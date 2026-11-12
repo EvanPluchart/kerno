@@ -2,6 +2,7 @@
 //! connection settings, SSH tunnels and SQL helpers. No UI dependency.
 
 pub mod config;
+pub mod connector;
 pub mod dialect;
 pub mod driver;
 pub mod error;
@@ -10,11 +11,14 @@ pub mod result;
 pub mod schema;
 pub mod sql;
 pub mod ssh;
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 pub use config::{
     ConnectParams, ConnectionConfig, Engine, Environment, Secret, Secrets, SshAuth, SshConfig,
     TlsConfig, TlsMode,
 };
+pub use connector::{Connector, HostKeyStore};
 pub use dialect::Dialect;
 pub use driver::{AdminView, Driver, Session, TxState};
 pub use error::{DbError, Error, Result};

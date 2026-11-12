@@ -8,6 +8,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Facts about the kerno-* test containers, for integration tests.
+test-support = []
+
 [dependencies]
 tokio.workspace = true
 async-trait.workspace = true
@@ -20,3 +24,8 @@ sqlparser.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 russh.workspace = true
+
+[dev-dependencies]
+# The crate's own integration tests use its test support.
+kerno-core = { path = ".", features = ["test-support"] }
+tempfile = "3"

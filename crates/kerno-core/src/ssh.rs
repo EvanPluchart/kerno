@@ -19,7 +19,9 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -29,7 +31,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::learn_known_hosts_path;
 use russh::keys::ssh_key::{HashAlg, PublicKey};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 
 use crate::config::{Secret, SshAuth, SshConfig};
@@ -144,9 +146,44 @@ pub struct TunnelRequest<'a> {
 }
 
 /// A byte stream to the database, carried by the SSH connection.
-pub trait TunnelStream: AsyncRead + AsyncWrite + Unpin + Send {}
+///
+/// A concrete type rather than a boxed trait object: generic driver code
+/// (TLS upgrade, connection tasks) needs to prove it is `Send + 'static`.
+pub struct TunnelStream(russh::ChannelStream<client::Msg>);
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelStream for T {}
+impl std::fmt::Debug for TunnelStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TunnelStream")
+    }
+}
+
+impl AsyncRead for TunnelStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TunnelStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 /// An authenticated SSH connection that can forward to hosts the SSH server
 /// reaches. Dropping it closes the SSH connection and everything forwarded
@@ -214,13 +251,9 @@ impl Tunnel {
 
     /// Opens a connection to `host:port` as seen from the SSH server and
     /// returns it as a stream. Nothing listens on the local machine.
-    pub async fn open_stream(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<Box<dyn TunnelStream>, SshError> {
+    pub async fn open_stream(&self, host: &str, port: u16) -> Result<TunnelStream, SshError> {
         let channel = open_channel(&self.handle, host, port).await?;
-        Ok(Box::new(channel.into_stream()))
+        Ok(TunnelStream(channel.into_stream()))
     }
 
     /// Opens a loopback port that forwards one connection to `host:port`,
@@ -357,12 +390,26 @@ async fn authenticate(
                 .map_err(other)?;
             accept(result).ok_or_else(|| rejected("private key"))
         }
-        SshAuth::Agent => {
-            let mut agent = AgentClient::connect_env().await.map_err(|error| {
-                SshError::Agent(format!(
-                    "could not reach the agent ({error}); is SSH_AUTH_SOCK set?"
-                ))
-            })?;
+        SshAuth::Agent { socket } => {
+            let mut agent = match socket {
+                Some(path) => AgentClient::connect_uds(path)
+                    .await
+                    .map(AgentClient::dynamic)
+                    .map_err(|error| {
+                        SshError::Agent(format!(
+                            "could not reach the agent at {}: {error}",
+                            path.display()
+                        ))
+                    })?,
+                None => AgentClient::connect_env()
+                    .await
+                    .map(AgentClient::dynamic)
+                    .map_err(|error| {
+                        SshError::Agent(format!(
+                            "could not reach the agent ({error}); is SSH_AUTH_SOCK set?"
+                        ))
+                    })?,
+            };
             let identities = agent
                 .request_identities()
                 .await

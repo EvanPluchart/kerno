@@ -36,3 +36,24 @@ Done and checked:
 
 Not done in this milestone, on purpose: the Linux container build (milestone 10) and `THIRD_PARTY_NOTICES.md`
 (created with the first ported logic or bundled asset).
+
+## 2026-11-12 — Milestone 1 (in progress)
+
+- `kerno-core`: driver and session traits, demand-driven streaming execution, compact row arena and result
+  store, connection settings with URL parsing and redacted secrets, tolerant SQL lexer, statement splitting
+  with `DELIMITER`, statement at cursor, introspection model, SSH tunnel, connector. 40 unit tests.
+- SSH tunnel reworked after an automated security review flagged the standing loopback listener (D-008).
+  10 integration tests against `kerno-ssh` pass: unknown host key refused then trusted then remembered,
+  changed host key always refused, password / key file / encrypted key / agent authentication and their
+  failures, stream forward, single-use port.
+  - The "contested single-use port" test first passed even with the guard removed (blocking reads starved the
+    forwarding task on a current-thread runtime, so it timed out silently). Rewritten with async reads; it now
+    fails without the guard ("a contested connection was forwarded") and passes with it.
+  - OpenSSH 10 in the bastion image penalises a source address after unauthenticated connections, which the
+    tests cause on purpose; `PerSourcePenalties no` is set in the test `sshd_config` only.
+- `kerno-postgres`: connection (direct or through the tunnel stream), TLS modes on rustls, streaming execute
+  over the simple query protocol with column types from Parse/Describe, cancel, transaction state tracking,
+  catalog introspection, DDL reconstruction, admin queries. 18 unit tests. Integration tests are next.
+- References: digests of how DBeaver and Beekeeper handle PostgreSQL and MySQL were written from the clones
+  (kept outside the repository). Catalog queries were written from the PostgreSQL documentation; the digests
+  served as a completeness check (extension-owned objects, `conparentid`, `reltuples = -1`, `contype = 'n'`).

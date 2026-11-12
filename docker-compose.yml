@@ -14,6 +14,12 @@ services:
       POSTGRES_DB: kerno
     ports:
       - "127.0.0.1:55432:5432"
+    networks:
+      default:
+        # A name the server certificate does not carry: through the SSH
+        # bastion, verify-full must refuse it and verify-ca accept it.
+        aliases:
+          - kerno-pg-alias
     volumes:
       - ./tests/fixtures/postgres:/docker-entrypoint-initdb.d:ro
       - ./tests/fixtures/generated/tls:/kerno-tls:ro

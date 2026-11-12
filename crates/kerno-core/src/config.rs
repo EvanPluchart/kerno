@@ -136,7 +136,7 @@ pub struct TlsConfig {
 }
 
 /// How Kerno authenticates to the SSH server of a tunnel.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum SshAuth {
     /// Password, from [`Secrets::ssh_password`].
@@ -146,9 +146,20 @@ pub enum SshAuth {
         /// Path of the private key.
         path: PathBuf,
     },
-    /// Keys held by the running SSH agent (`SSH_AUTH_SOCK`).
-    #[default]
-    Agent,
+    /// Keys held by an SSH agent.
+    Agent {
+        /// The agent's socket. `None` uses the one named by `SSH_AUTH_SOCK`;
+        /// set it for agents that do not export that variable to GUI apps
+        /// (password managers' agents, for example).
+        #[serde(default)]
+        socket: Option<PathBuf>,
+    },
+}
+
+impl Default for SshAuth {
+    fn default() -> Self {
+        Self::Agent { socket: None }
+    }
 }
 
 /// An SSH tunnel through which the database is reached.
@@ -617,7 +628,7 @@ mod tests {
             host: String::new(),
             port: 22,
             user: "u".into(),
-            auth: SshAuth::Agent,
+            auth: SshAuth::default(),
             keepalive_secs: 30,
         });
         assert!(

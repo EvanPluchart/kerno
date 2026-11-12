@@ -10,3 +10,9 @@ X11Forwarding no
 ClientAliveInterval 30
 LogLevel VERBOSE
 Subsystem sftp internal-sftp
+
+# Test-only: the tunnel tests fail authentication and abandon handshakes on
+# purpose (wrong password, refused host key), all from one source address.
+# OpenSSH's per-source penalties would then drop the next tests' connections.
+PerSourcePenalties no
+MaxStartups 100:30:200
