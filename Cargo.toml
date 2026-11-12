@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/kerno", "crates/kerno-core", "crates/kerno-postgres", "crates/kerno-mysql"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+kerno-core = { path = "crates/kerno-core" }
+kerno-postgres = { path = "crates/kerno-postgres" }
+kerno-mysql = { path = "crates/kerno-mysql" }
+
+# GPUI and gpui-component, pinned together through the gpui-kit facade
+# (see docs/DECISIONS.md, D-001).
+gpui-kit = { version = "=0.9.1", features = ["tree-sitter", "tree-sitter-sql"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+# Line tables keep backtraces useful while keeping target/ small.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
+[profile.release]
+strip = "debuginfo"

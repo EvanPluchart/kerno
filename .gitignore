@@ -1,3 +1,6 @@
 /target
 .DS_Store
 *.log
+# Generated test material (TLS certificates, SSH keys): scripts/test-env.sh
+/tests/fixtures/generated/
+/dist/

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 3
+
+jobs:
+  lint:
+    name: fmt, clippy, deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install GPUI system dependencies
+        run: sudo scripts/install-linux-deps.sh
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  test-linux:
+    name: test and build (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install GPUI system dependencies
+        run: sudo scripts/install-linux-deps.sh
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The kerno-* service containers (PostgreSQL 17, MySQL 8.4, MariaDB 11,
+      # SSH bastion), seeded from tests/fixtures.
+      - name: Start the test containers
+        run: scripts/test-env.sh up
+      - name: Test
+        run: xvfb-run -a cargo test --workspace -- --test-threads=3
+        env:
+          KERNO_REQUIRE_CONTAINERS: "1"
+      - name: Build
+        run: cargo build --release
+      - name: Stop the test containers
+        if: always()
+        run: scripts/test-env.sh down
+
+  test-macos:
+    name: test and build (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # GitHub's macOS runners have no Docker: the integration tests report
+      # themselves as skipped and the unit and UI tests run.
+      - name: Test
+        run: cargo test --workspace -- --test-threads=3
+      - name: Build
+        run: cargo build --release
