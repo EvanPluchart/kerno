@@ -157,3 +157,28 @@ the stack for what needs a real parse of a complete statement (classification, c
   real NOT NULL columns; otherwise the table is read-only in the data view.
 - Administrative views (sessions, roles, grants, sizes, settings) are canned queries shown in the ordinary
   results grid, so sorting, copy and export come for free.
+
+## D-012 — Kerno's own storage and what never goes into it
+
+- One SQLite file (`rusqlite`, bundled) in the platform data directory holds saved connections, query
+  history, saved queries, open tabs and settings; migrations are a versioned list in code, and a file
+  written by a newer Kerno is refused rather than guessed at. `KERNO_DATA_DIR` overrides the directory:
+  tests and checks of the real app use it so they never touch the owner's data.
+- Secrets are not in that file by construction: `ConnectionConfig` has no secret field (a test walks its
+  serialized keys), and passwords live in the OS secret store through `keyring` (`OsSecretStore`). Without a
+  usable secret store, `MemorySecretStore` keeps them for the life of the process and the app asks at
+  connect. `KERNO_SECRET_STORE=memory` forces that, and the one test that writes to the real keychain is
+  opt-in (`KERNO_TEST_OS_SECRET_STORE=1`), so an automated run never pops a keychain prompt.
+- History text is redacted before it is stored (`redact_secrets`). After an automated security review of the
+  first version, the rule set covers: the string after any word ending in `PASSWORD` (`MASTER_PASSWORD`,
+  `SOURCE_PASSWORD`, `OPTIONS (password '...')`), `IDENTIFIED BY`, `IDENTIFIED WITH plugin BY|AS`, the
+  current password after `REPLACE`, and, inside any literal, `password=value` pairs (libpq connection
+  strings, `sslpassword`) and the password of `scheme://user:password@host` URLs. A unit test had already
+  caught the `IDENTIFIED WITH plugin BY` form slipping through the first rule.
+- When a statement contained a secret, its server error message is not kept: MySQL syntax errors quote
+  the statement from the error point and can cut a literal in two, so the message cannot be cleaned
+  reliably. The status and timing are kept.
+- Limits, stated plainly: redaction recognises statements that set or carry a password. A secret used as
+  ordinary data (`INSERT INTO api_keys VALUES ('...')`) is query text like any other and is stored. That is
+  why the store file is created with mode 0600 in a 0700 directory (its `-wal`/`-shm` siblings inherit
+  the mode), and tightened again at every start.

@@ -9,6 +9,7 @@ pub mod error;
 pub mod exec;
 pub mod result;
 pub mod schema;
+pub mod secrets;
 pub mod sql;
 pub mod ssh;
 pub mod storage;

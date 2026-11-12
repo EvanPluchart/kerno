@@ -27,6 +27,7 @@ russh.workspace = true
 rusqlite.workspace = true
 directories.workspace = true
 uuid.workspace = true
+keyring.workspace = true
 
 [dev-dependencies]
 # The crate's own integration tests use its test support.

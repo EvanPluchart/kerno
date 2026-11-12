@@ -162,10 +162,21 @@ impl Storage {
     /// Opens (creating it and its directory if needed) the store at `path`
     /// and brings its schema up to date.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::io(format!("creating {}", parent.display()), error))?;
+            restrict(parent, 0o700)?;
         }
+        // History holds query text: the file is the user's alone. It is
+        // created here, before SQLite opens it, so it never exists with
+        // wider permissions; SQLite gives its -wal and -shm files the same
+        // mode as the main file.
+        if !path.exists() {
+            create_private(path)?;
+        }
+        restrict(path, 0o600)?;
         let connection = Connection::open(path).map_err(storage_error)?;
         // WAL: readers never block the writer, and a crash cannot corrupt
         // the file.
@@ -270,6 +281,11 @@ impl Storage {
     /// engine it ran on, used to redact secrets from its text.
     pub fn add_history(&self, entry: &HistoryEntry, rules: LexRules) -> Result<i64> {
         let sql = redact_secrets(&entry.sql, rules);
+        // The server's message may quote the statement: see ERROR_WITHHELD.
+        let error = match &entry.error {
+            Some(_) if sql != entry.sql => Some(ERROR_WITHHELD),
+            other => other.as_deref(),
+        };
         self.with(|c| {
             c.execute(
                 "INSERT INTO history
@@ -283,7 +299,7 @@ impl Storage {
                     entry.duration_ms,
                     entry.status.as_str(),
                     entry.row_count,
-                    entry.error,
+                    error,
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -474,6 +490,35 @@ impl Storage {
     }
 }
 
+/// Creates an empty file only its owner can read or write.
+fn create_private(path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map(|_| ())
+        .map_err(|error| Error::io(format!("creating {}", path.display()), error))
+}
+
+/// Sets Unix permission bits; does nothing on other platforms.
+fn restrict(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+            Error::io(format!("setting permissions of {}", path.display()), error)
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
 fn migrate(connection: &mut Connection) -> Result<()> {
     let version: usize = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -494,9 +539,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Replaces the password in statements that set one, so it never reaches
-/// the history or a log: the string after `PASSWORD` or `IDENTIFIED BY`
-/// (with optional `=`, `(`, `WITH plugin`, `AS`) becomes `'***'`.
+/// What replaces the error text of a statement that contained a secret:
+/// servers echo part of the statement in some messages (MySQL's syntax
+/// errors quote what follows the error point), possibly cutting a literal
+/// in two, so the message cannot be cleaned reliably.
+const ERROR_WITHHELD: &str = "(message not kept: the statement contained a password)";
+
+/// Removes passwords from a statement, so they never reach the history or
+/// a log. Redacted, each becoming `'***'` or `***`:
+///
+/// - the string after a word ending in `PASSWORD` (`PASSWORD`,
+///   `MASTER_PASSWORD`, `SOURCE_PASSWORD`, ...), with optional `=` or `(`;
+/// - the string after `IDENTIFIED BY`, `IDENTIFIED WITH plugin BY`,
+///   `IDENTIFIED ... AS`, and the old password after `... REPLACE`;
+/// - inside any string literal, the value of `password=...` (connection
+///   strings) and the password of a `scheme://user:password@host` URL.
+///
+/// This is a best effort over statements Kerno knows set or carry a
+/// password; it cannot recognise a secret used as ordinary data.
 pub fn redact_secrets(sql: &str, rules: LexRules) -> String {
     let tokens: Vec<_> = lex(sql, rules)
         .into_iter()
@@ -508,15 +568,20 @@ pub fn redact_secrets(sql: &str, rules: LexRules) -> String {
             .filter(|token| token.kind == TokenKind::Word)
             .map(|token| sql[token.range.clone()].to_ascii_uppercase())
     };
-    let mut secret_ranges = Vec::new();
+    let identified_within = |index: usize, reach: usize| {
+        (1..=reach).any(|back| word(index.wrapping_sub(back)).as_deref() == Some("IDENTIFIED"))
+    };
+
+    // Whole literals that are a password.
+    let mut whole: Vec<std::ops::Range<usize>> = Vec::new();
     for index in 0..tokens.len() {
         let introduces_secret = match word(index).as_deref() {
-            Some("PASSWORD") => true,
+            Some(word) if word.ends_with("PASSWORD") => true,
             // IDENTIFIED BY 'password', and MySQL's
             // IDENTIFIED WITH plugin BY 'password' / AS 'hash'.
-            Some("BY" | "AS") => {
-                (1..=3).any(|back| word(index.wrapping_sub(back)).as_deref() == Some("IDENTIFIED"))
-            }
+            Some("BY" | "AS") => identified_within(index, 3),
+            // ... IDENTIFIED [WITH plugin] BY 'new' REPLACE 'current'.
+            Some("REPLACE") => identified_within(index, 6),
             _ => false,
         };
         if !introduces_secret {
@@ -533,21 +598,103 @@ pub fn redact_secrets(sql: &str, rules: LexRules) -> String {
         if let Some(token) = tokens.get(next)
             && token.kind == TokenKind::String
         {
-            secret_ranges.push(token.range.clone());
+            whole.push(token.range.clone());
         }
     }
-    if secret_ranges.is_empty() {
+
+    // Replacements, in order: whole literals, and secrets inside the others.
+    let mut edits: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == TokenKind::String)
+    {
+        if whole.contains(&token.range) {
+            edits.push((token.range.clone(), "'***'"));
+            continue;
+        }
+        for inner in secrets_inside(&sql[token.range.clone()]) {
+            edits.push((
+                token.range.start + inner.start..token.range.start + inner.end,
+                "***",
+            ));
+        }
+    }
+    if edits.is_empty() {
         return sql.to_string();
     }
+    edits.sort_by_key(|(range, _)| range.start);
     let mut out = String::with_capacity(sql.len());
     let mut position = 0;
-    for range in secret_ranges {
+    for (range, replacement) in edits {
         out.push_str(&sql[position..range.start]);
-        out.push_str("'***'");
+        out.push_str(replacement);
         position = range.end;
     }
     out.push_str(&sql[position..]);
     out
+}
+
+/// Byte ranges, within a string literal's text, of passwords it carries:
+/// `password=value` pairs and `scheme://user:password@host` URLs.
+fn secrets_inside(literal: &str) -> Vec<std::ops::Range<usize>> {
+    let lower = literal.to_ascii_lowercase();
+    let bytes = literal.as_bytes();
+    let mut ranges = Vec::new();
+
+    // password = value (libpq connection strings and the like). The key may
+    // be longer (`sslpassword`), which is a secret just the same.
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("password") {
+        let mut at = from + found + "password".len();
+        from = at;
+        while bytes.get(at).is_some_and(|b| *b == b' ') {
+            at += 1;
+        }
+        if bytes.get(at) != Some(&b'=') {
+            continue;
+        }
+        at += 1;
+        while bytes.get(at).is_some_and(|b| *b == b' ') {
+            at += 1;
+        }
+        // A quoted value: its quotes are doubled, being inside a literal.
+        let end = if literal[at..].starts_with("''") {
+            literal[at + 2..]
+                .find("''")
+                .map_or(literal.len(), |close| at + 2 + close + 2)
+        } else {
+            literal[at..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ';' | '&'))
+                .map_or(literal.len(), |stop| at + stop)
+        };
+        if end > at {
+            ranges.push(at..end);
+            from = end;
+        }
+    }
+
+    // scheme://user:password@host
+    let mut from = 0;
+    while let Some(found) = literal[from..].find("://") {
+        let authority = from + found + 3;
+        from = authority;
+        let rest = &literal[authority..];
+        let stop = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '\'' | '"'))
+            .unwrap_or(rest.len());
+        let authority_text = &rest[..stop];
+        if let Some(at_sign) = authority_text.rfind('@')
+            && let Some(colon) = authority_text[..at_sign].find(':')
+            && at_sign > colon + 1
+        {
+            ranges.push(authority + colon + 1..authority + at_sign);
+        }
+    }
+
+    ranges.sort_by_key(|range| range.start);
+    // Overlaps cannot be applied twice; keep the first of any that collide.
+    ranges.dedup_by(|later, earlier| later.start < earlier.end);
+    ranges
 }
 
 /// Where Kerno keeps its files.
@@ -861,6 +1008,63 @@ mod tests {
             my("SET PASSWORD FOR u = PASSWORD('hunter2')"),
             "SET PASSWORD FOR u = PASSWORD('***')"
         );
+        // Replication and option forms: any word ending in PASSWORD.
+        assert_eq!(
+            my("CHANGE REPLICATION SOURCE TO SOURCE_USER='r', SOURCE_PASSWORD='hunter2'"),
+            "CHANGE REPLICATION SOURCE TO SOURCE_USER='r', SOURCE_PASSWORD='***'"
+        );
+        assert_eq!(
+            my("CHANGE MASTER TO MASTER_PASSWORD = 'hunter2', MASTER_PORT = 3306"),
+            "CHANGE MASTER TO MASTER_PASSWORD = '***', MASTER_PORT = 3306"
+        );
+        assert_eq!(
+            pg("CREATE USER MAPPING FOR u SERVER s OPTIONS (user 'r', password 'hunter2')"),
+            "CREATE USER MAPPING FOR u SERVER s OPTIONS (user 'r', password '***')"
+        );
+        // The current password given along with the new one.
+        assert_eq!(
+            my("ALTER USER u IDENTIFIED BY 'new-pw' REPLACE 'old-pw'"),
+            "ALTER USER u IDENTIFIED BY '***' REPLACE '***'"
+        );
+        assert_eq!(
+            my(
+                "ALTER USER u IDENTIFIED WITH caching_sha2_password BY 'new-pw' REPLACE 'old-pw' RETAIN CURRENT PASSWORD"
+            ),
+            "ALTER USER u IDENTIFIED WITH caching_sha2_password BY '***' REPLACE '***' RETAIN CURRENT PASSWORD"
+        );
+        // Connection strings and URLs inside literals.
+        assert_eq!(
+            pg(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=db user=r password=hunter2 dbname=x' PUBLICATION p"
+            ),
+            "CREATE SUBSCRIPTION s CONNECTION 'host=db user=r password=*** dbname=x' PUBLICATION p"
+        );
+        assert_eq!(
+            pg("select dblink_connect('host=db PASSWORD = ''hunter 2'' sslpassword=k3y')"),
+            "select dblink_connect('host=db PASSWORD = *** sslpassword=***')"
+        );
+        assert_eq!(
+            my(
+                "CREATE TABLE f (id int) ENGINE=FEDERATED CONNECTION='mysql://fed:hunter2@remote:3306/db/t'"
+            ),
+            "CREATE TABLE f (id int) ENGINE=FEDERATED CONNECTION='mysql://fed:***@remote:3306/db/t'"
+        );
+        for redacted in [
+            pg("ALTER USER ada PASSWORD 'hunter2'"),
+            my("CHANGE MASTER TO MASTER_PASSWORD = 'hunter2'"),
+            pg("select dblink_connect('password=hunter2')"),
+            my("select 'mysql://u:hunter2@h/db'"),
+        ] {
+            assert!(!redacted.contains("hunter2"), "{redacted}");
+        }
+        // A URL without a password, and `password` not followed by `=`.
+        for sql in [
+            "select 'https://example.com/a:b@c'",
+            "select 'postgres://user@host/db'",
+            "select 'the password is unknown'",
+        ] {
+            assert_eq!(pg(sql), sql);
+        }
         // Ordinary statements are untouched, including a column called password.
         for sql in [
             "select 'password' from t",
@@ -884,6 +1088,55 @@ mod tests {
         let stored = storage.history(None, "", 10).unwrap();
         assert_eq!(stored[0].sql, "ALTER USER ada PASSWORD '***'");
         assert!(storage.history(None, "hunter2", 10).unwrap().is_empty());
+
+        // A server error that quotes the statement, cut mid-literal as
+        // MySQL does: the message is not kept at all.
+        let mut failed = entry("c", "ALTER USER ada IDENTIFIED BY 'hunter2' REQUIRE", 2);
+        failed.status = HistoryStatus::Error;
+        failed.error = Some(
+            "You have an error in your SQL syntax near 'IDENTIFIED BY 'hunt' at line 1".into(),
+        );
+        storage.add_history(&failed, LexRules::MYSQL).unwrap();
+        let stored = &storage.history(None, "REQUIRE", 10).unwrap()[0];
+        assert_eq!(stored.error.as_deref(), Some(ERROR_WITHHELD));
+        assert_eq!(stored.status, HistoryStatus::Error);
+
+        // Errors of statements without a secret are kept as they are.
+        let mut failed = entry("c", "select nope", 3);
+        failed.error = Some("column \"nope\" does not exist".into());
+        storage.add_history(&failed, LexRules::POSTGRES).unwrap();
+        let stored = &storage.history(None, "nope", 10).unwrap()[0];
+        assert_eq!(
+            stored.error.as_deref(),
+            Some("column \"nope\" does not exist")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("Kerno");
+        let path = data_dir.join("kerno.db");
+        let storage = Storage::open(&path).unwrap();
+        storage
+            .add_history(&entry("c", "select 1", 1), LexRules::POSTGRES)
+            .unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&data_dir), 0o700);
+        // The write-ahead log holds the same data.
+        let wal = data_dir.join("kerno.db-wal");
+        assert!(wal.exists(), "WAL mode is on");
+        assert_eq!(mode(&wal), 0o600);
+        drop(storage);
+
+        // A file that was left wide open is tightened on the next start.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _storage = Storage::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

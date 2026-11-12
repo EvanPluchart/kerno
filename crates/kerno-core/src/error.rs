@@ -84,6 +84,9 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// The secret store failed.
+    #[error("secrets: {0}")]
+    Secrets(String),
     /// Kerno's own storage failed.
     #[error("storage: {0}")]
     Storage(String),
