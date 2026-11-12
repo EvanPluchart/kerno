@@ -44,6 +44,7 @@ use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
+use crate::structure::tab::{StructureTab, StructureTabEvent};
 use crate::tabs::{TabSnapshot, Target};
 use crate::theme::{self, Appearance};
 use kerno_core::TxState;
@@ -60,20 +61,28 @@ const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
 enum OpenTab {
     Query(Entity<QueryTab>),
     Data(Entity<DataTab>),
+    Structure(Entity<StructureTab>),
 }
 
 impl OpenTab {
     fn query(&self) -> Option<&Entity<QueryTab>> {
         match self {
             OpenTab::Query(tab) => Some(tab),
-            OpenTab::Data(_) => None,
+            _ => None,
         }
     }
 
     fn data(&self) -> Option<&Entity<DataTab>> {
         match self {
             OpenTab::Data(tab) => Some(tab),
-            OpenTab::Query(_) => None,
+            _ => None,
+        }
+    }
+
+    fn structure(&self) -> Option<&Entity<StructureTab>> {
+        match self {
+            OpenTab::Structure(tab) => Some(tab),
+            _ => None,
         }
     }
 
@@ -81,6 +90,7 @@ impl OpenTab {
         match self {
             OpenTab::Query(tab) => tab.focus_handle(cx),
             OpenTab::Data(tab) => tab.focus_handle(cx),
+            OpenTab::Structure(tab) => tab.focus_handle(cx),
         }
     }
 
@@ -88,6 +98,7 @@ impl OpenTab {
         match self {
             OpenTab::Query(tab) => tab.read(cx).snapshot(cx),
             OpenTab::Data(tab) => tab.read(cx).snapshot(),
+            OpenTab::Structure(tab) => tab.read(cx).snapshot(),
         }
     }
 
@@ -111,6 +122,7 @@ impl OpenTab {
                     tab.title()
                 }
             }
+            OpenTab::Structure(tab) => tab.read(cx).title(),
         }
     }
 
@@ -118,6 +130,7 @@ impl OpenTab {
         match self {
             OpenTab::Query(tab) => tab.read(cx).status(cx),
             OpenTab::Data(tab) => tab.read(cx).status(cx),
+            OpenTab::Structure(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -125,6 +138,7 @@ impl OpenTab {
         match self {
             OpenTab::Query(tab) => tab.clone().into(),
             OpenTab::Data(tab) => tab.clone().into(),
+            OpenTab::Structure(tab) => tab.clone().into(),
         }
     }
 }
@@ -218,6 +232,26 @@ impl Workspace {
                         cx,
                     );
                 }
+                TabSnapshot::Structure {
+                    target,
+                    schema,
+                    table,
+                    view,
+                    materialized,
+                } => {
+                    let kind = match (view, materialized) {
+                        (_, true) => RelationKind::MaterializedView,
+                        (true, false) => RelationKind::View,
+                        (false, false) => RelationKind::Table,
+                    };
+                    workspace.push_structure_tab(
+                        target,
+                        TableRef::new(schema, table),
+                        kind,
+                        window,
+                        cx,
+                    );
+                }
             }
         }
         // The tab that was active is active again.
@@ -233,6 +267,7 @@ impl Workspace {
             .map(|tab| match tab {
                 OpenTab::Query(tab) => tab.read(cx).title().to_string(),
                 OpenTab::Data(tab) => tab.read(cx).title().to_string(),
+                OpenTab::Structure(tab) => tab.read(cx).title().to_string(),
             })
             .collect()
     }
@@ -262,6 +297,12 @@ impl Workspace {
         self.tabs.get(self.active_tab)?.data()
     }
 
+    /// The active tab, when it shows a table's structure.
+    #[cfg(test)]
+    pub fn active_structure_tab(&self) -> Option<&Entity<StructureTab>> {
+        self.tabs.get(self.active_tab)?.structure()
+    }
+
     /// Opens the data of a table in a tab of its own.
     fn push_data_tab(
         &mut self,
@@ -279,13 +320,19 @@ impl Workspace {
             &tab,
             window,
             |this, tab, event: &DataTabEvent, window, cx| {
-                let DataTabEvent::Open {
-                    table,
-                    kind,
-                    filter,
-                } = event;
                 let target = tab.read(cx).target().clone();
-                this.open_data(target, table.clone(), *kind, filter.clone(), window, cx);
+                match event {
+                    DataTabEvent::Open {
+                        table,
+                        kind,
+                        filter,
+                    } => {
+                        this.open_data(target, table.clone(), *kind, filter.clone(), window, cx);
+                    }
+                    DataTabEvent::OpenStructure { table, kind } => {
+                        this.open_structure(target, table.clone(), *kind, window, cx);
+                    }
+                }
             },
         ));
         self.tabs.push(OpenTab::Data(tab.clone()));
@@ -315,6 +362,67 @@ impl Workspace {
             return self.tabs[index].data().expect("a data tab").clone();
         }
         let tab = self.push_data_tab(target, table, kind, filter, window, cx);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.schedule_save(cx);
+        tab
+    }
+
+    /// Opens the structure of a table in a tab of its own.
+    fn push_structure_tab(
+        &mut self,
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<StructureTab> {
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| StructureTab::new(target, table, kind, connections, window, cx));
+        // One subscription per tab: `close_tab_at` removes them by index.
+        self.tab_subscriptions.push(cx.subscribe_in(
+            &tab,
+            window,
+            |this, tab, event: &StructureTabEvent, window, cx| {
+                let target = tab.read(cx).target().clone();
+                match event {
+                    StructureTabEvent::OpenStructure { table, kind } => {
+                        this.open_structure(target, table.clone(), *kind, window, cx);
+                    }
+                    StructureTabEvent::OpenData { table, kind } => {
+                        this.open_data(target, table.clone(), *kind, Filter::default(), window, cx);
+                    }
+                }
+            },
+        ));
+        self.tabs.push(OpenTab::Structure(tab.clone()));
+        self.active_tab = self.tabs.len() - 1;
+        tab
+    }
+
+    /// Shows the structure of a table: in the tab that already shows it,
+    /// else in a new one.
+    pub fn open_structure(
+        &mut self,
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<StructureTab> {
+        let open = self.tabs.iter().position(|tab| {
+            tab.structure().is_some_and(|tab| {
+                let tab = tab.read(cx);
+                tab.target() == &target && tab.table() == &table
+            })
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index]
+                .structure()
+                .expect("a structure tab")
+                .clone();
+        }
+        let tab = self.push_structure_tab(target, table, kind, window, cx);
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
         tab
@@ -574,6 +682,13 @@ impl Workspace {
                     window,
                     cx,
                 );
+            }
+            NavigatorEvent::ShowStructure {
+                target,
+                table,
+                kind,
+            } => {
+                self.open_structure(target.clone(), table.clone(), *kind, window, cx);
             }
         }
     }

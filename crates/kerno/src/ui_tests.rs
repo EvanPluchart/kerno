@@ -18,7 +18,7 @@ use kerno_core::secrets::MemorySecretStore;
 use kerno_core::storage::{AppPaths, Storage};
 use kerno_core::{ConnectionConfig, Engine, testing};
 
-use gpui_kit::component::table::{ColumnSort, TableDelegate as _, TableState};
+use gpui_kit::component::table::{ColumnSort, TableDelegate as _, TableEvent, TableState};
 use kerno_core::browse::{Condition, Filter, Operator};
 use kerno_core::schema::{RelationKind, TableRef};
 
@@ -30,6 +30,7 @@ use crate::query::tab::Activity;
 use crate::settings::Settings;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
+use crate::structure::tab::{DDL_SECTION, List, StructureTab};
 use crate::tabs::TabSnapshot;
 use crate::tabs::Target;
 use crate::theme::{self, Appearance};
@@ -3185,4 +3186,361 @@ async fn a_table_opened_from_the_tree_comes_back_after_a_restart(cx: &mut TestAp
     kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
     restarted.click(cx, "data-connect");
     restarted.wait_for_rows(cx, &rows);
+}
+
+// Structure ---------------------------------------------------------------------
+
+impl Fixture {
+    /// Opens the structure of a table of the first connection.
+    fn open_structure(
+        &self,
+        cx: &mut TestAppContext,
+        schema: &str,
+        table: &str,
+        kind: RelationKind,
+    ) {
+        let connection = cx.update(|cx| self.connections.read(cx).saved()[0].id.clone());
+        let target = Target {
+            connection,
+            database: None,
+            schema: None,
+        };
+        let table = TableRef::new(schema, table);
+        self.step(cx, |window, cx| {
+            self.workspace.update(cx, |workspace, cx| {
+                workspace.open_structure(target, table, kind, window, cx);
+            })
+        });
+    }
+
+    /// The active tab, which shows a table's structure.
+    fn structure(&self, cx: &mut TestAppContext) -> Entity<StructureTab> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .active_structure_tab()
+                .expect("a structure tab")
+                .clone()
+        })
+    }
+
+    /// Does something to the active structure tab.
+    fn on_structure(
+        &self,
+        cx: &mut TestAppContext,
+        act: impl FnOnce(&mut StructureTab, &mut gpui_kit::Window, &mut gpui_kit::Context<StructureTab>),
+    ) {
+        let tab = self.structure(cx);
+        self.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| act(tab, window, cx))
+        });
+    }
+
+    /// Waits for the active structure tab to have read its table.
+    fn wait_for_structure(&self, cx: &mut TestAppContext) {
+        self.wait_until(cx, "the structure", |app, cx| {
+            let tab = app.structure(cx);
+            let state = cx.update(|cx| tab.read(cx).state());
+            assert!(!state.starts_with("failed"), "{state}");
+            state == "ready"
+        });
+    }
+
+    /// The rows of a list of the active structure tab.
+    fn structure_rows(&self, cx: &mut TestAppContext, list: List) -> Vec<Vec<String>> {
+        let tab = self.structure(cx);
+        cx.update(|cx| tab.read(cx).rows_of(list, cx))
+    }
+
+    /// One column of a list of the active structure tab.
+    fn structure_column(&self, cx: &mut TestAppContext, list: List, column: usize) -> Vec<String> {
+        self.structure_rows(cx, list)
+            .into_iter()
+            .map(|row| row[column].clone())
+            .collect()
+    }
+
+    fn structure_ddl(&self, cx: &mut TestAppContext) -> String {
+        let tab = self.structure(cx);
+        cx.update(|cx| tab.read(cx).ddl().to_string())
+    }
+}
+
+/// Where the fixture's shop is: a schema on PostgreSQL, a database on MySQL.
+fn shop(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "shop",
+        Engine::MySql | Engine::MariaDb => "kerno",
+    }
+}
+
+#[gpui_kit::test]
+fn the_structure_of_a_table_is_shown_in_tabs(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = shop(engine);
+        let app = connected(cx, engine);
+        app.open_structure(cx, schema, "orders", RelationKind::Table);
+        assert_eq!(app.titles(cx), ["orders · structure"]);
+        app.wait_for_structure(cx);
+        assert!(app.has(cx, "structure-table-name"), "{engine:?}");
+
+        // Columns, in table order, with their type and key.
+        let columns = app.structure_rows(cx, List::Columns);
+        let names: Vec<&str> = columns.iter().map(|row| row[1].as_str()).collect();
+        let expected: &[&str] = match engine {
+            Engine::Postgres => &[
+                "id",
+                "customer_id",
+                "status",
+                "invoice_number",
+                "placed_at",
+                "shipped_at",
+                "total",
+                "currency",
+                "notes",
+            ],
+            Engine::MySql | Engine::MariaDb => &[
+                "id",
+                "customer_id",
+                "status",
+                "placed_at",
+                "shipped_at",
+                "total",
+                "currency",
+                "notes",
+            ],
+        };
+        assert_eq!(names, expected, "{engine:?}");
+        assert_eq!(columns[0][0], "1");
+        assert_eq!(columns[0][5], "PK", "{engine:?}");
+        assert_eq!(columns[1][3], "no", "{engine:?}");
+        match engine {
+            Engine::Postgres => {
+                assert_eq!(columns[2][2], "shop.order_status");
+                assert_eq!(columns[2][4], "'pending'::shop.order_status");
+                assert_eq!(columns[0][6], "identity, always");
+            }
+            Engine::MySql | Engine::MariaDb => {
+                // MariaDB keeps the display width: "bigint(20) unsigned".
+                let customer_id = &columns[1][2];
+                assert!(
+                    customer_id.starts_with("bigint") && customer_id.ends_with(" unsigned"),
+                    "{engine:?}: {customer_id}"
+                );
+                assert_eq!(columns[0][6], "auto increment", "{engine:?}");
+            }
+        }
+
+        let indexes = app.structure_column(cx, List::Indexes, 0);
+        for index in ["orders_customer_idx", "orders_status_placed_idx"] {
+            assert!(
+                indexes.iter().any(|name| name == index),
+                "{engine:?}: {indexes:?}"
+            );
+        }
+        let primary = app.structure_rows(cx, List::Constraints);
+        assert!(
+            primary
+                .iter()
+                .any(|row| row[1] == "PRIMARY KEY" && row[2] == "id"),
+            "{engine:?}: {primary:?}"
+        );
+        // The foreign key to customers, and the tables that reference orders.
+        let references = app.structure_rows(cx, List::ForeignKeys);
+        assert_eq!(references.len(), 1, "{engine:?}: {references:?}");
+        assert_eq!(references[0][1], "customer_id");
+        assert_eq!(references[0][2], format!("{schema}.customers"));
+        assert_eq!(references[0][3], "id");
+        assert_eq!(references[0][5], "RESTRICT", "{engine:?}");
+        let referencing = app.structure_column(cx, List::ReferencedBy, 1);
+        let items = referencing
+            .iter()
+            .position(|table| *table == format!("{schema}.order_items"))
+            .unwrap_or_else(|| panic!("{engine:?}: {referencing:?}"));
+        assert_eq!(
+            app.structure_column(cx, List::Triggers, 0),
+            ["orders_log_status"],
+            "{engine:?}"
+        );
+        assert!(
+            app.structure_ddl(cx).starts_with("CREATE TABLE"),
+            "{engine:?}: {}",
+            app.structure_ddl(cx)
+        );
+
+        // Each sub-tab shows its own list; the DDL is in a code view.
+        app.on_structure(cx, |tab, _, cx| tab.select(DDL_SECTION, cx));
+        assert!(app.has(cx, "structure-ddl"), "{engine:?}");
+        app.on_structure(cx, |tab, _, cx| tab.select(4, cx));
+        assert!(!app.has(cx, "structure-ddl"), "{engine:?}");
+
+        // Cmd+C copies the selected cell.
+        let tab = app.structure(cx);
+        let grid = cx.update(|cx| tab.read(cx).grid(List::Columns)).unwrap();
+        app.on_structure(cx, |tab, _, cx| tab.select(0, cx));
+        app.step(cx, |window, cx| {
+            grid.update(cx, |table, cx| table.set_selected_cell(1, 2, cx));
+            grid.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        app.press(cx, &["secondary-c"]);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref(),
+            Some(columns[1][2].as_str()),
+            "{engine:?}"
+        );
+
+        // A double click on a key opens the table at its other end.
+        let referencing = cx
+            .update(|cx| tab.read(cx).grid(List::ReferencedBy))
+            .unwrap();
+        app.step(cx, |_, cx| {
+            referencing.update(cx, |_, cx| cx.emit(TableEvent::DoubleClickedCell(items, 0)))
+        });
+        assert_eq!(
+            app.titles(cx),
+            ["orders · structure", "order_items · structure"]
+        );
+        app.wait_for_structure(cx);
+        assert_eq!(
+            app.structure_column(cx, List::ForeignKeys, 2),
+            [format!("{schema}.orders"), format!("{schema}.products")],
+            "{engine:?}"
+        );
+        // Its rows are a click away, and its structure one back.
+        app.click(cx, "structure-open-data");
+        assert_eq!(
+            app.titles(cx),
+            [
+                "orders · structure",
+                "order_items · structure",
+                "order_items"
+            ]
+        );
+        // (Its rows are read and counted before the next engine's runtime
+        // replaces this one.)
+        app.wait_until(cx, "the rows", |app, cx| {
+            app.data_state(cx).contains(" of ")
+        });
+        app.click(cx, "data-open-structure");
+        assert_eq!(app.titles(cx).len(), 3, "{engine:?}");
+        assert_eq!(app.active(cx), Some(1));
+    }
+}
+
+#[gpui_kit::test]
+fn a_view_shows_its_columns_and_ddl(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = shop(engine);
+        let app = connected(cx, engine);
+        app.open_structure(cx, schema, "order_totals", RelationKind::View);
+        app.wait_for_structure(cx);
+        assert_eq!(
+            app.structure_column(cx, List::Columns, 1),
+            [
+                "order_id",
+                "customer_id",
+                "status",
+                "placed_at",
+                "line_count",
+                "computed_total"
+            ],
+            "{engine:?}"
+        );
+        // What a view does not have says so.
+        assert_eq!(
+            app.structure_rows(cx, List::Indexes),
+            Vec::<Vec<String>>::new()
+        );
+        app.on_structure(cx, |tab, _, cx| tab.select(1, cx));
+        assert!(app.has(cx, ("structure-empty", 1usize)), "{engine:?}");
+        app.on_structure(cx, |tab, _, cx| tab.select(3, cx));
+        assert!(
+            app.has(cx, ("structure-empty", 3usize)) && app.has(cx, ("structure-empty", 4usize)),
+            "{engine:?}"
+        );
+        let ddl = app.structure_ddl(cx);
+        assert!(
+            ddl.contains(" VIEW ") && ddl.contains("order_totals"),
+            "{engine:?}: {ddl}"
+        );
+
+        // A materialized view has its own DDL, and indexes.
+        if engine == Engine::Postgres {
+            app.open_structure(cx, schema, "product_sales", RelationKind::MaterializedView);
+            app.wait_for_structure(cx);
+            assert_eq!(app.structure_rows(cx, List::Columns).len(), 5);
+            assert_eq!(
+                app.structure_column(cx, List::Indexes, 0),
+                ["product_sales_product_idx"]
+            );
+            let ddl = app.structure_ddl(cx);
+            assert!(ddl.contains("MATERIALIZED VIEW"), "{ddl}");
+        }
+    }
+}
+
+#[gpui_kit::test]
+async fn the_structure_tab_comes_back_after_a_restart(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        // From the tree: the database, then on PostgreSQL the schema.
+        let path: Vec<&str> = match engine {
+            Engine::Postgres => vec!["kerno", "shop", "Tables"],
+            Engine::MySql | Engine::MariaDb => vec!["kerno", "Tables"],
+        };
+        for depth in 1..path.len() {
+            let folder = path[depth];
+            app.wait_until(cx, folder, |app, cx| {
+                app.tree(cx).contains(&row(depth, folder))
+            });
+            app.toggle(cx, &path[..=depth]);
+        }
+        app.wait_until(cx, "the tables", |app, cx| {
+            app.tree(cx)
+                .iter()
+                .any(|line| line.trim_start().starts_with("orders"))
+        });
+        let orders = app
+            .tree(cx)
+            .into_iter()
+            .find(|line| line.trim_start().starts_with("orders"))
+            .unwrap();
+        let mut node = path.clone();
+        node.push(orders.trim_start());
+        app.act(cx, Action::OpenStructure, &node);
+        assert_eq!(app.titles(cx), ["orders · structure"], "{engine:?}");
+        app.wait_for_structure(cx);
+        let columns = app.structure_rows(cx, List::Columns);
+        let stored = app.wait_for_stored_tabs(cx, |tabs| !tabs.is_empty()).await;
+        assert!(
+            matches!(&stored[..], [TabSnapshot::Structure { table, view: false, materialized: false, .. }]
+                if table == "orders"),
+            "{engine:?}: {stored:?}"
+        );
+
+        // The next launch shows the tab; the structure loads once connected.
+        let restarted = open(cx, app.storage.clone());
+        assert_eq!(restarted.titles(cx), ["orders · structure"]);
+        assert!(restarted.has(cx, "structure-waiting"), "{engine:?}");
+        let id = cx.update(|cx| restarted.connections.read(cx).saved()[0].id.clone());
+        let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+        kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+        restarted.click(cx, "structure-connect");
+        restarted.wait_for_structure(cx);
+        assert_eq!(
+            restarted.structure_rows(cx, List::Columns),
+            columns,
+            "{engine:?}"
+        );
+    }
 }

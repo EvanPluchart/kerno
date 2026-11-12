@@ -50,6 +50,20 @@ pub enum TabSnapshot {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         view: bool,
     },
+    /// The structure of a table or view.
+    Structure {
+        /// The connection and database the table is in.
+        target: Target,
+        /// PostgreSQL schema or MySQL database.
+        schema: String,
+        table: String,
+        /// A view.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        view: bool,
+        /// A materialized view: its DDL is not a view's.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        materialized: bool,
+    },
 }
 
 #[cfg(test)]
@@ -109,6 +123,27 @@ mod tests {
             r#"{"kind":"data","target":{"connection":"c1"},"schema":"shop","table":"orders"}"#
         );
         assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), data);
+        // A table's structure, the same way.
+        let structure = TabSnapshot::Structure {
+            target: Target {
+                connection: "c1".into(),
+                database: None,
+                schema: None,
+            },
+            schema: "shop".into(),
+            table: "product_sales".into(),
+            view: true,
+            materialized: true,
+        };
+        let json = serde_json::to_string(&structure).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"structure","target":{"connection":"c1"},"schema":"shop","table":"product_sales","view":true,"materialized":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<TabSnapshot>(&json).unwrap(),
+            structure
+        );
         // A kind this version does not know is rejected, and the storage
         // layer then skips that tab instead of failing to start.
         assert!(serde_json::from_str::<TabSnapshot>(r#"{"kind":"from_the_future"}"#).is_err());

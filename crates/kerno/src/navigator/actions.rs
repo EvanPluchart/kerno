@@ -28,6 +28,7 @@ impl Template {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     OpenData,
+    OpenStructure,
     NewQueryHere,
     Generate(Template),
     ShowDdl,
@@ -46,6 +47,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::OpenData => "Open data",
+            Action::OpenStructure => "Open structure",
             Action::NewQueryHere => "New query here",
             Action::Generate(template) => template.label(),
             Action::ShowDdl => "Show DDL",
@@ -106,7 +108,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
-            vec![OpenData],
+            vec![OpenData, OpenStructure],
             all_templates.to_vec(),
             vec![ShowDdl, CopyName],
             vec![Rename, Truncate, Drop],
@@ -115,7 +117,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             _,
             RelationKind::View | RelationKind::MaterializedView,
         )) => vec![
-            vec![OpenData, Generate(Template::Select)],
+            vec![OpenData, OpenStructure, Generate(Template::Select)],
             vec![ShowDdl, CopyName],
             vec![Rename, Drop],
         ],
@@ -162,6 +164,8 @@ mod tests {
             true,
         );
         for action in [
+            OpenData,
+            OpenStructure,
             Generate(Template::Select),
             Generate(Template::Delete),
             ShowDdl,
@@ -178,6 +182,7 @@ mod tests {
             true,
         );
         assert!(view.contains(&Generate(Template::Select)) && view.contains(&Drop));
+        assert!(view.contains(&OpenData) && view.contains(&OpenStructure));
         assert!(!view.contains(&Truncate) && !view.contains(&Generate(Template::Insert)));
 
         let schema = flat(NodeKind::Object(ObjectRef::Schema("shop".into())), true);
@@ -222,6 +227,8 @@ mod tests {
         }
         // Templates and DDL open a tab; nothing runs.
         for action in [
+            OpenData,
+            OpenStructure,
             NewQueryHere,
             Generate(Template::Delete),
             ShowDdl,

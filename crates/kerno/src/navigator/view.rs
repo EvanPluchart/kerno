@@ -49,6 +49,12 @@ pub enum NavigatorEvent {
         table: TableRef,
         kind: RelationKind,
     },
+    /// Show the structure of a table or view.
+    ShowStructure {
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+    },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -324,14 +330,22 @@ impl Navigator {
         };
         match action {
             Action::Refresh => self.refresh(id, cx),
-            Action::OpenData => {
+            Action::OpenData | Action::OpenStructure => {
                 if let (NodeKind::Object(ObjectRef::Relation(table, kind)), Some(target)) =
                     (&node.kind, self.target_of(&node, false))
                 {
-                    cx.emit(NavigatorEvent::OpenData {
-                        target,
-                        table: table.clone(),
-                        kind: *kind,
+                    let (table, kind) = (table.clone(), *kind);
+                    cx.emit(match action {
+                        Action::OpenData => NavigatorEvent::OpenData {
+                            target,
+                            table,
+                            kind,
+                        },
+                        _ => NavigatorEvent::ShowStructure {
+                            target,
+                            table,
+                            kind,
+                        },
                     });
                 }
             }

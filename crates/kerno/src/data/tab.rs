@@ -50,6 +50,8 @@ pub enum DataTabEvent {
         kind: RelationKind,
         filter: Filter,
     },
+    /// Show the structure of this table.
+    OpenStructure { table: TableRef, kind: RelationKind },
 }
 
 /// One line of the filter bar.
@@ -1174,6 +1176,22 @@ impl DataTab {
                 )
             })
             .child(div().flex_1())
+            // The right end holds the pending changes when there are some.
+            .when(pending == 0, |bar| {
+                bar.child(
+                    action(
+                        "data-open-structure",
+                        "Structure",
+                        "Show the columns, keys, indexes and DDL",
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.emit(DataTabEvent::OpenStructure {
+                            table: this.table.clone(),
+                            kind: this.kind,
+                        })
+                    })),
+                )
+            })
             .when(pending > 0, |bar| {
                 bar.child(
                     div()

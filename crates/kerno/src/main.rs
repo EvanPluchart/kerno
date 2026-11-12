@@ -13,6 +13,7 @@ mod settings;
 mod sidebar;
 mod sql_confirm;
 mod state;
+mod structure;
 mod tabs;
 mod theme;
 #[cfg(test)]
