@@ -12,6 +12,12 @@ workspace = true
 kerno-core.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
-futures-util.workspace = true
 tracing.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 mysql_async.workspace = true
+
+[dev-dependencies]
+kerno-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

@@ -56,28 +56,34 @@ pub trait Dialect: Send + Sync {
     /// columns and the usual spellings of booleans are written bare.
     /// Dialects override this for types whose literal needs another form.
     fn literal(&self, value: &CellValue, column: &ColumnInfo) -> String {
-        match value {
-            CellValue::Null => "NULL".into(),
-            CellValue::Default => "DEFAULT".into(),
-            CellValue::Bytes(bytes) => self.quote_bytes(bytes),
-            CellValue::Text(text) => match column.kind {
-                kind if kind.is_numeric() && is_number(text) => text.trim().to_string(),
-                TypeKind::Boolean if ["t", "true"].iter().any(|v| text.eq_ignore_ascii_case(v)) => {
-                    "TRUE".into()
-                }
-                TypeKind::Boolean
-                    if ["f", "false"].iter().any(|v| text.eq_ignore_ascii_case(v)) =>
-                {
-                    "FALSE".into()
-                }
-                _ => self.quote_string(text),
-            },
-        }
+        default_literal(self, value, column)
     }
 
     /// An `INSERT` that gives every column its default.
     fn insert_defaults(&self, table: &TableRef) -> String {
         format!("INSERT INTO {} DEFAULT VALUES", self.table_name(table))
+    }
+}
+
+/// The literal [`Dialect::literal`] writes by default. A dialect that
+/// overrides `literal` for a few types calls this for the rest.
+pub fn default_literal<D: Dialect + ?Sized>(
+    dialect: &D,
+    value: &CellValue,
+    column: &ColumnInfo,
+) -> String {
+    let is =
+        |spellings: [&str; 2], text: &str| spellings.iter().any(|s| text.eq_ignore_ascii_case(s));
+    match value {
+        CellValue::Null => "NULL".into(),
+        CellValue::Default => "DEFAULT".into(),
+        CellValue::Bytes(bytes) => dialect.quote_bytes(bytes),
+        CellValue::Text(text) => match column.kind {
+            kind if kind.is_numeric() && is_number(text) => text.trim().to_string(),
+            TypeKind::Boolean if is(["t", "true"], text) => "TRUE".into(),
+            TypeKind::Boolean if is(["f", "false"], text) => "FALSE".into(),
+            _ => dialect.quote_string(text),
+        },
     }
 }
 

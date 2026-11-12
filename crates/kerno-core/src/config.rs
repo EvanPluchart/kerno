@@ -384,6 +384,51 @@ pub struct ConnectParams {
     pub options: BTreeMap<String, String>,
 }
 
+/// The file written by "export connections": settings only, no secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionsFile {
+    /// Format marker, so another JSON file is not mistaken for this one.
+    pub kerno_connections: u32,
+    /// The connections.
+    pub connections: Vec<ConnectionConfig>,
+}
+
+/// Version written in [`ConnectionsFile::kerno_connections`].
+const CONNECTIONS_FILE_VERSION: u32 = 1;
+
+/// Serializes connections for export. Passwords and passphrases are not
+/// part of [`ConnectionConfig`], so the result cannot contain any.
+pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
+    serde_json::to_string_pretty(&ConnectionsFile {
+        kerno_connections: CONNECTIONS_FILE_VERSION,
+        connections: connections.to_vec(),
+    })
+    .map_err(|error| Error::Config(format!("could not encode the connections: {error}")))
+}
+
+/// Reads an exported connections file. Every connection is validated; one
+/// bad entry rejects the file, naming it, rather than importing part of it.
+pub fn import_connections(json: &str) -> Result<Vec<ConnectionConfig>> {
+    let file: ConnectionsFile = serde_json::from_str(json)
+        .map_err(|error| Error::Config(format!("this is not a Kerno connections file: {error}")))?;
+    if file.kerno_connections > CONNECTIONS_FILE_VERSION {
+        return Err(Error::Config(format!(
+            "this file was written by a newer version of Kerno (format {}, this version reads {})",
+            file.kerno_connections, CONNECTIONS_FILE_VERSION
+        )));
+    }
+    for (index, connection) in file.connections.iter().enumerate() {
+        connection.validate().map_err(|error| {
+            Error::Config(format!(
+                "connection {} (\"{}\"): {error}",
+                index + 1,
+                connection.name
+            ))
+        })?;
+    }
+    Ok(file.connections)
+}
+
 /// The fields a pasted connection URL fills in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedUrl {
@@ -638,6 +683,59 @@ mod tests {
                 .to_string()
                 .contains("SSH host")
         );
+    }
+
+    #[test]
+    fn connections_export_and_import_without_secrets() {
+        let mut first = ConnectionConfig::new(Engine::Postgres);
+        first.name = "Shop".into();
+        first.environment = Environment::Production;
+        first.color = Some("red".into());
+        first.group = Some("Work".into());
+        first.read_only = true;
+        first
+            .options
+            .insert("application_name".into(), "kerno".into());
+        first.ssh = Some(SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "ops".into(),
+            auth: SshAuth::Agent { socket: None },
+            keepalive_secs: 30,
+        });
+        let mut second = ConnectionConfig::new(Engine::MySql);
+        second.name = "Billing".into();
+        let exported = export_connections(&[first.clone(), second.clone()]).unwrap();
+        assert!(exported.contains("\"kerno_connections\": 1"), "{exported}");
+        assert_eq!(import_connections(&exported).unwrap(), [first, second]);
+        assert_eq!(
+            import_connections(&export_connections(&[]).unwrap()).unwrap(),
+            []
+        );
+    }
+
+    #[test]
+    fn import_rejects_what_is_not_a_valid_connections_file() {
+        for (json, expected) in [
+            ("not json", "not a Kerno connections file"),
+            ("[]", "not a Kerno connections file"),
+            (r#"{"connections": []}"#, "not a Kerno connections file"),
+            (
+                r#"{"kerno_connections": 99, "connections": []}"#,
+                "newer version",
+            ),
+            (
+                r#"{"kerno_connections": 1, "connections": [{"name":"ok","engine":"postgres","host":"h","port":5432,"user":"u"},{"name":"broken","engine":"postgres","host":"","port":5432,"user":"u"}]}"#,
+                "connection 2 (\"broken\")",
+            ),
+            (
+                r#"{"kerno_connections": 1, "connections": [{"name":"x","engine":"oracle","host":"h","port":1,"user":"u"}]}"#,
+                "not a Kerno connections file",
+            ),
+        ] {
+            let error = import_connections(json).unwrap_err().to_string();
+            assert!(error.contains(expected), "{json}: {error}");
+        }
     }
 
     #[test]

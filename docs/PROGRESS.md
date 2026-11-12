@@ -97,3 +97,21 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
   - the log directory was world-readable; now 0700.
 - Captures of the real app: `docs/screenshots/m2-empty-light.png`, `m2-tabs-light.png`, `m2-tabs-dark.png`.
   Noted for the editor milestone: `>=` renders as a ligature, and indent guides are noisy on aligned SQL.
+
+## 2026-11-12 — Milestone 1 closed
+
+- MySQL/MariaDB driver delivered by the delegated agent and reviewed (D-015). Its report was checked, not
+  taken on trust: scope confined to its crate, no stub or silenced lint, tests re-run here.
+- Changes made during review:
+  - string literals no longer depend on the session's backslash mode (hexadecimal form), with a test that
+    switches the mode behind the driver's back on both engines;
+  - MariaDB string defaults are normalised through the same function as MySQL's;
+  - the core splitter bug the agent reported (`END$$`) is fixed, test first (D-016);
+  - `default_literal` is a function, so a dialect override delegates instead of copying;
+  - the `Session::cancel` documentation no longer promises an error (MySQL's `SLEEP()` returns early).
+- Test run with `KERNO_REQUIRE_CONTAINERS=1` (nothing skipped), all passing:
+  - `kerno-core`: 72 unit, 10 SSH tunnel;
+  - `kerno-postgres`: 18 unit, 38 integration (connect 11, execute 15, introspect 9, edits 3);
+  - `kerno-mysql`: 37 unit, 51 integration on both engines (connect 12, execute 25, introspect 10, edits 4).
+- Open at the close of the milestone: MySQL/MariaDB `verify-ca` and the untested positive TLS paths
+  (planned in milestone 3); the accepted `rsa` advisory (D-013, owner to confirm).

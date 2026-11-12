@@ -218,3 +218,48 @@ the stack for what needs a real parse of a complete statement (classification, c
   tab are stored 400 ms after the last change and at quit.
 - `scripts/capture.sh` runs the real app on a scratch data directory with the in-memory secret store and
   captures its window; `KERNO_APPEARANCE` pins the theme for that run only.
+
+## D-015 — MySQL / MariaDB driver
+
+Written by a delegated agent from the PostgreSQL driver as a template, then reviewed: scope checked (only
+`crates/kerno-mysql`), tests re-run independently with the containers required, security-sensitive parts read.
+
+- One driver for both engines (`mysql_async`, text protocol, so values arrive as server text; binary
+  columns as raw bytes). `Session::engine()` reports what the server says it is (`VERSION()`), not what the
+  connection settings claim.
+- Cancel is `KILL QUERY <connection id>` on a side connection, the only way the protocol offers. Through
+  an SSH tunnel every new connection, the side connection included, gets its own single-use port (D-008).
+- `UPDATE` reports rows matched, not rows changed (`client_found_rows`), because applying pending edits
+  requires exactly one row per statement and an edit that sets a value to itself must still count.
+- Transaction state comes from the server's status flags. There is no "failed transaction" state on MySQL.
+- String literals: a quote is doubled. Text holding a backslash or a NUL is written as
+  `_utf8mb4 X'<hex>'`. The agent's version followed the session's `sql_mode` (`NO_BACKSLASH_ESCAPES`) by
+  re-reading it after statements that start with `SET`; a mode changed any other way (a prepared
+  `EXECUTE`, an executable comment) would have left the driver escaping for the wrong mode, and in one
+  direction a value such as `\'` then ends its own literal. The hexadecimal form reads the same in both
+  modes, so no tracking is needed for safety. A test changes the mode behind the driver's back on both
+  engines and checks nine awkward strings are stored exactly. Column defaults go through the same function,
+  so a default holding a backslash is shown and re-created in that form (both servers accept it).
+- Presentation: `TINYINT(1)` is a boolean with cells `0`/`1`; `BIT` cells are digit strings and written
+  back as `b'…'`; `TIMESTAMP` has no zone in its text and is a plain date-time; geometry is binary.
+- Catalog differences between the two engines (default quoting, check constraints, JSON as `LONGTEXT` on
+  MariaDB, sequences, functional index parts, process list and settings views) are handled per engine; the
+  version gates for servers older than the two tested (8.4.13, 11.8.9) come from documentation and are
+  not verified.
+
+Known limits, tracked in `docs/PLAN.md`:
+
+- `verify-ca` behaves like `verify-full` on MySQL/MariaDB: `mysql_async` 0.37.1 detects a host-name
+  mismatch by matching the text of a rustls error that rustls 0.23.46 no longer prints. It fails closed
+  (refuses), never open. No test server has a CA-signed certificate yet, so the positive paths of
+  `verify-ca`/`verify-full` and client certificates are untested on these engines.
+- In a request with several result sets, a result's completion is delivered when the next one starts.
+- Warnings are fetched for the last statement of a request only.
+- `LOAD DATA LOCAL INFILE` is refused.
+
+## D-016 — Statement splitting follows the `mysql` client for custom delimiters
+
+The agent found that `END$$` under `DELIMITER $$` was not split: `$` is an identifier character, so the lexer
+saw one word. The splitter now looks for the current delimiter as plain text at every position outside
+strings, quoted identifiers and comments, which is what the `mysql` client does (it will also split
+`select 2go` under `DELIMITER go`). A failing test was written first.

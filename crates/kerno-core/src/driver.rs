@@ -97,8 +97,11 @@ pub trait Session: Send + Sync + 'static {
     async fn execute(&self, sql: &str, sink: &mut ExecSink) -> Result<()>;
 
     /// Asks the server to stop the statement this session is running.
-    /// Returns once the request was delivered; the running
-    /// [`Session::execute`] then fails with the server's cancellation error.
+    /// Returns once the request was delivered. The running
+    /// [`Session::execute`] then ends as the server decides: usually with
+    /// its cancellation error, but some statements simply return early
+    /// (MySQL's `SLEEP()` returns 1 when interrupted). Callers that need to
+    /// know a statement was cancelled remember that they asked.
     /// Does nothing harmful when no statement is running.
     async fn cancel(&self) -> Result<()>;
 

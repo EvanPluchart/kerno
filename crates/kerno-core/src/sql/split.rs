@@ -29,66 +29,83 @@ impl StatementSpan {
 /// Statements end at `;` outside strings, quoted identifiers and comments.
 /// With [`LexRules::delimiter_command`], `DELIMITER xx` lines change the
 /// separator the way the `mysql` client does, and are not statements
-/// themselves. Empty statements and comment-only stretches are dropped.
+/// themselves. Like that client, a custom delimiter is matched as plain
+/// text anywhere outside strings, quoted identifiers and comments, even
+/// glued to a word (`END$$`). Empty statements and comment-only stretches
+/// are dropped.
 pub fn split_statements(source: &str, rules: LexRules) -> Vec<StatementSpan> {
     let tokens = lex(source, rules);
+    let bytes = source.as_bytes();
     let mut statements = Vec::new();
     let mut delimiter = String::from(";");
-    // First token of the statement being collected.
-    let mut first = 0;
-    let mut index = 0;
+    // Where the statement being collected starts.
+    let mut segment_start = 0;
+    // Everything before this byte has been dealt with.
+    let mut cursor = 0;
+    // Whether the statement being collected has anything but whitespace
+    // and comments so far.
+    let mut has_content = false;
 
-    while index < tokens.len() {
-        let token = &tokens[index];
-
+    for token in &tokens {
+        if token.range.end <= cursor {
+            continue;
+        }
+        if token.kind.is_trivia() {
+            continue;
+        }
+        let opaque = matches!(token.kind, TokenKind::String | TokenKind::QuotedIdent);
         if rules.delimiter_command
-            && is_statement_start(&tokens[first..index])
+            && !has_content
+            && cursor <= token.range.start
             && let Some((new_delimiter, line_end)) = delimiter_command(source, token)
         {
-            push_statement(
-                source,
-                &tokens[first..index],
-                token.range.start,
-                &mut statements,
-            );
             delimiter = new_delimiter;
-            // Skip the rest of the DELIMITER line.
-            while index < tokens.len() && tokens[index].range.start < line_end {
-                index += 1;
-            }
-            first = index;
+            segment_start = line_end;
+            cursor = line_end;
             continue;
         }
-
-        let at_delimiter = match token.kind {
-            TokenKind::Semicolon | TokenKind::Punct => {
-                source[token.range.start..].starts_with(delimiter.as_str())
-            }
-            _ => false,
-        };
-        if at_delimiter {
-            let delimiter_end = token.range.start + delimiter.len();
-            push_statement(
-                source,
-                &tokens[first..index],
-                delimiter_end,
-                &mut statements,
-            );
-            while index < tokens.len() && tokens[index].range.start < delimiter_end {
-                index += 1;
-            }
-            first = index;
+        if opaque {
+            has_content = true;
             continue;
         }
-        index += 1;
+        let mut position = token.range.start.max(cursor);
+        while position < token.range.end {
+            let end = position + delimiter.len();
+            let found = bytes[position..].starts_with(delimiter.as_bytes())
+                // A delimiter may run over several tokens (`//`), but never
+                // into a string, a quoted name or a comment.
+                && tokens
+                    .iter()
+                    .filter(|other| other.range.start < end && other.range.end > position)
+                    .all(|other| {
+                        !matches!(
+                            other.kind,
+                            TokenKind::String
+                                | TokenKind::QuotedIdent
+                                | TokenKind::LineComment
+                                | TokenKind::BlockComment
+                        )
+                    });
+            if found {
+                push_statement(source, segment_start..position, end, rules, &mut statements);
+                segment_start = end;
+                cursor = end;
+                has_content = false;
+                position = end;
+            } else {
+                has_content = true;
+                position += 1;
+            }
+        }
     }
-    push_statement(source, &tokens[first..], source.len(), &mut statements);
+    push_statement(
+        source,
+        segment_start..source.len(),
+        source.len(),
+        rules,
+        &mut statements,
+    );
     statements
-}
-
-/// Whether nothing but whitespace and comments was collected so far.
-fn is_statement_start(tokens: &[Token]) -> bool {
-    tokens.iter().all(|token| token.kind.is_trivia())
 }
 
 /// Recognises `DELIMITER xx` at `token`. Returns the new delimiter and the
@@ -108,12 +125,20 @@ fn delimiter_command(source: &str, token: &Token) -> Option<(String, usize)> {
     Some((delimiter.to_string(), line_end))
 }
 
+/// Records the statement in `segment`, if it holds one.
 fn push_statement(
     source: &str,
-    tokens: &[Token],
+    segment: Range<usize>,
     delimiter_end: usize,
+    rules: LexRules,
     statements: &mut Vec<StatementSpan>,
 ) {
+    if segment.start >= segment.end {
+        return;
+    }
+    // A segment can begin or end inside what was one token of the whole
+    // text (a delimiter glued to a word), so it is lexed on its own.
+    let tokens = lex(&source[segment.clone()], rules);
     let mut meaningful = tokens.iter().filter(|token| !token.kind.is_trivia());
     let Some(first) = meaningful.next() else {
         return;
@@ -121,8 +146,8 @@ fn push_statement(
     let last = meaningful.next_back().unwrap_or(first);
     // Leading comments stay out; they are not part of what runs. Comments
     // inside the statement (optimizer hints, MySQL `/*! */`) are kept.
-    let start = first.range.start;
-    let end = last.range.end;
+    let start = segment.start + first.range.start;
+    let end = segment.start + last.range.end;
     // The cursor belongs to the statement up to the end of the delimiter's line.
     let rest = &source[delimiter_end..];
     let trailing = rest
@@ -235,6 +260,35 @@ mod tests {
                 LexRules::MYSQL
             ),
             vec!["select 1; select 2", "select 3"]
+        );
+    }
+
+    #[test]
+    fn a_custom_delimiter_glued_to_a_word_still_ends_the_statement() {
+        // `$` may be part of an identifier, so `END$$` lexes as one word;
+        // the mysql client nevertheless ends the statement there.
+        let source =
+            "DELIMITER $$\ncreate procedure p()\nbegin\n  select 1;\nEND$$\nDELIMITER ;\nselect 2;";
+        assert_eq!(
+            texts(source, LexRules::MYSQL),
+            vec!["create procedure p()\nbegin\n  select 1;\nEND", "select 2"]
+        );
+        // Same with a delimiter made of letters, and one glued on both sides.
+        assert_eq!(
+            texts(
+                "delimiter go\nselect 1 go select 2go\nselect 3 go",
+                LexRules::MYSQL
+            ),
+            vec!["select 1", "select 2", "select 3"]
+        );
+        // The delimiter inside a string, a quoted name or a comment is text
+        // (and a trailing comment is not part of the statement).
+        assert_eq!(
+            texts(
+                "delimiter $$\nselect '$$', `a$$b` /* $$ */ $$ select 2 $$",
+                LexRules::MYSQL
+            ),
+            vec!["select '$$', `a$$b`", "select 2"]
         );
     }
 
