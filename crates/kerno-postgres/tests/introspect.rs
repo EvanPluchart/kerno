@@ -1072,3 +1072,71 @@ async fn administrative_views() {
 
     let _ = rows(&session, "SELECT 1").await;
 }
+
+#[tokio::test]
+async fn completion_catalog_lists_the_user_schemas() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let catalog = session.completion_catalog().await.unwrap();
+    eprintln!("completion_catalog: {:?}", started.elapsed());
+
+    // Other tests create scratch schemas meanwhile.
+    let schemas: Vec<_> = catalog
+        .schemas
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|name| !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_"))
+        .collect();
+    assert_eq!(schemas, ["analytics", "public", "shop"]);
+    assert!(
+        catalog
+            .schemas
+            .iter()
+            .all(|s| s.name != "information_schema" && !s.name.starts_with("pg_")),
+        "{schemas:?}"
+    );
+    assert_eq!(catalog.search_path, ["public"]);
+
+    let shop = catalog.schemas.iter().find(|s| s.name == "shop").unwrap();
+    let relation = |name: &str| shop.relations.iter().find(|r| r.name == name).unwrap();
+    let orders = relation("orders");
+    assert_eq!(orders.kind, RelationKind::Table);
+    assert_eq!(
+        names(&orders.columns, |c| &c.name),
+        [
+            "id",
+            "customer_id",
+            "status",
+            "invoice_number",
+            "placed_at",
+            "shipped_at",
+            "total",
+            "currency",
+            "notes"
+        ]
+    );
+    assert_eq!(orders.columns[0].data_type, "bigint");
+    assert_eq!(orders.columns[6].data_type, "numeric(12,2)");
+    let customer = orders
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.referenced_table == "customers")
+        .unwrap();
+    assert_eq!(customer.columns, ["customer_id"]);
+    assert_eq!(customer.referenced_schema, "shop");
+    assert_eq!(customer.referenced_columns, ["id"]);
+    assert_eq!(relation("order_totals").kind, RelationKind::View);
+    assert!(!relation("order_totals").columns.is_empty());
+    assert_eq!(
+        relation("product_sales").kind,
+        RelationKind::MaterializedView
+    );
+    // In byte order, functions and procedures alike.
+    assert!(shop.routines.is_sorted(), "{:?}", shop.routines);
+    for routine in ["cancel_stale_orders", "customer_lifetime_value"] {
+        assert!(shop.routines.iter().any(|r| r == routine), "{routine}");
+    }
+    assert!(shop.relations.is_sorted_by(|a, b| a.name <= b.name));
+}

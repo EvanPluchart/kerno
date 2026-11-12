@@ -9,6 +9,8 @@
 //! the same on both. Lists are sorted here, by byte order: the two engines
 //! collate catalog names differently.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use kerno_core::dialect::Dialect;
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, EventInfo,
@@ -16,6 +18,7 @@ use kerno_core::schema::{
     SequenceInfo, TableRef, TableStructure, TriggerInfo,
 };
 use kerno_core::sql::params::is_number;
+use kerno_core::sql::{Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
 use kerno_core::{DbError, Engine, Error, Result, Session, TypeKind};
 
 use crate::session::MysqlSession;
@@ -822,6 +825,95 @@ async fn check_constraints(
         .collect();
     checks.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(checks)
+}
+
+/// Databases being assembled: relations by name and routine names, both in
+/// byte order.
+type Assembly = BTreeMap<String, (BTreeMap<String, CatalogRelation>, BTreeSet<String>)>;
+
+pub(crate) async fn completion_catalog(session: &MysqlSession) -> Result<Catalog> {
+    let mut assembly = Assembly::new();
+    // From the databases first, so that an empty one is listed too.
+    let rows = session
+        .query(&format!(
+            "SELECT s.SCHEMA_NAME FROM information_schema.SCHEMATA s \
+             WHERE s.SCHEMA_NAME NOT IN ({SYSTEM_DATABASES})"
+        ))
+        .await?;
+    for row in &rows {
+        assembly.entry(text(row, 0)).or_default();
+    }
+    // Grouped by exact name, not by row order: catalog names collate
+    // case-insensitively, so `Orders` and `orders` would sort together.
+    let rows = session
+        .query(&format!(
+            "SELECT c.TABLE_SCHEMA, c.TABLE_NAME, t.TABLE_TYPE, c.COLUMN_NAME, c.COLUMN_TYPE \
+             FROM information_schema.COLUMNS c \
+             JOIN information_schema.TABLES t \
+               ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
+             WHERE c.TABLE_SCHEMA NOT IN ({SYSTEM_DATABASES}) AND t.TABLE_TYPE <> 'SEQUENCE' \
+             ORDER BY c.ORDINAL_POSITION"
+        ))
+        .await?;
+    for row in &rows {
+        let (relations, _) = assembly.entry(text(row, 0)).or_default();
+        let name = text(row, 1);
+        relations
+            .entry(name.clone())
+            .or_insert_with(|| CatalogRelation {
+                name,
+                kind: if text(row, 2).contains("VIEW") {
+                    RelationKind::View
+                } else {
+                    RelationKind::Table
+                },
+                columns: Vec::new(),
+                foreign_keys: Vec::new(),
+            })
+            .columns
+            .push(CatalogColumn {
+                name: text(row, 3),
+                data_type: text(row, 4),
+            });
+    }
+    let filter = format!("k.TABLE_SCHEMA NOT IN ({SYSTEM_DATABASES})");
+    for key in foreign_keys(session, &filter).await? {
+        if let Some(relation) = assembly
+            .get_mut(&key.table.schema)
+            .and_then(|(relations, _)| relations.get_mut(&key.table.name))
+        {
+            relation.foreign_keys.push(CatalogForeignKey {
+                columns: key.columns,
+                referenced_schema: key.referenced_table.schema,
+                referenced_table: key.referenced_table.name,
+                referenced_columns: key.referenced_columns,
+            });
+        }
+    }
+    // A function and a procedure may share a name: the set keeps one.
+    let rows = session
+        .query(&format!(
+            "SELECT r.ROUTINE_SCHEMA, r.ROUTINE_NAME FROM information_schema.ROUTINES r \
+             WHERE r.ROUTINE_SCHEMA NOT IN ({SYSTEM_DATABASES}) \
+               AND r.ROUTINE_TYPE IN ('PROCEDURE', 'FUNCTION')"
+        ))
+        .await?;
+    for row in &rows {
+        if let Some((_, routines)) = assembly.get_mut(&text(row, 0)) {
+            routines.insert(text(row, 1));
+        }
+    }
+    Ok(Catalog {
+        schemas: assembly
+            .into_iter()
+            .map(|(name, (relations, routines))| CatalogSchema {
+                name,
+                relations: relations.into_values().collect(),
+                routines: routines.into_iter().collect(),
+            })
+            .collect(),
+        search_path: session.database().into_iter().collect(),
+    })
 }
 
 /// Foreign keys matching `filter`, a condition over `k`

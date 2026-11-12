@@ -17,6 +17,7 @@ use crate::schema::{
     DatabaseInfo, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects, ServerInfo, TableRef,
     TableStructure,
 };
+use crate::sql::Catalog;
 
 /// Transaction state of a session, as last reported by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -132,6 +133,11 @@ pub trait Session: Send + Sync + 'static {
 
     /// Installed and available extensions. Empty on engines without them.
     async fn extensions(&self) -> Result<Vec<ExtensionInfo>>;
+
+    /// What SQL completion needs, in one call: every non-system schema
+    /// (database, on MySQL) with its relations, their columns and foreign
+    /// keys, the routine names, and the search path.
+    async fn completion_catalog(&self) -> Result<Catalog>;
 
     // Administration ------------------------------------------------------
 

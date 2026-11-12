@@ -17,7 +17,7 @@ use kerno_core::schema::{
     DatabaseInfo, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects, ServerInfo, TableRef,
     TableStructure,
 };
-use kerno_core::sql::{TokenKind, lex};
+use kerno_core::sql::{Catalog, TokenKind, lex};
 use kerno_core::{AdminView, Column, Engine, Error, Result, Session, TxState, TypeKind};
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
@@ -435,6 +435,10 @@ impl Session for PgSession {
 
     async fn extensions(&self) -> Result<Vec<ExtensionInfo>> {
         introspect::extensions(self).await
+    }
+
+    async fn completion_catalog(&self) -> Result<Catalog> {
+        introspect::completion_catalog(self).await
     }
 
     fn admin_query(&self, view: AdminView) -> Option<String> {

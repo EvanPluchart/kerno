@@ -1532,3 +1532,63 @@ async fn introspection_does_not_disturb_the_session() {
         exec_ok(&session, &format!("DROP DATABASE {database}")).await;
     }
 }
+
+#[tokio::test]
+async fn completion_catalog_lists_the_user_databases() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let catalog = session.completion_catalog().await.unwrap();
+
+        // Other tests create scratch databases meanwhile.
+        let databases: Vec<_> = catalog
+            .schemas
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|name| !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_"))
+            .collect();
+        assert_eq!(databases, ["kerno", "kerno_analytics", "kerno_other"]);
+        assert_eq!(catalog.search_path, ["kerno"]);
+
+        let kerno = catalog.schemas.iter().find(|s| s.name == "kerno").unwrap();
+        assert!(kerno.relations.is_sorted_by(|a, b| a.name <= b.name));
+        let relation = |name: &str| kerno.relations.iter().find(|r| r.name == name).unwrap();
+        let orders = relation("orders");
+        assert_eq!(orders.kind, RelationKind::Table);
+        assert_eq!(
+            names(&orders.columns, |c| &c.name),
+            [
+                "id",
+                "customer_id",
+                "status",
+                "placed_at",
+                "shipped_at",
+                "total",
+                "currency",
+                "notes"
+            ]
+        );
+        // MariaDB prints display widths (`bigint(20) unsigned`), MySQL 8 not.
+        assert!(
+            orders.columns[0].data_type.starts_with("bigint"),
+            "{}",
+            orders.columns[0].data_type
+        );
+        assert_eq!(orders.columns[5].data_type, "decimal(12,2)");
+        assert_eq!(orders.foreign_keys.len(), 1);
+        let customer = &orders.foreign_keys[0];
+        assert_eq!(customer.columns, ["customer_id"]);
+        assert_eq!(customer.referenced_schema, "kerno");
+        assert_eq!(customer.referenced_table, "customers");
+        assert_eq!(customer.referenced_columns, ["id"]);
+        assert_eq!(relation("order_totals").kind, RelationKind::View);
+        assert!(!relation("order_totals").columns.is_empty());
+        assert_eq!(
+            kerno.routines,
+            [
+                "cancel_stale_orders",
+                "customer_lifetime_value",
+                "customer_orders"
+            ]
+        );
+    }
+}

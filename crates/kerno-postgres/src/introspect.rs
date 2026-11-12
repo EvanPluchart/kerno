@@ -7,6 +7,8 @@
 //! extension are left out of schema listings, as `pg_dump` does: they are
 //! reached through the extension.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use kerno_core::dialect::Dialect;
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, EventInfo,
@@ -14,6 +16,7 @@ use kerno_core::schema::{
     SchemaInfo, SchemaObjects, SequenceInfo, TableRef, TableStructure, TriggerInfo, TypeInfo,
     TypeShape,
 };
+use kerno_core::sql::{Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
 use kerno_core::{Error, Result};
 use tokio_postgres::SimpleQueryRow;
 
@@ -574,6 +577,100 @@ async fn foreign_keys(session: &PgSession, filter: &str) -> Result<Vec<ForeignKe
             on_delete: action(row.get(8)),
         })
         .collect())
+}
+
+/// A condition over `n` (`pg_namespace`): not `information_schema` and not
+/// one of the `pg_` schemas (catalog, TOAST, temporary), which are reserved.
+const USER_SCHEMA: &str = "n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%'";
+
+/// Schemas being assembled: relations by name and routine names, both in
+/// byte order.
+type Assembly = BTreeMap<String, (BTreeMap<String, CatalogRelation>, BTreeSet<String>)>;
+
+pub(crate) async fn completion_catalog(session: &PgSession) -> Result<Catalog> {
+    let mut assembly = Assembly::new();
+    // From the schemas, so that an empty one is listed too.
+    let rows = session
+        .query(&format!(
+            "SELECT n.nspname, c.relname, c.relkind, a.attname, \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             FROM pg_catalog.pg_namespace n \
+             LEFT JOIN pg_catalog.pg_class c \
+                    ON c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'f', 'v', 'm') \
+             LEFT JOIN pg_catalog.pg_attribute a \
+                    ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+             WHERE {USER_SCHEMA} \
+             ORDER BY a.attnum"
+        ))
+        .await?;
+    for row in &rows {
+        let (relations, _) = assembly.entry(text(row, 0)).or_default();
+        let Some(name) = opt(row, 1) else { continue };
+        let relation = relations
+            .entry(name.clone())
+            .or_insert_with(|| CatalogRelation {
+                name,
+                kind: match row.get(2) {
+                    Some("p") => RelationKind::PartitionedTable,
+                    Some("f") => RelationKind::ForeignTable,
+                    Some("v") => RelationKind::View,
+                    Some("m") => RelationKind::MaterializedView,
+                    _ => RelationKind::Table,
+                },
+                columns: Vec::new(),
+                foreign_keys: Vec::new(),
+            });
+        if let Some(column) = opt(row, 3) {
+            relation.columns.push(CatalogColumn {
+                name: column,
+                data_type: text(row, 4),
+            });
+        }
+    }
+    for key in foreign_keys(session, USER_SCHEMA).await? {
+        if let Some(relation) = assembly
+            .get_mut(&key.table.schema)
+            .and_then(|(relations, _)| relations.get_mut(&key.table.name))
+        {
+            relation.foreign_keys.push(CatalogForeignKey {
+                columns: key.columns,
+                referenced_schema: key.referenced_table.schema,
+                referenced_table: key.referenced_table.name,
+                referenced_columns: key.referenced_columns,
+            });
+        }
+    }
+    let rows = session
+        .query(&format!(
+            "SELECT DISTINCT n.nspname, p.proname FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE {USER_SCHEMA}"
+        ))
+        .await?;
+    for row in &rows {
+        if let Some((_, routines)) = assembly.get_mut(row.get(0).unwrap_or_default()) {
+            routines.insert(text(row, 1));
+        }
+    }
+    let search_path = session
+        .query(
+            "SELECT s FROM unnest(pg_catalog.current_schemas(false)) WITH ORDINALITY AS u(s, i) \
+             ORDER BY i",
+        )
+        .await?
+        .iter()
+        .map(|row| text(row, 0))
+        .collect();
+    Ok(Catalog {
+        schemas: assembly
+            .into_iter()
+            .map(|(name, (relations, routines))| CatalogSchema {
+                name,
+                relations: relations.into_values().collect(),
+                routines: routines.into_iter().collect(),
+            })
+            .collect(),
+        search_path,
+    })
 }
 
 pub(crate) async fn extensions(session: &PgSession) -> Result<Vec<ExtensionInfo>> {

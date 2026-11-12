@@ -18,7 +18,7 @@ use kerno_core::schema::{
     TableStructure,
 };
 use kerno_core::sql::params::is_number;
-use kerno_core::sql::{LexRules, TokenKind, lex};
+use kerno_core::sql::{Catalog, LexRules, TokenKind, lex};
 use kerno_core::{AdminView, Column, Engine, Error, Notice, Result, Session, TxState, TypeKind};
 use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::Queryable;
@@ -590,6 +590,10 @@ impl Session for MysqlSession {
     /// Always empty: neither engine has extensions in PostgreSQL's sense.
     async fn extensions(&self) -> Result<Vec<ExtensionInfo>> {
         Ok(Vec::new())
+    }
+
+    async fn completion_catalog(&self) -> Result<Catalog> {
+        introspect::completion_catalog(self).await
     }
 
     fn admin_query(&self, view: AdminView) -> Option<String> {
