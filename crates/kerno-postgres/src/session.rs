@@ -377,16 +377,20 @@ impl Session for PgSession {
         let effect = tx_effect(sql);
         let outcome = self.run(&mut link, sql, sink).await;
         if matches!(outcome, Err(Error::Cancelled)) {
-            // The consumer left: stop the server too. The statement's
-            // remaining output is discarded by the connection, in order,
-            // before the next statement's answer is read.
+            // The consumer left. The statement's remaining output is
+            // discarded by the connection, in order, before the next
+            // statement's answer is read.
+            if self.tx_state() == TxState::Open {
+                // Inside a transaction block a cancel request would abort
+                // the block, and with it what the user did in it: letting a
+                // paged result go must not cost that. The server is left to
+                // finish the statement; the next one waits for it. (An
+                // explicit `cancel` still stops it, block and all.)
+                return outcome;
+            }
+            // Outside a block, stop the server too.
             if let Err(error) = self.cancel.cancel().await {
                 tracing::debug!(%error, "could not cancel an abandoned statement");
-            }
-            // The statement was running inside the block, so the block is
-            // now aborted if there was one.
-            if self.tx_state() == TxState::Open {
-                self.set_tx_state(TxState::Failed);
             }
             return outcome;
         }

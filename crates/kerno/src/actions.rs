@@ -26,6 +26,12 @@ gpui_kit::actions!(
         RunAll,
         /// Cancels the statement the active tab is running.
         CancelQuery,
+        /// Comments the selected lines out, or back in.
+        ToggleComment,
+        /// Opens the editor's search panel.
+        FindInEditor,
+        /// Opens the editor's search panel with its replace row.
+        ReplaceInEditor,
         /// Shows the plan of the statement at the cursor.
         ExplainStatement,
         /// Runs the statement at the cursor and shows its plan with timings.
@@ -208,6 +214,32 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-."],
         ["stop", "abort", "kill"],
         CancelQuery
+    ),
+    // The editor binds its own search keys (Cmd+F, Cmd+Shift+F) while it has
+    // the focus; these make the panel reachable from the palette and the menu.
+    command!(
+        "find_in_editor",
+        "Find in Editor",
+        "Editor",
+        [],
+        ["search", "find text"],
+        FindInEditor
+    ),
+    command!(
+        "replace_in_editor",
+        "Replace in Editor",
+        "Editor",
+        [],
+        ["search and replace", "substitute"],
+        ReplaceInEditor
+    ),
+    command!(
+        "toggle_comment",
+        "Toggle Line Comment",
+        "Editor",
+        ["secondary-/"],
+        ["comment out", "uncomment", "--"],
+        ToggleComment
     ),
     command!(
         "explain_statement",

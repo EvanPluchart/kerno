@@ -2324,3 +2324,42 @@ fn history_and_saved_queries_are_searched_and_reopened(cx: &mut TestAppContext) 
         storage.saved_queries().unwrap().is_empty()
     });
 }
+
+#[gpui_kit::test]
+fn the_comment_shortcut_toggles_the_lines_of_the_selection(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 1\nfrom dual");
+    // The cursor is on the last line: only that one.
+    app.press(cx, &["secondary-/"]);
+    assert_eq!(app.active_query(cx).1, "select 1\n-- from dual");
+    // Everything selected: both lines, as a block.
+    app.press(cx, &["secondary-a", "secondary-/"]);
+    assert_eq!(app.active_query(cx).1, "-- select 1\n-- -- from dual");
+    app.press(cx, &["secondary-a", "secondary-/"]);
+    assert_eq!(app.active_query(cx).1, "select 1\n-- from dual");
+    // One undo takes one toggle back.
+    app.press(cx, &["secondary-z"]);
+    assert_eq!(app.active_query(cx).1, "-- select 1\n-- -- from dual");
+}
+
+#[gpui_kit::test]
+fn the_editor_searches_and_replaces(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 1");
+    let searching = |cx: &mut TestAppContext| {
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.read(cx).searching(cx))
+    };
+    assert_eq!(searching(cx), None);
+    // The editor's own shortcut, then the commands of the palette and menu.
+    app.press(cx, &["cmd-f"]);
+    assert_eq!(searching(cx), Some(false));
+    app.press(cx, &["escape"]);
+    assert_eq!(searching(cx), None);
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(crate::actions::ReplaceInEditor), cx)
+    });
+    assert_eq!(searching(cx), Some(true));
+}

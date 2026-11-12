@@ -58,6 +58,43 @@ async fn rows_stream_only_as_far_as_asked() {
 }
 
 #[tokio::test]
+async fn abandoning_a_result_inside_a_transaction_keeps_the_transaction() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    // Paging through a result and then letting it go must not cost the
+    // user their open transaction: a cancel request would abort it.
+    exec::collect(session.clone(), "BEGIN").await.unwrap();
+    exec::collect(
+        session.clone(),
+        "CREATE TEMP TABLE kerno_kept (n int) ON COMMIT DROP; INSERT INTO kerno_kept VALUES (7)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.tx_state(), TxState::Open);
+
+    let mut execution = exec::run(
+        session.clone(),
+        "SELECT g FROM generate_series(1, 200000) g".into(),
+        RowLimit::Rows(100),
+    );
+    assert!(matches!(
+        next_event(&mut execution).await,
+        Some(ExecEvent::Columns(_))
+    ));
+    let (seen, complete) = read_rows(&mut execution, 100).await;
+    assert_eq!((seen, complete), (100, false));
+    drop(execution);
+
+    // The transaction is still there, with what was done in it.
+    assert_eq!(scalar(&session, "SELECT n FROM kerno_kept").await, "7");
+    assert_eq!(session.tx_state(), TxState::Open);
+    assert!(server_says_in_transaction(&session).await);
+    exec::collect(session.clone(), "ROLLBACK").await.unwrap();
+    assert_eq!(session.tx_state(), TxState::Idle);
+}
+
+#[tokio::test]
 async fn fetch_all_delivers_every_row_in_order() {
     let Some(session) = common::session().await else {
         return;

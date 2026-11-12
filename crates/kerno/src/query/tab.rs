@@ -36,6 +36,7 @@ use kerno_core::{
     Dialect, Error, ExecEvent, Notice, Plan, ResultStore, RowLimit, Session, TxState, exec,
 };
 
+use super::comment;
 use super::grid::{CopyFormat, Grid};
 use super::params;
 use super::{plan_view, viewer};
@@ -678,6 +679,39 @@ impl QueryTab {
                 .map(|span| vec![from(&text, 0, span)])
                 .unwrap_or_default(),
         }
+    }
+
+    /// Opens the editor's search panel, with its replace row when asked.
+    pub fn find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.open_search(replace, cx);
+        });
+    }
+
+    /// Whether the editor's search panel is open, and with its replace row.
+    #[cfg(test)]
+    pub fn searching(&self, cx: &App) -> Option<bool> {
+        let session = self.editor.read(cx).search_session();
+        session.open.then_some(session.replace_mode)
+    }
+
+    /// Comments the lines of the selection (or the cursor's line) out, or
+    /// back in. One step to undo.
+    pub fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let selection = editor.selected_range();
+            if text.get(selection.clone()).is_none() {
+                return;
+            }
+            let lines = comment::lines_of(&text, selection.clone());
+            let toggled = comment::toggle(&text[lines.clone()]);
+            let cursor = position_of(&text, lines.start);
+            let rewritten = format!("{}{toggled}{}", &text[..lines.start], &text[lines.end..]);
+            editor.replace_all(rewritten, window, cx);
+            editor.set_cursor_position(cursor, window, cx);
+        });
     }
 
     /// Stops what is running or waiting to be paged, keeping what arrived.

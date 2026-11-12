@@ -26,9 +26,10 @@ use gpui_kit::{
 
 use crate::actions::{
     About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
-    ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette, OpenSettings, OpenSqlFile,
-    Quit, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries,
-    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    FindInEditor, ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette, OpenSettings,
+    OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery,
+    ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme,
+    UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -153,6 +154,16 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Export Connections…", ExportConnections),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Find…", FindInEditor),
+                MenuItem::action("Replace…", ReplaceInEditor),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Line Comment", ToggleComment),
             ],
             disabled: false,
         },

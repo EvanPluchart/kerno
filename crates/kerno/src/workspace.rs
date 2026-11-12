@@ -27,9 +27,10 @@ use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_co
 
 use crate::actions::{
     self, About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
-    ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings,
-    OpenSqlFile, PreviousTab, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory,
-    ShowSavedQueries, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    FindInEditor, ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette,
+    OpenSettings, OpenSqlFile, PreviousTab, ReplaceInEditor, RunAll, RunStatement, SaveFile,
+    SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar,
+    UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -687,6 +688,29 @@ impl Workspace {
         }
     }
 
+    fn toggle_comment(&mut self, _: &ToggleComment, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.toggle_comment(window, cx));
+        }
+    }
+
+    fn find_in_editor(&mut self, _: &FindInEditor, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.find(false, window, cx));
+        }
+    }
+
+    fn replace_in_editor(
+        &mut self,
+        _: &ReplaceInEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.find(true, window, cx));
+        }
+    }
+
     fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
             tab.update(cx, |tab, cx| tab.cancel(cx));
@@ -1278,6 +1302,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_statement))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
+            .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::find_in_editor))
+            .on_action(cx.listener(Self::replace_in_editor))
             .on_action(cx.listener(Self::explain_statement))
             .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::import_connections))
