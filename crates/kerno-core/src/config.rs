@@ -346,20 +346,19 @@ pub struct Secrets {
     pub ssh_key_passphrase: Option<Secret>,
 }
 
-/// What a driver needs to open one session: where to dial, who to be, and
-/// which database. Built by [`crate::Connector`], after the SSH tunnel (if
-/// any) is up.
+/// What a driver needs to open one session: where the server is, how to
+/// reach it, who to be, and which database.
 #[derive(Debug, Clone)]
 pub struct ConnectParams {
     /// Engine to speak.
     pub engine: Engine,
-    /// Host name the user configured: used for TLS server-name checks even
-    /// when the socket goes to a tunnel entrance.
+    /// Server host. Also the name TLS certificates are checked against.
     pub host: String,
-    /// Address to dial.
-    pub dial_host: String,
-    /// Port to dial.
-    pub dial_port: u16,
+    /// Server port.
+    pub port: u16,
+    /// SSH tunnel to go through. `host` and `port` are then resolved by the
+    /// SSH server, and the driver must not dial them directly.
+    pub tunnel: Option<std::sync::Arc<crate::ssh::Tunnel>>,
     /// Database user.
     pub user: String,
     /// Database password.

@@ -83,3 +83,27 @@ depend on this machine. How the MySQL backup path is exercised end to end here i
   dependencies (`unmaintained = "workspace"`): the six reported on 2026-11-12 (`paste`, `instant`,
   `ttf-parser`, `rustybuzz`, `zvariant`, `zbus_names`) are transitive dependencies of GPUI and
   gpui-component.
+
+## D-008 — SSH tunnels without a standing local port
+
+The spec asks for "local port forward per connection". A listening loopback port is reachable by every
+local process for as long as it is open, whoever owns it: it would let any local user reach the database
+port behind the bastion. An automated security review of the first tunnel commit flagged exactly that, and
+it was right. The tunnel is therefore built like this:
+
+- PostgreSQL: no local port at all. `tokio-postgres` can run over any stream (`Config::connect_raw`), so the
+  driver speaks directly into an SSH `direct-tcpip` channel (`Tunnel::open_stream`). Cancel requests open
+  another channel the same way.
+- MySQL/MariaDB: `mysql_async` can only dial a TCP address or a Unix socket, and its TLS upgrade is
+  `unreachable!()` on a Unix socket, so a private Unix socket would silently rule out TLS through a tunnel.
+  It gets a single-use loopback port (`Tunnel::forward_once`): opened for one dial, it admits exactly one
+  connection and stops listening; it also stops after 10 s unused, and drops everything if two connections
+  are waiting (the driver's cannot be told apart).
+- Residual risk, stated in the code as well: a local process that connects in the instant between the port
+  opening and the driver's own connect takes the slot. Kerno's connect is then refused, so this is noticed
+  rather than silent, and the other process holds a raw connection to the database port, where it must
+  still authenticate. Loopback TCP gives no portable, `unsafe`-free way to identify the peer process.
+
+Host keys: checked against `~/.ssh/known_hosts` (read-only) and Kerno's own known-hosts file. Unknown host:
+the connection fails with the fingerprint, the UI asks, and a retry carrying that fingerprint records the key
+in Kerno's file only. Changed key: always refused, with the file and line of the recorded key.

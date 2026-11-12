@@ -19,7 +19,4 @@ tracing.workspace = true
 sqlparser.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
-rustls.workspace = true
-rustls-pki-types.workspace = true
-rustls-native-certs.workspace = true
 russh.workspace = true

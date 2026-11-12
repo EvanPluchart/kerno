@@ -1,5 +1,14 @@
-//! SSH tunnels: a local port that forwards to the database through an SSH
-//! server.
+//! SSH tunnels: reaching a database through an SSH server.
+//!
+//! A [`Tunnel`] is an authenticated SSH connection. Drivers use it in one of
+//! two ways, and neither leaves a port open for other local processes:
+//!
+//! - [`Tunnel::open_stream`] returns a stream that *is* the forwarded
+//!   connection. A driver that can run its protocol over any stream
+//!   (PostgreSQL) uses this; nothing listens locally.
+//! - [`Tunnel::forward_once`] opens a loopback port for a driver that can
+//!   only dial an address (MySQL). The port admits exactly one connection and
+//!   closes; see that method for what this does and does not guarantee.
 //!
 //! Host keys are checked against known-hosts files (the user's
 //! `~/.ssh/known_hosts`, read-only, and Kerno's own). An unknown host fails
@@ -13,14 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::learn_known_hosts_path;
 use russh::keys::ssh_key::{HashAlg, PublicKey};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
 
 use crate::config::{Secret, SshAuth, SshConfig};
 
@@ -124,10 +134,6 @@ pub struct TunnelRequest<'a> {
     pub password: Option<&'a Secret>,
     /// Passphrase of the key file, for [`SshAuth::KeyFile`].
     pub key_passphrase: Option<&'a Secret>,
-    /// Database host, as the SSH server resolves it.
-    pub target_host: &'a str,
-    /// Database port.
-    pub target_port: u16,
     /// Known-hosts files to check, in order. Missing files are skipped.
     pub known_hosts: &'a [PathBuf],
     /// File that newly trusted keys are appended to (Kerno's own).
@@ -137,25 +143,28 @@ pub struct TunnelRequest<'a> {
     pub trusted_fingerprint: Option<&'a str>,
 }
 
-/// An open tunnel. Connections to [`Tunnel::local_addr`] reach the database.
-/// Dropping the tunnel closes the listener and the SSH connection.
+/// A byte stream to the database, carried by the SSH connection.
+pub trait TunnelStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelStream for T {}
+
+/// An authenticated SSH connection that can forward to hosts the SSH server
+/// reaches. Dropping it closes the SSH connection and everything forwarded
+/// through it.
 pub struct Tunnel {
-    local_addr: SocketAddr,
     handle: Arc<Handle<HostKeyCheck>>,
-    accept_task: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tunnel")
-            .field("local_addr", &self.local_addr)
-            .finish_non_exhaustive()
+            .field("closed", &self.is_closed())
+            .finish()
     }
 }
 
 impl Tunnel {
-    /// Connects to the SSH server, authenticates, and starts forwarding a
-    /// local port to the database.
+    /// Connects to the SSH server and authenticates.
     pub async fn open(request: TunnelRequest<'_>) -> Result<Self, SshError> {
         let ssh = request.ssh;
         let verdict = Arc::new(Mutex::new(None));
@@ -198,49 +207,77 @@ impl Tunnel {
         };
 
         authenticate(&mut handle, &request).await?;
+        Ok(Self {
+            handle: Arc::new(handle),
+        })
+    }
 
-        // Check the forward works before reporting the tunnel as open, so a
-        // wrong database host fails here with a clear message.
-        let probe = handle
-            .channel_open_direct_tcpip(
-                request.target_host,
-                request.target_port.into(),
-                "127.0.0.1",
-                0,
-            )
-            .await
-            .map_err(|error| SshError::Forward {
-                host: request.target_host.to_string(),
-                port: request.target_port,
-                reason: forward_reason(&error),
-            })?;
-        let _ = probe.close().await;
+    /// Opens a connection to `host:port` as seen from the SSH server and
+    /// returns it as a stream. Nothing listens on the local machine.
+    pub async fn open_stream(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn TunnelStream>, SshError> {
+        let channel = open_channel(&self.handle, host, port).await?;
+        Ok(Box::new(channel.into_stream()))
+    }
 
+    /// Opens a loopback port that forwards one connection to `host:port`,
+    /// for drivers that can only dial an address. Connect to the returned
+    /// address right away.
+    ///
+    /// The port is not a standing door into the remote network:
+    /// - it admits exactly one connection, then stops listening;
+    /// - it stops listening after [`ADMISSION_TIMEOUT`] if nobody connects;
+    /// - if a second connection is already waiting when the first is taken,
+    ///   both are dropped, because the caller's cannot be told apart.
+    ///
+    /// What remains: another local process that connects in the instant
+    /// between this call and the caller's own connect takes the slot. The
+    /// caller's connect is then refused (so the theft is noticed, not
+    /// silent), and the other process holds a raw connection to the database
+    /// port, where it still has to authenticate. Loopback TCP offers no way
+    /// to check which process is on the other end; drivers that can take a
+    /// stream should use [`Tunnel::open_stream`] instead.
+    pub async fn forward_once(&self, host: &str, port: u16) -> Result<SocketAddr, SshError> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|error| SshError::Other(format!("could not open a local port: {error}")))?;
         let local_addr = listener
             .local_addr()
             .map_err(|error| SshError::Other(error.to_string()))?;
+        let handle = self.handle.clone();
+        let host = host.to_string();
 
-        let handle = Arc::new(handle);
-        let accept_task = tokio::spawn(forward_connections(
-            listener,
-            handle.clone(),
-            request.target_host.to_string(),
-            request.target_port,
-        ));
+        tokio::spawn(async move {
+            let accepted = tokio::time::timeout(ADMISSION_TIMEOUT, listener.accept()).await;
+            let Ok(Ok((mut local, _))) = accepted else {
+                return;
+            };
+            // Anything else already queued makes the first connection ambiguous.
+            let contested = listener.accept().now_or_never().is_some();
+            drop(listener);
+            if contested {
+                tracing::warn!(
+                    "two local connections reached a single-use tunnel port; both were refused"
+                );
+                return;
+            }
+            let channel = match open_channel(&handle, &host, port).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    tracing::warn!(%error, "SSH tunnel could not open a forward channel");
+                    return;
+                }
+            };
+            let mut remote = channel.into_stream();
+            // Ends when either side closes; errors here are ordinary
+            // disconnects, which the database driver reports itself.
+            let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+        });
 
-        Ok(Self {
-            local_addr,
-            handle,
-            accept_task,
-        })
-    }
-
-    /// The local address that forwards to the database.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        Ok(local_addr)
     }
 
     /// Whether the SSH connection is gone.
@@ -251,7 +288,6 @@ impl Tunnel {
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        self.accept_task.abort();
         let handle = self.handle.clone();
         // Say goodbye politely when a runtime is still around to do it.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -264,54 +300,28 @@ impl Drop for Tunnel {
     }
 }
 
+async fn open_channel(
+    handle: &Handle<HostKeyCheck>,
+    host: &str,
+    port: u16,
+) -> Result<russh::Channel<client::Msg>, SshError> {
+    handle
+        .channel_open_direct_tcpip(host, port.into(), "127.0.0.1", 0)
+        .await
+        .map_err(|error| SshError::Forward {
+            host: host.to_string(),
+            port,
+            reason: match &error {
+                russh::Error::ChannelOpenFailure(reason) => format!("{reason:?}"),
+                other => other.to_string(),
+            },
+        })
+}
+
+/// How long a single-use tunnel port waits for its one connection.
+pub const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
-fn forward_reason(error: &russh::Error) -> String {
-    match error {
-        russh::Error::ChannelOpenFailure(reason) => format!("{reason:?}"),
-        other => other.to_string(),
-    }
-}
-
-async fn forward_connections(
-    listener: TcpListener,
-    handle: Arc<Handle<HostKeyCheck>>,
-    target_host: String,
-    target_port: u16,
-) {
-    loop {
-        let (mut local, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                tracing::warn!(%error, "SSH tunnel listener stopped");
-                return;
-            }
-        };
-        let handle = handle.clone();
-        let target_host = target_host.clone();
-        tokio::spawn(async move {
-            let channel = match handle
-                .channel_open_direct_tcpip(
-                    target_host,
-                    target_port.into(),
-                    peer.ip().to_string(),
-                    peer.port().into(),
-                )
-                .await
-            {
-                Ok(channel) => channel,
-                Err(error) => {
-                    tracing::warn!(%error, "SSH tunnel could not open a forward channel");
-                    return;
-                }
-            };
-            let mut remote = channel.into_stream();
-            // Ends when either side closes; errors here are ordinary
-            // disconnects, which the database driver reports itself.
-            let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
-        });
-    }
-}
 
 async fn authenticate(
     handle: &mut Handle<HostKeyCheck>,
