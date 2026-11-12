@@ -14,7 +14,8 @@ use common::{exec_ok, rows, run};
 use kerno_core::config::Engine;
 use kerno_core::testing;
 use kerno_core::tools::{
-    self, BackupContent, BackupFormat, BackupOptions, RestoreOptions, Tool, ToolCommand,
+    self, BackupContent, BackupFormat, BackupOptions, RestoreOptions, ScriptCheck, Tool,
+    ToolCommand,
 };
 
 const SCRATCH: &str = "kerno_test_restore";
@@ -263,7 +264,12 @@ async fn genuine_round_trip(
         .position(|line| line.contains(r"line\r\n"))
         .unwrap()
         + 1;
-    let refusal = tools::check_script(Tool::Mysql, &path, &AtomicBool::new(false)).unwrap_err();
+    let check = |path: &Path| ScriptCheck {
+        tool: Tool::Mysql,
+        path: path.to_path_buf(),
+        version: None,
+    };
+    let refusal = tools::check_script(&check(&path), &AtomicBool::new(false)).unwrap_err();
     assert!(
         refusal
             .to_string()
@@ -310,7 +316,7 @@ async fn genuine_round_trip(
     // the carriage return the dump restores.
     let copy = common::fresh_database(&session, "restore_copy").await;
     let restore = restore_into(&path, None, &copy);
-    assert_eq!(restore.script_check, Some((Tool::Mysql, path.clone())));
+    assert_eq!(restore.script_check, Some(check(&path)));
     let refusal = tools::run(restore, |_| {}, Arc::new(AtomicBool::new(false)))
         .await
         .unwrap_err();
@@ -347,7 +353,7 @@ async fn genuine_round_trip(
         "kerno.sql: {} bytes",
         std::fs::metadata(&fixture).unwrap().len()
     );
-    tools::check_script(Tool::Mysql, &fixture, &AtomicBool::new(false))
+    tools::check_script(&check(&fixture), &AtomicBool::new(false))
         .expect("the fixture dump holds no client command");
 }
 

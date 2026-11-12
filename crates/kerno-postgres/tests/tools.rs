@@ -17,8 +17,8 @@ use kerno_core::config::{ConnectParams, Engine, SshAuth, TlsConfig};
 use kerno_core::ssh::{Tunnel, TunnelRequest};
 use kerno_core::testing;
 use kerno_core::tools::{
-    self, BackupContent, BackupFormat, BackupOptions, FALLBACK_DIRS, RestoreOptions, Tool,
-    ToolCommand,
+    self, BackupContent, BackupFormat, BackupOptions, FALLBACK_DIRS, RestoreOptions, ScriptCheck,
+    Tool, ToolCommand,
 };
 use kerno_core::{Session, TlsMode};
 
@@ -417,7 +417,9 @@ async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
         },
     )
     .unwrap();
-    assert_eq!(restore.script_check, Some((Tool::Psql, path)));
+    let check = restore.script_check.clone().expect("checked");
+    assert_eq!((check.tool, &check.path), (Tool::Psql, &path));
+    assert!(check.version.is_some(), "{check:?}");
     run_ok(restore).await;
     let copied = genuine_contents(COPY).await;
     assert_eq!(copied, genuine_contents(SOURCE).await);
@@ -434,8 +436,33 @@ async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
         "kerno.sql: {} bytes",
         std::fs::metadata(&fixture).unwrap().len()
     );
-    tools::check_script(Tool::Psql, &fixture, &AtomicBool::new(false))
+    // With the version of the psql that restores it: no false alarm.
+    let mut check = ScriptCheck {
+        tool: Tool::Psql,
+        path: fixture.clone(),
+        version: tools::version(&psql),
+    };
+    tools::check_script(&check, &AtomicBool::new(false))
         .expect("the fixture dump holds no client command");
+    // Unknown version, the strict rule of a psql older than 8.4: the `\s`
+    // of the `email` domain's regular expression reads as `\s` (history
+    // to a file), on that dump and on the one above.
+    check.version = None;
+    let dump = std::fs::read_to_string(&fixture).unwrap();
+    let regex_line = dump
+        .lines()
+        .position(|line| line.contains("@[^@\\s]+$"))
+        .unwrap()
+        + 1;
+    let refusal = tools::check_script(&check, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        refusal.to_string().contains(&format!(
+            "kerno.sql, line {regex_line}: \\s]+@[^@ is a psql"
+        )),
+        "{refusal}"
+    );
+    check.path = path;
+    assert!(tools::check_script(&check, &AtomicBool::new(false)).is_err());
 }
 
 /// A file with client commands is refused before psql starts: the marker
@@ -451,26 +478,41 @@ async fn a_plain_file_with_client_commands_runs_nothing() {
     let pwned = files.path().join("pwned");
     let pwned = pwned.display();
     let input = files.path().join("hostile.sql");
-    for (text, line) in [
-        (format!("SELECT 1;\n\\! touch {pwned}\n"), 2),
+    // Glued arguments, refused for a psql of unknown version (one before
+    // 8.4 runs them); a refused command with a space whatever the version.
+    let known = tools::version(&psql);
+    let cases = [
+        (format!("SELECT 1;\n\\!touch {pwned}\n"), 2, None),
+        (format!("SELECT 1 \\o|touch {pwned}\n"), 1, None),
+        (format!("SELECT 1;\n\\g|touch {pwned}\n"), 2, None),
+        (format!("\\i{pwned}\n"), 1, None),
+    ];
+    for (text, line, version) in cases.into_iter().chain([
+        (format!("SELECT 1;\n\\! touch {pwned}\n"), 2, known.clone()),
         (
             format!("\\restrict k\nSELECT 1; \\! touch {pwned}\n\\unrestrict k\n"),
             2,
+            known.clone(),
         ),
-        (format!("SELECT 1 \\g |touch {pwned}\n"), 1),
+        (format!("SELECT 1 \\g |touch {pwned}\n"), 1, known.clone()),
         (
             format!("COPY t (a) FROM stdin;\n1\n\\.\n\\copy t TO PROGRAM 'touch {pwned}'\n"),
             4,
+            known.clone(),
         ),
-        (format!("\\set x '\\\\! touch {pwned}'\nSELECT :x;\n"), 1),
-    ] {
+        (
+            format!("\\set x '\\\\! touch {pwned}'\nSELECT :x;\n"),
+            1,
+            known.clone(),
+        ),
+    ]) {
         std::fs::write(&input, &text).unwrap();
         let options = RestoreOptions {
             database: "kerno_test_never".into(),
             input: input.clone(),
             format: BackupFormat::Sql,
             allow_client_commands: false,
-            tool_version: tools::version(&psql),
+            tool_version: version,
         };
         let command =
             tools::restore_command(&psql, &testing::params(Engine::Postgres), &options).unwrap();

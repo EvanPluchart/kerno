@@ -21,7 +21,8 @@
 //!   meta-commands off (`\restrict`, which pg_dump 17.6 / 18 writes, is a
 //!   command of the file itself, so a hostile file leaves it out), so
 //!   [`run`] reads the file with [`check_script`] before starting psql and
-//!   refuses it when it holds one.
+//!   refuses it when it holds one. Its rule depends on the version (see
+//!   the psql table below).
 //! - MySQL's `mysql` from 8.0.43, 8.4.6 and 9.4 (when `--commands` appeared),
 //!   given the version found by [`version`]: `--commands=OFF`.
 //! - MariaDB's `mariadb` from 10.6.18, 10.11.8, 11.0.6, 11.1.5, 11.2.4,
@@ -34,6 +35,20 @@
 //!   scan being the only protection.
 //! - `pg_restore`: nothing to do, a custom-format archive holds no client
 //!   script.
+//!
+//! psql reads a command name up to whitespace or a backslash. What the scan
+//! refuses (the full list is `PSQL_REFUSED`):
+//!
+//! | Written | psql 8.4 and later (checked: 14.24, 18.6) | psql before 8.4 | Scan, psql known to be 8.4+ | Scan, older or unknown psql |
+//! |---|---|---|---|---|
+//! | `\! cmd`, `\o file`, `\i file`, `\set x …`… (a refused command, then whitespace, a backslash or the end of the line) | runs it | runs it | refused | refused |
+//! | `\!cmd`, `\o\|cmd`, `\ifile`, `\w/f`, `\s/f`, `\g\|cmd`, `\cdb`, `\ir/f`, `\efname` (argument glued on) | "invalid command", nothing runs | runs the one-letter command with that argument | allowed | refused (first letter one of `! c e g i o s w`) |
+//! | `\s+`, `\w*` in a regular expression (`\d+`, `\S`, `\W` start with no refused letter) | invalid command | `\s` and `\w` run | allowed | refused |
+//! | COPY data escapes `\N \t \n \r \\`… | not read as commands inside COPY data | same | allowed | allowed |
+//!
+//! So the strict rule costs a false alarm on any dump with a `\s` or `\w`
+//! regular expression (the fixture database has one, in a domain check): give
+//! the version ([`RestoreOptions::tool_version`]) to get the lenient one.
 //!
 //! The mysql / mariadb client commands (from `help` in MySQL 26.10 and
 //! MariaDB 11.8) and what stops each one:
@@ -335,9 +350,22 @@ pub struct ToolCommand {
     pub stdin: Option<PathBuf>,
     /// The SSH tunnel to open before starting the child.
     pub tunnel: Option<TunnelHop>,
-    /// A script the child will read ([`Tool::Psql`] or [`Tool::Mysql`]),
-    /// which [`run`] checks with [`check_script`] before starting it.
-    pub script_check: Option<(Tool, PathBuf)>,
+    /// A script the child will read, which [`run`] checks with
+    /// [`check_script`] before starting it.
+    pub script_check: Option<ScriptCheck>,
+}
+
+/// A script to check for client commands, see [`check_script`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptCheck {
+    /// [`Tool::Psql`], or [`Tool::Mysql`] for MySQL and MariaDB: whose
+    /// client commands to look for.
+    pub tool: Tool,
+    /// The script.
+    pub path: PathBuf,
+    /// The version of the tool that will read it, from [`version`]; `None`
+    /// when unknown, which applies the strictest rule.
+    pub version: Option<ToolVersion>,
 }
 
 impl ToolCommand {
@@ -475,7 +503,13 @@ pub fn restore_command(
         ));
     }
     let mut command = connection_command(tool_path, params);
-    let check = |tool| (!options.allow_client_commands).then(|| (tool, options.input.clone()));
+    let check = |tool| {
+        (!options.allow_client_commands).then(|| ScriptCheck {
+            tool,
+            path: options.input.clone(),
+            version: options.tool_version.clone(),
+        })
+    };
     let args = &mut command.args;
     match (params.engine, options.format) {
         (Engine::Postgres, BackupFormat::Sql) => {
@@ -686,9 +720,9 @@ pub async fn run(
     on_line: impl Fn(String) + Send + 'static,
     cancel: Arc<AtomicBool>,
 ) -> Result<ExitStatus> {
-    if let Some((tool, path)) = command.script_check.clone() {
+    if let Some(check) = command.script_check.clone() {
         let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || check_script(tool, &path, &cancel))
+        tokio::task::spawn_blocking(move || check_script(&check, &cancel))
             .await
             .map_err(|error| Error::io("checking the script", std::io::Error::other(error)))??;
     }
@@ -789,11 +823,13 @@ fn emit(read: std::io::Result<usize>, line: &mut Vec<u8>, on_line: &impl Fn(Stri
 /// space. A false alarm costs the user an explicit opt-in; reading the file
 /// the way the tool does would mean following its lexer (and the encoding
 /// the file can switch to), where any gap is a command run unasked.
-pub fn check_script(tool: Tool, path: &Path, cancel: &AtomicBool) -> Result<()> {
+pub fn check_script(check: &ScriptCheck, cancel: &AtomicBool) -> Result<()> {
+    let path = &check.path;
     let file = std::fs::File::open(path)
         .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?;
-    let psql = tool == Tool::Psql;
-    let Some(found) = scan(psql, file, path, cancel)? else {
+    let psql = check.tool == Tool::Psql;
+    let glued = psql && !check.version.as_ref().is_some_and(psql_needs_a_space);
+    let Some(found) = scan(psql, glued, file, path, cancel)? else {
         return Ok(());
     };
     Err(Error::Config(format!(
@@ -805,6 +841,17 @@ pub fn check_script(tool: Tool, path: &Path, cancel: &AtomicBool) -> Result<()> 
         found.command,
         if psql { "psql" } else { "mysql" },
     )))
+}
+
+/// Whether this psql reads `\ofile` as the unknown command `ofile`, not as
+/// `\o file`: from 8.4 on (commit 6f093f3825, "One-letter backslash
+/// commands now need a space before the first argument", in the 8.4
+/// release notes). Checked with psql 14.24 and 18.6: `\!touch x`,
+/// `\o|cmd`, `\i/x.sql`, `\w/f`, `\s/f`, `\g|cmd`, `\cdb`, `\cd/dir`,
+/// `\ir/x.sql`, `\efname`, `\copy(…)` are all "invalid command".
+/// A version that does not name PostgreSQL (another tool's) proves nothing.
+fn psql_needs_a_space(version: &ToolVersion) -> bool {
+    version.text.contains("(PostgreSQL)") && version.number >= (8, 4, 0)
 }
 
 /// A client command found by [`scan`].
@@ -939,6 +986,9 @@ impl Word {
 /// `\` inside a character: the cost is rare false alarms.
 struct Scanner {
     psql: bool,
+    /// psql: also refuse a refused one-letter command with its argument
+    /// glued on (`\ofile`), which psql before 8.4 runs as `\o file`.
+    glued: bool,
     line: u64,
     prev: u8,
     /// An unpaired backslash was the last byte; `ambiguous` when it came
@@ -956,9 +1006,10 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn new(psql: bool) -> Self {
+    fn new(psql: bool, glued: bool) -> Self {
         Self {
             psql,
+            glued,
             line: 1,
             prev: b'\n',
             backslash: None,
@@ -1039,7 +1090,9 @@ impl Scanner {
     /// psql: the command `name` started on `line` has ended.
     fn end_name(&mut self, line: u64, name: Word) -> Option<Finding> {
         let text = name.get();
+        let one_letter = |cmd: &&str| cmd.len() == 1 && cmd.as_bytes()[0] == text[0];
         let refused = !name.cut && PSQL_REFUSED.iter().any(|cmd| cmd.as_bytes() == text)
+            || (self.glued && PSQL_REFUSED.iter().any(one_letter))
             || (!name.cut && text.eq_ignore_ascii_case(b"copy"))
             || text.starts_with(b"lo_");
         if refused {
@@ -1131,11 +1184,12 @@ impl Scanner {
 /// [`SCAN_CHUNK`] pieces.
 fn scan(
     psql: bool,
+    glued: bool,
     mut reader: impl Read,
     path: &Path,
     cancel: &AtomicBool,
 ) -> Result<Option<Finding>> {
-    let mut scanner = Scanner::new(psql);
+    let mut scanner = Scanner::new(psql, glued);
     let mut chunk = [0u8; SCAN_CHUNK];
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1303,7 +1357,11 @@ mod tests {
         );
         assert_eq!(
             command.script_check,
-            Some((Tool::Psql, "/backups/shop.dump".into()))
+            Some(ScriptCheck {
+                tool: Tool::Psql,
+                path: "/backups/shop.dump".into(),
+                version: None,
+            })
         );
         assert_no_secret(&command);
 
@@ -1389,7 +1447,11 @@ mod tests {
         // Version unknown: the file is checked before mysql starts.
         assert_eq!(
             command.script_check,
-            Some((Tool::Mysql, "/backups/shop.dump".into()))
+            Some(ScriptCheck {
+                tool: Tool::Mysql,
+                path: "/backups/shop.dump".into(),
+                version: None,
+            })
         );
         assert_no_secret(&command);
     }
@@ -1518,7 +1580,14 @@ mod tests {
         assert_eq!(command.script_check, None);
         let command = restore_with(Engine::MySql, "mysql  Ver 8.0.36 for Linux", false);
         assert!(command.args.ends_with(&["--local-infile=0".into()]));
-        assert_eq!(command.script_check, Some((Tool::Mysql, input.clone())));
+        assert_eq!(
+            command.script_check,
+            Some(ScriptCheck {
+                tool: Tool::Mysql,
+                path: input.clone(),
+                version: parse_version("mysql  Ver 8.0.36 for Linux"),
+            })
+        );
 
         // The opt-in: neither the option nor the check.
         for version in [
@@ -1547,10 +1616,110 @@ mod tests {
     }
 
     /// What [`scan`] finds in `text`: line and command.
+    /// psql known to be 8.4 or later: glued arguments are not looked at.
     fn found(psql: bool, text: &[u8]) -> Option<(u64, String)> {
-        scan(psql, text, Path::new("test.sql"), &AtomicBool::new(false))
-            .unwrap()
-            .map(|found| (found.line, found.command))
+        scan_with(psql, false, text)
+    }
+
+    fn scan_with(psql: bool, glued: bool, text: &[u8]) -> Option<(u64, String)> {
+        scan(
+            psql,
+            glued,
+            text,
+            Path::new("test.sql"),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .map(|found| (found.line, found.command))
+    }
+
+    /// The psql rule used for `version`, through `check_script`.
+    fn found_for(version: Option<&str>, text: &str) -> Option<(u64, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.sql");
+        std::fs::write(&path, text).unwrap();
+        let check = ScriptCheck {
+            tool: Tool::Psql,
+            path,
+            version: version.map(|text| parse_version(text).unwrap()),
+        };
+        match check_script(&check, &AtomicBool::new(false)) {
+            Ok(()) => None,
+            Err(error) => {
+                let text = error.to_string();
+                let (_, after) = text.split_once(", line ").unwrap();
+                let (line, rest) = after.split_once(": ").unwrap();
+                let (command, _) = rest.split_once(" is a psql").unwrap();
+                Some((line.parse().unwrap(), command.to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn glued_arguments_are_refused_unless_psql_is_known_to_need_a_space() {
+        let glued = [
+            ("\\!touch /tmp/x", "\\!touch"),
+            ("SELECT 1 \\o|touch /tmp/x", "\\o|touch"),
+            ("\\i/tmp/x.sql", "\\i/tmp/x.sql"),
+            ("\\ir/tmp/x.sql", "\\ir/tmp/x.sql"),
+            ("SELECT 1 \\w/tmp/f", "\\w/tmp/f"),
+            ("\\s/tmp/f", "\\s/tmp/f"),
+            ("SELECT 1 \\g|touch /tmp/x", "\\g|touch"),
+            ("SELECT 1 \\gx|touch /tmp/x", "\\gx|touch"),
+            ("\\cdb", "\\cdb"),
+            ("\\cd/tmp", "\\cd/tmp"),
+            ("\\efname", "\\efname"),
+            ("\\copy(SELECT 1) TO PROGRAM 'x'", "\\copy(SELECT"),
+            ("\\setx 1", "\\setx"),
+            ("\\o\\! touch /tmp/x", "\\o"),
+        ];
+        let regex = "CREATE DOMAIN email AS text CHECK ((VALUE ~ '^[^@\\s]+@[^@\\s]+$'::text));";
+        for version in [
+            None,
+            Some("psql (PostgreSQL) 8.3.23"),
+            Some("mysql  Ver 26.10.0 for x"),
+        ] {
+            for (text, command) in glued {
+                let text = format!("SET a = 1;\n{text}\n");
+                assert_eq!(
+                    found_for(version, &text),
+                    Some((2, command.to_string())),
+                    "{version:?} {text}"
+                );
+            }
+            assert_eq!(
+                found_for(version, &format!("SELECT 1;\n{regex}\n")),
+                Some((2, "\\s]+@[^@".to_string()))
+            );
+        }
+        for version in [
+            "psql (PostgreSQL) 8.4.0",
+            "psql (PostgreSQL) 14.24 (Homebrew)",
+            "psql (PostgreSQL) 18.6",
+        ] {
+            for (text, _) in glued.iter().filter(|(text, _)| !text.contains("\\o\\")) {
+                assert_eq!(
+                    found_for(Some(version), &format!("{text}\n")),
+                    None,
+                    "{version} {text}"
+                );
+            }
+            assert_eq!(found_for(Some(version), regex), None);
+            // A refused command with a space is refused whatever the version.
+            assert_eq!(
+                found_for(Some(version), "SELECT 1;\n\\o /tmp/x\n"),
+                Some((2, "\\o".into()))
+            );
+        }
+        // COPY data escapes start with none of those letters.
+        assert_eq!(
+            scan_with(
+                true,
+                true,
+                b"1\tC:\\\\x\\tab\\N\\n\\r\\b\\f\\v\\101\\x41\n\\.\n"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1761,7 +1930,11 @@ mod tests {
         .unwrap();
         // The "tool" would leave a mark if it started.
         let mut command = shell(&format!("touch {}", started.display()));
-        command.script_check = Some((Tool::Psql, script.clone()));
+        command.script_check = Some(ScriptCheck {
+            tool: Tool::Psql,
+            path: script.clone(),
+            version: None,
+        });
         let error = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
             .await
             .unwrap_err();
@@ -1776,20 +1949,28 @@ mod tests {
         // A clean script: the tool starts.
         std::fs::write(&script, "SELECT 1;\n").unwrap();
         let mut command = shell(&format!("touch {}", started.display()));
-        command.script_check = Some((Tool::Mysql, script.clone()));
+        command.script_check = Some(ScriptCheck {
+            tool: Tool::Mysql,
+            path: script.clone(),
+            version: None,
+        });
         let status = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
         assert!(status.success() && started.exists());
 
+        let check = |path: &Path| ScriptCheck {
+            tool: Tool::Psql,
+            path: path.to_path_buf(),
+            version: None,
+        };
         let error = check_script(
-            Tool::Psql,
-            &dir.path().join("absent.sql"),
+            &check(&dir.path().join("absent.sql")),
             &AtomicBool::new(false),
         )
         .unwrap_err();
         assert!(error.to_string().contains("absent.sql"), "{error}");
-        let cancelled = check_script(Tool::Psql, &script, &AtomicBool::new(true));
+        let cancelled = check_script(&check(&script), &AtomicBool::new(true));
         assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
     }
 
@@ -1844,7 +2025,9 @@ mod tests {
             largest_read: 0,
         };
         let started = Instant::now();
+        // The strict rule (unknown psql), which looks at more names.
         let found = scan(
+            true,
             true,
             &mut source,
             Path::new("big.sql"),
