@@ -477,7 +477,10 @@ async fn indexes(session: &PgSession, oid: &str) -> Result<Vec<IndexInfo>> {
                 (SELECT json_agg(COALESCE(a.attname, pg_catalog.pg_get_indexdef(i.indexrelid, k.n, true)) ORDER BY k.n)::text \
                  FROM generate_series(1, i.indnkeyatts) AS k(n) \
                  LEFT JOIN pg_catalog.pg_attribute a \
-                        ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1] AND a.attnum > 0) \
+                        ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1] AND a.attnum > 0), \
+                EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c \
+                        WHERE c.conindid = i.indexrelid AND c.conrelid = i.indrelid \
+                          AND c.contype IN ('p', 'u', 'x')) \
          FROM pg_catalog.pg_index i \
          JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
          JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
@@ -496,6 +499,7 @@ async fn indexes(session: &PgSession, oid: &str) -> Result<Vec<IndexInfo>> {
             predicate: opt(row, 4),
             definition: opt(row, 5),
             columns: list(row, 6),
+            backs_constraint: flag(row, 7),
         })
         .collect())
 }

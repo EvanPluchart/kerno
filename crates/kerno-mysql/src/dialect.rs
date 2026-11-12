@@ -2,10 +2,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kerno_core::dialect::{Dialect, default_literal, hex};
-use kerno_core::schema::{ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
+use kerno_core::dialect::{Dialect, column_list, default_literal, foreign_key_sql, hex};
+use kerno_core::schema::{
+    ColumnGeneration, ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef,
+};
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{CellValue, LexRules};
+use kerno_core::table_draft::{ColumnDraft, IndexDraft, TableChange, TableDraft, present};
 use kerno_core::{Engine, Error, Plan, Result, TypeKind};
 
 /// The MySQL / MariaDB dialect. The two engines differ only in how a plan
@@ -52,6 +55,67 @@ impl MysqlDialect {
 
 fn unsupported(what: &str) -> Error {
     Error::Unsupported(what.into())
+}
+
+impl MysqlDialect {
+    /// The full definition of `column`, as `CREATE TABLE`, `ADD`, `MODIFY`
+    /// and `CHANGE COLUMN` take it:
+    /// `name type [COLLATE c] NOT NULL|NULL [DEFAULT e] [AUTO_INCREMENT] [COMMENT '…']`.
+    ///
+    /// `from` is the column on the server, for `MODIFY` and `CHANGE`: these
+    /// replace the whole definition, so a collation other than the table's
+    /// is carried over while the type stays, and a generated column is
+    /// refused (its expression would be lost).
+    fn column_sql(&self, column: &ColumnDraft, from: Option<&ColumnInfo>) -> Result<String> {
+        let data_type = column.data_type.trim();
+        let mut sql = format!("{} {data_type}", self.quote_ident(&column.name));
+        if let Some(from) = from {
+            if matches!(
+                from.generation,
+                Some(ColumnGeneration::Stored(_) | ColumnGeneration::Virtual(_))
+            ) {
+                return Err(unsupported(&format!(
+                    "changing the generated column {} from the table form; \
+                     write the ALTER TABLE statement instead",
+                    self.quote_ident(&from.name)
+                )));
+            }
+            if let Some(collation) = &from.collation
+                && from.data_type.eq_ignore_ascii_case(data_type)
+            {
+                sql.push_str(&format!(" COLLATE {collation}"));
+            }
+        }
+        sql.push_str(if column.nullable {
+            " NULL"
+        } else {
+            " NOT NULL"
+        });
+        if column.auto_increment {
+            sql.push_str(" AUTO_INCREMENT");
+        } else if let Some(default) = present(&column.default) {
+            sql.push_str(&format!(" DEFAULT {default}"));
+        }
+        if let Some(comment) = present(&column.comment) {
+            sql.push_str(&format!(" COMMENT {}", self.quote_string(comment)));
+        }
+        Ok(sql)
+    }
+
+    /// `[UNIQUE] INDEX name (…)`.
+    fn index_sql(&self, index: &IndexDraft) -> String {
+        format!(
+            "{}INDEX {} {}",
+            if index.unique { "UNIQUE " } else { "" },
+            self.quote_ident(&index.name),
+            column_list(self, &index.columns)
+        )
+    }
+}
+
+/// `ALTER TABLE t` and its clauses, one per line.
+fn alter_statement(table: &str, clauses: &[String]) -> String {
+    format!("ALTER TABLE {table}\n    {}", clauses.join(",\n    "))
 }
 
 /// Whether `text` is the digits of a bit string, as BIT cells are presented.
@@ -242,6 +306,125 @@ impl Dialect for MysqlDialect {
         Err(unsupported(
             "schemas inside a database; create a database instead",
         ))
+    }
+
+    /// One `CREATE TABLE` holding everything: keys, indexes and comments
+    /// are written inline.
+    fn create_table_sql(&self, draft: &TableDraft) -> Result<Vec<String>> {
+        let mut items = draft
+            .columns
+            .iter()
+            .map(|column| self.column_sql(column, None))
+            .collect::<Result<Vec<_>>>()?;
+        if !draft.primary_key.is_empty() {
+            items.push(format!(
+                "PRIMARY KEY {}",
+                column_list(self, &draft.primary_key)
+            ));
+        }
+        items.extend(draft.indexes.iter().map(|index| self.index_sql(index)));
+        items.extend(draft.foreign_keys.iter().map(|k| foreign_key_sql(self, k)));
+        let comment = present(&draft.comment).map_or_else(String::new, |c| {
+            format!(" COMMENT = {}", self.quote_string(c))
+        });
+        Ok(vec![format!(
+            "CREATE TABLE {} (\n    {}\n){comment}",
+            self.table_name(&draft.table),
+            items.join(",\n    ")
+        )])
+    }
+
+    /// Foreign keys are dropped by a first statement; everything else is
+    /// one `ALTER TABLE`, which the server checks as a whole and applies
+    /// all or nothing. One statement is needed: an auto-increment column
+    /// must stay a key, so its primary key cannot be dropped, nor such a
+    /// column added, by a statement of its own. The first one is apart
+    /// because a foreign key cannot be dropped and added again under the
+    /// same name in one statement.
+    ///
+    /// A column both renamed and altered is one `CHANGE COLUMN`: in a single
+    /// statement neither name can be modified after `RENAME COLUMN`.
+    fn alter_table_sql(&self, table: &TableRef, changes: &[TableChange]) -> Result<Vec<String>> {
+        let name = self.table_name(table);
+        let q = |ident: &str| self.quote_ident(ident);
+        let altered = |column: &str| {
+            changes.iter().find_map(|change| match change {
+                TableChange::AlterColumn { name, from, to } if name == column => Some((from, to)),
+                _ => None,
+            })
+        };
+        let is_renamed = |column: &str| {
+            changes.iter().any(
+                |change| matches!(change, TableChange::RenameColumn { to, .. } if to == column),
+            )
+        };
+
+        let mut statements = Vec::new();
+        let dropped_keys: Vec<String> = changes
+            .iter()
+            .filter_map(|change| match change {
+                TableChange::DropForeignKey(key) => Some(format!("DROP FOREIGN KEY {}", q(key))),
+                _ => None,
+            })
+            .collect();
+        if !dropped_keys.is_empty() {
+            statements.push(alter_statement(&name, &dropped_keys));
+        }
+
+        let mut clauses = Vec::new();
+        for change in changes {
+            match change {
+                TableChange::DropForeignKey(_) => {}
+                TableChange::DropIndex(index) => clauses.push(format!("DROP INDEX {}", q(index))),
+                TableChange::DropPrimaryKey(_) => clauses.push("DROP PRIMARY KEY".into()),
+                TableChange::DropColumn(column) => {
+                    clauses.push(format!("DROP COLUMN {}", q(column)));
+                }
+                TableChange::RenameColumn { from, to } => clauses.push(match altered(to) {
+                    Some((column, draft)) => format!(
+                        "CHANGE COLUMN {} {}",
+                        q(from),
+                        self.column_sql(draft, Some(column))?
+                    ),
+                    None => format!("RENAME COLUMN {} TO {}", q(from), q(to)),
+                }),
+                TableChange::AddColumn(column) => {
+                    clauses.push(format!("ADD COLUMN {}", self.column_sql(column, None)?));
+                }
+                TableChange::AlterColumn { name, from, to } => {
+                    if !is_renamed(name) {
+                        clauses.push(format!(
+                            "MODIFY COLUMN {}",
+                            self.column_sql(to, Some(from))?
+                        ));
+                    }
+                }
+                TableChange::AddPrimaryKey(columns) => {
+                    clauses.push(format!("ADD PRIMARY KEY {}", column_list(self, columns)));
+                }
+                TableChange::AddIndex(index) => {
+                    clauses.push(format!("ADD {}", self.index_sql(index)))
+                }
+                TableChange::AddForeignKey(key) => {
+                    clauses.push(format!("ADD {}", foreign_key_sql(self, key)));
+                }
+                // MySQL has no NULL comment: an empty one is none.
+                TableChange::SetTableComment(comment) => clauses.push(format!(
+                    "COMMENT = {}",
+                    self.quote_string(present(comment).unwrap_or_default())
+                )),
+                // With the database: a bare name would move the table to
+                // the session's default database.
+                TableChange::RenameTable { to } => clauses.push(format!(
+                    "RENAME TO {}",
+                    self.table_name(&TableRef::new(table.schema.clone(), to.clone()))
+                )),
+            }
+        }
+        if !clauses.is_empty() {
+            statements.push(alter_statement(&name, &clauses));
+        }
+        Ok(statements)
     }
 }
 
@@ -618,6 +801,197 @@ mod tests {
             assert_eq!(
                 d.create_database_sql("odd `name`").unwrap(),
                 "CREATE DATABASE `odd ``name```"
+            );
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn draft_column(name: &str, data_type: &str, nullable: bool) -> ColumnDraft {
+        ColumnDraft {
+            original: None,
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable,
+            default: None,
+            comment: None,
+            auto_increment: false,
+        }
+    }
+
+    fn foreign_key() -> kerno_core::table_draft::ForeignKeyDraft {
+        kerno_core::table_draft::ForeignKeyDraft {
+            original: None,
+            name: "fk".into(),
+            columns: strings(&["customer_id"]),
+            referenced_table: TableRef::new("shop", "customers"),
+            referenced_columns: strings(&["id"]),
+            on_update: "NO ACTION".into(),
+            on_delete: "CASCADE".into(),
+        }
+    }
+
+    #[test]
+    fn create_table_is_one_statement_with_everything_inline() {
+        for d in both() {
+            let mut draft = TableDraft::new(t());
+            draft.comment = Some("it's ours".into());
+            draft.columns.push(ColumnDraft {
+                default: Some("'new'".into()),
+                comment: Some(r"a\b".into()),
+                ..draft_column("status", "varchar(20)", false)
+            });
+            draft.columns.push(draft_column("customer_id", "int", true));
+            draft.indexes = vec![
+                IndexDraft {
+                    original: None,
+                    name: "by status".into(),
+                    columns: strings(&["status"]),
+                    unique: true,
+                },
+                IndexDraft {
+                    original: None,
+                    name: "by customer".into(),
+                    columns: strings(&["customer_id", "status"]),
+                    unique: false,
+                },
+            ];
+            draft.foreign_keys = vec![foreign_key()];
+            assert_eq!(
+                d.create_table_sql(&draft).unwrap(),
+                strings(&["CREATE TABLE `shop`.`order items` (\n    \
+                     `id` bigint NOT NULL AUTO_INCREMENT,\n    \
+                     `status` varchar(20) NOT NULL DEFAULT 'new' COMMENT _utf8mb4 X'615c62',\n    \
+                     `customer_id` int NULL,\n    \
+                     PRIMARY KEY (`id`),\n    \
+                     UNIQUE INDEX `by status` (`status`),\n    \
+                     INDEX `by customer` (`customer_id`, `status`),\n    \
+                     CONSTRAINT `fk` FOREIGN KEY (`customer_id`) REFERENCES `shop`.`customers` (`id`) \
+                     ON UPDATE NO ACTION ON DELETE CASCADE\n) COMMENT = 'it''s ours'"])
+            );
+        }
+    }
+
+    #[test]
+    fn alter_table_drops_foreign_keys_first_then_does_the_rest_at_once() {
+        let from = |name: &str, data_type: &str| ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: true,
+            collation: Some("utf8mb4_bin".into()),
+            ..column(TypeKind::Text)
+        };
+        let code = from("code", "varchar(10)");
+        let note = from("note", "varchar(10)");
+        let changes = [
+            TableChange::DropForeignKey("fk".into()),
+            TableChange::DropForeignKey("fk2".into()),
+            TableChange::DropIndex("old".into()),
+            TableChange::DropPrimaryKey("PRIMARY".into()),
+            TableChange::DropColumn("gone".into()),
+            TableChange::RenameColumn {
+                from: "code".into(),
+                to: "kode".into(),
+            },
+            TableChange::RenameColumn {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            TableChange::AddColumn(ColumnDraft {
+                default: Some("0".into()),
+                ..draft_column("n", "int", false)
+            }),
+            // Renamed and altered: one CHANGE COLUMN, collation kept.
+            TableChange::AlterColumn {
+                name: "kode".into(),
+                from: code.clone(),
+                to: ColumnDraft {
+                    nullable: false,
+                    ..ColumnDraft {
+                        name: "kode".into(),
+                        ..ColumnDraft::from(&code)
+                    }
+                },
+            },
+            // Retyped: the collation of the old type is not carried over.
+            TableChange::AlterColumn {
+                name: "note".into(),
+                from: note.clone(),
+                to: ColumnDraft {
+                    data_type: "text".into(),
+                    comment: Some("n".into()),
+                    ..ColumnDraft::from(&note)
+                },
+            },
+            TableChange::AddPrimaryKey(strings(&["id", "n"])),
+            TableChange::AddIndex(IndexDraft {
+                original: None,
+                name: "i".into(),
+                columns: strings(&["b"]),
+                unique: false,
+            }),
+            TableChange::AddForeignKey(foreign_key()),
+            TableChange::SetTableComment(None),
+            TableChange::RenameTable {
+                to: "orders".into(),
+            },
+        ];
+        for d in both() {
+            assert_eq!(
+                d.alter_table_sql(&t(), &changes).unwrap(),
+                strings(&[
+                    "ALTER TABLE `shop`.`order items`\n    \
+                     DROP FOREIGN KEY `fk`,\n    DROP FOREIGN KEY `fk2`",
+                    "ALTER TABLE `shop`.`order items`\n    \
+                     DROP INDEX `old`,\n    \
+                     DROP PRIMARY KEY,\n    \
+                     DROP COLUMN `gone`,\n    \
+                     CHANGE COLUMN `code` `kode` varchar(10) COLLATE utf8mb4_bin NOT NULL,\n    \
+                     RENAME COLUMN `a` TO `b`,\n    \
+                     ADD COLUMN `n` int NOT NULL DEFAULT 0,\n    \
+                     MODIFY COLUMN `note` text NULL COMMENT 'n',\n    \
+                     ADD PRIMARY KEY (`id`, `n`),\n    \
+                     ADD INDEX `i` (`b`),\n    \
+                     ADD CONSTRAINT `fk` FOREIGN KEY (`customer_id`) REFERENCES `shop`.`customers` (`id`) \
+                     ON UPDATE NO ACTION ON DELETE CASCADE,\n    \
+                     COMMENT = '',\n    \
+                     RENAME TO `shop`.`orders`",
+                ])
+            );
+            // Nothing to do, nothing to run; no foreign key, one statement.
+            assert_eq!(d.alter_table_sql(&t(), &[]).unwrap(), Vec::<String>::new());
+            assert_eq!(
+                d.alter_table_sql(&t(), &[TableChange::SetTableComment(Some("x".into()))])
+                    .unwrap(),
+                strings(&["ALTER TABLE `shop`.`order items`\n    COMMENT = 'x'"])
+            );
+        }
+    }
+
+    #[test]
+    fn a_generated_column_is_not_rewritten() {
+        let mut total = column(TypeKind::Integer);
+        total.name = "total".into();
+        total.data_type = "int".into();
+        total.generation = Some(ColumnGeneration::Stored("a + b".into()));
+        let change = TableChange::AlterColumn {
+            name: "total".into(),
+            from: total.clone(),
+            to: ColumnDraft {
+                comment: Some("sum".into()),
+                ..ColumnDraft::from(&total)
+            },
+        };
+        for d in both() {
+            assert_eq!(
+                refusal(
+                    d.alter_table_sql(&t(), std::slice::from_ref(&change))
+                        .map(|statements| statements.join(";"))
+                ),
+                "changing the generated column `total` from the table form; \
+                 write the ALTER TABLE statement instead"
             );
         }
     }

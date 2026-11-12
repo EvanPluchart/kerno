@@ -305,6 +305,10 @@ pub struct IndexInfo {
     pub unique: bool,
     /// Backs the primary key.
     pub primary: bool,
+    /// Backs a primary key, unique or exclusion constraint and goes with it:
+    /// it is dropped by dropping the constraint. MySQL's unique keys are
+    /// plain indexes (listed as constraints too) and are not marked.
+    pub backs_constraint: bool,
     /// Access method (`btree`, `gin`, `FULLTEXT`, ...).
     pub method: String,
     /// Partial-index predicate.
@@ -482,6 +486,7 @@ mod tests {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             unique: true,
             primary: false,
+            backs_constraint: false,
             method: "btree".into(),
             predicate: predicate.map(Into::into),
             definition: None,

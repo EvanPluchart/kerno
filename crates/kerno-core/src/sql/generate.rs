@@ -411,6 +411,7 @@ mod tests {
                 columns: vec!["email".into()],
                 unique: true,
                 primary: false,
+                backs_constraint: false,
                 method: "btree".into(),
                 predicate: None,
                 definition: None,

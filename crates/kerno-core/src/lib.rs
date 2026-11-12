@@ -19,6 +19,7 @@ pub mod sort;
 pub mod sql;
 pub mod ssh;
 pub mod storage;
+pub mod table_draft;
 #[cfg(feature = "test-support")]
 pub mod testing;
 

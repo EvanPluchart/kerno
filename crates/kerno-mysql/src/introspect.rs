@@ -700,6 +700,8 @@ async fn indexes(session: &MysqlSession, table: &TableRef) -> Result<Vec<IndexIn
                 name,
                 unique,
                 primary,
+                // A unique key is the index itself (`DROP INDEX` drops it).
+                backs_constraint: primary,
                 method,
                 predicate: None,
             }

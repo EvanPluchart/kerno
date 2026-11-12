@@ -1021,6 +1021,7 @@ mod tests {
                     columns: vec!["id".into()],
                     unique: true,
                     primary: true,
+                    backs_constraint: true,
                     method: "btree".into(),
                     predicate: None,
                     definition: None,
