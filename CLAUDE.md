@@ -273,6 +273,17 @@ each. Not in v1.
       coverage, settings, packaging, Linux container build, README, docs.
 - Keep `docs/PLAN.md` (milestones and status), `docs/PROGRESS.md` (log), `docs/DECISIONS.md` (choices and
   why) current. Update them before each commit.
+- Model budget (owner request): the main session plans, reviews and integrates; subagents implement.
+  - Write an implementation plan per remaining milestone in `docs/plans/M<n>.md` first: files to touch,
+    types and functions, catalog queries per engine, tests to write, acceptance checks, screenshots to take.
+    Detailed enough that an agent with no other context can implement it from the plan, CLAUDE.md and the
+    code.
+  - Implementation goes to subagents with the Agent tool, `model: "opus"`, `effort: "high"`, one bounded
+    part of a plan per agent.
+  - Mechanical work (running the test suite, captures, grep and inventory, doc updates, formatting) can go
+    to `model: "sonnet"` or `model: "haiku"` when that is enough.
+  - At most 2 subagents at once (they share `target/` and the CPU). Review each result yourself (diff, tests,
+    capture) before committing.
 - Commit locally only. Never add a remote, push, tag a release or publish anything.
 - Use context7 for library docs; read the pinned sources when the docs and the code disagree.
 
