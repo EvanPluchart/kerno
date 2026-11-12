@@ -6,6 +6,7 @@ mod connections;
 mod data;
 mod engine_logo;
 mod export_dialog;
+mod import_dialog;
 mod library;
 mod logging;
 mod navigator;
@@ -28,11 +29,11 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
-    FindInEditor, FormatSql, ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette,
-    OpenSettings, OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs,
-    SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme,
-    UseLightTheme, UseSystemTheme,
+    About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData,
+    FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection, NewQueryTab,
+    OpenCommandPalette, OpenSettings, OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement,
+    SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar,
+    UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -152,6 +153,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Open SQL File…", OpenSqlFile),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::action("Save As…", SaveFileAs),
+                MenuItem::separator(),
+                MenuItem::action("Export…", ExportData),
+                MenuItem::action("Import CSV…", ImportCsv),
                 MenuItem::separator(),
                 MenuItem::action("Import Connections…", ImportConnections),
                 MenuItem::action("Export Connections…", ExportConnections),

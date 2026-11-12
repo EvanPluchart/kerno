@@ -361,6 +361,18 @@ impl ExportDialog {
         cx.notify();
     }
 
+    /// Where the export is, in words; for tests.
+    #[cfg(test)]
+    pub fn state(&self) -> String {
+        match &self.state {
+            State::Options => "options".into(),
+            State::Running { .. } => "running".into(),
+            State::Done { progress, .. } => format!("done: {} rows", progress.rows),
+            State::Cancelled => "cancelled".into(),
+            State::Failed(error) => format!("failed: {error}"),
+        }
+    }
+
     /// One line about what is exported.
     fn source_text(&self) -> String {
         match &self.source {

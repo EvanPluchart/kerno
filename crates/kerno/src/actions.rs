@@ -46,6 +46,10 @@ gpui_kit::actions!(
         ApplyChanges,
         /// Forgets the pending changes.
         DiscardChanges,
+        /// Writes the rows of the table or result on screen to a file.
+        ExportData,
+        /// Imports a CSV file into a table.
+        ImportCsv,
         /// Opens the editor's search panel.
         FindInEditor,
         /// Opens the editor's search panel with its replace row.
@@ -296,6 +300,30 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["revert", "undo edits"],
         DiscardChanges
+    ),
+    command!(
+        "export_data",
+        "Export…",
+        "Data",
+        [],
+        [
+            "csv",
+            "json",
+            "ndjson",
+            "markdown",
+            "insert",
+            "write rows",
+            "dump"
+        ],
+        ExportData
+    ),
+    command!(
+        "import_csv",
+        "Import CSV…",
+        "Data",
+        [],
+        ["load", "csv", "insert rows", "spreadsheet"],
+        ImportCsv
     ),
     // The editor binds its own search keys (Cmd+F, Cmd+Shift+F) while it has
     // the focus; these make the panel reachable from the palette and the menu.

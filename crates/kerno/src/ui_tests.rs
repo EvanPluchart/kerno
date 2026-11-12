@@ -4610,3 +4610,533 @@ async fn a_table_form_is_not_restored_after_a_restart(cx: &mut TestAppContext) {
     assert_eq!(restarted.titles(cx), ["Query 1", "Query 2"]);
     assert_eq!(restarted.active(cx), Some(0));
 }
+
+// Export and import ------------------------------------------------------------
+
+impl Fixture {
+    /// Answers the export dialog's "Choose file…" with `path`, then waits
+    /// for the export to end.
+    fn export_to(&self, cx: &mut TestAppContext, path: &Path) {
+        self.click(cx, "export-choose-file");
+        let path = path.to_path_buf();
+        cx.simulate_new_path_selection(move |_| Some(path));
+        self.wait_until(cx, "the export", |app, cx| {
+            ["export-done", "export-failed", "export-cancelled"]
+                .into_iter()
+                .any(|id| app.has(cx, id))
+        });
+    }
+
+    /// The connection the tests use, as a target.
+    fn target(&self, cx: &mut TestAppContext, database: Option<&str>) -> Target {
+        let connection = cx.update(|cx| self.connections.read(cx).saved()[0].id.clone());
+        Target {
+            connection,
+            database: database.map(str::to_string),
+            schema: None,
+        }
+    }
+
+    /// Opens the import dialog into `table`, or into a new table of `schema`.
+    fn import_dialog(
+        &self,
+        cx: &mut TestAppContext,
+        schema: &str,
+        table: Option<TableRef>,
+    ) -> Option<Entity<crate::import_dialog::ImportDialog>> {
+        let target = self.target(cx, None);
+        let (workspace, schema) = (self.workspace.clone(), schema.to_string());
+        self.step(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.import_csv_into(target, schema, table, window, cx)
+            })
+        })
+    }
+
+    /// Chooses `path` in an import dialog and waits for its preview.
+    fn import_file(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<crate::import_dialog::ImportDialog>,
+        path: &Path,
+    ) -> String {
+        self.click(cx, "import-choose-file");
+        let path = path.to_path_buf();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        self.wait_until(cx, "the preview", |_, cx| {
+            cx.update(|cx| dialog.read(cx).state(cx))
+                .starts_with("options: ")
+        });
+        cx.update(|cx| dialog.read(cx).state(cx))
+    }
+
+    /// Maps, confirms and runs an import, and waits for it to end.
+    fn run_import(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<crate::import_dialog::ImportDialog>,
+    ) -> String {
+        // "Map columns…" waits for the columns of an existing table.
+        self.wait_until(cx, "the mapping", |app, cx| {
+            app.click(cx, "import-next");
+            !cx.update(|cx| dialog.read(cx).state(cx))
+                .starts_with("options")
+        });
+        let state = cx.update(|cx| dialog.read(cx).state(cx));
+        assert_eq!(state, "mapping");
+        self.click(cx, "import-start");
+        assert!(self.has(cx, "sql-preview"), "the SQL is shown first");
+        self.click(cx, "sql-confirm");
+        self.wait_until(cx, "the import", |_, cx| {
+            let state = cx.update(|cx| dialog.read(cx).state(cx));
+            ["done", "failed", "cancelled"]
+                .iter()
+                .any(|end| state.starts_with(end))
+        });
+        cx.update(|cx| dialog.read(cx).state(cx))
+    }
+}
+
+#[gpui_kit::test]
+fn a_filtered_table_is_exported_to_csv_and_json_through_the_dialog(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, create) = scratch_schema(engine, "kerno_ui_export");
+        let _scratch = Scratch::new(
+            engine,
+            &[&cleanup],
+            &[
+                &create,
+                "CREATE TABLE kerno_ui_export.t (id INT PRIMARY KEY, name TEXT, note TEXT)",
+                "INSERT INTO kerno_ui_export.t VALUES \
+                 (1, 'plain', NULL), (2, 'a, \"quoted\" one', 'x'), (3, 'third', NULL)",
+            ],
+        );
+        let app = connected(cx, engine);
+        let dir = tempfile::tempdir().unwrap();
+        app.open_table(cx, "kerno_ui_export", "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–3 of 3");
+        app.on_data(cx, |tab, window, cx| {
+            tab.set_filter(
+                Filter {
+                    conditions: vec![Condition {
+                        column: "id".into(),
+                        operator: Operator::Greater,
+                        value: "1".into(),
+                    }],
+                    raw: String::new(),
+                },
+                window,
+                cx,
+            )
+        });
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+
+        // CSV: every row the filter keeps, not one page of them.
+        let tab = app.data(cx);
+        let dialog = app
+            .step(cx, |window, cx| {
+                tab.update(cx, |tab, cx| tab.export(window, cx))
+            })
+            .expect("the export dialog");
+        let csv = dir.path().join("t.csv");
+        app.export_to(cx, &csv);
+        assert_eq!(
+            cx.update(|cx| dialog.read(cx).state()),
+            "done: 2 rows",
+            "{engine:?}"
+        );
+        assert!(app.has(cx, "export-reveal"));
+        assert_eq!(
+            std::fs::read_to_string(&csv).unwrap(),
+            "id,name,note\r\n2,\"a, \"\"quoted\"\" one\",x\r\n3,third,\r\n",
+            "{engine:?}"
+        );
+        app.click(cx, "export-close");
+        assert!(!app.has(cx, "export-dialog"));
+
+        // JSON, from the toolbar button this time.
+        app.click(cx, "data-export");
+        app.click(cx, ("export-format", 2usize));
+        let json = dir.path().join("t.json");
+        app.export_to(cx, &json);
+        assert!(app.has(cx, "export-done"), "{engine:?}");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!([
+                {"id": 2, "name": "a, \"quoted\" one", "note": "x"},
+                {"id": 3, "name": "third", "note": null},
+            ]),
+            "{engine:?}"
+        );
+        app.click(cx, "export-close");
+
+        // The tree offers it too, for the whole table.
+        let path: &[&str] = match engine {
+            Engine::Postgres => &["kerno", "kerno_ui_export", "Tables", "t"],
+            _ => &["kerno_ui_export", "Tables", "t"],
+        };
+        app.open_path(cx, path);
+        app.act(cx, Action::Export, path);
+        let all = dir.path().join("all.csv");
+        app.export_to(cx, &all);
+        assert_eq!(
+            std::fs::read_to_string(&all).unwrap().lines().count(),
+            4,
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_slow_export_is_cancelled_and_leaves_no_file(cx: &mut TestAppContext) {
+    for (engine, sql) in [
+        (Engine::Postgres, "SELECT pg_sleep(60) AS slept"),
+        (Engine::MariaDb, "SELECT SLEEP(60) AS slept"),
+    ] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let dir = tempfile::tempdir().unwrap();
+        let target = app.target(cx, None);
+        let connections = app.connections.clone();
+        let dialog = app
+            .step(cx, |window, cx| {
+                crate::export_dialog::open(
+                    connections,
+                    target,
+                    crate::export_dialog::Source::Query { sql: sql.into() },
+                    window,
+                    cx,
+                )
+            })
+            .expect("the export dialog");
+        let file = dir.path().join("slow.csv");
+        app.click(cx, "export-choose-file");
+        let chosen = file.clone();
+        cx.simulate_new_path_selection(move |_| Some(chosen));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| dialog.read(cx).state()), "running");
+        assert!(app.has(cx, "export-progress"));
+        // The server says nothing for a minute; the cancel does not wait.
+        app.click(cx, "export-cancel");
+        app.wait_until(cx, "the cancel", |_, cx| {
+            cx.update(|cx| dialog.read(cx).state()) != "running"
+        });
+        assert_eq!(cx.update(|cx| dialog.read(cx).state()), "cancelled");
+        assert!(!file.exists(), "{engine:?}");
+        assert!(!dir.path().join("slow.csv.tmp").exists(), "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_query_result_is_exported_by_running_its_statement_again(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_export_result CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_export_result",
+            "CREATE TABLE kerno_ui_export_result.t (id serial PRIMARY KEY, name text)",
+            "INSERT INTO kerno_ui_export_result.t (name) VALUES ('a'), ('b'), ('c')",
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let dir = tempfile::tempdir().unwrap();
+    app.run_in_new_tab(
+        cx,
+        "select id, name from kerno_ui_export_result.t order by id",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["3 rows"]);
+    app.click(cx, "result-export");
+    assert!(app.has(cx, "export-dialog"));
+    app.click(cx, ("export-format", 3usize));
+    let file = dir.path().join("result.ndjson");
+    app.export_to(cx, &file);
+    assert!(app.has(cx, "export-done"));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "{\"id\":1,\"name\":\"a\"}\n{\"id\":2,\"name\":\"b\"}\n{\"id\":3,\"name\":\"c\"}\n"
+    );
+    app.click(cx, "export-close");
+
+    // A statement that writes returns rows, but is not run again.
+    app.run_in_new_tab(
+        cx,
+        "insert into kerno_ui_export_result.t (name) values ('d') returning id",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the insert", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    assert!(!app.has(cx, "result-export"));
+
+    // A tab that runs in a schema exports in that schema too.
+    let schema = ["kerno", "kerno_ui_export_result"];
+    app.open_path(cx, &schema);
+    app.act(cx, Action::NewQueryHere, &schema);
+    app.wait_until(cx, "the tab of the schema", |app, cx| {
+        app.titles(cx).last().map(String::as_str) == Some("kerno_ui_export_result")
+    });
+    let tab = app.tab(cx);
+    let editor = cx.update(|cx| tab.read(cx).editor().clone());
+    app.step(cx, |window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replace_all("select count(*) as n from t", window, cx)
+        })
+    });
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the count", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    app.click(cx, "result-export");
+    let file = dir.path().join("count.csv");
+    app.export_to(cx, &file);
+    assert!(app.has(cx, "export-done"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "n\r\n4\r\n");
+}
+
+#[gpui_kit::test]
+fn a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, create) = scratch_schema(engine, "kerno_ui_import");
+        let _scratch = Scratch::new(
+            engine,
+            &[&cleanup],
+            &[
+                &create,
+                "CREATE TABLE kerno_ui_import.people (id INT PRIMARY KEY, name TEXT, age INT)",
+            ],
+        );
+        let server = |sql: &str| on_server(engine, sql);
+        let app = connected(cx, engine);
+        let dir = tempfile::tempdir().unwrap();
+        let tables: &[&str] = match engine {
+            Engine::Postgres => &["kerno", "kerno_ui_import", "Tables"],
+            _ => &["kerno_ui_import", "Tables"],
+        };
+        app.open_path(cx, &[tables, &["people"]].concat());
+        app.open_table(cx, "kerno_ui_import", "people", RelationKind::Table);
+        app.wait_for_rows(cx, "No rows");
+
+        // Into the table: semicolons, columns in another order, one the
+        // table does not have, and an empty age that is NULL.
+        let file = dir.path().join("people.csv");
+        std::fs::write(
+            &file,
+            "Name;ID;city;age\nAda;1;London;36\n\"Bob; Jr\";2;Paris;\n",
+        )
+        .unwrap();
+        let dialog = app
+            .import_dialog(
+                cx,
+                "kerno_ui_import",
+                Some(TableRef::new("kerno_ui_import", "people")),
+            )
+            .expect("the import dialog");
+        assert_eq!(
+            app.import_file(cx, &dialog, &file),
+            "options: 4 columns, 2 rows, delimiter ';'",
+            "{engine:?}"
+        );
+        assert!(app.has(cx, "import-preview"));
+        assert_eq!(app.run_import(cx, &dialog), "done: 2 rows", "{engine:?}");
+        assert_eq!(
+            server(
+                "SELECT concat(count(*), '/', count(age), '/', max(name)) \
+                 FROM kerno_ui_import.people"
+            ),
+            "2/1/Bob; Jr",
+            "{engine:?}"
+        );
+        // The open tab shows the new rows.
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        app.click(cx, "import-close");
+
+        // Into a new table named after the file, with guessed types.
+        let file = dir.path().join("Prices.csv");
+        std::fs::write(
+            &file,
+            "code,price,day\nA1,1.5,2024-01-02\nB2,2,2024-02-03\n",
+        )
+        .unwrap();
+        let dialog = app
+            .import_dialog(cx, "kerno_ui_import", None)
+            .expect("the import dialog");
+        app.import_file(cx, &dialog, &file);
+        assert_eq!(app.run_import(cx, &dialog), "done: 2 rows", "{engine:?}");
+        assert_eq!(
+            server("SELECT sum(price) FROM kerno_ui_import.prices"),
+            if engine == Engine::Postgres {
+                "3.5"
+            } else {
+                "3.5000000000"
+            },
+            "{engine:?}"
+        );
+        // The tree lists it.
+        app.wait_until(cx, "the new table in the tree", |app, cx| {
+            app.shows(cx, &[tables, &["prices"]].concat())
+        });
+        app.click(cx, "import-close");
+
+        // The tree's entry opens the same dialog, and so do the commands,
+        // for the table on screen.
+        app.act(cx, Action::ImportCsv, tables);
+        assert!(app.has(cx, "import-dialog"), "{engine:?}");
+        app.click(cx, "import-close");
+        for (command, dialog, close) in [
+            (
+                Box::new(crate::actions::ImportCsv) as Box<dyn gpui_kit::Action>,
+                "import-dialog",
+                "import-close",
+            ),
+            (
+                Box::new(crate::actions::ExportData),
+                "export-dialog",
+                "export-close",
+            ),
+        ] {
+            app.step(cx, |window, cx| window.dispatch_action(command, cx));
+            assert!(app.has(cx, dialog), "{engine:?} {dialog}");
+            app.click(cx, close);
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_failed_import_says_which_line_and_keeps_nothing(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, create) = scratch_schema(engine, "kerno_ui_import_fail");
+        let _scratch = Scratch::new(
+            engine,
+            &[&cleanup],
+            &[
+                &create,
+                "CREATE TABLE kerno_ui_import_fail.t (id INT PRIMARY KEY, age INT)",
+            ],
+        );
+        let server = |sql: &str| on_server(engine, sql);
+        let app = connected(cx, engine);
+        let dir = tempfile::tempdir().unwrap();
+
+        // A value the server refuses, at line 4.
+        let file = dir.path().join("bad.csv");
+        std::fs::write(&file, "id,age\n1,10\n2,20\nx3,30\n").unwrap();
+        let dialog = app
+            .import_dialog(
+                cx,
+                "kerno_ui_import_fail",
+                Some(TableRef::new("kerno_ui_import_fail", "t")),
+            )
+            .expect("the import dialog");
+        app.import_file(cx, &dialog, &file);
+        let report = app.run_import(cx, &dialog);
+        assert!(
+            report.starts_with("failed: line 4: "),
+            "{engine:?}: {report}"
+        );
+        assert!(app.has(cx, "import-failed"));
+        assert_eq!(
+            server("SELECT count(*) FROM kerno_ui_import_fail.t"),
+            "0",
+            "{engine:?}"
+        );
+        app.click(cx, "import-close");
+
+        // A new table that exists already: nothing is created, and the
+        // table that was there is not dropped.
+        on_server(engine, "CREATE TABLE kerno_ui_import_fail.taken (n INT)");
+        on_server(
+            engine,
+            "INSERT INTO kerno_ui_import_fail.taken VALUES (1), (2)",
+        );
+        let file = dir.path().join("taken.csv");
+        std::fs::write(&file, "n\n3\n").unwrap();
+        let dialog = app
+            .import_dialog(cx, "kerno_ui_import_fail", None)
+            .expect("the import dialog");
+        app.import_file(cx, &dialog, &file);
+        let report = app.run_import(cx, &dialog);
+        assert!(report.starts_with("failed: "), "{engine:?}: {report}");
+        assert!(!report.contains("dropped"), "{engine:?}: {report}");
+        assert_eq!(
+            server("SELECT count(*) FROM kerno_ui_import_fail.taken"),
+            "2",
+            "{engine:?}"
+        );
+        app.click(cx, "import-close");
+
+        // A new table whose 62nd line does not fit the type guessed from
+        // the first rows: the table does not stay.
+        let mut text = String::from("n\n");
+        for n in 1..=60 {
+            text.push_str(&format!("{n}\n"));
+        }
+        text.push_str("oops\n");
+        let file = dir.path().join("numbers.csv");
+        std::fs::write(&file, text).unwrap();
+        let dialog = app
+            .import_dialog(cx, "kerno_ui_import_fail", None)
+            .expect("the import dialog");
+        app.import_file(cx, &dialog, &file);
+        let report = app.run_import(cx, &dialog);
+        assert!(
+            report.starts_with("failed: line 62: "),
+            "{engine:?}: {report}"
+        );
+        // MariaDB created it on its own and dropped it again; PostgreSQL
+        // rolled the CREATE back with the rest.
+        assert_eq!(
+            report.ends_with("(table dropped)"),
+            engine == Engine::MariaDb,
+            "{report}"
+        );
+        assert_eq!(
+            server(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_schema = 'kerno_ui_import_fail' AND table_name = 'numbers'"
+            ),
+            "0",
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_read_only_connection_cannot_import(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    let tables = ["kerno", "shop", "Tables"];
+    app.open_path(cx, &[&tables[..], &["customers"]].concat());
+    assert_eq!(
+        app.why_not(cx, Action::ImportCsv, &tables),
+        Some("read-only connection")
+    );
+    app.act(cx, Action::ImportCsv, &tables);
+    assert!(!app.has(cx, "import-dialog"));
+    assert!(app.import_dialog(cx, "shop", None).is_none());
+    // Exporting only reads: it stays offered.
+    assert_eq!(
+        app.why_not(
+            cx,
+            Action::Export,
+            &["kerno", "shop", "Tables", "customers"]
+        ),
+        None
+    );
+}

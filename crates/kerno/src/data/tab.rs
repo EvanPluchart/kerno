@@ -198,6 +198,10 @@ impl DataTab {
         &self.table
     }
 
+    pub fn kind(&self) -> RelationKind {
+        self.kind
+    }
+
     pub fn target(&self) -> &Target {
         &self.target
     }

@@ -27,11 +27,11 @@ use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_co
 
 use crate::actions::{
     self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, DeleteRows, DiscardChanges,
-    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, FindInEditor, FormatSql,
-    ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings,
-    OpenSqlFile, PreviousTab, RefreshData, ReplaceInEditor, RunAll, RunStatement, SaveFile,
-    SaveFileAs, SaveQuery, SetDefault, SetNull, ShowHistory, ShowSavedQueries, ToggleComment,
-    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData, FindInEditor,
+    FormatSql, ImportConnections, ImportCsv, NewConnection, NewQueryTab, NextTab,
+    OpenCommandPalette, OpenSettings, OpenSqlFile, PreviousTab, RefreshData, ReplaceInEditor,
+    RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, SetDefault, SetNull, ShowHistory,
+    ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -39,6 +39,7 @@ use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
 use crate::data::tab::{DataTab, DataTabEvent};
+use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
@@ -861,8 +862,13 @@ impl Workspace {
                 let tab = self.open_query(title.clone(), sql, target.clone(), window, cx);
                 tab.update(cx, |tab, cx| tab.set_source(Some(schema.clone()), cx));
             }
-            // The import dialog is wired in a later step (M8 part 2).
-            NavigatorEvent::ImportCsv { .. } => {}
+            NavigatorEvent::ImportCsv {
+                target,
+                schema,
+                table,
+            } => {
+                self.import_csv_into(target.clone(), schema.clone(), table.clone(), window, cx);
+            }
         }
     }
 
@@ -1177,6 +1183,134 @@ impl Workspace {
     ) {
         if let Some(tab) = self.active_data_tab().cloned() {
             tab.update(cx, |tab, cx| act(tab, window, cx));
+        }
+    }
+
+    // Export and import ------------------------------------------------------
+
+    /// Exports what is on screen: the rows of a table, or a query result.
+    fn export_data(&mut self, _: &ExportData, window: &mut Window, cx: &mut Context<Self>) {
+        // The tabs say themselves why they cannot export (not connected).
+        let opened = if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.export(window, cx));
+            true
+        } else if let Some(tab) = self.active_query_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.export_result(window, cx))
+                .is_some()
+        } else {
+            false
+        };
+        if !opened {
+            window.push_notification(
+                Notification::warning(
+                    "Open the rows of a table, or run a statement that returns rows: \
+                     that is what is exported.",
+                ),
+                cx,
+            );
+        }
+    }
+
+    /// Imports a CSV file into the table on screen, or into a new table of
+    /// the connection being browsed.
+    fn import_csv(&mut self, _: &ImportCsv, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_data_tab()
+            && tab.read(cx).kind().is_table()
+        {
+            let tab = tab.read(cx);
+            let (target, table) = (tab.target().clone(), tab.table().clone());
+            self.import_csv_into(target, table.schema.clone(), Some(table), window, cx);
+            return;
+        }
+        let meta = self.default_target(cx).and_then(|target| {
+            let meta = self.connections.read(cx).meta_session(&target.connection)?;
+            Some((target, meta))
+        });
+        let Some((target, meta)) = meta else {
+            window.push_notification(
+                Notification::warning(
+                    "Connect first: the file is imported into a new table of the connection \
+                     shown in the sidebar.",
+                ),
+                cx,
+            );
+            return;
+        };
+        let schema = if meta.dialect().has_schemas() {
+            Some("public".to_string())
+        } else {
+            meta.database()
+        };
+        let Some(schema) = schema else {
+            window.push_notification(
+                Notification::warning(
+                    "Choose a database first: right-click it in the tree and choose \
+                     “Import CSV…”.",
+                ),
+                cx,
+            );
+            return;
+        };
+        self.import_csv_into(target, schema, None, window, cx);
+    }
+
+    /// Opens the import of a CSV file into `table`, or into a new table of
+    /// `schema`.
+    pub fn import_csv_into(
+        &mut self,
+        target: Target,
+        schema: String,
+        table: Option<TableRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ImportDialog>> {
+        let workspace = cx.entity().downgrade();
+        let imported = target.clone();
+        import_dialog::open(
+            self.connections.clone(),
+            target,
+            schema,
+            table,
+            window,
+            cx,
+            move |table, window, cx| {
+                let _ =
+                    workspace.update(cx, |this, cx| this.imported(&imported, table, window, cx));
+            },
+        )
+    }
+
+    /// Shows what an import added: the tables of its schema in the tree,
+    /// and the rows of an open data tab of the table.
+    fn imported(
+        &mut self,
+        target: &Target,
+        table: &TableRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| {
+            navigator.refresh_tables(
+                &target.connection,
+                target.database.as_deref(),
+                &table.schema,
+                cx,
+            )
+        });
+        for tab in self.tabs.iter().filter_map(OpenTab::data) {
+            let same = {
+                let tab = tab.read(cx);
+                let shown = tab.target();
+                shown.connection == target.connection
+                    && tab.table() == table
+                    && (shown.database.is_none()
+                        || target.database.is_none()
+                        || shown.database == target.database)
+            };
+            if same {
+                tab.update(cx, |tab, cx| tab.refresh(window, cx));
+            }
         }
     }
 
@@ -1833,6 +1967,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::format_sql))
             .on_action(cx.listener(Self::find_in_editor))
             .on_action(cx.listener(Self::refresh_data))
+            .on_action(cx.listener(Self::export_data))
+            .on_action(cx.listener(Self::import_csv))
             .on_action(cx.listener(Self::add_row))
             .on_action(cx.listener(Self::duplicate_rows))
             .on_action(cx.listener(Self::delete_rows))
