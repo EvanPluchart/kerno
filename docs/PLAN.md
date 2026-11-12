@@ -42,8 +42,8 @@ For every feature of §4, in this order:
 
 ## Open points
 
-- `mysql` and `mysqldump` are not installed on the development Mac; installing them is a system-level
-  install (CLAUDE.md §8). To settle in milestone 8 (see DECISIONS D-006).
+- `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not
+  on `$PATH`); the backup tools find them in their fallback directories. Nothing to ask the owner.
 - Milestone 10, required by GOAL criterion 1 (owner's decision of 2026-11-12): `cargo deny check` must be
   clean with no ignored advisory. `deny.toml` ignores RUSTSEC-2023-0071 for now (timing side channel in
   `rsa`, reached only when an SSH tunnel authenticates with an RSA key file; russh pins the affected
