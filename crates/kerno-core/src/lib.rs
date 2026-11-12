@@ -11,6 +11,7 @@ pub mod result;
 pub mod schema;
 pub mod sql;
 pub mod ssh;
+pub mod storage;
 #[cfg(feature = "test-support")]
 pub mod testing;
 

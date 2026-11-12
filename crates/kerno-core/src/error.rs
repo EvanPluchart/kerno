@@ -84,6 +84,9 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// Kerno's own storage failed.
+    #[error("storage: {0}")]
+    Storage(String),
     /// A result did not have the shape a driver expected.
     #[error("unexpected response from the server: {0}")]
     Protocol(String),
