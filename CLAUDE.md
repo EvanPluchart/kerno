@@ -40,9 +40,21 @@ servers.
 
 - Licence: MIT OR Apache-2.0 (Rust convention), `LICENSE-MIT` and `LICENSE-APACHE` at the root, SPDX headers
   not needed. Check every dependency licence is compatible (`cargo deny` with a `deny.toml`).
-- Beekeeper Studio and DBeaver are references for features and UX quality only. No copied code, icons,
-  screenshots, names, colours or wording from either. Database engine logos are trademarks: use neutral
-  monochrome glyphs you draw yourself, not the vendors' logos.
+- Study the open-source code of both references to see how each feature really works (queries used for
+  introspection, edge cases per engine, SQL generation, type handling, UX flows), then implement it in
+  idiomatic Rust. Clone them shallow into `~/VM/refs/` (outside this repo, never committed, never a
+  submodule) and grep there; or use `gh api` for single files.
+  - DBeaver Community (`github.com/dbeaver/dbeaver`, Java, Apache-2.0): porting its logic to Rust is allowed.
+    When a Kerno file ports non-trivial DBeaver logic, say so in a comment naming the source file, and list
+    DBeaver in `THIRD_PARTY_NOTICES.md` with its Apache-2.0 notice.
+  - Beekeeper Studio (`github.com/beekeeper-studio/beekeeper-studio`, TypeScript/Electron, GPL-3.0): read it
+    to understand behaviour and UX, then write Kerno's code from that understanding. Never translate its code
+    line by line into Rust: a translation is a derivative work and would force Kerno under GPL-3.0. Never
+    open `src-commercial/` (proprietary licence).
+  - SQL queries against system catalogs (`pg_catalog`, `information_schema`) are facts about the engine:
+    write them from the engine docs, using the references to check you missed nothing.
+- No icons, screenshots, names, colours or wording copied from either. Database engine logos are
+  trademarks: use neutral monochrome glyphs you draw yourself, not the vendors' logos.
 - Nothing leaves the machine: no telemetry, no analytics, no update pings, no crash upload.
 
 ### Machine hygiene (the owner's Mac froze once — strict)
