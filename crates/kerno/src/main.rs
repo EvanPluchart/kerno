@@ -3,6 +3,7 @@
 mod actions;
 mod bridge;
 mod connections;
+mod engine_logo;
 mod logging;
 mod settings;
 mod sidebar;
@@ -36,7 +37,7 @@ fn main() {
     let startup = std::thread::spawn(Startup::load);
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(engine_logo::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             let started = startup

@@ -19,6 +19,7 @@ use kerno_core::storage::SavedConnection;
 use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{Connections, Status};
+use crate::engine_logo::engine_logo;
 use crate::theme;
 
 /// The sidebar view.
@@ -185,7 +186,20 @@ impl Sidebar {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_none().size(px(8.)).rounded_full().bg(tag))
+                    // The tag (or environment) colour, then the engine.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(3.))
+                            .h(px(16.))
+                            .rounded_full()
+                            .bg(tag),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(engine_logo(config.engine, px(16.), cx)),
+                    )
                     .child(
                         div()
                             .flex_1()

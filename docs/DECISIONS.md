@@ -304,3 +304,32 @@ The MySQL and MariaDB test containers now present the certificate signed by the 
 `kerno_cert` account that requires the client certificate. Covered on both engines: `verify-ca` and
 `verify-full` positive paths, wrong CA, system store, name mismatch for both modes, client certificate with
 and without its key.
+
+## D-019 — Engine logos (owner request of 2026-11-12)
+
+CLAUDE.md §1 now asks for each engine's real logo wherever an engine is named. Done for the two places that
+exist today (engine picker, sidebar connections) through one function, `engine_logo`, which the navigator
+root, tab badges and status bar will call when they exist.
+
+- Files: `crates/kerno/assets/engines/` (the app's asset directory, next to the fonts and the theme),
+  unmodified, with source URLs, checksums and trademark notices in `THIRD_PARTY_NOTICES.md`. A test checks
+  each engine has its file and that the UI kit's own icons are still served by the combined asset source.
+- PostgreSQL: the official three-colour elephant from the PostgreSQL wiki, in full colour. Its white
+  outline keeps it readable on dark surfaces, so no second variant is needed.
+- MariaDB and MySQL: the single-colour marks from Simple Icons (a source the spec names), drawn in one flat
+  colour: the theme's text colour, so dark on light and light on dark. Both vendors publish black and
+  reversed variants of their marks, which is what this reproduces; no brand colour is invented. MariaDB's
+  own SVG on mariadb.org is the horizontal lock-up with the wordmark, which does not fit a 16 px square.
+- No padding is drawn into the logos; callers leave clear space (4 px in the picker tile).
+
+**For the owner to confirm (MySQL).** Oracle's logo page says: "The original MySQL logo may only be used by
+MySQL representatives and companies having a written agreement with Oracle", and that a written agreement
+is needed before "displaying any MySQL logos except the Conditional Use Logos" or displaying them
+"elsewhere except on a website". Read strictly, that page does not grant what the spec's "follow each
+vendor's usage guidelines" assumes; showing the dolphin to identify a MySQL connection is what every
+database client does, and the owner's instruction treats it as nominative use. Kerno therefore ships the
+Simple Icons mark, not Oracle's original logo file, states the trademark, and never uses it in its own
+branding. If the owner prefers to be strict with Oracle's wording, the fallback is a one-line change in
+`engine_logo` (text label only for MySQL). PostgreSQL's and MariaDB's policies raise no such question for
+this use.
+

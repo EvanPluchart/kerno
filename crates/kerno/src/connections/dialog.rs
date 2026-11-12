@@ -9,8 +9,7 @@ use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -25,6 +24,7 @@ use kerno_core::storage::SavedConnection;
 
 use super::form::{ConnectionForm, Field, FieldError, SshAuthKind};
 use super::manager::{Connections, TestReport};
+use crate::engine_logo::engine_logo;
 use crate::state::AppState;
 use crate::theme;
 
@@ -512,18 +512,11 @@ impl ConnectionDialog {
                                 this.pick_engine(engine, window, cx)
                             }))
                             .child(
-                                // A plain monogram: engine logos are trademarks.
+                                // The engine's own logo, with clear space around it.
                                 div()
-                                    .size(px(28.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(theme.radius)
-                                    .bg(theme.muted)
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(theme.muted_foreground)
-                                    .child(engine_monogram(engine)),
+                                    .flex_none()
+                                    .p_1()
+                                    .child(engine_logo(engine, px(24.), cx)),
                             )
                             .child(div().text_sm().child(engine.label()))
                     })),
@@ -969,15 +962,6 @@ fn engine_key(engine: Engine) -> &'static str {
         Engine::Postgres => "postgres",
         Engine::MySql => "mysql",
         Engine::MariaDb => "mariadb",
-    }
-}
-
-/// Two letters standing for an engine, drawn in the UI typeface.
-fn engine_monogram(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "Pg",
-        Engine::MySql => "My",
-        Engine::MariaDb => "Ma",
     }
 }
 

@@ -147,3 +147,21 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
 - Still open in this milestone: captures in `docs/screenshots/`; the client-side write block of read-only
   connections arrives with the editor (milestone 5).
 
+## 2026-11-12 — Engine logos, milestone 3 closed
+
+- Owner request (CLAUDE.md §1 "Engine logos"): the two-letter monograms are replaced by the engines' logos
+  in the engine picker and on the sidebar connections (D-019, sources and trademark notices in
+  `THIRD_PARTY_NOTICES.md`). The MySQL logo policy needs the owner's confirmation (D-019, PLAN).
+- Sidebar rows: tag or environment colour as a bar on the left, then the engine logo, name and status.
+- Real app, release build, driven in the background with `orca computer`, light and dark. All four test
+  targets connected from the UI: PostgreSQL directly, PostgreSQL through the SSH bastion (host key
+  question, SSH password, database password), MySQL, MariaDB. An unreachable server shows its error on the
+  row and in a notification.
+- Captures looked at one by one, in `docs/screenshots/`: `m3-dialog-general-{light,dark}`,
+  `m3-dialog-{tls,ssh,advanced}-light`, `m3-password-prompt-{light,dark}`, `m3-ssh-trust-light`,
+  `m3-connection-failed-light`, `m3-sidebar-connected-{light,dark}`, `m3-sidebar-menu-light`.
+- Noted for the polish milestone: a "connection refused" error should say what to check; the test result
+  stays on screen after the form changes; the fingerprint in the host key question is not monospaced; the
+  sidebar row will be reworked when the schema tree hangs under it (milestone 4).
+- App tests: 44 passing with the containers required.
+

@@ -25,6 +25,32 @@ SHA-256 of the release archives the files were taken from:
 The interface icons are the Lucide set (ISC licence, https://lucide.dev), bundled through the
 `gpui-kit-assets` crate.
 
+## Database engine logos
+
+Kerno shows the logo of a database engine next to its name (engine picker, saved connections) to identify
+the engine a connection talks to. This is nominative use: the logos are not part of Kerno's own branding,
+and their presence does not mean that their owners endorse, sponsor or are affiliated with Kerno. The files
+in `crates/kerno/assets/engines/` are byte-for-byte what the sources below serve; Kerno scales them and does
+not alter them.
+
+| File | Mark | Taken from | SHA-256 |
+| --- | --- | --- | --- |
+| `postgresql.svg` | PostgreSQL elephant ("Slonik"), official three-colour artwork | https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg (listed on https://wiki.postgresql.org/wiki/Logo) | `51f93e19516081fc7d6fe6ab9bbab07abe5f7819e28016eefacea6dea691bc54` |
+| `mysql.svg` | MySQL dolphin and wordmark, single colour | Simple Icons 15.22.0, `icons/mysql.svg` (https://simpleicons.org, artwork files released under CC0-1.0) | `67c144cc3e44ad14062a3f20ebe29c5e7eeb2c2c9c0f43cf48d87fe6291a8b2d` |
+| `mariadb.svg` | MariaDB sea lion, single colour | Simple Icons 15.22.0, `icons/mariadb.svg` | `477435746bb2024048c7b71529f615fb70d7e679618f37bac49f78fd07e67dfe` |
+
+The single-colour marks are drawn in one flat colour, dark on light surfaces and light on dark ones, as the
+vendors' own black and reversed variants are. The elephant keeps its official colours.
+
+Trademark notices:
+
+- Postgres, PostgreSQL and the Slonik Logo are trademarks or registered trademarks of the PostgreSQL
+  Community Association of Canada, and used with their permission. Policy:
+  https://www.postgresql.org/about/policies/trademarks/
+- MySQL is a registered trademark of Oracle and/or its affiliates. Logo policy:
+  https://www.mysql.com/about/legal/logos.html
+- MariaDB is a registered trademark of MariaDB plc or its affiliates. Logo page: https://mariadb.com/about-us/logos/
+
 ## UI framework
 
 - GPUI, by Zed Industries (Apache-2.0), consumed as the `gpui-pre` snapshot crates.

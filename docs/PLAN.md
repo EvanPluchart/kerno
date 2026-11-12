@@ -8,7 +8,7 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 0  | Environment, pinned GPUI hello window, workspace, licences, containers, fixtures, CI file | done  |
 | 1  | Driver trait, PostgreSQL and MySQL/MariaDB drivers with tests              | done   |
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
-| 3  | Connections (§4 A)                                                         | doing  |
+| 3  | Connections (§4 A)                                                         | done   |
 | 4  | Schema navigator (§4 B)                                                    | todo   |
 | 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | todo   |
 | 6  | Table data view and editing (§4 E)                                         | todo   |
@@ -37,6 +37,9 @@ For every feature of §4, in this order:
 
 - `mysql` and `mysqldump` are not installed on the development Mac; installing them is a system-level
   install (CLAUDE.md §8). To settle in milestone 8 (see DECISIONS D-006).
+- **For the owner to confirm:** the MySQL logo. Oracle's published logo policy reserves the MySQL logo to
+  holders of a written agreement; Kerno shows the Simple Icons mark as nominative use, as the spec asks.
+  Details and the one-line fallback in DECISIONS D-019.
 - **For the owner to confirm:** `deny.toml` ignores one security advisory, RUSTSEC-2023-0071 (timing side
   channel in `rsa`, reached only when an SSH tunnel authenticates with an RSA key file). The fix exists but
   russh does not use it yet. Reasoning and alternatives in DECISIONS D-013.
