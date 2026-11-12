@@ -24,6 +24,15 @@ of each milestone, split into parts. The main session plans, reviews and commits
 by a subagent (`opus`, effort high; `sonnet` or `haiku` for mechanical work), at most two at once. If the
 main session stops, the work continues from these files.
 
+## Owner feedback of 2026-11-13 (spec commit `6100e4f`)
+
+After testing a release build: (1) a double click or Enter on a table opens its data, as DBeaver; the
+chevron and the arrow keys expand; a setting chooses data / structure / expand — `plans/CTX.md` Part 0, in
+progress; (2) context menus on every surface (sidebar, folders, connections, tab bar, editor, grids, status
+bar), connection folders and drag and drop — `plans/CTX.md` Parts 1 to 3; (3) DBeaver Community is the
+primary reference: `docs/DBEAVER-PARITY.md` is built from its source and its gaps become plan parts —
+`plans/PARITY.md`. GOAL criterion 2 requires both.
+
 ## How each feature is built
 
 For every feature of §4, in this order:

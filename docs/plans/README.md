@@ -1,7 +1,9 @@
 # Implementation plans
 
 One file per remaining milestone: `M5.md` (what is left), `M6.md` (what is left), `M7.md`, `M8.md`, `M9.md`,
-`M10.md`. Each is written so that an agent with no other context can implement it from the plan, `CLAUDE.md`
+`M10.md`; plus `CTX.md` (context menus everywhere, connection folders, navigator clicks) and `PARITY.md`
+(the DBeaver inventory and its gaps), both from the owner's feedback of 2026-11-13: DBeaver Community is
+the primary reference for features and interactions (CLAUDE.md §3). Each is written so that an agent with no other context can implement it from the plan, `CLAUDE.md`
 (the master spec, it wins over everything here) and the code. Read this page first: it holds what every
 plan shares.
 
