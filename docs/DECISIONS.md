@@ -182,3 +182,39 @@ the stack for what needs a real parse of a complete statement (classification, c
   ordinary data (`INSERT INTO api_keys VALUES ('...')`) is query text like any other and is stored. That is
   why the store file is created with mode 0600 in a 0700 directory (its `-wal`/`-shm` siblings inherit
   the mode), and tightened again at every start.
+
+## D-013 — Accepted advisory: RUSTSEC-2023-0071 in `rsa` (owner should confirm)
+
+- `cargo deny check` reports a timing side channel in the `rsa` crate ("Marvin attack"). The fixed version,
+  `rsa 0.10.0`, was published on 2026-11-08. `russh 0.65.1`, the newest release, requires
+  `rsa =0.10.0-rc.18` exactly, so Kerno cannot move to the fix until russh does.
+- Where the affected code runs in Kerno: only when a tunnel authenticates with an RSA private key *file*.
+  That is one signature per tunnel the user opens. Keys held by the SSH agent are signed by the agent,
+  not by this code; Ed25519 and ECDSA keys do not use it; verifying an RSA host key is a public-key
+  operation and is not affected.
+- Choice: keep RSA key files working (the spec requires key-file authentication, and `id_rsa` is still
+  common) and list the advisory under `[advisories] ignore` in `deny.toml` with this reason. The alternatives
+  were dropping russh's `rsa` feature (which also removes RSA host-key verification) or refusing RSA key
+  files in Kerno.
+- This is a security trade-off made on the owner's behalf: it is listed in `docs/PLAN.md` under open points.
+  Remove the ignore entry when a russh release depends on `rsa >= 0.10.0`.
+
+## D-014 — App shell
+
+- Startup: Kerno's own files (store, settings, saved tabs) are read on a separate thread while the platform
+  initialises, and joined before the window opens, so the first frame has the right theme and tabs and the
+  UI thread never reads the disk. After startup, storage and secret-store calls go through
+  `bridge::spawn_blocking`.
+- One Tokio runtime with three workers (`bridge.rs`) is the only place GPUI and Tokio meet.
+- Commands live in one table (`actions::COMMANDS`): the palette, the default key bindings and the user's
+  keymap file are derived from it. The keymap file maps command ids to shortcuts (a string, a list, or `null`);
+  overrides replace a command's defaults; unknown ids, unknown key names (GPUI's parser accepts any word as a
+  key) and shortcuts bound twice are reported in a notification at startup instead of being applied silently.
+- Theme: both modes are defined as tokens in `assets/themes/kerno.json`; a unit test computes WCAG contrast
+  for 42 text/surface pairs, the editor and every syntax colour (4.5:1), and tag colours and focus ring (3:1).
+  It caught the light-mode warning colour on the status bar at 4.43:1 before any screenshot did.
+- Tabs: the central area uses gpui-component's `TabBar` and `resizable` panels rather than its dock, which
+  brings split panes and drag-to-dock that v1 does not need. Open tabs, their unsaved text and the active
+  tab are stored 400 ms after the last change and at quit.
+- `scripts/capture.sh` runs the real app on a scratch data directory with the in-memory secret store and
+  captures its window; `KERNO_APPEARANCE` pins the theme for that run only.

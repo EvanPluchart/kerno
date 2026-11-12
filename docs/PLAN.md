@@ -7,7 +7,7 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | -- | ------------------------------------------------------------------------- | ------ |
 | 0  | Environment, pinned GPUI hello window, workspace, licences, containers, fixtures, CI file | done  |
 | 1  | Driver trait, PostgreSQL and MySQL/MariaDB drivers with tests              | doing  |
-| 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | todo |
+| 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | doing |
 | 3  | Connections (§4 A)                                                         | todo   |
 | 4  | Schema navigator (§4 B)                                                    | todo   |
 | 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | todo   |
@@ -37,3 +37,6 @@ For every feature of §4, in this order:
 
 - `mysql` and `mysqldump` are not installed on the development Mac; installing them is a system-level
   install (CLAUDE.md §8). To settle in milestone 8 (see DECISIONS D-006).
+- **For the owner to confirm:** `deny.toml` ignores one security advisory, RUSTSEC-2023-0071 (timing side
+  channel in `rsa`, reached only when an SSH tunnel authenticates with an RSA key file). The fix exists but
+  russh does not use it yet. Reasoning and alternatives in DECISIONS D-013.

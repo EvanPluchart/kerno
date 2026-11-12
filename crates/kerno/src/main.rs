@@ -1,26 +1,146 @@
-use gpui_kit::component::button::*;
-use gpui_kit::component::*;
-use gpui_kit::*;
+//! Kerno: a fast, native database client.
 
-struct Hello;
+mod actions;
+mod bridge;
+mod logging;
+mod settings;
+mod state;
+mod tabs;
+mod theme;
+#[cfg(test)]
+mod ui_tests;
+mod workspace;
 
-impl Render for Hello {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .v_flex()
-            .gap_2()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .child("Kerno")
-            .child(Button::new("ok").primary().label("Hello"))
-    }
-}
+use gpui_kit::component::{TitleBar, WindowExt as _};
+use gpui_kit::{
+    App, AppContext as _, Bounds, Focusable as _, Menu, MenuItem, WindowBounds, WindowOptions, px,
+    size,
+};
+
+use crate::actions::{
+    About, CloseTab, NewQueryTab, OpenCommandPalette, OpenSettings, Quit, ToggleSidebar,
+    UseDarkTheme, UseLightTheme, UseSystemTheme,
+};
+use crate::state::{AppState, Startup};
+use crate::theme::Appearance;
+use crate::workspace::Workspace;
 
 fn main() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
-        gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| Hello))
-            .expect("failed to open window");
-    });
+    // Kerno's own files are read on another thread while the platform
+    // starts up, so the first frame has the saved tabs and the right theme
+    // without the UI thread ever touching the disk.
+    let startup = std::thread::spawn(Startup::load);
+
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            let started = startup
+                .join()
+                .map_err(|_| anyhow::anyhow!("reading Kerno's data panicked"))
+                .and_then(|startup| startup)
+                .and_then(|startup| start(startup, cx));
+            if let Err(error) = started {
+                eprintln!("Kerno could not start: {error:#}");
+                cx.quit();
+            }
+        });
+}
+
+fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
+    logging::init(&startup.paths.logs(), cx)?;
+
+    bridge::init(cx)?;
+    // KERNO_APPEARANCE=light|dark pins the theme for one run; screenshots
+    // of the real app use it.
+    let pinned = match std::env::var("KERNO_APPEARANCE").as_deref() {
+        Ok("light") => Some(Appearance::Light),
+        Ok("dark") => Some(Appearance::Dark),
+        _ => None,
+    };
+    AppState::init(&startup, pinned, cx);
+    theme::init(AppState::get(cx).appearance(), cx)?;
+
+    let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
+    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.set_menus(menus());
+    // One window: closing it ends the app.
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+
+    let mut window_size = size(px(1280.), px(800.));
+    if let Some(display) = cx.primary_display() {
+        let available = display.bounds().size;
+        window_size.width = window_size.width.min(available.width * 0.9);
+        window_size.height = window_size.height.min(available.height * 0.9);
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            window_size,
+            cx,
+        ))),
+        window_min_size: Some(size(px(720.), px(440.))),
+        ..TitleBar::window_options()
+    };
+    let Startup {
+        connections,
+        tabs,
+        active_tab,
+        ..
+    } = startup;
+    let keymap_file = AppState::get(cx).paths.keymap();
+    gpui_kit::open_window(options, cx, move |window, cx| {
+        window.set_window_title("Kerno");
+        let workspace = cx.new(|cx| Workspace::new(connections, tabs, active_tab, window, cx));
+        workspace.focus_handle(cx).focus(window, cx);
+        for problem in keymap_problems {
+            window.push_notification(format!("{}: {problem}", keymap_file.display()), cx);
+        }
+        workspace
+    })?;
+    cx.activate(true);
+    Ok(())
+}
+
+/// The native menu bar.
+fn menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "Kerno".into(),
+            items: vec![
+                MenuItem::action("About Kerno", About),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Kerno", Quit),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Query Tab", NewQueryTab),
+                MenuItem::separator(),
+                MenuItem::action("Close Tab", CloseTab),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Command Palette…", OpenCommandPalette),
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::separator(),
+                MenuItem::action("Follow System Appearance", UseSystemTheme),
+                MenuItem::action("Light Appearance", UseLightTheme),
+                MenuItem::action("Dark Appearance", UseDarkTheme),
+            ],
+            disabled: false,
+        },
+    ]
 }

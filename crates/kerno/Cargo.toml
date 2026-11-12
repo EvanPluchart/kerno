@@ -10,4 +10,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+kerno-core.workspace = true
+kerno-postgres.workspace = true
 gpui-kit.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+kerno-core = { workspace = true, features = ["test-support"] }
+tempfile = "3"

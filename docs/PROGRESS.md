@@ -69,3 +69,31 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
     `serial` heuristic (D-011);
   - an "empty statement reports no row count" assumption was wrong (D-009); the unreachable fallback and
     its comment were removed.
+- Core additions: query parameters (`:name`, `$n`, `?`), pending-edit SQL with atomic apply (PostgreSQL tests
+  write every type of `all_types` back from its text form and check a failed apply changes nothing),
+  SQLite app storage, OS secret store. 69 core unit tests.
+- A second automated security review (storage commit) asked for wider redaction; done, with tests (D-012).
+- `cargo deny check` now fails on two things the driver dependencies brought in: a data licence
+  (allowed after reading it) and RUSTSEC-2023-0071 in `rsa`, accepted with a written reason and flagged for the
+  owner (D-013).
+- The MySQL/MariaDB driver is being written by a background agent confined to `crates/kerno-mysql`, with the
+  PostgreSQL driver and its tests as the template. Not reviewed yet; milestone 1 stays open until it is.
+
+## 2026-11-12 — Milestone 2 (in progress)
+
+- App shell in `crates/kerno`: Tokio bridge, global state, settings, theme (tokens, embedded Inter and
+  JetBrains Mono), command table with key bindings and keymap override file, workspace with sidebar, query
+  tabs holding a SQL editor, command palette, settings dialog, native menu, status bar, rotating log file.
+- 20 tests in the app crate, 8 of them through the real views in a headless window (keyboard, clicks, typed
+  text): tabs, palette, settings, restore of tabs/text/active tab across a restart, stored appearance.
+- What the UI tests and captures found:
+  - clicking a background tab's close button also activated that tab (the click bubbled); fixed;
+  - my first test helper sent several key presses in one window update, which no keyboard does; three
+    apparent failures were that, plus two wrong expectations of mine (tab numbering, Escape in the palette);
+  - the first "light" capture of the real app was dark: the system-appearance observer overrode the pinned
+    theme; fixed with an explicit override in the app state;
+  - in dark mode the editor gutter and active line were white: the theme file had no editor colours; added,
+    with a contrast test;
+  - the log directory was world-readable; now 0700.
+- Captures of the real app: `docs/screenshots/m2-empty-light.png`, `m2-tabs-light.png`, `m2-tabs-dark.png`.
+  Noted for the editor milestone: `>=` renders as a ligature, and indent guides are noisy on aligned SQL.
