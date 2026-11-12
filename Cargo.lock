@@ -4419,6 +4419,7 @@ dependencies = [
  "kerno-core",
  "kerno-mysql",
  "kerno-postgres",
+ "lsp-types",
  "serde",
  "serde_json",
  "tempfile",

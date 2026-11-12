@@ -2488,6 +2488,158 @@ fn the_editor_searches_and_replaces(cx: &mut TestAppContext) {
     assert_eq!(searching(cx), Some(true));
 }
 
+/// Labels and inserted texts completion proposes in the active tab at the
+/// `|` of `sql`.
+fn proposals(app: &Fixture, cx: &mut TestAppContext, sql: &str) -> Vec<(String, String)> {
+    let cursor = sql.find('|').expect("a | marks the cursor");
+    let text = sql.replacen('|', "", 1);
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.read(cx).completions(&text, cursor, cx))
+}
+
+fn labels(proposals: Vec<(String, String)>) -> Vec<String> {
+    proposals.into_iter().map(|(label, _)| label).collect()
+}
+
+/// Opens a query tab and waits for what its completion proposes from.
+fn new_tab_with_catalog(app: &Fixture, cx: &mut TestAppContext) {
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    app.wait_until(cx, "the completion catalog", |_, cx| {
+        cx.update(|cx| tab.read(cx).catalog_ready())
+    });
+}
+
+/// Whether the editor's completion list is open, and its labels.
+fn completion_menu(app: &Fixture, cx: &mut TestAppContext) -> (bool, Vec<String>) {
+    let tab = app.tab(cx);
+    cx.update(|cx| {
+        let editor = tab.read(cx).editor().read(cx);
+        let menu = editor.completion_menu_state();
+        let labels = menu.items.iter().map(|item| item.label.clone()).collect();
+        (menu.open, labels)
+    })
+}
+
+#[gpui_kit::test]
+fn completion_proposes_tables_columns_and_joins(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    new_tab_with_catalog(&app, cx);
+    let tables = labels(proposals(&app, cx, "select * from shop.ord|"));
+    assert!(tables.contains(&"orders".to_string()), "{tables:?}");
+    let columns = labels(proposals(&app, cx, "select o.| from shop.orders o"));
+    assert_eq!(columns[..3], ["id", "customer_id", "status"], "{columns:?}");
+    // The join along the foreign key comes first, with its condition.
+    let joins = labels(proposals(&app, cx, "select * from shop.orders o join |"));
+    assert!(
+        joins[0].contains("customers ON ") && joins[0].contains("o.customer_id"),
+        "{joins:?}"
+    );
+    // A word typed in full proposes nothing: Enter starts a new line.
+    let finished = proposals(&app, cx, "select * from shop.orders o left join|");
+    assert_eq!(finished, [], "{finished:?}");
+
+    if !testing::available(Engine::MySql) {
+        return;
+    }
+    // A table named with a reserved word is written quoted.
+    let (drop, create) = scratch_schema(Engine::MySql, "kerno_ui_complete");
+    let _scratch = Scratch::new(
+        Engine::MySql,
+        &[&drop],
+        &[&create, "CREATE TABLE kerno_ui_complete.`select` (id INT)"],
+    );
+    let app = connected(cx, Engine::MySql);
+    new_tab_with_catalog(&app, cx);
+    let tables = proposals(&app, cx, "select * from kerno_ui_complete.sel|");
+    assert_eq!(
+        tables.first(),
+        Some(&("select".to_string(), "`select`".to_string())),
+        "{tables:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn typing_in_the_editor_opens_completion_and_enter_accepts_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    new_tab_with_catalog(&app, cx);
+    app.type_text(cx, "select * from shop.cust");
+    let (open, items) = completion_menu(&app, cx);
+    assert!(open, "{items:?}");
+    assert_eq!(items[0], "customers");
+    app.press(cx, &["enter"]);
+    assert_eq!(app.active_query(cx).1, "select * from shop.customers");
+    assert!(!completion_menu(&app, cx).0);
+    // A word opens the list again; a space closes it and accepts nothing.
+    app.type_text(cx, " w");
+    assert!(completion_menu(&app, cx).0);
+    app.type_text(cx, " ");
+    assert!(!completion_menu(&app, cx).0);
+    assert_eq!(app.active_query(cx).1, "select * from shop.customers w ");
+    // After a dot come the alias's columns.
+    app.type_text(cx, "where w.");
+    let (open, items) = completion_menu(&app, cx);
+    assert!(open);
+    assert_eq!(items[..2], ["id", "email"], "{items:?}");
+}
+
+#[gpui_kit::test]
+fn the_catalog_follows_ddl(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let (drop, create) = scratch_schema(Engine::Postgres, "kerno_ui_c");
+    let _scratch = Scratch::new(Engine::Postgres, &[&drop], &[&create]);
+    let app = connected(cx, Engine::Postgres);
+    new_tab_with_catalog(&app, cx);
+    let fresh = |app: &Fixture, cx: &mut TestAppContext| {
+        labels(proposals(app, cx, "select * from kerno_ui_c.|")).contains(&"fresh".to_string())
+    };
+    assert!(!fresh(&app, cx));
+    app.type_text(cx, "create table kerno_ui_c.fresh (id int, label text)");
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the new table in completion", |app, cx| fresh(app, cx));
+    assert_eq!(app.outcomes(cx), ["done"]);
+}
+
+#[gpui_kit::test]
+fn format_sql_rewrites_the_selection_or_everything_as_one_undo_step(cx: &mut TestAppContext) {
+    use kerno_core::sql::{LexRules, format_sql};
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    let first = "select 1;\n";
+    let second = "select a, b from t where x = 1 and y = 2";
+    app.type_text(cx, &format!("{first}{second}"));
+    // The selection: the second line only, without the newline the
+    // formatter ends with.
+    app.press(cx, &["shift-home", "secondary-shift-i"]);
+    let laid_out = format_sql(second, LexRules::POSTGRES);
+    let selection_done = format!("{first}{}", laid_out.trim_end_matches('\n'));
+    assert_ne!(laid_out.trim_end(), second);
+    assert_eq!(app.active_query(cx).1, selection_done);
+    let tab = app.tab(cx);
+    let cursor = cx.update(|cx| tab.read(cx).editor().read(cx).cursor());
+    assert_eq!(cursor, first.len());
+    // No selection: everything, from the menu's command.
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(crate::actions::FormatSql), cx)
+    });
+    let everything = format_sql(&selection_done, LexRules::POSTGRES);
+    assert_ne!(everything, selection_done);
+    assert_eq!(app.active_query(cx).1, everything);
+    // Already laid out: nothing changes and there is no step to undo.
+    app.press(cx, &["secondary-shift-i"]);
+    assert_eq!(app.active_query(cx).1, everything);
+    app.press(cx, &["secondary-z"]);
+    assert_eq!(app.active_query(cx).1, selection_done);
+}
+
 // Table data --------------------------------------------------------------------
 
 /// A scratch table with these columns after an auto-numbered `id`, on

@@ -27,7 +27,7 @@ use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_co
 
 use crate::actions::{
     self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, DeleteRows, DiscardChanges,
-    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, FindInEditor,
+    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, FindInEditor, FormatSql,
     ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings,
     OpenSqlFile, PreviousTab, RefreshData, ReplaceInEditor, RunAll, RunStatement, SaveFile,
     SaveFileAs, SaveQuery, SetDefault, SetNull, ShowHistory, ShowSavedQueries, ToggleComment,
@@ -874,6 +874,12 @@ impl Workspace {
         }
     }
 
+    fn format_sql(&mut self, _: &FormatSql, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_query_tab() {
+            tab.update(cx, |tab, cx| tab.format(window, cx));
+        }
+    }
+
     /// Runs `act` on the active tab when it shows a table's data.
     fn on_data_tab(
         &mut self,
@@ -1536,6 +1542,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::format_sql))
             .on_action(cx.listener(Self::find_in_editor))
             .on_action(cx.listener(Self::refresh_data))
             .on_action(cx.listener(Self::add_row))

@@ -2,6 +2,7 @@
 //! and showing what they return.
 
 mod comment;
+mod completion;
 pub mod grid;
 mod params;
 pub mod plan_view;

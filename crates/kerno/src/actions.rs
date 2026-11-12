@@ -28,6 +28,8 @@ gpui_kit::actions!(
         CancelQuery,
         /// Comments the selected lines out, or back in.
         ToggleComment,
+        /// Lays out the SQL of the selection, or of the whole editor.
+        FormatSql,
         /// Reads the rows of the table on screen again.
         RefreshData,
         /// Adds an empty row to the table on screen.
@@ -320,6 +322,14 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-/"],
         ["comment out", "uncomment", "--"],
         ToggleComment
+    ),
+    command!(
+        "format_sql",
+        "Format SQL",
+        "Editor",
+        ["secondary-shift-i"],
+        ["beautify", "pretty", "indent"],
+        FormatSql
     ),
     command!(
         "explain_statement",

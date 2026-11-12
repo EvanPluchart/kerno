@@ -27,10 +27,10 @@ use gpui_kit::{
 
 use crate::actions::{
     About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
-    FindInEditor, ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette, OpenSettings,
-    OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery,
-    ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme,
-    UseSystemTheme,
+    FindInEditor, FormatSql, ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette,
+    OpenSettings, OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs,
+    SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme,
+    UseLightTheme, UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -165,6 +165,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Replace…", ReplaceInEditor),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Line Comment", ToggleComment),
+                MenuItem::action("Format SQL", FormatSql),
             ],
             disabled: false,
         },

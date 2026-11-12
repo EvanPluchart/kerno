@@ -14,6 +14,8 @@ kerno-core.workspace = true
 kerno-postgres.workspace = true
 kerno-mysql.workspace = true
 gpui-kit.workspace = true
+# The types of the editor's completion API; the version the UI kit uses.
+lsp-types = "=0.97.0"
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

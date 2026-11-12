@@ -3,13 +3,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
+use gpui_kit::component::input::{
+    CompletionProvider, Editor, EditorState, InputEvent, Position, RopeExt as _,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
@@ -28,7 +31,8 @@ use gpui_kit::{
 };
 use kerno_core::config::Environment;
 use kerno_core::sql::{
-    LexRules, Param, ParamKey, ParamValue, bind_params, find_params, split_statements, statement_at,
+    LexRules, Param, ParamKey, ParamValue, bind_params, find_params, format_sql, split_statements,
+    statement_at,
 };
 use kerno_core::sql::{StatementClass, StatementKind, classify};
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
@@ -37,6 +41,7 @@ use kerno_core::{
 };
 
 use super::comment;
+use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::grid::{CopyFormat, Grid};
 use super::params;
 use super::{plan_view, viewer};
@@ -246,6 +251,10 @@ pub struct QueryTab {
     grid_subscriptions: Vec<Subscription>,
     /// Bumped at every run and target change, so late answers are dropped.
     generation: u64,
+    /// What completion offers; empty until loaded.
+    catalog: SharedCatalog,
+    /// The catalog being loaded. Replacing it drops the older load.
+    catalog_load: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -268,6 +277,11 @@ impl QueryTab {
                 .soft_wrap(false)
                 .default_value(sql)
                 .placeholder("Write SQL here")
+        });
+        editor.update(cx, |editor, _| {
+            editor
+                .lsp_mut()
+                .set_completion_highlighter(Rc::new(completion::highlight));
         });
         // An edit makes a file's tab differ from its file. (Moving the
         // cursor also notifies observers; only a change of text counts.)
@@ -309,6 +323,8 @@ impl QueryTab {
             explain_mode: None,
             grid_subscriptions: Vec::new(),
             generation: 0,
+            catalog: SharedCatalog::default(),
+            catalog_load: None,
             _subscriptions: vec![subscription, edits],
         };
         tab.follow_connection(cx);
@@ -525,6 +541,9 @@ impl QueryTab {
         self.databases.clear();
         self.schemas.clear();
         self.generation += 1;
+        *self.catalog.borrow_mut() = Arc::default();
+        self.catalog_load = None;
+        self.complete_with(None, cx);
         self.follow_connection(cx);
         cx.notify();
     }
@@ -538,12 +557,15 @@ impl QueryTab {
         if !self.connected(cx) {
             self.stop(cx);
             self.session = None;
+            self.complete_with(None, cx);
             cx.notify();
             return;
         }
         let Some(meta) = self.connections.read(cx).meta_session(&target.connection) else {
             return;
         };
+        self.complete_with(Some(meta.clone()), cx);
+        self.load_catalog(cx);
         // The connection's own session lists the databases, and the
         // schemas when the tab is in its database.
         let own_database = target.database.is_none() || target.database == meta.database();
@@ -581,6 +603,87 @@ impl QueryTab {
             }
         })
         .detach();
+    }
+
+    /// Completion in the editor proposes from the catalog, with the dialect
+    /// of `session`; none without a session.
+    fn complete_with(&self, session: Option<Arc<dyn Session>>, cx: &mut Context<Self>) {
+        let catalog = self.catalog.clone();
+        self.editor.update(cx, |editor, _| {
+            editor.lsp_mut().completion_provider = session.map(|session| {
+                Rc::new(SqlCompletion { catalog, session }) as Rc<dyn CompletionProvider>
+            });
+        });
+    }
+
+    /// Loads (again) what completion offers: from the connection's own
+    /// session when the tab is in its database, else from the tab's.
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let Some(meta) = self.connections.read(cx).meta_session(&target.connection) else {
+            return;
+        };
+        let session = if target.database.is_none() || target.database == meta.database() {
+            Task::ready(Ok(meta))
+        } else {
+            self.session(cx)
+        };
+        self.catalog_load = Some(cx.spawn(async move |this, cx| {
+            let Ok(session) = session.await else {
+                return;
+            };
+            let loading = cx
+                .update(|cx| bridge::spawn(cx, async move { session.completion_catalog().await }));
+            match loading.await {
+                Ok(mut catalog) => {
+                    // The tab's schema is searched first.
+                    if let Some(schema) = target.schema {
+                        catalog.search_path.retain(|name| *name != schema);
+                        catalog.search_path.insert(0, schema);
+                    }
+                    let _ = this.update(cx, |this, _| {
+                        *this.catalog.borrow_mut() = Arc::new(catalog);
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "the completion catalog was not loaded"),
+            }
+        }));
+    }
+
+    /// Whether the completion catalog has arrived; for tests.
+    #[cfg(test)]
+    pub fn catalog_ready(&self) -> bool {
+        !self.catalog.borrow().schemas.is_empty()
+    }
+
+    /// Labels and inserted texts completion proposes at byte `cursor` of
+    /// `sql`; for tests.
+    #[cfg(test)]
+    pub fn completions(&self, sql: &str, cursor: usize, cx: &App) -> Vec<(String, String)> {
+        let Some(session) = self
+            .target
+            .as_ref()
+            .and_then(|target| self.connections.read(cx).meta_session(&target.connection))
+        else {
+            return Vec::new();
+        };
+        let provider = SqlCompletion {
+            catalog: self.catalog.clone(),
+            session,
+        };
+        provider
+            .items(&gpui_kit::component::input::Rope::from(sql), cursor)
+            .into_iter()
+            .map(|item| {
+                let insert = match item.text_edit {
+                    Some(lsp_types::CompletionTextEdit::Edit(edit)) => edit.new_text,
+                    _ => String::new(),
+                };
+                (item.label, insert)
+            })
+            .collect()
     }
 
     /// This tab's session, opened (and put in the tab's schema) if needed.
@@ -713,6 +816,36 @@ impl QueryTab {
             let cursor = position_of(&text, lines.start);
             let rewritten = format!("{}{toggled}{}", &text[..lines.start], &text[lines.end..]);
             editor.replace_all(rewritten, window, cx);
+            editor.set_cursor_position(cursor, window, cx);
+        });
+    }
+
+    /// Lays out the selection, or the whole text without one: keywords in
+    /// upper case, one clause per line. One step to undo; text already
+    /// laid out is left alone.
+    pub fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let mut range = editor.selected_range();
+            let Some(selected) = text.get(range.clone()) else {
+                return;
+            };
+            if selected.trim().is_empty() {
+                range = 0..text.len();
+            }
+            let part = &text[range.clone()];
+            let mut formatted = format_sql(part, rules);
+            // A piece of the text keeps what followed it on its line.
+            if range.len() < text.len() && !part.ends_with('\n') && formatted.ends_with('\n') {
+                formatted.pop();
+            }
+            if formatted == part {
+                return;
+            }
+            let rewritten = format!("{}{formatted}{}", &text[..range.start], &text[range.end..]);
+            editor.replace_all(rewritten, window, cx);
+            let cursor = editor.text().offset_to_position(range.start);
             editor.set_cursor_position(cursor, window, cx);
         });
     }
@@ -1048,15 +1181,17 @@ impl QueryTab {
                     return;
                 }
             }
+            let mut changed_schema = false;
             for (index, statement) in statements.into_iter().enumerate() {
                 let started = Instant::now();
                 let started_at_ms = kerno_core::storage::now_ms();
                 // How the statement ended, for the history and the editor.
                 let mut ended: Option<(HistoryStatus, Option<Failure>)> = None;
                 let mut row_count: Option<u64> = None;
+                let kind = classify(&statement.sql, rules).kind;
                 // Only statements that change rows have a count worth showing.
                 let counts_rows = matches!(
-                    classify(&statement.sql, rules).kind,
+                    kind,
                     StatementKind::Insert
                         | StatementKind::Update
                         | StatementKind::Delete
@@ -1234,6 +1369,11 @@ impl QueryTab {
                     });
                 }
                 let (status, failure) = ended.unwrap_or((HistoryStatus::Ok, None));
+                // A table or view created, changed or dropped changes what
+                // completion offers.
+                changed_schema |= kind == StatementKind::Ddl
+                    && explain.is_none()
+                    && matches!(status, HistoryStatus::Ok);
                 let _ = this.update(cx, |this, cx| {
                     let ended = Ended {
                         started_at_ms,
@@ -1257,6 +1397,9 @@ impl QueryTab {
             let _ = this.update(cx, |this, cx| {
                 this.activity = Activity::Idle;
                 this.run = None;
+                if changed_schema {
+                    this.load_catalog(cx);
+                }
                 cx.notify();
             });
         }));
