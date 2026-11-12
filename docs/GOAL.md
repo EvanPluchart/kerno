@@ -6,7 +6,8 @@ order without stopping for approval; ask only under CLAUDE.md §8.
 The goal is reached only when ALL of these are true and verified by you:
 
 1. `nice -n 10 cargo build --release` succeeds; `cargo fmt --check`, `cargo clippy --workspace --all-targets
-   -- -D warnings` and `cargo deny check` are clean; `nice -n 10 cargo test --workspace -- --test-threads=3`
+   -- -D warnings` and `cargo deny check` are clean with no ignored advisory (RUSTSEC-2023-0071 in the SSH stack fixed in
+   milestone 10, by upgrading or replacing the affected dependency); `nice -n 10 cargo test --workspace -- --test-threads=3`
    passes with the `kerno-*` containers up (integration tests ran, not skipped).
 2. Every v1 feature of CLAUDE.md §4 (A to I) works end to end against PostgreSQL 17, MySQL 8.4 and
    MariaDB 11. `docs/FEATURES.md` lists each item with its status, the test that covers it, and the
