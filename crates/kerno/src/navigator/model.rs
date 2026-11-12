@@ -60,8 +60,10 @@ pub enum NodeKind {
     Group(Group),
     /// A column of a table or view.
     Column { table: TableRef, name: String },
-    /// A PostgreSQL extension.
-    Extension(String),
+    /// A PostgreSQL extension, installed in the database or available.
+    Extension { name: String, installed: bool },
+    /// A value of a PostgreSQL enum type.
+    EnumValue { ty: TableRef, value: String },
 }
 
 /// The children of a node.
@@ -97,6 +99,15 @@ pub struct Node {
     pub schema: Option<String>,
     pub children: Children,
     pub expanded: bool,
+}
+
+impl Node {
+    /// Whether the node is a PostgreSQL enum type: the only type whose
+    /// children (its values) are known, even when it has none.
+    pub fn is_enum(&self) -> bool {
+        matches!(self.kind, NodeKind::Object(ObjectRef::Type(_)))
+            && matches!(self.children, Children::Loaded(_))
+    }
 }
 
 /// Something to fetch from the server for the node `id`.
@@ -410,7 +421,10 @@ fn extension_nodes(group: &Node, extensions: Vec<ExtensionInfo>) -> Vec<Node> {
             ..child(
                 group,
                 &format!("ext:{}", extension.name),
-                NodeKind::Extension(extension.name.clone()),
+                NodeKind::Extension {
+                    name: extension.name.clone(),
+                    installed: extension.installed_version.is_some(),
+                },
                 extension.name,
             )
         })
@@ -570,26 +584,45 @@ fn object_groups(parent: &Node, objects: SchemaObjects, has_schemas: bool) -> Ve
         groups.push(group(parent, Group::Types, |folder| {
             types
                 .iter()
-                .map(|kind| Node {
-                    hint: Some(
-                        match &kind.shape {
-                            TypeShape::Enum(_) => "enum",
-                            TypeShape::Composite(_) => "composite",
-                            TypeShape::Domain { .. } => "domain",
-                            TypeShape::Range(_) => "range",
-                            TypeShape::Other => "type",
-                        }
-                        .into(),
-                    ),
-                    ..child(
-                        folder,
-                        &format!("type:{}", kind.name),
-                        NodeKind::Object(ObjectRef::Type(TableRef::new(
-                            schema.clone(),
+                .map(|kind| {
+                    let ty = TableRef::new(schema.clone(), kind.name.clone());
+                    let mut node = Node {
+                        hint: Some(
+                            match &kind.shape {
+                                TypeShape::Enum(_) => "enum",
+                                TypeShape::Composite(_) => "composite",
+                                TypeShape::Domain { .. } => "domain",
+                                TypeShape::Range(_) => "range",
+                                TypeShape::Other => "type",
+                            }
+                            .into(),
+                        ),
+                        ..child(
+                            folder,
+                            &format!("type:{}", kind.name),
+                            NodeKind::Object(ObjectRef::Type(ty.clone())),
                             kind.name.clone(),
-                        ))),
-                        kind.name.clone(),
-                    )
+                        )
+                    };
+                    // An enum lists its values, in order.
+                    if let TypeShape::Enum(values) = &kind.shape {
+                        let values = values
+                            .iter()
+                            .map(|value| {
+                                child(
+                                    &node,
+                                    &format!("value:{value}"),
+                                    NodeKind::EnumValue {
+                                        ty: ty.clone(),
+                                        value: value.clone(),
+                                    },
+                                    value.clone(),
+                                )
+                            })
+                            .collect();
+                        node.children = Children::Loaded(values);
+                    }
+                    node
                 })
                 .collect()
         }));
@@ -778,7 +811,7 @@ fn scaled(value: u64, unit: u64, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use kerno_core::TypeKind;
-    use kerno_core::schema::{ColumnInfo, IndexInfo, RelationInfo, RoutineInfo};
+    use kerno_core::schema::{ColumnInfo, IndexInfo, RelationInfo, RoutineInfo, TypeInfo};
 
     use super::*;
 
@@ -852,6 +885,23 @@ mod tests {
                 routine("total", RoutineKind::Function, "integer"),
                 routine("total", RoutineKind::Function, "integer, integer"),
                 routine("archive", RoutineKind::Procedure, ""),
+            ],
+            types: vec![
+                TypeInfo {
+                    name: "mood".into(),
+                    shape: TypeShape::Enum(vec!["sad".into(), "ok".into()]),
+                    comment: None,
+                },
+                TypeInfo {
+                    name: "nothing_yet".into(),
+                    shape: TypeShape::Enum(Vec::new()),
+                    comment: None,
+                },
+                TypeInfo {
+                    name: "address".into(),
+                    shape: TypeShape::Composite(Vec::new()),
+                    comment: None,
+                },
             ],
             ..SchemaObjects::default()
         }
@@ -929,7 +979,7 @@ mod tests {
                 "    > Functions",
                 "    > Procedures",
                 "    Sequences",
-                "    Types",
+                "    > Types",
                 "    Triggers",
                 // System objects come last.
                 "  > pg_catalog",
@@ -963,6 +1013,28 @@ mod tests {
             ["total(integer)", "total(integer, integer)"]
         );
         assert_ne!(functions[0].id, functions[1].id);
+        // An enum lists its values; it is an enum even without any.
+        let types = format!("{shop}{SEP}types");
+        let ty = |name: &str| tree.node(&format!("{types}{SEP}type:{name}")).unwrap();
+        let Children::Loaded(values) = &ty("mood").children else {
+            panic!("an enum's values come with it");
+        };
+        assert_eq!(
+            values.iter().map(|node| &node.kind).collect::<Vec<_>>(),
+            [
+                &NodeKind::EnumValue {
+                    ty: TableRef::new("shop", "mood"),
+                    value: "sad".into()
+                },
+                &NodeKind::EnumValue {
+                    ty: TableRef::new("shop", "mood"),
+                    value: "ok".into()
+                },
+            ]
+        );
+        assert!(ty("mood").is_enum() && ty("nothing_yet").is_enum());
+        assert!(!ty("address").is_enum());
+        assert!(!values[0].is_enum());
     }
 
     #[test]

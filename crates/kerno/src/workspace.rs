@@ -41,7 +41,7 @@ use crate::connections::manager::{
 use crate::data::tab::{DataTab, DataTabEvent};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
-use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
+use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
@@ -226,11 +226,15 @@ impl Workspace {
                     target,
                     file,
                     unsaved,
+                    source,
                 } => {
                     let tab = workspace.push_query_tab(title, &sql, target, window, cx);
-                    if let Some(file) = file {
-                        tab.update(cx, |tab, cx| tab.set_file(file, unsaved, cx));
-                    }
+                    tab.update(cx, |tab, cx| {
+                        if let Some(file) = file {
+                            tab.set_file(file, unsaved, cx);
+                        }
+                        tab.set_source(source, cx);
+                    });
                 }
                 TabSnapshot::Data {
                     target,
@@ -555,8 +559,22 @@ impl Workspace {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| QueryTab::new(title, sql, target, connections, window, cx));
         let editor = tab.read(cx).editor().clone();
-        self.tab_subscriptions
-            .push(cx.observe(&editor, |this, _, cx| this.schedule_save(cx)));
+        // One subscription per tab: they are dropped with it, by index.
+        self.tab_subscriptions.push(Subscription::join(
+            cx.observe(&editor, |this, _, cx| this.schedule_save(cx)),
+            cx.subscribe(&tab, |this, tab, event: &QueryTabEvent, cx| match event {
+                QueryTabEvent::SourceApplied => {
+                    let tab = tab.read(cx);
+                    if let (Some(target), Some(schema)) = (tab.target().cloned(), tab.source()) {
+                        let schema = schema.to_string();
+                        let navigator = this.sidebar.read(cx).navigator().clone();
+                        navigator.update(cx, |navigator, cx| {
+                            navigator.refresh_source(&target, &schema, cx)
+                        });
+                    }
+                }
+            }),
+        ));
         self.tabs.push(OpenTab::Query(tab.clone()));
         self.active_tab = self.tabs.len() - 1;
         tab
@@ -810,6 +828,15 @@ impl Workspace {
             }
             NavigatorEvent::CreateTable { target, schema } => {
                 self.open_table_editor(target.clone(), schema.clone(), None, window, cx);
+            }
+            NavigatorEvent::OpenSource {
+                title,
+                sql,
+                target,
+                schema,
+            } => {
+                let tab = self.open_query(title.clone(), sql, target.clone(), window, cx);
+                tab.update(cx, |tab, cx| tab.set_source(Some(schema.clone()), cx));
             }
         }
     }

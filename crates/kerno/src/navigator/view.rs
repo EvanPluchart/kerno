@@ -57,6 +57,14 @@ pub enum NavigatorEvent {
     },
     /// Open the form of a new table in `schema`.
     CreateTable { target: Target, schema: String },
+    /// Open a query tab in source mode holding `sql`, the script that
+    /// replaces an object of `schema`.
+    OpenSource {
+        title: String,
+        sql: String,
+        target: Option<Target>,
+        schema: String,
+    },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -402,11 +410,20 @@ impl Navigator {
             }
             Action::Generate(template) => self.generate(template, &node, window, cx),
             Action::ShowDdl => self.show_ddl(&node, window, cx),
+            Action::EditSource => {
+                if self.unavailable(action, &node, cx).is_none() {
+                    self.edit_source(&node, window, cx)
+                }
+            }
             Action::Rename
             | Action::Truncate
             | Action::Drop
             | Action::CreateSchema
-            | Action::CreateDatabase => self.confirm(action, &node, window, cx),
+            | Action::CreateDatabase
+            | Action::InstallExtension
+            | Action::CreateEnum
+            | Action::AddEnumValue
+            | Action::RenameEnumValue => self.confirm(action, &node, window, cx),
         }
     }
 
@@ -429,6 +446,11 @@ impl Navigator {
                 Some("not supported by this database")
             }
             (Action::Drop, Some(object)) if dialect.drop_sql(object).is_err() => {
+                Some("not supported by this database")
+            }
+            (Action::EditSource, Some(object))
+                if dialect.replace_source_sql(object, "").is_err() =>
+            {
                 Some("not supported by this database")
             }
             // PostgreSQL cannot drop the database a session is in.
@@ -581,6 +603,54 @@ impl Navigator {
         .detach();
     }
 
+    /// Opens the script that replaces a view or routine by its edited
+    /// definition, in a query tab in source mode. Nothing runs.
+    fn edit_source(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+        let (NodeKind::Object(object), Some(schema)) = (&node.kind, node.schema.clone()) else {
+            return;
+        };
+        let (object, name) = (object.clone(), node.label.clone());
+        let target = self.target_of(node, false);
+        let session = self.session_for(&node.database, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let script = match session.await {
+                Err(error) => Err(error),
+                Ok(session) => {
+                    match cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let ddl = session.ddl(&object).await?;
+                            session.dialect().replace_source_sql(&object, &ddl)
+                        })
+                    }) {
+                        Ok(reading) => reading.await,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let _ = this.update_in(cx, |_, window, cx| match script {
+                Ok(sql) => cx.emit(NavigatorEvent::OpenSource {
+                    title: name,
+                    sql,
+                    target,
+                    schema,
+                }),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "The source of {name} could not be read: {error}"
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Reads again the objects of `schema` after a source was applied
+    /// from a tab on `target`, when this tree shows that connection.
+    pub fn refresh_source(&mut self, target: &Target, schema: &str, cx: &mut Context<Self>) {
+        self.refresh_tables(&target.connection, target.database.as_deref(), schema, cx);
+    }
+
     /// Shows the statement a destructive or creating action would run and
     /// runs it once confirmed.
     fn confirm(
@@ -605,21 +675,32 @@ impl Navigator {
         }
         let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
         let object = match &node.kind {
-            NodeKind::Object(object) => object.clone(),
-            _ => return,
+            NodeKind::Object(object) => Some(object.clone()),
+            _ => None,
         };
         let name = node.label.clone();
-        let kind = kind_name(&object);
+        let kind = match (&node.kind, &object) {
+            (NodeKind::Extension { .. }, _) => "extension",
+            (_, Some(object)) => kind_name(object),
+            _ => "object",
+        };
         // The statement is written by the dialect of the connection; the
         // session it runs on is found when it runs.
         let dialect_of = meta.clone();
         let above = model::parent_of(&node.id).map(str::to_string);
         // Databases are listed by the connection's own session, and a
         // database is dropped from outside it.
-        let on_root = matches!(object, ObjectRef::Database(_));
+        let on_root = matches!(object, Some(ObjectRef::Database(_)));
         let (title, explanation, statement, button, destructive, after, done) = match action {
             Action::Drop => {
-                let Ok(sql) = dialect_of.dialect().drop_sql(&object) else {
+                let sql = match (&node.kind, &object) {
+                    (NodeKind::Extension { name, .. }, _) => {
+                        dialect_of.dialect().drop_extension_sql(name)
+                    }
+                    (_, Some(object)) => dialect_of.dialect().drop_sql(object),
+                    _ => return,
+                };
+                let Ok(sql) = sql else {
                     return;
                 };
                 (
@@ -639,7 +720,7 @@ impl Navigator {
                 )
             }
             Action::Truncate => {
-                let ObjectRef::Relation(table, _) = &object else {
+                let Some(ObjectRef::Relation(table, _)) = &object else {
                     return;
                 };
                 (
@@ -653,8 +734,11 @@ impl Navigator {
                 )
             }
             Action::Rename => {
+                let Some(object) = &object else {
+                    return;
+                };
                 let (renamed, build_for) = (object.clone(), dialect_of.clone());
-                let current = plain_name(&object);
+                let current = plain_name(object);
                 (
                     format!("Rename {kind} “{name}”"),
                     format!(
@@ -662,7 +746,7 @@ impl Navigator {
                     ),
                     Statement::Named {
                         label: "New name",
-                        initial: plain_name(&object),
+                        initial: plain_name(object),
                         build: Rc::new(move |new_name| {
                             if new_name == current {
                                 return Err("Type a different name.".into());
@@ -726,6 +810,111 @@ impl Navigator {
                     "Created the database.".to_string(),
                 )
             }
+            Action::InstallExtension => {
+                let NodeKind::Extension {
+                    name: extension, ..
+                } = &node.kind
+                else {
+                    return;
+                };
+                let Ok(sql) = dialect_of.dialect().create_extension_sql(extension) else {
+                    return;
+                };
+                (
+                    format!("Install extension “{name}”?"),
+                    format!(
+                        "Its types, functions and operators are added to the database “{}”.",
+                        node.database
+                    ),
+                    Statement::Fixed(sql),
+                    "Install",
+                    false,
+                    After::Refresh(above.clone()),
+                    format!("Installed extension {name}."),
+                )
+            }
+            Action::CreateEnum => {
+                let Some(schema) = node.schema.clone() else {
+                    return;
+                };
+                let build_for = dialect_of.clone();
+                (
+                    "Create enum".to_string(),
+                    format!("A new enum type in the schema “{schema}”, with its values in order."),
+                    Statement::NamedList {
+                        list_label: "Values, one per line",
+                        build: Rc::new(move |name, values| {
+                            build_for
+                                .dialect()
+                                .create_enum_sql(&TableRef::new(schema.clone(), name), values)
+                                .map_err(|error| error.to_string())
+                        }),
+                    },
+                    "Create enum",
+                    false,
+                    After::Refresh(Some(node.id.clone())),
+                    "Created the enum.".to_string(),
+                )
+            }
+            Action::AddEnumValue => {
+                // On a value: the new one goes before it.
+                let (ty, before) = match &node.kind {
+                    NodeKind::Object(ObjectRef::Type(ty)) => (ty.clone(), None),
+                    NodeKind::EnumValue { ty, value } => (ty.clone(), Some(value.clone())),
+                    _ => return,
+                };
+                let explanation = match &before {
+                    Some(value) => format!("The new value goes just before “{value}”."),
+                    None => "The new value goes after the others.".to_string(),
+                };
+                let (title, build_for) =
+                    (format!("Add a value to “{}”", ty.name), dialect_of.clone());
+                (
+                    title,
+                    explanation,
+                    Statement::Named {
+                        label: "Value",
+                        initial: String::new(),
+                        build: Rc::new(move |value| {
+                            build_for
+                                .dialect()
+                                .add_enum_value_sql(&ty, value, before.as_deref())
+                                .map_err(|error| error.to_string())
+                        }),
+                    },
+                    "Add value",
+                    false,
+                    After::Refresh(Some(node.id.clone())),
+                    "Added the value.".to_string(),
+                )
+            }
+            Action::RenameEnumValue => {
+                let NodeKind::EnumValue { ty, value } = &node.kind else {
+                    return;
+                };
+                let (ty, current, build_for) = (ty.clone(), value.clone(), dialect_of.clone());
+                (
+                    format!("Rename value “{value}”"),
+                    format!("Rows holding “{value}” hold the new value from then on."),
+                    Statement::Named {
+                        label: "New value",
+                        initial: value.clone(),
+                        build: Rc::new(move |new_value| {
+                            if new_value == current {
+                                return Err("Type a different value.".into());
+                            }
+                            build_for
+                                .dialect()
+                                .rename_enum_value_sql(&ty, &current, new_value)
+                                .map_err(|error| error.to_string())
+                        }),
+                    },
+                    "Rename value",
+                    false,
+                    After::Refresh(Some(node.id.clone())),
+                    "Renamed the value.".to_string(),
+                )
+            }
             _ => return,
         };
         // Creating a database and anything done to a database runs on the
@@ -738,7 +927,7 @@ impl Navigator {
         // A session of the navigator's own inside a database would keep
         // PostgreSQL from dropping or renaming it.
         let release = match (&object, action) {
-            (ObjectRef::Database(name), Action::Drop | Action::Rename) => Some(name.clone()),
+            (Some(ObjectRef::Database(name)), Action::Drop | Action::Rename) => Some(name.clone()),
             _ => None,
         };
         let plan = Plan {
@@ -857,6 +1046,15 @@ impl Navigator {
             .item()
             .id
             .to_string()
+    }
+
+    /// Whether the node of a row is open; for tests.
+    #[cfg(test)]
+    pub fn is_open(&self, row: usize, cx: &App) -> bool {
+        self.tree_state
+            .read(cx)
+            .entry(row)
+            .is_some_and(|entry| entry.is_expanded())
     }
 
     /// Why an action cannot be used on the node of a row; for tests.
@@ -1079,7 +1277,8 @@ fn glyph(kind: &NodeKind) -> Glyph {
             ObjectRef::Event(_) => Glyph::CalendarClock,
             ObjectRef::Index { .. } => Glyph::KeyRound,
         },
-        NodeKind::Group(Group::Extensions) | NodeKind::Extension(_) => Glyph::Puzzle,
+        NodeKind::Group(Group::Extensions) | NodeKind::Extension { .. } => Glyph::Puzzle,
+        NodeKind::EnumValue { .. } => Glyph::ListOrdered,
         NodeKind::Group(_) => Glyph::Folder,
         NodeKind::Column { .. } => Glyph::Columns3,
     }
@@ -1098,7 +1297,8 @@ fn name_of(node: &Node) -> String {
         | NodeKind::Object(ObjectRef::Schema(name))
         | NodeKind::Object(ObjectRef::Database(name))
         | NodeKind::Column { name, .. }
-        | NodeKind::Extension(name) => name.clone(),
+        | NodeKind::Extension { name, .. }
+        | NodeKind::EnumValue { value: name, .. } => name.clone(),
         NodeKind::Group(group) => group.label().to_string(),
     }
 }

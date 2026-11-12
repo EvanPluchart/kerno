@@ -118,6 +118,57 @@ pub trait Dialect: Send + Sync {
         Ok(format!("CREATE DATABASE {}", self.quote_ident(name)))
     }
 
+    /// The script that replaces `object` by the definition in `ddl`: what
+    /// [`crate::Session::ddl`] printed for it, edited by the user. The
+    /// script is run one statement at a time, as the editor splits it.
+    /// `Unsupported` for objects whose source cannot be edited this way;
+    /// the answer depends on the kind of object only, never on `ddl`.
+    fn replace_source_sql(&self, object: &ObjectRef, ddl: &str) -> Result<String> {
+        let _ = (object, ddl);
+        Err(Error::Unsupported(
+            "editing the source of this kind of object".into(),
+        ))
+    }
+
+    /// The statement that installs the extension `name` in the connected
+    /// database. `Unsupported` on engines without extensions.
+    fn create_extension_sql(&self, name: &str) -> Result<String> {
+        let _ = name;
+        Err(Error::Unsupported("extensions".into()))
+    }
+
+    /// The statement that removes the extension `name`, and only it (no
+    /// `CASCADE`). `Unsupported` on engines without extensions.
+    fn drop_extension_sql(&self, name: &str) -> Result<String> {
+        let _ = name;
+        Err(Error::Unsupported("extensions".into()))
+    }
+
+    /// The statement that creates the enum type `ty` with `values` in
+    /// order. `Unsupported` where enums are column types, not objects.
+    fn create_enum_sql(&self, ty: &TableRef, values: &[String]) -> Result<String> {
+        let _ = (ty, values);
+        Err(Error::Unsupported("enum types".into()))
+    }
+
+    /// The statement that adds `value` to the enum type `ty`: last, or
+    /// just before the value `before`.
+    fn add_enum_value_sql(
+        &self,
+        ty: &TableRef,
+        value: &str,
+        before: Option<&str>,
+    ) -> Result<String> {
+        let _ = (ty, value, before);
+        Err(Error::Unsupported("enum types".into()))
+    }
+
+    /// The statement that renames the value `from` of the enum type `ty`.
+    fn rename_enum_value_sql(&self, ty: &TableRef, from: &str, to: &str) -> Result<String> {
+        let _ = (ty, from, to);
+        Err(Error::Unsupported("enum types".into()))
+    }
+
     /// The statements that create the table `draft` describes: `CREATE
     /// TABLE` with its primary and foreign keys, then its indexes, then its
     /// comments. Types and defaults are written as typed: they are SQL the
@@ -696,6 +747,22 @@ mod tests {
                 error.to_string(),
                 "not supported by this database: scheduled events"
             );
+        }
+    }
+
+    #[test]
+    fn sources_extensions_and_enums_are_engine_specific() {
+        let (d, t) = (AnsiDialect, TableRef::new("s", "t"));
+        let view = ObjectRef::Relation(t.clone(), RelationKind::View);
+        for result in [
+            d.replace_source_sql(&view, "CREATE VIEW v AS SELECT 1"),
+            d.create_extension_sql("x"),
+            d.drop_extension_sql("x"),
+            d.create_enum_sql(&t, &["a".into()]),
+            d.add_enum_value_sql(&t, "a", None),
+            d.rename_enum_value_sql(&t, "a", "b"),
+        ] {
+            assert!(matches!(result, Err(Error::Unsupported(_))), "{result:?}");
         }
     }
 

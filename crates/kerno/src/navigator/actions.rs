@@ -1,6 +1,6 @@
 //! What can be done to each kind of node: the content of its context menu.
 
-use kerno_core::schema::{ObjectRef, RelationKind};
+use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind};
 
 use super::model::{Group, Node, NodeKind};
 
@@ -40,6 +40,11 @@ pub enum Action {
     CreateView,
     CreateSchema,
     CreateDatabase,
+    EditSource,
+    InstallExtension,
+    CreateEnum,
+    AddEnumValue,
+    RenameEnumValue,
     Refresh,
 }
 
@@ -59,12 +64,18 @@ impl Action {
             Action::CreateView => "Create view…",
             Action::CreateSchema => "Create schema…",
             Action::CreateDatabase => "Create database…",
+            Action::EditSource => "Edit source",
+            Action::InstallExtension => "Install…",
+            Action::CreateEnum => "Create enum…",
+            Action::AddEnumValue => "Add value…",
+            Action::RenameEnumValue => "Rename value…",
             Action::Refresh => "Refresh",
         }
     }
 
     /// Whether the action changes the database, which a read-only
-    /// connection does not allow.
+    /// connection does not allow. Editing a source opens a tab whose only
+    /// purpose is to apply it.
     pub fn writes(self) -> bool {
         matches!(
             self,
@@ -74,6 +85,11 @@ impl Action {
                 | Action::CreateTable
                 | Action::CreateSchema
                 | Action::CreateDatabase
+                | Action::EditSource
+                | Action::InstallExtension
+                | Action::CreateEnum
+                | Action::AddEnumValue
+                | Action::RenameEnumValue
         )
     }
 }
@@ -119,14 +135,30 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             RelationKind::View | RelationKind::MaterializedView,
         )) => vec![
             vec![OpenData, OpenStructure, Generate(Template::Select)],
-            vec![ShowDdl, CopyName],
+            vec![ShowDdl, EditSource, CopyName],
             vec![Rename, Drop],
         ],
+        NodeKind::Object(ObjectRef::Routine {
+            kind: RoutineKind::Function | RoutineKind::Procedure,
+            ..
+        }) => vec![vec![ShowDdl, EditSource, CopyName], vec![Rename, Drop]],
+        NodeKind::Object(ObjectRef::Type(_)) if node.is_enum() => {
+            vec![vec![ShowDdl, CopyName], vec![AddEnumValue, Rename, Drop]]
+        }
         NodeKind::Object(_) => vec![vec![ShowDdl, CopyName], vec![Rename, Drop]],
         NodeKind::Group(Group::Tables) => vec![vec![CreateTable]],
         NodeKind::Group(Group::Views) => vec![vec![CreateView]],
+        // The folder exists on PostgreSQL only.
+        NodeKind::Group(Group::Types) => vec![vec![CreateEnum]],
         NodeKind::Group(_) => Vec::new(),
-        NodeKind::Column { .. } | NodeKind::Extension(_) => vec![vec![CopyName]],
+        NodeKind::EnumValue { .. } => vec![vec![CopyName], vec![AddEnumValue, RenameEnumValue]],
+        NodeKind::Extension { installed, .. } => {
+            vec![
+                vec![CopyName],
+                vec![if *installed { Drop } else { InstallExtension }],
+            ]
+        }
+        NodeKind::Column { .. } => vec![vec![CopyName]],
     };
     groups.into_iter().chain([vec![Refresh]]).collect()
 }
@@ -214,9 +246,58 @@ mod tests {
             [CopyName, Refresh]
         );
         // Every menu ends with Refresh, in a group of its own.
+        let extension = |installed| NodeKind::Extension {
+            name: "pg_trgm".into(),
+            installed,
+        };
         assert_eq!(
-            actions(&node(NodeKind::Extension("pg_trgm".into())), true).last(),
+            actions(&node(extension(true)), true).last(),
             Some(&vec![Refresh])
+        );
+        // An extension is installed or dropped, as it is.
+        assert_eq!(flat(extension(true), true), [CopyName, Drop, Refresh]);
+        assert_eq!(
+            flat(extension(false), true),
+            [CopyName, InstallExtension, Refresh]
+        );
+
+        // Views and routines have a source to edit; tables do not.
+        assert!(view.contains(&EditSource) && !table.contains(&EditSource));
+        let routine = |kind| {
+            flat(
+                NodeKind::Object(ObjectRef::Routine {
+                    schema: "shop".into(),
+                    name: "f".into(),
+                    kind,
+                    identity_arguments: String::new(),
+                }),
+                true,
+            )
+        };
+        assert!(routine(RoutineKind::Function).contains(&EditSource));
+        assert!(routine(RoutineKind::Procedure).contains(&EditSource));
+        assert!(!routine(RoutineKind::Aggregate).contains(&EditSource));
+
+        // Enums: created in the Types folder, values added and renamed.
+        assert_eq!(
+            flat(NodeKind::Group(Group::Types), true),
+            [CreateEnum, Refresh]
+        );
+        let ty = NodeKind::Object(ObjectRef::Type(TableRef::new("shop", "mood")));
+        let mut mood = node(ty.clone());
+        mood.children = Children::Loaded(Vec::new());
+        assert!(actions(&mood, true).concat().contains(&AddEnumValue));
+        // Other types have no values.
+        assert!(!flat(ty, true).contains(&AddEnumValue));
+        assert_eq!(
+            flat(
+                NodeKind::EnumValue {
+                    ty: TableRef::new("shop", "mood"),
+                    value: "sad".into()
+                },
+                true
+            ),
+            [CopyName, AddEnumValue, RenameEnumValue, Refresh]
         );
     }
 
@@ -230,6 +311,11 @@ mod tests {
             CreateTable,
             CreateSchema,
             CreateDatabase,
+            EditSource,
+            InstallExtension,
+            CreateEnum,
+            AddEnumValue,
+            RenameEnumValue,
         ] {
             assert!(action.writes(), "{action:?}");
         }

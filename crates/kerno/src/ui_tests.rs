@@ -537,6 +537,7 @@ async fn unsaved_text_and_tabs_come_back_after_a_restart(cx: &mut TestAppContext
                 target: None,
                 file: None,
                 unsaved: false,
+                source: None,
             },
             TabSnapshot::Query {
                 title: "Query 2".into(),
@@ -544,6 +545,7 @@ async fn unsaved_text_and_tabs_come_back_after_a_restart(cx: &mut TestAppContext
                 target: None,
                 file: None,
                 unsaved: false,
+                source: None,
             },
         ]
     );
@@ -1492,6 +1494,340 @@ fn production_asks_twice_and_read_only_refuses(cx: &mut TestAppContext) {
         });
         assert!(!exists(), "{engine:?}");
     }
+}
+
+impl Fixture {
+    /// Whether the schema tree has a row at this path of labels.
+    fn shows(&self, cx: &mut TestAppContext, path: &[&str]) -> bool {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .row_of(path, cx)
+                .is_some()
+        })
+    }
+
+    /// Whether the row of the tree at this path is open.
+    fn is_open(&self, cx: &mut TestAppContext, path: &[&str]) -> bool {
+        let row = self.tree_row(cx, path);
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .is_open(row, cx)
+        })
+    }
+
+    /// Opens the rows of the tree along `path`, waiting for each to load.
+    fn open_path(&self, cx: &mut TestAppContext, path: &[&str]) {
+        for depth in 1..=path.len() {
+            let part = &path[..depth];
+            self.wait_until(cx, &format!("{part:?}"), |app, cx| app.shows(cx, part));
+            if depth < path.len() && !self.is_open(cx, part) {
+                self.toggle(cx, part);
+            }
+        }
+    }
+
+    /// Replaces `from` by `to` in the active query tab's text.
+    fn edit_query(&self, cx: &mut TestAppContext, from: &str, to: &str) {
+        let (_, sql) = self.active_query(cx);
+        assert!(sql.contains(from), "{from:?} not in\n{sql}");
+        let tab = self.tab(cx);
+        let editor = cx.update(|cx| tab.read(cx).editor().clone());
+        let edited = sql.replacen(from, to, 1);
+        self.step(cx, |window, cx| {
+            editor.update(cx, |editor, cx| editor.replace_all(edited, window, cx))
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn editing_a_source_applies_it_once_its_sql_is_confirmed(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let (cleanup, setup) = if pg {
+            (
+                "DROP SCHEMA IF EXISTS kerno_ui_source CASCADE",
+                [
+                    "CREATE SCHEMA kerno_ui_source",
+                    "CREATE VIEW kerno_ui_source.v AS SELECT 1 AS a",
+                    "CREATE FUNCTION kerno_ui_source.f() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+                ],
+            )
+        } else {
+            (
+                "DROP DATABASE IF EXISTS kerno_ui_source",
+                [
+                    "CREATE DATABASE kerno_ui_source",
+                    "CREATE VIEW kerno_ui_source.v AS SELECT 1 AS a",
+                    "CREATE FUNCTION kerno_ui_source.f() RETURNS INT DETERMINISTIC RETURN 1",
+                ],
+            )
+        };
+        let _scratch = Scratch::new(engine, &[cleanup], &setup);
+        let server = |sql: &str| on_server(engine, sql);
+        let columns = || {
+            server(
+                "SELECT count(*) FROM information_schema.columns \
+                 WHERE table_schema = 'kerno_ui_source' AND table_name = 'v'",
+            )
+        };
+        let root: &[&str] = if pg {
+            &["kerno", "kerno_ui_source"]
+        } else {
+            &["kerno_ui_source"]
+        };
+        let at = |rest: &[&'static str]| [root, rest].concat();
+        let (view_from, view_to, body_from, body_to) = if pg {
+            ("1 AS a", "1 AS a, 2 AS b", "SELECT 1", "SELECT 2")
+        } else {
+            ("1 AS `a`", "1 AS `a`,2 AS `b`", "RETURN 1", "RETURN 2")
+        };
+        let routines = if pg { "Functions" } else { "Routines" };
+
+        // A read-only connection offers no source to edit.
+        let mut config = testing::config(engine);
+        config.read_only = true;
+        let app = connected_as(cx, config);
+        app.open_path(cx, &at(&["Views", "v"]));
+        assert_eq!(
+            app.why_not(cx, Action::EditSource, &at(&["Views", "v"])),
+            Some("read-only connection"),
+            "{engine:?}"
+        );
+        app.act(cx, Action::EditSource, &at(&["Views", "v"]));
+        assert_eq!(app.titles(cx), Vec::<String>::new(), "{engine:?}");
+
+        let app = connected(cx, engine);
+        // The view's columns are shown: applying the source reads them again.
+        app.open_path(cx, &at(&["Views", "v", "Columns", "a"]));
+
+        // The script opens in a tab in source mode; nothing runs.
+        app.act(cx, Action::EditSource, &at(&["Views", "v"]));
+        app.wait_until(cx, "the source", |app, cx| app.titles(cx) == ["v"]);
+        let (_, sql) = app.active_query(cx);
+        assert!(sql.starts_with("CREATE OR REPLACE"), "{engine:?}: {sql}");
+        assert!(app.has(cx, "tab-apply-source"));
+        app.edit_query(cx, view_from, view_to);
+
+        // Applying shows the script; cancelling runs nothing.
+        app.click(cx, "tab-apply-source");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview"));
+        assert_eq!(columns(), "1", "{engine:?}");
+
+        app.click(cx, "tab-apply-source");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the apply", |app, cx| {
+            !app.running(cx) && !app.outcomes(cx).is_empty()
+        });
+        assert!(
+            app.outcomes(cx)
+                .iter()
+                .all(|outcome| outcome.starts_with("done")),
+            "{engine:?}: {:?}",
+            app.outcomes(cx)
+        );
+        assert_eq!(server("SELECT b FROM kerno_ui_source.v"), "2", "{engine:?}");
+        // The tree read the objects again: the view closed, and opens on
+        // its new column.
+        app.wait_until(cx, "the refresh", |app, cx| {
+            !app.shows(cx, &at(&["Views", "v", "Columns"]))
+        });
+        app.open_path(cx, &at(&["Views", "v", "Columns"]));
+        app.toggle(cx, &at(&["Views", "v", "Columns"]));
+        app.wait_until(cx, "the new column", |app, cx| {
+            app.shows(cx, &at(&["Views", "v", "Columns", "b"]))
+        });
+
+        // A function gets a new body.
+        app.open_path(cx, &at(&[routines, "f()"]));
+        app.act(cx, Action::EditSource, &at(&[routines, "f()"]));
+        app.wait_until(cx, "the function's source", |app, cx| {
+            app.titles(cx).len() == 2
+        });
+        app.edit_query(cx, body_from, body_to);
+        app.click(cx, "tab-apply-source");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the apply", |app, cx| {
+            !app.running(cx) && !app.outcomes(cx).is_empty()
+        });
+        assert_eq!(server("SELECT kerno_ui_source.f()"), "2", "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_materialized_view_whose_new_source_fails_is_kept(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_matview CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_matview",
+            "CREATE MATERIALIZED VIEW kerno_ui_matview.m AS SELECT 1 AS a",
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let m = ["kerno", "kerno_ui_matview", "Materialized views", "m"];
+    app.open_path(cx, &m);
+    app.act(cx, Action::EditSource, &m);
+    app.wait_until(cx, "the source", |app, cx| app.titles(cx) == ["m"]);
+    app.edit_query(cx, "1 AS a", "1 AS a, no_such_column");
+    let (_, edited) = app.active_query(cx);
+    app.click(cx, "tab-apply-source");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the apply", |app, cx| {
+        !app.running(cx) && !app.outcomes(cx).is_empty()
+    });
+    // BEGIN and DROP ran; the CREATE failed and the rest did not run.
+    assert_eq!(app.outcomes(cx), ["done", "done", "failed [42703]"]);
+    // Rolled back: no transaction left open, the view is still there, and
+    // the text waits to be fixed.
+    app.wait_until(cx, "the rollback", |app, cx| !app.has(cx, "tab-rollback"));
+    assert_eq!(
+        on_server(Engine::Postgres, "SELECT a FROM kerno_ui_matview.m"),
+        "1"
+    );
+    assert_eq!(app.active_query(cx).1, edited);
+}
+
+#[gpui_kit::test]
+fn extensions_are_installed_and_dropped_from_the_tree(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    // Extensions belong to a database: this test has its own, which the
+    // app is still connected to when it is dropped.
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP DATABASE IF EXISTS kerno_ui_ext WITH (FORCE)"],
+        &["CREATE DATABASE kerno_ui_ext"],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let extensions = ["kerno_ui_ext", "Extensions"];
+    app.open_path(cx, &["kerno_ui_ext", "Extensions", "citext"]);
+    // Installed extensions come first: a new database has only plpgsql.
+    let first = |app: &Fixture, cx: &mut TestAppContext| {
+        let tree = app.tree(cx);
+        let database = tree
+            .iter()
+            .position(|line| *line == row(0, "kerno_ui_ext"))?;
+        let folder = database
+            + tree[database..]
+                .iter()
+                .position(|line| *line == row(1, "Extensions"))?;
+        tree.get(folder + 1).cloned()
+    };
+    assert_eq!(first(&app, cx), Some(row(2, "plpgsql")));
+
+    app.act(
+        cx,
+        Action::InstallExtension,
+        &["kerno_ui_ext", "Extensions", "citext"],
+    );
+    assert!(app.has(cx, "sql-preview"));
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the install", |app, cx| {
+        first(app, cx) == Some(row(2, "citext"))
+    });
+
+    app.act(cx, Action::Drop, &["kerno_ui_ext", "Extensions", "citext"]);
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the drop", |app, cx| {
+        first(app, cx) == Some(row(2, "plpgsql"))
+    });
+    assert!(app.shows(cx, &[&extensions[..], &["citext"]].concat()));
+}
+
+#[gpui_kit::test]
+fn enums_are_created_and_their_values_added_and_renamed(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_enum CASCADE"],
+        &["CREATE SCHEMA kerno_ui_enum"],
+    );
+    let values = || {
+        on_server(
+            Engine::Postgres,
+            "SELECT enum_range(NULL::kerno_ui_enum.mood)::text",
+        )
+    };
+    let app = connected(cx, Engine::Postgres);
+    let types = ["kerno", "kerno_ui_enum", "Types"];
+    let mood = ["kerno", "kerno_ui_enum", "Types", "mood"];
+    let value = |name: &'static str| [&mood[..], &[name]].concat();
+    app.open_path(cx, &types);
+
+    // A name and its values, one per line.
+    app.act(cx, Action::CreateEnum, &types);
+    app.type_text(cx, "mood");
+    app.click(cx, "sql-list");
+    app.type_text(cx, "sad");
+    app.press(cx, &["enter"]);
+    app.type_text(cx, "ok");
+    app.click(cx, "sql-confirm");
+    // The folder was empty: it is opened once the schema is read again.
+    app.wait_until(cx, "the enum", |app, cx| {
+        if app.shows(cx, &mood) {
+            return true;
+        }
+        if app.shows(cx, &types) && !app.is_open(cx, &types) {
+            app.toggle(cx, &types);
+        }
+        false
+    });
+    // The tree lists its values.
+    app.open_path(cx, &value("sad"));
+    assert!(app.shows(cx, &value("ok")));
+    assert_eq!(values(), "{sad,ok}");
+
+    // A value at the end, then one before another.
+    app.act(cx, Action::AddEnumValue, &mood);
+    app.type_text(cx, "happy");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the new value", |app, cx| {
+        app.shows(cx, &value("happy"))
+    });
+    app.act(cx, Action::AddEnumValue, &value("ok"));
+    app.type_text(cx, "meh");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the value before", |app, cx| {
+        app.shows(cx, &value("meh"))
+    });
+
+    // Renaming starts from the old value.
+    app.act(cx, Action::RenameEnumValue, &value("sad"));
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "glum");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the rename", |app, cx| app.shows(cx, &value("glum")));
+    assert_eq!(values(), "{glum,meh,ok,happy}");
+    let tree = app.tree(cx);
+    let start = tree
+        .iter()
+        .position(|line| *line == row(4, "glum"))
+        .unwrap();
+    assert_eq!(
+        tree[start..start + 4],
+        [row(4, "glum"), row(4, "meh"), row(4, "ok"), row(4, "happy")]
+    );
+
+    app.act(cx, Action::Drop, &mood);
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the drop", |app, cx| !app.shows(cx, &mood));
 }
 
 // Running statements ----------------------------------------------------------

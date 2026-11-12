@@ -328,6 +328,36 @@ impl Dialect for MysqlDialect {
         ))
     }
 
+    /// `SHOW CREATE` prints a plain `CREATE`: `OR REPLACE` goes after it,
+    /// for views on both engines and for routines on MariaDB. MySQL cannot
+    /// replace a routine: it is dropped first (`IF EXISTS`, so the script
+    /// runs again after a definition that failed). The definition keeps
+    /// its `DELIMITER` lines; the editor splits on them.
+    fn replace_source_sql(&self, object: &ObjectRef, ddl: &str) -> Result<String> {
+        let or_replace = || Ok(ddl.replacen("CREATE ", "CREATE OR REPLACE ", 1));
+        match object {
+            ObjectRef::Relation(_, RelationKind::View) => or_replace(),
+            ObjectRef::Routine {
+                schema, name, kind, ..
+            } if matches!(kind, RoutineKind::Function | RoutineKind::Procedure) => {
+                if self.engine == Engine::MariaDb {
+                    return or_replace();
+                }
+                let keyword = if *kind == RoutineKind::Procedure {
+                    "PROCEDURE"
+                } else {
+                    "FUNCTION"
+                };
+                Ok(format!(
+                    "DROP {keyword} IF EXISTS {};\n\n{}",
+                    self.table_name(&TableRef::new(schema.clone(), name.clone())),
+                    ddl.trim_start()
+                ))
+            }
+            _ => Err(unsupported("editing the source of this kind of object")),
+        }
+    }
+
     /// One `CREATE TABLE` holding everything: keys, indexes and comments
     /// are written inline.
     fn create_table_sql(&self, draft: &TableDraft) -> Result<Vec<String>> {
@@ -740,6 +770,84 @@ mod tests {
             "not supported by this database: renaming a trigger; \
              drop it and create it again under the new name"
         );
+    }
+
+    #[test]
+    fn source_scripts_replace_what_show_create_printed() {
+        use kerno_core::sql::split_statements;
+        let (mysql, mariadb) = (mysql(), MysqlDialect::new(Engine::MariaDb));
+        let routine = |kind| ObjectRef::Routine {
+            schema: "shop".into(),
+            name: "f".into(),
+            kind,
+            identity_arguments: String::new(),
+        };
+        let view = ObjectRef::Relation(TableRef::new("shop", "v"), RelationKind::View);
+        let view_ddl = "CREATE ALGORITHM=UNDEFINED DEFINER=`kerno`@`%` SQL SECURITY DEFINER \
+                        VIEW `v` AS select 1 AS `a`;";
+        for d in [&mysql, &mariadb] {
+            assert_eq!(
+                d.replace_source_sql(&view, view_ddl).unwrap(),
+                "CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`kerno`@`%` SQL SECURITY DEFINER \
+                 VIEW `v` AS select 1 AS `a`;"
+            );
+        }
+        // As the driver prints a routine: between DELIMITER lines.
+        let body = "CREATE DEFINER=`kerno`@`%` FUNCTION `f`() RETURNS int\n    DETERMINISTIC\n\
+                    BEGIN\n  DECLARE x INT;\n  RETURN 1;\nEND";
+        let ddl = format!("DELIMITER //\n{body}//\nDELIMITER ;");
+        let statements = |script: &str| -> Vec<String> {
+            split_statements(script, LexRules::MYSQL)
+                .iter()
+                .map(|statement| statement.text(script).to_string())
+                .collect()
+        };
+        // MariaDB replaces it in place.
+        let replaced = mariadb
+            .replace_source_sql(&routine(RoutineKind::Function), &ddl)
+            .unwrap();
+        assert_eq!(
+            statements(&replaced),
+            [body.replacen("CREATE ", "CREATE OR REPLACE ", 1)]
+        );
+        // MySQL drops it first; the body stays one statement.
+        for (kind, keyword) in [
+            (RoutineKind::Function, "FUNCTION"),
+            (RoutineKind::Procedure, "PROCEDURE"),
+        ] {
+            let script = mysql.replace_source_sql(&routine(kind), &ddl).unwrap();
+            assert_eq!(
+                statements(&script),
+                [
+                    format!("DROP {keyword} IF EXISTS `shop`.`f`"),
+                    body.to_string()
+                ]
+            );
+        }
+        for object in [
+            ObjectRef::Relation(TableRef::new("shop", "t"), RelationKind::Table),
+            ObjectRef::Event(TableRef::new("shop", "e")),
+            routine(RoutineKind::Aggregate),
+        ] {
+            assert!(
+                matches!(
+                    mysql.replace_source_sql(&object, ""),
+                    Err(Error::Unsupported(_))
+                ),
+                "{object:?}"
+            );
+        }
+        // Extensions and standalone enums are PostgreSQL's.
+        let t = TableRef::new("shop", "t");
+        for result in [
+            mariadb.create_extension_sql("x"),
+            mariadb.drop_extension_sql("x"),
+            mariadb.create_enum_sql(&t, &[]),
+            mariadb.add_enum_value_sql(&t, "a", None),
+            mariadb.rename_enum_value_sql(&t, "a", "b"),
+        ] {
+            assert!(matches!(result, Err(Error::Unsupported(_))), "{result:?}");
+        }
     }
 
     #[test]

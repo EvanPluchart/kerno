@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use gpui_kit::InteractiveElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -17,6 +17,10 @@ use kerno_core::config::Environment;
 
 /// Writes the statement for a typed name, or says why there is none.
 pub type BuildStatement = dyn Fn(&str) -> Result<String, String>;
+
+/// Writes the statement for a typed name and list, or says why there is
+/// none.
+pub type BuildListStatement = dyn Fn(&str, &[String]) -> Result<String, String>;
 
 /// Runs the confirmed statement.
 type Run = dyn Fn(String, &mut Window, &mut App);
@@ -33,6 +37,14 @@ pub enum Statement {
         initial: String,
         /// The statement for a name, or why there is none for it.
         build: Rc<BuildStatement>,
+    },
+    /// Built from a name and a list typed one item per line (an enum and
+    /// its values).
+    NamedList {
+        /// Label of the list field.
+        list_label: &'static str,
+        /// The statement for a name and the non-empty lines, trimmed.
+        build: Rc<BuildListStatement>,
     },
 }
 
@@ -54,11 +66,12 @@ pub struct Confirmation {
 struct ConfirmView {
     confirmation: Confirmation,
     name: Option<Entity<InputState>>,
+    list: Option<Entity<TextareaState>>,
     /// On production, the first click on the action arms it and the second
     /// runs it.
     armed: bool,
     run: Rc<Run>,
-    _subscription: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// Asks, then calls `run` with the statement to execute.
@@ -94,43 +107,67 @@ impl ConfirmView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let name = match &confirmation.statement {
+        let initial = match &confirmation.statement {
             Statement::Fixed(_) => None,
-            Statement::Named { initial, .. } => {
-                let initial = initial.clone();
-                Some(cx.new(|cx| InputState::new(window, cx).default_value(initial)))
+            Statement::Named { initial, .. } => Some(initial.clone()),
+            Statement::NamedList { .. } => Some(String::new()),
+        };
+        let name =
+            initial.map(|initial| cx.new(|cx| InputState::new(window, cx).default_value(initial)));
+        let list = matches!(confirmation.statement, Statement::NamedList { .. })
+            .then(|| cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8)));
+        // A changed statement is confirmed afresh.
+        let disarm = |this: &mut Self, event: &InputEvent, cx: &mut Context<Self>| {
+            if matches!(event, InputEvent::Change) {
+                this.armed = false;
+                cx.notify();
             }
         };
-        let subscription = name.as_ref().map(|name| {
-            cx.subscribe(name, |this, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    // A changed statement is confirmed afresh.
-                    this.armed = false;
-                    cx.notify();
-                }
-            })
-        });
+        let mut subscriptions = Vec::new();
+        if let Some(name) = &name {
+            subscriptions
+                .push(cx.subscribe(name, move |this, _, event, cx| disarm(this, event, cx)));
+        }
+        if let Some(list) = &list {
+            subscriptions
+                .push(cx.subscribe(list, move |this, _, event, cx| disarm(this, event, cx)));
+        }
         Self {
             confirmation,
             name,
+            list,
             armed: false,
             run,
-            _subscription: subscription,
+            _subscriptions: subscriptions,
         }
     }
 
     /// The statement as it stands, or why there is none.
     fn statement(&self, cx: &App) -> Result<String, String> {
-        match (&self.confirmation.statement, &self.name) {
-            (Statement::Named { build, .. }, Some(name)) => {
-                let typed = name.read(cx).value().trim().to_string();
-                if typed.is_empty() {
-                    return Err("Type a name.".into());
-                }
-                build(&typed)
+        let typed = match &self.name {
+            Some(name) => name.read(cx).value().trim().to_string(),
+            None => String::new(),
+        };
+        match &self.confirmation.statement {
+            Statement::Fixed(sql) => Ok(sql.clone()),
+            Statement::Named { label, .. } if typed.is_empty() => {
+                Err(format!("Type a {}.", label.to_lowercase()))
             }
-            (Statement::Fixed(sql), _) => Ok(sql.clone()),
-            (Statement::Named { .. }, None) => Err("No name.".into()),
+            _ if typed.is_empty() => Err("Type a name.".into()),
+            Statement::Named { build, .. } => build(&typed),
+            Statement::NamedList { build, .. } => {
+                let lines: Vec<String> = self
+                    .list
+                    .as_ref()
+                    .map(|list| list.read(cx).value().to_string())
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                build(&typed, &lines)
+            }
         }
     }
 
@@ -158,18 +195,36 @@ impl Render for ConfirmView {
         } else {
             self.confirmation.action
         };
-        let field = match (&self.confirmation.statement, &self.name) {
-            (Statement::Named { label, .. }, Some(name)) => Some(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(*label),
-                    )
-                    .child(Input::new(name).id("sql-name")),
-            ),
+        let labelled = |label: &'static str, field: gpui_kit::AnyElement| {
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(label),
+                )
+                .child(field)
+        };
+        let name_label = match &self.confirmation.statement {
+            Statement::Named { label, .. } => label,
+            _ => "Name",
+        };
+        let field = self.name.as_ref().map(|name| {
+            labelled(
+                name_label,
+                Input::new(name).id("sql-name").into_any_element(),
+            )
+        });
+        let list = match (&self.confirmation.statement, &self.list) {
+            (Statement::NamedList { list_label, .. }, Some(list)) => Some(labelled(
+                list_label,
+                div()
+                    .id("sql-list")
+                    .test_support()
+                    .child(Textarea::new(list))
+                    .into_any_element(),
+            )),
             _ => None,
         };
         v_flex()
@@ -181,6 +236,7 @@ impl Render for ConfirmView {
                     .child(SharedString::from(self.confirmation.explanation.clone())),
             )
             .children(field)
+            .children(list)
             .child(
                 div()
                     .id("sql-preview")

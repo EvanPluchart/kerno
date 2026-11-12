@@ -13,7 +13,7 @@ use common::{db_error, engines, exec_ok, rows, run, scalar};
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
     ParamKey, bind_params, delete_template, find_params, insert_template, select_template,
-    update_template,
+    split_statements, update_template,
 };
 use kerno_core::{Engine, Session};
 
@@ -438,4 +438,102 @@ async fn objects(session: Arc<dyn Session>, database: String) {
         &databases(&made),
     )
     .await;
+}
+
+/// Runs a script the way the query editor does: split into statements
+/// (`DELIMITER` lines followed), each sent on its own, stopping at the
+/// first that fails.
+async fn run_script(session: &Arc<dyn Session>, script: &str) -> kerno_core::Result<()> {
+    for statement in split_statements(script, session.dialect().lex_rules()) {
+        run(session, statement.text(script)).await?;
+    }
+    Ok(())
+}
+
+/// The replace script of `object`, from its DDL with `from` changed to `to`.
+async fn edited_source(
+    session: &Arc<dyn Session>,
+    object: &ObjectRef,
+    from: &str,
+    to: &str,
+) -> String {
+    let ddl = session.ddl(object).await.unwrap();
+    assert!(ddl.contains(from), "{from:?} not in\n{ddl}");
+    session
+        .dialect()
+        .replace_source_sql(object, &ddl.replacen(from, to, 1))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn edited_sources_replace_views_and_routines() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let database = common::scratch_database("generate_sources");
+        let cleanup = [format!("DROP DATABASE IF EXISTS {database}")];
+        cleaning_up(&session, &cleanup, sources(session.clone(), database)).await;
+    }
+}
+
+async fn sources(session: Arc<dyn Session>, database: String) {
+    let mariadb = session.engine() == Engine::MariaDb;
+    for sql in [
+        "CREATE DATABASE {db}",
+        "CREATE VIEW {db}.v AS SELECT 1 AS a",
+        "CREATE FUNCTION {db}.f() RETURNS INT DETERMINISTIC RETURN 1",
+        "CREATE PROCEDURE {db}.p() BEGIN SELECT 1; SELECT 1; END",
+    ] {
+        exec_ok(&session, &sql.replace("{db}", &database)).await;
+    }
+    // SHOW CREATE leaves names unqualified: the script runs in the
+    // object's database, as the editor tab of the object does.
+    exec_ok(&session, &format!("USE {database}")).await;
+    let in_database = |name: &str| TableRef::new(database.clone(), name);
+    let routine = |name: &str, kind| ObjectRef::Routine {
+        schema: database.clone(),
+        name: name.into(),
+        kind,
+        identity_arguments: String::new(),
+    };
+
+    let view = ObjectRef::Relation(in_database("v"), RelationKind::View);
+    let script = edited_source(&session, &view, "1 AS `a`", "1 AS `a`,2 AS `b`").await;
+    run_script(&session, &script).await.unwrap();
+    assert_eq!(
+        scalar(&session, &format!("SELECT b FROM {database}.v")).await,
+        "2"
+    );
+
+    // A body that fails: MariaDB keeps the old function; MySQL dropped
+    // it first, and the script runs again once fixed.
+    let function = routine("f", RoutineKind::Function);
+    let broken = edited_source(&session, &function, "RETURN 1", "RETURN 1 +").await;
+    let fixed = edited_source(&session, &function, "RETURN 1", "RETURN 2").await;
+    assert_eq!(
+        broken.contains("DROP FUNCTION IF EXISTS"),
+        !mariadb,
+        "{broken}"
+    );
+    assert!(run_script(&session, &broken).await.is_err());
+    let functions = format!(
+        "SELECT count(*) FROM information_schema.routines \
+         WHERE routine_schema = '{database}' AND routine_name = 'f'"
+    );
+    assert_eq!(
+        scalar(&session, &functions).await,
+        if mariadb { "1" } else { "0" }
+    );
+    run_script(&session, &fixed).await.unwrap();
+    run_script(&session, &fixed).await.unwrap();
+    assert_eq!(
+        scalar(&session, &format!("SELECT {database}.f()")).await,
+        "2"
+    );
+
+    // A procedure whose body has semicolons stays one statement.
+    let procedure = routine("p", RoutineKind::Procedure);
+    let script = edited_source(&session, &procedure, "SELECT 1;", "SELECT 2;").await;
+    run_script(&session, &script).await.unwrap();
+    let ddl = session.ddl(&procedure).await.unwrap();
+    assert!(ddl.contains("SELECT 2; SELECT 1;"), "{ddl}");
 }

@@ -24,7 +24,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
     div, px,
@@ -34,7 +34,7 @@ use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, find_params, format_sql, split_statements,
     statement_at,
 };
-use kerno_core::sql::{StatementClass, StatementKind, classify};
+use kerno_core::sql::{StatementClass, StatementKind, TxCommand, classify};
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
     Dialect, Error, ExecEvent, Notice, Plan, ResultStore, RowLimit, Session, TxState, exec,
@@ -255,8 +255,21 @@ pub struct QueryTab {
     catalog: SharedCatalog,
     /// The catalog being loaded. Replacing it drops the older load.
     catalog_load: Option<Task<()>>,
+    /// Source mode: the text replaces an object of this schema (MySQL
+    /// database), and "Apply source" runs all of it.
+    source: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// What a query tab tells the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTabEvent {
+    /// A source was applied, whether all of it ran or not: the objects of
+    /// its schema may have changed.
+    SourceApplied,
+}
+
+impl EventEmitter<QueryTabEvent> for QueryTab {}
 
 impl QueryTab {
     /// A query tab titled `title` with `sql` in its editor, running on
@@ -325,6 +338,7 @@ impl QueryTab {
             generation: 0,
             catalog: SharedCatalog::default(),
             catalog_load: None,
+            source: None,
             _subscriptions: vec![subscription, edits],
         };
         tab.follow_connection(cx);
@@ -354,7 +368,19 @@ impl QueryTab {
             target: self.target.clone(),
             file: self.file.clone(),
             unsaved: self.unsaved,
+            source: self.source.clone(),
         }
+    }
+
+    /// Puts the tab in source mode for an object of `schema`, or out of it.
+    pub fn set_source(&mut self, schema: Option<String>, cx: &mut Context<Self>) {
+        self.source = schema;
+        cx.notify();
+    }
+
+    /// The schema of the object whose source the tab holds, in source mode.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     /// The `.sql` file of this tab, when it has one.
@@ -385,7 +411,7 @@ impl QueryTab {
             .map(|target| target.connection.as_str())
     }
 
-    #[cfg(test)]
+    /// Where the tab runs its statements.
     pub fn target(&self) -> Option<&Target> {
         self.target.as_ref()
     }
@@ -537,6 +563,8 @@ impl QueryTab {
         }
         self.stop(cx);
         self.target = target;
+        // The source replaces an object where it was read from.
+        self.source = None;
         self.session = None;
         self.databases.clear();
         self.schemas.clear();
@@ -1029,7 +1057,7 @@ impl QueryTab {
             .and_then(|target| connections.meta_session(&target.connection));
         let (Some(saved), Some(meta)) = (saved, meta) else {
             // Nothing to run on: the run itself says so.
-            self.start(statements, window, cx);
+            self.start(statements, false, window, cx);
             return;
         };
         // What will be sent decides: EXPLAIN ANALYZE runs the statement.
@@ -1045,26 +1073,7 @@ impl QueryTab {
         if saved.config.read_only
             && let Some(blocked) = classes.iter().position(|class| class.writes)
         {
-            self.stop(cx);
-            self.results.clear();
-            self.grid_subscriptions.clear();
-            self.notices.clear();
-            self.results.push(ResultPane {
-                statement: statements[blocked].sql.clone(),
-                outcome: Outcome::Failed(Failure {
-                    message: format!(
-                        "“{name}” is a read-only connection: this statement would change the database and was not run."
-                    ),
-                    code: None,
-                    detail: None,
-                    hint: Some("Untick “Read-only” in the connection's settings to allow changes.".into()),
-                    position: None,
-                }),
-                rows_affected: None,
-                elapsed: None,
-            });
-            self.active_result = 0;
-            cx.notify();
+            self.refuse_read_only(&statements[blocked].sql, &name, cx);
             return;
         }
         // Statements that destroy something are shown and confirmed first;
@@ -1080,7 +1089,7 @@ impl QueryTab {
             .map(|(statement, _)| statement)
             .collect();
         if to_confirm.is_empty() {
-            self.start(statements, window, cx);
+            self.start(statements, false, window, cx);
             return;
         }
         let destructive = classes.iter().any(|class| class.destructive);
@@ -1111,14 +1120,127 @@ impl QueryTab {
         let view = cx.entity();
         sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
             let statements = statements.clone();
-            view.update(cx, |this, cx| this.start(statements, window, cx));
+            view.update(cx, |this, cx| this.start(statements, false, window, cx));
             let editor = view.read(cx).focus_handle(cx);
             window.defer(cx, move |window, cx| editor.focus(window, cx));
         });
     }
 
-    /// Runs the statements, guards passed.
-    fn start(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows why a statement was not run on a read-only connection.
+    fn refuse_read_only(&mut self, statement: &str, connection: &str, cx: &mut Context<Self>) {
+        self.stop(cx);
+        self.results.clear();
+        self.grid_subscriptions.clear();
+        self.notices.clear();
+        self.results.push(ResultPane {
+            statement: statement.to_string(),
+            outcome: Outcome::Failed(Failure {
+                message: format!(
+                    "“{connection}” is a read-only connection: this statement would change the database and was not run."
+                ),
+                code: None,
+                detail: None,
+                hint: Some(
+                    "Untick “Read-only” in the connection's settings to allow changes.".into(),
+                ),
+                position: None,
+            }),
+            rows_affected: None,
+            elapsed: None,
+        });
+        self.active_result = 0;
+        cx.notify();
+    }
+
+    /// Runs the whole text, the script of a source, once its SQL was
+    /// shown and confirmed. Parameters are not asked for: a source is
+    /// sent as it is written. Whatever came of it, the window is told.
+    pub fn apply_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source.is_none() || matches!(self.activity, Activity::Running { .. }) {
+            return;
+        }
+        let rules = self.lex_rules(cx);
+        let text = self.sql(cx);
+        let statements: Vec<Statement> = split_statements(&text, rules)
+            .iter()
+            .map(|span| Statement {
+                sql: span.text(&text).to_string(),
+                origin: Some(span.range.start),
+            })
+            .collect();
+        if statements.is_empty() {
+            return;
+        }
+        self.explain_mode = None;
+        self.clear_error_mark(cx);
+        let connections = self.connections.read(cx);
+        let Some(saved) = self
+            .target
+            .as_ref()
+            .and_then(|target| connections.get(&target.connection))
+        else {
+            // Nothing to run on: the run itself says so.
+            self.start(statements, true, window, cx);
+            return;
+        };
+        let (name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let classes: Vec<StatementClass> = statements
+            .iter()
+            .map(|statement| classify(&statement.sql, rules))
+            .collect();
+        if saved.config.read_only {
+            let blocked = classes.iter().position(|class| class.writes).unwrap_or(0);
+            self.refuse_read_only(&statements[blocked].sql, &name, cx);
+            return;
+        }
+        let destructive = classes.iter().any(|class| class.destructive);
+        let in_transaction = classes
+            .iter()
+            .any(|class| class.kind == StatementKind::Transaction(TxCommand::Begin));
+        let confirmation = Confirmation {
+            title: format!("Apply the source of “{}”?", self.title),
+            explanation: match (destructive, in_transaction) {
+                (true, true) => "The object is dropped, then created from this definition, in one \
+                                 transaction: if the definition fails, the old object stays."
+                    .to_string(),
+                (true, false) => {
+                    "The object is dropped, then created from this definition. If the \
+                                  definition fails, the object stays dropped until it is fixed and \
+                                  applied again."
+                        .to_string()
+                }
+                _ => "The object is replaced by this definition.".to_string(),
+            },
+            statement: ConfirmStatement::Fixed(
+                statements
+                    .iter()
+                    .map(|statement| statement.sql.as_str())
+                    .collect::<Vec<_>>()
+                    .join(";\n\n"),
+            ),
+            action: "Apply source",
+            destructive,
+            connection: name,
+            environment,
+        };
+        let view = cx.entity();
+        sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
+            let statements = statements.clone();
+            view.update(cx, |this, cx| this.start(statements, true, window, cx));
+            let editor = view.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, cx| editor.focus(window, cx));
+        });
+    }
+
+    /// Runs the statements, guards passed. `applying` a source: the window
+    /// is told once it ran.
+    fn start(
+        &mut self,
+        statements: Vec<Statement>,
+        applying: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop(cx);
         self.generation += 1;
         self.results.clear();
@@ -1182,6 +1304,7 @@ impl QueryTab {
                 }
             }
             let mut changed_schema = false;
+            let mut any_failed = false;
             for (index, statement) in statements.into_iter().enumerate() {
                 let started = Instant::now();
                 let started_at_ms = kerno_core::storage::now_ms();
@@ -1391,7 +1514,19 @@ impl QueryTab {
                     this.statement_ended(&recorded, ended, cx)
                 });
                 if failed {
+                    any_failed = true;
                     break;
+                }
+            }
+            // A source that failed inside its own transaction leaves nothing
+            // half done, and no lock held: the transaction is rolled back.
+            if applying && any_failed && !manual && session.tx_state() == TxState::Failed {
+                let rolling = cx
+                    .update(|_, cx| bridge::spawn(cx, exec::collect(session.clone(), "ROLLBACK")));
+                if let Ok(rolling) = rolling
+                    && let Err(error) = rolling.await
+                {
+                    tracing::warn!(%error, "the failed source was not rolled back");
                 }
             }
             let _ = this.update(cx, |this, cx| {
@@ -1399,6 +1534,9 @@ impl QueryTab {
                 this.run = None;
                 if changed_schema {
                     this.load_catalog(cx);
+                }
+                if applying {
+                    cx.emit(QueryTabEvent::SourceApplied);
                 }
                 cx.notify();
             });
@@ -1937,9 +2075,27 @@ impl QueryTab {
                     .disabled(running)
                     .on_click(cx.listener(|this, _, window, cx| this.run(Scope::All, window, cx))),
             )
+            .when(self.source.is_some(), |this| {
+                this.child(
+                    Button::new("tab-apply-source")
+                        .primary()
+                        .small()
+                        .label("Apply source")
+                        .tooltip("Run the whole script, which replaces the object, once its SQL is confirmed")
+                        .disabled(running)
+                        .on_click(cx.listener(|this, _, window, cx| this.apply_source(window, cx))),
+                )
+            })
             .child(
                 Button::new("tab-run")
-                    .primary()
+                    .map(|button| {
+                        // In source mode, applying is the main action.
+                        if self.source.is_some() {
+                            button.ghost()
+                        } else {
+                            button.primary()
+                        }
+                    })
                     .small()
                     .label("Run")
                     .tooltip("Run the statement at the cursor, or the selection (Cmd+Enter)")

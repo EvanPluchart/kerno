@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use common::{db_error, exec_ok, rows, run, scalar};
 use kerno_core::Session;
-use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
+use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef, TypeShape};
 use kerno_core::sql::{
     ParamKey, bind_params, delete_template, find_params, insert_template, select_template,
-    update_template,
+    split_statements, update_template,
 };
 
 /// SQLSTATE of a syntax error.
@@ -497,4 +497,177 @@ async fn objects(session: Arc<dyn Session>, schema: String) {
         },
     )
     .await;
+}
+
+/// Runs a script the way the query editor does: split into statements,
+/// each sent on its own, stopping at the first that fails.
+async fn run_script(session: &Arc<dyn Session>, script: &str) -> kerno_core::Result<()> {
+    for statement in split_statements(script, session.dialect().lex_rules()) {
+        run(session, statement.text(script)).await?;
+    }
+    Ok(())
+}
+
+/// The replace script of `object`, from its DDL with `from` changed to `to`.
+async fn edited_source(
+    session: &Arc<dyn Session>,
+    object: &ObjectRef,
+    from: &str,
+    to: &str,
+) -> String {
+    let ddl = session.ddl(object).await.unwrap();
+    assert!(ddl.contains(from), "{from:?} not in\n{ddl}");
+    session
+        .dialect()
+        .replace_source_sql(object, &ddl.replacen(from, to, 1))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn edited_sources_replace_views_and_routines() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("generate_sources");
+    let cleanup = [format!("DROP SCHEMA IF EXISTS {schema} CASCADE")];
+    cleaning_up(&session, &cleanup, sources(session.clone(), schema)).await;
+}
+
+async fn sources(session: Arc<dyn Session>, schema: String) {
+    for sql in [
+        "CREATE SCHEMA {s}",
+        "CREATE VIEW {s}.v AS SELECT 1 AS a",
+        "CREATE MATERIALIZED VIEW {s}.m AS SELECT 1 AS a",
+        "CREATE FUNCTION {s}.f() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE PROCEDURE {s}.p() LANGUAGE sql AS 'SELECT 1'",
+    ] {
+        exec_ok(&session, &sql.replace("{s}", &schema)).await;
+    }
+    let relation =
+        |name: &str, kind| ObjectRef::Relation(TableRef::new(schema.clone(), name), kind);
+    let routine = |name: &str, kind| ObjectRef::Routine {
+        schema: schema.clone(),
+        name: name.into(),
+        kind,
+        identity_arguments: String::new(),
+    };
+
+    // A view gets a column at the end: CREATE OR REPLACE allows that.
+    let view = relation("v", RelationKind::View);
+    let script = edited_source(&session, &view, "1 AS a", "1 AS a, 2 AS b").await;
+    run_script(&session, &script).await.unwrap();
+    assert_eq!(
+        scalar(&session, &format!("SELECT b FROM {schema}.v")).await,
+        "2"
+    );
+
+    // A materialized view is dropped and created again, in a transaction:
+    // a definition that fails leaves the old one.
+    let matview = relation("m", RelationKind::MaterializedView);
+    let script = edited_source(&session, &matview, "1 AS a", "1 AS a, no_such_column").await;
+    assert!(script.contains("DROP MATERIALIZED VIEW"), "{script}");
+    assert!(run_script(&session, &script).await.is_err());
+    exec_ok(&session, "ROLLBACK").await;
+    assert_eq!(
+        scalar(&session, &format!("SELECT a FROM {schema}.m")).await,
+        "1"
+    );
+    let script = edited_source(&session, &matview, "1 AS a", "1 AS a, 2 AS b").await;
+    run_script(&session, &script).await.unwrap();
+    assert_eq!(
+        scalar(&session, &format!("SELECT b FROM {schema}.m")).await,
+        "2"
+    );
+
+    // A function and a procedure get a new body.
+    let function = routine("f", RoutineKind::Function);
+    let script = edited_source(&session, &function, "SELECT 1", "SELECT 2").await;
+    run_script(&session, &script).await.unwrap();
+    assert_eq!(scalar(&session, &format!("SELECT {schema}.f()")).await, "2");
+    let procedure = routine("p", RoutineKind::Procedure);
+    let script = edited_source(&session, &procedure, "SELECT 1", "SELECT 2").await;
+    run_script(&session, &script).await.unwrap();
+    let ddl = session.ddl(&procedure).await.unwrap();
+    assert!(ddl.contains("SELECT 2"), "{ddl}");
+}
+
+#[tokio::test]
+async fn enums_are_created_extended_and_renamed() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("generate_enums");
+    let cleanup = [format!("DROP SCHEMA IF EXISTS {schema} CASCADE")];
+    cleaning_up(&session, &cleanup, enums(session.clone(), schema)).await;
+}
+
+async fn enums(session: Arc<dyn Session>, schema: String) {
+    let d = session.dialect();
+    exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+    let mood = TableRef::new(schema.clone(), "Mood");
+    let values = |list: &[&str]| list.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    exec_ok(
+        &session,
+        &d.create_enum_sql(&mood, &values(&["sad", "ok"])).unwrap(),
+    )
+    .await;
+    exec_ok(
+        &session,
+        &d.add_enum_value_sql(&mood, "happy", None).unwrap(),
+    )
+    .await;
+    exec_ok(
+        &session,
+        &d.add_enum_value_sql(&mood, "it's meh", Some("ok")).unwrap(),
+    )
+    .await;
+    exec_ok(
+        &session,
+        &d.rename_enum_value_sql(&mood, "sad", "glum").unwrap(),
+    )
+    .await;
+    let types = session.objects(&schema).await.unwrap().types;
+    assert_eq!(types.len(), 1);
+    assert_eq!(
+        types[0].shape,
+        TypeShape::Enum(values(&["glum", "it's meh", "ok", "happy"]))
+    );
+    exec_ok(&session, &d.drop_sql(&ObjectRef::Type(mood)).unwrap()).await;
+    assert!(session.objects(&schema).await.unwrap().types.is_empty());
+}
+
+#[tokio::test]
+async fn an_extension_is_installed_and_dropped() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    // Extensions belong to a database: this test has its own.
+    let database = common::scratch_schema("generate_extension");
+    let cleanup = [format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")];
+    cleaning_up(&session, &cleanup, extension(session.clone(), database)).await;
+}
+
+async fn extension(session: Arc<dyn Session>, database: String) {
+    exec_ok(&session, &format!("CREATE DATABASE {database}")).await;
+    let mut params = kerno_core::testing::params(common::ENGINE);
+    params.database = Some(database);
+    let inside = common::connect(&params).await.unwrap();
+    let d = inside.dialect();
+    let citext = |extensions: Vec<kerno_core::schema::ExtensionInfo>| {
+        extensions
+            .into_iter()
+            .find(|extension| extension.name == "citext")
+            .expect("citext is available")
+            .installed_version
+    };
+    assert_eq!(citext(inside.extensions().await.unwrap()), None);
+    exec_ok(&inside, &d.create_extension_sql("citext").unwrap()).await;
+    assert!(citext(inside.extensions().await.unwrap()).is_some());
+    assert_eq!(
+        scalar(&inside, "SELECT 'A'::citext = 'a'::citext").await,
+        "t"
+    );
+    exec_ok(&inside, &d.drop_extension_sql("citext").unwrap()).await;
+    assert_eq!(citext(inside.extensions().await.unwrap()), None);
+    inside.close().await;
 }

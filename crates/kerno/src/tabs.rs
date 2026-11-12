@@ -38,6 +38,9 @@ pub enum TabSnapshot {
         /// The text differs from the file's.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unsaved: bool,
+        /// Source mode: the schema of the object the text replaces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// The data of a table or view.
     Data {
@@ -78,6 +81,7 @@ mod tests {
             target: None,
             file: None,
             unsaved: false,
+            source: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         assert_eq!(
@@ -99,6 +103,7 @@ mod tests {
             }),
             file: None,
             unsaved: false,
+            source: None,
         };
         let json = serde_json::to_string(&bound).unwrap();
         assert!(
@@ -106,6 +111,21 @@ mod tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), bound);
+        // A tab in source mode remembers the schema of its object.
+        let source = TabSnapshot::Query {
+            title: "v".into(),
+            sql: String::new(),
+            target: None,
+            file: None,
+            unsaved: false,
+            source: Some("shop".into()),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"query","title":"v","sql":"","source":"shop"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), source);
         // A table's data: where it is, and whether it is a view.
         let data = TabSnapshot::Data {
             target: Target {

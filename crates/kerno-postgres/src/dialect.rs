@@ -1,9 +1,9 @@
 //! PostgreSQL's SQL dialect.
 
 use kerno_core::dialect::{Dialect, default_drop_sql, default_rename_sql, hex};
-use kerno_core::schema::{ObjectRef, RoutineKind};
+use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::LexRules;
-use kerno_core::{Engine, Plan, Result, TypeKind};
+use kerno_core::{Engine, Error, Plan, Result, TypeKind};
 
 /// The PostgreSQL dialect.
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,13 +116,80 @@ impl Dialect for PgDialect {
             None => default_drop_sql(self, object),
         }
     }
+
+    /// Views and routines are printed as `CREATE OR REPLACE` already
+    /// (`pg_get_viewdef` wrapped by the driver, `pg_get_functiondef`). A
+    /// materialized view cannot be replaced: it is dropped and created
+    /// again in one transaction, so a definition that fails keeps the old
+    /// one.
+    fn replace_source_sql(&self, object: &ObjectRef, ddl: &str) -> Result<String> {
+        match object {
+            ObjectRef::Relation(_, RelationKind::View)
+            | ObjectRef::Routine {
+                kind: RoutineKind::Function | RoutineKind::Procedure | RoutineKind::Window,
+                ..
+            } => Ok(ddl.to_string()),
+            ObjectRef::Relation(view, RelationKind::MaterializedView) => Ok(format!(
+                "BEGIN;\n\nDROP MATERIALIZED VIEW {};\n\n{}\n\nCOMMIT;",
+                self.table_name(view),
+                ddl.trim()
+            )),
+            _ => Err(Error::Unsupported(
+                "editing the source of this kind of object".into(),
+            )),
+        }
+    }
+
+    fn create_extension_sql(&self, name: &str) -> Result<String> {
+        Ok(format!(
+            "CREATE EXTENSION IF NOT EXISTS {}",
+            self.quote_ident(name)
+        ))
+    }
+
+    fn drop_extension_sql(&self, name: &str) -> Result<String> {
+        Ok(format!("DROP EXTENSION {}", self.quote_ident(name)))
+    }
+
+    fn create_enum_sql(&self, ty: &TableRef, values: &[String]) -> Result<String> {
+        let values: Vec<String> = values.iter().map(|v| self.quote_string(v)).collect();
+        Ok(format!(
+            "CREATE TYPE {} AS ENUM ({})",
+            self.table_name(ty),
+            values.join(", ")
+        ))
+    }
+
+    fn add_enum_value_sql(
+        &self,
+        ty: &TableRef,
+        value: &str,
+        before: Option<&str>,
+    ) -> Result<String> {
+        let mut sql = format!(
+            "ALTER TYPE {} ADD VALUE {}",
+            self.table_name(ty),
+            self.quote_string(value)
+        );
+        if let Some(before) = before {
+            sql.push_str(&format!(" BEFORE {}", self.quote_string(before)));
+        }
+        Ok(sql)
+    }
+
+    fn rename_enum_value_sql(&self, ty: &TableRef, from: &str, to: &str) -> Result<String> {
+        Ok(format!(
+            "ALTER TYPE {} RENAME VALUE {} TO {}",
+            self.table_name(ty),
+            self.quote_string(from),
+            self.quote_string(to)
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kerno_core::Error;
-    use kerno_core::schema::{RelationKind, TableRef};
 
     #[test]
     fn identifiers_are_always_quoted() {
@@ -332,6 +399,89 @@ mod tests {
                 "ALTER TABLE \"shop\".\"order items\" ADD COLUMN \"placed\" timestamptz DEFAULT now() NOT NULL",
                 "ALTER TABLE \"shop\".\"order items\" RENAME TO \"orders\"",
             ]
+        );
+    }
+
+    #[test]
+    fn source_scripts_replace_what_the_driver_printed() {
+        let d = PgDialect;
+        let t = TableRef::new("shop", "v");
+        // What `ddl` prints, already `CREATE OR REPLACE`: kept as it is.
+        let view = "CREATE OR REPLACE VIEW \"shop\".\"v\" AS\n SELECT 1 AS a;";
+        assert_eq!(
+            d.replace_source_sql(&ObjectRef::Relation(t.clone(), RelationKind::View), view)
+                .unwrap(),
+            view
+        );
+        let function = "CREATE OR REPLACE FUNCTION shop.f()\n RETURNS integer\n LANGUAGE sql\nAS $function$SELECT 1$function$;";
+        for kind in [
+            RoutineKind::Function,
+            RoutineKind::Procedure,
+            RoutineKind::Window,
+        ] {
+            assert_eq!(
+                d.replace_source_sql(&routine(kind, ""), function).unwrap(),
+                function
+            );
+        }
+        // A materialized view is dropped and created in one transaction.
+        let matview = "CREATE MATERIALIZED VIEW \"shop\".\"v\" AS\n SELECT 1 AS a\nWITH DATA;\n";
+        assert_eq!(
+            d.replace_source_sql(
+                &ObjectRef::Relation(t.clone(), RelationKind::MaterializedView),
+                matview
+            )
+            .unwrap(),
+            "BEGIN;\n\nDROP MATERIALIZED VIEW \"shop\".\"v\";\n\n\
+             CREATE MATERIALIZED VIEW \"shop\".\"v\" AS\n SELECT 1 AS a\nWITH DATA;\n\nCOMMIT;"
+        );
+        for object in [
+            ObjectRef::Relation(t.clone(), RelationKind::Table),
+            routine(RoutineKind::Aggregate, "numeric"),
+            ObjectRef::Type(t),
+        ] {
+            assert!(
+                matches!(
+                    d.replace_source_sql(&object, ""),
+                    Err(Error::Unsupported(_))
+                ),
+                "{object:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_and_enum_statements() {
+        let d = PgDialect;
+        assert_eq!(
+            d.create_extension_sql("uuid-ossp").unwrap(),
+            "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\""
+        );
+        assert_eq!(
+            d.drop_extension_sql("citext").unwrap(),
+            "DROP EXTENSION \"citext\""
+        );
+        let mood = TableRef::new("public", "Mood");
+        assert_eq!(
+            d.create_enum_sql(&mood, &["sad".into(), "it's ok".into()])
+                .unwrap(),
+            "CREATE TYPE \"public\".\"Mood\" AS ENUM ('sad', 'it''s ok')"
+        );
+        assert_eq!(
+            d.create_enum_sql(&mood, &[]).unwrap(),
+            "CREATE TYPE \"public\".\"Mood\" AS ENUM ()"
+        );
+        assert_eq!(
+            d.add_enum_value_sql(&mood, "happy", None).unwrap(),
+            "ALTER TYPE \"public\".\"Mood\" ADD VALUE 'happy'"
+        );
+        assert_eq!(
+            d.add_enum_value_sql(&mood, r"a\b", Some("sad")).unwrap(),
+            r#"ALTER TYPE "public"."Mood" ADD VALUE E'a\\b' BEFORE 'sad'"#
+        );
+        assert_eq!(
+            d.rename_enum_value_sql(&mood, "sad", "glum").unwrap(),
+            "ALTER TYPE \"public\".\"Mood\" RENAME VALUE 'sad' TO 'glum'"
         );
     }
 
