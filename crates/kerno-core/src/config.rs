@@ -301,6 +301,12 @@ impl ConnectionConfig {
                 "a client certificate needs both the certificate file and the key file".into(),
             ));
         }
+        if let Some(key) = self.options.keys().find(|key| is_secret_option(key)) {
+            return Err(Error::Config(format!(
+                "option \"{key}\" looks like a secret; options are stored and exported in plain text, \
+                 so use the password fields instead"
+            )));
+        }
         if let Some(ssh) = &self.ssh {
             if ssh.host.trim().is_empty() {
                 return missing("the SSH host");
@@ -384,6 +390,17 @@ pub struct ConnectParams {
     pub options: BTreeMap<String, String>,
 }
 
+/// Whether an option's name says its value is a secret. Options are stored
+/// and exported in plain text, so such an option is never accepted:
+/// secrets go through [`Secrets`] to the OS secret store.
+pub fn is_secret_option(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "pwd"
+        || ["password", "passwd", "passphrase", "secret", "token"]
+            .iter()
+            .any(|word| key.contains(word))
+}
+
 /// The file written by "export connections": settings only, no secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionsFile {
@@ -399,6 +416,13 @@ const CONNECTIONS_FILE_VERSION: u32 = 1;
 /// Serializes connections for export. Passwords and passphrases are not
 /// part of [`ConnectionConfig`], so the result cannot contain any.
 pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
+    // The one free-form part of a connection is its options: refuse to
+    // write a file if any of them is named like a secret.
+    for connection in connections {
+        connection.validate().map_err(|error| {
+            Error::Config(format!("connection \"{}\": {error}", connection.name))
+        })?;
+    }
     serde_json::to_string_pretty(&ConnectionsFile {
         kerno_connections: CONNECTIONS_FILE_VERSION,
         connections: connections.to_vec(),
@@ -477,6 +501,8 @@ pub fn parse_connection_url(input: &str) -> Result<ParsedUrl> {
     let password = url.password().map(decode).transpose()?.map(Secret::new);
     let database = non_empty(decode(url.path().trim_start_matches('/'))?);
 
+    let mut user = user;
+    let mut password = password;
     let mut tls_mode = None;
     let mut options = BTreeMap::new();
     for (key, value) in url.query_pairs() {
@@ -487,6 +513,14 @@ pub fn parse_connection_url(input: &str) -> Result<ParsedUrl> {
                         .ok_or_else(|| bad(&format!("unknown TLS mode \"{value}\"")))?,
                 );
             }
+            // libpq-style URLs may carry the credentials as parameters.
+            // They are credentials, not options: options are stored in
+            // plain text and exported.
+            "user" => user = non_empty(value.into_owned()),
+            "password" => password = Some(Secret::new(value.into_owned())),
+            // Any other secret (a key passphrase, a token) has no field to
+            // go to and is dropped rather than kept as an option.
+            _ if is_secret_option(&key) => {}
             _ => {
                 options.insert(key.into_owned(), value.into_owned());
             }
@@ -736,6 +770,72 @@ mod tests {
             let error = import_connections(json).unwrap_err().to_string();
             assert!(error.contains(expected), "{json}: {error}");
         }
+    }
+
+    #[test]
+    fn secrets_cannot_hide_in_options() {
+        for key in [
+            "password",
+            "Password",
+            "sslpassword",
+            "ssl_key_passphrase",
+            "PWD",
+            "auth_token",
+            "client_secret",
+            "passwd",
+        ] {
+            assert!(is_secret_option(key), "{key}");
+        }
+        for key in [
+            "sslkey",
+            "application_name",
+            "search_path",
+            "key_buffer_size",
+            "connect_timeout",
+            "sql_mode",
+        ] {
+            assert!(!is_secret_option(key), "{key}");
+        }
+
+        // A URL that carries credentials as parameters: they become the
+        // credentials, and a secret with no field to go to is dropped.
+        let parsed = parse_connection_url(
+            "postgresql://db.example.com/shop?user=ada&password=hunter2&sslpassword=keypass&application_name=kerno",
+        )
+        .unwrap();
+        assert_eq!(parsed.user.as_deref(), Some("ada"));
+        assert_eq!(
+            parsed.password.as_ref().map(Secret::expose),
+            Some("hunter2")
+        );
+        assert_eq!(
+            parsed.options.keys().collect::<Vec<_>>(),
+            ["application_name"]
+        );
+
+        // Typed or imported as an option: refused everywhere.
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Leaky".into();
+        config.options.insert("password".into(), "hunter2".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("looks like a secret"), "{error}");
+        assert!(
+            !error.contains("hunter2"),
+            "the value must not be echoed: {error}"
+        );
+        let error = export_connections(std::slice::from_ref(&config))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Leaky") && !error.contains("hunter2"),
+            "{error}"
+        );
+        let file = r#"{"kerno_connections": 1, "connections": [{"name":"x","engine":"postgres","host":"h","port":5432,"user":"u","options":{"sslpassword":"hunter2"}}]}"#;
+        let error = import_connections(file).unwrap_err().to_string();
+        assert!(
+            error.contains("looks like a secret") && !error.contains("hunter2"),
+            "{error}"
+        );
     }
 
     #[test]
