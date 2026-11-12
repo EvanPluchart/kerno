@@ -9,3 +9,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+kerno-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+rustls.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
