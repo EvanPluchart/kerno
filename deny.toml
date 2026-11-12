@@ -16,12 +16,6 @@ yanked = "warn"
 # instant, ttf-parser, rustybuzz, zvariant, zbus_names) come in through GPUI
 # and gpui-component and are theirs to replace.
 unmaintained = "workspace"
-# One accepted advisory. Remove this entry as soon as a russh release depends
-# on rsa >= 0.10.0 (the fixed version, published 2026-11-08); see
-# docs/DECISIONS.md D-013.
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa timing side channel: russh 0.65.1 pins rsa =0.10.0-rc.18 exactly and no russh release uses the fixed 0.10.0 yet. In Kerno the only RSA private-key operation is one SSH authentication signature per tunnel the user opens, with an RSA key file; keys held by the SSH agent, and Ed25519/ECDSA keys, never reach this code." },
-]
 
 [licenses]
 version = 2

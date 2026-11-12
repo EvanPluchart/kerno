@@ -44,9 +44,5 @@ For every feature of §4, in this order:
 
 - `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not
   on `$PATH`); the backup tools find them in their fallback directories. Nothing to ask the owner.
-- Milestone 10, required by GOAL criterion 1 (owner's decision of 2026-11-12): `cargo deny check` must be
-  clean with no ignored advisory. `deny.toml` ignores RUSTSEC-2023-0071 for now (timing side channel in
-  `rsa`, reached only when an SSH tunnel authenticates with an RSA key file; russh pins the affected
-  release candidate). To do: upgrade russh to a version built on the fixed `rsa`, or replace the affected
-  dependency (drop russh's `rsa` feature and state that RSA keys go through the agent, or another SSH
-  client), then remove the ignore. Reasoning in DECISIONS D-013.
+- Done on 2026-11-13: `cargo deny check` is clean with no ignored advisory (russh built without its `rsa`
+  feature; RSA key files and RSA-only host keys are refused, see DECISIONS D-013).

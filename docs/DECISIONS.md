@@ -203,6 +203,21 @@ the stack for what needs a real parse of a complete statement (classification, c
 criterion 1 requires `cargo deny check` clean with no ignored advisory. Planned for milestone 10 (upgrade
 russh to a version on the fixed `rsa`, or replace the affected dependency); see `docs/PLAN.md`.
 
+**Resolved on 2026-11-13 (milestone 10, part 1).** RUSTSEC-2023-0071 is out of the dependency tree and
+`deny.toml` ignores nothing. Every russh release up to 0.65.1 pins `rsa =0.10.0-rc.18` exactly, a release
+candidate below the patched `>= 0.10.0`, so no upgrade and no `[patch]` fixes it. Kerno builds russh
+without its `rsa` feature instead (`rsa`, `pkcs1` and `crypto-primes` leave `Cargo.lock`). Consequences:
+
+- RSA private key **files** are refused before any login, in every format, with: "the private key … is an
+  RSA key. RSA key files are not supported in this build: load the key in your SSH agent, or use an Ed25519
+  key".
+- RSA keys held by the SSH agent still work (the agent signs; covered by a test). Ed25519 and ECDSA key
+  files are unaffected.
+- An SSH server whose only host key is RSA cannot be reached: Kerno offers Ed25519 and ECDSA host keys and
+  such a server fails with "No common Key algorithm". Not tested against a real RSA-only server.
+- Restore RSA key files and host keys when a russh release depends on `rsa >= 0.10.0`. Both limits go in the
+  README's known limits.
+
 ## D-014 — App shell
 
 - Startup: Kerno's own files (store, settings, saved tabs) are read on a separate thread while the platform

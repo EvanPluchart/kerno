@@ -225,7 +225,6 @@ async fn key_file_authentication() {
         return;
     };
     bastion.open(key("id_ed25519")).await.expect("ed25519 key");
-    bastion.open(key("id_rsa")).await.expect("rsa key");
     bastion
         .open(key("id_ed25519_enc"))
         .await
@@ -264,6 +263,62 @@ async fn key_file_authentication() {
     match bastion.open(SshAuth::KeyFile { path: stranger }).await {
         Err(SshError::AuthRejected { method, .. }) => assert_eq!(method, "private key"),
         other => panic!("expected AuthRejected, got {other:?}"),
+    }
+}
+
+/// RSA key files are refused before any network authentication, in every
+/// format, with or without a passphrase at hand. The bastion trusts
+/// `id_rsa`, so the refusal is Kerno's, not the server's.
+#[tokio::test]
+async fn rsa_key_files_are_refused_with_a_clear_message() {
+    let Some(bastion) = Bastion::new().await else {
+        return;
+    };
+    let expect_refused = |outcome: Result<Tunnel, SshError>, path: &Path| match outcome {
+        Err(error @ SshError::RsaKeyFile { .. }) => {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the private key {} is an RSA key. RSA key files are not supported in this \
+                     build: load the key in your SSH agent, or use an Ed25519 key",
+                    path.display()
+                )
+            );
+        }
+        other => panic!("expected RsaKeyFile for {}, got {other:?}", path.display()),
+    };
+
+    let fixture = testing::generated("ssh/id_rsa");
+    expect_refused(bastion.open(key("id_rsa")).await, &fixture);
+
+    let dir = tempfile::tempdir().unwrap();
+    // OpenSSH and PEM PKCS#1, plain and encrypted; PKCS#8 plain only
+    // (russh cannot decrypt OpenSSL's encrypted PKCS#8, whatever the key).
+    let variants = [
+        ("RFC4716", ""),
+        ("RFC4716", "kerno_rsa_passphrase"),
+        ("PEM", ""),
+        ("PEM", "kerno_rsa_passphrase"),
+        ("PKCS8", ""),
+    ];
+    for (format, passphrase) in variants {
+        let path = dir
+            .path()
+            .join(format!("rsa_{format}_{}", passphrase.len()));
+        let status = Command::new("ssh-keygen")
+            .args([
+                "-q", "-t", "rsa", "-b", "2048", "-m", format, "-N", passphrase, "-f",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "ssh-keygen {format}");
+        let ssh = testing::ssh(SshAuth::KeyFile { path: path.clone() });
+        for given in [None, Some(Secret::new(passphrase))] {
+            let mut request = bastion.request(&ssh);
+            request.key_passphrase = given.as_ref();
+            expect_refused(Tunnel::open(request).await, &path);
+        }
     }
 }
 
@@ -331,6 +386,15 @@ async fn agent_authentication() {
         })
         .await
         .expect("agent login");
+
+    // The agent signs, so an RSA key it holds still works.
+    let rsa = Agent::start(Some("id_rsa"));
+    bastion
+        .open(SshAuth::Agent {
+            socket: Some(rsa.socket.clone()),
+        })
+        .await
+        .expect("agent login with an RSA key");
 
     let empty = Agent::start(None);
     match bastion

@@ -17,6 +17,7 @@
 //! [`TunnelRequest::trusted_fingerprint`] accepts and records the key. A
 //! host whose key changed is always refused.
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -29,8 +30,10 @@ use russh::client::{self, AuthResult, Handle};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::learn_known_hosts_path;
-use russh::keys::ssh_key::{HashAlg, PublicKey};
-use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path};
+use russh::keys::ssh_key::{HashAlg, PrivateKey, PublicKey};
+use russh::keys::{
+    Algorithm, EcdsaCurve, PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 
@@ -108,6 +111,17 @@ pub enum SshError {
         path: String,
         /// What failed.
         reason: String,
+    },
+    /// The key file holds an RSA key. Signing with it would need the `rsa`
+    /// crate, left out of this build for its timing side channel
+    /// (RUSTSEC-2023-0071); an agent signs RSA keys itself.
+    #[error(
+        "the private key {path} is an RSA key. RSA key files are not supported in this build: \
+         load the key in your SSH agent, or use an Ed25519 key"
+    )]
+    RsaKeyFile {
+        /// Key file.
+        path: String,
     },
     /// The SSH agent is unreachable or has no usable key.
     #[error("SSH agent: {0}")]
@@ -218,6 +232,25 @@ impl Tunnel {
                 .then(|| Duration::from_secs(ssh.keepalive_secs.into())),
             // Three missed keep-alives and the tunnel is declared dead.
             keepalive_max: 3,
+            // Without the `rsa` crate an RSA host key cannot be verified:
+            // leave it out of the offer, so a server with only an RSA host
+            // key fails with "no common key algorithm" rather than "wrong
+            // server signature", which reads like an interception.
+            preferred: russh::Preferred {
+                key: Cow::Borrowed(&[
+                    Algorithm::Ed25519,
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP256,
+                    },
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP384,
+                    },
+                    Algorithm::Ecdsa {
+                        curve: EcdsaCurve::NistP521,
+                    },
+                ]),
+                ..russh::Preferred::DEFAULT
+            },
             ..client::Config::default()
         });
 
@@ -379,13 +412,9 @@ async fn authenticate(
         }
         SshAuth::KeyFile { path } => {
             let key = load_key(path, request.key_passphrase).await?;
-            let hash = handle
-                .best_supported_rsa_hash()
-                .await
-                .map_err(other)?
-                .flatten();
+            // Never RSA (see `load_key`), so there is no hash to negotiate.
             let result = handle
-                .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+                .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), None))
                 .await
                 .map_err(other)?;
             accept(result).ok_or_else(|| rejected("private key"))
@@ -446,6 +475,13 @@ fn accept(result: AuthResult) -> Option<()> {
     result.success().then_some(())
 }
 
+/// OID of `rsaEncryption`, the algorithm of a PKCS#8 RSA key.
+const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
+
+/// Reads a private key file. RSA keys are refused with
+/// [`SshError::RsaKeyFile`] in every format (OpenSSH, PEM PKCS#1, PKCS#8,
+/// any other that loads), before any passphrase is asked for when the format
+/// allows it.
 async fn load_key(
     path: &Path,
     passphrase: Option<&Secret>,
@@ -456,28 +492,54 @@ async fn load_key(
     let had_passphrase = passphrase.is_some();
     // Reading the file and deriving the key from a passphrase both block.
     let loaded = tokio::task::spawn_blocking(move || {
-        russh::keys::load_secret_key(owned_path, passphrase.as_ref().map(Secret::expose))
+        let text = std::fs::read_to_string(owned_path)?;
+        // The public half of an OpenSSH key is readable without the
+        // passphrase: refuse an RSA key before asking for it, the way russh
+        // refuses a PEM one.
+        if PrivateKey::from_openssh(&text).is_ok_and(|key| key.algorithm().is_rsa()) {
+            return Err(russh::keys::Error::UnsupportedKeyType {
+                key_type_string: "RSA".into(),
+                key_type_raw: Vec::new(),
+            });
+        }
+        russh::keys::decode_secret_key(&text, passphrase.as_ref().map(Secret::expose))
     })
     .await
     .map_err(|error| SshError::Other(error.to_string()))?;
 
-    loaded.map_err(|error| match error {
-        russh::keys::Error::KeyIsEncrypted => SshError::Passphrase {
+    let rsa = match &loaded {
+        // Any other format that loads (PuTTY, ...).
+        Ok(key) => key.algorithm().is_rsa(),
+        // OpenSSH (above) and PEM PKCS#1 (`BEGIN RSA PRIVATE KEY`).
+        Err(russh::keys::Error::UnsupportedKeyType {
+            key_type_string, ..
+        }) => key_type_string == "RSA",
+        // PKCS#8 (`BEGIN PRIVATE KEY`).
+        Err(russh::keys::Error::UnknownAlgorithm(oid)) => oid.to_string() == RSA_ENCRYPTION_OID,
+        Err(_) => false,
+    };
+    if rsa {
+        return Err(SshError::RsaKeyFile { path: display });
+    }
+
+    match loaded {
+        Ok(key) => Ok(key),
+        Err(russh::keys::Error::KeyIsEncrypted) => Err(SshError::Passphrase {
             path: display,
             reason: "a passphrase is required",
-        },
+        }),
         // ssh-key reports a wrong passphrase as a decryption/crypto failure.
-        other if had_passphrase && !matches!(other, russh::keys::Error::IO(_)) => {
-            SshError::Passphrase {
+        Err(other) if had_passphrase && !matches!(other, russh::keys::Error::IO(_)) => {
+            Err(SshError::Passphrase {
                 path: display,
                 reason: "the passphrase is wrong",
-            }
+            })
         }
-        other => SshError::Key {
+        Err(other) => Err(SshError::Key {
             path: display,
             reason: other.to_string(),
-        },
-    })
+        }),
+    }
 }
 
 /// Checks the server's key against the known-hosts files.
