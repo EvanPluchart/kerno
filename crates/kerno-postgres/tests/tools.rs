@@ -49,15 +49,7 @@ async fn cleaning_up(
 
 /// The major version `tool --version` prints ("pg_dump (PostgreSQL) 17.2").
 fn major_version(tool: &Path) -> Option<u32> {
-    let output = std::process::Command::new(tool)
-        .arg("--version")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let version = text
-        .split_whitespace()
-        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))?;
-    version.split('.').next()?.parse().ok()
+    tools::version(tool).map(|version| version.number.0)
 }
 
 async fn server_major(session: &Arc<dyn Session>) -> u32 {
@@ -192,9 +184,13 @@ async fn round_trips(session: Arc<dyn Session>, dir: PathBuf) {
                 database: SCRATCH.into(),
                 input: path,
                 format,
+                allow_client_commands: false,
+                tool_version: None,
             },
         )
         .unwrap();
+        // psql reads a script, checked before it starts; pg_restore does not.
+        assert_eq!(restore.script_check.is_some(), format == BackupFormat::Sql);
         run_ok(restore).await;
         assert_eq!(contents(SCRATCH).await, source, "{format:?}");
     }
@@ -314,4 +310,194 @@ async fn an_older_pg_dump_fails_with_its_reason() {
         lines.iter().any(|line| line.contains("version mismatch")),
         "{lines:#?}"
     );
+}
+
+const SOURCE: &str = "kerno_test_restore_src";
+const COPY: &str = "kerno_test_restore_copy";
+
+/// What a genuine dump holds and the client-command check must let through:
+/// backslashes in COPY data (written `\\`, `\t`, `\n`, `\N`), regular
+/// expressions in a function and a domain, a trigger.
+const GENUINE: [&str; 6] = [
+    "CREATE TABLE paths (id int PRIMARY KEY, body text)",
+    concat!(
+        r"INSERT INTO paths VALUES (1, 'C:\Users\x\out.txt'), (2, E'tab\there\nline\r\n'), ",
+        r"(3, '\! touch /tmp/never \o x \set y'), (4, '\.'), (5, '\'), ",
+        r"(6, 'caf' || chr(233) || '\x'), (7, NULL), (8, 'use `code`')",
+    ),
+    concat!(
+        "CREATE FUNCTION squash(t text) RETURNS text LANGUAGE sql IMMUTABLE ",
+        r"AS $$ SELECT regexp_replace(t, '\s+', ' ', 'g') $$",
+    ),
+    "CREATE FUNCTION squash_body() RETURNS trigger LANGUAGE plpgsql \
+     AS $$ BEGIN NEW.body := squash(NEW.body); RETURN NEW; END $$",
+    "CREATE TRIGGER paths_squash BEFORE UPDATE ON paths FOR EACH ROW EXECUTE FUNCTION squash_body()",
+    r"CREATE DOMAIN email AS text CHECK (VALUE ~ '^[^@\s]+@[^@\s]+$')",
+];
+
+/// The rows, functions and triggers of `database`.
+async fn genuine_contents(database: &str) -> Vec<Vec<Option<String>>> {
+    let mut params = testing::params(Engine::Postgres);
+    params.database = Some(database.into());
+    let session = common::connect(&params).await.expect("connect");
+    let mut all = rows(&session, "SELECT id::text, body FROM paths ORDER BY id").await;
+    all.extend(
+        rows(
+            &session,
+            "SELECT p.proname || ': ' || p.prosrc FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' \
+             UNION ALL SELECT tgname FROM pg_trigger WHERE NOT tgisinternal \
+             UNION ALL SELECT typname FROM pg_type WHERE typname = 'email' ORDER BY 1",
+        )
+        .await,
+    );
+    all
+}
+
+/// A plain dump holding backslashes, regular expressions and a trigger is
+/// read by the check without a false alarm and restores; so does a dump of
+/// the fixture database (every type, functions, triggers).
+#[tokio::test]
+async fn a_genuine_plain_dump_passes_the_check_and_restores() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let Some(dir) = tool_dir(server_major(&session).await) else {
+        return;
+    };
+    let cleanup = [SOURCE, COPY].map(|db| format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"));
+    let body = genuine_round_trip(session.clone(), dir);
+    cleaning_up(&session, &cleanup, body).await;
+}
+
+async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
+    for db in [SOURCE, COPY] {
+        exec_ok(&session, &format!("CREATE DATABASE {db}")).await;
+    }
+    let mut params = testing::params(Engine::Postgres);
+    params.database = Some(SOURCE.into());
+    let source = common::connect(&params).await.expect("connect");
+    for sql in GENUINE {
+        exec_ok(&source, sql).await;
+    }
+    let files = tempfile::tempdir().unwrap();
+    let path = files.path().join("genuine.sql");
+    let params = testing::params(Engine::Postgres);
+    let backup = |database: &str, output: &Path| {
+        tools::backup_command(
+            &dir.join("pg_dump"),
+            &params,
+            &BackupOptions {
+                database: database.into(),
+                output: output.to_path_buf(),
+                format: BackupFormat::Sql,
+                content: BackupContent::All,
+                tables: Vec::new(),
+            },
+        )
+        .unwrap()
+    };
+    run_ok(backup(SOURCE, &path)).await;
+    let dump = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        dump.contains("C:\\\\Users") && dump.contains("\\\\! touch") && dump.contains("\\s+"),
+        "{dump}"
+    );
+
+    let psql = dir.join("psql");
+    let restore = tools::restore_command(
+        &psql,
+        &params,
+        &RestoreOptions {
+            database: COPY.into(),
+            input: path.clone(),
+            format: BackupFormat::Sql,
+            allow_client_commands: false,
+            tool_version: tools::version(&psql),
+        },
+    )
+    .unwrap();
+    assert_eq!(restore.script_check, Some((Tool::Psql, path)));
+    run_ok(restore).await;
+    let copied = genuine_contents(COPY).await;
+    assert_eq!(copied, genuine_contents(SOURCE).await);
+    assert!(copied.len() > 8, "{copied:?}");
+
+    // The fixture database, without its million-row table.
+    let fixture = files.path().join("kerno.sql");
+    let mut command = backup("kerno", &fixture);
+    command
+        .args
+        .push("--exclude-table-data=analytics.big_table".into());
+    run_ok(command).await;
+    eprintln!(
+        "kerno.sql: {} bytes",
+        std::fs::metadata(&fixture).unwrap().len()
+    );
+    tools::check_script(Tool::Psql, &fixture, &AtomicBool::new(false))
+        .expect("the fixture dump holds no client command");
+}
+
+/// A file with client commands is refused before psql starts: the marker
+/// file the commands would create never appears. With the opt-in the
+/// command is built without the check (and not run here).
+#[tokio::test]
+async fn a_plain_file_with_client_commands_runs_nothing() {
+    let Some(psql) = tools::find(Tool::Psql) else {
+        eprintln!("SKIPPED: no psql installed");
+        return;
+    };
+    let files = tempfile::tempdir().unwrap();
+    let pwned = files.path().join("pwned");
+    let pwned = pwned.display();
+    let input = files.path().join("hostile.sql");
+    for (text, line) in [
+        (format!("SELECT 1;\n\\! touch {pwned}\n"), 2),
+        (
+            format!("\\restrict k\nSELECT 1; \\! touch {pwned}\n\\unrestrict k\n"),
+            2,
+        ),
+        (format!("SELECT 1 \\g |touch {pwned}\n"), 1),
+        (
+            format!("COPY t (a) FROM stdin;\n1\n\\.\n\\copy t TO PROGRAM 'touch {pwned}'\n"),
+            4,
+        ),
+        (format!("\\set x '\\\\! touch {pwned}'\nSELECT :x;\n"), 1),
+    ] {
+        std::fs::write(&input, &text).unwrap();
+        let options = RestoreOptions {
+            database: "kerno_test_never".into(),
+            input: input.clone(),
+            format: BackupFormat::Sql,
+            allow_client_commands: false,
+            tool_version: tools::version(&psql),
+        };
+        let command =
+            tools::restore_command(&psql, &testing::params(Engine::Postgres), &options).unwrap();
+        let error = tools::run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect_err(&text);
+        eprintln!("{error}");
+        assert!(
+            matches!(error, kerno_core::Error::Config(_))
+                && error
+                    .to_string()
+                    .contains(&format!("hostile.sql, line {line}: \\")),
+            "{text}: {error}"
+        );
+        assert!(!files.path().join("pwned").exists(), "{text}");
+
+        let allowed = RestoreOptions {
+            allow_client_commands: true,
+            ..options
+        };
+        let command =
+            tools::restore_command(&psql, &testing::params(Engine::Postgres), &allowed).unwrap();
+        assert_eq!(command.script_check, None);
+        assert!(
+            command
+                .args
+                .contains(&format!("--file={}", input.display()))
+        );
+    }
 }
