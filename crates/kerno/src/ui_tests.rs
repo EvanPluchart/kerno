@@ -18,13 +18,20 @@ use kerno_core::secrets::MemorySecretStore;
 use kerno_core::storage::{AppPaths, Storage};
 use kerno_core::{ConnectionConfig, Engine, testing};
 
+use gpui_kit::component::table::{ColumnSort, TableDelegate as _, TableState};
+use kerno_core::browse::{Condition, Filter, Operator};
+use kerno_core::schema::{RelationKind, TableRef};
+
 use crate::connections::manager::{Connections, Drivers, Status};
+use crate::data::tab::DataTab;
 use crate::navigator::actions::{Action, Template};
+use crate::query::grid::Grid;
 use crate::query::tab::Activity;
 use crate::settings::Settings;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
 use crate::tabs::TabSnapshot;
+use crate::tabs::Target;
 use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
 use crate::{actions, bridge};
@@ -284,6 +291,96 @@ impl Fixture {
                 .expect("an open tab")
                 .clone()
         })
+    }
+
+    /// Opens the data of a table of the first connection.
+    fn open_table(&self, cx: &mut TestAppContext, schema: &str, table: &str, kind: RelationKind) {
+        let connection = cx.update(|cx| self.connections.read(cx).saved()[0].id.clone());
+        let target = Target {
+            connection,
+            database: None,
+            schema: None,
+        };
+        let table = TableRef::new(schema, table);
+        self.step(cx, |window, cx| {
+            self.workspace.update(cx, |workspace, cx| {
+                workspace.open_data(target, table, kind, Filter::default(), window, cx);
+            })
+        });
+    }
+
+    /// The active tab, which shows a table's data.
+    fn data(&self, cx: &mut TestAppContext) -> Entity<DataTab> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .active_data_tab()
+                .expect("a data tab")
+                .clone()
+        })
+    }
+
+    /// Does something to the active data tab.
+    fn on_data(
+        &self,
+        cx: &mut TestAppContext,
+        act: impl FnOnce(&mut DataTab, &mut gpui_kit::Window, &mut gpui_kit::Context<DataTab>),
+    ) {
+        let tab = self.data(cx);
+        self.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| act(tab, window, cx))
+        });
+    }
+
+    /// Where the active data tab is with its rows ("Rows 1–3 of 3").
+    fn data_state(&self, cx: &mut TestAppContext) -> String {
+        let tab = self.data(cx);
+        cx.update(|cx| tab.read(cx).state(cx))
+    }
+
+    /// Waits for the active data tab to show these rows.
+    fn wait_for_rows(&self, cx: &mut TestAppContext, state: &str) {
+        self.wait_until(cx, state, |app, cx| {
+            let now = app.data_state(cx);
+            assert!(!now.starts_with("failed"), "{now}");
+            now == state
+        });
+    }
+
+    /// The grid of the active data tab.
+    fn data_grid(&self, cx: &mut TestAppContext) -> Entity<TableState<Grid>> {
+        let tab = self.data(cx);
+        cx.update(|cx| tab.read(cx).grid()).expect("a grid")
+    }
+
+    /// What the grid of the active data tab draws.
+    fn data_rows(&self, cx: &mut TestAppContext) -> Vec<Vec<String>> {
+        let grid = self.data_grid(cx);
+        cx.update(|cx| grid.read(cx).delegate().shown())
+    }
+
+    /// Rows of the active data tab with changes waiting.
+    fn pending(&self, cx: &mut TestAppContext) -> usize {
+        let tab = self.data(cx);
+        cx.update(|cx| tab.read(cx).pending_count(cx))
+    }
+
+    /// Types `text` in a cell of the active data tab, in place of what it
+    /// holds, and ends with `key`.
+    fn type_in_cell(
+        &self,
+        cx: &mut TestAppContext,
+        row: usize,
+        column: usize,
+        text: &str,
+        key: &str,
+    ) {
+        self.on_data(cx, |tab, window, cx| tab.edit_cell(row, column, window, cx));
+        self.press(cx, &["secondary-a", "backspace"]);
+        if !text.is_empty() {
+            self.type_text(cx, text);
+        }
+        self.press(cx, &[key]);
     }
 
     /// What the status bar says.
@@ -1986,6 +2083,33 @@ fn a_double_click_on_a_cell_shows_its_whole_value(cx: &mut TestAppContext) {
     }
 }
 
+#[gpui_kit::test]
+fn a_right_click_on_a_cell_opens_the_menu_of_its_row(cx: &mut TestAppContext) {
+    use gpui_kit::test::{ClickOptions, TestQueryExt as _};
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(cx, "select 1 as a, 'x' as b", "secondary-enter");
+    app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    let menu_has = |app: &Fixture, cx: &mut TestAppContext, label: &str| {
+        app.step(cx, |window, _| window.try_find_by_label(label).is_some())
+    };
+    assert!(!menu_has(&app, cx, "Copy as CSV"));
+    // On the first row, under the headers, in the first column of values.
+    app.step(cx, |window, cx| {
+        window.click_with_options(
+            "table-inner",
+            ClickOptions::new()
+                .with_offset(gpui_kit::point(px(90.), px(44.)))
+                .with_button(gpui_kit::MouseButton::Right),
+            cx,
+        )
+    });
+    assert!(menu_has(&app, cx, "Copy as CSV"));
+    assert!(menu_has(&app, cx, "Copy column names"));
+}
+
 // Plans and guards ----------------------------------------------------------------
 
 #[gpui_kit::test]
@@ -2362,4 +2486,551 @@ fn the_editor_searches_and_replaces(cx: &mut TestAppContext) {
         window.dispatch_action(Box::new(crate::actions::ReplaceInEditor), cx)
     });
     assert_eq!(searching(cx), Some(true));
+}
+
+// Table data --------------------------------------------------------------------
+
+/// A scratch table with these columns after an auto-numbered `id`, on
+/// any engine.
+fn scratch_table(engine: Engine, name: &str, columns: &str) -> String {
+    let id = match engine {
+        Engine::Postgres => "integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+        Engine::MySql | Engine::MariaDb => "INT AUTO_INCREMENT PRIMARY KEY",
+    };
+    format!("CREATE TABLE {name} (id {id}, {columns})")
+}
+
+/// What removes and creates a scratch schema (a database on MySQL). Each
+/// test has its own: they run side by side.
+fn scratch_schema(engine: Engine, name: &str) -> (String, String) {
+    match engine {
+        Engine::Postgres => (
+            format!("DROP SCHEMA IF EXISTS {name} CASCADE"),
+            format!("CREATE SCHEMA {name}"),
+        ),
+        Engine::MySql | Engine::MariaDb => (
+            format!("DROP DATABASE IF EXISTS {name}"),
+            format!("CREATE DATABASE {name}"),
+        ),
+    }
+}
+
+const ENGINES: [Engine; 3] = [Engine::Postgres, Engine::MySql, Engine::MariaDb];
+
+#[gpui_kit::test]
+fn a_table_is_read_in_pages_sorted_and_filtered_by_the_server(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_pages");
+        let day = match engine {
+            Engine::Postgres => "DATE '2020-01-01' + n",
+            Engine::MySql | Engine::MariaDb => "DATE_ADD('2020-01-01', INTERVAL n DAY)",
+        };
+        let digits = "(SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 \
+                      UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 \
+                      UNION ALL SELECT 8 UNION ALL SELECT 9)";
+        // 250 rows: item 1 to item 250.
+        let fill = format!(
+            "INSERT INTO kerno_ui_pages.items (name, qty, born) \
+             SELECT CONCAT('item ', n), MOD(n, 7), {day} FROM \
+             (SELECT a.d + b.d * 10 + c.d * 100 + 1 AS n FROM {digits} a, {digits} b, {digits} c) numbers \
+             WHERE n <= 250 ORDER BY n"
+        );
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                &scratch_table(
+                    engine,
+                    "kerno_ui_pages.items",
+                    "name VARCHAR(50) NOT NULL, qty INT, born DATE",
+                ),
+                &fill,
+            ],
+        );
+        let app = connected(cx, engine);
+        cx.update(|cx| AppState::update_settings(cx, |settings| settings.page_size = 100));
+        app.open_table(cx, "kerno_ui_pages", "items", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–100 of 250");
+        assert_eq!(app.titles(cx), ["items"]);
+        assert_eq!(app.data_rows(cx)[0][..3], ["1", "item 1", "1"]);
+        // Opening it again shows the same tab.
+        app.open_table(cx, "kerno_ui_pages", "items", RelationKind::Table);
+        assert_eq!(app.titles(cx), ["items"]);
+
+        // Pages.
+        app.click(cx, "data-next");
+        app.wait_for_rows(cx, "Rows 101–200 of 250");
+        assert_eq!(app.data_rows(cx)[0][0], "101");
+        app.click(cx, "data-next");
+        app.wait_for_rows(cx, "Rows 201–250 of 250");
+        // There is no page after the last.
+        app.on_data(cx, |tab, window, cx| tab.turn_page(1, window, cx));
+        cx.run_until_parked();
+        assert_eq!(app.data_state(cx), "Rows 201–250 of 250");
+        app.click(cx, "data-previous");
+        app.wait_for_rows(cx, "Rows 101–200 of 250");
+
+        // A click on a header sorts on the server, from the first page.
+        let grid = app.data_grid(cx);
+        app.step(cx, |window, cx| {
+            grid.update(cx, |table, cx| {
+                table
+                    .delegate_mut()
+                    .perform_sort(3, ColumnSort::Descending, window, cx)
+            })
+        });
+        app.wait_until(cx, "the sorted page", |app, cx| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).sort() == Some(("qty", true)))
+                && app.data_state(cx) == "Rows 1–100 of 250"
+        });
+        // The largest quantity first, and the key settles ties.
+        assert_eq!(app.data_rows(cx)[0][..3], ["6", "item 6", "6"]);
+        assert_eq!(app.data_rows(cx)[1][..3], ["13", "item 13", "6"]);
+
+        // The filter bar: a condition on the first column.
+        app.click(cx, "filter-add");
+        app.type_text(cx, "42");
+        app.press(cx, &["enter"]);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        assert_eq!(app.data_rows(cx)[0][..2], ["42", "item 42"]);
+        // Conditions and SQL together.
+        app.on_data(cx, |tab, window, cx| {
+            tab.set_filter(
+                Filter {
+                    conditions: vec![Condition {
+                        column: "name".into(),
+                        operator: Operator::Contains,
+                        value: "item 24".into(),
+                    }],
+                    raw: "qty < 3 -- few".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+        let ids: Vec<String> = app
+            .data_rows(cx)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        // Sorted on the quantity, descending, then on the key.
+        assert_eq!(ids, ["240", "247", "246", "245"]);
+
+        // Nothing matches: the grid says so.
+        app.on_data(cx, |tab, window, cx| {
+            let nothing = Filter {
+                conditions: vec![Condition::equals("id", "-1")],
+                raw: String::new(),
+            };
+            tab.set_filter(nothing, window, cx)
+        });
+        app.wait_for_rows(cx, "No rows");
+        assert!(app.has(cx, "data-empty"));
+
+        // A filter the server refuses is reported, and can be taken away.
+        app.on_data(cx, |tab, window, cx| {
+            let broken = Filter {
+                conditions: Vec::new(),
+                raw: "nope nope".into(),
+            };
+            tab.set_filter(broken, window, cx)
+        });
+        app.wait_until(cx, "the error", |app, cx| {
+            app.data_state(cx).starts_with("failed")
+        });
+        assert!(app.has(cx, "data-error"));
+        app.click(cx, "filter-clear");
+        app.wait_for_rows(cx, "Rows 1–100 of 250");
+
+        // Every operator is valid SQL on every kind of column.
+        for (column, value) in [("id", "5"), ("name", "item 5"), ("born", "2020-01-06")] {
+            for operator in Operator::ALL {
+                app.on_data(cx, |tab, window, cx| {
+                    let one = Filter {
+                        conditions: vec![Condition {
+                            column: column.into(),
+                            operator,
+                            value: value.into(),
+                        }],
+                        raw: String::new(),
+                    };
+                    tab.set_filter(one, window, cx)
+                });
+                app.wait_until(cx, "the filtered rows", |app, cx| {
+                    let state = app.data_state(cx);
+                    assert!(
+                        !state.starts_with("failed"),
+                        "{engine:?} {column} {operator:?}: {state}"
+                    );
+                    state != "loading"
+                });
+                // These three keep the one row whose value this is.
+                if matches!(operator, Operator::Equals | Operator::In | Operator::Like) {
+                    assert_eq!(
+                        app.data_rows(cx)[0][0],
+                        "5",
+                        "{engine:?} {column} {operator:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn cells_are_edited_reviewed_and_applied_in_one_transaction(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let server = |sql: &str| on_server(engine, sql);
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_edits");
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                &scratch_table(
+                    engine,
+                    "kerno_ui_edits.people",
+                    "name VARCHAR(50) NOT NULL, qty INT, note VARCHAR(20) DEFAULT 'n/a'",
+                ),
+                "INSERT INTO kerno_ui_edits.people (name, qty, note) \
+                 VALUES ('ann', 1, 'x'), ('bob', 2, NULL), ('cy', 3, 'z')",
+            ],
+        );
+        let count = |condition: &str| {
+            server(&format!(
+                "SELECT count(*) FROM kerno_ui_edits.people WHERE {condition}"
+            ))
+        };
+        let app = connected(cx, engine);
+        app.open_table(cx, "kerno_ui_edits", "people", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–3 of 3");
+        assert!(!app.has(cx, "data-pending") && !app.has(cx, "data-read-only"));
+        let select_row = |app: &Fixture, cx: &mut TestAppContext, row: usize| {
+            let grid = app.data_grid(cx);
+            app.step(cx, |_, cx| {
+                grid.update(cx, |table, cx| table.set_selected_row(row, cx))
+            });
+        };
+        let select_cell = |app: &Fixture, cx: &mut TestAppContext, row: usize, column: usize| {
+            let grid = app.data_grid(cx);
+            app.step(cx, |_, cx| {
+                grid.update(cx, |table, cx| table.set_selected_cell(row, column, cx))
+            });
+        };
+
+        // Typing in a cell changes nothing on the server: the change waits.
+        app.type_in_cell(cx, 0, 2, "anna", "enter");
+        assert_eq!(app.pending(cx), 1);
+        assert_eq!(app.data_rows(cx)[0][1], "anna");
+        // The tab is marked while changes wait.
+        let labels = |app: &Fixture, cx: &mut TestAppContext| {
+            cx.update(|cx| app.workspace.read(cx).tab_labels(cx))
+        };
+        assert_eq!(labels(&app, cx), ["people •"]);
+        assert!(app.status_bar(cx).contains(&"1 pending change".to_string()));
+        assert!(app.has(cx, "data-pending"));
+        assert_eq!(count("name = 'ann'"), "1");
+        // Escape drops what is being typed.
+        app.type_in_cell(cx, 1, 2, "zzz", "escape");
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[1][1].as_str()),
+            (1, "bob")
+        );
+        // Typing the same value back is no change.
+        app.type_in_cell(cx, 1, 2, "bob", "enter");
+        assert_eq!(app.pending(cx), 1);
+        // An emptied number is NULL; emptied text is the empty string.
+        app.type_in_cell(cx, 0, 3, "", "enter");
+        app.type_in_cell(cx, 2, 4, "", "enter");
+        assert_eq!(app.data_rows(cx)[0][2], "NULL");
+        assert_eq!(app.data_rows(cx)[2][3], "");
+        assert_eq!(app.pending(cx), 2);
+        // A deleted row, a new row, a copied row.
+        select_row(&app, cx, 1);
+        app.click(cx, "data-delete");
+        app.click(cx, "data-add-row");
+        app.type_in_cell(cx, 3, 2, "dee", "enter");
+        select_row(&app, cx, 0);
+        app.click(cx, "data-duplicate");
+        assert_eq!(app.pending(cx), 5);
+        assert_eq!(app.data_rows(cx)[4][1..], ["anna", "NULL", "x"]);
+
+        // The review shows the statements; cancelling runs none.
+        let tab = app.data(cx);
+        let (_, statements) = cx.update(|cx| tab.read(cx).pending_sql(cx)).unwrap();
+        let verbs: Vec<&str> = statements
+            .iter()
+            .map(|statement| statement.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(verbs, ["DELETE", "UPDATE", "UPDATE", "INSERT", "INSERT"]);
+        if engine == Engine::Postgres {
+            assert_eq!(
+                statements[1],
+                "UPDATE \"kerno_ui_edits\".\"people\" SET \"name\" = 'anna', \"qty\" = NULL WHERE \"id\" = 1"
+            );
+        }
+        app.click(cx, "data-review");
+        assert!(app.has(cx, "sql-preview"));
+        app.click(cx, "sql-cancel");
+        assert_eq!(
+            (app.pending(cx), count("true = true")),
+            (5, "3".to_string())
+        );
+        // Applying asks the same way, then writes everything.
+        app.click(cx, "data-apply");
+        assert!(app.has(cx, "sql-preview"));
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied changes", |app, cx| {
+            app.pending(cx) == 0 && app.data_state(cx) == "Rows 1–4 of 4"
+        });
+        assert_eq!(labels(&app, cx), ["people"]);
+        assert_eq!(count("id = 2"), "0");
+        assert_eq!(count("name = 'anna' AND qty IS NULL"), "2");
+        assert_eq!(count("id = 3 AND note = ''"), "1");
+        // The new row took the column's default.
+        assert_eq!(count("name = 'dee' AND note = 'n/a'"), "1");
+
+        // One statement fails: none is kept, and the changes still wait.
+        app.type_in_cell(cx, 0, 3, "7", "enter");
+        select_cell(&app, cx, 1, 2);
+        app.click(cx, "data-set-null");
+        assert_eq!(app.pending(cx), 2);
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the refusal", |app, cx| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).apply_error().is_some())
+        });
+        assert!(app.has(cx, "data-apply-error"));
+        assert_eq!(app.pending(cx), 2);
+        assert_eq!(count("id = 1 AND qty IS NULL"), "1");
+        // The page does not move from under pending changes.
+        app.click(cx, "data-refresh");
+        cx.run_until_parked();
+        assert_eq!(app.pending(cx), 2);
+        app.click(cx, "data-discard");
+        assert_eq!(app.pending(cx), 0);
+        assert!(!app.has(cx, "data-apply-error"));
+
+        // A row changed by someone else since it was read is not written over.
+        server("UPDATE kerno_ui_edits.people SET id = 100 WHERE id = 3");
+        app.type_in_cell(cx, 1, 2, "late", "enter");
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the refusal", |app, cx| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).apply_error().is_some())
+        });
+        assert_eq!(count("name = 'late'"), "0");
+        app.click(cx, "data-discard");
+        app.click(cx, "data-refresh");
+        app.wait_until(cx, "the fresh rows", |app, cx| {
+            app.data_state(cx) == "Rows 1–4 of 4" && app.data_rows(cx)[3][0] == "100"
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn rows_that_cannot_be_addressed_are_read_only_and_say_why(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_keys CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_keys",
+            "CREATE TABLE kerno_ui_keys.keyless (name text, body text)",
+            "INSERT INTO kerno_ui_keys.keyless VALUES ('a', repeat('long ', 100))",
+            "CREATE TABLE kerno_ui_keys.keyed (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
+            "INSERT INTO kerno_ui_keys.keyed VALUES (1)",
+            "CREATE VIEW kerno_ui_keys.names AS SELECT name FROM kerno_ui_keys.keyless",
+        ],
+    );
+    let reason = |app: &Fixture, cx: &mut TestAppContext| {
+        let tab = app.data(cx);
+        cx.update(|cx| tab.read(cx).read_only_reason(cx))
+    };
+    let app = connected(cx, Engine::Postgres);
+    // No key: a row cannot be told from another.
+    app.open_table(cx, "kerno_ui_keys", "keyless", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    assert!(reason(&app, cx).unwrap().contains("no primary key"));
+    assert!(app.has(cx, "data-read-only") && !app.has(cx, "data-add-row"));
+    // A double click shows the value instead of typing in it.
+    app.on_data(cx, |tab, window, cx| tab.edit_cell(0, 2, window, cx));
+    assert!(app.has(cx, "value-text"));
+    app.click(cx, "value-close");
+    app.on_data(cx, |tab, window, cx| tab.add_row(window, cx));
+    assert_eq!(app.pending(cx), 0);
+    // A view.
+    app.open_table(cx, "kerno_ui_keys", "names", RelationKind::View);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    assert!(reason(&app, cx).unwrap().contains("view"));
+    // A table with a key takes changes, except in its computed column.
+    app.open_table(cx, "kerno_ui_keys", "keyed", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    assert_eq!(reason(&app, cx), None);
+    assert!(app.has(cx, "data-add-row"));
+    app.on_data(cx, |tab, window, cx| tab.edit_cell(0, 2, window, cx));
+    assert!(app.has(cx, "value-text"));
+    app.click(cx, "value-close");
+    assert_eq!(app.titles(cx), ["keyless", "names", "keyed"]);
+
+    // A read-only connection takes none at all.
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.open_table(cx, "kerno_ui_keys", "keyed", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    assert!(reason(&app, cx).unwrap().contains("read-only connection"));
+    assert!(!app.has(cx, "data-add-row"));
+}
+
+#[gpui_kit::test]
+fn foreign_keys_lead_to_the_referenced_row_and_back(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_fk");
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                "CREATE TABLE kerno_ui_fk.authors (id INT PRIMARY KEY, name VARCHAR(20))",
+                "CREATE TABLE kerno_ui_fk.books (id INT PRIMARY KEY, author_id INT, title VARCHAR(20), \
+                 CONSTRAINT books_author FOREIGN KEY (author_id) REFERENCES kerno_ui_fk.authors (id))",
+                "INSERT INTO kerno_ui_fk.authors VALUES (1, 'ann'), (2, 'bob')",
+                "INSERT INTO kerno_ui_fk.books VALUES (10, 1, 'a1'), (11, 1, 'a2'), (12, 2, 'b1'), (13, NULL, 'orphan')",
+            ],
+        );
+        let app = connected(cx, engine);
+        app.open_table(cx, "kerno_ui_fk", "books", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+        let related = |app: &Fixture, cx: &mut TestAppContext, row: usize| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).related(row, cx))
+        };
+        // A book leads to its author; one without an author leads nowhere.
+        let to_author = related(&app, cx, 0);
+        assert_eq!(
+            to_author
+                .iter()
+                .map(|related| related.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Go to authors (author_id = 1)"]
+        );
+        assert_eq!(related(&app, cx, 3), []);
+        app.on_data(cx, |tab, _, cx| tab.follow(&to_author[0], cx));
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        assert_eq!(app.data_rows(cx), [["1", "ann"]]);
+        // And the author back to every book of theirs.
+        let to_books = related(&app, cx, 0);
+        assert_eq!(
+            to_books
+                .iter()
+                .map(|related| related.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Rows of books referencing this one (author_id)"]
+        );
+        app.on_data(cx, |tab, _, cx| tab.follow(&to_books[0], cx));
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        assert_eq!(app.data_rows(cx), [["10", "1", "a1"], ["11", "1", "a2"]]);
+        assert_eq!(app.titles(cx), ["books", "authors", "books"]);
+    }
+}
+
+#[gpui_kit::test]
+fn a_slow_page_is_cancelled_and_the_tab_stays_usable(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "shop", "categories", RelationKind::Table);
+    app.wait_until(cx, "the rows", |app, cx| {
+        app.data_state(cx).contains(" of ")
+    });
+    let rows = app.data_state(cx);
+    app.on_data(cx, |tab, window, cx| {
+        let slow = Filter {
+            conditions: Vec::new(),
+            raw: "pg_sleep(30) IS NOT NULL".into(),
+        };
+        tab.set_filter(slow, window, cx)
+    });
+    // Let the statement reach the server before stopping it.
+    std::thread::sleep(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert_eq!(app.data_state(cx), "loading");
+    assert!(app.status_bar(cx).contains(&"running…".to_string()));
+    app.press(cx, &["secondary-."]);
+    app.wait_until(cx, "the cancellation", |app, cx| {
+        app.data_state(cx).starts_with("failed")
+    });
+    app.click(cx, "filter-clear");
+    app.wait_for_rows(cx, &rows);
+}
+
+#[gpui_kit::test]
+async fn a_table_opened_from_the_tree_comes_back_after_a_restart(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.wait_until(cx, "the schemas", |app, cx| {
+        app.tree(cx).contains(&row(1, "shop"))
+    });
+    app.toggle(cx, &["kerno", "shop"]);
+    app.wait_until(cx, "the folders", |app, cx| {
+        app.tree(cx).contains(&row(2, "Tables"))
+    });
+    app.toggle(cx, &["kerno", "shop", "Tables"]);
+    app.wait_until(cx, "the tables", |app, cx| {
+        app.tree(cx)
+            .iter()
+            .any(|line| line.trim_start().starts_with("categories"))
+    });
+    let categories = app
+        .tree(cx)
+        .into_iter()
+        .find(|line| line.trim_start().starts_with("categories"))
+        .unwrap();
+    app.act(
+        cx,
+        Action::OpenData,
+        &["kerno", "shop", "Tables", categories.trim_start()],
+    );
+    assert_eq!(app.titles(cx), ["categories"]);
+    app.wait_until(cx, "the rows", |app, cx| {
+        app.data_state(cx).contains(" of ")
+    });
+    let rows = app.data_state(cx);
+    let stored = app.wait_for_stored_tabs(cx, |tabs| !tabs.is_empty()).await;
+    assert!(
+        matches!(&stored[..], [TabSnapshot::Data { schema, table, view: false, .. }]
+            if schema == "shop" && table == "categories"),
+        "{stored:?}"
+    );
+
+    // The next launch shows the tab; its rows load once connected.
+    let restarted = open(cx, app.storage.clone());
+    assert_eq!(restarted.titles(cx), ["categories"]);
+    assert_eq!(restarted.data_state(cx), "waiting");
+    assert!(restarted.has(cx, "data-waiting"));
+    let id = cx.update(|cx| restarted.connections.read(cx).saved()[0].id.clone());
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+    restarted.click(cx, "data-connect");
+    restarted.wait_for_rows(cx, &rows);
 }

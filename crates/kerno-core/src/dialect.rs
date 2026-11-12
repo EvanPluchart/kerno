@@ -60,6 +60,13 @@ pub trait Dialect: Send + Sync {
         Err(Error::Unsupported("reading query plans".into()))
     }
 
+    /// `expr` as text, for matching a pattern against a column of any
+    /// type. The default is the standard cast to a character string of no
+    /// given length.
+    fn cast_to_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS CHAR)")
+    }
+
     /// A literal holding `value`, to store in `column` or compare with it.
     ///
     /// Text is written as a string literal and left to the server to

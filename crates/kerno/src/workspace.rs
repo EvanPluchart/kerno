@@ -19,24 +19,26 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, BorrowAppContext as _, Context, Entity, FocusHandle, Focusable,
+    AnyView, App, AppContext as _, BorrowAppContext as _, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
     Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
-    FindInEditor, ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette,
-    OpenSettings, OpenSqlFile, PreviousTab, ReplaceInEditor, RunAll, RunStatement, SaveFile,
-    SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar,
-    UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, DeleteRows, DiscardChanges,
+    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, FindInEditor,
+    ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings,
+    OpenSqlFile, PreviousTab, RefreshData, ReplaceInEditor, RunAll, RunStatement, SaveFile,
+    SaveFileAs, SaveQuery, SetDefault, SetNull, ShowHistory, ShowSavedQueries, ToggleComment,
+    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
+use crate::data::tab::{DataTab, DataTabEvent};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
@@ -45,17 +47,94 @@ use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::tabs::{TabSnapshot, Target};
 use crate::theme::{self, Appearance};
 use kerno_core::TxState;
+use kerno_core::browse::Filter;
+use kerno_core::schema::{RelationKind, TableRef};
+use kerno_core::sql::CellValue;
 use kerno_core::storage::SavedQuery;
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
+
+/// A tab of the central area.
+#[derive(Clone)]
+enum OpenTab {
+    Query(Entity<QueryTab>),
+    Data(Entity<DataTab>),
+}
+
+impl OpenTab {
+    fn query(&self) -> Option<&Entity<QueryTab>> {
+        match self {
+            OpenTab::Query(tab) => Some(tab),
+            OpenTab::Data(_) => None,
+        }
+    }
+
+    fn data(&self) -> Option<&Entity<DataTab>> {
+        match self {
+            OpenTab::Data(tab) => Some(tab),
+            OpenTab::Query(_) => None,
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            OpenTab::Query(tab) => tab.focus_handle(cx),
+            OpenTab::Data(tab) => tab.focus_handle(cx),
+        }
+    }
+
+    fn snapshot(&self, cx: &App) -> TabSnapshot {
+        match self {
+            OpenTab::Query(tab) => tab.read(cx).snapshot(cx),
+            OpenTab::Data(tab) => tab.read(cx).snapshot(),
+        }
+    }
+
+    /// The tab's name, marked when it holds something not saved or not
+    /// applied yet.
+    fn label(&self, cx: &App) -> SharedString {
+        match self {
+            OpenTab::Query(tab) => {
+                let tab = tab.read(cx);
+                if tab.file().is_some() && tab.unsaved() {
+                    SharedString::from(format!("{} •", tab.title()))
+                } else {
+                    tab.title()
+                }
+            }
+            OpenTab::Data(tab) => {
+                let tab = tab.read(cx);
+                if tab.pending_count(cx) > 0 {
+                    SharedString::from(format!("{} •", tab.title()))
+                } else {
+                    tab.title()
+                }
+            }
+        }
+    }
+
+    fn status(&self, cx: &App) -> TabStatus {
+        match self {
+            OpenTab::Query(tab) => tab.read(cx).status(cx),
+            OpenTab::Data(tab) => tab.read(cx).status(cx),
+        }
+    }
+
+    fn view(&self) -> AnyView {
+        match self {
+            OpenTab::Query(tab) => tab.clone().into(),
+            OpenTab::Data(tab) => tab.clone().into(),
+        }
+    }
+}
 
 /// The root view of a Kerno window.
 pub struct Workspace {
     focus_handle: FocusHandle,
     connections: Entity<Connections>,
     sidebar: Entity<Sidebar>,
-    tabs: Vec<Entity<QueryTab>>,
+    tabs: Vec<OpenTab>,
     active_tab: usize,
     /// Number given to the next "Query N" tab.
     next_query_number: usize,
@@ -119,6 +198,26 @@ impl Workspace {
                         tab.update(cx, |tab, cx| tab.set_file(file, unsaved, cx));
                     }
                 }
+                TabSnapshot::Data {
+                    target,
+                    schema,
+                    table,
+                    view,
+                } => {
+                    let kind = if view {
+                        RelationKind::View
+                    } else {
+                        RelationKind::Table
+                    };
+                    workspace.push_data_tab(
+                        target,
+                        TableRef::new(schema, table),
+                        kind,
+                        Filter::default(),
+                        window,
+                        cx,
+                    );
+                }
             }
         }
         // The tab that was active is active again.
@@ -131,7 +230,19 @@ impl Workspace {
     pub fn tab_titles(&self, cx: &App) -> Vec<String> {
         self.tabs
             .iter()
-            .map(|tab| tab.read(cx).title().to_string())
+            .map(|tab| match tab {
+                OpenTab::Query(tab) => tab.read(cx).title().to_string(),
+                OpenTab::Data(tab) => tab.read(cx).title().to_string(),
+            })
+            .collect()
+    }
+
+    /// What the tab bar writes on each tab; for tests.
+    #[cfg(test)]
+    pub fn tab_labels(&self, cx: &App) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|tab| tab.label(cx).to_string())
             .collect()
     }
 
@@ -141,10 +252,72 @@ impl Workspace {
         (!self.tabs.is_empty()).then_some(self.active_tab)
     }
 
-    /// The active query tab.
-    #[cfg(test)]
+    /// The active tab, when it is a query tab.
     pub fn active_query_tab(&self) -> Option<&Entity<QueryTab>> {
-        self.tabs.get(self.active_tab)
+        self.tabs.get(self.active_tab)?.query()
+    }
+
+    /// The active tab, when it shows a table's data.
+    pub fn active_data_tab(&self) -> Option<&Entity<DataTab>> {
+        self.tabs.get(self.active_tab)?.data()
+    }
+
+    /// Opens the data of a table in a tab of its own.
+    fn push_data_tab(
+        &mut self,
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+        filter: Filter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DataTab> {
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| DataTab::new(target, table, kind, filter, connections, window, cx));
+        // The other end of a foreign key opens beside it.
+        self.tab_subscriptions.push(cx.subscribe_in(
+            &tab,
+            window,
+            |this, tab, event: &DataTabEvent, window, cx| {
+                let DataTabEvent::Open {
+                    table,
+                    kind,
+                    filter,
+                } = event;
+                let target = tab.read(cx).target().clone();
+                this.open_data(target, table.clone(), *kind, filter.clone(), window, cx);
+            },
+        ));
+        self.tabs.push(OpenTab::Data(tab.clone()));
+        self.active_tab = self.tabs.len() - 1;
+        tab
+    }
+
+    /// Shows the data of a table: in the tab that already shows it, when
+    /// nothing asks for other rows, else in a new one.
+    pub fn open_data(
+        &mut self,
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+        filter: Filter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DataTab> {
+        let open = self.tabs.iter().position(|tab| {
+            tab.data().is_some_and(|tab| {
+                let tab = tab.read(cx);
+                filter.is_empty() && tab.target() == &target && tab.table() == &table
+            })
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index].data().expect("a data tab").clone();
+        }
+        let tab = self.push_data_tab(target, table, kind, filter, window, cx);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.schedule_save(cx);
+        tab
     }
 
     fn push_query_tab(
@@ -167,7 +340,7 @@ impl Workspace {
         let editor = tab.read(cx).editor().clone();
         self.tab_subscriptions
             .push(cx.observe(&editor, |this, _, cx| this.schedule_save(cx)));
-        self.tabs.push(tab.clone());
+        self.tabs.push(OpenTab::Query(tab.clone()));
         self.active_tab = self.tabs.len() - 1;
         tab
     }
@@ -210,11 +383,7 @@ impl Workspace {
 
     /// Writes the open tabs to storage now.
     fn save_tabs(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        let snapshots: Vec<TabSnapshot> = self
-            .tabs
-            .iter()
-            .map(|tab| tab.read(cx).snapshot(cx))
-            .collect();
+        let snapshots: Vec<TabSnapshot> = self.tabs.iter().map(|tab| tab.snapshot(cx)).collect();
         let active_tab = self.active_tab;
         let storage = AppState::get(cx).storage.clone();
         bridge::spawn_blocking(cx, move || {
@@ -392,6 +561,20 @@ impl Workspace {
                 self.activate_tab(self.tabs.len() - 1, window, cx);
                 self.schedule_save(cx);
             }
+            NavigatorEvent::OpenData {
+                target,
+                table,
+                kind,
+            } => {
+                self.open_data(
+                    target.clone(),
+                    table.clone(),
+                    *kind,
+                    Filter::default(),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -465,11 +648,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // A file that is already open is shown, not opened twice.
-        if let Some(index) = self
-            .tabs
-            .iter()
-            .position(|tab| tab.read(cx).file() == Some(path.as_path()))
-        {
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.query()
+                .is_some_and(|tab| tab.read(cx).file() == Some(path.as_path()))
+        }) {
             self.activate_tab(index, window, cx);
             return;
         }
@@ -498,8 +680,7 @@ impl Workspace {
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let file = self
-            .tabs
-            .get(self.active_tab)
+            .active_query_tab()
             .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf));
         match file {
             Some(path) => self.save_active_tab_to(path, window, cx),
@@ -508,7 +689,7 @@ impl Workspace {
     }
 
     fn save_file_as(&mut self, _: &SaveFileAs, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
+        let Some(tab) = self.active_query_tab() else {
             return;
         };
         let tab = tab.read(cx);
@@ -546,7 +727,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.get(self.active_tab).cloned() else {
+        let Some(tab) = self.active_query_tab().cloned() else {
             return;
         };
         let sql = tab.read(cx).sql(cx);
@@ -574,8 +755,7 @@ impl Workspace {
 
     fn show_library(&mut self, shelf: Shelf, window: &mut Window, cx: &mut Context<Self>) {
         let connection = self
-            .tabs
-            .get(self.active_tab)
+            .active_query_tab()
             .and_then(|tab| tab.read(cx).connection_id().map(str::to_string));
         let workspace = cx.entity();
         Library::open(
@@ -606,7 +786,7 @@ impl Workspace {
     }
 
     fn save_query(&mut self, _: &SaveQuery, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
+        let Some(tab) = self.active_query_tab() else {
             return;
         };
         let tab = tab.read(cx);
@@ -660,13 +840,13 @@ impl Workspace {
     // Running ------------------------------------------------------------------
 
     fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.run(Scope::AtCursor, window, cx));
         }
     }
 
     fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx));
         }
     }
@@ -677,25 +857,77 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.explain(false, window, cx));
         }
     }
 
     fn explain_analyze(&mut self, _: &ExplainAnalyze, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.explain(true, window, cx));
         }
     }
 
     fn toggle_comment(&mut self, _: &ToggleComment, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.toggle_comment(window, cx));
         }
     }
 
+    /// Runs `act` on the active tab when it shows a table's data.
+    fn on_data_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut DataTab, &mut Window, &mut Context<DataTab>),
+    ) {
+        if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| act(tab, window, cx));
+        }
+    }
+
+    fn refresh_data(&mut self, _: &RefreshData, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| tab.refresh(window, cx));
+    }
+
+    fn add_row(&mut self, _: &AddRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| tab.add_row(window, cx));
+    }
+
+    fn duplicate_rows(&mut self, _: &DuplicateRows, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.duplicate_rows(None, window, cx)
+        });
+    }
+
+    fn delete_rows(&mut self, _: &DeleteRows, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.delete_rows(None, window, cx)
+        });
+    }
+
+    fn set_null(&mut self, _: &SetNull, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.set_selected(CellValue::Null, window, cx)
+        });
+    }
+
+    fn set_default(&mut self, _: &SetDefault, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.set_selected(CellValue::Default, window, cx)
+        });
+    }
+
+    fn apply_changes(&mut self, _: &ApplyChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, window, cx| tab.review(window, cx));
+    }
+
+    fn discard_changes(&mut self, _: &DiscardChanges, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_data_tab(window, cx, |tab, _, cx| tab.discard(cx));
+    }
+
     fn find_in_editor(&mut self, _: &FindInEditor, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.find(false, window, cx));
         }
     }
@@ -706,13 +938,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.find(true, window, cx));
         }
     }
 
     fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
+        if let Some(tab) = self.active_query_tab() {
+            tab.update(cx, |tab, cx| tab.cancel(cx));
+        }
+        if let Some(tab) = self.active_data_tab() {
             tab.update(cx, |tab, cx| tab.cancel(cx));
         }
     }
@@ -1090,7 +1325,7 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                Tab::new().label(tab_label(tab.read(cx))).suffix(
+                Tab::new().label(tab.label(cx)).suffix(
                     Button::new(("close-tab", index))
                         .ghost()
                         .xsmall()
@@ -1118,7 +1353,7 @@ impl Workspace {
             .children(
                 self.tabs
                     .get(self.active_tab)
-                    .map(|tab| div().flex_1().min_h_0().child(tab.clone())),
+                    .map(|tab| div().flex_1().min_h_0().child(tab.view())),
             )
             .into_any_element()
     }
@@ -1128,10 +1363,7 @@ impl Workspace {
     /// how many connections are open.
     fn status_items(&self, cx: &App) -> Vec<(String, Option<gpui_kit::Hsla>)> {
         let theme = cx.theme();
-        let status = self
-            .tabs
-            .get(self.active_tab)
-            .map(|tab| tab.read(cx).status(cx));
+        let status = self.tabs.get(self.active_tab).map(|tab| tab.status(cx));
         let Some(TabStatus {
             connection: Some(connection),
             read_only,
@@ -1141,6 +1373,7 @@ impl Workspace {
             rows,
             elapsed,
             notices,
+            pending,
         }) = status
         else {
             return vec![(
@@ -1166,6 +1399,15 @@ impl Workspace {
         }
         if running {
             items.push(("running…".into(), None));
+        }
+        if pending > 0 {
+            items.push((
+                format!(
+                    "{pending} pending change{}",
+                    if pending == 1 { "" } else { "s" }
+                ),
+                Some(theme.warning),
+            ));
         }
         items.extend(rows.map(|rows| {
             (
@@ -1221,15 +1463,6 @@ impl Workspace {
                         .child("Passwords are kept in memory only (no system secret store in use)"),
                 )
             })
-    }
-}
-
-/// The name on a tab: its title, marked when its file has unsaved changes.
-fn tab_label(tab: &QueryTab) -> SharedString {
-    if tab.file().is_some() && tab.unsaved() {
-        SharedString::from(format!("{} •", tab.title()))
-    } else {
-        tab.title()
     }
 }
 
@@ -1304,6 +1537,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::find_in_editor))
+            .on_action(cx.listener(Self::refresh_data))
+            .on_action(cx.listener(Self::add_row))
+            .on_action(cx.listener(Self::duplicate_rows))
+            .on_action(cx.listener(Self::delete_rows))
+            .on_action(cx.listener(Self::set_null))
+            .on_action(cx.listener(Self::set_default))
+            .on_action(cx.listener(Self::apply_changes))
+            .on_action(cx.listener(Self::discard_changes))
             .on_action(cx.listener(Self::replace_in_editor))
             .on_action(cx.listener(Self::explain_statement))
             .on_action(cx.listener(Self::explain_analyze))

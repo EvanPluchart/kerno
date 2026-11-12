@@ -175,6 +175,8 @@ pub struct TabStatus {
     pub elapsed: Option<Duration>,
     /// Messages the server sent during the last run.
     pub notices: usize,
+    /// Rows with changes waiting to be applied (a table's data).
+    pub pending: usize,
 }
 
 /// A statement on one line, cut short: enough to tell which one it is.
@@ -408,6 +410,7 @@ impl QueryTab {
                 .map(|grid| grid.read(cx).delegate().row_count()),
             elapsed: pane.and_then(|pane| pane.elapsed),
             notices: self.notices.len(),
+            pending: 0,
         }
     }
 

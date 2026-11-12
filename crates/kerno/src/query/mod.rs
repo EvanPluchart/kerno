@@ -4,6 +4,6 @@
 mod comment;
 pub mod grid;
 mod params;
-mod plan_view;
+pub mod plan_view;
 pub mod tab;
-mod viewer;
+pub mod viewer;

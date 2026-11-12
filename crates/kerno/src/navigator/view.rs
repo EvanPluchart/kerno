@@ -43,6 +43,12 @@ pub enum NavigatorEvent {
         sql: String,
         target: Option<Target>,
     },
+    /// Show the rows of a table or view.
+    OpenData {
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+    },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -318,6 +324,17 @@ impl Navigator {
         };
         match action {
             Action::Refresh => self.refresh(id, cx),
+            Action::OpenData => {
+                if let (NodeKind::Object(ObjectRef::Relation(table, kind)), Some(target)) =
+                    (&node.kind, self.target_of(&node, false))
+                {
+                    cx.emit(NavigatorEvent::OpenData {
+                        target,
+                        table: table.clone(),
+                        kind: *kind,
+                    });
+                }
+            }
             Action::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(name_of(&node))),
             Action::NewQueryHere | Action::CreateTable | Action::CreateView => {
                 self.open_template(action, &node, window, cx)

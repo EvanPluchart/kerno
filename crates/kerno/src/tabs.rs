@@ -39,6 +39,17 @@ pub enum TabSnapshot {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unsaved: bool,
     },
+    /// The data of a table or view.
+    Data {
+        /// The connection and database the table is in.
+        target: Target,
+        /// PostgreSQL schema or MySQL database.
+        schema: String,
+        table: String,
+        /// A view: its rows are read-only.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        view: bool,
+    },
 }
 
 #[cfg(test)]
@@ -81,6 +92,23 @@ mod tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), bound);
+        // A table's data: where it is, and whether it is a view.
+        let data = TabSnapshot::Data {
+            target: Target {
+                connection: "c1".into(),
+                database: None,
+                schema: None,
+            },
+            schema: "shop".into(),
+            table: "orders".into(),
+            view: false,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"data","target":{"connection":"c1"},"schema":"shop","table":"orders"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), data);
         // A kind this version does not know is rejected, and the storage
         // layer then skips that tab instead of failing to start.
         assert!(serde_json::from_str::<TabSnapshot>(r#"{"kind":"from_the_future"}"#).is_err());

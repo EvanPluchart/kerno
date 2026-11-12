@@ -3,6 +3,7 @@
 mod actions;
 mod bridge;
 mod connections;
+mod data;
 mod engine_logo;
 mod library;
 mod logging;

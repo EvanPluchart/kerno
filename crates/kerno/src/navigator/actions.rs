@@ -27,6 +27,7 @@ impl Template {
 /// One entry of a node's menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    OpenData,
     NewQueryHere,
     Generate(Template),
     ShowDdl,
@@ -44,6 +45,7 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
+            Action::OpenData => "Open data",
             Action::NewQueryHere => "New query here",
             Action::Generate(template) => template.label(),
             Action::ShowDdl => "Show DDL",
@@ -104,6 +106,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
+            vec![OpenData],
             all_templates.to_vec(),
             vec![ShowDdl, CopyName],
             vec![Rename, Truncate, Drop],
@@ -112,7 +115,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             _,
             RelationKind::View | RelationKind::MaterializedView,
         )) => vec![
-            vec![Generate(Template::Select)],
+            vec![OpenData, Generate(Template::Select)],
             vec![ShowDdl, CopyName],
             vec![Rename, Drop],
         ],

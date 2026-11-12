@@ -66,6 +66,11 @@ impl Dialect for PgDialect {
         format!("decode('{}', 'hex')", hex(bytes))
     }
 
+    /// `CHAR` without a length is one character here.
+    fn cast_to_text(&self, expr: &str) -> String {
+        format!("CAST({expr} AS text)")
+    }
+
     fn explain(&self, sql: &str, analyze: bool) -> String {
         if analyze {
             format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}")

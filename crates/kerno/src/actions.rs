@@ -28,6 +28,22 @@ gpui_kit::actions!(
         CancelQuery,
         /// Comments the selected lines out, or back in.
         ToggleComment,
+        /// Reads the rows of the table on screen again.
+        RefreshData,
+        /// Adds an empty row to the table on screen.
+        AddRow,
+        /// Copies the selected rows as new rows.
+        DuplicateRows,
+        /// Marks the selected rows for deletion.
+        DeleteRows,
+        /// Sets the selected cells to NULL.
+        SetNull,
+        /// Gives the selected cells their column's default.
+        SetDefault,
+        /// Shows the SQL of the pending changes, to apply it.
+        ApplyChanges,
+        /// Forgets the pending changes.
+        DiscardChanges,
         /// Opens the editor's search panel.
         FindInEditor,
         /// Opens the editor's search panel with its replace row.
@@ -214,6 +230,70 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-."],
         ["stop", "abort", "kill"],
         CancelQuery
+    ),
+    command!(
+        "refresh_data",
+        "Refresh Rows",
+        "Data",
+        ["secondary-r"],
+        ["reload", "read again"],
+        RefreshData
+    ),
+    command!(
+        "add_row",
+        "Add Row",
+        "Data",
+        [],
+        ["insert", "new row"],
+        AddRow
+    ),
+    command!(
+        "duplicate_rows",
+        "Duplicate Selected Rows",
+        "Data",
+        [],
+        ["copy row", "clone"],
+        DuplicateRows
+    ),
+    command!(
+        "delete_rows",
+        "Delete Selected Rows",
+        "Data",
+        [],
+        ["remove row"],
+        DeleteRows
+    ),
+    command!(
+        "set_null",
+        "Set Selected Cells to NULL",
+        "Data",
+        [],
+        ["null", "empty"],
+        SetNull
+    ),
+    command!(
+        "set_default",
+        "Set Selected Cells to Default",
+        "Data",
+        [],
+        ["default value"],
+        SetDefault
+    ),
+    command!(
+        "apply_changes",
+        "Review and Apply Pending Changes",
+        "Data",
+        [],
+        ["commit", "save rows", "review sql"],
+        ApplyChanges
+    ),
+    command!(
+        "discard_changes",
+        "Discard Pending Changes",
+        "Data",
+        [],
+        ["revert", "undo edits"],
+        DiscardChanges
     ),
     // The editor binds its own search keys (Cmd+F, Cmd+Shift+F) while it has
     // the focus; these make the panel reachable from the palette and the menu.
