@@ -53,8 +53,15 @@ servers.
     open `src-commercial/` (proprietary licence).
   - SQL queries against system catalogs (`pg_catalog`, `information_schema`) are facts about the engine:
     write them from the engine docs, using the references to check you missed nothing.
-- No icons, screenshots, names, colours or wording copied from either. Database engine logos are
-  trademarks: use neutral monochrome glyphs you draw yourself, not the vendors' logos.
+- No icons, screenshots, names, colours or wording copied from either.
+- Engine logos (owner request): show each engine's real logo wherever an engine is named — the engine picker
+  of the new-connection dialog, saved connections in the sidebar, the navigator root, tab and status-bar
+  connection badges. This is nominative use (identifying the engine Kerno connects to), the way every
+  database client does it. Rules: unmodified official artwork as SVG, taken from the vendor's press or brand
+  page or from Simple Icons; one file per engine in `assets/engines/`; source URL and the vendor's trademark
+  notice in `THIRD_PARTY_NOTICES.md`; follow each vendor's usage guidelines (no recolouring beyond what
+  they allow, clear space, no distortion). Never use an engine logo as part of Kerno's own branding. Keep a
+  monochrome variant only where the vendor provides one, for small sizes and dark backgrounds.
 - Nothing leaves the machine: no telemetry, no analytics, no update pings, no crash upload.
 
 ### Machine hygiene (the owner's Mac froze once — strict)
