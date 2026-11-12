@@ -55,6 +55,8 @@ pub enum NavigatorEvent {
         table: TableRef,
         kind: RelationKind,
     },
+    /// Open the form of a new table in `schema`.
+    CreateTable { target: Target, schema: String },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -240,6 +242,43 @@ impl Navigator {
         }
     }
 
+    /// Reads again the tables of `schema` (in `database`, or in any database
+    /// when `None`) when the tree of `connection` shows them.
+    pub fn refresh_tables(
+        &mut self,
+        connection: &str,
+        database: Option<&str>,
+        schema: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.connection.as_deref() != Some(connection) {
+            return;
+        }
+        fn ids(items: &[model::Item], out: &mut Vec<String>) {
+            for item in items {
+                out.push(item.id.clone());
+                ids(&item.children, out);
+            }
+        }
+        // ponytail: walks the rows shown, so a folder hidden by the filter
+        // is not refreshed; look nodes up in the model if that matters.
+        let mut all = Vec::new();
+        ids(&self.tree.items(), &mut all);
+        let folders: Vec<String> = all
+            .into_iter()
+            .filter(|id| {
+                self.tree.node(id).is_some_and(|node| {
+                    node.kind == NodeKind::Group(Group::Tables)
+                        && node.schema.as_deref() == Some(schema)
+                        && database.is_none_or(|database| node.database == database)
+                })
+            })
+            .collect();
+        for folder in folders {
+            self.refresh(&folder, cx);
+        }
+    }
+
     /// The session that answers for `database`, opened if it is not yet.
     fn session_for(
         &mut self,
@@ -350,7 +389,15 @@ impl Navigator {
                 }
             }
             Action::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(name_of(&node))),
-            Action::NewQueryHere | Action::CreateTable | Action::CreateView => {
+            Action::CreateTable => {
+                if self.unavailable(action, &node, cx).is_none()
+                    && let (Some(target), Some(schema)) =
+                        (self.target_of(&node, false), node.schema.clone())
+                {
+                    cx.emit(NavigatorEvent::CreateTable { target, schema });
+                }
+            }
+            Action::NewQueryHere | Action::CreateView => {
                 self.open_template(action, &node, window, cx)
             }
             Action::Generate(template) => self.generate(template, &node, window, cx),
@@ -413,13 +460,6 @@ impl Navigator {
                 Ok(session) => {
                     let dialect = session.dialect();
                     let (title, sql) = match action {
-                        Action::CreateTable => (
-                            "New table".to_string(),
-                            format!(
-                                "CREATE TABLE {} (\n    id BIGINT PRIMARY KEY,\n    name VARCHAR(255) NOT NULL\n);\n",
-                                dialect.table_name(&TableRef::new(schema, "new_table"))
-                            ),
-                        ),
                         Action::CreateView => (
                             "New view".to_string(),
                             format!(
@@ -432,7 +472,10 @@ impl Navigator {
                     };
                     cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
                 }
-                Err(error) => window.push_notification(Notification::error(SharedString::from(error.to_string())), cx),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(error.to_string())),
+                    cx,
+                ),
             });
         })
         .detach();

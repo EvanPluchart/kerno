@@ -44,6 +44,7 @@ use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
+use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{StructureTab, StructureTabEvent};
 use crate::tabs::{TabSnapshot, Target};
 use crate::theme::{self, Appearance};
@@ -62,6 +63,8 @@ enum OpenTab {
     Query(Entity<QueryTab>),
     Data(Entity<DataTab>),
     Structure(Entity<StructureTab>),
+    /// Not restored after a restart: an unsaved draft is not worth keeping.
+    TableEditor(Entity<TableEditor>),
 }
 
 impl OpenTab {
@@ -86,43 +89,58 @@ impl OpenTab {
         }
     }
 
+    fn table_editor(&self) -> Option<&Entity<TableEditor>> {
+        match self {
+            OpenTab::TableEditor(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             OpenTab::Query(tab) => tab.focus_handle(cx),
             OpenTab::Data(tab) => tab.focus_handle(cx),
             OpenTab::Structure(tab) => tab.focus_handle(cx),
+            OpenTab::TableEditor(tab) => tab.focus_handle(cx),
         }
     }
 
-    fn snapshot(&self, cx: &App) -> TabSnapshot {
+    /// What is stored to open the tab again at the next launch, if anything.
+    fn snapshot(&self, cx: &App) -> Option<TabSnapshot> {
         match self {
-            OpenTab::Query(tab) => tab.read(cx).snapshot(cx),
-            OpenTab::Data(tab) => tab.read(cx).snapshot(),
-            OpenTab::Structure(tab) => tab.read(cx).snapshot(),
+            OpenTab::Query(tab) => Some(tab.read(cx).snapshot(cx)),
+            OpenTab::Data(tab) => Some(tab.read(cx).snapshot()),
+            OpenTab::Structure(tab) => Some(tab.read(cx).snapshot()),
+            OpenTab::TableEditor(_) => None,
+        }
+    }
+
+    fn title(&self, cx: &App) -> SharedString {
+        match self {
+            OpenTab::Query(tab) => tab.read(cx).title(),
+            OpenTab::Data(tab) => tab.read(cx).title(),
+            OpenTab::Structure(tab) => tab.read(cx).title(),
+            OpenTab::TableEditor(tab) => tab.read(cx).title(),
         }
     }
 
     /// The tab's name, marked when it holds something not saved or not
     /// applied yet.
     fn label(&self, cx: &App) -> SharedString {
-        match self {
+        let marked = match self {
             OpenTab::Query(tab) => {
                 let tab = tab.read(cx);
-                if tab.file().is_some() && tab.unsaved() {
-                    SharedString::from(format!("{} •", tab.title()))
-                } else {
-                    tab.title()
-                }
+                tab.file().is_some() && tab.unsaved()
             }
-            OpenTab::Data(tab) => {
-                let tab = tab.read(cx);
-                if tab.pending_count(cx) > 0 {
-                    SharedString::from(format!("{} •", tab.title()))
-                } else {
-                    tab.title()
-                }
-            }
-            OpenTab::Structure(tab) => tab.read(cx).title(),
+            OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
+            OpenTab::Structure(_) => false,
+            OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
+        };
+        let title = self.title(cx);
+        if marked {
+            SharedString::from(format!("{title} •"))
+        } else {
+            title
         }
     }
 
@@ -131,6 +149,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.read(cx).status(cx),
             OpenTab::Data(tab) => tab.read(cx).status(cx),
             OpenTab::Structure(tab) => tab.read(cx).status(cx),
+            OpenTab::TableEditor(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -139,6 +158,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.clone().into(),
             OpenTab::Data(tab) => tab.clone().into(),
             OpenTab::Structure(tab) => tab.clone().into(),
+            OpenTab::TableEditor(tab) => tab.clone().into(),
         }
     }
 }
@@ -264,11 +284,7 @@ impl Workspace {
     pub fn tab_titles(&self, cx: &App) -> Vec<String> {
         self.tabs
             .iter()
-            .map(|tab| match tab {
-                OpenTab::Query(tab) => tab.read(cx).title().to_string(),
-                OpenTab::Data(tab) => tab.read(cx).title().to_string(),
-                OpenTab::Structure(tab) => tab.read(cx).title().to_string(),
-            })
+            .map(|tab| tab.title(cx).to_string())
             .collect()
     }
 
@@ -301,6 +317,12 @@ impl Workspace {
     #[cfg(test)]
     pub fn active_structure_tab(&self) -> Option<&Entity<StructureTab>> {
         self.tabs.get(self.active_tab)?.structure()
+    }
+
+    /// The active tab, when it is a table form.
+    #[cfg(test)]
+    pub fn active_table_editor(&self) -> Option<&Entity<TableEditor>> {
+        self.tabs.get(self.active_tab)?.table_editor()
     }
 
     /// Opens the data of a table in a tab of its own.
@@ -391,6 +413,10 @@ impl Workspace {
                     StructureTabEvent::OpenData { table, kind } => {
                         this.open_data(target, table.clone(), *kind, Filter::default(), window, cx);
                     }
+                    StructureTabEvent::EditTable { table } => {
+                        let schema = table.schema.clone();
+                        this.open_table_editor(target, schema, Some(table.clone()), window, cx);
+                    }
                 }
             },
         ));
@@ -426,6 +452,89 @@ impl Workspace {
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
         tab
+    }
+
+    /// Opens the form of `table`, or of a new table in `schema` when `None`:
+    /// in the tab that already shows it, else in a new one.
+    pub fn open_table_editor(
+        &mut self,
+        target: Target,
+        schema: String,
+        table: Option<TableRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TableEditor> {
+        let open = table.as_ref().and_then(|table| {
+            self.tabs.iter().position(|tab| {
+                tab.table_editor().is_some_and(|tab| {
+                    let tab = tab.read(cx);
+                    tab.target() == &target && tab.table() == Some(table)
+                })
+            })
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index]
+                .table_editor()
+                .expect("a table editor")
+                .clone();
+        }
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| TableEditor::new(target, schema, table, connections, window, cx));
+        // One subscription per tab: `close_tab_at` removes them by index.
+        self.tab_subscriptions
+            .push(cx.subscribe_in(&tab, window, Self::on_table_editor_event));
+        self.tabs.push(OpenTab::TableEditor(tab.clone()));
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        tab
+    }
+
+    /// Shows what a table form changed: the tree, the structure tab of the
+    /// table, and the new table's structure in place of its form.
+    fn on_table_editor_event(
+        &mut self,
+        editor: &Entity<TableEditor>,
+        event: &TableEditorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let TableEditorEvent::Applied { from, table } = event;
+        let target = editor.read(cx).target().clone();
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| {
+            navigator.refresh_tables(
+                &target.connection,
+                target.database.as_deref(),
+                &table.schema,
+                cx,
+            )
+        });
+        let shown = from.as_ref().unwrap_or(table);
+        for tab in self.tabs.iter().filter_map(OpenTab::structure) {
+            let same = {
+                let tab = tab.read(cx);
+                tab.target() == &target && tab.table() == shown
+            };
+            if same {
+                let table = table.clone();
+                tab.update(cx, |tab, cx| tab.set_table(table, window, cx));
+            }
+        }
+        if from.is_none() {
+            // A new table: its structure takes the place of its form.
+            let (editor, table) = (editor.clone(), table.clone());
+            cx.defer_in(window, move |this, window, cx| {
+                if let Some(index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.table_editor() == Some(&editor))
+                {
+                    this.close_tab_at(index, window, cx);
+                }
+                this.open_structure(target, table, RelationKind::Table, window, cx);
+            });
+        }
+        cx.notify();
     }
 
     fn push_query_tab(
@@ -491,8 +600,17 @@ impl Workspace {
 
     /// Writes the open tabs to storage now.
     fn save_tabs(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        let snapshots: Vec<TabSnapshot> = self.tabs.iter().map(|tab| tab.snapshot(cx)).collect();
-        let active_tab = self.active_tab;
+        let snapshots: Vec<TabSnapshot> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.snapshot(cx))
+            .collect();
+        // Counted among the tabs that are stored.
+        let active_tab = self.tabs[..self.active_tab.min(self.tabs.len())]
+            .iter()
+            .filter(|tab| tab.snapshot(cx).is_some())
+            .count()
+            .min(snapshots.len().saturating_sub(1));
         let storage = AppState::get(cx).storage.clone();
         bridge::spawn_blocking(cx, move || {
             let saved = storage
@@ -689,6 +807,9 @@ impl Workspace {
                 kind,
             } => {
                 self.open_structure(target.clone(), table.clone(), *kind, window, cx);
+            }
+            NavigatorEvent::CreateTable { target, schema } => {
+                self.open_table_editor(target.clone(), schema.clone(), None, window, cx);
             }
         }
     }

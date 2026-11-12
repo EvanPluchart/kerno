@@ -30,6 +30,7 @@ use crate::query::tab::Activity;
 use crate::settings::Settings;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
+use crate::structure::editor::TableEditor;
 use crate::structure::tab::{DDL_SECTION, List, StructureTab};
 use crate::tabs::TabSnapshot;
 use crate::tabs::Target;
@@ -1298,15 +1299,12 @@ fn statements_and_ddl_open_in_a_tab_and_run_nothing(cx: &mut TestAppContext) {
         (Some("kerno"), Some("shop"))
     );
 
+    // "Create table…" opens the table form.
     app.act(cx, Action::CreateTable, &["kerno", "shop", "Tables"]);
-    app.wait_until(cx, "the CREATE TABLE", |app, cx| app.titles(cx).len() == 6);
-    let (title, sql) = app.active_query(cx);
-    assert_eq!(title, "New table");
-    assert!(
-        sql.starts_with("CREATE TABLE \"shop\".\"new_table\" ("),
-        "{sql}"
-    );
-    // Writing a statement is not running it.
+    assert_eq!(app.titles(cx).len(), 6);
+    assert_eq!(app.titles(cx)[5], "New table");
+    assert!(app.has(cx, "table-editor"));
+    // Opening a form is not running anything.
     assert_eq!(
         on_server(
             Engine::Postgres,
@@ -3543,4 +3541,584 @@ async fn the_structure_tab_comes_back_after_a_restart(cx: &mut TestAppContext) {
             "{engine:?}"
         );
     }
+}
+
+// Table form --------------------------------------------------------------------
+
+impl Fixture {
+    /// The active tab, which is a table form.
+    fn editor(&self, cx: &mut TestAppContext) -> Entity<TableEditor> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .active_table_editor()
+                .expect("a table form")
+                .clone()
+        })
+    }
+
+    /// Waits for the active table form to show its table.
+    fn wait_for_editor(&self, cx: &mut TestAppContext) {
+        self.wait_until(cx, "the table form", |app, cx| {
+            let editor = app.editor(cx);
+            cx.update(|cx| editor.read(cx).ready())
+        });
+    }
+
+    /// Replaces what an input holds with `text`, as typed.
+    fn fill_in(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>, text: &str) {
+        self.click(cx, id);
+        self.press(cx, &["secondary-a", "backspace"]);
+        self.type_text(cx, text);
+    }
+
+    /// The statements of the form's preview, one script, or its problems.
+    fn editor_sql(&self, cx: &mut TestAppContext) -> Result<String, Vec<String>> {
+        let editor = self.editor(cx);
+        cx.update(|cx| {
+            editor
+                .read(cx)
+                .statements(cx)
+                .map(|(statements, _)| statements.join(";\n"))
+        })
+    }
+
+    /// Opens the folders down to the tables of `schema` in the tree, and
+    /// gives the path of that folder.
+    fn open_tables(&self, cx: &mut TestAppContext, engine: Engine, schema: &str) -> Vec<String> {
+        let path: Vec<String> = match engine {
+            Engine::Postgres => vec!["kerno".into(), schema.into(), "Tables".into()],
+            Engine::MySql | Engine::MariaDb => vec![schema.into(), "Tables".into()],
+        };
+        let start = path.len() - 2;
+        self.wait_until(cx, schema, |app, cx| {
+            app.tree(cx).contains(&row(start, &path[start]))
+        });
+        self.toggle(
+            cx,
+            &path[..=start]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        self.wait_until(cx, "the folders", |app, cx| {
+            app.tree_row_of(cx, &path).is_some()
+        });
+        self.toggle(cx, &path.iter().map(String::as_str).collect::<Vec<_>>());
+        self.wait_until(cx, "the tables", |app, cx| {
+            app.tree(cx).contains(&row(path.len(), "existing"))
+        });
+        path
+    }
+
+    fn tree_row_of(&self, cx: &mut TestAppContext, path: &[String]) -> Option<usize> {
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .row_of(&path, cx)
+        })
+    }
+}
+
+/// Column names of a table on a test server, in order.
+fn columns_on_server(engine: Engine, schema: &str, table: &str) -> String {
+    let aggregate = match engine {
+        Engine::Postgres => "string_agg(column_name::text, ',' ORDER BY ordinal_position)",
+        Engine::MySql | Engine::MariaDb => {
+            "GROUP_CONCAT(column_name ORDER BY ordinal_position SEPARATOR ',')"
+        }
+    };
+    on_server(
+        engine,
+        &format!(
+            "SELECT {aggregate} FROM information_schema.columns \
+             WHERE table_schema = '{schema}' AND table_name = '{table}'"
+        ),
+    )
+}
+
+#[gpui_kit::test]
+fn a_table_is_created_from_the_form(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_form_create";
+        let (drop_schema, create_schema) = scratch_schema(engine, schema);
+        // A table already there: an empty folder does not stay open.
+        let existing = format!("CREATE TABLE {schema}.existing (id INT PRIMARY KEY)");
+        let _scratch = Scratch::new(engine, &[&drop_schema], &[&create_schema, &existing]);
+        let app = connected(cx, engine);
+        let tables = app.open_tables(cx, engine, schema);
+        let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+
+        app.act(cx, Action::CreateTable, &tables);
+        assert_eq!(app.titles(cx), ["New table"], "{engine:?}");
+        app.wait_for_editor(cx);
+        // A new table starts with an auto-numbered key and needs a name.
+        assert_eq!(
+            app.editor_sql(cx),
+            Err(vec!["The table needs a name.".to_string()])
+        );
+        assert!(app.has(cx, "editor-problems"));
+
+        app.fill_in(cx, "editor-name", "gadgets");
+        app.click(cx, "editor-add-column");
+        app.fill_in(cx, ("column-name", 1usize), "label");
+        app.fill_in(cx, ("column-type", 1usize), "varchar(80)");
+        app.click(cx, ("column-null", 1usize));
+        app.click(cx, "editor-add-column");
+        app.fill_in(cx, ("column-name", 2usize), "price");
+        let price = match engine {
+            Engine::Postgres => "numeric(10,2)",
+            Engine::MySql | Engine::MariaDb => "decimal(10,2)",
+        };
+        app.fill_in(cx, ("column-type", 2usize), price);
+        app.fill_in(cx, ("column-default", 2usize), "0");
+        app.click(cx, "editor-add-index");
+        app.fill_in(cx, ("index-name", 0usize), "gadgets_label_idx");
+        app.click(cx, "index-0-column-1".to_string());
+        app.click(cx, ("index-unique", 0usize));
+        // A foreign key to the table already there; its menus are driven
+        // through what their entries call.
+        app.click(cx, "editor-add-column");
+        app.fill_in(cx, ("column-name", 3usize), "existing_id");
+        app.fill_in(cx, ("column-type", 3usize), "int");
+        app.click(cx, "editor-add-key");
+        app.fill_in(cx, ("key-name", 0usize), "gadgets_existing_fk");
+        let editor = app.editor(cx);
+        app.step(cx, |window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.reference(0, "existing", window, cx);
+                editor.set_action(0, true, "CASCADE", cx);
+            })
+        });
+        app.fill_in(cx, ("key-referenced", 0usize), "id");
+        app.click(cx, "key-0-column-3".to_string());
+
+        let sql = app
+            .editor_sql(cx)
+            .unwrap_or_else(|problems| panic!("{problems:?}"));
+        assert!(sql.starts_with("CREATE TABLE"), "{engine:?}: {sql}");
+        assert!(
+            sql.contains("REFERENCES")
+                && sql.contains("existing")
+                && sql.contains("ON DELETE CASCADE"),
+            "{engine:?}: {sql}"
+        );
+        assert!(
+            sql.contains("label") && sql.contains("varchar(80) NOT NULL") && sql.contains(price),
+            "{engine:?}: {sql}"
+        );
+        assert!(sql.contains("UNIQUE"), "{engine:?}: {sql}");
+        assert!(app.has(cx, "editor-preview"));
+        assert_eq!(app.titles(cx), ["New table"]);
+        assert_eq!(
+            cx.update(|cx| app.workspace.read(cx).tab_labels(cx)),
+            ["New table •"]
+        );
+
+        app.click(cx, "editor-apply");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        app.click(cx, "sql-confirm");
+        // The form gives way to the structure of the new table.
+        app.wait_until(cx, "the new table", |app, cx| {
+            app.titles(cx) == ["gadgets · structure"]
+        });
+        app.wait_for_structure(cx);
+        assert_eq!(
+            app.structure_column(cx, List::Columns, 1),
+            ["id", "label", "price", "existing_id"],
+            "{engine:?}"
+        );
+        let keys = app.structure_rows(cx, List::ForeignKeys);
+        assert_eq!(keys.len(), 1, "{engine:?}: {keys:?}");
+        assert_eq!(
+            (
+                keys[0][0].as_str(),
+                keys[0][1].as_str(),
+                keys[0][2].clone(),
+                keys[0][5].as_str()
+            ),
+            (
+                "gadgets_existing_fk",
+                "existing_id",
+                format!("{schema}.existing"),
+                "CASCADE"
+            ),
+            "{engine:?}"
+        );
+        assert!(
+            app.structure_column(cx, List::Indexes, 0)
+                .contains(&"gadgets_label_idx".to_string()),
+            "{engine:?}"
+        );
+        assert_eq!(
+            columns_on_server(engine, schema, "gadgets"),
+            "id,label,price,existing_id"
+        );
+        // The tree shows it in its folder.
+        let depth = tables.len();
+        app.wait_until(cx, "the table in the tree", |app, cx| {
+            app.tree(cx).contains(&row(depth, "gadgets"))
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn a_table_is_altered_from_the_form_with_a_preview(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_form_alter";
+        let (drop_schema, create_schema) = scratch_schema(engine, schema);
+        // MySQL keeps an auto-updated timestamp through a comment change.
+        let stamp = match engine {
+            Engine::Postgres => "",
+            Engine::MySql | Engine::MariaDb => {
+                ", stamp TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+            }
+        };
+        let create = scratch_table(
+            engine,
+            &format!("{schema}.items"),
+            &format!("name varchar(50) NOT NULL, note text, qty int{stamp}"),
+        );
+        let _scratch = Scratch::new(engine, &[&drop_schema], &[&create_schema, &create]);
+        let app = connected(cx, engine);
+        app.open_structure(cx, schema, "items", RelationKind::Table);
+        app.wait_for_structure(cx);
+        if engine != Engine::Postgres {
+            // The auto-update is shown with the columns.
+            let columns = app.structure_rows(cx, List::Columns);
+            assert!(
+                columns[4][8].to_lowercase().contains("current_timestamp"),
+                "{engine:?}: {columns:?}"
+            );
+        }
+        app.click(cx, "structure-edit");
+        assert_eq!(app.titles(cx), ["items · structure", "items · edit"]);
+        app.wait_for_editor(cx);
+        assert!(app.has(cx, "editor-no-change"), "{engine:?}");
+        assert_eq!(app.editor_sql(cx), Ok(String::new()));
+
+        // Rename, retype, add, index, then drop.
+        app.fill_in(cx, ("column-name", 1usize), "title");
+        app.fill_in(cx, ("column-type", 3usize), "bigint");
+        if engine != Engine::Postgres {
+            app.fill_in(cx, ("column-comment", 4usize), "touched");
+        }
+        app.click(cx, "editor-add-column");
+        let added: usize = if engine == Engine::Postgres { 4 } else { 5 };
+        app.fill_in(cx, ("column-name", added), "added");
+        app.fill_in(cx, ("column-type", added), "int");
+        app.click(cx, "editor-add-index");
+        app.fill_in(cx, ("index-name", 0usize), "items_added_idx");
+        app.click(cx, format!("index-0-column-{added}"));
+        app.click(cx, ("column-remove", 2usize));
+
+        let sql = app
+            .editor_sql(cx)
+            .unwrap_or_else(|problems| panic!("{problems:?}"));
+        for part in ["DROP COLUMN", "RENAME COLUMN", "ADD COLUMN", "INDEX"] {
+            assert!(sql.contains(part), "{engine:?}: {part} in {sql}");
+        }
+        assert!(sql.contains("note") && sql.contains("title"), "{sql}");
+        assert!(sql.to_lowercase().contains("bigint"), "{sql}");
+        if engine != Engine::Postgres {
+            assert!(sql.contains("ON UPDATE"), "{engine:?}: {sql}");
+        }
+        assert_eq!(
+            cx.update(|cx| app.workspace.read(cx).tab_labels(cx)),
+            ["items · structure", "items · edit •"]
+        );
+
+        // Cancelling runs nothing.
+        app.click(cx, "editor-apply");
+        assert!(app.has(cx, "sql-preview"));
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview"));
+        let before = match engine {
+            Engine::Postgres => "id,name,note,qty",
+            Engine::MySql | Engine::MariaDb => "id,name,note,qty,stamp",
+        };
+        assert_eq!(columns_on_server(engine, schema, "items"), before);
+
+        // Confirming applies, and the form shows the table as it is now.
+        app.click(cx, "editor-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the alter", |app, cx| app.has(cx, "editor-no-change"));
+        let editor = app.editor(cx);
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).error().map(str::to_string)),
+            None
+        );
+        let after = match engine {
+            Engine::Postgres => "id,title,qty,added",
+            Engine::MySql | Engine::MariaDb => "id,title,qty,stamp,added",
+        };
+        assert_eq!(columns_on_server(engine, schema, "items"), after);
+        assert_eq!(
+            cx.update(|cx| app.workspace.read(cx).tab_labels(cx)),
+            ["items · structure", "items · edit"]
+        );
+        if engine != Engine::Postgres {
+            let extra = on_server(
+                engine,
+                &format!(
+                    "SELECT EXTRA FROM information_schema.columns \
+                     WHERE table_schema = '{schema}' AND table_name = 'items' \
+                     AND column_name = 'stamp'"
+                ),
+            );
+            assert!(
+                extra.to_lowercase().contains("on update"),
+                "{engine:?}: {extra}"
+            );
+        }
+        // The structure tab was read again.
+        app.open_structure(cx, schema, "items", RelationKind::Table);
+        app.wait_until(cx, "the structure again", |app, cx| {
+            app.structure_column(cx, List::Columns, 1)
+                .contains(&"added".to_string())
+        });
+        assert!(
+            app.structure_column(cx, List::Indexes, 0)
+                .contains(&"items_added_idx".to_string()),
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn the_form_refuses_what_is_invalid(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.wait_until(cx, "the schemas", |app, cx| {
+        app.tree(cx).contains(&row(1, "shop"))
+    });
+    app.act(cx, Action::CreateTable, &["kerno", "shop"]);
+    app.wait_for_editor(cx);
+    let problems = |app: &Fixture, cx: &mut TestAppContext| app.editor_sql(cx).unwrap_err();
+
+    app.fill_in(cx, "editor-name", "kerno_ui_never");
+    assert!(app.editor_sql(cx).is_ok());
+    // A column without a name, another named like the first.
+    app.click(cx, "editor-add-column");
+    app.fill_in(cx, ("column-type", 1usize), "text");
+    assert_eq!(problems(&app, cx), ["Column 2 has no name."]);
+    app.fill_in(cx, ("column-name", 1usize), "id");
+    assert_eq!(problems(&app, cx), ["There are two columns named \"id\"."]);
+    app.fill_in(cx, ("column-name", 1usize), "label");
+    // A nullable key column, an index without columns.
+    app.click(cx, ("column-key", 1usize));
+    app.click(cx, ("column-null", 1usize));
+    app.click(cx, "editor-add-index");
+    assert_eq!(
+        problems(&app, cx),
+        [
+            "Column \"label\" is in the primary key and cannot allow NULL.",
+            "Index 1 has no name.",
+            "Index \"\" has no column.",
+        ]
+    );
+    // What is wrong shows instead of the statements, and nothing can run.
+    assert!(app.has(cx, "editor-problems") && !app.has(cx, "editor-preview"));
+    app.click(cx, "editor-apply");
+    assert!(!app.has(cx, "sql-preview"));
+
+    // Put right, the statements are back.
+    app.click(cx, ("index-remove", 0usize));
+    app.click(cx, ("column-null", 1usize));
+    let sql = app
+        .editor_sql(cx)
+        .unwrap_or_else(|problems| panic!("{problems:?}"));
+    assert!(sql.contains("PRIMARY KEY (\"id\", \"label\")"), "{sql}");
+    // Removing a key column takes it out of the key.
+    app.click(cx, ("column-remove", 1usize));
+    let sql = app
+        .editor_sql(cx)
+        .unwrap_or_else(|problems| panic!("{problems:?}"));
+    assert!(sql.contains("PRIMARY KEY (\"id\")"), "{sql}");
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM pg_tables WHERE tablename = 'kerno_ui_never'"
+        ),
+        "0"
+    );
+}
+
+#[gpui_kit::test]
+fn a_read_only_connection_cannot_apply(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.wait_until(cx, "the schemas", |app, cx| {
+        app.tree(cx).contains(&row(1, "shop"))
+    });
+    assert_eq!(
+        app.why_not(cx, Action::CreateTable, &["kerno", "shop"]),
+        Some("read-only connection")
+    );
+    app.act(cx, Action::CreateTable, &["kerno", "shop"]);
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+
+    // The structure tab says why there is no "Edit table…".
+    app.open_structure(cx, "shop", "orders", RelationKind::Table);
+    app.wait_for_structure(cx);
+    assert!(!app.has(cx, "structure-edit") && app.has(cx, "structure-edit-disabled"));
+    // A view has none at all.
+    app.open_structure(cx, "shop", "order_totals", RelationKind::View);
+    app.wait_for_structure(cx);
+    assert!(!app.has(cx, "structure-edit") && !app.has(cx, "structure-edit-disabled"));
+
+    // The form itself writes the statements but cannot run them.
+    let target = Target {
+        connection: cx.update(|cx| app.connections.read(cx).saved()[0].id.clone()),
+        database: None,
+        schema: None,
+    };
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_table_editor(
+                target,
+                "shop".into(),
+                Some(TableRef::new("shop", "orders")),
+                window,
+                cx,
+            );
+        })
+    });
+    app.wait_for_editor(cx);
+    app.fill_in(cx, ("column-comment", 1usize), "who ordered");
+    assert!(
+        app.editor_sql(cx)
+            .is_ok_and(|sql| sql.contains("COMMENT ON COLUMN"))
+    );
+    assert!(app.has(cx, "editor-read-only") && !app.has(cx, "editor-apply"));
+}
+
+#[gpui_kit::test]
+fn production_asks_twice_before_a_table_is_altered(cx: &mut TestAppContext) {
+    let engine = Engine::MariaDb;
+    if !testing::available(engine) {
+        return;
+    }
+    let schema = "kerno_ui_form_prod";
+    let (drop_schema, create_schema) = scratch_schema(engine, schema);
+    let create = format!("CREATE TABLE {schema}.t (id INT PRIMARY KEY, a INT)");
+    let _scratch = Scratch::new(engine, &[&drop_schema], &[&create_schema, &create]);
+    let mut config = testing::config(engine);
+    config.environment = kerno_core::config::Environment::Production;
+    let app = connected_as(cx, config);
+    app.open_structure(cx, schema, "t", RelationKind::Table);
+    app.wait_for_structure(cx);
+    app.click(cx, "structure-edit");
+    app.wait_for_editor(cx);
+    app.fill_in(cx, ("column-name", 1usize), "b");
+
+    app.click(cx, "editor-apply");
+    assert!(app.has(cx, "sql-production"));
+    app.click(cx, "sql-confirm");
+    // One click arms the button and runs nothing.
+    assert!(app.has(cx, "sql-preview"));
+    assert_eq!(columns_on_server(engine, schema, "t"), "id,a");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the rename", |_, _| {
+        columns_on_server(engine, schema, "t") == "id,b"
+    });
+}
+
+#[gpui_kit::test]
+fn a_failed_alter_changes_nothing_on_postgresql(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let schema = "kerno_ui_form_fail";
+    let (drop_schema, create_schema) = scratch_schema(engine, schema);
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop_schema],
+        &[
+            &create_schema,
+            "CREATE TABLE kerno_ui_form_fail.t (id int PRIMARY KEY, a int)",
+            "INSERT INTO kerno_ui_form_fail.t VALUES (1, 1)",
+        ],
+    );
+    let app = connected(cx, engine);
+    app.open_structure(cx, schema, "t", RelationKind::Table);
+    app.wait_for_structure(cx);
+    app.click(cx, "structure-edit");
+    app.wait_for_editor(cx);
+    // The rename runs first; the NOT NULL column cannot be added to a
+    // table that has a row.
+    app.fill_in(cx, ("column-name", 1usize), "b");
+    app.click(cx, "editor-add-column");
+    app.fill_in(cx, ("column-name", 2usize), "c");
+    app.fill_in(cx, ("column-type", 2usize), "int");
+    app.click(cx, ("column-null", 2usize));
+    app.click(cx, "editor-apply");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the failure", |app, cx| app.has(cx, "editor-error"));
+    let editor = app.editor(cx);
+    let error = cx
+        .update(|cx| editor.read(cx).error().map(str::to_string))
+        .unwrap_or_default();
+    assert!(
+        error.starts_with("Nothing was changed. Statement 2 failed:")
+            && error.contains("ADD COLUMN"),
+        "{error}"
+    );
+    // Rolled back: the rename did not land, and the form keeps the edits.
+    assert_eq!(columns_on_server(engine, schema, "t"), "id,a");
+    assert!(
+        app.editor_sql(cx)
+            .is_ok_and(|sql| sql.contains("RENAME COLUMN"))
+    );
+}
+
+#[gpui_kit::test]
+async fn a_table_form_is_not_restored_after_a_restart(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let app = open(cx, storage.clone());
+    let target = Target {
+        connection: "not-saved".into(),
+        database: None,
+        schema: None,
+    };
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_table_editor(target, "shop".into(), None, window, cx);
+        })
+    });
+    app.press(cx, &["secondary-t", "secondary-t"]);
+    // From "Query 2" round to "Query 1", past the form.
+    app.press(cx, &["ctrl-tab", "ctrl-tab"]);
+    assert_eq!(app.titles(cx), ["New table", "Query 1", "Query 2"]);
+    assert_eq!(app.active(cx), Some(1));
+    // Only the query tabs are stored, and the active one among them.
+    let stored = storage.clone();
+    cx.wait_for(app.window.into(), Duration::from_secs(10), move |_, _| {
+        stored.tabs::<TabSnapshot>().unwrap().len() == 2
+            && stored
+                .setting::<usize>(crate::state::ACTIVE_TAB_KEY)
+                .unwrap()
+                == Some(0)
+    })
+    .await;
+
+    let restarted = open(cx, storage);
+    assert_eq!(restarted.titles(cx), ["Query 1", "Query 2"]);
+    assert_eq!(restarted.active(cx), Some(0));
 }

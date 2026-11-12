@@ -71,6 +71,7 @@ impl Action {
             Action::Rename
                 | Action::Truncate
                 | Action::Drop
+                | Action::CreateTable
                 | Action::CreateSchema
                 | Action::CreateDatabase
         )
@@ -222,7 +223,14 @@ mod tests {
     #[test]
     fn only_statements_that_change_the_database_count_as_writes() {
         use Action::*;
-        for action in [Rename, Truncate, Drop, CreateSchema, CreateDatabase] {
+        for action in [
+            Rename,
+            Truncate,
+            Drop,
+            CreateTable,
+            CreateSchema,
+            CreateDatabase,
+        ] {
             assert!(action.writes(), "{action:?}");
         }
         // Templates and DDL open a tab; nothing runs.
@@ -233,7 +241,6 @@ mod tests {
             Generate(Template::Delete),
             ShowDdl,
             CopyName,
-            CreateTable,
             CreateView,
             Refresh,
         ] {

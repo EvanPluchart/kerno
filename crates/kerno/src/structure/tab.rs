@@ -35,6 +35,8 @@ pub enum StructureTabEvent {
     OpenStructure { table: TableRef, kind: RelationKind },
     /// Show the rows of this table.
     OpenData { table: TableRef, kind: RelationKind },
+    /// Open this table in the table form.
+    EditTable { table: TableRef },
 }
 
 /// A list of the structure, shown as a table.
@@ -163,6 +165,22 @@ impl StructureTab {
 
     pub fn target(&self) -> &Target {
         &self.target
+    }
+
+    /// Shows another table: the same one under its new name.
+    pub fn set_table(&mut self, table: TableRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.table = table;
+        self.reload(window, cx);
+    }
+
+    /// Why the table cannot be edited here, when it cannot.
+    fn read_only_reason(&self, cx: &App) -> Option<String> {
+        let read_only = self
+            .connections
+            .read(cx)
+            .get(&self.target.connection)
+            .is_some_and(|saved| saved.config.read_only);
+        read_only.then(|| "Read-only connection: the table cannot be edited.".to_string())
     }
 
     pub fn snapshot(&self) -> TabSnapshot {
@@ -513,6 +531,32 @@ impl StructureTab {
                         })
                     })),
             )
+            // Views are edited through their source, not this form.
+            .when(self.kind.is_table(), |bar| {
+                match self.read_only_reason(cx) {
+                    Some(reason) => bar.child(
+                        div()
+                            .id("structure-edit-disabled")
+                            .test_support()
+                            .px_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(reason)),
+                    ),
+                    None => bar.child(
+                        Button::new("structure-edit")
+                            .ghost()
+                            .small()
+                            .label("Edit table…")
+                            .tooltip("Change columns, keys and indexes in a form")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.emit(StructureTabEvent::EditTable {
+                                    table: this.table.clone(),
+                                })
+                            })),
+                    ),
+                }
+            })
     }
 
     fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -871,8 +915,8 @@ fn list_rows(structure: &TableStructure, list: List) -> (Headers, Vec<Vec<String
     let yes = |value: bool| if value { "yes" } else { "no" }.to_string();
     let table_name = |table: &TableRef| format!("{}.{}", table.schema, table.name);
     match list {
-        List::Columns => (
-            &[
+        List::Columns => {
+            static HEADERS: [&str; 9] = [
                 "#",
                 "Name",
                 "Type",
@@ -881,25 +925,36 @@ fn list_rows(structure: &TableStructure, list: List) -> (Headers, Vec<Vec<String
                 "Key",
                 "Generated",
                 "Comment",
-            ],
-            structure
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(index, column)| {
-                    vec![
-                        (index + 1).to_string(),
-                        column.name.clone(),
-                        column.data_type.clone(),
-                        yes(column.nullable),
-                        column.default.clone().unwrap_or_default(),
-                        key_of(structure, column),
-                        generation_of(column.generation.as_ref()),
-                        column.comment.clone().unwrap_or_default(),
-                    ]
-                })
-                .collect(),
-        ),
+                "On update",
+            ];
+            // "On update" only where a column has one (MySQL, MariaDB).
+            let on_update = structure.columns.iter().any(|c| c.on_update.is_some());
+            let headers: Headers = if on_update { &HEADERS } else { &HEADERS[..8] };
+            (
+                headers,
+                structure
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        let mut row = vec![
+                            (index + 1).to_string(),
+                            column.name.clone(),
+                            column.data_type.clone(),
+                            yes(column.nullable),
+                            column.default.clone().unwrap_or_default(),
+                            key_of(structure, column),
+                            generation_of(column.generation.as_ref()),
+                            column.comment.clone().unwrap_or_default(),
+                        ];
+                        if on_update {
+                            row.push(column.on_update.clone().unwrap_or_default());
+                        }
+                        row
+                    })
+                    .collect(),
+            )
+        }
         List::Indexes => (
             &["Name", "Columns", "Kind", "Method", "Definition"],
             structure
