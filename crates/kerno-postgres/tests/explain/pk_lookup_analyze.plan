@@ -1,0 +1,1 @@
+Index Scan on orders  (cost=8.3 rows=1) (actual rows=1 ms=1.063 loops=1)

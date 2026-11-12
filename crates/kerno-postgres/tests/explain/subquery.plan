@@ -1,0 +1,5 @@
+Nested Loop  (cost=77.56 rows=67)
+  Aggregate  (cost=10.51 rows=1)
+    Seq Scan on products  (cost=10 rows=200)
+  Seq Scan on products  (cost=10.5 rows=67)
+  Index Scan on order_items  (cost=8.99 rows=31)

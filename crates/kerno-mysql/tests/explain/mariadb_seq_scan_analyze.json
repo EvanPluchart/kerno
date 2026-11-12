@@ -1,0 +1,35 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.023176276
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 0.0974836,
+    "r_loops": 1,
+    "r_total_time_ms": 3.474774062,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "customers",
+          "access_type": "ALL",
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 500,
+          "r_rows": 500,
+          "cost": 0.0974836,
+          "r_table_time_ms": 2.539803066,
+          "r_other_time_ms": 0.915879747,
+          "r_engine_stats": {
+            "pages_accessed": 7,
+            "pages_read_count": 6,
+            "pages_read_time_ms": 2.202371492
+          },
+          "filtered": 100,
+          "r_total_filtered": 84,
+          "attached_condition": "customers.full_name like '%a%'",
+          "r_filtered": 84
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+Query block  (cost=4.987) (actual ms=2.284 loops=1)
+  Nested loop
+    Table scan on p  (cost=0.047 rows=200) (actual rows=200 ms=0.484 loops=1)
+    Single-row index lookup on <subquery2>  (rows=1) (actual rows=75 ms=1.447 loops=100)
+      Materialized
+        Query block
+          Table scan on order_items  (cost=2.482 rows=14658) (actual rows=12500 ms=1.157 loops=1)
+  Query block  (cost=0.047) (actual ms=0.326 loops=1)
+    Table scan on products  (cost=0.047 rows=200) (actual rows=200 ms=0.323 loops=1)

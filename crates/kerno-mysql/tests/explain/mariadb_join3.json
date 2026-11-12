@@ -1,0 +1,58 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 2.25927347,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": [
+            "PRIMARY",
+            "orders_customer_idx",
+            "orders_status_placed_idx"
+          ],
+          "key": "orders_status_placed_idx",
+          "key_length": "1",
+          "used_key_parts": ["status"],
+          "ref": ["const"],
+          "loops": 1,
+          "rows": 715,
+          "cost": 0.72833952,
+          "filtered": 100,
+          "index_condition": "o.`status` = 'paid'"
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "8",
+          "used_key_parts": ["id"],
+          "ref": ["kerno.o.customer_id"],
+          "loops": 715,
+          "rows": 1,
+          "cost": 0.645259,
+          "filtered": 100
+        }
+      },
+      {
+        "table": {
+          "table_name": "i",
+          "access_type": "ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "8",
+          "used_key_parts": ["order_id"],
+          "ref": ["kerno.o.id"],
+          "loops": 715,
+          "rows": 2,
+          "cost": 0.88567495,
+          "filtered": 100
+        }
+      }
+    ]
+  }
+}

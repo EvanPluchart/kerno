@@ -26,9 +26,9 @@ use gpui_kit::{
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
-    NextTab, OpenCommandPalette, OpenSettings, PreviousTab, ToggleSidebar, UseDarkTheme,
-    UseLightTheme, UseSystemTheme,
+    self, About, CancelQuery, CloseTab, ExportConnections, ImportConnections, NewConnection,
+    NewQueryTab, NextTab, OpenCommandPalette, OpenSettings, PreviousTab, RunAll, RunStatement,
+    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -36,10 +36,12 @@ use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
 use crate::navigator::view::{Navigator, NavigatorEvent};
+use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
-use crate::tabs::{QueryTab, TabSnapshot};
+use crate::tabs::{TabSnapshot, Target};
 use crate::theme::{self, Appearance};
+use kerno_core::TxState;
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
@@ -101,8 +103,8 @@ impl Workspace {
         };
         for snapshot in tabs {
             match snapshot {
-                TabSnapshot::Query { title, sql } => {
-                    workspace.push_query_tab(title, &sql, window, cx)
+                TabSnapshot::Query { title, sql, target } => {
+                    workspace.push_query_tab(title, &sql, target, window, cx)
                 }
             }
         }
@@ -136,6 +138,7 @@ impl Workspace {
         &mut self,
         title: String,
         sql: &str,
+        target: Option<Target>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -146,7 +149,8 @@ impl Workspace {
         {
             self.next_query_number = self.next_query_number.max(number + 1);
         }
-        let tab = cx.new(|cx| QueryTab::new(title, sql, window, cx));
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| QueryTab::new(title, sql, target, connections, window, cx));
         let editor = tab.read(cx).editor().clone();
         self.tab_subscriptions
             .push(cx.observe(&editor, |this, _, cx| this.schedule_save(cx)));
@@ -213,7 +217,25 @@ impl Workspace {
 
     fn new_query_tab(&mut self, _: &NewQueryTab, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("Query {}", self.next_query_number);
-        self.push_query_tab(title, "", window, cx);
+        // A new tab runs on the connection being browsed, when it is open.
+        let target = self
+            .sidebar
+            .read(cx)
+            .navigator()
+            .read(cx)
+            .connection()
+            .filter(|id| {
+                matches!(
+                    self.connections.read(cx).status(id),
+                    Status::Connected { .. }
+                )
+            })
+            .map(|id| Target {
+                connection: id.to_string(),
+                database: None,
+                schema: None,
+            });
+        self.push_query_tab(title, "", target, window, cx);
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
     }
@@ -368,8 +390,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            NavigatorEvent::OpenQuery { title, sql } => {
-                self.push_query_tab(title.clone(), sql, window, cx);
+            NavigatorEvent::OpenQuery { title, sql, target } => {
+                self.push_query_tab(title.clone(), sql, target.clone(), window, cx);
                 self.activate_tab(self.tabs.len() - 1, window, cx);
                 self.schedule_save(cx);
             }
@@ -380,6 +402,26 @@ impl Workspace {
     #[cfg(test)]
     pub fn navigator(&self, cx: &App) -> Entity<Navigator> {
         self.sidebar.read(cx).navigator().clone()
+    }
+
+    // Running ------------------------------------------------------------------
+
+    fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.run(Scope::AtCursor, window, cx));
+        }
+    }
+
+    fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx));
+        }
+    }
+
+    fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.cancel(cx));
+        }
     }
 
     // Connections --------------------------------------------------------------
@@ -788,6 +830,75 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// What the status bar says, left to right: the active tab's
+    /// connection, database, transaction, rows and timing; without a tab,
+    /// how many connections are open.
+    fn status_items(&self, cx: &App) -> Vec<(String, Option<gpui_kit::Hsla>)> {
+        let theme = cx.theme();
+        let status = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.read(cx).status(cx));
+        let Some(TabStatus {
+            connection: Some(connection),
+            read_only,
+            database,
+            transaction,
+            running,
+            rows,
+            elapsed,
+            notices,
+        }) = status
+        else {
+            return vec![(
+                match self.connections.read(cx).connected_count() {
+                    0 => "Not connected".to_string(),
+                    1 => "1 connection open".to_string(),
+                    count => format!("{count} connections open"),
+                },
+                None,
+            )];
+        };
+        let mut items = vec![(connection, None)];
+        items.extend(database.map(|database| (database, None)));
+        if read_only {
+            items.push(("read-only".into(), Some(theme.warning)));
+        }
+        match transaction {
+            TxState::Idle => {}
+            TxState::Open => items.push(("transaction open".into(), Some(theme.warning))),
+            TxState::Failed => {
+                items.push(("transaction failed: roll back".into(), Some(theme.danger)))
+            }
+        }
+        if running {
+            items.push(("running…".into(), None));
+        }
+        items.extend(rows.map(|rows| {
+            (
+                format!("{rows} row{}", if rows == 1 { "" } else { "s" }),
+                None,
+            )
+        }));
+        items.extend(elapsed.map(|elapsed| (duration_text(elapsed), None)));
+        if notices > 0 {
+            items.push((
+                format!("{notices} message{}", if notices == 1 { "" } else { "s" }),
+                None,
+            ));
+        }
+        items
+    }
+
+    /// The text of the status bar; for tests.
+    #[cfg(test)]
+    pub fn status_text(&self, cx: &App) -> Vec<String> {
+        self.status_items(cx)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
     fn render_status_bar(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         let memory_only = !AppState::get(cx).secrets.is_persistent();
@@ -801,11 +912,15 @@ impl Workspace {
             .bg(theme.status_bar)
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(match self.connections.read(cx).connected_count() {
-                0 => SharedString::from("Not connected"),
-                1 => SharedString::from("1 connection open"),
-                count => SharedString::from(format!("{count} connections open")),
-            })
+            .child(
+                h_flex()
+                    .gap_3()
+                    .children(self.status_items(cx).into_iter().map(|(text, color)| {
+                        div()
+                            .when_some(color, |this, color| this.text_color(color))
+                            .child(SharedString::from(text))
+                    })),
+            )
             .when(memory_only, |this| {
                 this.child(
                     div()
@@ -876,6 +991,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::run_statement))
+            .on_action(cx.listener(Self::run_all))
+            .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::import_connections))
             .on_action(cx.listener(Self::export_connections))
             .size_full()

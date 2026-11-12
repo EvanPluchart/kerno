@@ -5,6 +5,7 @@ mod connect;
 mod ddl;
 mod dialect;
 mod introspect;
+mod plan;
 mod session;
 mod types;
 

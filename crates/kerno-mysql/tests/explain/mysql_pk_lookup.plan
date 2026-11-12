@@ -1,0 +1,2 @@
+Query block  (cost=1)
+  Constant row on orders  (cost=0 rows=1)

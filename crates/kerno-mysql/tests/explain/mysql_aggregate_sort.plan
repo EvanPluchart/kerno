@@ -1,0 +1,4 @@
+Query block  (cost=505)
+  Ordering operation
+    Grouping operation
+      Index scan on orders  (cost=505 rows=5000)

@@ -1,0 +1,1 @@
+Seq Scan on customers  (cost=22.25 rows=400)

@@ -20,6 +20,7 @@ use kerno_core::{ConnectionConfig, Engine, testing};
 
 use crate::connections::manager::{Connections, Drivers, Status};
 use crate::navigator::actions::{Action, Template};
+use crate::query::tab::Activity;
 use crate::settings::Settings;
 use crate::sidebar::Sidebar;
 use crate::state::AppState;
@@ -236,6 +237,67 @@ impl Fixture {
         })
     }
 
+    /// What the statements of the active tab's last run produced.
+    fn outcomes(&self, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| {
+            let workspace = self.workspace.read(cx);
+            workspace
+                .active_query_tab()
+                .map(|tab| tab.read(cx).outcomes(cx))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Columns and first rows of a result of the active tab.
+    fn result(
+        &self,
+        cx: &mut TestAppContext,
+        index: usize,
+        limit: usize,
+    ) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        cx.update(|cx| {
+            let workspace = self.workspace.read(cx);
+            workspace
+                .active_query_tab()
+                .expect("an open tab")
+                .read(cx)
+                .rows_of(index, limit, cx)
+        })
+    }
+
+    /// Whether the active tab is waiting for the server.
+    fn running(&self, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            let workspace = self.workspace.read(cx);
+            workspace
+                .active_query_tab()
+                .is_some_and(|tab| matches!(tab.read(cx).activity(), Activity::Running { .. }))
+        })
+    }
+
+    /// The active query tab.
+    fn tab(&self, cx: &mut TestAppContext) -> Entity<crate::query::tab::QueryTab> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .active_query_tab()
+                .expect("an open tab")
+                .clone()
+        })
+    }
+
+    /// What the status bar says.
+    fn status_bar(&self, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| self.workspace.read(cx).status_text(cx))
+    }
+
+    /// Opens a query tab, types `sql` and runs it with `keys`.
+    fn run_in_new_tab(&self, cx: &mut TestAppContext, sql: &str, keys: &str) {
+        self.press(cx, &["secondary-t"]);
+        self.type_text(cx, sql);
+        self.press(cx, &[keys]);
+    }
+
     /// Clicks a row of the schema tree: opens or closes it.
     fn toggle(&self, cx: &mut TestAppContext, path: &[&str]) {
         let row = self.tree_row(cx, path);
@@ -372,11 +434,13 @@ async fn unsaved_text_and_tabs_come_back_after_a_restart(cx: &mut TestAppContext
         [
             TabSnapshot::Query {
                 title: "Query 1".into(),
-                sql: String::new()
+                sql: String::new(),
+                target: None,
             },
             TabSnapshot::Query {
                 title: "Query 2".into(),
-                sql: "select 'not saved anywhere'".into()
+                sql: "select 'not saved anywhere'".into(),
+                target: None,
             },
         ]
     );
@@ -1115,12 +1179,21 @@ fn statements_and_ddl_open_in_a_tab_and_run_nothing(cx: &mut TestAppContext) {
 
     app.act(cx, Action::NewQueryHere, &["kerno", "shop"]);
     app.wait_until(cx, "the query tab", |app, cx| app.titles(cx).len() == 5);
+    // An empty tab that runs in that schema of that database.
+    assert_eq!(app.active_query(cx), ("shop".to_string(), String::new()));
+    let target = cx.update(|cx| {
+        let workspace = app.workspace.read(cx);
+        workspace
+            .active_query_tab()
+            .unwrap()
+            .read(cx)
+            .target()
+            .cloned()
+    });
+    let target = target.expect("the tab is bound");
     assert_eq!(
-        app.active_query(cx),
-        (
-            "shop".to_string(),
-            "SET search_path TO \"shop\";\n\n".to_string()
-        )
+        (target.database.as_deref(), target.schema.as_deref()),
+        (Some("kerno"), Some("shop"))
     );
 
     app.act(cx, Action::CreateTable, &["kerno", "shop", "Tables"]);
@@ -1318,5 +1391,593 @@ fn production_asks_twice_and_read_only_refuses(cx: &mut TestAppContext) {
             !app.tree(cx).contains(&row(2, "invoices"))
         });
         assert!(!exists(), "{engine:?}");
+    }
+}
+
+// Running statements ----------------------------------------------------------
+
+fn cells(row: &[&str]) -> Vec<Option<String>> {
+    row.iter().map(|cell| Some(cell.to_string())).collect()
+}
+
+#[gpui_kit::test]
+fn statements_run_and_their_rows_fill_the_grid(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let customers = match engine {
+            Engine::Postgres => "shop.customers",
+            _ => "kerno.customers",
+        };
+        // Cmd+Enter runs the statement the cursor is in.
+        app.run_in_new_tab(
+            cx,
+            &format!("select id, full_name, phone from {customers} order by id limit 3"),
+            "secondary-enter",
+        );
+        app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["3 rows"]);
+        let (columns, rows) = app.result(cx, 0, 10);
+        assert_eq!(columns, ["id", "full_name", "phone"], "{engine:?}");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0].as_deref(), Some("1"), "{engine:?}");
+        assert!(!app.running(cx));
+        // The status bar names the tab's connection and database, the rows
+        // on screen and how long the statement took.
+        let status = cx.update(|cx| app.workspace.read(cx).status_text(cx));
+        assert_eq!(
+            status[..3],
+            [
+                format!("test {}", engine.label()),
+                "kerno".to_string(),
+                "3 rows".to_string()
+            ],
+            "{engine:?}"
+        );
+        assert!(status[3].ends_with(" ms"), "{status:?}");
+
+        // Cmd+Shift+Enter runs them all: one result each; a statement
+        // without rows says what it did.
+        let script = match engine {
+            Engine::Postgres => {
+                "select 1 as one; select null::text as nothing, '' as blank; set statement_timeout = 0"
+            }
+            _ => "select 1 as one; select null as nothing, '' as blank; set @kerno_ui = 1",
+        };
+        app.run_in_new_tab(cx, script, "secondary-shift-enter");
+        app.wait_until(cx, "the script", |app, cx| {
+            app.outcomes(cx).len() == 3 && !app.running(cx)
+        });
+        assert_eq!(app.outcomes(cx)[..2], ["1 rows", "1 rows"], "{engine:?}");
+        assert!(app.outcomes(cx)[2].starts_with("done"), "{engine:?}");
+        assert_eq!(
+            app.result(cx, 0, 10),
+            (vec!["one".to_string()], vec![cells(&["1"])])
+        );
+        // NULL is not the empty string.
+        assert_eq!(
+            app.result(cx, 1, 10).1,
+            [vec![None, Some(String::new())]],
+            "{engine:?}"
+        );
+
+        // A script stops at the first statement that fails.
+        app.run_in_new_tab(
+            cx,
+            "select 1; select * from kerno_no_such_table; select 2",
+            "secondary-shift-enter",
+        );
+        app.wait_until(cx, "the failure", |app, cx| {
+            app.outcomes(cx).len() == 2 && !app.running(cx)
+        });
+        let outcomes = app.outcomes(cx);
+        let code = if engine == Engine::Postgres {
+            "42P01"
+        } else {
+            "1146 (42S02)"
+        };
+        assert_eq!(
+            outcomes,
+            ["1 rows".to_string(), format!("failed [{code}]")],
+            "{engine:?}"
+        );
+        assert!(
+            app.has(cx, "result-error"),
+            "the error is the result on screen"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_large_result_arrives_a_page_at_a_time(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g, g * 2 as twice from generate_series(1, 2500) g",
+        "secondary-enter",
+    );
+    // The first page is here and the tab is not busy: the rest waits on
+    // the server until asked for.
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.outcomes(cx) == ["1000 rows, more"]
+    });
+    assert!(!app.running(cx));
+    assert!(app.has(cx, "fetch-more") && app.has(cx, "fetch-all"));
+
+    app.click(cx, "fetch-more");
+    app.wait_until(cx, "the second page", |app, cx| {
+        app.outcomes(cx) == ["2000 rows, more"]
+    });
+    app.click(cx, "fetch-all");
+    app.wait_until(cx, "the rest", |app, cx| app.outcomes(cx) == ["2500 rows"]);
+    assert!(!app.has(cx, "fetch-more") && !app.running(cx));
+    assert_eq!(
+        app.result(cx, 0, 2).1,
+        [cells(&["1", "2"]), cells(&["2", "4"])]
+    );
+
+    // In a script, a statement with more than a page stops at its first
+    // page so the next one can run.
+    app.run_in_new_tab(
+        cx,
+        "select g from generate_series(1, 2500) g; select 'after' as marker",
+        "secondary-shift-enter",
+    );
+    app.wait_until(cx, "the script", |app, cx| {
+        app.outcomes(cx).len() == 2 && !app.running(cx)
+    });
+    assert_eq!(app.outcomes(cx), ["1000 rows, incomplete", "1 rows"]);
+}
+
+#[gpui_kit::test]
+fn a_running_statement_is_cancelled_and_the_window_stays_usable(cx: &mut TestAppContext) {
+    for (engine, slow) in [
+        (Engine::Postgres, "select pg_sleep(60)"),
+        (
+            Engine::MySql,
+            "select count(*) from kerno.orders where sleep(0.05) = 0",
+        ),
+        (
+            Engine::MariaDb,
+            "select count(*) from kerno.orders where sleep(0.05) = 0",
+        ),
+    ] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        app.run_in_new_tab(cx, slow, "secondary-enter");
+        app.wait_until(cx, "the statement to start", |app, cx| app.running(cx));
+        assert!(app.has(cx, "tab-cancel"), "{engine:?}");
+
+        // While it runs the window answers: another tab opens, the tree is there.
+        app.press(cx, &["secondary-t"]);
+        assert_eq!(app.titles(cx).len(), 2, "{engine:?}");
+        assert!(app.has(cx, "navigator-filter"));
+        app.press(cx, &["ctrl-shift-tab"]);
+        assert!(app.running(cx), "{engine:?}: still running in its tab");
+
+        let started = std::time::Instant::now();
+        app.press(cx, &["secondary-."]);
+        app.wait_until(cx, "the cancellation", |app, cx| !app.running(cx));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{engine:?}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(app.outcomes(cx), ["cancelled"], "{engine:?}");
+        assert!(app.has(cx, "result-cancelled"));
+
+        // The session is usable again.
+        app.run_in_new_tab(cx, "select 7 as seven", "secondary-enter");
+        app.wait_until(cx, "the next statement", |app, cx| {
+            app.outcomes(cx) == ["1 rows"]
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn a_tab_without_an_open_connection_says_what_to_do(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.run_in_new_tab(cx, "select 1", "secondary-enter");
+    app.wait_until(cx, "the refusal", |app, cx| app.outcomes(cx).len() == 1);
+    assert_eq!(app.outcomes(cx), ["failed []"]);
+    assert!(app.has(cx, "result-error"));
+}
+
+#[gpui_kit::test]
+fn parameters_are_asked_for_before_a_statement_runs(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) || !testing::available(Engine::MySql) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    // A named parameter used twice and a numbered one: two values to give.
+    app.run_in_new_tab(
+        cx,
+        "select :who as who, $1::int + 1 as next, :who || '!' as again",
+        "secondary-enter",
+    );
+    assert!(app.has(cx, ("param", 0usize)) && app.has(cx, ("param", 1usize)));
+    assert!(!app.has(cx, ("param", 2usize)));
+    assert_eq!(app.outcomes(cx), Vec::<String>::new(), "nothing ran yet");
+    // The first field has the focus.
+    app.type_text(cx, "O'Brien");
+    app.click(cx, ("param", 1usize));
+    app.type_text(cx, "41");
+    app.click(cx, "params-run");
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    // Text became a string, quote and all; the number stayed a number.
+    assert_eq!(
+        app.result(cx, 0, 1).1,
+        [cells(&["O'Brien", "42", "O'Brien!"])]
+    );
+
+    // Running again offers what was typed; NULL is a tick away, and Enter runs.
+    app.press(cx, &["secondary-enter"]);
+    app.click(cx, ("param-null", 0usize));
+    app.click(cx, ("param", 1usize));
+    app.press(cx, &["enter"]);
+    app.wait_until(cx, "the rows", |app, cx| {
+        app.outcomes(cx) == ["1 rows"] && app.result(cx, 0, 1).1[0][0].is_none()
+    });
+    assert_eq!(
+        app.result(cx, 0, 1).1,
+        [vec![None, Some("42".to_string()), None]]
+    );
+
+    // Cancelling the prompt runs nothing.
+    app.run_in_new_tab(cx, "select :x", "secondary-enter");
+    app.click(cx, "params-cancel");
+    assert_eq!(app.outcomes(cx), Vec::<String>::new());
+
+    // MySQL: every `?` is its own value.
+    let app = connected(cx, Engine::MySql);
+    app.run_in_new_tab(
+        cx,
+        "select ? as a, ? as b, '?' as not_one",
+        "secondary-enter",
+    );
+    assert!(app.has(cx, ("param", 1usize)) && !app.has(cx, ("param", 2usize)));
+    app.type_text(cx, "1.5");
+    app.click(cx, ("param", 1usize));
+    app.type_text(cx, "two");
+    app.click(cx, "params-run");
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    assert_eq!(app.result(cx, 0, 1).1, [cells(&["1.5", "two", "?"])]);
+}
+
+#[gpui_kit::test]
+fn manual_commit_keeps_changes_in_a_transaction_until_it_is_ended(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let server = |sql: &str| on_server(engine, sql);
+        let (cleanup, setup, table) = match engine {
+            Engine::Postgres => (
+                "DROP SCHEMA IF EXISTS kerno_ui_tx CASCADE",
+                vec![
+                    "CREATE SCHEMA kerno_ui_tx",
+                    "CREATE TABLE kerno_ui_tx.entries (id int PRIMARY KEY)",
+                ],
+                "kerno_ui_tx.entries",
+            ),
+            _ => (
+                "DROP DATABASE IF EXISTS kerno_ui_tx",
+                vec![
+                    "CREATE DATABASE kerno_ui_tx",
+                    "CREATE TABLE kerno_ui_tx.entries (id INT PRIMARY KEY)",
+                ],
+                "kerno_ui_tx.entries",
+            ),
+        };
+        let _scratch = Scratch::new(engine, &[cleanup], &setup);
+        let count = || server(&format!("SELECT count(*) FROM {table}"));
+        let app = connected(cx, engine);
+        let open = |app: &Fixture, cx: &mut TestAppContext| {
+            app.status_bar(cx).contains(&"transaction open".to_string())
+        };
+
+        // Auto-commit: the row is there for everyone at once.
+        app.run_in_new_tab(
+            cx,
+            &format!("insert into {table} values (1)"),
+            "secondary-enter",
+        );
+        app.wait_until(cx, "the insert", |app, cx| {
+            app.outcomes(cx) == ["done, 1 affected"]
+        });
+        assert_eq!(count(), "1", "{engine:?}");
+        assert!(!open(&app, cx) && !app.has(cx, "tab-commit"));
+
+        // Manual commit: the tab opens a transaction with its first statement.
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+        app.press(cx, &["secondary-a"]);
+        app.type_text(cx, &format!("insert into {table} values (2)"));
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the insert", |app, cx| {
+            app.outcomes(cx) == ["done, 1 affected"] && !app.running(cx)
+        });
+        assert!(open(&app, cx), "{engine:?}: {:?}", app.status_bar(cx));
+        assert_eq!(count(), "1", "{engine:?}: not committed yet");
+
+        // Rollback undoes it.
+        app.click(cx, "tab-rollback");
+        app.wait_until(cx, "the rollback", |app, cx| !open(app, cx));
+        assert_eq!(count(), "1", "{engine:?}");
+
+        // Commit keeps it.
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the insert", |app, cx| {
+            open(app, cx) && !app.running(cx)
+        });
+        app.click(cx, "tab-commit");
+        app.wait_until(cx, "the commit", |app, cx| !open(app, cx));
+        assert_eq!(count(), "2", "{engine:?}");
+
+        if engine == Engine::Postgres {
+            // After an error PostgreSQL accepts only a rollback, and the tab says so.
+            app.press(cx, &["secondary-a"]);
+            app.type_text(cx, "select 1/0");
+            app.press(cx, &["secondary-enter"]);
+            app.wait_until(cx, "the failure", |app, cx| {
+                app.outcomes(cx) == ["failed [22012]"]
+            });
+            assert!(
+                app.status_bar(cx)
+                    .contains(&"transaction failed: roll back".to_string())
+            );
+            app.click(cx, "tab-rollback");
+            app.wait_until(cx, "the rollback", |app, cx| !app.has(cx, "tab-rollback"));
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn messages_errors_and_history_of_a_run(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    // What the server says on the side is kept apart from the results.
+    app.run_in_new_tab(
+        cx,
+        "do $$ begin raise notice 'hello from the server'; raise warning 'careful'; end $$",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the block", |app, cx| {
+        app.outcomes(cx).len() == 1 && !app.running(cx)
+    });
+    assert!(app.outcomes(cx)[0].starts_with("done"));
+    let tab = app.tab(cx);
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).messages()),
+        ["NOTICE: hello from the server", "WARNING: careful"]
+    );
+    assert!(app.status_bar(cx).contains(&"2 messages".to_string()));
+
+    // A failed statement is marked where the server says it went wrong,
+    // and the mark goes when the statement is run again.
+    app.run_in_new_tab(
+        cx,
+        "select id,\n  nope\nfrom shop.customers",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the failure", |app, cx| {
+        app.outcomes(cx) == ["failed [42703]"]
+    });
+    let tab = app.tab(cx);
+    assert_eq!(cx.update(|cx| tab.read(cx).error_marks(cx)), 1);
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "select 1");
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    assert_eq!(cx.update(|cx| tab.read(cx).error_marks(cx)), 0);
+
+    // Every statement that ran is in the history, with how it ended.
+    let storage = app.storage.clone();
+    app.wait_until(cx, "the history", |_, _| {
+        storage.history(None, "", 10).unwrap().len() == 3
+    });
+    let history = storage.history(None, "", 10).unwrap();
+    let connection = storage.connections().unwrap()[0].id.clone();
+    assert!(
+        history
+            .iter()
+            .all(|entry| entry.connection_id == connection)
+    );
+    let ended: Vec<(&str, kerno_core::storage::HistoryStatus, Option<i64>)> = history
+        .iter()
+        .rev()
+        .map(|entry| {
+            (
+                entry.sql.lines().next().unwrap_or_default(),
+                entry.status,
+                entry.row_count,
+            )
+        })
+        .collect();
+    use kerno_core::storage::HistoryStatus::{Error, Ok as Fine};
+    assert_eq!(ended[1], ("select id,", Error, None));
+    assert_eq!(ended[2], ("select 1", Fine, Some(1)));
+    assert!(ended[0].0.starts_with("do $$") && ended[0].1 == Fine);
+    assert!(history.iter().any(|entry| {
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("nope"))
+    }));
+}
+
+// The results grid --------------------------------------------------------------
+
+#[gpui_kit::test]
+fn the_grid_sorts_copies_and_rearranges_what_it_shows(cx: &mut TestAppContext) {
+    use gpui_kit::component::table::{ColumnSort, TableDelegate as _};
+
+    use crate::query::grid::{CopyFormat, Grid};
+
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g as n, case when g % 3 = 0 then null else 'v' || g end as label, g % 2 = 0 as even \
+         from generate_series(1, 6) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["6 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    let shown = |cx: &mut TestAppContext| cx.update(|cx| grid.read(cx).delegate().shown());
+    let row = |cells: [&str; 3]| cells.map(str::to_string).to_vec();
+    // NULL and booleans are shown for what they are.
+    assert_eq!(
+        shown(cx)[..3],
+        [
+            row(["1", "v1", "false"]),
+            row(["2", "v2", "true"]),
+            row(["3", "NULL", "false"])
+        ]
+    );
+
+    // Sorting is done here, on what was fetched; numbers as numbers, NULLs last.
+    let sort = |cx: &mut TestAppContext, column: usize, order: ColumnSort| {
+        app.step(cx, |window, cx| {
+            grid.update(cx, |table, cx| {
+                table.delegate_mut().perform_sort(column, order, window, cx)
+            })
+        });
+    };
+    sort(cx, 1, ColumnSort::Descending);
+    assert_eq!(
+        shown(cx)
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        ["6", "5", "4", "3", "2", "1"]
+    );
+    sort(cx, 2, ColumnSort::Ascending);
+    assert_eq!(
+        shown(cx)
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>(),
+        ["v1", "v2", "v4", "v5", "NULL", "NULL"]
+    );
+    sort(cx, 1, ColumnSort::Descending);
+
+    // A range is the table's selected cell stretched to another one.
+    let copy = |cx: &mut TestAppContext, format: Option<CopyFormat>| {
+        let copied =
+            cx.update(|cx| grid.update(cx, |table, cx| Grid::copy(table, format, None, cx)));
+        assert!(copied, "{format:?}");
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    };
+    cx.update(|cx| {
+        grid.update(cx, |table, cx| {
+            table.set_selected_cell(0, 1, cx);
+            table.delegate_mut().extend_to(2, 2);
+        })
+    });
+    assert_eq!(copy(cx, Some(CopyFormat::Tsv)), "6\t\n5\tv5\n4\tv4\n");
+    assert_eq!(
+        copy(cx, Some(CopyFormat::TsvWithHeader)),
+        "n\tlabel\n6\t\n5\tv5\n4\tv4\n"
+    );
+    assert_eq!(
+        copy(cx, Some(CopyFormat::Csv)),
+        "n,label\r\n6,\r\n5,v5\r\n4,v4\r\n"
+    );
+    assert_eq!(
+        copy(cx, Some(CopyFormat::Json)),
+        "[{\"n\":6,\"label\":null},\n{\"n\":5,\"label\":\"v5\"},\n{\"n\":4,\"label\":\"v4\"}]"
+    );
+    assert_eq!(
+        copy(cx, Some(CopyFormat::Markdown)),
+        "| n | label |\n| ---: | --- |\n| 6 | *NULL* |\n| 5 | v5 |\n| 4 | v4 |\n"
+    );
+    assert_eq!(
+        copy(cx, Some(CopyFormat::SqlInsert)).lines().next(),
+        Some("INSERT INTO \"schema_name\".\"table_name\" (\"n\", \"label\") VALUES (6, NULL);")
+    );
+    assert_eq!(copy(cx, None), "n\nlabel");
+    // One cell is copied as its value, without quoting.
+    cx.update(|cx| {
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
+            table.set_selected_cell(1, 2, cx);
+        })
+    });
+    assert_eq!(copy(cx, Some(CopyFormat::Tsv)), "v5");
+
+    // Columns can be hidden, pinned and shown again.
+    cx.update(|cx| {
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().hide(2);
+            table.refresh(cx);
+        })
+    });
+    let columns =
+        |cx: &mut TestAppContext| cx.update(|cx| grid.read(cx).delegate().shown_columns());
+    assert_eq!(columns(cx), ["n", "even"]);
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().toggle_pin(2)));
+    assert_eq!(columns(cx), ["even", "n"]);
+    assert_eq!(shown(cx)[0], ["true", "6"]);
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().show_all()));
+    assert_eq!(columns(cx), ["n", "label", "even"]);
+
+    // Everything, with Cmd+A then Cmd+C in the grid.
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.select_all_rows(cx)));
+    assert_eq!(copy(cx, Some(CopyFormat::Tsv)).lines().count(), 6);
+}
+
+#[gpui_kit::test]
+fn a_double_click_on_a_cell_shows_its_whole_value(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select repeat('long text ', 200) as body, '{\"a\": [1, 2]}'::jsonb as doc, '\\x00ff10'::bytea as raw",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    // The grid cuts what is long; the viewer does not.
+    let shown = cx.update(|cx| grid.read(cx).delegate().shown());
+    assert_eq!(shown[0][0].chars().count(), 300);
+    assert_eq!(shown[0][2], "\\x00ff10");
+    for column in 1..=3 {
+        app.step(cx, |_, cx| {
+            grid.update(cx, |_, cx| {
+                cx.emit(gpui_kit::component::table::TableEvent::DoubleClickedCell(
+                    0, column,
+                ))
+            })
+        });
+        assert!(app.has(cx, "value-text"), "column {column}");
+        app.click(cx, "value-copy");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        match column {
+            1 => assert_eq!(copied.len(), 2000),
+            2 => assert_eq!(copied, "{\n  \"a\": [\n    1,\n    2\n  ]\n}"),
+            _ => assert!(copied.starts_with("00000000  00 ff 10"), "{copied}"),
+        }
+        app.click(cx, "value-close");
+        assert!(!app.has(cx, "value-text"));
     }
 }

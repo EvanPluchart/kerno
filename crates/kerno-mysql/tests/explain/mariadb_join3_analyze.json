@@ -1,0 +1,96 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.051229574
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 2.25927347,
+    "r_loops": 1,
+    "r_total_time_ms": 20.3629013,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": [
+            "PRIMARY",
+            "orders_customer_idx",
+            "orders_status_placed_idx"
+          ],
+          "key": "orders_status_placed_idx",
+          "key_length": "1",
+          "used_key_parts": ["status"],
+          "ref": ["const"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 715,
+          "r_index_rows": 715,
+          "r_rows": 715,
+          "cost": 0.72833952,
+          "r_table_time_ms": 1.928257837,
+          "r_other_time_ms": 0.053939031,
+          "r_engine_stats": {
+            "pages_accessed": 1438,
+            "pages_read_count": 8,
+            "pages_read_time_ms": 1.53876301
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "index_condition": "o.`status` = 'paid'",
+          "r_icp_filtered": 100,
+          "r_filtered": 100
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "8",
+          "used_key_parts": ["id"],
+          "ref": ["kerno.o.customer_id"],
+          "loops": 715,
+          "r_loops": 715,
+          "rows": 1,
+          "r_rows": 1,
+          "cost": 0.645259,
+          "r_table_time_ms": 0.351520749,
+          "r_other_time_ms": 0.02838677,
+          "r_engine_stats": {
+            "pages_accessed": 1443
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "r_filtered": 100
+        }
+      },
+      {
+        "table": {
+          "table_name": "i",
+          "access_type": "ref",
+          "possible_keys": ["PRIMARY"],
+          "key": "PRIMARY",
+          "key_length": "8",
+          "used_key_parts": ["order_id"],
+          "ref": ["kerno.o.id"],
+          "loops": 715,
+          "r_loops": 715,
+          "rows": 2,
+          "r_rows": 2.499300699,
+          "cost": 0.88567495,
+          "r_table_time_ms": 17.91292715,
+          "r_other_time_ms": 0.086410828,
+          "r_engine_stats": {
+            "pages_accessed": 1443,
+            "pages_read_count": 84,
+            "pages_read_time_ms": 17.25348706
+          },
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "r_filtered": 100
+        }
+      }
+    ]
+  }
+}

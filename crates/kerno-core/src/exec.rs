@@ -240,19 +240,42 @@ impl Execution {
 
     /// Asks for `rows` more rows (on top of what is still outstanding).
     pub fn request_rows(&self, rows: u64) {
-        let _ = self
-            .demand
-            .rows
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current != UNLIMITED).then(|| current.saturating_add(rows).min(UNLIMITED - 1))
-            });
-        self.demand.changed.notify_waiters();
+        self.demand().request_rows(rows);
     }
 
     /// Asks for every remaining row.
     pub fn request_all(&self) {
-        self.demand.rows.store(UNLIMITED, Ordering::Release);
-        self.demand.changed.notify_waiters();
+        self.demand().request_all();
+    }
+
+    /// A handle to ask for more rows from elsewhere than where the events
+    /// are read (the grid that shows them, for one).
+    pub fn demand(&self) -> RowDemand {
+        RowDemand(self.demand.clone())
+    }
+}
+
+/// Asks an [`Execution`] for more rows. Outliving the execution is
+/// harmless: nobody is left to hear the request.
+#[derive(Debug, Clone)]
+pub struct RowDemand(Arc<Demand>);
+
+impl RowDemand {
+    /// Asks for `rows` more rows (on top of what is still outstanding).
+    pub fn request_rows(&self, rows: u64) {
+        let _ = self
+            .0
+            .rows
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != UNLIMITED).then(|| current.saturating_add(rows).min(UNLIMITED - 1))
+            });
+        self.0.changed.notify_waiters();
+    }
+
+    /// Asks for every remaining row.
+    pub fn request_all(&self) {
+        self.0.rows.store(UNLIMITED, Ordering::Release);
+        self.0.changed.notify_waiters();
     }
 }
 

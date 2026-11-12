@@ -1,0 +1,6 @@
+-> Limit: 5 row(s)  (actual time=2305..2305 rows=5 loops=1)
+    -> Sort: n DESC, limit input to 5 row(s) per chunk  (actual time=2305..2305 rows=5 loops=1)
+        -> Stream results  (cost=144720 rows=950) (actual time=250..2305 rows=1000 loops=1)
+            -> Group aggregate: count(0)  (cost=144720 rows=950) (actual time=250..2304 rows=1000 loops=1)
+                -> Filter: (kerno_analytics.big_table.score > 100)  (cost=112020 rows=326996) (actual time=119..2288 rows=929200 loops=1)
+                    -> Index scan on big_table using big_table_bucket_idx  (cost=112020 rows=981087) (actual time=119..2259 rows=1e+6 loops=1)

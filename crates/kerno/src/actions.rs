@@ -20,6 +20,12 @@ gpui_kit::actions!(
         ImportConnections,
         /// Writes the saved connections, without secrets, to a file.
         ExportConnections,
+        /// Runs the statement at the cursor, or the selection.
+        RunStatement,
+        /// Runs every statement of the active tab.
+        RunAll,
+        /// Cancels the statement the active tab is running.
+        CancelQuery,
         /// Opens a new query tab.
         NewQueryTab,
         /// Closes the active tab.
@@ -114,6 +120,30 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-t"],
         ["sql", "editor"],
         NewQueryTab
+    ),
+    command!(
+        "run_statement",
+        "Run Statement",
+        "Query",
+        ["secondary-enter"],
+        ["execute", "selection", "sql"],
+        RunStatement
+    ),
+    command!(
+        "run_all",
+        "Run All Statements",
+        "Query",
+        ["secondary-shift-enter"],
+        ["execute", "script", "sql"],
+        RunAll
+    ),
+    command!(
+        "cancel_query",
+        "Cancel Running Statement",
+        "Query",
+        ["secondary-."],
+        ["stop", "abort", "kill"],
+        CancelQuery
     ),
     command!(
         "close_tab",

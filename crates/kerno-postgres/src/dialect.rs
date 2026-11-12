@@ -3,7 +3,7 @@
 use kerno_core::dialect::{Dialect, default_drop_sql, default_rename_sql, hex};
 use kerno_core::schema::{ObjectRef, RoutineKind};
 use kerno_core::sql::LexRules;
-use kerno_core::{Engine, Result};
+use kerno_core::{Engine, Plan, Result};
 
 /// The PostgreSQL dialect.
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,6 +72,10 @@ impl Dialect for PgDialect {
         } else {
             format!("EXPLAIN (FORMAT JSON) {sql}")
         }
+    }
+
+    fn parse_plan(&self, output: &str, _analyze: bool) -> Result<Plan> {
+        crate::plan::parse(output)
     }
 
     /// `ALTER <kind> <name> RENAME TO` for every kind of object; indexes,

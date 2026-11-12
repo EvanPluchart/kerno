@@ -6,7 +6,7 @@ use kerno_core::dialect::{Dialect, default_literal, hex};
 use kerno_core::schema::{ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{CellValue, LexRules};
-use kerno_core::{Engine, Error, Result, TypeKind};
+use kerno_core::{Engine, Error, Plan, Result, TypeKind};
 
 /// The MySQL / MariaDB dialect. The two engines differ only in how a plan
 /// with actual timings is asked for (see [`Dialect::explain`]).
@@ -109,6 +109,14 @@ impl Dialect for MysqlDialect {
             (false, _) => format!("EXPLAIN FORMAT=JSON {sql}"),
             (true, Engine::MariaDb) => format!("ANALYZE FORMAT=JSON {sql}"),
             (true, _) => format!("EXPLAIN ANALYZE {sql}"),
+        }
+    }
+
+    /// MySQL's `EXPLAIN ANALYZE` is a tree of text; the rest is JSON.
+    fn parse_plan(&self, output: &str, analyze: bool) -> Result<Plan> {
+        match (analyze, self.engine) {
+            (true, Engine::MySql) => crate::plan::parse_tree(output),
+            _ => crate::plan::parse_json_plan(output),
         }
     }
 

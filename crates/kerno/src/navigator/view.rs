@@ -32,12 +32,17 @@ use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
+use crate::tabs::Target;
 
 /// What the rest of the window does for the navigator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigatorEvent {
-    /// Open a query tab holding `sql`.
-    OpenQuery { title: String, sql: String },
+    /// Open a query tab holding `sql`, running on `target`.
+    OpenQuery {
+        title: String,
+        sql: String,
+        target: Option<Target>,
+    },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -116,6 +121,25 @@ impl Navigator {
         self.connection = id;
         self.reset(cx);
         self.follow_status(cx);
+    }
+
+    /// The connection whose tree is shown.
+    pub fn connection(&self) -> Option<&str> {
+        self.connection.as_deref()
+    }
+
+    /// Where a tab opened from `node` runs: its database, and its schema
+    /// when `in_schema`.
+    fn target_of(&self, node: &Node, in_schema: bool) -> Option<Target> {
+        Some(Target {
+            connection: self.connection.clone()?,
+            database: Some(node.database.clone()),
+            // Without schemas the database is the schema.
+            schema: node
+                .schema
+                .clone()
+                .filter(|schema| in_schema && *schema != node.database),
+        })
     }
 
     fn reset(&mut self, cx: &mut Context<Self>) {
@@ -350,6 +374,7 @@ impl Navigator {
         let Some(schema) = node.schema.clone() else {
             return;
         };
+        let target = self.target_of(node, action == Action::NewQueryHere);
         let session = self.session_for(&node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let outcome = session.await;
@@ -371,14 +396,10 @@ impl Navigator {
                                 dialect.table_name(&TableRef::new(schema, "new_view"))
                             ),
                         ),
-                        // The tab starts in this schema.
-                        _ if dialect.has_schemas() => (
-                            schema.clone(),
-                            format!("SET search_path TO {};\n\n", dialect.quote_ident(&schema)),
-                        ),
-                        _ => (schema.clone(), format!("USE {};\n\n", dialect.quote_ident(&schema))),
+                        // An empty tab that runs in this schema.
+                        _ => (schema.clone(), String::new()),
                     };
-                    cx.emit(NavigatorEvent::OpenQuery { title, sql });
+                    cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
                 }
                 Err(error) => window.push_notification(Notification::error(SharedString::from(error.to_string())), cx),
             });
@@ -398,6 +419,7 @@ impl Navigator {
             return;
         };
         let table = table.clone();
+        let target = self.target_of(node, false);
         let page_size = AppState::get(cx).settings.page_size;
         let session = self.session_for(&node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -434,6 +456,7 @@ impl Navigator {
                 Ok(sql) => cx.emit(NavigatorEvent::OpenQuery {
                     title: table.name.clone(),
                     sql,
+                    target,
                 }),
                 Err(error) => window.push_notification(
                     Notification::error(SharedString::from(format!(
@@ -453,6 +476,7 @@ impl Navigator {
             return;
         };
         let (object, name) = (object.clone(), node.label.clone());
+        let target = self.target_of(node, false);
         let session = self.session_for(&node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let ddl = match session.await {
@@ -470,6 +494,7 @@ impl Navigator {
                 Ok(sql) => cx.emit(NavigatorEvent::OpenQuery {
                     title: format!("DDL {name}"),
                     sql,
+                    target,
                 }),
                 Err(error) => window.push_notification(
                     Notification::error(SharedString::from(format!(

@@ -183,7 +183,7 @@ the stack for what needs a real parse of a complete statement (classification, c
   why the store file is created with mode 0600 in a 0700 directory (its `-wal`/`-shm` siblings inherit
   the mode), and tightened again at every start.
 
-## D-013 — Accepted advisory: RUSTSEC-2023-0071 in `rsa` (owner should confirm)
+## D-013 — Accepted advisory: RUSTSEC-2023-0071 in `rsa` (temporary)
 
 - `cargo deny check` reports a timing side channel in the `rsa` crate ("Marvin attack"). The fixed version,
   `rsa 0.10.0`, was published on 2026-11-08. `russh 0.65.1`, the newest release, requires
@@ -198,6 +198,10 @@ the stack for what needs a real parse of a complete statement (classification, c
   files in Kerno.
 - This is a security trade-off made on the owner's behalf: it is listed in `docs/PLAN.md` under open points.
   Remove the ignore entry when a russh release depends on `rsa >= 0.10.0`.
+
+**Owner's decision, 2026-11-12:** the ignore is acceptable for now, and must be gone at the end: GOAL
+criterion 1 requires `cargo deny check` clean with no ignored advisory. Planned for milestone 10 (upgrade
+russh to a version on the fixed `rsa`, or replace the affected dependency); see `docs/PLAN.md`.
 
 ## D-014 — App shell
 
@@ -316,22 +320,24 @@ root, tab badges and status bar will call when they exist.
   each engine has its file and that the UI kit's own icons are still served by the combined asset source.
 - PostgreSQL: the official three-colour elephant from the PostgreSQL wiki, in full colour. Its white
   outline keeps it readable on dark surfaces, so no second variant is needed.
-- MariaDB and MySQL: the single-colour marks from Simple Icons (a source the spec names), drawn in one flat
-  colour: the theme's text colour, so dark on light and light on dark. Both vendors publish black and
-  reversed variants of their marks, which is what this reproduces; no brand colour is invented. MariaDB's
-  own SVG on mariadb.org is the horizontal lock-up with the wordmark, which does not fit a 16 px square.
+- MySQL: the official logo in its colours (dolphin and wordmark), as served by mysql.com
+  (`/common/logos/mysql-logo.svg`, the artwork of the logo page), drawn like the PostgreSQL one, in both
+  themes.
+- MariaDB: the single-colour sea lion from Simple Icons (a source the spec names), drawn in one flat
+  colour: the theme's text colour, so dark on light and light on dark. The vendor publishes black and
+  reversed variants of its mark, which is what this reproduces; no brand colour is invented. MariaDB's own
+  SVG on mariadb.org is the horizontal lock-up with the wordmark, which does not fit a 16 px square.
 - No padding is drawn into the logos; callers leave clear space (4 px in the picker tile).
 
-**For the owner to confirm (MySQL).** Oracle's logo page says: "The original MySQL logo may only be used by
-MySQL representatives and companies having a written agreement with Oracle", and that a written agreement
-is needed before "displaying any MySQL logos except the Conditional Use Logos" or displaying them
-"elsewhere except on a website". Read strictly, that page does not grant what the spec's "follow each
-vendor's usage guidelines" assumes; showing the dolphin to identify a MySQL connection is what every
-database client does, and the owner's instruction treats it as nominative use. Kerno therefore ships the
-Simple Icons mark, not Oracle's original logo file, states the trademark, and never uses it in its own
-branding. If the owner prefers to be strict with Oracle's wording, the fallback is a one-line change in
-`engine_logo` (text label only for MySQL). PostgreSQL's and MariaDB's policies raise no such question for
-this use.
+**MySQL: decided by the owner on 2026-11-12.** Oracle's logo page says: "The original MySQL logo may only
+be used by MySQL representatives and companies having a written agreement with Oracle", and that a written
+agreement is needed before "displaying any MySQL logos except the Conditional Use Logos" or displaying them
+"elsewhere except on a website". The first version of this change therefore shipped the Simple Icons mark
+and asked the owner. The owner's answer: keep the MySQL logo and use the normal official artwork in full
+colour, as DBeaver, Beekeeper Studio and TablePlus do in their pickers; the owner accepts the risk, knowing
+Oracle's policy. If Oracle ever asks for it to be removed, the fallback is to swap that one file
+(`crates/kerno/assets/engines/mysql.svg`) or to show the engine's name alone, a one-line change in
+`engine_logo`. PostgreSQL's and MariaDB's policies raise no such question for this use.
 
 ## D-020 — Schema navigator
 
@@ -385,4 +391,57 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   `INSERT` leaves out generated columns and keeps identity-by-default and auto-increment ones, so the
   prompt shows them; deleting a line lets the server number the row.
 - Integration tests run every statement against PostgreSQL, MySQL and MariaDB in scratch schemas.
+
+## D-022 — Query tabs: one session per tab, results by pages
+
+- A query tab is bound to a connection, a database and (PostgreSQL) a schema, chosen in its toolbar and
+  stored with the tab. It opens its own session at the first run; the navigator's session is never used for
+  the user's statements, so a long query does not block the tree. A new tab takes the connection being
+  browsed; a tab opened from the tree takes the node's database and schema.
+- Cmd+Enter runs the selection or, without one, the statement the cursor is in; Cmd+Shift+Enter the
+  selection or the whole text, one result per statement, stopping at the first failure. Statements are
+  split by the core splitter with the engine's lexical rules.
+- Rows arrive by pages (the "grid page size" setting, 1,000 by default) through the core's back-pressure:
+  the statement stays open on the server and the tab is not "running" while it waits to be asked for more.
+  The grid asks for the next page when scrolled near its end; "Fetch all" lifts the limit. Running
+  something else in the tab, or "Stop", lets the pending statement go.
+  In a script, a statement with more rows than a page stops at its first page, because the next statement
+  needs the session; the footer says the result is incomplete.
+- Cancel sends the engine's cancel request on the side. Whatever the server then answers (an error on
+  PostgreSQL, sometimes a normal end on MySQL), the tab knows it asked and shows "Cancelled"; rows that had
+  arrived stay.
+- Parameters (`:name`, `$1`, `?`) are asked for before anything runs, in one prompt for the run; values
+  are written into the statement as literals by the dialect (a number or boolean bare, anything else a
+  quoted string, or NULL). What was typed is offered again next time, for the life of the tab.
+- Transaction mode per tab: auto-commit (the default), or manual, where the tab opens a transaction with
+  the first statement and shows Commit and Rollback while one is open. The state shown is the server's
+  (`TxState`), so a `BEGIN` typed by hand shows the same buttons.
+- Server messages (NOTICE, WARNING) of a run are kept apart from results, in a "Messages" tab.
+- A failed statement is underlined in the editor at the position the server gave, when the statement ran
+  as written (not when parameters were written into it: positions would be off).
+- Every statement is recorded in the history when it ends (text redacted by the storage layer, duration,
+  status, row count, error).
+
+## D-023 — Results grid
+
+- The grid is gpui-component's virtualized `DataTable` with a delegate over the core `ResultStore`: only
+  visible rows and columns are laid out, and cells are formatted when drawn (`kerno_core::format::display`
+  borrows the server's text when it can).
+- `ResultStore` holds its batches behind `Arc`, so a clone is a snapshot. A result over 20,000 rows is
+  sorted on a background thread from such a snapshot; smaller ones at once. Sorting is offered when rows
+  have stopped arriving, and is done on what was fetched (the footer says when that is not everything).
+- Written here because the kit's table falls short of the spec (CLAUDE.md §2):
+  - range selection: the table selects one cell, row or column; shift-click stretches a rectangle from it,
+    kept in the delegate and drawn by it; Cmd+A selects everything;
+  - row numbers: a pinned first column of the delegate;
+  - hide and pin columns: the delegate keeps its own layout (order, hidden, pinned first).
+- Copy: a single cell is copied as its value; anything larger as TSV (what spreadsheets paste), with
+  the other formats in the row menu: TSV with header, CSV, JSON, Markdown, SQL INSERT. They are written by
+  the core exporter, the same code that will write files in milestone 8. `INSERT`s name a placeholder table,
+  since a statement does not say which table its rows would go back to.
+- The value viewer (double click) shows a cell in full as text, indented JSON or a hex dump.
+- Formatting, sorting and export (`format.rs`, `sort.rs`, `export.rs`), statement classification and
+  EXPLAIN parsing (`sql/classify.rs`, `plan.rs`) were written by two delegated agents to written briefs and
+  checked: scope, tests re-run with the containers required, lint. The last two are wired into the app in the
+  next step of this milestone.
 

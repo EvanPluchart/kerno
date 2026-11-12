@@ -194,3 +194,31 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
 - Test run with `KERNO_REQUIRE_CONTAINERS=1`, nothing skipped, all passing: app 62, `kerno-core` 89 + 10 SSH,
   `kerno-postgres` 21 + 40, `kerno-mysql` 43 + 54 (319 in all). `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings` and `cargo deny check` clean.
+
+## 2026-11-12 — Milestone 5, first part: running statements, the grid
+
+- Owner's decisions of the day applied: the official MySQL logo in colour (D-019 rewritten, notices
+  updated); RUSTSEC-2023-0071 stays ignored for now and must be gone in milestone 10 (PLAN, D-013; GOAL
+  criterion 1 changed by the owner).
+- Built (D-022, D-023): query tabs bound to a connection/database/schema with their own session; run at
+  cursor, selection or all; paging with "Fetch more" / "Fetch all"; cancel; parameters prompt; auto or
+  manual commit with Commit/Rollback; messages tab; error underlined in the editor; history recording; the
+  per-tab status bar (connection, database, transaction, rows, timing); the results grid with type-aware
+  cells, row numbers, client-side sort, column resize/reorder/hide/pin, range selection, copy in six
+  formats, and the value viewer.
+- Found by the tests, fixed:
+  - PostgreSQL ends a cancelled statement with an error, not a "cancelled" status: the tab now remembers
+    that it asked;
+  - after the parameters prompt was confirmed with Enter, the keyboard was dead until a click: focus now
+    returns to the editor;
+  - the grid read the table's selection while the table was drawing its cells (a panic in debug): the
+    selection is mirrored in the delegate instead;
+  - two of my test statements were wrong for MySQL (`empty` is reserved there).
+- Real app: a statement on the test PostgreSQL, 500 rows in 7 ms, grid checked by eye (NULL, booleans,
+  JSON, arrays, row numbers, type names in the headers); a syntax error underlined; the restored tab from
+  the previous run came back with its text and its connection.
+- Tests, `KERNO_REQUIRE_CONTAINERS=1`, nothing skipped: 426 passing (app 71, core 160 + 10 SSH + 1 doc,
+  PostgreSQL driver 71, MySQL/MariaDB driver 113). fmt, clippy clean.
+- Next in this milestone: read-only and destructive-statement guards (classification), EXPLAIN tree,
+  history and saved-queries panels, open/save `.sql`, completion, format, find/replace.
+

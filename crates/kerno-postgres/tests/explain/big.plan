@@ -1,0 +1,7 @@
+Limit  (cost=43357.07 rows=5)
+  Sort  (cost=43359.56 rows=1000)
+    Aggregate  (cost=43340.45 rows=1000)
+      Gather Merge  (cost=43320.45 rows=2000)
+        Sort  (cost=42089.57 rows=1000)
+          Aggregate  (cost=42037.24 rows=1000)
+            Seq Scan on big_table  (cost=40088.33 rows=387782)

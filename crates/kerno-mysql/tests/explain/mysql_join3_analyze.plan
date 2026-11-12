@@ -1,0 +1,5 @@
+Nested loop inner join  (cost=1207 rows=1359) (actual rows=1787 ms=18.7 loops=1)
+  Nested loop inner join  (cost=356 rows=715) (actual rows=715 ms=3.78 loops=1)
+    Index lookup on o  (cost=105 rows=715) (actual rows=715 ms=3.1 loops=1)
+    Single-row index lookup on c  (cost=0.25 rows=1) (actual rows=715 ms=0.635 loops=715)
+  Index lookup on i  (cost=1 rows=1.9) (actual rows=1787.5 ms=14.8 loops=715)

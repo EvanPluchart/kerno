@@ -1,0 +1,2 @@
+Query block  (cost=0.097)
+  Table scan on customers  (cost=0.097 rows=500)

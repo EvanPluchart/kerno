@@ -1,0 +1,5 @@
+-> Nested loop inner join  (cost=1207 rows=1359) (actual time=2.04..18.7 rows=1787 loops=1)
+    -> Nested loop inner join  (cost=356 rows=715) (actual time=0.742..3.78 rows=715 loops=1)
+        -> Index lookup on o using orders_status_placed_idx (status='paid'), with index condition: (o.`status` = 'paid')  (cost=105 rows=715) (actual time=0.713..3.1 rows=715 loops=1)
+        -> Single-row index lookup on c using PRIMARY (id=o.customer_id)  (cost=0.25 rows=1) (actual time=874e-6..888e-6 rows=1 loops=715)
+    -> Index lookup on i using PRIMARY (order_id=o.id)  (cost=1 rows=1.9) (actual time=0.0205..0.0207 rows=2.5 loops=715)

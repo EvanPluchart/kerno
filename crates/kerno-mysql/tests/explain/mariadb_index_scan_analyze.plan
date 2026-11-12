@@ -1,0 +1,2 @@
+Query block  (cost=0.02) (actual ms=0.174 loops=1)
+  Index lookup on orders  (cost=0.02 rows=10) (actual rows=10 ms=0.171 loops=1)

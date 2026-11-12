@@ -1,0 +1,4 @@
+Query block  (cost=172.847) (actual ms=1240.037 loops=1)
+  Filesort  (actual rows=6 ms=1239.968 loops=1)
+    Temporary table
+      Table scan on big_table  (cost=172.847 rows=985579) (actual rows=1000000 ms=1239.894 loops=1)

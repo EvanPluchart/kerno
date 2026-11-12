@@ -1,0 +1,1 @@
+Index lookup on orders  (cost=6.66 rows=10) (actual rows=10 ms=0.094 loops=1)

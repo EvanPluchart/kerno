@@ -1,0 +1,5 @@
+Query block  (cost=1206.63)
+  Nested loop
+    Index lookup on o  (cost=105.45 rows=715)
+    Single-row index lookup on c  (cost=250.25 rows=1)
+    Index lookup on i  (cost=850.93 rows=1)

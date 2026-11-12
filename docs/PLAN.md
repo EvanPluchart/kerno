@@ -37,9 +37,9 @@ For every feature of §4, in this order:
 
 - `mysql` and `mysqldump` are not installed on the development Mac; installing them is a system-level
   install (CLAUDE.md §8). To settle in milestone 8 (see DECISIONS D-006).
-- **For the owner to confirm:** the MySQL logo. Oracle's published logo policy reserves the MySQL logo to
-  holders of a written agreement; Kerno shows the Simple Icons mark as nominative use, as the spec asks.
-  Details and the one-line fallback in DECISIONS D-019.
-- **For the owner to confirm:** `deny.toml` ignores one security advisory, RUSTSEC-2023-0071 (timing side
-  channel in `rsa`, reached only when an SSH tunnel authenticates with an RSA key file). The fix exists but
-  russh does not use it yet. Reasoning and alternatives in DECISIONS D-013.
+- Milestone 10, required by GOAL criterion 1 (owner's decision of 2026-11-12): `cargo deny check` must be
+  clean with no ignored advisory. `deny.toml` ignores RUSTSEC-2023-0071 for now (timing side channel in
+  `rsa`, reached only when an SSH tunnel authenticates with an RSA key file; russh pins the affected
+  release candidate). To do: upgrade russh to a version built on the fixed `rsa`, or replace the affected
+  dependency (drop russh's `rsa` feature and state that RSA keys go through the agent, or another SSH
+  client), then remove the ignore. Reasoning in DECISIONS D-013.

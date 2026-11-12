@@ -1,0 +1,73 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost": 4.986814432,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "p",
+          "access_type": "ALL",
+          "possible_keys": ["PRIMARY"],
+          "loops": 1,
+          "rows": 200,
+          "cost": 0.046874,
+          "filtered": 100,
+          "attached_condition": "p.price > (subquery#3)"
+        }
+      },
+      {
+        "table": {
+          "table_name": "<subquery2>",
+          "access_type": "eq_ref",
+          "possible_keys": ["distinct_key"],
+          "key": "distinct_key",
+          "key_length": "8",
+          "used_key_parts": ["product_id"],
+          "ref": ["func"],
+          "rows": 1,
+          "filtered": 100,
+          "materialized": {
+            "unique": 1,
+            "query_block": {
+              "select_id": 2,
+              "nested_loop": [
+                {
+                  "table": {
+                    "table_name": "order_items",
+                    "access_type": "ALL",
+                    "possible_keys": ["order_items_product_idx"],
+                    "loops": 1,
+                    "rows": 14658,
+                    "cost": 2.4821696,
+                    "filtered": 100,
+                    "attached_condition": "order_items.quantity > 2"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "subqueries": [
+      {
+        "query_block": {
+          "select_id": 3,
+          "cost": 0.046874,
+          "nested_loop": [
+            {
+              "table": {
+                "table_name": "products",
+                "access_type": "ALL",
+                "loops": 1,
+                "rows": 200,
+                "cost": 0.046874,
+                "filtered": 100
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

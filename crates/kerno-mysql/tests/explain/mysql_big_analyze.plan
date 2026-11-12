@@ -1,0 +1,6 @@
+Limit  (actual rows=5 ms=2305 loops=1)
+  Sort  (actual rows=5 ms=2305 loops=1)
+    Stream results  (cost=144720 rows=950) (actual rows=1000 ms=2305 loops=1)
+      Group aggregate  (cost=144720 rows=950) (actual rows=1000 ms=2304 loops=1)
+        Filter  (cost=112020 rows=326996) (actual rows=929200 ms=2288 loops=1)
+          Index scan on big_table  (cost=112020 rows=981087) (actual rows=1000000 ms=2259 loops=1)

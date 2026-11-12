@@ -1,0 +1,8 @@
+Nested loop semijoin  (cost=1028 rows=944) (actual rows=75 ms=5.79 loops=1)
+  Filter  (cost=11.7 rows=66.7) (actual rows=100 ms=1.9 loops=1)
+    Table scan on p  (cost=11.7 rows=200) (actual rows=200 ms=1.22 loops=1)
+    Select #3
+      Aggregate  (cost=45 rows=1) (actual rows=1 ms=0.599 loops=1)
+        Table scan on products  (cost=25 rows=200) (actual rows=200 ms=0.574 loops=1)
+  Filter  (cost=156 rows=14.2) (actual rows=75 ms=3.86 loops=100)
+    Index lookup on order_items  (cost=156 rows=42.5) (actual rows=737 ms=3.83 loops=100)

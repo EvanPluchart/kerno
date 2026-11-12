@@ -2,6 +2,7 @@
 
 use crate::config::Engine;
 use crate::error::{Error, Result};
+use crate::plan::Plan;
 use crate::result::TypeKind;
 use crate::schema::{ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
 use crate::sql::LexRules;
@@ -49,6 +50,15 @@ pub trait Dialect: Send + Sync {
     /// Wraps `sql` so the server returns its plan as JSON. With `analyze`
     /// the statement is executed and actual timings are included.
     fn explain(&self, sql: &str, analyze: bool) -> String;
+
+    /// Reads what the statement written by [`Dialect::explain`] returned:
+    /// `output` is the text of its single cell, `analyze` the flag it was
+    /// asked with. An error means the output has a shape this dialect does
+    /// not know; the raw text is then all there is to show.
+    fn parse_plan(&self, output: &str, analyze: bool) -> Result<Plan> {
+        let _ = (output, analyze);
+        Err(Error::Unsupported("reading query plans".into()))
+    }
 
     /// A literal holding `value`, to store in `column` or compare with it.
     ///

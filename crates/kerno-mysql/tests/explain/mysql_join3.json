@@ -1,0 +1,104 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1206.63"
+    },
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": [
+            "PRIMARY",
+            "orders_customer_idx",
+            "orders_status_placed_idx"
+          ],
+          "key": "orders_status_placed_idx",
+          "used_key_parts": [
+            "status"
+          ],
+          "key_length": "1",
+          "ref": [
+            "const"
+          ],
+          "rows_examined_per_scan": 715,
+          "rows_produced_per_join": 715,
+          "filtered": "100.00",
+          "index_condition": "(`kerno`.`o`.`status` = 'paid')",
+          "cost_info": {
+            "read_cost": "33.95",
+            "eval_cost": "71.50",
+            "prefix_cost": "105.45",
+            "data_read_per_join": "44K"
+          },
+          "used_columns": [
+            "id",
+            "customer_id",
+            "status"
+          ]
+        }
+      },
+      {
+        "table": {
+          "table_name": "c",
+          "access_type": "eq_ref",
+          "possible_keys": [
+            "PRIMARY"
+          ],
+          "key": "PRIMARY",
+          "used_key_parts": [
+            "id"
+          ],
+          "key_length": "8",
+          "ref": [
+            "kerno.o.customer_id"
+          ],
+          "rows_examined_per_scan": 1,
+          "rows_produced_per_join": 715,
+          "filtered": "100.00",
+          "cost_info": {
+            "read_cost": "178.75",
+            "eval_cost": "71.50",
+            "prefix_cost": "355.70",
+            "data_read_per_join": "1M"
+          },
+          "used_columns": [
+            "id",
+            "full_name"
+          ]
+        }
+      },
+      {
+        "table": {
+          "table_name": "i",
+          "access_type": "ref",
+          "possible_keys": [
+            "PRIMARY"
+          ],
+          "key": "PRIMARY",
+          "used_key_parts": [
+            "order_id"
+          ],
+          "key_length": "8",
+          "ref": [
+            "kerno.o.id"
+          ],
+          "rows_examined_per_scan": 1,
+          "rows_produced_per_join": 1359,
+          "filtered": "100.00",
+          "cost_info": {
+            "read_cost": "715.00",
+            "eval_cost": "135.93",
+            "prefix_cost": "1206.63",
+            "data_read_per_join": "42K"
+          },
+          "used_columns": [
+            "order_id",
+            "quantity"
+          ]
+        }
+      }
+    ]
+  }
+}

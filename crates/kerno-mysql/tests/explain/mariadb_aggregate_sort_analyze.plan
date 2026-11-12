@@ -1,0 +1,4 @@
+Query block  (cost=0.842) (actual ms=1.243 loops=1)
+  Filesort  (actual rows=6 ms=1.228 loops=1)
+    Temporary table
+      Table scan on orders  (cost=0.842 rows=5000) (actual rows=5000 ms=1.176 loops=1)

@@ -36,11 +36,12 @@ not alter them.
 | File | Mark | Taken from | SHA-256 |
 | --- | --- | --- | --- |
 | `postgresql.svg` | PostgreSQL elephant ("Slonik"), official three-colour artwork | https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg (listed on https://wiki.postgresql.org/wiki/Logo) | `51f93e19516081fc7d6fe6ab9bbab07abe5f7819e28016eefacea6dea691bc54` |
-| `mysql.svg` | MySQL dolphin and wordmark, single colour | Simple Icons 15.22.0, `icons/mysql.svg` (https://simpleicons.org, artwork files released under CC0-1.0) | `67c144cc3e44ad14062a3f20ebe29c5e7eeb2c2c9c0f43cf48d87fe6291a8b2d` |
-| `mariadb.svg` | MariaDB sea lion, single colour | Simple Icons 15.22.0, `icons/mariadb.svg` | `477435746bb2024048c7b71529f615fb70d7e679618f37bac49f78fd07e67dfe` |
+| `mysql.svg` | MySQL logo (dolphin and wordmark), official colours | https://www.mysql.com/common/logos/mysql-logo.svg (the artwork of https://www.mysql.com/about/legal/logos.html) | `974bf440a8a42e7783d3896cf9b326f3d73bc7305a27febf45cef0e91b53e595` |
+| `mariadb.svg` | MariaDB sea lion, single colour | Simple Icons 15.22.0, `icons/mariadb.svg` (https://simpleicons.org, artwork files released under CC0-1.0) | `477435746bb2024048c7b71529f615fb70d7e679618f37bac49f78fd07e67dfe` |
 
-The single-colour marks are drawn in one flat colour, dark on light surfaces and light on dark ones, as the
-vendors' own black and reversed variants are. The elephant keeps its official colours.
+The PostgreSQL and MySQL logos keep their official colours. The MariaDB mark is single-colour and is drawn in
+one flat colour, dark on light surfaces and light on dark ones, as the vendor's own black and reversed
+variants are.
 
 Trademark notices:
 

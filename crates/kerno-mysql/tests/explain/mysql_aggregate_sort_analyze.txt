@@ -1,0 +1,4 @@
+-> Sort: n DESC  (actual time=2.28..2.28 rows=6 loops=1)
+    -> Stream results  (cost=1005 rows=6) (actual time=0.493..2.24 rows=6 loops=1)
+        -> Group aggregate: count(0), sum(orders.total)  (cost=1005 rows=6) (actual time=0.484..2.23 rows=6 loops=1)
+            -> Index scan on orders using orders_status_placed_idx  (cost=505 rows=5000) (actual time=0.199..1.82 rows=5000 loops=1)

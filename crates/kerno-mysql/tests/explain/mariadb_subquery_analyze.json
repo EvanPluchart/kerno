@@ -1,0 +1,120 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.066235796
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 4.986814432,
+    "r_loops": 1,
+    "r_total_time_ms": 2.283863614,
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "p",
+          "access_type": "ALL",
+          "possible_keys": ["PRIMARY"],
+          "loops": 1,
+          "r_loops": 1,
+          "rows": 200,
+          "r_rows": 200,
+          "cost": 0.046874,
+          "r_table_time_ms": 0.463066999,
+          "r_other_time_ms": 0.020800291,
+          "r_engine_stats": {
+            "pages_accessed": 5,
+            "pages_read_count": 1,
+            "pages_read_time_ms": 0.380532778
+          },
+          "filtered": 100,
+          "r_total_filtered": 50,
+          "attached_condition": "p.price > (subquery#3)",
+          "r_filtered": 50
+        }
+      },
+      {
+        "table": {
+          "table_name": "<subquery2>",
+          "access_type": "eq_ref",
+          "possible_keys": ["distinct_key"],
+          "key": "distinct_key",
+          "key_length": "8",
+          "used_key_parts": ["product_id"],
+          "ref": ["func"],
+          "r_loops": 100,
+          "r_table_loops": 6350,
+          "rows": 1,
+          "r_rows": 0.75,
+          "r_table_time_ms": 0.251520954,
+          "r_other_time_ms": 0.038557654,
+          "filtered": 100,
+          "r_total_filtered": 100,
+          "r_filtered": 100,
+          "materialized": {
+            "unique": 1,
+            "query_block": {
+              "select_id": 2,
+              "nested_loop": [
+                {
+                  "table": {
+                    "table_name": "order_items",
+                    "access_type": "ALL",
+                    "possible_keys": ["order_items_product_idx"],
+                    "loops": 1,
+                    "r_loops": 1,
+                    "rows": 14658,
+                    "r_rows": 12500,
+                    "cost": 2.4821696,
+                    "r_table_time_ms": 0.817630677,
+                    "r_other_time_ms": 0.339765875,
+                    "r_engine_stats": {
+                      "pages_accessed": 86,
+                      "pages_read_count": 1,
+                      "pages_read_time_ms": 0.012630237
+                    },
+                    "filtered": 100,
+                    "r_total_filtered": 50,
+                    "attached_condition": "order_items.quantity > 2",
+                    "r_filtered": 50
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "subqueries": [
+      {
+        "query_block": {
+          "select_id": 3,
+          "cost": 0.046874,
+          "r_loops": 1,
+          "r_total_time_ms": 0.325843436,
+          "nested_loop": [
+            {
+              "table": {
+                "table_name": "products",
+                "access_type": "ALL",
+                "loops": 1,
+                "r_loops": 1,
+                "rows": 200,
+                "r_rows": 200,
+                "cost": 0.046874,
+                "r_table_time_ms": 0.307585866,
+                "r_other_time_ms": 0.015381378,
+                "r_engine_stats": {
+                  "pages_accessed": 5,
+                  "pages_read_count": 3,
+                  "pages_read_time_ms": 0.269486736
+                },
+                "filtered": 100,
+                "r_total_filtered": 100,
+                "r_filtered": 100
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

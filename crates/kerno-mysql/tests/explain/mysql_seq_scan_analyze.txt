@@ -1,0 +1,2 @@
+-> Filter: (customers.full_name like '%a%')  (cost=57 rows=55.6) (actual time=2.42..4.14 rows=420 loops=1)
+    -> Table scan on customers  (cost=57 rows=500) (actual time=1.3..2.98 rows=500 loops=1)

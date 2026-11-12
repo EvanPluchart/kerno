@@ -1,0 +1,4 @@
+Sort  (actual rows=6 ms=2.28 loops=1)
+  Stream results  (cost=1005 rows=6) (actual rows=6 ms=2.24 loops=1)
+    Group aggregate  (cost=1005 rows=6) (actual rows=6 ms=2.23 loops=1)
+      Index scan on orders  (cost=505 rows=5000) (actual rows=5000 ms=1.82 loops=1)

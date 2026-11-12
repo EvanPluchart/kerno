@@ -1,0 +1,2 @@
+Bitmap Heap Scan on orders  (cost=35.64 rows=10) (actual rows=10 ms=1.362 loops=1)
+  Bitmap Index Scan on orders_customer_idx  (cost=4.36 rows=10) (actual rows=10 ms=0.411 loops=1)

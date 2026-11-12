@@ -1,0 +1,2 @@
+Query block  (actual ms=0.001 loops=1)
+  Constant row on orders  (rows=1) (actual loops=0)

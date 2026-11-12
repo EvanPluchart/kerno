@@ -1,0 +1,2 @@
+Query block  (cost=6.66)
+  Index lookup on orders  (cost=6.66 rows=10)

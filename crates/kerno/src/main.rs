@@ -6,6 +6,7 @@ mod connections;
 mod engine_logo;
 mod logging;
 mod navigator;
+mod query;
 mod settings;
 mod sidebar;
 mod sql_confirm;
@@ -23,9 +24,9 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
-    OpenCommandPalette, OpenSettings, Quit, ToggleSidebar, UseDarkTheme, UseLightTheme,
-    UseSystemTheme,
+    About, CancelQuery, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
+    OpenCommandPalette, OpenSettings, Quit, RunAll, RunStatement, ToggleSidebar, UseDarkTheme,
+    UseLightTheme, UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -146,6 +147,16 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Export Connections…", ExportConnections),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Query".into(),
+            items: vec![
+                MenuItem::action("Run Statement", RunStatement),
+                MenuItem::action("Run All Statements", RunAll),
+                MenuItem::separator(),
+                MenuItem::action("Cancel Running Statement", CancelQuery),
             ],
             disabled: false,
         },

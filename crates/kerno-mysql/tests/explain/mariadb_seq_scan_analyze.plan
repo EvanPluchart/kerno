@@ -1,0 +1,2 @@
+Query block  (cost=0.097) (actual ms=3.475 loops=1)
+  Table scan on customers  (cost=0.097 rows=500) (actual rows=500 ms=3.456 loops=1)

@@ -232,10 +232,14 @@ impl BatchBuilder {
 
 /// All rows fetched so far for one result set, addressable by global row
 /// index. Memory grows with what was fetched.
+///
+/// Cloning is cheap: the clone shares the rows (a snapshot of what was
+/// fetched at that moment), so a result can be sorted or exported off the
+/// UI thread while more rows arrive.
 #[derive(Debug, Clone)]
 pub struct ResultStore {
     columns: Arc<[Column]>,
-    batches: Vec<RowBatch>,
+    batches: Vec<Arc<RowBatch>>,
     /// `starts[i]` is the global index of the first row of `batches[i]`.
     starts: Vec<usize>,
     rows: usize,
@@ -265,7 +269,7 @@ impl ResultStore {
         debug_assert_eq!(batch.column_count(), self.columns.len());
         self.starts.push(self.rows);
         self.rows += batch.row_count();
-        self.batches.push(batch);
+        self.batches.push(Arc::new(batch));
     }
 
     /// Number of rows fetched so far.
@@ -296,7 +300,7 @@ impl ResultStore {
 
     /// Heap bytes held by the stored rows.
     pub fn memory_bytes(&self) -> usize {
-        self.batches.iter().map(RowBatch::memory_bytes).sum()
+        self.batches.iter().map(|batch| batch.memory_bytes()).sum()
     }
 }
 
@@ -412,5 +416,28 @@ mod tests {
         let mut builder = BatchBuilder::new(0);
         assert_eq!(builder.row_count(), 0);
         assert_eq!(builder.finish().row_count(), 0);
+    }
+
+    #[test]
+    fn a_clone_is_a_snapshot_that_shares_the_rows() {
+        let columns: Arc<[Column]> = vec![Column::new("n", "int4", TypeKind::Integer)].into();
+        let batch = |values: &[&str]| {
+            let mut builder = BatchBuilder::new(1);
+            for value in values {
+                builder.push_text(value);
+            }
+            builder.finish()
+        };
+        let mut store = ResultStore::new(columns);
+        store.push(batch(&["1", "2"]));
+        let snapshot = store.clone();
+        store.push(batch(&["3"]));
+        assert_eq!((snapshot.row_count(), store.row_count()), (2, 3));
+        assert_eq!(snapshot.text(1, 0), Some("2"));
+        // The rows are the same memory, not a copy.
+        assert!(std::ptr::eq(
+            snapshot.cell(0, 0).unwrap().as_ptr(),
+            store.cell(0, 0).unwrap().as_ptr()
+        ));
     }
 }

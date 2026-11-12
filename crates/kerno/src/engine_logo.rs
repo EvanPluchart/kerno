@@ -71,9 +71,11 @@ pub fn engine_logo(engine: Engine, size: Pixels, cx: &App) -> AnyElement {
         // The elephant in its official colours; its white outline carries
         // it on dark surfaces too.
         Engine::Postgres => img(POSTGRESQL).size(size).into_any_element(),
-        // Single-colour marks, drawn in one flat colour as their vendors'
+        // The official dolphin and wordmark, in their colours (the owner's
+        // choice, see DECISIONS D-019).
+        Engine::MySql => img(MYSQL).size(size).into_any_element(),
+        // A single-colour mark, drawn in one flat colour as the vendor's
         // own black and reversed variants are: dark on light, light on dark.
-        Engine::MySql => mark(MYSQL, size, cx),
         Engine::MariaDb => mark(MARIADB, size, cx),
     }
 }

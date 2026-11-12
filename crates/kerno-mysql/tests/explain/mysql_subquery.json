@@ -1,0 +1,94 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "query_cost": "1041.56"
+    },
+    "nested_loop": [
+      {
+        "table": {
+          "table_name": "p",
+          "access_type": "ALL",
+          "possible_keys": [
+            "PRIMARY"
+          ],
+          "rows_examined_per_scan": 200,
+          "rows_produced_per_join": 66,
+          "filtered": "33.33",
+          "cost_info": {
+            "read_cost": "5.00",
+            "eval_cost": "6.67",
+            "prefix_cost": "25.00",
+            "data_read_per_join": "63K"
+          },
+          "used_columns": [
+            "id",
+            "name",
+            "price"
+          ],
+          "attached_condition": "(`kerno`.`p`.`price` > (/* select#3 */ select avg(`kerno`.`products`.`price`) from `kerno`.`products`))",
+          "attached_subqueries": [
+            {
+              "dependent": false,
+              "cacheable": true,
+              "query_block": {
+                "select_id": 3,
+                "cost_info": {
+                  "query_cost": "25.00"
+                },
+                "table": {
+                  "table_name": "products",
+                  "access_type": "ALL",
+                  "rows_examined_per_scan": 200,
+                  "rows_produced_per_join": 200,
+                  "filtered": "100.00",
+                  "cost_info": {
+                    "read_cost": "5.00",
+                    "eval_cost": "20.00",
+                    "prefix_cost": "25.00",
+                    "data_read_per_join": "190K"
+                  },
+                  "used_columns": [
+                    "price"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "table": {
+          "table_name": "order_items",
+          "access_type": "ref",
+          "possible_keys": [
+            "order_items_product_idx"
+          ],
+          "key": "order_items_product_idx",
+          "used_key_parts": [
+            "product_id"
+          ],
+          "key_length": "8",
+          "ref": [
+            "kerno.p.id"
+          ],
+          "rows_examined_per_scan": 42,
+          "rows_produced_per_join": 66,
+          "filtered": "33.33",
+          "first_match": "p",
+          "cost_info": {
+            "read_cost": "733.26",
+            "eval_cost": "6.67",
+            "prefix_cost": "1041.56",
+            "data_read_per_join": "2K"
+          },
+          "used_columns": [
+            "product_id",
+            "quantity"
+          ],
+          "attached_condition": "(`kerno`.`order_items`.`quantity` > 2)"
+        }
+      }
+    ]
+  }
+}

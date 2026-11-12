@@ -1,0 +1,4 @@
+Query block  (cost=0.842)
+  Filesort
+    Temporary table
+      Table scan on orders  (cost=0.842 rows=5000)

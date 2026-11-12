@@ -1,0 +1,47 @@
+{
+  "query_optimization": {
+    "r_total_time_ms": 0.053855663
+  },
+  "query_block": {
+    "select_id": 1,
+    "cost": 172.8471154,
+    "r_loops": 1,
+    "r_total_time_ms": 1240.03665,
+    "filesort": {
+      "sort_key": "count(0) desc",
+      "r_loops": 1,
+      "r_total_time_ms": 0.074697638,
+      "r_limit": 5,
+      "r_used_priority_queue": true,
+      "r_output_rows": 6,
+      "r_sort_mode": "sort_key,rowid",
+      "temporary_table": {
+        "nested_loop": [
+          {
+            "table": {
+              "table_name": "big_table",
+              "access_type": "ALL",
+              "loops": 1,
+              "r_loops": 1,
+              "rows": 985579,
+              "r_rows": 1000000,
+              "cost": 172.8471154,
+              "r_table_time_ms": 1168.313454,
+              "r_other_time_ms": 71.58030398,
+              "r_engine_stats": {
+                "pages_accessed": 14183,
+                "pages_read_count": 2435,
+                "pages_read_time_ms": 151.7541294,
+                "pages_prefetch_read_count": 13248
+              },
+              "filtered": 100,
+              "r_total_filtered": 92.92,
+              "attached_condition": "kerno_analytics.big_table.score > 100",
+              "r_filtered": 92.92
+            }
+          }
+        ]
+      }
+    }
+  }
+}

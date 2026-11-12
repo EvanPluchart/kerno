@@ -1,0 +1,2 @@
+Filter  (cost=57 rows=55.6) (actual rows=420 ms=4.14 loops=1)
+  Table scan on customers  (cost=57 rows=500) (actual rows=500 ms=2.98 loops=1)

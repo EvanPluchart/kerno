@@ -1,0 +1,8 @@
+Hash Join  (cost=457.52 rows=1788)
+  Hash Join  (cost=425.53 rows=1788)
+    Seq Scan on order_items  (cost=230 rows=12500)
+    Hash  (cost=153.76 rows=715)
+      Bitmap Heap Scan on orders  (cost=153.76 rows=715)
+        Bitmap Index Scan on orders_status_placed_idx  (cost=29.64 rows=715)
+  Hash  (cost=21 rows=500)
+    Seq Scan on customers  (cost=21 rows=500)

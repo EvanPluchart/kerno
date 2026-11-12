@@ -1,0 +1,8 @@
+Hash Join  (cost=457.52 rows=1788) (actual rows=1787 ms=7.484 loops=1)
+  Hash Join  (cost=425.53 rows=1788) (actual rows=1787 ms=7.284 loops=1)
+    Seq Scan on order_items  (cost=230 rows=12500) (actual rows=12500 ms=3.378 loops=1)
+    Hash  (cost=153.76 rows=715) (actual rows=715 ms=3.388 loops=1)
+      Bitmap Heap Scan on orders  (cost=153.76 rows=715) (actual rows=715 ms=3.338 loops=1)
+        Bitmap Index Scan on orders_status_placed_idx  (cost=29.64 rows=715) (actual rows=715 ms=1.04 loops=1)
+  Hash  (cost=21 rows=500) (actual rows=500 ms=0.064 loops=1)
+    Seq Scan on customers  (cost=21 rows=500) (actual rows=500 ms=0.04 loops=1)

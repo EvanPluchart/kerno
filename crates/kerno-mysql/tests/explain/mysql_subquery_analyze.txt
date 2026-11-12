@@ -1,0 +1,8 @@
+-> Nested loop semijoin  (cost=1028 rows=944) (actual time=2.96..5.79 rows=75 loops=1)
+    -> Filter: (p.price > (select #3))  (cost=11.7 rows=66.7) (actual time=1.87..1.9 rows=100 loops=1)
+        -> Table scan on p  (cost=11.7 rows=200) (actual time=1.19..1.22 rows=200 loops=1)
+        -> Select #3 (subquery in condition; run only once)
+            -> Aggregate: avg(products.price)  (cost=45 rows=1) (actual time=0.599..0.599 rows=1 loops=1)
+                -> Table scan on products  (cost=25 rows=200) (actual time=0.0135..0.574 rows=200 loops=1)
+    -> Filter: (order_items.quantity > 2)  (cost=156 rows=14.2) (actual time=0.0386..0.0386 rows=0.75 loops=100)
+        -> Index lookup on order_items using order_items_product_idx (product_id=p.id)  (cost=156 rows=42.5) (actual time=0.038..0.0383 rows=7.37 loops=100)
