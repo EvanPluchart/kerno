@@ -12,6 +12,10 @@ The goal is reached only when ALL of these are true and verified by you:
 2. Every v1 feature of CLAUDE.md §4 (A to I) works end to end against PostgreSQL 17, MySQL 8.4 and
    MariaDB 11. `docs/FEATURES.md` lists each item with its status, the test that covers it, and the
    screenshot that shows it. No item is missing or stubbed.
+   `docs/DBEAVER-PARITY.md` inventories DBeaver Community's navigator, editor, results and connection
+   features and context menus that apply to PostgreSQL and MySQL (from its source, `plugin.xml` menu
+   contributions included), each marked done in Kerno or moved to `docs/ROADMAP.md` with a reason. Every
+   surface listed in CLAUDE.md §3 "Context menus everywhere" answers a right-click (UI tests).
 3. Secrets: no password or passphrase on disk outside the OS secret store or in logs (a test greps the data
    dir and log file after a session with a known password). Destructive actions and pending edits always
    preview SQL and confirm (UI tests cover drop, truncate and apply edits).

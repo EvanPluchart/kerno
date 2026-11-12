@@ -127,6 +127,16 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
   example Inter and JetBrains Mono, OFL). Tabular figures in the grid.
 - Every view has real empty, loading and error states that say what happened and what to do next. Errors
   from the server show the message, the SQL position (highlighted in the editor) and the hint/detail fields.
+- DBeaver Community is the primary reference for features and interactions (owner request): when in doubt
+  about what an action, menu or default should be, do what DBeaver does, with Kerno's look.
+- Context menus everywhere (owner request), modelled on DBeaver's: every surface answers a right-click with
+  the actions that make sense there. Sidebar empty area: New connection, New folder, Import connections,
+  Refresh, Collapse all. Folder: New connection here, New subfolder, Rename, Delete. Connection: Connect,
+  Disconnect, Reconnect, New SQL editor, Edit, Duplicate, Rename, Move to folder, Delete, Refresh, Copy.
+  Navigator objects: as §4 B. Tabs bar: Close, Close others, Close to the right, Close all, Rename. Editor:
+  Run statement, Run script, Explain, Format, Cut/Copy/Paste, Comment, Save. Results grid: Copy, Copy as…,
+  Paste, Set NULL, Edit cell, Filter by this value, Exclude this value, Order by column, Hide column, Export.
+  Status bar items: their own actions. Drag and drop connections between folders.
 - Keyboard first: every action reachable from the command palette (Cmd/Ctrl+K), sensible default
   shortcuts (Cmd+Enter run statement, Cmd+Shift+Enter run all, Cmd+. cancel, Cmd+T new query, Cmd+W close tab,
   Cmd+S save, Cmd+P quick open table), a keymap file the user can override, native menu bar on macOS.
@@ -149,11 +159,15 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
 
 ### B. Schema navigator
 
-1. Lazy tree: databases → schemas → tables, views, materialized views, functions, procedures, sequences,
+1. Click behaviour (owner request, as DBeaver): single click selects; double click on a table, view or
+   materialized view opens its data tab (structure for other objects: routines open their source); Enter
+   does the same as double click; the chevron, Right/Left arrows or a double click on a folder node expand and
+   collapse. A setting chooses what double click on a table opens (data, structure, or expand).
+2. Lazy tree: databases → schemas → tables, views, materialized views, functions, procedures, sequences,
    types/enums, triggers, extensions (PostgreSQL); databases → tables, views, routines, triggers, events
    (MySQL). Columns and indexes under each table.
-2. Filter box, refresh node, row-count and size hints, icons per object kind.
-3. Context menu: open data, open structure, new query here, copy name, generate SELECT/INSERT/UPDATE/DELETE,
+3. Filter box, refresh node, row-count and size hints, icons per object kind.
+4. Context menu: open data, open structure, new query here, copy name, generate SELECT/INSERT/UPDATE/DELETE,
    show DDL, rename, truncate, drop (with SQL preview and confirmation), create table/view/schema/database.
 
 ### C. SQL editor
