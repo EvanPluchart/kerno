@@ -10,16 +10,17 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    TestSupportExt as _, Window, div, px,
+    App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::storage::SavedConnection;
 
 use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
-use crate::connections::manager::{Connections, Status};
+use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
+use crate::navigator::view::Navigator;
 use crate::theme;
 
 /// The sidebar view.
@@ -27,18 +28,51 @@ pub struct Sidebar {
     connections: Entity<Connections>,
     /// The connection last clicked.
     selected: Option<String>,
-    _subscription: Subscription,
+    /// The schema tree of the selected connection.
+    navigator: Entity<Navigator>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Sidebar {
     /// The sidebar for `connections`.
-    pub fn new(connections: Entity<Connections>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.observe(&connections, |_, _, cx| cx.notify());
+    pub fn new(
+        connections: Entity<Connections>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let navigator = cx.new(|cx| Navigator::new(connections.clone(), window, cx));
+        let subscriptions = vec![
+            cx.observe(&connections, |_, _, cx| cx.notify()),
+            // A connection that has just opened is the one to browse.
+            cx.subscribe(
+                &connections,
+                |this, connections, event: &ConnectionsEvent, cx| {
+                    if let ConnectionsEvent::StatusChanged { id } = event
+                        && matches!(connections.read(cx).status(id), Status::Connected { .. })
+                    {
+                        this.select(id.clone(), cx);
+                    }
+                },
+            ),
+        ];
         Self {
             connections,
             selected: None,
-            _subscription: subscription,
+            navigator,
+            _subscriptions: subscriptions,
         }
+    }
+
+    /// The schema tree shown under the connections.
+    pub fn navigator(&self) -> &Entity<Navigator> {
+        &self.navigator
+    }
+
+    fn select(&mut self, id: String, cx: &mut Context<Self>) {
+        self.selected = Some(id.clone());
+        self.navigator
+            .update(cx, |navigator, cx| navigator.set_connection(Some(id), cx));
+        cx.notify();
     }
 
     /// Opens the dialog to edit a connection, once its secrets are read.
@@ -131,7 +165,7 @@ impl Sidebar {
             .on_click(cx.listener({
                 let id = id.clone();
                 move |this, event: &ClickEvent, _, cx| {
-                    this.selected = Some(id.clone());
+                    this.select(id.clone(), cx);
                     // A double click opens (or closes) the connection.
                     if event.click_count() >= 2 {
                         this.connections.update(cx, |connections, cx| {
@@ -248,10 +282,13 @@ impl Render for Sidebar {
                 .push((index, connection));
         }
         let muted = cx.theme().muted_foreground;
+        // The list takes what it needs, up to a share of the sidebar; the
+        // schema tree gets the rest.
         let mut list = v_flex()
             .id("connection-list")
-            .flex_1()
-            .min_h_0()
+            .flex_none()
+            .max_h(gpui_kit::relative(0.45))
+            .pb_2()
             .overflow_y_scroll();
         for (group, connections) in &groups {
             if !group.is_empty() {
@@ -324,6 +361,15 @@ impl Render for Sidebar {
                         ),
                 )
             })
-            .when(!saved.is_empty(), |this| this.child(list))
+            .when(!saved.is_empty(), |this| {
+                this.child(list).child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .border_t_1()
+                        .border_color(theme.sidebar_border)
+                        .child(self.navigator.clone()),
+                )
+            })
     }
 }

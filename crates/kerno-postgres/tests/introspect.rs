@@ -25,6 +25,8 @@ async fn databases_and_schemas() {
         .iter()
         .filter(|d| !d.is_system)
         .map(|d| d.name.as_str())
+        // Other tests create and drop scratch databases meanwhile.
+        .filter(|name| !name.starts_with("kerno_test_"))
         .collect();
     assert_eq!(user, ["kerno", "kerno_other", "postgres"]);
     let templates: Vec<_> = databases

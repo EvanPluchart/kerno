@@ -29,7 +29,26 @@ Engine logos (CLAUDE.md §1): engine picker and sidebar connections show the ven
 (`every_engine_has_its_logo_and_the_kit_icons_still_load`; visible in every `m3-*` capture). Navigator root,
 tab and status-bar badges follow with those views.
 
-## B. Schema navigator — todo (milestone 4)
+## B. Schema navigator
+
+Tests: `crates/kerno/src/ui_tests.rs` (UI, against the three servers), `crates/kerno/src/navigator/model.rs`
+and `actions.rs` (tree and menus), `crates/kerno-core/src/sql/generate.rs` and the drivers' `dialect.rs`
+(statements), `crates/kerno-{postgres,mysql}/tests/generate.rs` (statements run on the servers),
+`tests/introspect.rs` of both drivers (what the tree shows).
+
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| B1 Lazy tree, PostgreSQL: databases → schemas → tables, views, materialized views, functions, procedures, sequences, types, triggers, extensions | done | `the_schema_tree_opens_level_by_level`, `the_tree_follows_the_connection`, `databases_then_schemas_then_folders_of_objects` | `m4-navigator-tree-*.png` |
+| B1 Lazy tree, MySQL / MariaDB: databases → tables, views, routines, triggers, events | done | `mysql_and_mariadb_list_objects_under_their_databases`, `mysql_databases_hold_the_objects_directly` | `m4-navigator-mariadb-light.png` |
+| B1 Columns and indexes under each table | done | `the_schema_tree_opens_level_by_level`, `a_table_loads_its_columns_and_indexes_once` | `m4-navigator-tree-*.png` |
+| B2 Filter box | done | `the_filter_narrows_the_tree_and_clearing_it_restores_it`, `the_filter_keeps_what_matches_and_the_way_to_it` | `m4-navigator-filter-light.png` |
+| B2 Refresh node | done | `refresh_reloads_the_nearest_node_that_owns_its_children`, `dropping_renaming_and_truncating_show_the_sql_and_ask` (the tree is refreshed after each) | — |
+| B2 Row-count and size hints, icons per object kind | done | `databases_then_schemas_then_folders_of_objects`, `counts_and_sizes_are_compact` | `m4-navigator-tree-*.png` |
+| B3 New query here, copy name, generate SELECT / INSERT / UPDATE / DELETE, show DDL | done (the tab is bound to the connection in milestone 5) | `statements_and_ddl_open_in_a_tab_and_run_nothing`, `generate.rs` tests | `m4-navigator-menu-light.png` |
+| B3 Rename, truncate, drop, with SQL preview and confirmation | done | `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` (MySQL, MariaDB), `tests/generate.rs` (PG, My, Ma) | `m4-confirm-drop-*.png`, `m4-confirm-rename-light.png`, `m4-confirm-production-light.png`, `m4-navigator-menu-readonly-light.png` |
+| B3 Create schema / database | done | `dropping_renaming_and_truncating_show_the_sql_and_ask` (schema), `tests/generate.rs` (database) | — |
+| B3 Create table / view | partial: opens a statement to complete in a query tab; the form editor is milestone 7 | `statements_and_ddl_open_in_a_tab_and_run_nothing` | — |
+| B3 Open data, open structure | todo: with the table data view (milestone 6) and the structure view (milestone 7) | | |
 
 ## C. SQL editor — todo (milestone 5)
 

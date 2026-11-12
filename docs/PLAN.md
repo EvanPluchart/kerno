@@ -9,7 +9,7 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 1  | Driver trait, PostgreSQL and MySQL/MariaDB drivers with tests              | done   |
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |
-| 4  | Schema navigator (§4 B)                                                    | todo   |
+| 4  | Schema navigator (§4 B)                                                    | done   |
 | 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | todo   |
 | 6  | Table data view and editing (§4 E)                                         | todo   |
 | 7  | Structure (§4 F)                                                           | todo   |

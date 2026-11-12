@@ -35,6 +35,7 @@ use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
+use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::tabs::{QueryTab, TabSnapshot};
@@ -76,7 +77,9 @@ impl Workspace {
         });
         // Text typed in the last moments before quitting is not lost.
         let flush_on_quit = cx.on_app_quit(|this, cx| this.save_tabs(cx));
-        let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), cx));
+        let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), window, cx));
+        let navigator = sidebar.read(cx).navigator().clone();
+        let navigator_events = cx.subscribe_in(&navigator, window, Self::on_navigator_event);
         let connection_events = cx.subscribe_in(&connections, window, Self::on_connections_event);
 
         let mut workspace = Self {
@@ -89,7 +92,12 @@ impl Workspace {
             palette,
             pending_save: None,
             tab_subscriptions: Vec::new(),
-            _subscriptions: vec![follow_system, flush_on_quit, connection_events],
+            _subscriptions: vec![
+                follow_system,
+                flush_on_quit,
+                connection_events,
+                navigator_events,
+            ],
         };
         for snapshot in tabs {
             match snapshot {
@@ -350,6 +358,28 @@ impl Workspace {
                     content.child(command)
                 })
         });
+    }
+
+    fn on_navigator_event(
+        &mut self,
+        _: &Entity<Navigator>,
+        event: &NavigatorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NavigatorEvent::OpenQuery { title, sql } => {
+                self.push_query_tab(title.clone(), sql, window, cx);
+                self.activate_tab(self.tabs.len() - 1, window, cx);
+                self.schedule_save(cx);
+            }
+        }
+    }
+
+    /// The schema tree of the sidebar.
+    #[cfg(test)]
+    pub fn navigator(&self, cx: &App) -> Entity<Navigator> {
+        self.sidebar.read(cx).navigator().clone()
     }
 
     // Connections --------------------------------------------------------------

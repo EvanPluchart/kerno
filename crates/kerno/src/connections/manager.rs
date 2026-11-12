@@ -202,10 +202,6 @@ impl Connections {
 
     /// Opens another session on a connected connection, in `database` or
     /// the connection's default one. Query tabs each use their own.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "query tabs open sessions from milestone 5")
-    )]
     pub fn open_session(
         &self,
         id: &str,

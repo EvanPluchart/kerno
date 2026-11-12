@@ -3,10 +3,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kerno_core::dialect::{Dialect, default_literal, hex};
-use kerno_core::schema::{ColumnInfo, TableRef};
+use kerno_core::schema::{ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{CellValue, LexRules};
-use kerno_core::{Engine, TypeKind};
+use kerno_core::{Engine, Error, Result, TypeKind};
 
 /// The MySQL / MariaDB dialect. The two engines differ only in how a plan
 /// with actual timings is asked for (see [`Dialect::explain`]).
@@ -39,6 +39,19 @@ impl MysqlDialect {
     fn backslash_escapes(&self) -> bool {
         !self.no_backslash_escapes.load(Ordering::Acquire)
     }
+
+    /// Sequences exist on MariaDB only.
+    fn require_sequences(&self) -> Result<()> {
+        if self.engine == Engine::MariaDb {
+            Ok(())
+        } else {
+            Err(unsupported("sequences"))
+        }
+    }
+}
+
+fn unsupported(what: &str) -> Error {
+    Error::Unsupported(what.into())
 }
 
 /// Whether `text` is the digits of a bit string, as BIT cells are presented.
@@ -117,6 +130,110 @@ impl Dialect for MysqlDialect {
     /// Neither engine has `DEFAULT VALUES`; both accept empty lists.
     fn insert_defaults(&self, table: &TableRef) -> String {
         format!("INSERT INTO {} () VALUES ()", self.table_name(table))
+    }
+
+    /// `RENAME TABLE` for tables, views and MariaDB's sequences,
+    /// `ALTER EVENT` and `ALTER TABLE ... RENAME INDEX` for the rest.
+    /// Routines, triggers and databases cannot be renamed on these engines.
+    ///
+    /// The new name of a table or event is written with its database: a
+    /// bare name would move the object to the session's default database.
+    fn rename_sql(&self, object: &ObjectRef, new_name: &str) -> Result<String> {
+        let renamed = |from: &TableRef| {
+            format!(
+                "{} TO {}",
+                self.table_name(from),
+                self.table_name(&TableRef::new(from.schema.clone(), new_name))
+            )
+        };
+        match object {
+            ObjectRef::Relation(_, RelationKind::MaterializedView) => {
+                Err(unsupported("materialized views"))
+            }
+            ObjectRef::Relation(table, _) => Ok(format!("RENAME TABLE {}", renamed(table))),
+            ObjectRef::Sequence(sequence) => {
+                self.require_sequences()?;
+                Ok(format!("RENAME TABLE {}", renamed(sequence)))
+            }
+            ObjectRef::Event(event) => {
+                let (from, to) = (
+                    self.table_name(event),
+                    self.table_name(&TableRef::new(event.schema.clone(), new_name)),
+                );
+                Ok(format!("ALTER EVENT {from} RENAME TO {to}"))
+            }
+            ObjectRef::Index { table, name } => Ok(format!(
+                "ALTER TABLE {} RENAME INDEX {} TO {}",
+                self.table_name(table),
+                self.quote_ident(name),
+                self.quote_ident(new_name)
+            )),
+            ObjectRef::Routine { .. } => Err(unsupported(
+                "renaming a function or procedure; drop it and create it again under the new name",
+            )),
+            ObjectRef::Trigger { .. } => Err(unsupported(
+                "renaming a trigger; drop it and create it again under the new name",
+            )),
+            ObjectRef::Schema(_) | ObjectRef::Database(_) => Err(unsupported(
+                "renaming a database; create the new one and move the tables into it with RENAME TABLE",
+            )),
+            ObjectRef::Type(_) => Err(unsupported("user-defined types")),
+        }
+    }
+
+    fn drop_sql(&self, object: &ObjectRef) -> Result<String> {
+        let qualified = |schema: &str, name: &str| {
+            format!("{}.{}", self.quote_ident(schema), self.quote_ident(name))
+        };
+        Ok(match object {
+            ObjectRef::Relation(_, RelationKind::MaterializedView) => {
+                return Err(unsupported("materialized views"));
+            }
+            ObjectRef::Relation(view, RelationKind::View) => {
+                format!("DROP VIEW {}", self.table_name(view))
+            }
+            ObjectRef::Relation(table, _) => format!("DROP TABLE {}", self.table_name(table)),
+            ObjectRef::Routine {
+                schema, name, kind, ..
+            } => {
+                let keyword = match kind {
+                    RoutineKind::Procedure => "PROCEDURE",
+                    // MariaDB's stored aggregate functions are functions too.
+                    RoutineKind::Function | RoutineKind::Aggregate => "FUNCTION",
+                    RoutineKind::Window => {
+                        return Err(unsupported("user-defined window functions"));
+                    }
+                };
+                // No argument list: these engines have no overloading.
+                format!("DROP {keyword} {}", qualified(schema, name))
+            }
+            ObjectRef::Sequence(sequence) => {
+                self.require_sequences()?;
+                format!("DROP SEQUENCE {}", self.table_name(sequence))
+            }
+            // A trigger is named within the database of its table.
+            ObjectRef::Trigger { table, name } => {
+                format!("DROP TRIGGER {}", qualified(&table.schema, name))
+            }
+            ObjectRef::Event(event) => format!("DROP EVENT {}", self.table_name(event)),
+            ObjectRef::Index { table, name } => format!(
+                "DROP INDEX {} ON {}",
+                self.quote_ident(name),
+                self.table_name(table)
+            ),
+            // A database is the schema of these engines.
+            ObjectRef::Schema(name) | ObjectRef::Database(name) => {
+                format!("DROP DATABASE {}", self.quote_ident(name))
+            }
+            ObjectRef::Type(_) => return Err(unsupported("user-defined types")),
+        })
+    }
+
+    /// Databases hold tables directly on these engines.
+    fn create_schema_sql(&self, _name: &str) -> Result<String> {
+        Err(unsupported(
+            "schemas inside a database; create a database instead",
+        ))
     }
 }
 
@@ -285,6 +402,216 @@ mod tests {
             d.literal(&text(r"a\b"), &column(TypeKind::Text)),
             "_utf8mb4 X'615c62'"
         );
+    }
+
+    fn both() -> [MysqlDialect; 2] {
+        [mysql(), MysqlDialect::new(Engine::MariaDb)]
+    }
+
+    fn t() -> TableRef {
+        TableRef::new("shop", "order items")
+    }
+
+    fn routine(kind: RoutineKind) -> ObjectRef {
+        ObjectRef::Routine {
+            schema: "shop".into(),
+            name: "order total".into(),
+            kind,
+            identity_arguments: String::new(),
+        }
+    }
+
+    fn trigger() -> ObjectRef {
+        ObjectRef::Trigger {
+            table: t(),
+            name: "audit `it`".into(),
+        }
+    }
+
+    fn index(name: &str) -> ObjectRef {
+        ObjectRef::Index {
+            table: t(),
+            name: name.into(),
+        }
+    }
+
+    /// The message of the `Unsupported` error `result` holds.
+    fn refusal(result: Result<String>) -> String {
+        match result {
+            Err(Error::Unsupported(message)) => message,
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_statements() {
+        for d in both() {
+            // Tables and views alike; the new name stays in the database.
+            for kind in [
+                RelationKind::Table,
+                RelationKind::PartitionedTable,
+                RelationKind::ForeignTable,
+                RelationKind::View,
+            ] {
+                assert_eq!(
+                    d.rename_sql(&ObjectRef::Relation(t(), kind), "odd `name`")
+                        .unwrap(),
+                    "RENAME TABLE `shop`.`order items` TO `shop`.`odd ``name```",
+                    "{kind:?}"
+                );
+            }
+            assert_eq!(
+                d.rename_sql(&ObjectRef::Event(TableRef::new("shop", "nightly")), "order")
+                    .unwrap(),
+                "ALTER EVENT `shop`.`nightly` RENAME TO `shop`.`order`"
+            );
+            assert_eq!(
+                d.rename_sql(&index("by date"), "order").unwrap(),
+                "ALTER TABLE `shop`.`order items` RENAME INDEX `by date` TO `order`"
+            );
+            // A new name is an identifier, never SQL.
+            assert_eq!(
+                d.rename_sql(
+                    &ObjectRef::Relation(t(), RelationKind::Table),
+                    "x`; DROP TABLE y"
+                )
+                .unwrap(),
+                "RENAME TABLE `shop`.`order items` TO `shop`.`x``; DROP TABLE y`"
+            );
+        }
+    }
+
+    #[test]
+    fn what_cannot_be_renamed_says_why() {
+        for d in both() {
+            for kind in [
+                RoutineKind::Function,
+                RoutineKind::Procedure,
+                RoutineKind::Aggregate,
+                RoutineKind::Window,
+            ] {
+                assert_eq!(
+                    refusal(d.rename_sql(&routine(kind), "x")),
+                    "renaming a function or procedure; drop it and create it again under the new name"
+                );
+            }
+            assert_eq!(
+                refusal(d.rename_sql(&trigger(), "x")),
+                "renaming a trigger; drop it and create it again under the new name"
+            );
+            for object in [
+                ObjectRef::Schema("shop".into()),
+                ObjectRef::Database("shop".into()),
+            ] {
+                assert_eq!(
+                    refusal(d.rename_sql(&object, "x")),
+                    "renaming a database; create the new one and move the tables into it with RENAME TABLE"
+                );
+            }
+            let view = ObjectRef::Relation(t(), RelationKind::MaterializedView);
+            assert_eq!(refusal(d.rename_sql(&view, "x")), "materialized views");
+            assert_eq!(refusal(d.drop_sql(&view)), "materialized views");
+            let user_type = ObjectRef::Type(t());
+            assert_eq!(refusal(d.rename_sql(&user_type, "x")), "user-defined types");
+            assert_eq!(refusal(d.drop_sql(&user_type)), "user-defined types");
+            assert_eq!(
+                refusal(d.drop_sql(&routine(RoutineKind::Window))),
+                "user-defined window functions"
+            );
+            assert_eq!(
+                refusal(d.create_schema_sql("x")),
+                "schemas inside a database; create a database instead"
+            );
+        }
+        assert_eq!(
+            mysql().rename_sql(&trigger(), "x").unwrap_err().to_string(),
+            "not supported by this database: renaming a trigger; \
+             drop it and create it again under the new name"
+        );
+    }
+
+    #[test]
+    fn sequences_are_mariadb_only() {
+        let sequence = ObjectRef::Sequence(TableRef::new("shop", "invoice numbers"));
+        let mariadb = MysqlDialect::new(Engine::MariaDb);
+        assert_eq!(
+            mariadb.rename_sql(&sequence, "order").unwrap(),
+            "RENAME TABLE `shop`.`invoice numbers` TO `shop`.`order`"
+        );
+        assert_eq!(
+            mariadb.drop_sql(&sequence).unwrap(),
+            "DROP SEQUENCE `shop`.`invoice numbers`"
+        );
+        assert_eq!(refusal(mysql().rename_sql(&sequence, "x")), "sequences");
+        assert_eq!(refusal(mysql().drop_sql(&sequence)), "sequences");
+    }
+
+    #[test]
+    fn drop_statements() {
+        for d in both() {
+            let drop = |object: ObjectRef| d.drop_sql(&object).unwrap();
+            for kind in [
+                RelationKind::Table,
+                RelationKind::PartitionedTable,
+                RelationKind::ForeignTable,
+            ] {
+                assert_eq!(
+                    drop(ObjectRef::Relation(t(), kind)),
+                    "DROP TABLE `shop`.`order items`"
+                );
+            }
+            assert_eq!(
+                drop(ObjectRef::Relation(t(), RelationKind::View)),
+                "DROP VIEW `shop`.`order items`"
+            );
+            // No argument list: these engines have no overloading.
+            assert_eq!(
+                drop(routine(RoutineKind::Function)),
+                "DROP FUNCTION `shop`.`order total`"
+            );
+            assert_eq!(
+                drop(routine(RoutineKind::Aggregate)),
+                "DROP FUNCTION `shop`.`order total`"
+            );
+            assert_eq!(
+                drop(routine(RoutineKind::Procedure)),
+                "DROP PROCEDURE `shop`.`order total`"
+            );
+            // A trigger is named within the database of its table.
+            assert_eq!(drop(trigger()), "DROP TRIGGER `shop`.`audit ``it```");
+            assert_eq!(
+                drop(ObjectRef::Event(TableRef::new("shop", "nightly"))),
+                "DROP EVENT `shop`.`nightly`"
+            );
+            assert_eq!(
+                drop(index("by date")),
+                "DROP INDEX `by date` ON `shop`.`order items`"
+            );
+            assert_eq!(
+                drop(index("PRIMARY")),
+                "DROP INDEX `PRIMARY` ON `shop`.`order items`"
+            );
+            // A database is the schema of these engines.
+            assert_eq!(
+                drop(ObjectRef::Schema("my db".into())),
+                "DROP DATABASE `my db`"
+            );
+            assert_eq!(
+                drop(ObjectRef::Database("my db".into())),
+                "DROP DATABASE `my db`"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_and_create_statements() {
+        for d in both() {
+            assert_eq!(d.truncate_sql(&t()), "TRUNCATE TABLE `shop`.`order items`");
+            assert_eq!(
+                d.create_database_sql("odd `name`").unwrap(),
+                "CREATE DATABASE `odd ``name```"
+            );
+        }
     }
 
     #[test]

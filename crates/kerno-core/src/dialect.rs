@@ -1,8 +1,9 @@
 //! What differs between engines in the SQL Kerno writes.
 
 use crate::config::Engine;
+use crate::error::{Error, Result};
 use crate::result::TypeKind;
-use crate::schema::{ColumnInfo, TableRef};
+use crate::schema::{ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
 use crate::sql::LexRules;
 use crate::sql::edits::CellValue;
 use crate::sql::params::is_number;
@@ -63,6 +64,107 @@ pub trait Dialect: Send + Sync {
     fn insert_defaults(&self, table: &TableRef) -> String {
         format!("INSERT INTO {} DEFAULT VALUES", self.table_name(table))
     }
+
+    /// The statement that renames `object` to `new_name`, in the schema it
+    /// is in. `Unsupported` when the engine cannot rename that kind of
+    /// object. The default is the standard `ALTER <kind> <name> RENAME TO`.
+    fn rename_sql(&self, object: &ObjectRef, new_name: &str) -> Result<String> {
+        default_rename_sql(self, object, new_name)
+    }
+
+    /// The statement that drops `object`, and only it: no `CASCADE` and no
+    /// `IF EXISTS`, so the server says what depends on it or that it is
+    /// gone. `Unsupported` when the engine has no such kind of object.
+    fn drop_sql(&self, object: &ObjectRef) -> Result<String> {
+        default_drop_sql(self, object)
+    }
+
+    /// The statement that removes every row of `table`.
+    fn truncate_sql(&self, table: &TableRef) -> String {
+        format!("TRUNCATE TABLE {}", self.table_name(table))
+    }
+
+    /// The statement that creates the schema `name` in the connected
+    /// database. `Unsupported` on engines whose databases have no schemas.
+    fn create_schema_sql(&self, name: &str) -> Result<String> {
+        Ok(format!("CREATE SCHEMA {}", self.quote_ident(name)))
+    }
+
+    /// The statement that creates the database `name` with the server's
+    /// defaults.
+    fn create_database_sql(&self, name: &str) -> Result<String> {
+        Ok(format!("CREATE DATABASE {}", self.quote_ident(name)))
+    }
+}
+
+/// `<kind> <name>` as standard `ALTER` and `DROP` statements name `object`.
+///
+/// The argument list of a routine is the SQL the server printed for it
+/// (see [`ObjectRef::Routine`]) and is written as it is.
+fn object_target<D: Dialect + ?Sized>(dialect: &D, object: &ObjectRef) -> Result<String> {
+    let qualified = |schema: &str, name: &str| {
+        format!(
+            "{}.{}",
+            dialect.quote_ident(schema),
+            dialect.quote_ident(name)
+        )
+    };
+    Ok(match object {
+        ObjectRef::Relation(table, kind) => {
+            let keyword = match kind {
+                RelationKind::Table | RelationKind::PartitionedTable => "TABLE",
+                RelationKind::ForeignTable => "FOREIGN TABLE",
+                RelationKind::View => "VIEW",
+                RelationKind::MaterializedView => "MATERIALIZED VIEW",
+            };
+            format!("{keyword} {}", dialect.table_name(table))
+        }
+        ObjectRef::Routine {
+            schema,
+            name,
+            kind,
+            identity_arguments,
+        } => {
+            let keyword = match kind {
+                RoutineKind::Function | RoutineKind::Window => "FUNCTION",
+                RoutineKind::Procedure => "PROCEDURE",
+                RoutineKind::Aggregate => "AGGREGATE",
+            };
+            format!(
+                "{keyword} {}({identity_arguments})",
+                qualified(schema, name)
+            )
+        }
+        ObjectRef::Sequence(sequence) => format!("SEQUENCE {}", dialect.table_name(sequence)),
+        ObjectRef::Type(user_type) => format!("TYPE {}", dialect.table_name(user_type)),
+        ObjectRef::Trigger { table, name } => {
+            format!("TRIGGER {}", qualified(&table.schema, name))
+        }
+        ObjectRef::Index { table, name } => format!("INDEX {}", qualified(&table.schema, name)),
+        ObjectRef::Event(_) => return Err(Error::Unsupported("scheduled events".into())),
+        ObjectRef::Schema(name) => format!("SCHEMA {}", dialect.quote_ident(name)),
+        ObjectRef::Database(name) => format!("DATABASE {}", dialect.quote_ident(name)),
+    })
+}
+
+/// The statement [`Dialect::rename_sql`] writes by default. A dialect that
+/// overrides `rename_sql` for a few kinds of object calls this for the rest.
+pub fn default_rename_sql<D: Dialect + ?Sized>(
+    dialect: &D,
+    object: &ObjectRef,
+    new_name: &str,
+) -> Result<String> {
+    Ok(format!(
+        "ALTER {} RENAME TO {}",
+        object_target(dialect, object)?,
+        dialect.quote_ident(new_name)
+    ))
+}
+
+/// The statement [`Dialect::drop_sql`] writes by default. A dialect that
+/// overrides `drop_sql` for a few kinds of object calls this for the rest.
+pub fn default_drop_sql<D: Dialect + ?Sized>(dialect: &D, object: &ObjectRef) -> Result<String> {
+    Ok(format!("DROP {}", object_target(dialect, object)?))
 }
 
 /// The literal [`Dialect::literal`] writes by default. A dialect that
@@ -203,6 +305,137 @@ mod tests {
         assert_eq!(
             AnsiDialect.insert_defaults(&TableRef::new("s", "t")),
             "INSERT INTO \"s\".\"t\" DEFAULT VALUES"
+        );
+    }
+
+    fn routine(kind: RoutineKind, identity_arguments: &str) -> ObjectRef {
+        ObjectRef::Routine {
+            schema: "s".into(),
+            name: "f".into(),
+            kind,
+            identity_arguments: identity_arguments.into(),
+        }
+    }
+
+    /// One object of every kind, with the words that name it in `ALTER`
+    /// and `DROP`.
+    fn objects() -> Vec<(ObjectRef, &'static str)> {
+        let t = || TableRef::new("s", "t");
+        vec![
+            (
+                ObjectRef::Relation(t(), RelationKind::Table),
+                "TABLE \"s\".\"t\"",
+            ),
+            (
+                ObjectRef::Relation(t(), RelationKind::PartitionedTable),
+                "TABLE \"s\".\"t\"",
+            ),
+            (
+                ObjectRef::Relation(t(), RelationKind::ForeignTable),
+                "FOREIGN TABLE \"s\".\"t\"",
+            ),
+            (
+                ObjectRef::Relation(t(), RelationKind::View),
+                "VIEW \"s\".\"t\"",
+            ),
+            (
+                ObjectRef::Relation(t(), RelationKind::MaterializedView),
+                "MATERIALIZED VIEW \"s\".\"t\"",
+            ),
+            (
+                routine(RoutineKind::Function, "integer, text"),
+                "FUNCTION \"s\".\"f\"(integer, text)",
+            ),
+            (routine(RoutineKind::Function, ""), "FUNCTION \"s\".\"f\"()"),
+            (
+                routine(RoutineKind::Window, "integer"),
+                "FUNCTION \"s\".\"f\"(integer)",
+            ),
+            (
+                routine(RoutineKind::Procedure, ""),
+                "PROCEDURE \"s\".\"f\"()",
+            ),
+            (
+                routine(RoutineKind::Aggregate, "integer"),
+                "AGGREGATE \"s\".\"f\"(integer)",
+            ),
+            (ObjectRef::Sequence(t()), "SEQUENCE \"s\".\"t\""),
+            (ObjectRef::Type(t()), "TYPE \"s\".\"t\""),
+            (
+                ObjectRef::Trigger {
+                    table: t(),
+                    name: "trg".into(),
+                },
+                "TRIGGER \"s\".\"trg\"",
+            ),
+            (
+                ObjectRef::Index {
+                    table: t(),
+                    name: "t idx".into(),
+                },
+                "INDEX \"s\".\"t idx\"",
+            ),
+            (
+                ObjectRef::Schema("my schema".into()),
+                "SCHEMA \"my schema\"",
+            ),
+            (ObjectRef::Database("db".into()), "DATABASE \"db\""),
+        ]
+    }
+
+    #[test]
+    fn rename_and_drop_name_every_kind_of_object() {
+        let d = AnsiDialect;
+        for (object, target) in objects() {
+            assert_eq!(
+                d.rename_sql(&object, "Weird \"name\"").unwrap(),
+                format!("ALTER {target} RENAME TO \"Weird \"\"name\"\"\""),
+                "{object:?}"
+            );
+            assert_eq!(
+                d.drop_sql(&object).unwrap(),
+                format!("DROP {target}"),
+                "{object:?}"
+            );
+        }
+        // A new name is an identifier, never SQL.
+        assert_eq!(
+            d.rename_sql(&ObjectRef::Schema("a".into()), "b; DROP SCHEMA a")
+                .unwrap(),
+            "ALTER SCHEMA \"a\" RENAME TO \"b; DROP SCHEMA a\""
+        );
+    }
+
+    #[test]
+    fn scheduled_events_are_not_standard() {
+        let event = ObjectRef::Event(TableRef::new("s", "e"));
+        for result in [
+            AnsiDialect.rename_sql(&event, "x"),
+            AnsiDialect.drop_sql(&event),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "not supported by this database: scheduled events"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_and_create_statements() {
+        let d = AnsiDialect;
+        assert_eq!(
+            d.truncate_sql(&TableRef::new("s", "order items")),
+            "TRUNCATE TABLE \"s\".\"order items\""
+        );
+        assert_eq!(
+            d.create_schema_sql("my \"schema\"").unwrap(),
+            "CREATE SCHEMA \"my \"\"schema\"\"\""
+        );
+        assert_eq!(
+            d.create_database_sql("my db").unwrap(),
+            "CREATE DATABASE \"my db\""
         );
     }
 

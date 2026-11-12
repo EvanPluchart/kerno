@@ -333,3 +333,56 @@ branding. If the owner prefers to be strict with Oracle's wording, the fallback 
 `engine_logo` (text label only for MySQL). PostgreSQL's and MariaDB's policies raise no such question for
 this use.
 
+## D-020 — Schema navigator
+
+- The tree is plain data (`navigator/model.rs`, no UI types): nodes, what is loaded, what is open, the
+  filter. The view asks it what to fetch (`Load`), runs that on a session and hands the answer back. The
+  widget is gpui-component's virtualized `Tree`; the model is converted to its items after every change.
+- Loading is lazy at three levels: the schemas of a database, the objects of a schema (one catalog pass
+  gives tables, views, routines, sequences, types and triggers with their counts), the columns and indexes
+  of a table. A node that is not loaded yet shows a "Loading…" line, an empty one "Nothing here", a failed
+  one the server's message, and opening it again retries.
+- PostgreSQL: one session per database, opened when the database is first opened in the tree (the
+  connection's own session serves its own database). MySQL and MariaDB: the connection's session sees every
+  database, so no other session is opened. The sessions are dropped when the connection closes or the
+  tree is reloaded.
+- Refresh reloads the nearest node the server answers for (a table inside "Tables" is refreshed with its
+  schema) and keeps the folders below it open. Tables that were open close: their columns would have to be
+  fetched again.
+- The filter matches names of objects, not of folders; a match is shown with the way to it, opened, and a
+  matching schema or table keeps everything under it.
+- Partitions are not listed among the tables (they are reached through their parent, in the structure
+  view of milestone 7). Empty folders are shown, dimmed: they say there is nothing, and carry "Create…".
+- Statements (D-021) run only after `sql_confirm`: a dialog that shows the exact SQL, never confirms on
+  Enter, and on a `production` connection needs two clicks on the action. The same dialog will confirm
+  pending edits and ALTERs in later milestones. On a `read_only` connection the entries that write are
+  disabled and say why; so is anything the engine cannot do (renaming a MySQL trigger) and dropping the
+  database the connection is in on PostgreSQL.
+- "Generate SELECT/INSERT/UPDATE/DELETE", "Show DDL", "New query here", "Create table…" and "Create view…"
+  open a query tab and run nothing. Until query tabs are bound to a connection (milestone 5), "New query
+  here" starts the tab with `SET search_path` / `USE`; "Create table…" writes a statement to complete,
+  and becomes the form editor in milestone 7. "Open data" and "Open structure" arrive with those views
+  (milestones 6 and 7).
+- Glyphs: sixteen Lucide icons embedded with the kit's `icon_assets!` (the kit bundles only the icons its
+  own components use). Engine logo at the root of the tree (D-019).
+
+## D-021 — SQL written for the navigator
+
+Written by a delegated agent to a brief (signatures, rules, tests first), then checked: scope confined to
+the dialect and `sql/generate.rs`, tests re-run here with the containers required.
+
+- Rename, drop, truncate, create schema and create database are methods of `Dialect` with standard-SQL
+  defaults; each driver overrides what its engine does differently. A new engine starts from the defaults.
+- No `CASCADE`, no `IF EXISTS`: the user acts on something they see, and an error is information.
+- Every identifier and every new name is quoted by the dialect. On MySQL and MariaDB the new name of a
+  table, view, sequence or event is qualified with its database, because a bare name would move the object
+  to the session's default database.
+- What an engine cannot do is `Error::Unsupported` with a sentence saying what to do instead (MySQL cannot
+  rename a routine, a trigger or a database).
+- Templates use `:column` placeholders, which Kerno prompts for before running. `UPDATE` and `DELETE` are
+  never written without a `WHERE`: a table without a primary or unique key gets `WHERE -- add a condition`,
+  which the server refuses as it stands. An all-key table gets `:new_<column>` parameters for `SET`.
+  `INSERT` leaves out generated columns and keeps identity-by-default and auto-increment ones, so the
+  prompt shows them; deleting a line lets the server number the row.
+- Integration tests run every statement against PostgreSQL, MySQL and MariaDB in scratch schemas.
+

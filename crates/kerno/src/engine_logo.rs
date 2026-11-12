@@ -16,7 +16,31 @@ const POSTGRESQL: &str = "engines/postgresql.svg";
 const MYSQL: &str = "engines/mysql.svg";
 const MARIADB: &str = "engines/mariadb.svg";
 
-/// Kerno's assets: the engine logos, then everything the UI kit bundles.
+// The glyphs of the schema tree, from the same Lucide set as the UI kit's.
+gpui_kit::assets::icon_assets!(
+    TreeGlyphs,
+    [
+        Boxes,
+        CalendarClock,
+        Columns3,
+        Database,
+        Eye,
+        Folder,
+        KeyRound,
+        Layers,
+        ListOrdered,
+        Puzzle,
+        RefreshCw,
+        Shapes,
+        SquareFunction,
+        Table,
+        Workflow,
+        Zap,
+    ]
+);
+
+/// Kerno's assets: the engine logos and the schema tree's glyphs, then
+/// everything the UI kit bundles.
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -27,8 +51,11 @@ impl AssetSource for Assets {
             MARIADB => Some(include_bytes!("../assets/engines/mariadb.svg")),
             _ => None,
         };
-        match own {
-            Some(bytes) => Ok(Some(Cow::Borrowed(bytes))),
+        if let Some(bytes) = own {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        match TreeGlyphs.load(path)? {
+            Some(glyph) => Ok(Some(glyph)),
             None => gpui_kit::assets::Assets.load(path),
         }
     }
@@ -68,6 +95,17 @@ mod tests {
         for path in [POSTGRESQL, MYSQL, MARIADB] {
             let bytes = Assets.load(path).unwrap().expect(path);
             assert!(bytes.windows(4).any(|window| window == b"<svg"), "{path}");
+        }
+        // So is every glyph of the schema tree.
+        use gpui_kit::assets::IconName;
+        for glyph in [
+            IconName::Database,
+            IconName::Table,
+            IconName::SquareFunction,
+            IconName::Zap,
+        ] {
+            let path = glyph.path();
+            assert!(TreeGlyphs.load(&path).unwrap().is_some(), "{path}");
         }
         // The UI kit's own icons are still served.
         let kit_icons = Assets.list("icons").unwrap();

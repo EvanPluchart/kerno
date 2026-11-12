@@ -165,3 +165,32 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
   sidebar row will be reworked when the schema tree hangs under it (milestone 4).
 - App tests: 44 passing with the containers required.
 
+## 2026-11-12 — Milestone 4: schema navigator
+
+- Built: the schema tree under the connections (D-020): lazy loading at three levels, sessions per
+  database on PostgreSQL, filter, refresh, hints (row estimate and size, column type and key, counts),
+  a glyph per kind of object, the context menu of every kind of node, and `sql_confirm`, the dialog every
+  statement that changes something goes through.
+- The SQL of the menu (rename, drop, truncate, create, the four templates) was delegated to an agent with a
+  written brief and checked afterwards (D-021). Its report also found that a PostgreSQL test of mine
+  compared the exact list of databases and could fail while another test's scratch database existed;
+  fixed.
+- Found by the tests and by looking at the real app, fixed:
+  - after a refresh every folder under the node was closed; open folders now stay open;
+  - a long type pushed the column's name out of its row (`created_at` showed only `timestamp with time
+    zone`); the name now keeps its room and the hint is cut;
+  - a long routine name was clipped without an ellipsis;
+  - folders without a chevron were 3 px off;
+  - renaming to the same name was offered; it now says to type a different name;
+  - my test waited for a row to disappear and asserted before the refreshed tree had arrived; it now waits
+    for the tree it expects.
+- Real app (release build, driven in the background): the tree on PostgreSQL and MariaDB, the filter, the
+  menu, a drop confirmed and run on a scratch schema (the tree refreshed, a notification confirmed it), the
+  rename dialog with its live statement, the read-only menu, the two-click confirmation on a production
+  connection. Captures `docs/screenshots/m4-*.png`, light and two in dark, each looked at.
+- Noted for the polish milestone: the rename field should start with its text selected; `Cmd+A` could not
+  be sent by the driving tool, so that path is covered by the UI test only.
+
+- Test run with `KERNO_REQUIRE_CONTAINERS=1`, nothing skipped, all passing: app 62, `kerno-core` 89 + 10 SSH,
+  `kerno-postgres` 21 + 40, `kerno-mysql` 43 + 54 (319 in all). `cargo fmt --check`, `cargo clippy --workspace
+  --all-targets -- -D warnings` and `cargo deny check` clean.
