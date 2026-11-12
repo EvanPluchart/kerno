@@ -3,5 +3,6 @@
 
 pub mod grid;
 mod params;
+mod plan_view;
 pub mod tab;
 mod viewer;

@@ -1,5 +1,7 @@
 //! Tabs of the central area and what is remembered of them between runs.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Where a query tab runs its statements.
@@ -30,6 +32,12 @@ pub enum TabSnapshot {
         /// The connection the tab runs on, when one was chosen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<Target>,
+        /// The `.sql` file the tab was opened from or saved to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<PathBuf>,
+        /// The text differs from the file's.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unsaved: bool,
     },
 }
 
@@ -43,6 +51,8 @@ mod tests {
             title: "Query 1".into(),
             sql: "select 'unsaved'\n".into(),
             target: None,
+            file: None,
+            unsaved: false,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         assert_eq!(
@@ -62,6 +72,8 @@ mod tests {
                 database: Some("kerno".into()),
                 schema: None,
             }),
+            file: None,
+            unsaved: false,
         };
         let json = serde_json::to_string(&bound).unwrap();
         assert!(

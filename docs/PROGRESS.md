@@ -222,3 +222,25 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
 - Next in this milestone: read-only and destructive-statement guards (classification), EXPLAIN tree,
   history and saved-queries panels, open/save `.sql`, completion, format, find/replace.
 
+## 2026-11-12 — Milestone 5, second part: guards, plans, library, files
+
+- Guards before a run (statement classification from the core): a read-only connection runs nothing that
+  writes, EXPLAIN ANALYZE of a write included, and says how to allow it; a statement that destroys (DROP,
+  TRUNCATE, ALTER … DROP, DELETE or UPDATE without WHERE) is shown and confirmed; on a production connection
+  every write is, with two clicks. The "confirmations" setting turns the first of these off, never the
+  production one.
+- EXPLAIN (Cmd+E) and EXPLAIN ANALYZE (Cmd+Shift+E): a tree with estimated cost and rows, real rows, own and
+  total time per step, a bar for each step's share, the slowest step highlighted, planning and execution
+  time, and the raw output a click away. PostgreSQL, MySQL and MariaDB.
+- Query library (Cmd+Y, toolbar buttons): history per connection, searchable, with status, duration, rows
+  and error; saved queries with a name and a folder; a click opens either in a tab on its connection.
+- `.sql` files: open (Cmd+O), save (Cmd+S), save as; the tab is named after its file and marked when its
+  text differs; a file already open is shown, not opened twice; file tabs come back after a restart.
+- Found by the tests, fixed: a tab was marked unsaved as soon as the cursor moved (the editor notifies on
+  every change of state; only text changes count now); a row count was shown for SET and DO ("0 rows
+  affected"); the history recorded an EXPLAIN as the statement itself, with "0 rows".
+- Real app: the plan of a three-table join (captured, `m5-explain-analyze-light.png`), the history dialog
+  (`m5-history-light.png`). Fixed from the capture: plan details listed measurement bookkeeping before
+  the conditions; they are left to the raw output now.
+- App tests: 80 passing with the containers required.
+

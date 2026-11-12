@@ -436,11 +436,15 @@ async fn unsaved_text_and_tabs_come_back_after_a_restart(cx: &mut TestAppContext
                 title: "Query 1".into(),
                 sql: String::new(),
                 target: None,
+                file: None,
+                unsaved: false,
             },
             TabSnapshot::Query {
                 title: "Query 2".into(),
                 sql: "select 'not saved anywhere'".into(),
                 target: None,
+                file: None,
+                unsaved: false,
             },
         ]
     );
@@ -1980,4 +1984,343 @@ fn a_double_click_on_a_cell_shows_its_whole_value(cx: &mut TestAppContext) {
         app.click(cx, "value-close");
         assert!(!app.has(cx, "value-text"));
     }
+}
+
+// Plans and guards ----------------------------------------------------------------
+
+#[gpui_kit::test]
+fn plans_are_shown_as_a_tree_on_every_engine(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let schema = if engine == Engine::Postgres {
+            "shop"
+        } else {
+            "kerno"
+        };
+        let sql = format!(
+            "select c.full_name, o.id from {schema}.customers c \
+             join {schema}.orders o on o.customer_id = c.id where o.status = 'paid'"
+        );
+        // Cmd+E: the plan, without running the statement.
+        app.run_in_new_tab(cx, &sql, "secondary-e");
+        app.wait_until(cx, "the plan", |app, cx| {
+            app.outcomes(cx).len() == 1 && !app.running(cx)
+        });
+        let outcome = app.outcomes(cx).remove(0);
+        let steps: usize = outcome
+            .strip_prefix("plan, ")
+            .and_then(|rest| rest.strip_suffix(" steps"))
+            .and_then(|steps| steps.parse().ok())
+            .unwrap_or_else(|| panic!("{engine:?}: {outcome}"));
+        assert!(steps >= 3, "{engine:?}: {outcome}");
+        assert!(
+            app.has(cx, "plan-tree") && app.has(cx, ("plan-node", steps - 1)),
+            "{engine:?}"
+        );
+
+        // Cmd+Shift+E: run it and time each step; the raw output stays a click away.
+        app.press(cx, &["secondary-shift-e"]);
+        app.wait_until(cx, "the analyzed plan", |app, cx| {
+            app.outcomes(cx).len() == 1 && !app.running(cx)
+        });
+        assert!(
+            app.outcomes(cx)[0].starts_with("plan, "),
+            "{engine:?}: {:?}",
+            app.outcomes(cx)
+        );
+        app.click(cx, "plan-as-raw");
+        assert!(
+            app.has(cx, "plan-raw") && !app.has(cx, "plan-tree"),
+            "{engine:?}"
+        );
+        app.click(cx, "plan-as-tree");
+        assert!(app.has(cx, "plan-tree"), "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn statements_that_destroy_or_write_are_guarded(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) || !testing::available(Engine::MySql) {
+        return;
+    }
+    let pg = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_guard CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_guard",
+            "CREATE TABLE kerno_ui_guard.items AS SELECT generate_series(1, 3) AS id",
+        ],
+    );
+    let count = || pg("SELECT count(*) FROM kerno_ui_guard.items");
+
+    // A read-only connection runs nothing that writes, EXPLAIN ANALYZE included.
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.run_in_new_tab(
+        cx,
+        "delete from kerno_ui_guard.items where id = 1",
+        "secondary-enter",
+    );
+    assert_eq!(app.outcomes(cx), ["failed []"]);
+    assert!(app.has(cx, "result-error") && !app.has(cx, "sql-preview"));
+    app.press(cx, &["secondary-shift-e"]);
+    assert_eq!(app.outcomes(cx), ["failed []"]);
+    assert_eq!(count(), "3");
+    // Reading, and a plan that does not run the statement, are fine.
+    app.press(cx, &["secondary-e"]);
+    app.wait_until(cx, "the plan", |app, cx| {
+        app.outcomes(cx).len() == 1 && !app.running(cx)
+    });
+    assert!(
+        app.outcomes(cx)[0].starts_with("plan, "),
+        "{:?}",
+        app.outcomes(cx)
+    );
+    app.run_in_new_tab(
+        cx,
+        "select count(*) from kerno_ui_guard.items",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the count", |app, cx| app.outcomes(cx) == ["1 rows"]);
+
+    // Elsewhere, what destroys is shown and confirmed; what does not, runs.
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "delete from kerno_ui_guard.items where id = 1",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the delete", |app, cx| {
+        app.outcomes(cx) == ["done, 1 affected"]
+    });
+    assert_eq!(count(), "2");
+    app.run_in_new_tab(
+        cx,
+        "select 1; delete from kerno_ui_guard.items",
+        "secondary-shift-enter",
+    );
+    assert!(app.has(cx, "sql-preview") && !app.has(cx, "sql-production"));
+    assert_eq!(
+        app.outcomes(cx),
+        Vec::<String>::new(),
+        "nothing runs before the answer"
+    );
+    app.click(cx, "sql-cancel");
+    assert_eq!(app.outcomes(cx), Vec::<String>::new());
+    assert_eq!(count(), "2");
+    app.press(cx, &["secondary-shift-enter"]);
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the script", |app, cx| {
+        app.outcomes(cx).len() == 2 && !app.running(cx)
+    });
+    assert_eq!(app.outcomes(cx), ["1 rows", "done, 2 affected"]);
+    assert_eq!(count(), "0");
+    // The keyboard still works after the dialog.
+    app.press(cx, &["secondary-t"]);
+    assert_eq!(app.titles(cx).len(), 3);
+
+    // On production every write is confirmed, twice.
+    let _database = Scratch::new(
+        Engine::MySql,
+        &["DROP DATABASE IF EXISTS kerno_ui_guard"],
+        &[
+            "CREATE DATABASE kerno_ui_guard",
+            "CREATE TABLE kerno_ui_guard.items (id INT PRIMARY KEY)",
+        ],
+    );
+    let mut config = testing::config(Engine::MySql);
+    config.environment = kerno_core::config::Environment::Production;
+    let app = connected_as(cx, config);
+    app.run_in_new_tab(
+        cx,
+        "insert into kerno_ui_guard.items values (1)",
+        "secondary-enter",
+    );
+    assert!(app.has(cx, "sql-production"));
+    app.click(cx, "sql-confirm");
+    assert!(
+        app.has(cx, "sql-preview"),
+        "one click is not enough on production"
+    );
+    assert_eq!(
+        on_server(Engine::MySql, "SELECT count(*) FROM kerno_ui_guard.items"),
+        "0"
+    );
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the insert", |app, cx| {
+        app.outcomes(cx) == ["done, 1 affected"]
+    });
+    // Reading is never questioned.
+    app.run_in_new_tab(
+        cx,
+        "select count(*) from kerno_ui_guard.items",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the count", |app, cx| app.outcomes(cx) == ["1 rows"]);
+}
+
+// Files, history, saved queries ---------------------------------------------------
+
+#[gpui_kit::test]
+async fn sql_files_are_opened_saved_and_marked_when_changed(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let app = open(cx, storage.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.sql");
+    std::fs::write(&file, "select 42;\n").unwrap();
+    let open_file = |app: &Fixture, cx: &mut TestAppContext, path: &std::path::Path| {
+        let (workspace, path) = (app.workspace.clone(), path.to_path_buf());
+        app.step(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_sql_file_from(path, window, cx)
+            })
+        });
+    };
+    open_file(&app, cx, &file);
+    app.wait_until(cx, "the file", |app, cx| app.titles(cx) == ["report.sql"]);
+    assert_eq!(app.active_query(cx).1, "select 42;\n");
+    let unsaved = |app: &Fixture, cx: &mut TestAppContext| {
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.read(cx).unsaved())
+    };
+    assert!(!unsaved(&app, cx));
+
+    // Typing marks the tab; Cmd+S writes the file and clears the mark.
+    app.type_text(cx, "-- checked\n");
+    assert!(unsaved(&app, cx));
+    app.press(cx, &["secondary-s"]);
+    app.wait_until(cx, "the save", |app, cx| !unsaved(app, cx));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "-- checked\nselect 42;\n"
+    );
+
+    // A file already open is shown, not opened twice.
+    app.press(cx, &["secondary-t"]);
+    open_file(&app, cx, &file);
+    cx.run_until_parked();
+    assert_eq!(app.titles(cx), ["report.sql", "Query 1"]);
+    assert_eq!(app.active(cx), Some(0));
+
+    // "Save as" moves the tab to the new file.
+    let copy = dir.path().join("copy of report.sql");
+    let (workspace, target) = (app.workspace.clone(), copy.clone());
+    app.step(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.save_active_tab_to(target, window, cx)
+        })
+    });
+    app.wait_until(cx, "the copy", |app, cx| {
+        app.titles(cx)[0] == "copy of report.sql"
+    });
+    assert_eq!(
+        std::fs::read_to_string(&copy).unwrap(),
+        "-- checked\nselect 42;\n"
+    );
+
+    // The tab is the same file after a restart.
+    app.wait_for_stored_tabs(cx, |tabs| {
+        tabs.first().is_some_and(|tab| {
+            matches!(tab, TabSnapshot::Query { file: Some(path), unsaved: false, .. } if *path == copy)
+        })
+    })
+    .await;
+    let restarted = open(cx, storage);
+    assert_eq!(restarted.titles(cx), ["copy of report.sql", "Query 1"]);
+
+    // A file that cannot be read says so and opens nothing.
+    open_file(&restarted, cx, &dir.path().join("missing.sql"));
+    cx.run_until_parked();
+    assert_eq!(restarted.titles(cx).len(), 2);
+}
+
+#[gpui_kit::test]
+fn history_and_saved_queries_are_searched_and_reopened(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(cx, "select 'needle' as hay", "secondary-enter");
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    app.run_in_new_tab(cx, "select 2 as other", "secondary-enter");
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    let storage = app.storage.clone();
+    app.wait_until(cx, "the history", |_, _| {
+        storage.history(None, "", 10).unwrap().len() == 2
+    });
+
+    // Save the text of the tab under a name, in a folder.
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(crate::actions::SaveQuery), cx)
+    });
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "The other one");
+    app.click(cx, "save-query-folder");
+    app.type_text(cx, "/samples/");
+    app.click(cx, "save-query-confirm");
+    app.wait_until(cx, "the saved query", |_, _| {
+        storage.saved_queries().unwrap().len() == 1
+    });
+    let saved = storage.saved_queries().unwrap().remove(0);
+    assert_eq!(
+        (
+            saved.name.as_str(),
+            saved.folder.as_str(),
+            saved.sql.as_str()
+        ),
+        ("The other one", "samples", "select 2 as other")
+    );
+
+    // Cmd+Y: the history, newest first; the search narrows it; a click
+    // opens the statement in a tab on the connection it ran on.
+    app.press(cx, &["secondary-y"]);
+    app.wait_until(cx, "the history list", |app, cx| {
+        app.has(cx, ("history", 1usize))
+    });
+    app.type_text(cx, "NEEDLE");
+    app.wait_until(cx, "the search", |app, cx| {
+        !app.has(cx, ("history", 1usize))
+    });
+    app.click(cx, ("history", 0usize));
+    assert!(!app.has(cx, "library-search"), "picking closes the library");
+    assert_eq!(
+        app.active_query(cx),
+        ("History".to_string(), "select 'needle' as hay".to_string())
+    );
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["1 rows"]);
+
+    // The saved query opens under its name; deleting it takes two clicks.
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(crate::actions::ShowSavedQueries), cx)
+    });
+    app.wait_until(cx, "the saved list", |app, cx| {
+        app.has(cx, ("saved", 0usize))
+    });
+    app.click(cx, ("saved", 0usize));
+    assert_eq!(
+        app.active_query(cx),
+        ("The other one".to_string(), "select 2 as other".to_string())
+    );
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(crate::actions::ShowSavedQueries), cx)
+    });
+    app.wait_until(cx, "the saved list", |app, cx| {
+        app.has(cx, ("saved-delete", 0usize))
+    });
+    app.click(cx, ("saved-delete", 0usize));
+    assert_eq!(
+        storage.saved_queries().unwrap().len(),
+        1,
+        "one click only asks"
+    );
+    app.click(cx, ("saved-delete", 0usize));
+    app.wait_until(cx, "the deletion", |_, _| {
+        storage.saved_queries().unwrap().is_empty()
+    });
 }

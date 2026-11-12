@@ -26,6 +26,22 @@ gpui_kit::actions!(
         RunAll,
         /// Cancels the statement the active tab is running.
         CancelQuery,
+        /// Shows the plan of the statement at the cursor.
+        ExplainStatement,
+        /// Runs the statement at the cursor and shows its plan with timings.
+        ExplainAnalyze,
+        /// Opens a `.sql` file in a tab.
+        OpenSqlFile,
+        /// Writes the active tab to its file.
+        SaveFile,
+        /// Writes the active tab to a file chosen now.
+        SaveFileAs,
+        /// Shows what was run before.
+        ShowHistory,
+        /// Shows the queries saved under a name.
+        ShowSavedQueries,
+        /// Saves the text of the active tab under a name.
+        SaveQuery,
         /// Opens a new query tab.
         NewQueryTab,
         /// Closes the active tab.
@@ -122,6 +138,54 @@ pub const COMMANDS: &[Command] = &[
         NewQueryTab
     ),
     command!(
+        "open_sql_file",
+        "Open SQL File…",
+        "Files",
+        ["secondary-o"],
+        ["load", "script"],
+        OpenSqlFile
+    ),
+    command!(
+        "save_file",
+        "Save",
+        "Files",
+        ["secondary-s"],
+        ["write", "sql", "file"],
+        SaveFile
+    ),
+    command!(
+        "save_file_as",
+        "Save As…",
+        "Files",
+        ["secondary-shift-s"],
+        ["write", "sql", "file"],
+        SaveFileAs
+    ),
+    command!(
+        "show_history",
+        "Query History",
+        "Query",
+        ["secondary-y"],
+        ["past", "recent", "ran"],
+        ShowHistory
+    ),
+    command!(
+        "show_saved_queries",
+        "Saved Queries",
+        "Query",
+        [],
+        ["snippets", "favourites", "library"],
+        ShowSavedQueries
+    ),
+    command!(
+        "save_query",
+        "Save Query…",
+        "Query",
+        [],
+        ["name", "snippet", "favourite", "keep"],
+        SaveQuery
+    ),
+    command!(
         "run_statement",
         "Run Statement",
         "Query",
@@ -144,6 +208,22 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-."],
         ["stop", "abort", "kill"],
         CancelQuery
+    ),
+    command!(
+        "explain_statement",
+        "Explain Statement",
+        "Query",
+        ["secondary-e"],
+        ["plan", "query plan"],
+        ExplainStatement
+    ),
+    command!(
+        "explain_analyze",
+        "Explain Analyze (Runs the Statement)",
+        "Query",
+        ["secondary-shift-e"],
+        ["plan", "timing", "slow"],
+        ExplainAnalyze
     ),
     command!(
         "close_tab",

@@ -2,7 +2,7 @@
 //! commands that act on them.
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -26,15 +26,17 @@ use gpui_kit::{
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, CancelQuery, CloseTab, ExportConnections, ImportConnections, NewConnection,
-    NewQueryTab, NextTab, OpenCommandPalette, OpenSettings, PreviousTab, RunAll, RunStatement,
-    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
+    ImportConnections, NewConnection, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings,
+    OpenSqlFile, PreviousTab, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory,
+    ShowSavedQueries, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
+use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, Scope, TabStatus, duration_text};
 use crate::sidebar::Sidebar;
@@ -42,6 +44,7 @@ use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::tabs::{TabSnapshot, Target};
 use crate::theme::{self, Appearance};
 use kerno_core::TxState;
+use kerno_core::storage::SavedQuery;
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
@@ -103,8 +106,17 @@ impl Workspace {
         };
         for snapshot in tabs {
             match snapshot {
-                TabSnapshot::Query { title, sql, target } => {
-                    workspace.push_query_tab(title, &sql, target, window, cx)
+                TabSnapshot::Query {
+                    title,
+                    sql,
+                    target,
+                    file,
+                    unsaved,
+                } => {
+                    let tab = workspace.push_query_tab(title, &sql, target, window, cx);
+                    if let Some(file) = file {
+                        tab.update(cx, |tab, cx| tab.set_file(file, unsaved, cx));
+                    }
                 }
             }
         }
@@ -141,7 +153,7 @@ impl Workspace {
         target: Option<Target>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Entity<QueryTab> {
         // Keep "Query N" numbers unique across restored and new tabs.
         if let Some(number) = title
             .strip_prefix("Query ")
@@ -154,8 +166,9 @@ impl Workspace {
         let editor = tab.read(cx).editor().clone();
         self.tab_subscriptions
             .push(cx.observe(&editor, |this, _, cx| this.schedule_save(cx)));
-        self.tabs.push(tab);
+        self.tabs.push(tab.clone());
         self.active_tab = self.tabs.len() - 1;
+        tab
     }
 
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -217,24 +230,7 @@ impl Workspace {
 
     fn new_query_tab(&mut self, _: &NewQueryTab, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("Query {}", self.next_query_number);
-        // A new tab runs on the connection being browsed, when it is open.
-        let target = self
-            .sidebar
-            .read(cx)
-            .navigator()
-            .read(cx)
-            .connection()
-            .filter(|id| {
-                matches!(
-                    self.connections.read(cx).status(id),
-                    Status::Connected { .. }
-                )
-            })
-            .map(|id| Target {
-                connection: id.to_string(),
-                database: None,
-                schema: None,
-            });
+        let target = self.default_target(cx);
         self.push_query_tab(title, "", target, window, cx);
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
@@ -404,6 +400,262 @@ impl Workspace {
         self.sidebar.read(cx).navigator().clone()
     }
 
+    // Files and the library -----------------------------------------------------
+
+    /// The connection new tabs run on: the one being browsed, when open.
+    fn default_target(&self, cx: &App) -> Option<Target> {
+        self.sidebar
+            .read(cx)
+            .navigator()
+            .read(cx)
+            .connection()
+            .filter(|id| {
+                matches!(
+                    self.connections.read(cx).status(id),
+                    Status::Connected { .. }
+                )
+            })
+            .map(|id| Target {
+                connection: id.to_string(),
+                database: None,
+                schema: None,
+            })
+    }
+
+    /// Opens a tab holding `sql` and gives it the keyboard.
+    fn open_query(
+        &mut self,
+        title: String,
+        sql: &str,
+        target: Option<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<QueryTab> {
+        let tab = self.push_query_tab(title, sql, target, window, cx);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.schedule_save(cx);
+        tab
+    }
+
+    fn open_sql_file(&mut self, _: &OpenSqlFile, window: &mut Window, cx: &mut Context<Self>) {
+        let picking = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picking.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.open_sql_file_from(path, window, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the file at `path` in a tab of its own.
+    pub fn open_sql_file_from(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A file that is already open is shown, not opened twice.
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.read(cx).file() == Some(path.as_path()))
+        {
+            self.activate_tab(index, window, cx);
+            return;
+        }
+        let source = path.clone();
+        let reading = bridge::spawn_blocking(cx, move || std::fs::read_to_string(&source));
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(sql) => {
+                    let target = this.default_target(cx);
+                    let tab = this.open_query(String::new(), &sql, target, window, cx);
+                    tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
+                    this.schedule_save(cx);
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "{} could not be opened: {error}",
+                        path.display()
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        let file = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf));
+        match file {
+            Some(path) => self.save_active_tab_to(path, window, cx),
+            None => self.save_file_as(&SaveFileAs, window, cx),
+        }
+    }
+
+    fn save_file_as(&mut self, _: &SaveFileAs, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let tab = tab.read(cx);
+        let (directory, name) = match tab.file() {
+            Some(file) => (
+                file.parent().map(Path::to_path_buf).unwrap_or_default(),
+                file.file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            ),
+            None => (
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                Some(format!(
+                    "{}.sql",
+                    tab.title().to_lowercase().replace(' ', "-")
+                )),
+            ),
+        };
+        let picking = cx.prompt_for_new_path(&directory, name.as_deref());
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = picking.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.save_active_tab_to(path, window, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Writes the text of the active tab to `path`, which becomes its file.
+    pub fn save_active_tab_to(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab).cloned() else {
+            return;
+        };
+        let sql = tab.read(cx).sql(cx);
+        let target = path.clone();
+        let writing = bridge::spawn_blocking(cx, move || std::fs::write(&target, sql));
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = writing.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(()) => {
+                    tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
+                    this.schedule_save(cx);
+                    cx.notify();
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "{} could not be written: {error}",
+                        path.display()
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    fn show_library(&mut self, shelf: Shelf, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.read(cx).connection_id().map(str::to_string));
+        let workspace = cx.entity();
+        Library::open(
+            shelf,
+            connection,
+            self.connections.clone(),
+            window,
+            cx,
+            move |title, sql, target, window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.open_query(title, &sql, target, window, cx);
+                });
+            },
+        );
+    }
+
+    fn show_history(&mut self, _: &ShowHistory, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_library(Shelf::History, window, cx);
+    }
+
+    fn show_saved_queries(
+        &mut self,
+        _: &ShowSavedQueries,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_library(Shelf::Saved, window, cx);
+    }
+
+    fn save_query(&mut self, _: &SaveQuery, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let tab = tab.read(cx);
+        let (sql, connection_id) = (tab.sql(cx), tab.connection_id().map(str::to_string));
+        if sql.trim().is_empty() {
+            return;
+        }
+        let workspace = cx.entity();
+        library::ask_name(
+            tab.title().to_string(),
+            window,
+            cx,
+            move |name, folder, window, cx| {
+                let query = SavedQuery {
+                    id: 0,
+                    connection_id: connection_id.clone(),
+                    folder,
+                    name: name.clone(),
+                    sql: sql.clone(),
+                };
+                workspace.update(cx, |this, cx| this.store_query(query, window, cx));
+            },
+        );
+    }
+
+    /// Writes a saved query to the store and says so.
+    pub fn store_query(&mut self, query: SavedQuery, window: &mut Window, cx: &mut Context<Self>) {
+        let storage = AppState::get(cx).storage.clone();
+        let name = query.name.clone();
+        let saving = bridge::spawn_blocking(cx, move || storage.save_query(&query));
+        cx.spawn_in(window, async move |_, cx| {
+            let outcome = saving.await;
+            let _ = cx.update(|window, cx| match outcome {
+                Ok(_) => window.push_notification(
+                    Notification::success(SharedString::from(format!(
+                        "Saved “{name}”. Find it under Saved Queries."
+                    ))),
+                    cx,
+                ),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "“{name}” was not saved: {error}"
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
     // Running ------------------------------------------------------------------
 
     fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
@@ -415,6 +667,23 @@ impl Workspace {
     fn run_all(&mut self, _: &RunAll, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
             tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx));
+        }
+    }
+
+    fn explain_statement(
+        &mut self,
+        _: &ExplainStatement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.explain(false, window, cx));
+        }
+    }
+
+    fn explain_analyze(&mut self, _: &ExplainAnalyze, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.update(cx, |tab, cx| tab.explain(true, window, cx));
         }
     }
 
@@ -797,7 +1066,7 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                Tab::new().label(tab.read(cx).title()).suffix(
+                Tab::new().label(tab_label(tab.read(cx))).suffix(
                     Button::new(("close-tab", index))
                         .ghost()
                         .xsmall()
@@ -931,6 +1200,15 @@ impl Workspace {
     }
 }
 
+/// The name on a tab: its title, marked when its file has unsaved changes.
+fn tab_label(tab: &QueryTab) -> SharedString {
+    if tab.file().is_some() && tab.unsaved() {
+        SharedString::from(format!("{} •", tab.title()))
+    } else {
+        tab.title()
+    }
+}
+
 /// The commands shown in the palette, grouped, in display order.
 fn palette_groups() -> Vec<(&'static str, Vec<&'static actions::Command>)> {
     let mut groups: Vec<(&'static str, Vec<&'static actions::Command>)> = Vec::new();
@@ -991,9 +1269,17 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::open_sql_file))
+            .on_action(cx.listener(Self::save_file))
+            .on_action(cx.listener(Self::save_file_as))
+            .on_action(cx.listener(Self::show_history))
+            .on_action(cx.listener(Self::show_saved_queries))
+            .on_action(cx.listener(Self::save_query))
             .on_action(cx.listener(Self::run_statement))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
+            .on_action(cx.listener(Self::explain_statement))
+            .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::import_connections))
             .on_action(cx.listener(Self::export_connections))
             .size_full()

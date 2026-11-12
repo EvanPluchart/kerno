@@ -4,6 +4,7 @@ mod actions;
 mod bridge;
 mod connections;
 mod engine_logo;
+mod library;
 mod logging;
 mod navigator;
 mod query;
@@ -24,9 +25,10 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, CancelQuery, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
-    OpenCommandPalette, OpenSettings, Quit, RunAll, RunStatement, ToggleSidebar, UseDarkTheme,
-    UseLightTheme, UseSystemTheme,
+    About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections,
+    ImportConnections, NewConnection, NewQueryTab, OpenCommandPalette, OpenSettings, OpenSqlFile,
+    Quit, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries,
+    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -143,6 +145,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New Query Tab", NewQueryTab),
                 MenuItem::action("New Connection…", NewConnection),
                 MenuItem::separator(),
+                MenuItem::action("Open SQL File…", OpenSqlFile),
+                MenuItem::action("Save", SaveFile),
+                MenuItem::action("Save As…", SaveFileAs),
+                MenuItem::separator(),
                 MenuItem::action("Import Connections…", ImportConnections),
                 MenuItem::action("Export Connections…", ExportConnections),
                 MenuItem::separator(),
@@ -156,7 +162,14 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Run Statement", RunStatement),
                 MenuItem::action("Run All Statements", RunAll),
                 MenuItem::separator(),
+                MenuItem::action("Explain Statement", ExplainStatement),
+                MenuItem::action("Explain Analyze", ExplainAnalyze),
+                MenuItem::separator(),
                 MenuItem::action("Cancel Running Statement", CancelQuery),
+                MenuItem::separator(),
+                MenuItem::action("Query History", ShowHistory),
+                MenuItem::action("Saved Queries", ShowSavedQueries),
+                MenuItem::action("Save Query…", SaveQuery),
             ],
             disabled: false,
         },

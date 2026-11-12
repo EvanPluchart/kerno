@@ -2,38 +2,48 @@
 //! statements returned.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, Position};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, Position};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    div, px,
 };
+use kerno_core::config::Environment;
 use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, find_params, split_statements, statement_at,
 };
+use kerno_core::sql::{StatementClass, StatementKind, classify};
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
-use kerno_core::{Error, ExecEvent, Notice, ResultStore, RowLimit, Session, TxState, exec};
+use kerno_core::{
+    Dialect, Error, ExecEvent, Notice, Plan, ResultStore, RowLimit, Session, TxState, exec,
+};
 
 use super::grid::{CopyFormat, Grid};
 use super::params;
-use super::viewer;
+use super::{plan_view, viewer};
+use crate::actions::{ShowHistory, ShowSavedQueries};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
+use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
 
@@ -111,6 +121,17 @@ impl From<&Error> for Failure {
 pub enum Outcome {
     /// Rows, in a grid.
     Rows(Entity<TableState<Grid>>),
+    /// The plan of the statement (EXPLAIN).
+    Plan {
+        /// The plan as a tree; `None` when the output could not be read.
+        plan: Option<Plan>,
+        /// What the server returned, as it is.
+        raw: String,
+        /// Why there is no tree, when there is none.
+        problem: Option<String>,
+        /// The raw output is shown instead of the tree.
+        show_raw: bool,
+    },
     /// It ran and returned no rows.
     Done,
     /// The server refused it.
@@ -213,6 +234,12 @@ pub struct QueryTab {
     param_values: HashMap<String, String>,
     /// The editor shows where the last statement failed.
     error_marked: bool,
+    /// The `.sql` file the text was read from or written to.
+    file: Option<PathBuf>,
+    /// The text was changed since it was read or written.
+    unsaved: bool,
+    /// The run being prepared asks for a plan: `Some(analyze)`.
+    explain_mode: Option<bool>,
     grid_subscriptions: Vec<Subscription>,
     /// Bumped at every run and target change, so late answers are dropped.
     generation: u64,
@@ -238,6 +265,14 @@ impl QueryTab {
                 .soft_wrap(false)
                 .default_value(sql)
                 .placeholder("Write SQL here")
+        });
+        // An edit makes a file's tab differ from its file. (Moving the
+        // cursor also notifies observers; only a change of text counts.)
+        let edits = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && this.file.is_some() && !this.unsaved {
+                this.unsaved = true;
+                cx.notify();
+            }
         });
         let subscription = cx.subscribe(&connections, |this, _, event: &ConnectionsEvent, cx| {
             if let ConnectionsEvent::StatusChanged { id } = event
@@ -266,9 +301,12 @@ impl QueryTab {
             manual_commit: false,
             param_values: HashMap::new(),
             error_marked: false,
+            file: None,
+            unsaved: false,
+            explain_mode: None,
             grid_subscriptions: Vec::new(),
             generation: 0,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, edits],
         };
         tab.follow_connection(cx);
         tab
@@ -295,7 +333,37 @@ impl QueryTab {
             title: self.title.to_string(),
             sql: self.sql(cx),
             target: self.target.clone(),
+            file: self.file.clone(),
+            unsaved: self.unsaved,
         }
+    }
+
+    /// The `.sql` file of this tab, when it has one.
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// Whether the text differs from its file's (always, without a file).
+    pub fn unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    /// The tab is the file at `path` from now on, named after it; its text
+    /// is what the file holds unless `unsaved`.
+    pub fn set_file(&mut self, path: PathBuf, unsaved: bool, cx: &mut Context<Self>) {
+        if let Some(name) = path.file_name() {
+            self.title = SharedString::from(name.to_string_lossy().into_owned());
+        }
+        self.file = Some(path);
+        self.unsaved = unsaved;
+        cx.notify();
+    }
+
+    /// The connection the tab runs on.
+    pub fn connection_id(&self) -> Option<&str> {
+        self.target
+            .as_ref()
+            .map(|target| target.connection.as_str())
     }
 
     #[cfg(test)]
@@ -370,6 +438,14 @@ impl QueryTab {
                     format!("failed [{}]", failure.code.clone().unwrap_or_default())
                 }
                 Outcome::Cancelled => "cancelled".into(),
+                Outcome::Plan {
+                    plan: Some(plan), ..
+                } => {
+                    format!("plan, {} steps", plan_view::rows(plan).len())
+                }
+                Outcome::Plan { problem, .. } => {
+                    format!("plan unread: {}", problem.clone().unwrap_or_default())
+                }
             })
             .collect()
     }
@@ -642,7 +718,28 @@ impl QueryTab {
     /// Runs the statements of `scope`, one after the other, stopping at
     /// the first that fails.
     pub fn run(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        let statements = self.statements(scope, cx);
+        self.launch(scope, None, window, cx);
+    }
+
+    /// Shows the plan of the statement at the cursor. With `analyze` the
+    /// statement is run and the plan carries what really happened.
+    pub fn explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch(Scope::AtCursor, Some(analyze), window, cx);
+    }
+
+    fn launch(
+        &mut self,
+        scope: Scope,
+        explain: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut statements = self.statements(scope, cx);
+        if explain.is_some() {
+            // One plan at a time: the first statement of a selection.
+            statements.truncate(1);
+        }
+        self.explain_mode = explain;
         if statements.is_empty() {
             return;
         }
@@ -750,6 +847,108 @@ impl QueryTab {
     /// Runs `statements` one after the other, stopping at the first that
     /// fails.
     fn execute(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        let connections = self.connections.read(cx);
+        let saved = self
+            .target
+            .as_ref()
+            .and_then(|target| connections.get(&target.connection));
+        let meta = self
+            .target
+            .as_ref()
+            .and_then(|target| connections.meta_session(&target.connection));
+        let (Some(saved), Some(meta)) = (saved, meta) else {
+            // Nothing to run on: the run itself says so.
+            self.start(statements, window, cx);
+            return;
+        };
+        // What will be sent decides: EXPLAIN ANALYZE runs the statement.
+        let explain = self.explain_mode;
+        let classes: Vec<StatementClass> = statements
+            .iter()
+            .map(|statement| match explain {
+                Some(analyze) => classify(&meta.dialect().explain(&statement.sql, analyze), rules),
+                None => classify(&statement.sql, rules),
+            })
+            .collect();
+        let name = saved.config.name.clone();
+        if saved.config.read_only
+            && let Some(blocked) = classes.iter().position(|class| class.writes)
+        {
+            self.stop(cx);
+            self.results.clear();
+            self.grid_subscriptions.clear();
+            self.notices.clear();
+            self.results.push(ResultPane {
+                statement: statements[blocked].sql.clone(),
+                outcome: Outcome::Failed(Failure {
+                    message: format!(
+                        "“{name}” is a read-only connection: this statement would change the database and was not run."
+                    ),
+                    code: None,
+                    detail: None,
+                    hint: Some("Untick “Read-only” in the connection's settings to allow changes.".into()),
+                    position: None,
+                }),
+                rows_affected: None,
+                elapsed: None,
+            });
+            self.active_result = 0;
+            cx.notify();
+            return;
+        }
+        // Statements that destroy something are shown and confirmed first;
+        // on a production connection, so is anything that writes.
+        let production = saved.config.environment == Environment::Production;
+        let ask_destructive = AppState::get(cx).settings.confirm_destructive;
+        let to_confirm: Vec<&Statement> = statements
+            .iter()
+            .zip(&classes)
+            .filter(|(_, class)| {
+                (class.destructive && ask_destructive) || (production && class.writes)
+            })
+            .map(|(statement, _)| statement)
+            .collect();
+        if to_confirm.is_empty() {
+            self.start(statements, window, cx);
+            return;
+        }
+        let destructive = classes.iter().any(|class| class.destructive);
+        let confirmation = Confirmation {
+            title: match to_confirm.len() {
+                1 => "Run this statement?".to_string(),
+                count => format!("Run these {count} statements?"),
+            },
+            explanation: if destructive {
+                "It removes data or objects for good (a DROP, a TRUNCATE, an ALTER that drops, or a DELETE \
+                 or UPDATE without a WHERE). This cannot be undone."
+                    .to_string()
+            } else {
+                "It changes the database.".to_string()
+            },
+            statement: ConfirmStatement::Fixed(
+                to_confirm
+                    .iter()
+                    .map(|statement| statement.sql.as_str())
+                    .collect::<Vec<_>>()
+                    .join(";\n\n"),
+            ),
+            action: "Run",
+            destructive,
+            connection: name,
+            environment: saved.config.environment,
+        };
+        let view = cx.entity();
+        sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
+            let statements = statements.clone();
+            view.update(cx, |this, cx| this.start(statements, window, cx));
+            let editor = view.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, cx| editor.focus(window, cx));
+        });
+    }
+
+    /// Runs the statements, guards passed.
+    fn start(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
         self.stop(cx);
         self.generation += 1;
         self.results.clear();
@@ -765,6 +964,8 @@ impl QueryTab {
         };
         let page = u64::from(AppState::get(cx).settings.page_size).max(1);
         let manual = self.manual_commit;
+        let explain = self.explain_mode;
+        let rules = self.lex_rules(cx);
         let session = self.session(cx);
         self.run = Some(cx.spawn_in(window, async move |this, cx| {
             let session = match session.await {
@@ -816,6 +1017,17 @@ impl QueryTab {
                 // How the statement ended, for the history and the editor.
                 let mut ended: Option<(HistoryStatus, Option<Failure>)> = None;
                 let mut row_count: Option<u64> = None;
+                // Only statements that change rows have a count worth showing.
+                let counts_rows = matches!(
+                    classify(&statement.sql, rules).kind,
+                    StatementKind::Insert
+                        | StatementKind::Update
+                        | StatementKind::Delete
+                        | StatementKind::Merge
+                        | StatementKind::Copy
+                );
+                // The pane the statement's rows went to, for its plan.
+                let mut rows_pane: Option<usize> = None;
                 let _ = this.update(cx, |this, cx| {
                     this.activity = Activity::Running {
                         index,
@@ -824,8 +1036,13 @@ impl QueryTab {
                     };
                     cx.notify();
                 });
+                // A plan is asked for by wrapping the statement.
+                let sent = match explain {
+                    Some(analyze) => session.dialect().explain(&statement.sql, analyze),
+                    None => statement.sql.clone(),
+                };
                 let starting = {
-                    let (session, sql) = (session.clone(), statement.sql.clone());
+                    let (session, sql) = (session.clone(), sent.clone());
                     cx.update(|_, cx| {
                         // `exec::run` spawns the statement: it needs the runtime.
                         bridge::spawn(
@@ -852,6 +1069,7 @@ impl QueryTab {
                                     session.clone(),
                                 );
                                 pane = Some(this.open_grid(&statement.sql, grid, window, cx));
+                                rows_pane = pane;
                             }
                             ExecEvent::Rows(batch) => {
                                 if let Some(grid) = pane.and_then(|pane| this.results[pane].grid())
@@ -903,7 +1121,7 @@ impl QueryTab {
                                     this.results.push(ResultPane {
                                         statement: statement.sql.clone(),
                                         outcome: Outcome::Done,
-                                        rows_affected,
+                                        rows_affected: rows_affected.filter(|_| counts_rows),
                                         elapsed: Some(started.elapsed()),
                                     })
                                 }
@@ -970,6 +1188,14 @@ impl QueryTab {
                         break;
                     }
                 }
+                if explain.is_some()
+                    && let Some(pane) = rows_pane
+                {
+                    let dialect_of = session.clone();
+                    let _ = this.update(cx, |this, cx| {
+                        this.show_plan(pane, dialect_of.dialect(), explain == Some(true), cx)
+                    });
+                }
                 let (status, failure) = ended.unwrap_or((HistoryStatus::Ok, None));
                 let _ = this.update(cx, |this, cx| {
                     let ended = Ended {
@@ -977,9 +1203,15 @@ impl QueryTab {
                         elapsed: started.elapsed(),
                         status,
                         failure,
-                        row_count,
+                        // The lines of a plan are not rows of data.
+                        row_count: row_count.filter(|_| explain.is_none()),
                     };
-                    this.statement_ended(&statement, ended, cx)
+                    // The history holds what was sent: an EXPLAIN is one.
+                    let recorded = Statement {
+                        sql: sent.clone(),
+                        origin: statement.origin.filter(|_| explain.is_none()),
+                    };
+                    this.statement_ended(&recorded, ended, cx)
                 });
                 if failed {
                     break;
@@ -1113,6 +1345,39 @@ impl QueryTab {
             });
         })
         .detach();
+    }
+
+    /// Replaces the rows an EXPLAIN returned by its plan as a tree.
+    fn show_plan(
+        &mut self,
+        pane: usize,
+        dialect: &dyn Dialect,
+        analyze: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(grid) = self.results.get(pane).and_then(ResultPane::grid) else {
+            return;
+        };
+        // The output is one cell, or one line per row for text plans.
+        let raw = {
+            let grid = grid.read(cx).delegate();
+            (0..grid.row_count())
+                .filter_map(|row| grid.value_at(row, 1).and_then(|(_, value)| value))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (plan, problem) = match dialect.parse_plan(&raw, analyze) {
+            Ok(plan) => (Some(plan), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        self.results[pane].outcome = Outcome::Plan {
+            show_raw: plan.is_none(),
+            plan,
+            raw,
+            problem,
+        };
+        cx.notify();
     }
 
     /// Adds the pane of a result set that starts to arrive.
@@ -1425,6 +1690,24 @@ impl QueryTab {
                 )
             })
             .child(div().flex_1())
+            .child(
+                Button::new("tab-history")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(Glyph::Clock))
+                    .tooltip("Query history (Cmd+Y)")
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowHistory), cx)),
+            )
+            .child(
+                Button::new("tab-saved")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(Glyph::Bookmark))
+                    .tooltip("Saved queries")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ShowSavedQueries), cx)
+                    }),
+            )
             .when(waiting, |this| {
                 this.child(
                     Button::new("tab-cancel")
@@ -1435,6 +1718,36 @@ impl QueryTab {
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )
             })
+            .child(
+                Button::new("tab-explain")
+                    .ghost()
+                    .small()
+                    .label("Explain")
+                    .dropdown_caret(true)
+                    .disabled(running)
+                    .dropdown_menu({
+                        let view = view.clone();
+                        move |menu, _, _| {
+                            let (plan, analyze) = (view.clone(), view.clone());
+                            menu.item(
+                                PopupMenuItem::new(
+                                    "Explain: the plan, without running the statement",
+                                )
+                                .on_click(move |_, window, cx| {
+                                    plan.update(cx, |this, cx| this.explain(false, window, cx))
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(
+                                    "Explain analyze: runs the statement and times each step",
+                                )
+                                .on_click(move |_, window, cx| {
+                                    analyze.update(cx, |this, cx| this.explain(true, window, cx))
+                                }),
+                            )
+                        }
+                    }),
+            )
             .child(
                 Button::new("tab-run-all")
                     .ghost()
@@ -1475,6 +1788,64 @@ impl QueryTab {
                     None => "Done.".to_string(),
                 }))
                 .into_any_element(),
+            Outcome::Plan {
+                plan,
+                raw,
+                problem,
+                show_raw,
+            } => {
+                let show_raw = *show_raw || plan.is_none();
+                let view = |raw_view: bool, id: &'static str, label: &'static str| {
+                    Button::new(id)
+                        .ghost()
+                        .xsmall()
+                        .label(label)
+                        .selected(show_raw == raw_view)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let active = this.active_result;
+                            if let Some(Outcome::Plan { show_raw, .. }) =
+                                this.results.get_mut(active).map(|pane| &mut pane.outcome)
+                            {
+                                *show_raw = raw_view;
+                            }
+                            cx.notify();
+                        }))
+                };
+                v_flex()
+                    .size_full()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .child(view(false, "plan-as-tree", "Plan").disabled(plan.is_none()))
+                            .child(view(true, "plan-as-raw", "Raw output"))
+                            .children(problem.clone().map(|problem| {
+                                div().pl_2().text_xs().text_color(theme.warning).child(
+                                    SharedString::from(format!(
+                                        "The plan could not be read as a tree: {problem}"
+                                    )),
+                                )
+                            })),
+                    )
+                    .child(
+                        div().flex_1().min_h_0().child(match plan {
+                            Some(plan) if !show_raw => plan_view::render(plan, cx),
+                            _ => div()
+                                .id("plan-raw")
+                                .test_support()
+                                .size_full()
+                                .p_3()
+                                .overflow_y_scroll()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .child(SharedString::from(raw.clone()))
+                                .into_any_element(),
+                        }),
+                    )
+                    .into_any_element()
+            }
             Outcome::Cancelled => div()
                 .id("result-cancelled")
                 .test_support()
@@ -1575,6 +1946,7 @@ impl QueryTab {
             .children(self.results.iter().enumerate().map(|(index, pane)| {
                 Tab::new().label(SharedString::from(match &pane.outcome {
                     Outcome::Failed(_) => format!("Error {}", index + 1),
+                    Outcome::Plan { .. } => format!("Plan {}", index + 1),
                     _ => format!("Result {}", index + 1),
                 }))
             }))
