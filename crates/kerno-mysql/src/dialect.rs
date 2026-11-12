@@ -204,6 +204,21 @@ impl Dialect for MysqlDialect {
         }
     }
 
+    fn type_for(&self, kind: TypeKind) -> &'static str {
+        match kind {
+            TypeKind::Integer => "bigint",
+            TypeKind::Float => "double",
+            TypeKind::Decimal => "decimal(38,10)",
+            TypeKind::Boolean => "tinyint(1)",
+            TypeKind::Date => "date",
+            TypeKind::DateTime | TypeKind::DateTimeTz => "datetime",
+            TypeKind::Uuid => "char(36)",
+            TypeKind::Json => "json",
+            TypeKind::Binary => "longblob",
+            _ => "text",
+        }
+    }
+
     /// Neither engine has `DEFAULT VALUES`; both accept empty lists.
     fn insert_defaults(&self, table: &TableRef) -> String {
         format!("INSERT INTO {} () VALUES ()", self.table_name(table))

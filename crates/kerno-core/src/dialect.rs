@@ -39,6 +39,10 @@ pub trait Dialect: Send + Sync {
         )
     }
 
+    /// The column type for values of `kind`, when a table is created to
+    /// hold imported data. Kinds without a natural type are text.
+    fn type_for(&self, kind: TypeKind) -> &'static str;
+
     /// The clause that limits a `SELECT` to `limit` rows starting at `offset`.
     fn limit_offset(&self, limit: u64, offset: u64) -> String {
         if offset == 0 {
@@ -497,6 +501,9 @@ pub(crate) mod test_support {
         }
         fn explain(&self, sql: &str, _: bool) -> String {
             format!("EXPLAIN {sql}")
+        }
+        fn type_for(&self, _: TypeKind) -> &'static str {
+            "text"
         }
     }
 }

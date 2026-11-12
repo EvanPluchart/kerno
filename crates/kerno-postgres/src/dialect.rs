@@ -3,7 +3,7 @@
 use kerno_core::dialect::{Dialect, default_drop_sql, default_rename_sql, hex};
 use kerno_core::schema::{ObjectRef, RoutineKind};
 use kerno_core::sql::LexRules;
-use kerno_core::{Engine, Plan, Result};
+use kerno_core::{Engine, Plan, Result, TypeKind};
 
 /// The PostgreSQL dialect.
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,6 +64,21 @@ impl Dialect for PgDialect {
         // decode() rather than a '\x..' literal, which depends on
         // standard_conforming_strings.
         format!("decode('{}', 'hex')", hex(bytes))
+    }
+
+    fn type_for(&self, kind: TypeKind) -> &'static str {
+        match kind {
+            TypeKind::Integer => "bigint",
+            TypeKind::Float => "double precision",
+            TypeKind::Decimal => "numeric",
+            TypeKind::Boolean => "boolean",
+            TypeKind::Date => "date",
+            TypeKind::DateTime | TypeKind::DateTimeTz => "timestamptz",
+            TypeKind::Uuid => "uuid",
+            TypeKind::Json => "jsonb",
+            TypeKind::Binary => "bytea",
+            _ => "text",
+        }
     }
 
     /// `CHAR` without a length is one character here.
