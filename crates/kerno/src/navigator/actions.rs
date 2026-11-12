@@ -3,6 +3,7 @@
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind};
 
 use super::model::{Group, Node, NodeKind};
+use crate::settings::TableDoubleClick;
 
 /// A statement written for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,8 @@ pub enum Action {
     CreateEnum,
     AddEnumValue,
     RenameEnumValue,
+    Export,
+    ImportCsv,
     Refresh,
 }
 
@@ -69,6 +72,8 @@ impl Action {
             Action::CreateEnum => "Create enum…",
             Action::AddEnumValue => "Add value…",
             Action::RenameEnumValue => "Rename value…",
+            Action::Export => "Export…",
+            Action::ImportCsv => "Import CSV…",
             Action::Refresh => "Refresh",
         }
     }
@@ -90,6 +95,7 @@ impl Action {
                 | Action::CreateEnum
                 | Action::AddEnumValue
                 | Action::RenameEnumValue
+                | Action::ImportCsv
         )
     }
 }
@@ -116,16 +122,19 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         // A MySQL database is where its tables are, like a schema.
         NodeKind::Object(ObjectRef::Database(_)) => vec![
             vec![NewQueryHere, CreateTable, CreateView, CreateDatabase],
+            vec![ImportCsv],
             vec![ShowDdl, CopyName],
             vec![Drop],
         ],
         NodeKind::Object(ObjectRef::Schema(_)) => vec![
             vec![NewQueryHere, CreateTable, CreateView, CreateSchema],
+            vec![ImportCsv],
             vec![ShowDdl, CopyName],
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
             vec![OpenData, OpenStructure],
+            vec![Export, ImportCsv],
             all_templates.to_vec(),
             vec![ShowDdl, CopyName],
             vec![Rename, Truncate, Drop],
@@ -135,6 +144,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             RelationKind::View | RelationKind::MaterializedView,
         )) => vec![
             vec![OpenData, OpenStructure, Generate(Template::Select)],
+            vec![Export],
             vec![ShowDdl, EditSource, CopyName],
             vec![Rename, Drop],
         ],
@@ -146,7 +156,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![vec![ShowDdl, CopyName], vec![AddEnumValue, Rename, Drop]]
         }
         NodeKind::Object(_) => vec![vec![ShowDdl, CopyName], vec![Rename, Drop]],
-        NodeKind::Group(Group::Tables) => vec![vec![CreateTable]],
+        NodeKind::Group(Group::Tables) => vec![vec![CreateTable, ImportCsv]],
         NodeKind::Group(Group::Views) => vec![vec![CreateView]],
         // The folder exists on PostgreSQL only.
         NodeKind::Group(Group::Types) => vec![vec![CreateEnum]],
@@ -161,6 +171,30 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Column { .. } => vec![vec![CopyName]],
     };
     groups.into_iter().chain([vec![Refresh]]).collect()
+}
+
+/// What a double click or Enter does to a node: an entry of its menu, or
+/// `None` to open or close it in the tree. Tables and views follow the
+/// user's setting; routines open their source; other objects their DDL.
+pub fn default_action(node: &Node, has_schemas: bool, table: TableDoubleClick) -> Option<Action> {
+    match &node.kind {
+        NodeKind::Object(ObjectRef::Relation(..)) => match table {
+            TableDoubleClick::Data => Some(Action::OpenData),
+            TableDoubleClick::Structure => Some(Action::OpenStructure),
+            TableDoubleClick::Expand => None,
+        },
+        NodeKind::Object(ObjectRef::Routine {
+            kind: RoutineKind::Function | RoutineKind::Procedure,
+            ..
+        }) => Some(Action::EditSource),
+        NodeKind::Object(ObjectRef::Schema(_) | ObjectRef::Database(_)) | NodeKind::Group(_) => {
+            None
+        }
+        _ => actions(node, has_schemas)
+            .concat()
+            .contains(&Action::ShowDdl)
+            .then_some(Action::ShowDdl),
+    }
 }
 
 #[cfg(test)]
@@ -232,8 +266,13 @@ mod tests {
 
         assert_eq!(
             flat(NodeKind::Group(Group::Tables), true),
-            [CreateTable, Refresh]
+            [CreateTable, ImportCsv, Refresh]
         );
+        // Rows go out of tables and views, and come into tables.
+        assert!(table.contains(&Export) && table.contains(&ImportCsv));
+        assert!(view.contains(&Export) && !view.contains(&ImportCsv));
+        assert!(schema.contains(&ImportCsv) && mysql_database.contains(&ImportCsv));
+        assert!(!pg_database.contains(&ImportCsv));
         assert_eq!(flat(NodeKind::Group(Group::Triggers), true), [Refresh]);
         assert_eq!(
             flat(
@@ -302,6 +341,64 @@ mod tests {
     }
 
     #[test]
+    fn a_double_click_opens_what_the_node_is_for() {
+        use Action::*;
+        let orders = TableRef::new("shop", "orders");
+        let open = |kind: NodeKind, table| default_action(&node(kind), true, table);
+        for kind in [
+            RelationKind::Table,
+            RelationKind::View,
+            RelationKind::MaterializedView,
+        ] {
+            let relation = NodeKind::Object(ObjectRef::Relation(orders.clone(), kind));
+            assert_eq!(
+                open(relation.clone(), TableDoubleClick::Data),
+                Some(OpenData)
+            );
+            assert_eq!(
+                open(relation.clone(), TableDoubleClick::Structure),
+                Some(OpenStructure)
+            );
+            assert_eq!(open(relation, TableDoubleClick::Expand), None);
+        }
+        let routine = |kind| {
+            NodeKind::Object(ObjectRef::Routine {
+                schema: "shop".into(),
+                name: "f".into(),
+                kind,
+                identity_arguments: String::new(),
+            })
+        };
+        let data = TableDoubleClick::Data;
+        assert_eq!(open(routine(RoutineKind::Function), data), Some(EditSource));
+        assert_eq!(
+            open(routine(RoutineKind::Procedure), data),
+            Some(EditSource)
+        );
+        assert_eq!(open(routine(RoutineKind::Aggregate), data), Some(ShowDdl));
+        assert_eq!(
+            open(NodeKind::Object(ObjectRef::Sequence(orders.clone())), data),
+            Some(ShowDdl)
+        );
+        // Containers open and close.
+        assert_eq!(
+            open(NodeKind::Object(ObjectRef::Schema("shop".into())), data),
+            None
+        );
+        assert_eq!(
+            open(NodeKind::Object(ObjectRef::Database("kerno".into())), data),
+            None
+        );
+        assert_eq!(open(NodeKind::Group(Group::Tables), data), None);
+        // Nothing to show for a column.
+        let column = NodeKind::Column {
+            table: orders,
+            name: "id".into(),
+        };
+        assert_eq!(open(column, data), None);
+    }
+
+    #[test]
     fn only_statements_that_change_the_database_count_as_writes() {
         use Action::*;
         for action in [
@@ -316,6 +413,7 @@ mod tests {
             CreateEnum,
             AddEnumValue,
             RenameEnumValue,
+            ImportCsv,
         ] {
             assert!(action.writes(), "{action:?}");
         }
@@ -328,6 +426,7 @@ mod tests {
             ShowDdl,
             CopyName,
             CreateView,
+            Export,
             Refresh,
         ] {
             assert!(!action.writes(), "{action:?}");

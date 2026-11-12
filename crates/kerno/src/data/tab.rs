@@ -32,6 +32,7 @@ use kerno_core::{Error, ResultStore, Session, TxState, exec};
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
+use crate::export_dialog::{self, ExportDialog, Source};
 use crate::query::grid::{CopyFormat, Grid, RowMenu, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
@@ -903,6 +904,26 @@ impl DataTab {
         }
     }
 
+    /// Opens the export of every row the applied filter keeps, in the
+    /// order on screen.
+    pub fn export(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ExportDialog>> {
+        export_dialog::open(
+            self.connections.clone(),
+            self.target.clone(),
+            Source::Table {
+                table: self.table.clone(),
+                filter: self.applied.clone(),
+                sort: self.sort.clone(),
+            },
+            window,
+            cx,
+        )
+    }
+
     /// Forgets every pending change.
     pub fn discard(&mut self, cx: &mut Context<Self>) {
         self.change(cx, |pending, _| pending.clear());
@@ -1189,6 +1210,16 @@ impl DataTab {
                             table: this.table.clone(),
                             kind: this.kind,
                         })
+                    })),
+                )
+                .child(
+                    action(
+                        "data-export",
+                        "Export…",
+                        "Write every row matching the filter to a file",
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.export(window, cx);
                     })),
                 )
             })

@@ -42,6 +42,7 @@ use crate::data::tab::{DataTab, DataTabEvent};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
+use crate::settings::TableDoubleClick;
 use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
@@ -706,6 +707,10 @@ impl Workspace {
                 .content(|content, _, cx| {
                     let current = AppState::get(cx).appearance();
                     let selected = Appearance::ALL.iter().position(|a| *a == current);
+                    let double_click = AppState::get(cx).settings.table_double_click;
+                    let opens = TableDoubleClick::ALL
+                        .iter()
+                        .position(|choice| *choice == double_click);
                     content.child(
                         v_flex()
                             .gap_2()
@@ -717,6 +722,24 @@ impl Workspace {
                                     .on_change(|index, window, cx| {
                                         if let Some(appearance) = Appearance::ALL.get(*index) {
                                             Workspace::set_appearance(*appearance, window, cx);
+                                        }
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Double click on a table or view in the tree"),
+                            )
+                            .child(
+                                RadioGroup::new("table-double-click")
+                                    .children(TableDoubleClick::ALL.map(TableDoubleClick::label))
+                                    .selected_index(opens)
+                                    .on_change(|index, _, cx| {
+                                        if let Some(choice) = TableDoubleClick::ALL.get(*index) {
+                                            AppState::update_settings(cx, |settings| {
+                                                settings.table_double_click = *choice
+                                            });
                                         }
                                     }),
                             ),
@@ -838,6 +861,8 @@ impl Workspace {
                 let tab = self.open_query(title.clone(), sql, target.clone(), window, cx);
                 tab.update(cx, |tab, cx| tab.set_source(Some(schema.clone()), cx));
             }
+            // The import dialog is wired in a later step (M8 part 2).
+            NavigatorEvent::ImportCsv { .. } => {}
         }
     }
 

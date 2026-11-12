@@ -397,12 +397,40 @@ impl Fixture {
         self.press(cx, &[keys]);
     }
 
-    /// Clicks a row of the schema tree: opens or closes it.
+    /// Clicks the chevron of a row of the schema tree: opens or closes it.
+    /// A row without children has none, and nothing happens.
     fn toggle(&self, cx: &mut TestAppContext, path: &[&str]) {
         let row = self.tree_row(cx, path);
         self.step(cx, |window, cx| {
-            window.within("navigator").click(("node", row), cx)
+            let mut tree = window.within("navigator");
+            if tree.try_find(("node-chevron", row)).is_some() {
+                tree.click(("node-chevron", row), cx)
+            }
         });
+    }
+
+    /// Clicks a row of the schema tree, once or twice.
+    fn click_row(&self, cx: &mut TestAppContext, path: &[&str], double: bool) {
+        let row = self.tree_row(cx, path);
+        self.step(cx, |window, cx| {
+            let mut tree = window.within("navigator");
+            if double {
+                tree.double_click(("node", row), cx)
+            } else {
+                tree.click(("node", row), cx)
+            }
+        });
+    }
+
+    /// The row selected in the schema tree.
+    fn selected_row(&self, cx: &mut TestAppContext) -> Option<usize> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .selected_row(cx)
+        })
     }
 
     /// Waits until the stored tabs satisfy `predicate`.
@@ -1044,6 +1072,130 @@ fn the_schema_tree_opens_level_by_level(cx: &mut TestAppContext) {
     });
     app.toggle(cx, &["kerno_other", "public", "Tables"]);
     assert!(app.tree(cx).contains(&row(3, "notes")));
+}
+
+#[gpui_kit::test]
+fn a_click_selects_a_row_and_the_chevron_or_the_arrows_open_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let tables = ["kerno", "shop", "Tables"];
+    let customers = ["kerno", "shop", "Tables", "customers"];
+    app.open_path(cx, &customers);
+    let columns = || row(4, "Columns");
+
+    // One click selects; it opens nothing.
+    app.click_row(cx, &customers, false);
+    assert_eq!(app.selected_row(cx), Some(app.tree_row(cx, &customers)));
+    assert!(!app.is_open(cx, &customers));
+    assert!(!app.tree(cx).contains(&columns()), "{:#?}", app.tree(cx));
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+
+    // Right opens the selected row, then goes to its first child; Left
+    // goes back to the parent, then closes it.
+    app.press(cx, &["right"]);
+    app.wait_until(cx, "the folders of customers", |app, cx| {
+        app.tree(cx).contains(&columns())
+    });
+    app.press(cx, &["right"]);
+    let first_child = app.tree_row(cx, &["kerno", "shop", "Tables", "customers", "Columns"]);
+    assert_eq!(app.selected_row(cx), Some(first_child));
+    app.press(cx, &["left"]);
+    assert_eq!(app.selected_row(cx), Some(app.tree_row(cx, &customers)));
+    app.press(cx, &["left"]);
+    assert!(!app.tree(cx).contains(&columns()));
+    // Up and Down move the selection.
+    app.press(cx, &["down"]);
+    assert_eq!(app.selected_row(cx), Some(app.tree_row(cx, &customers) + 1));
+    app.press(cx, &["up"]);
+    assert_eq!(app.selected_row(cx), Some(app.tree_row(cx, &customers)));
+
+    // The chevron opens and closes.
+    app.toggle(cx, &customers);
+    assert!(app.tree(cx).contains(&columns()));
+    app.toggle(cx, &customers);
+    assert!(!app.tree(cx).contains(&columns()));
+
+    // A double click on a folder closes and opens it.
+    app.click_row(cx, &tables, true);
+    assert!(!app.tree(cx).contains(&row(3, "customers")));
+    app.click_row(cx, &tables, true);
+    assert!(app.tree(cx).contains(&row(3, "customers")));
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+}
+
+#[gpui_kit::test]
+fn a_double_click_or_enter_opens_what_the_row_is_for(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let table = |name: &'static str| ["kerno", "shop", "Tables", name];
+    app.open_path(cx, &table("customers"));
+
+    // A double click opens the rows of a table, and does not open the row.
+    app.click_row(cx, &table("customers"), true);
+    assert_eq!(app.titles(cx), ["customers"]);
+    assert!(cx.update(|cx| app.workspace.read(cx).active_data_tab().is_some()));
+    assert!(!app.is_open(cx, &table("customers")));
+
+    // Enter does the same for the selected row.
+    app.click_row(cx, &table("orders"), false);
+    app.press(cx, &["enter"]);
+    assert_eq!(app.titles(cx), ["customers", "orders"]);
+
+    // The setting: structure...
+    app.press(cx, &["secondary-,"]);
+    app.step(cx, |window, cx| {
+        window.within("table-double-click").click(1usize, cx)
+    });
+    app.press(cx, &["escape"]);
+    cx.update(|cx| {
+        assert_eq!(
+            AppState::get(cx).settings.table_double_click,
+            crate::settings::TableDoubleClick::Structure
+        )
+    });
+    app.click_row(cx, &table("products"), true);
+    assert_eq!(app.titles(cx).len(), 3);
+    assert!(cx.update(|cx| app.workspace.read(cx).active_structure_tab().is_some()));
+    // ...or open the row in the tree.
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            settings.table_double_click = crate::settings::TableDoubleClick::Expand
+        })
+    });
+    app.click_row(cx, &table("customers"), true);
+    app.wait_until(cx, "the folders of customers", |app, cx| {
+        app.tree(cx).contains(&row(4, "Columns"))
+    });
+    assert_eq!(app.titles(cx).len(), 3);
+
+    // A function opens its source.
+    app.open_path(cx, &["kerno", "shop", "Functions"]);
+    app.toggle(cx, &["kerno", "shop", "Functions"]);
+    app.wait_until(cx, "the functions", |app, cx| {
+        app.tree(cx)
+            .iter()
+            .any(|line| line.starts_with("      customer_lifetime_value"))
+    });
+    let function = app
+        .tree(cx)
+        .into_iter()
+        .find_map(|line| {
+            line.strip_prefix("      ")
+                .filter(|label| label.starts_with("customer_lifetime_value"))
+                .map(str::to_string)
+        })
+        .unwrap();
+    app.click_row(cx, &["kerno", "shop", "Functions", &function], true);
+    app.wait_until(cx, "the function's source", |app, cx| {
+        app.titles(cx).len() == 4
+    });
+    let (_, sql) = app.active_query(cx);
+    assert!(sql.contains("customer_lifetime_value"), "{sql}");
+    assert!(app.has(cx, "tab-apply-source"));
 }
 
 #[gpui_kit::test]

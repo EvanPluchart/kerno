@@ -49,6 +49,7 @@ use crate::actions::{ShowHistory, ShowSavedQueries};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
+use crate::export_dialog::{self, ExportDialog, Source};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
@@ -778,6 +779,34 @@ impl QueryTab {
             });
             Ok(session)
         })
+    }
+
+    /// Whether the result of `pane` can be exported: rows of a statement
+    /// that only reads, since an export runs it again.
+    fn exportable(&self, pane: &ResultPane, cx: &App) -> bool {
+        matches!(pane.outcome, Outcome::Rows(_))
+            && !classify(&pane.statement, self.lex_rules(cx)).writes
+    }
+
+    /// Opens the export of the result on screen; its statement runs again.
+    pub fn export_result(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ExportDialog>> {
+        let pane = self.results.get(self.active_result)?;
+        if !self.exportable(pane, cx) {
+            return None;
+        }
+        export_dialog::open(
+            self.connections.clone(),
+            self.target.clone()?,
+            Source::Query {
+                sql: pane.statement.clone(),
+            },
+            window,
+            cx,
+        )
     }
 
     /// The statements a run takes: the selection or, without one, the
@@ -2329,6 +2358,7 @@ impl QueryTab {
             Outcome::Rows(grid) => Some(grid.clone()),
             _ => None,
         };
+        let exportable = self.exportable(pane, cx);
         v_flex()
             .size_full()
             .child(tabs)
@@ -2382,6 +2412,18 @@ impl QueryTab {
                                         cx.notify();
                                     });
                                     cx.notify();
+                                })),
+                        )
+                    })
+                    .when(exportable, |this| {
+                        this.child(
+                            Button::new("result-export")
+                                .ghost()
+                                .xsmall()
+                                .label("Export…")
+                                .tooltip("Run the statement again and write all its rows to a file")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.export_result(window, cx);
                                 })),
                         )
                     })

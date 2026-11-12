@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::actions::{SelectLeft, SelectRight};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
@@ -18,18 +19,21 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task,
-    TestSupportExt as _, Window, div, px,
+    IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    div, px,
 };
+use kerno_core::browse::Filter;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{delete_template, insert_template, select_template, update_template};
 use kerno_core::{Session, exec};
 
-use super::actions::{Action, Template, actions};
+use super::actions::{Action, Template, actions, default_action};
 use super::model::{self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Tree};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
+use crate::export_dialog::{self, Source};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
@@ -64,6 +68,12 @@ pub enum NavigatorEvent {
         sql: String,
         target: Option<Target>,
         schema: String,
+    },
+    /// Import a CSV file into `table`, or into a new table of `schema`.
+    ImportCsv {
+        target: Target,
+        schema: String,
+        table: Option<TableRef>,
     },
 }
 
@@ -397,6 +407,34 @@ impl Navigator {
                 }
             }
             Action::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(name_of(&node))),
+            Action::Export => {
+                if let (NodeKind::Object(ObjectRef::Relation(table, _)), Some(target)) =
+                    (&node.kind, self.target_of(&node, false))
+                {
+                    let source = Source::Table {
+                        table: table.clone(),
+                        filter: Filter::default(),
+                        sort: None,
+                    };
+                    export_dialog::open(self.connections.clone(), target, source, window, cx);
+                }
+            }
+            Action::ImportCsv => {
+                if self.unavailable(action, &node, cx).is_none()
+                    && let (Some(target), Some(schema)) =
+                        (self.target_of(&node, false), node.schema.clone())
+                {
+                    let table = match &node.kind {
+                        NodeKind::Object(ObjectRef::Relation(table, _)) => Some(table.clone()),
+                        _ => None,
+                    };
+                    cx.emit(NavigatorEvent::ImportCsv {
+                        target,
+                        schema,
+                        table,
+                    });
+                }
+            }
             Action::CreateTable => {
                 if self.unavailable(action, &node, cx).is_none()
                     && let (Some(target), Some(schema)) =
@@ -1026,6 +1064,115 @@ impl Navigator {
         cx.notify();
     }
 
+    // Clicks and keys --------------------------------------------------------
+
+    fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tree_state
+            .update(cx, |state, cx| state.set_selected_index(Some(index), cx));
+    }
+
+    /// Opens the row's node, or closes it.
+    fn toggle_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((id, open)) = self
+            .tree_state
+            .read(cx)
+            .entry(index)
+            .filter(|entry| entry.is_folder())
+            .map(|entry| (entry.item().id.to_string(), entry.is_expanded()))
+        else {
+            return;
+        };
+        if open {
+            self.tree.collapse(&id);
+        } else {
+            self.expand(&id, cx);
+        }
+        self.sync(cx);
+    }
+
+    /// What a double click or Enter does: opens the row's object (see
+    /// [`default_action`]), or opens or closes the row.
+    fn open_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .tree_state
+            .read(cx)
+            .entry(index)
+            .map(|entry| entry.item().id.to_string())
+        else {
+            return;
+        };
+        let Some(node) = self.tree.node(&id).cloned() else {
+            return;
+        };
+        let has_schemas = self
+            .connection
+            .as_deref()
+            .and_then(|connection| self.connections.read(cx).meta_session(connection))
+            .is_some_and(|meta| meta.dialect().has_schemas());
+        let table = AppState::get(cx).settings.table_double_click;
+        match default_action(&node, has_schemas, table) {
+            // A source that cannot be edited here (read-only connection)
+            // is shown as DDL.
+            Some(Action::EditSource)
+                if self.unavailable(Action::EditSource, &node, cx).is_some() =>
+            {
+                self.perform(Action::ShowDdl, &id, window, cx)
+            }
+            Some(action) => self.perform(action, &id, window, cx),
+            None => self.toggle_row(index, cx),
+        }
+    }
+
+    /// Right: opens the selected row, or goes to its first child when open.
+    fn key_right(&mut self, cx: &mut Context<Self>) {
+        let state = self.tree_state.read(cx);
+        let Some(index) = state.selected_index() else {
+            return;
+        };
+        let Some(entry) = state.entry(index) else {
+            return;
+        };
+        if !entry.is_folder() {
+            return;
+        }
+        if !entry.is_expanded() {
+            self.toggle_row(index, cx);
+        } else if state
+            .entry(index + 1)
+            .is_some_and(|child| child.depth() > entry.depth())
+        {
+            self.select_row(index + 1, cx);
+        }
+    }
+
+    /// Left: closes the selected row, or goes to its parent when closed.
+    fn key_left(&mut self, cx: &mut Context<Self>) {
+        let state = self.tree_state.read(cx);
+        let Some(index) = state.selected_index() else {
+            return;
+        };
+        let Some(entry) = state.entry(index) else {
+            return;
+        };
+        if entry.is_folder() && entry.is_expanded() {
+            self.toggle_row(index, cx);
+            return;
+        }
+        let depth = entry.depth();
+        let parent = (0..index)
+            .rev()
+            .find(|&above| state.entry(above).is_some_and(|row| row.depth() < depth));
+        if let Some(parent) = parent {
+            self.select_row(parent, cx);
+        }
+    }
+
+    /// The selected row; for tests.
+    #[cfg(test)]
+    pub fn selected_row(&self, cx: &App) -> Option<usize> {
+        self.tree_state.read(cx).selected_index()
+    }
+
     /// The rows now shown, indented by depth; for tests.
     #[cfg(test)]
     pub fn outline(&self, cx: &App) -> Vec<String> {
@@ -1088,7 +1235,13 @@ impl Navigator {
 
     // Rendering ---------------------------------------------------------------
 
-    fn render_row(&self, index: usize, entry: &TreeEntry, cx: &App) -> ListItem {
+    fn render_row(
+        &self,
+        view: &Entity<Self>,
+        index: usize,
+        entry: &TreeEntry,
+        cx: &App,
+    ) -> ListItem {
         let theme = cx.theme();
         let id = entry.item().id.as_ref();
         let indent = px(14.) * entry.depth() + px(8.);
@@ -1100,7 +1253,8 @@ impl Navigator {
             .pl(indent)
             .text_sm();
         let Some(node) = self.tree.node(id) else {
-            // A line of text under a node: loading, empty, or an error.
+            // A line of text under a node: loading, empty, or an error. The
+            // tree's own click selects it; there is nothing to open.
             let failed = model::parent_of(id)
                 .and_then(|parent| self.tree.node(parent))
                 .is_some_and(|parent| matches!(parent.children, Children::Failed(_)));
@@ -1119,17 +1273,44 @@ impl Navigator {
         let chevron = if !entry.is_folder() {
             div().flex_none().size_3().into_any_element()
         } else {
-            Icon::new(if entry.is_expanded() {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            })
-            .flex_none()
-            .size_3()
-            .text_color(theme.muted_foreground)
-            .into_any_element()
+            let view = view.clone();
+            div()
+                .id(("node-chevron", index))
+                .test_support()
+                .flex_none()
+                .child(
+                    Icon::new(if entry.is_expanded() {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size_3()
+                    .text_color(theme.muted_foreground),
+                )
+                // The chevron opens and closes, and nothing else.
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    view.update(cx, |this, cx| {
+                        this.select_row(index, cx);
+                        this.toggle_row(index, cx);
+                    });
+                })
+                .into_any_element()
         };
-        base.child(
+        // Clicks are the navigator's: the tree's own would open or close
+        // the row on a single click.
+        let view = view.clone();
+        base.on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            let count = event.click_count();
+            view.update(cx, |this, cx| {
+                this.select_row(index, cx);
+                if count >= 2 {
+                    this.open_row(index, window, cx);
+                }
+            });
+        })
+        .child(
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -1358,8 +1539,9 @@ impl Render for Navigator {
             Root::Loaded => {
                 let view = cx.entity();
                 let menu_view = cx.entity();
-                tree(&self.tree_state, move |index, entry, _, _, cx| {
-                    view.read(cx).render_row(index, entry, cx)
+                let keys = cx.entity();
+                let tree_view = tree(&self.tree_state, move |index, entry, _, _, cx| {
+                    view.read(cx).render_row(&view, index, entry, cx)
                 })
                 .context_menu(move |_, entry, mut menu, _, cx| {
                     let id = entry.item().id.to_string();
@@ -1399,9 +1581,33 @@ impl Render for Navigator {
                     }
                     menu
                 })
-                .flex_1()
-                .min_h_0()
-                .into_any_element()
+                .size_full();
+                // Right and Left also move to the first child and the
+                // parent; Enter does what a double click does. They run
+                // before the tree's own handling of the keys.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .capture_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                        cx.stop_propagation();
+                        this.key_right(cx);
+                    }))
+                    .capture_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                        cx.stop_propagation();
+                        this.key_left(cx);
+                    }))
+                    .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
+                            cx.stop_propagation();
+                            keys.update(cx, |this, cx| {
+                                if let Some(index) = this.tree_state.read(cx).selected_index() {
+                                    this.open_row(index, window, cx);
+                                }
+                            });
+                        }
+                    })
+                    .child(tree_view)
+                    .into_any_element()
             }
         };
         v_flex()

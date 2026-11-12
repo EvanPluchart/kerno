@@ -5,6 +5,7 @@ mod bridge;
 mod connections;
 mod data;
 mod engine_logo;
+mod export_dialog;
 mod library;
 mod logging;
 mod navigator;

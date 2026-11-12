@@ -7,6 +7,32 @@ use crate::theme::Appearance;
 
 const KEY: &str = "settings";
 
+/// What a double click (or Enter) on a table or view in the schema tree
+/// opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TableDoubleClick {
+    /// Its rows.
+    #[default]
+    Data,
+    /// Its columns, keys, indexes and DDL.
+    Structure,
+    /// Its columns and indexes, in the tree.
+    Expand,
+}
+
+impl TableDoubleClick {
+    pub const ALL: [TableDoubleClick; 3] = [Self::Data, Self::Structure, Self::Expand];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Data => "Open its data",
+            Self::Structure => "Open its structure",
+            Self::Expand => "Expand it in the tree",
+        }
+    }
+}
+
 /// Everything the settings view edits. Unknown or missing fields fall back
 /// to their defaults, so settings survive upgrades in both directions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,6 +46,8 @@ pub struct Settings {
     pub confirm_destructive: bool,
     /// Whether the sidebar is shown.
     pub sidebar_visible: bool,
+    /// What a double click on a table or view in the tree opens.
+    pub table_double_click: TableDoubleClick,
 }
 
 impl Default for Settings {
@@ -29,6 +57,7 @@ impl Default for Settings {
             page_size: 1_000,
             confirm_destructive: true,
             sidebar_visible: true,
+            table_double_click: TableDoubleClick::Data,
         }
     }
 }
@@ -66,6 +95,7 @@ mod tests {
             page_size: 250,
             confirm_destructive: false,
             sidebar_visible: false,
+            table_double_click: TableDoubleClick::Structure,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);
@@ -83,5 +113,7 @@ mod tests {
         let loaded = Settings::load(&storage);
         assert_eq!(loaded.appearance, Appearance::Light);
         assert_eq!(loaded.page_size, Settings::default().page_size);
+        // Settings stored before the double-click choice existed open data.
+        assert_eq!(loaded.table_double_click, TableDoubleClick::Data);
     }
 }
