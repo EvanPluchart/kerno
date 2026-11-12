@@ -472,6 +472,7 @@ async fn columns(
                     )
                 },
                 generation,
+                on_update: on_update(&extra),
                 // Filled in from the primary key's index.
                 primary_key_position: None,
                 comment: opt(row, 7),
@@ -513,6 +514,37 @@ fn string_literal_value(sql: &str) -> Option<String> {
     Some(text)
 }
 
+/// Whether `text` is `CURRENT_TIMESTAMP`, in any spelling.
+fn is_now(text: &str) -> bool {
+    text.to_ascii_lowercase().starts_with("current_timestamp")
+}
+
+/// `CURRENT_TIMESTAMP[(n)]`, however the server spelled it: MariaDB writes
+/// `current_timestamp()`; both accept the keyword.
+fn now(text: &str) -> String {
+    let precision = text
+        .split_once('(')
+        .map(|(_, rest)| rest.trim_end_matches(')').trim())
+        .filter(|precision| !precision.is_empty());
+    match precision {
+        Some(precision) => format!("CURRENT_TIMESTAMP({precision})"),
+        None => "CURRENT_TIMESTAMP".to_string(),
+    }
+}
+
+/// The `ON UPDATE` expression in a column's `EXTRA` (upper-cased): MySQL
+/// `DEFAULT_GENERATED ON UPDATE CURRENT_TIMESTAMP`, MariaDB
+/// `ON UPDATE CURRENT_TIMESTAMP()`.
+fn on_update(extra: &str) -> Option<String> {
+    let (_, rest) = extra.split_once("ON UPDATE ")?;
+    let expression = rest.split_whitespace().next()?;
+    Some(if is_now(expression) {
+        now(expression)
+    } else {
+        expression.to_string()
+    })
+}
+
 /// A column default as an SQL expression, the same on both engines.
 ///
 /// MariaDB already prints SQL: strings quoted, expressions bare, and the
@@ -527,18 +559,6 @@ fn normalize_default(
     dialect: &dyn Dialect,
 ) -> Option<String> {
     let raw = raw?;
-    let is_now = |text: &str| text.to_ascii_lowercase().starts_with("current_timestamp");
-    // MariaDB spells it current_timestamp(); both accept the keyword.
-    let now = |text: &str| {
-        let precision = text
-            .split_once('(')
-            .map(|(_, rest)| rest.trim_end_matches(')').trim())
-            .filter(|precision| !precision.is_empty());
-        match precision {
-            Some(precision) => format!("CURRENT_TIMESTAMP({precision})"),
-            None => "CURRENT_TIMESTAMP".to_string(),
-        }
-    };
     let lower = raw.to_ascii_lowercase();
     if mariadb {
         let literal = raw.starts_with('\'')
@@ -1010,6 +1030,36 @@ mod tests {
             "b'101'",
         ] {
             assert_eq!(string_literal_value(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn on_update_is_read_from_extra_on_both_engines() {
+        for (extra, expected) in [
+            // MySQL 8.4.
+            (
+                "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+                Some("CURRENT_TIMESTAMP"),
+            ),
+            (
+                "on update CURRENT_TIMESTAMP(3) INVISIBLE",
+                Some("CURRENT_TIMESTAMP(3)"),
+            ),
+            // MariaDB 11.
+            ("on update current_timestamp()", Some("CURRENT_TIMESTAMP")),
+            (
+                "on update current_timestamp(6)",
+                Some("CURRENT_TIMESTAMP(6)"),
+            ),
+            ("DEFAULT_GENERATED", None),
+            ("auto_increment", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                on_update(&extra.to_ascii_uppercase()).as_deref(),
+                expected,
+                "{extra}"
+            );
         }
     }
 

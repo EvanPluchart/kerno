@@ -458,6 +458,7 @@ async fn columns(session: &PgSession, oid: &str) -> Result<Vec<ColumnInfo>> {
                     expression
                 },
                 generation,
+                on_update: None,
                 primary_key_position: number(row, 10).map(|position| position as u32),
                 comment: opt(row, 11),
                 collation: opt(row, 12),

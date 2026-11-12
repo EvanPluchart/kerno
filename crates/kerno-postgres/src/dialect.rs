@@ -303,6 +303,7 @@ mod tests {
                 default: Some("now()".into()),
                 comment: None,
                 auto_increment: false,
+                on_update: None,
             }),
             TableChange::RenameTable {
                 to: "orders".into(),

@@ -377,7 +377,7 @@ enum Run {
     Binary,
     /// `-1`, `@var`, `*`: glued to what follows if it was written so.
     Prefix,
-    /// `U&'...'`, `1e-3`, `a[1:2]`: spaced as it was written.
+    /// `a[1:2]`: spaced as it was written.
     Written,
 }
 
@@ -734,21 +734,8 @@ impl<'a> Statement<'a> {
                 *run = Run::Prefix;
                 return true;
             }
-            // What a space would break: `U&'...'` literals, the exponent
-            // of `1e-3` (three tokens for the lexer) and array slices.
-            let written = match b.text {
-                "&" => {
-                    tight
-                        && a.text.eq_ignore_ascii_case("u")
-                        && self.toks.get(index + 1).is_some_and(|next| {
-                            next.glued
-                                && matches!(next.kind, TokenKind::String | TokenKind::QuotedIdent)
-                        })
-                }
-                "-" | "+" => tight && a.kind == TokenKind::Number && a.text.ends_with(['e', 'E']),
-                ":" => !self.run_goes_on(index),
-                _ => false,
-            };
+            // What a space would break: array slices.
+            let written = b.text == ":" && !self.run_goes_on(index);
             *run = if written {
                 Run::Written
             } else if a.ends_operand() {

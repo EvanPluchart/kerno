@@ -245,9 +245,6 @@ pub fn complete(
 /// The byte range of `sql` to lex for a completion at `cursor`: the
 /// statement the cursor is in or, right after one, what follows it.
 fn statement_bounds(sql: &str, cursor: usize, rules: LexRules) -> (usize, usize) {
-    // ponytail: splits the whole text on every call, and `split_statements`
-    // is quadratic in the number of statements; pass the visible statement
-    // only, or cache the spans, if completion lags in a script of thousands.
     let spans = split_statements(sql, rules);
     let before = spans.partition_point(|span| span.range.start <= cursor);
     let previous = before.checked_sub(1).map(|index| &spans[index].range);
@@ -326,7 +323,13 @@ impl<'a> Tok<'a> {
                 quoted: false,
             };
         }
-        let (quote, inner) = self.text.split_at(1);
+        // `U&"..."`: the prefix is not part of the name (its escapes stay
+        // as written).
+        let text = match self.text.get(..2) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("u&") => &self.text[2..],
+            _ => self.text,
+        };
+        let (quote, inner) = text.split_at(1);
         let inner = inner.strip_suffix(quote).unwrap_or(inner);
         let text = if inner.contains(quote) {
             Cow::Owned(inner.replace(&quote.repeat(2), quote))

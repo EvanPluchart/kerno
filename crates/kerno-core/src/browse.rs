@@ -287,6 +287,7 @@ mod tests {
             nullable: true,
             default: None,
             generation: None,
+            on_update: None,
             primary_key_position: None,
             comment: None,
             collation: None,

@@ -514,6 +514,7 @@ mod tests {
             nullable: true,
             default: None,
             generation: None,
+            on_update: None,
             primary_key_position: None,
             comment: None,
             collation: None,
@@ -717,6 +718,7 @@ mod tests {
             default: None,
             comment: None,
             auto_increment: false,
+            on_update: None,
         }
     }
 

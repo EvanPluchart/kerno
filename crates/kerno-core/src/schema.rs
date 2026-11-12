@@ -284,6 +284,9 @@ pub struct ColumnInfo {
     pub default: Option<String>,
     /// Identity / auto-increment / generated column.
     pub generation: Option<ColumnGeneration>,
+    /// What the column is set to when its row is updated (MySQL and MariaDB
+    /// `ON UPDATE CURRENT_TIMESTAMP`), as SQL; always `None` on PostgreSQL.
+    pub on_update: Option<String>,
     /// Position in the primary key (1-based), when part of it.
     pub primary_key_position: Option<u32>,
     /// Comment.
@@ -473,6 +476,7 @@ mod tests {
             nullable,
             default: None,
             generation: None,
+            on_update: None,
             primary_key_position: pk,
             comment: None,
             collation: None,

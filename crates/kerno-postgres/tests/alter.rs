@@ -49,6 +49,7 @@ fn column(name: &str, data_type: &str, nullable: bool) -> ColumnDraft {
         default: None,
         comment: None,
         auto_increment: false,
+        on_update: None,
     }
 }
 

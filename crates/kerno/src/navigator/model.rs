@@ -831,6 +831,7 @@ mod tests {
             nullable,
             default: None,
             generation: None,
+            on_update: None,
             primary_key_position: key.then_some(1),
             comment: None,
             collation: None,

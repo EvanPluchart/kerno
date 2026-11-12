@@ -60,7 +60,7 @@ fn unsupported(what: &str) -> Error {
 impl MysqlDialect {
     /// The full definition of `column`, as `CREATE TABLE`, `ADD`, `MODIFY`
     /// and `CHANGE COLUMN` take it:
-    /// `name type [COLLATE c] NOT NULL|NULL [DEFAULT e] [AUTO_INCREMENT] [COMMENT '…']`.
+    /// `name type [COLLATE c] NOT NULL|NULL [DEFAULT e] [AUTO_INCREMENT] [ON UPDATE e] [COMMENT '…']`.
     ///
     /// `from` is the column on the server, for `MODIFY` and `CHANGE`: these
     /// replace the whole definition, so a collation other than the table's
@@ -93,8 +93,13 @@ impl MysqlDialect {
         });
         if column.auto_increment {
             sql.push_str(" AUTO_INCREMENT");
-        } else if let Some(default) = present(&column.default) {
-            sql.push_str(&format!(" DEFAULT {default}"));
+        } else {
+            if let Some(default) = present(&column.default) {
+                sql.push_str(&format!(" DEFAULT {default}"));
+            }
+            if let Some(on_update) = present(&column.on_update) {
+                sql.push_str(&format!(" ON UPDATE {on_update}"));
+            }
         }
         if let Some(comment) = present(&column.comment) {
             sql.push_str(&format!(" COMMENT {}", self.quote_string(comment)));
@@ -444,6 +449,7 @@ mod tests {
             nullable: true,
             default: None,
             generation: None,
+            on_update: None,
             primary_key_position: None,
             comment: None,
             collation: None,
@@ -818,6 +824,7 @@ mod tests {
             default: None,
             comment: None,
             auto_increment: false,
+            on_update: None,
         }
     }
 
@@ -966,6 +973,43 @@ mod tests {
                 d.alter_table_sql(&t(), &[TableChange::SetTableComment(Some("x".into()))])
                     .unwrap(),
                 strings(&["ALTER TABLE `shop`.`order items`\n    COMMENT = 'x'"])
+            );
+        }
+    }
+
+    #[test]
+    fn on_update_is_written_back_in_the_definition() {
+        let mut updated_at = column(TypeKind::DateTime);
+        updated_at.name = "updated_at".into();
+        updated_at.data_type = "timestamp".into();
+        updated_at.nullable = false;
+        updated_at.default = Some("CURRENT_TIMESTAMP".into());
+        updated_at.on_update = Some("CURRENT_TIMESTAMP".into());
+        let comment_only = TableChange::AlterColumn {
+            name: "updated_at".into(),
+            from: updated_at.clone(),
+            to: ColumnDraft {
+                comment: Some("touched".into()),
+                ..ColumnDraft::from(&updated_at)
+            },
+        };
+        let mut draft = TableDraft::new(t());
+        draft.columns.push(ColumnDraft::from(&updated_at));
+        for d in both() {
+            assert_eq!(
+                d.alter_table_sql(&t(), std::slice::from_ref(&comment_only))
+                    .unwrap(),
+                strings(&["ALTER TABLE `shop`.`order items`\n    \
+                     MODIFY COLUMN `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP \
+                     ON UPDATE CURRENT_TIMESTAMP COMMENT 'touched'"])
+            );
+            assert_eq!(
+                d.create_table_sql(&draft).unwrap(),
+                strings(&["CREATE TABLE `shop`.`order items` (\n    \
+                     `id` bigint NOT NULL AUTO_INCREMENT,\n    \
+                     `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP \
+                     ON UPDATE CURRENT_TIMESTAMP,\n    \
+                     PRIMARY KEY (`id`)\n)"])
             );
         }
     }

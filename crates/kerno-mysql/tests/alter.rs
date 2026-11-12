@@ -58,6 +58,7 @@ fn column(name: &str, data_type: &str, nullable: bool) -> ColumnDraft {
         default: None,
         comment: None,
         auto_increment: false,
+        on_update: None,
     }
 }
 
@@ -263,4 +264,106 @@ async fn edit(session: Arc<dyn Session>, engine: Engine, database: String) {
 
     let articles = TableRef::new(database.clone(), "articles");
     assert_eq!(read_back(&session, &articles).await, saved(draft));
+}
+
+#[tokio::test]
+async fn a_comment_only_edit_keeps_on_update_current_timestamp() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let database = common::scratch_database("alter_on_update");
+        let cleanup = [format!("DROP DATABASE IF EXISTS {database}")];
+        cleaning_up(
+            &session,
+            &cleanup,
+            keep_on_update(session.clone(), engine, database),
+        )
+        .await;
+    }
+}
+
+async fn keep_on_update(session: Arc<dyn Session>, engine: Engine, database: String) {
+    for sql in [
+        format!("CREATE DATABASE {database}"),
+        format!(
+            "CREATE TABLE {database}.stamped (\
+               id int PRIMARY KEY, \
+               note varchar(20), \
+               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP \
+                 ON UPDATE CURRENT_TIMESTAMP)"
+        ),
+        format!("INSERT INTO {database}.stamped VALUES (1, 'a', '2000-01-01 00:00:00')"),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    let extra = common::scalar(
+        &session,
+        &format!(
+            "SELECT EXTRA FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = 'stamped' \
+               AND COLUMN_NAME = 'updated_at'"
+        ),
+    )
+    .await;
+    println!("{engine:?} EXTRA of updated_at: {extra:?}");
+    assert!(
+        extra
+            .to_ascii_lowercase()
+            .contains("on update current_timestamp"),
+        "{extra}"
+    );
+
+    let table = TableRef::new(database.clone(), "stamped");
+    let updated_at = |draft: &TableDraft| {
+        draft
+            .columns
+            .iter()
+            .find(|c| c.name == "updated_at")
+            .cloned()
+            .unwrap()
+    };
+    let mut draft = read_back(&session, &table).await;
+    assert_eq!(
+        updated_at(&draft).on_update.as_deref(),
+        Some("CURRENT_TIMESTAMP")
+    );
+
+    let structure = session.table_structure(&table).await.unwrap();
+    let at = draft
+        .columns
+        .iter()
+        .position(|c| c.name == "updated_at")
+        .unwrap();
+    draft.columns[at].comment = Some("touched".into());
+    let statements = session
+        .dialect()
+        .alter_table_sql(&table, &changes(&table, &structure, &draft))
+        .unwrap();
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    assert!(
+        statements[0].contains("MODIFY COLUMN `updated_at`")
+            && statements[0].contains("ON UPDATE CURRENT_TIMESTAMP"),
+        "{statements:#?}"
+    );
+    apply(&session, &statements).await;
+
+    let after = read_back(&session, &table).await;
+    assert_eq!(after, draft);
+    assert_eq!(
+        updated_at(&after).on_update.as_deref(),
+        Some("CURRENT_TIMESTAMP")
+    );
+    // And the server still does it: the timestamp moves on an update.
+    exec_ok(
+        &session,
+        &format!("UPDATE {database}.stamped SET note = 'b' WHERE id = 1"),
+    )
+    .await;
+    assert_eq!(
+        common::scalar(
+            &session,
+            &format!("SELECT updated_at > '2001-01-01' FROM {database}.stamped WHERE id = 1"),
+        )
+        .await,
+        "1"
+    );
 }

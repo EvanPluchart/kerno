@@ -205,13 +205,43 @@ fn next_token(source: &str, pos: &mut usize, rules: LexRules) -> TokenKind {
         return TokenKind::Semicolon;
     }
     if byte.is_ascii_digit() {
-        *pos = scan_while(bytes, start, |b| {
+        let mut end = scan_while(bytes, start, |b| {
             b.is_ascii_alphanumeric() || b == b'.' || b == b'_'
         });
+        // The exponent's sign belongs to a decimal number: `1.5e-3` (but
+        // `0x1E-3` is a subtraction).
+        if let Some((b'e' | b'E', mantissa)) = bytes[start..end].split_last()
+            && mantissa
+                .iter()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'_'))
+            && matches!(bytes.get(end), Some(b'+' | b'-'))
+            && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
+        {
+            end = scan_while(bytes, end + 1, |b| b.is_ascii_digit() || b == b'_');
+        }
+        *pos = end;
         return TokenKind::Number;
     }
     if is_word_start(byte) {
         let end = scan_while(bytes, start, is_word_part);
+        // PostgreSQL Unicode escapes: U&'...' strings and U&"..." names.
+        if end == start + 1
+            && (byte == b'U' || byte == b'u')
+            && bytes.get(end) == Some(&b'&')
+            && !rules.backslash_escapes
+        {
+            match bytes.get(end + 1) {
+                Some(b'\'') => {
+                    *pos = scan_quoted(bytes, end + 1, b'\'', false);
+                    return TokenKind::String;
+                }
+                Some(b'"') if !rules.double_quoted_strings => {
+                    *pos = scan_quoted(bytes, end + 1, b'"', false);
+                    return TokenKind::QuotedIdent;
+                }
+                _ => {}
+            }
+        }
         // PostgreSQL escape strings: E'...' has backslash escapes.
         if end == start + 1
             && (byte == b'E' || byte == b'e')
@@ -467,6 +497,39 @@ mod tests {
         assert_eq!(
             kinds("':a' -- :b", LexRules::POSTGRES),
             vec![(String, "':a'"), (LineComment, "-- :b")]
+        );
+    }
+
+    #[test]
+    fn exponents_and_unicode_escapes_are_one_token() {
+        assert_eq!(
+            kinds("1.5e-3 2E+10 0x1E-3 1e", LexRules::POSTGRES),
+            vec![
+                (Number, "1.5e-3"),
+                (Number, "2E+10"),
+                (Number, "0x1E"),
+                (Punct, "-"),
+                (Number, "3"),
+                (Number, "1e"),
+            ]
+        );
+        assert_eq!(
+            kinds(
+                "U&'d\\0061t''a' u&\"n\\0061me\" u & 'x'",
+                LexRules::POSTGRES
+            ),
+            vec![
+                (String, "U&'d\\0061t''a'"),
+                (QuotedIdent, "u&\"n\\0061me\""),
+                (Word, "u"),
+                (Punct, "&"),
+                (String, "'x'"),
+            ]
+        );
+        // On MySQL `&` is bitwise and.
+        assert_eq!(
+            kinds("U&'x'", LexRules::MYSQL),
+            vec![(Word, "U"), (Punct, "&"), (String, "'x'")]
         );
     }
 
