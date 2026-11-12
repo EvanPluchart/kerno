@@ -24,3 +24,4 @@ tokio-postgres-rustls.workspace = true
 [dev-dependencies]
 kerno-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"

@@ -107,3 +107,53 @@ it was right. The tunnel is therefore built like this:
 Host keys: checked against `~/.ssh/known_hosts` (read-only) and Kerno's own known-hosts file. Unknown host:
 the connection fails with the fingerprint, the UI asks, and a retry carrying that fingerprint records the key
 in Kerno's file only. Changed key: always refused, with the file and line of the recorded key.
+
+## D-009 — Values travel as server text; PostgreSQL uses the simple query protocol
+
+- Every result value is kept in the server's own text form (raw bytes for binary columns), packed in
+  row-major arenas (`RowBatch`): one byte buffer and one `u32` offset per cell, a bitmap for NULL. No
+  allocation per cell, NULL distinct from empty. Column metadata carries a type family (`TypeKind`) that
+  drives rendering, sorting and literal quoting.
+- Why text: it is exact for every type, including extension and user-defined types a client has no decoder
+  for, and it is what `psql` shows. Decoding binary formats would mean one decoder per type and a failure
+  mode for every unknown one.
+- PostgreSQL therefore runs statements through the simple query protocol (`tokio-postgres`'s
+  `simple_query_raw`), which returns text. That protocol's row description is exposed by `tokio-postgres`
+  without type OIDs, so statements that can return rows are described first (`Parse`/`Describe` through
+  `Client::prepare`) to learn the column types. A failed describe is not reported: executing the statement
+  gives the authoritative error. Cost: one extra round trip for row-returning statements.
+- Paging uses back-pressure rather than cursors: the driver stops reading the socket when the consumer has
+  no demand, so the server blocks; no transaction is needed to keep a portal open. A suspended statement
+  occupies its session, which is why each query tab owns a session.
+- Transaction state: `tokio-postgres` does not expose the ReadyForQuery status byte. The session derives the
+  state from each statement's leading keywords and outcome (any error inside a block aborts it; a failed
+  COMMIT ends it). An integration test checks it against the server
+  (`now() <> statement_timestamp()` is true exactly inside a block opened by an earlier statement).
+- Parameters and edited values are written as SQL literals by the dialect, so the SQL shown for review is
+  byte for byte the SQL that runs.
+- Empty statements: the server's EmptyQueryResponse is reported by `tokio-postgres` as a command affecting
+  0 rows; the driver cannot tell the two apart. The app never sends empty statements (the splitter drops
+  them).
+
+## D-010 — Statement splitting with Kerno's own lexer; `sqlparser` for analysis
+
+The spec names `sqlparser` for statement splitting and statement-at-cursor. Its tokenizer rejects text that
+is still being typed (an unterminated string or comment fails the whole script), knows nothing of the
+`mysql` client's `DELIMITER` command, and reports line/column rather than byte offsets. Splitting therefore
+uses a small tolerant lexer in `kerno-core` (`sql::lex`, `sql::split`) that never fails. `sqlparser` stays in
+the stack for what needs a real parse of a complete statement (classification, completion context).
+
+## D-011 — PostgreSQL introspection choices
+
+- Reads `pg_catalog`, not `information_schema` (which hides objects the role has no privilege on and omits
+  materialized views). Written for PostgreSQL 12+ (`prokind`, `attidentity`, `attgenerated`).
+- Objects owned by an extension are not listed among a schema's objects, as in `pg_dump`: `pgcrypto`,
+  `pg_trgm` and `hstore` alone would add about 150 functions to `public`. Extensions have their own list.
+- `serial` is recognised by ownership (`pg_get_serial_sequence`), not by "the default starts with
+  `nextval(`". The DDL round-trip test caught the name heuristic rewriting `orders.invoice_number` (an
+  integer column defaulting to an independent sequence) as `bigserial`, which creates another sequence and
+  adds NOT NULL. Both reference clients use the name heuristic.
+- Row identity for editing: the primary key, else the first non-partial unique index whose columns are all
+  real NOT NULL columns; otherwise the table is read-only in the data view.
+- Administrative views (sessions, roles, grants, sizes, settings) are canned queries shown in the ordinary
+  results grid, so sorting, copy and export come for free.

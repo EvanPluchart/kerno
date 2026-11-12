@@ -122,9 +122,11 @@ fn terminated(sql: String) -> String {
 fn column_line(column: &ColumnInfo) -> String {
     let mut line = D.quote_ident(&column.name);
     line.push(' ');
-    // `serial` is shorthand for an integer column fed by an owned sequence;
-    // print it that way instead of exposing the sequence's nextval().
+    // `serial` is shorthand for a NOT NULL integer column fed by a sequence
+    // it owns; print it that way instead of exposing the sequence's
+    // nextval(). A nullable one is not what `serial` would create.
     let serial = match (&column.generation, column.data_type.as_str()) {
+        _ if column.nullable => None,
         (Some(ColumnGeneration::AutoIncrement), "smallint") => Some("smallserial"),
         (Some(ColumnGeneration::AutoIncrement), "integer") => Some("serial"),
         (Some(ColumnGeneration::AutoIncrement), "bigint") => Some("bigserial"),
@@ -498,6 +500,15 @@ mod tests {
         c.generation = Some(ColumnGeneration::AutoIncrement);
         c.default = Some("nextval('t_id_seq'::regclass)".into());
         assert_eq!(column_line(&c), "\"id\" serial");
+
+        // Nullable with an owned sequence: not what `serial` means.
+        let mut c = column("id", "integer");
+        c.generation = Some(ColumnGeneration::AutoIncrement);
+        c.default = Some("nextval('t_id_seq'::regclass)".into());
+        assert_eq!(
+            column_line(&c),
+            "\"id\" integer DEFAULT nextval('t_id_seq'::regclass)"
+        );
 
         let mut c = column("total", "numeric");
         c.generation = Some(ColumnGeneration::Stored("(price * qty)".into()));

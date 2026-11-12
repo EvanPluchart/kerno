@@ -140,7 +140,6 @@ impl PgSession {
         tokio::pin!(stream);
 
         let mut binary: Vec<bool> = Vec::new();
-        let mut completed_any = false;
         loop {
             tokio::select! {
                 biased;
@@ -181,7 +180,6 @@ impl PgSession {
                         sink.end_row().await?;
                     }
                     Some(Ok(SimpleQueryMessage::CommandComplete(rows))) => {
-                        completed_any = true;
                         sink.complete(Some(rows)).await?;
                     }
                     Some(Ok(_)) => {}
@@ -197,10 +195,6 @@ impl PgSession {
                 }
                 ConnectionEvent::Closed(why) => return Err(Error::Closed(why)),
             }
-        }
-        if !completed_any {
-            // An empty statement: the server answers with no command tag.
-            sink.complete(None).await?;
         }
         Ok(())
     }

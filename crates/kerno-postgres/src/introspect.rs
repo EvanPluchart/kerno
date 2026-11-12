@@ -401,7 +401,8 @@ async fn columns(session: &PgSession, oid: &str) -> Result<Vec<ColumnInfo>> {
                 CASE WHEN a.attcollation <> t.typcollation THEN coll.collname END, \
                 (SELECT json_agg(e.enumlabel ORDER BY e.enumsortorder)::text \
                  FROM pg_catalog.pg_enum e \
-                 WHERE e.enumtypid = CASE WHEN t.typcategory = 'A' THEN t.typelem ELSE a.atttypid END) \
+                 WHERE e.enumtypid = CASE WHEN t.typcategory = 'A' THEN t.typelem ELSE a.atttypid END), \
+                pg_catalog.pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) IS NOT NULL \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
          LEFT JOIN pg_catalog.pg_type bt ON bt.oid = t.typbasetype \
@@ -427,8 +428,9 @@ async fn columns(session: &PgSession, oid: &str) -> Result<Vec<ColumnInfo>> {
                 (Some("d"), _) => Some(ColumnGeneration::IdentityByDefault),
                 (_, Some("s")) => expression.clone().map(ColumnGeneration::Stored),
                 (_, Some("v")) => expression.clone().map(ColumnGeneration::Virtual),
-                // `serial` is an integer column whose default draws from a sequence.
-                _ if kind == kerno_core::TypeKind::Integer
+                // `serial`: the default draws from a sequence the column
+                // owns. A default on an independent sequence is just a default.
+                _ if flag(row, 14)
                     && expression
                         .as_deref()
                         .is_some_and(|e| e.starts_with("nextval(")) =>

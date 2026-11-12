@@ -57,3 +57,15 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
 - References: digests of how DBeaver and Beekeeper handle PostgreSQL and MySQL were written from the clones
   (kept outside the repository). Catalog queries were written from the PostgreSQL documentation; the digests
   served as a completeness check (extension-owned objects, `conparentid`, `reltuples = -1`, `contype = 'n'`).
+- `kerno-postgres` integration tests against `kerno-postgres` and `kerno-ssh`: 35 tests, all passing
+  (11 connection, 15 execution, 9 introspection/DDL/admin), on top of 18 unit tests. Covered: plain, TLS in
+  all five modes, wrong CA, client certificate, read-only, tunnel (password and key), TLS host-name check
+  through the tunnel (`verify-full` refuses an alias the certificate lacks, `verify-ca` accepts it), cancel of
+  `pg_sleep` directly and through the tunnel, abandoning a suspended million-row result, every type of
+  `all_types` including NULLs and edge values, notices, error position/detail/hint, transaction state
+  checked against the server, session kill, catalog listings, table structure, administrative views.
+- Found by the tests and fixed:
+  - the DDL round-trip (recreate each fixture table from its generated DDL, compare structures) caught the
+    `serial` heuristic (D-011);
+  - an "empty statement reports no row count" assumption was wrong (D-009); the unreachable fallback and
+    its comment were removed.
