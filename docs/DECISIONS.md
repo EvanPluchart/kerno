@@ -249,10 +249,7 @@ Written by a delegated agent from the PostgreSQL driver as a template, then revi
 
 Known limits, tracked in `docs/PLAN.md`:
 
-- `verify-ca` behaves like `verify-full` on MySQL/MariaDB: `mysql_async` 0.37.1 detects a host-name
-  mismatch by matching the text of a rustls error that rustls 0.23.46 no longer prints. It fails closed
-  (refuses), never open. No test server has a CA-signed certificate yet, so the positive paths of
-  `verify-ca`/`verify-full` and client certificates are untested on these engines.
+- (Resolved in D-018.) `verify-ca` used to behave like `verify-full` on MySQL/MariaDB.
 - In a request with several result sets, a result's completion is delivered when the next one starts.
 - Warnings are fetched for the last statement of a request only.
 - `LOAD DATA LOCAL INFILE` is refused.
@@ -263,3 +260,47 @@ The agent found that `END$$` under `DELIMITER $$` was not split: `$` is an ident
 saw one word. The splitter now looks for the current delimiter as plain text at every position outside
 strings, quoted identifiers and comments, which is what the `mysql` client does (it will also split
 `select 2go` under `DELIMITER go`). A failing test was written first.
+
+## D-017 — Connections: one manager entity, prompts instead of failures
+
+- `Connections` (app crate) is the one owner of the saved list and of each connection's live state: status,
+  the tunnel and sessions, the secrets of this run, keep-alive. The sidebar, the dialog and the workspace
+  observe it; none of them talks to a driver.
+- A connection attempt that lacks something asks for it instead of failing: a password that is not saved,
+  an SSH password, the passphrase of an encrypted key (asked again when wrong), an SSH host key seen for the
+  first time (fingerprint shown, trusted only on an explicit answer, then written to Kerno's own
+  known-hosts file; the user's `~/.ssh/known_hosts` is read, never written).
+- "The server wants a password and none was given" is a typed error (`Error::PasswordRequired`) raised by
+  both drivers, so a connection whose password is not in the secret store (imported from a file, or the
+  entry was removed) prompts too. Asking up front would be wrong: `trust`/socket/certificate logins have no
+  password.
+- A secret typed at a prompt is kept in memory for the run. It is written to the secret store only when the
+  connection says "save password" and the attempt succeeded. A typed secret that fails is forgotten, so the
+  next attempt asks again rather than replaying it.
+- Auto-reconnect: a 30 s keep-alive ping on the navigator session; a failed ping drops the sessions and
+  connects again once, with the secrets already in memory.
+- Export writes the settings only. Secret-named driver options are refused at validation (D-012), so an
+  export cannot carry one. Imported connections get new ids and no secrets.
+- The dialog does not close on Enter (a half-filled form must not be saved by accident); Enter in the URL
+  field fills the form from the URL. `Cmd+N` opens it.
+- Engine tiles show a two-letter monogram in the UI typeface, not a vendor logo (CLAUDE.md §1).
+
+## D-018 — `verify-ca` on MySQL / MariaDB
+
+`mysql_async` 0.37.1 implements "skip the host-name check" by matching the text of a rustls error; rustls
+0.23.46 words that error differently, so the switch never fires and a name mismatch is always refused. The
+library does not accept a custom certificate verifier.
+
+Kerno's driver therefore handles `verify-ca` itself: when the handshake fails only because the host name
+is not in the certificate (rustls' structured `NotValidForNameContext`), it dials once more under one of the
+names the certificate presents. That second handshake verifies the chain against the configured CA in full,
+as before, and the name check then passes: the result is exactly "chain verified, name not compared".
+Anything the driver cannot read as a plain DNS name or IP address is not guessed at and the connection stays
+refused. The names come from rustls' debug form (`DnsName("…")`, `IpAddress(…)`); if a future rustls changes
+it, the unit test of `usable_name` and the integration test through the bastion (server reached under a name
+its certificate does not carry) fail, and the behaviour falls back to refusing.
+
+The MySQL and MariaDB test containers now present the certificate signed by the test CA, and have a
+`kerno_cert` account that requires the client certificate. Covered on both engines: `verify-ca` and
+`verify-full` positive paths, wrong CA, system store, name mismatch for both modes, client certificate with
+and without its key.

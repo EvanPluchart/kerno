@@ -4417,6 +4417,7 @@ dependencies = [
  "anyhow",
  "gpui-kit",
  "kerno-core",
+ "kerno-mysql",
  "kerno-postgres",
  "serde",
  "serde_json",

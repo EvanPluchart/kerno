@@ -54,6 +54,9 @@ pub enum Error {
     /// The connection could not be established (network, authentication).
     #[error("could not connect: {0}")]
     Connect(String),
+    /// The server asks for a password and none was given.
+    #[error("the server asks for a password and none was given")]
+    PasswordRequired,
     /// TLS setup or handshake failed.
     #[error("TLS: {0}")]
     Tls(String),

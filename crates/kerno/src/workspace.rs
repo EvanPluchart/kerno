@@ -1,11 +1,15 @@
 //! The main window: title bar, sidebar, tabs and status bar, and the
 //! commands that act on them.
 
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -16,16 +20,22 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, BorrowAppContext as _, Context, Entity, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, Window, div, px,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
+    Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
-use kerno_core::storage::SavedConnection;
+use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, CloseTab, NewQueryTab, NextTab, OpenCommandPalette, OpenSettings, PreviousTab,
-    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
+    NextTab, OpenCommandPalette, OpenSettings, PreviousTab, ToggleSidebar, UseDarkTheme,
+    UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
+use crate::connections::dialog::ConnectionDialog;
+use crate::connections::manager::{
+    Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
+};
+use crate::sidebar::Sidebar;
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::tabs::{QueryTab, TabSnapshot};
 use crate::theme::{self, Appearance};
@@ -36,7 +46,8 @@ const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
 /// The root view of a Kerno window.
 pub struct Workspace {
     focus_handle: FocusHandle,
-    connections: Vec<SavedConnection>,
+    connections: Entity<Connections>,
+    sidebar: Entity<Sidebar>,
     tabs: Vec<Entity<QueryTab>>,
     active_tab: usize,
     /// Number given to the next "Query N" tab.
@@ -51,7 +62,7 @@ impl Workspace {
     /// Creates the workspace with the saved connections and the tabs that
     /// were open last time.
     pub fn new(
-        connections: Vec<SavedConnection>,
+        connections: Entity<Connections>,
         tabs: Vec<TabSnapshot>,
         active_tab: usize,
         window: &mut Window,
@@ -65,17 +76,20 @@ impl Workspace {
         });
         // Text typed in the last moments before quitting is not lost.
         let flush_on_quit = cx.on_app_quit(|this, cx| this.save_tabs(cx));
+        let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), cx));
+        let connection_events = cx.subscribe_in(&connections, window, Self::on_connections_event);
 
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
             connections,
+            sidebar,
             tabs: Vec::new(),
             active_tab: 0,
             next_query_number: 1,
             palette,
             pending_save: None,
             tab_subscriptions: Vec::new(),
-            _subscriptions: vec![follow_system, flush_on_quit],
+            _subscriptions: vec![follow_system, flush_on_quit, connection_events],
         };
         for snapshot in tabs {
             match snapshot {
@@ -338,68 +352,342 @@ impl Workspace {
         });
     }
 
-    // Rendering ---------------------------------------------------------------
+    // Connections --------------------------------------------------------------
 
-    fn render_sidebar(&self, cx: &App) -> impl IntoElement {
-        let theme = cx.theme();
-        v_flex()
-            .id("sidebar")
-            .test_support()
-            .size_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_2()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(theme.muted_foreground)
-                    .child("CONNECTIONS"),
-            )
-            .when(self.connections.is_empty(), |this| {
-                this.child(
-                    v_flex()
-                        .px_3()
-                        .gap_1()
-                        .child(div().text_sm().child("No saved connections"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("Connections you save are listed here."),
-                        ),
-                )
-            })
-            .children(self.connections.iter().map(|connection| {
-                let config = &connection.config;
-                let tag = config
-                    .color
-                    .as_deref()
-                    .and_then(|key| theme::tag_color(key, cx))
-                    .unwrap_or_else(|| theme::environment_color(config.environment, cx));
-                h_flex()
-                    .px_3()
-                    .py_1()
-                    .gap_2()
-                    .child(div().size(px(8.)).rounded_full().bg(tag))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .truncate()
-                            .child(SharedString::from(config.name.clone())),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(config.engine.label()),
-                    )
-            }))
+    fn new_connection(&mut self, _: &NewConnection, window: &mut Window, cx: &mut Context<Self>) {
+        ConnectionDialog::open(self.connections.clone(), None, window, cx);
     }
+
+    fn on_connections_event(
+        &mut self,
+        _: &Entity<Connections>,
+        event: &ConnectionsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnectionsEvent::ListChanged => {}
+            ConnectionsEvent::StatusChanged { id } => {
+                let connections = self.connections.read(cx);
+                if let (Status::Failed { message }, Some(saved)) =
+                    (connections.status(id), connections.get(id))
+                {
+                    let text = format!("{}: {message}", saved.config.name);
+                    window.push_notification(Notification::error(SharedString::from(text)), cx);
+                }
+            }
+            ConnectionsEvent::Failed { message } => {
+                window.push_notification(
+                    Notification::error(SharedString::from(message.clone())),
+                    cx,
+                );
+            }
+            ConnectionsEvent::NeedsInput { id, request } => {
+                self.ask(id.clone(), request.clone(), window, cx)
+            }
+        }
+        cx.notify();
+    }
+
+    /// Asks the user for what a connection attempt needs.
+    fn ask(
+        &mut self,
+        id: String,
+        request: InputRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .connections
+            .read(cx)
+            .get(&id)
+            .map(|saved| saved.config.name.clone())
+            .unwrap_or_default();
+        match request {
+            InputRequest::DatabasePassword => self.ask_secret(
+                id,
+                format!("Password for “{name}”"),
+                "The database password is not saved for this connection.".into(),
+                InputAnswer::DatabasePassword,
+                window,
+                cx,
+            ),
+            InputRequest::SshPassword => self.ask_secret(
+                id,
+                format!("SSH password for “{name}”"),
+                "The password of the SSH user on the tunnel server.".into(),
+                InputAnswer::SshPassword,
+                window,
+                cx,
+            ),
+            InputRequest::SshKeyPassphrase { path, retry } => self.ask_secret(
+                id,
+                format!("Passphrase for “{name}”"),
+                if retry {
+                    format!("That passphrase did not open {path}. Try again.")
+                } else {
+                    format!("The private key {path} is encrypted.")
+                },
+                InputAnswer::SshKeyPassphrase,
+                window,
+                cx,
+            ),
+            InputRequest::TrustHostKey {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+            } => {
+                let shown = fingerprint.clone();
+                let connections = self.connections.clone();
+                // Answers once: trust, or give the attempt up.
+                let answered = Rc::new(Cell::new(false));
+                let finish = Rc::new(move |trust: bool, cx: &mut App| {
+                    if answered.replace(true) {
+                        return;
+                    }
+                    connections.update(cx, |connections, cx| match trust {
+                        true => connections.answer(
+                            &id,
+                            InputAnswer::TrustHostKey(fingerprint.clone()),
+                            cx,
+                        ),
+                        false => connections.cancel_input(&id, cx),
+                    });
+                });
+                let text = SharedString::from(format!(
+                    "“{name}” goes through an SSH server Kerno has not seen before.\n\n\
+                     {algorithm} key fingerprint:\n{shown}\n\n\
+                     Compare it with the fingerprint your server's administrator gives you. \
+                     If you trust it, the key is remembered and checked on every connection."
+                ));
+                let title = SharedString::from(format!("Trust the SSH server {host}:{port}?"));
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let (on_ok, on_close) = (finish.clone(), finish.clone());
+                    alert
+                        .title(title.clone())
+                        .description(text.clone())
+                        .confirm()
+                        .ok_text("Trust and connect")
+                        .on_ok(move |_, _, cx| {
+                            on_ok(true, cx);
+                            true
+                        })
+                        .on_close(move |_, _, cx| on_close(false, cx))
+                });
+            }
+        }
+    }
+
+    fn ask_secret(
+        &mut self,
+        id: String,
+        title: String,
+        explanation: String,
+        answer: fn(Secret) -> InputAnswer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let connections = self.connections.clone();
+        // Answers once: with what was typed, or by giving the attempt up.
+        let answered = Rc::new(Cell::new(false));
+        let finish = {
+            let input = input.clone();
+            Rc::new(move |submit: bool, cx: &mut App| {
+                if answered.replace(true) {
+                    return;
+                }
+                let secret = Secret::new(input.read(cx).value().to_string());
+                connections.update(cx, |connections, cx| match submit {
+                    true => connections.answer(&id, answer(secret), cx),
+                    false => connections.cancel_input(&id, cx),
+                });
+            })
+        };
+        let focused = Rc::new(Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused) = (input.clone(), focused.clone());
+            let (on_enter, on_close, on_click) = (finish.clone(), finish.clone(), finish.clone());
+            let explanation = SharedString::from(explanation.clone());
+            dialog
+                .title(SharedString::from(title.clone()))
+                .w(px(420.))
+                // Enter in the field confirms the dialog.
+                .on_ok(move |_, _, cx| {
+                    on_enter(true, cx);
+                    true
+                })
+                // Escape, the close button and a click outside give up.
+                .on_close(move |_, _, cx| on_close(false, cx))
+                .content(move |content, window, cx| {
+                    if !focused.replace(true) {
+                        let input = input.clone();
+                        window.defer(cx, move |window, cx| {
+                            input.read(cx).focus_handle(cx).focus(window, cx)
+                        });
+                    }
+                    let (submit, cancel) = (on_click.clone(), on_click.clone());
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .child(div().text_sm().child(explanation.clone()))
+                            .child(Input::new(&input).id("secret-input").mask_toggle())
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("secret-cancel")
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(move |_, window, cx| {
+                                                cancel(false, cx);
+                                                window.close_dialog(cx);
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("secret-ok")
+                                            .primary()
+                                            .label("Connect")
+                                            .on_click(move |_, window, cx| {
+                                                submit(true, cx);
+                                                window.close_dialog(cx);
+                                            }),
+                                    ),
+                            ),
+                    )
+                })
+        });
+    }
+
+    fn export_connections(
+        &mut self,
+        _: &ExportConnections,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let picking = cx.prompt_for_new_path(&home, Some("kerno-connections.json"));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = picking.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.export_connections_to(path, window, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Writes the saved connections, without their secrets, to `path`.
+    pub fn export_connections_to(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let configs: Vec<ConnectionConfig> = self
+            .connections
+            .read(cx)
+            .saved()
+            .iter()
+            .map(|saved| saved.config.clone())
+            .collect();
+        let count = configs.len();
+        let target = path.clone();
+        let writing = bridge::spawn_blocking(cx, move || {
+            let json = export_connections(&configs)?;
+            std::fs::write(&target, json).map_err(|error| {
+                kerno_core::Error::io(format!("writing {}", target.display()), error)
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = writing.await;
+            let _ = this.update_in(cx, |_, window, cx| match outcome {
+                Ok(()) => window.push_notification(
+                    Notification::success(SharedString::from(format!(
+                        "Exported {count} connection{} to {}. Passwords are not included.",
+                        if count == 1 { "" } else { "s" },
+                        path.display()
+                    ))),
+                    cx,
+                ),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!("The export failed: {error}"))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    fn import_connections(
+        &mut self,
+        _: &ImportConnections,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picking = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picking.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.import_connections_from(path, window, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Adds the connections of an exported file.
+    pub fn import_connections_from(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = path.clone();
+        let reading = bridge::spawn_blocking(cx, move || {
+            let json = std::fs::read_to_string(&source).map_err(|error| {
+                kerno_core::Error::io(format!("reading {}", source.display()), error)
+            })?;
+            import_connections(&json)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(configs) => {
+                    let count = configs.len();
+                    this.connections.update(cx, |connections, cx| connections.import(configs, cx));
+                    window.push_notification(
+                        Notification::success(SharedString::from(format!(
+                            "Imported {count} connection{}. Enter their passwords when you connect.",
+                            if count == 1 { "" } else { "s" }
+                        ))),
+                        cx,
+                    );
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "{} was not imported: {error}",
+                        path.display()
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    // Rendering ---------------------------------------------------------------
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -483,7 +771,11 @@ impl Workspace {
             .bg(theme.status_bar)
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child("Not connected")
+            .child(match self.connections.read(cx).connected_count() {
+                0 => SharedString::from("Not connected"),
+                1 => SharedString::from("1 connection open"),
+                count => SharedString::from(format!("{count} connections open")),
+            })
             .when(memory_only, |this| {
                 this.child(
                     div()
@@ -531,7 +823,7 @@ impl Render for Workspace {
                     resizable_panel()
                         .size(px(260.))
                         .size_range(px(200.)..px(480.))
-                        .child(self.render_sidebar(cx)),
+                        .child(self.sidebar.clone()),
                 )
                 .child(main)
         } else {
@@ -553,6 +845,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::open_command_palette))
+            .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::import_connections))
+            .on_action(cx.listener(Self::export_connections))
             .size_full()
             .bg(background)
             .text_color(foreground)

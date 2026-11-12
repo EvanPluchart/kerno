@@ -214,6 +214,11 @@ fn connect_error(error: tokio_postgres::Error) -> Error {
         return Error::Connect(format!("{} [{}]", db.message(), db.code().code()));
     }
     let text = error_chain(&error);
+    // The client library's words when the server asks for a password and
+    // the settings carry none.
+    if text.contains("password missing") {
+        return Error::PasswordRequired;
+    }
     if text.contains("TLS") || text.contains("certificate") {
         Error::Tls(text)
     } else {

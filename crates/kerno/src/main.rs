@@ -2,8 +2,10 @@
 
 mod actions;
 mod bridge;
+mod connections;
 mod logging;
 mod settings;
+mod sidebar;
 mod state;
 mod tabs;
 mod theme;
@@ -18,9 +20,11 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, CloseTab, NewQueryTab, OpenCommandPalette, OpenSettings, Quit, ToggleSidebar,
-    UseDarkTheme, UseLightTheme, UseSystemTheme,
+    About, CloseTab, ExportConnections, ImportConnections, NewConnection, NewQueryTab,
+    OpenCommandPalette, OpenSettings, Quit, ToggleSidebar, UseDarkTheme, UseLightTheme,
+    UseSystemTheme,
 };
+use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
 use crate::theme::Appearance;
 use crate::workspace::Workspace;
@@ -96,6 +100,14 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     let keymap_file = AppState::get(cx).paths.keymap();
     gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("Kerno");
+        // The user's own known_hosts is read, never written: keys Kerno
+        // learns go to its own file.
+        let user_known_hosts = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join(".ssh/known_hosts"));
+        let drivers = Drivers::default()
+            .with(kerno_postgres::PostgresDriver)
+            .with(kerno_mysql::MysqlDriver);
+        let connections = cx.new(|_| Connections::new(connections, drivers, user_known_hosts));
         let workspace = cx.new(|cx| Workspace::new(connections, tabs, active_tab, window, cx));
         workspace.focus_handle(cx).focus(window, cx);
         for problem in keymap_problems {
@@ -125,6 +137,10 @@ fn menus() -> Vec<Menu> {
             name: "File".into(),
             items: vec![
                 MenuItem::action("New Query Tab", NewQueryTab),
+                MenuItem::action("New Connection…", NewConnection),
+                MenuItem::separator(),
+                MenuItem::action("Import Connections…", ImportConnections),
+                MenuItem::action("Export Connections…", ExportConnections),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
             ],

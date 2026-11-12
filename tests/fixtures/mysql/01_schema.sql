@@ -250,3 +250,6 @@ CREATE EVENT purge_old_audit_log
 CREATE USER 'kerno_readonly'@'%' IDENTIFIED BY 'kerno_ro_pw';
 GRANT SELECT ON kerno.* TO 'kerno_readonly'@'%';
 GRANT SELECT, INSERT ON kerno.audit_log TO 'kerno_readonly'@'%';
+-- Signs in with the client certificate the test CA issued, without a password.
+CREATE USER 'kerno_cert'@'%' REQUIRE SUBJECT '/CN=kerno_cert';
+GRANT SELECT ON kerno.* TO 'kerno_cert'@'%';

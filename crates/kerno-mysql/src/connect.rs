@@ -215,8 +215,67 @@ pub(crate) async fn open(
                 .await?
                 .map_err(|error| connect_error(error, params))
         }
+        // verify-ca: the chain is what counts, not the name. The client
+        // library's own switch for this does not recognise the TLS
+        // library's error any more and refuses, so dial again under a name
+        // the certificate carries: the chain is verified in full, exactly
+        // as before, and the name check then passes.
+        Err(error) if params.tls.mode == TlsMode::VerifyCa => {
+            let Some(name) = presented_names(&error).and_then(|names| usable_name(&names)) else {
+                return Err(connect_error(error, params));
+            };
+            let tls = tls_under_name(params, name).await?;
+            dial(params, timeout, tls, database)
+                .await?
+                .map_err(|error| connect_error(error, params))
+        }
         Err(error) => Err(connect_error(error, params)),
     }
+}
+
+async fn tls_under_name(params: &ConnectParams, name: String) -> Result<Option<SslOpts>> {
+    Ok(ssl_opts(params)
+        .await?
+        .map(|opts| opts.with_danger_tls_hostname_override(Some(name))))
+}
+
+/// The names the server's certificate carries, when the only thing wrong
+/// with it is that the host name is not one of them.
+fn presented_names(error: &mysql_async::Error) -> Option<Vec<String>> {
+    let tls = match error {
+        mysql_async::Error::Io(IoError::Tls(mysql_async::TlsError::Tls(error))) => error,
+        // The handshake's own failure arrives wrapped in an I/O error.
+        mysql_async::Error::Io(IoError::Io(io)) => io.get_ref()?.downcast_ref::<rustls::Error>()?,
+        _ => return None,
+    };
+    match tls {
+        rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext {
+            presented,
+            ..
+        }) => Some(presented.clone()),
+        _ => None,
+    }
+}
+
+/// A host name or address that matches one of a certificate's names, which
+/// the TLS library reports as `DnsName("db.example.com")` or
+/// `IpAddress(10.0.0.5)`. A wildcard is given a first label.
+fn usable_name(presented: &[String]) -> Option<String> {
+    presented.iter().find_map(|name| {
+        let name = name
+            .strip_prefix("DnsName(\"")
+            .and_then(|rest| rest.strip_suffix("\")"))
+            .or_else(|| name.strip_prefix("IpAddress(")?.strip_suffix(')'))?;
+        let name = match name.strip_prefix("*.") {
+            Some(parent) => format!("host.{parent}"),
+            None => name.to_string(),
+        };
+        let plain = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'));
+        plain.then_some(name)
+    })
 }
 
 /// `errno (sqlstate)`, the form MySQL's own tools print.
@@ -236,6 +295,10 @@ fn connect_error(error: mysql_async::Error, params: &ConnectParams) -> Error {
     match error {
         // Wrong password, unknown database, host not allowed: the server's
         // own sentence is the useful one.
+        // ER_ACCESS_DENIED_ERROR without a password: one is needed.
+        mysql_async::Error::Server(server) if server.code == 1045 && params.password.is_none() => {
+            Error::PasswordRequired
+        }
         mysql_async::Error::Server(server) => {
             Error::Connect(format!("{} [{}]", server.message, code(&server)))
         }
@@ -253,12 +316,12 @@ fn connect_error(error: mysql_async::Error, params: &ConnectParams) -> Error {
             if !about_tls {
                 Error::Connect(text)
             } else if params.tls.mode == TlsMode::VerifyCa && text.contains("not valid for name") {
-                // The chain was accepted and only the name differs, which
-                // verify-ca should let through; the client library does
-                // not recognise this error of the TLS library and refuses.
+                // Only the name differs, and `open` found no name in the
+                // certificate to dial under (or the second dial failed the
+                // same way): refused rather than guessed.
                 Error::Tls(format!(
-                    "{text}. The certificate is signed by a trusted authority, but this driver \
-                     cannot yet skip the host name check of verify-ca; connect with a name the \
+                    "{text}. verify-ca could not be completed because the certificate carries \
+                     no host name or address this driver can use; connect with a name the \
                      certificate carries"
                 ))
             } else {
@@ -371,6 +434,33 @@ mod tests {
             read_only: false,
             options: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn a_certificate_name_is_picked_for_verify_ca() {
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            usable_name(&names(&[
+                "DnsName(\"db.example.com\")",
+                "IpAddress(10.0.0.5)"
+            ])),
+            Some("db.example.com".into())
+        );
+        assert_eq!(
+            usable_name(&names(&["IpAddress(10.0.0.5)"])),
+            Some("10.0.0.5".into())
+        );
+        assert_eq!(usable_name(&names(&["IpAddress(::1)"])), Some("::1".into()));
+        assert_eq!(
+            usable_name(&names(&["DnsName(\"*.example.com\")"])),
+            Some("host.example.com".into())
+        );
+        // Anything else is not guessed at: the connection stays refused.
+        assert_eq!(
+            usable_name(&names(&["OtherName(1.2.3)", "DnsName(\"a b\")", ""])),
+            None
+        );
+        assert_eq!(usable_name(&[]), None);
     }
 
     #[test]

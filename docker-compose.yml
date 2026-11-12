@@ -40,11 +40,24 @@ services:
       MYSQL_DATABASE: kerno
       MYSQL_USER: kerno
       MYSQL_PASSWORD: kerno_test_pw
-    command: ["--character-set-server=utf8mb4", "--local-infile=1", "--max-connections=100"]
+    command:
+      - --character-set-server=utf8mb4
+      - --local-infile=1
+      - --max-connections=100
+      # The generated test certificate, signed by the test CA.
+      - --ssl-ca=/kerno-tls/ca.crt
+      - --ssl-cert=/kerno-tls/server.crt
+      - --ssl-key=/kerno-tls/server.key
     ports:
       - "127.0.0.1:53306:3306"
+    networks:
+      default:
+        # A name the server certificate does not carry (see postgres).
+        aliases:
+          - kerno-mysql-alias
     volumes:
       - ./tests/fixtures/mysql:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
       - kerno_mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "mysql -h 127.0.0.1 -ukerno -pkerno_test_pw -N -e 'select 1 from kerno.kerno_seed_done' | grep -q 1"]
@@ -61,12 +74,23 @@ services:
       MARIADB_DATABASE: kerno
       MARIADB_USER: kerno
       MARIADB_PASSWORD: kerno_test_pw
-    command: ["--character-set-server=utf8mb4", "--local-infile=1", "--max-connections=100"]
+    command:
+      - --character-set-server=utf8mb4
+      - --local-infile=1
+      - --max-connections=100
+      - --ssl-ca=/kerno-tls/ca.crt
+      - --ssl-cert=/kerno-tls/server.crt
+      - --ssl-key=/kerno-tls/server.key
     ports:
       - "127.0.0.1:53307:3306"
+    networks:
+      default:
+        aliases:
+          - kerno-mariadb-alias
     volumes:
       # Same seed as MySQL: the fixture avoids engine-specific syntax.
       - ./tests/fixtures/mysql:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
       - kerno_mariadb_data:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -ukerno -pkerno_test_pw -N -e 'select 1 from kerno.kerno_seed_done' | grep -q 1"]

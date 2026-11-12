@@ -115,3 +115,35 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
   - `kerno-mysql`: 37 unit, 51 integration on both engines (connect 12, execute 25, introspect 10, edits 4).
 - Open at the close of the milestone: MySQL/MariaDB `verify-ca` and the untested positive TLS paths
   (planned in milestone 3); the accepted `rsa` advisory (D-013, owner to confirm).
+
+## 2026-11-12 — Milestone 3: connections
+
+- Built: the `Connections` manager entity (D-017), the connection dialog (engine picker, General / SSL-TLS /
+  SSH tunnel / Advanced, fill from a URL, test, save, save and connect), the sidebar list (groups, tag
+  colour, status, double click to connect or disconnect, context menu: connect, edit, duplicate, delete with
+  confirmation), the prompts (password, SSH password, key passphrase, SSH host key), import and export of
+  connections, the `New Connection` / `Import` / `Export` commands and menu items.
+- Found by the UI tests, fixed:
+  - Enter in any field of the connection dialog closed it (the dialog's own confirm action fired after the
+    field's); the form now refuses that, and the password prompt uses it to submit;
+  - a connection saved with "save password" but with nothing in the secret store (imported, or the entry
+    removed) failed with the client library's "password missing" instead of asking. Both drivers now raise
+    `Error::PasswordRequired` and the manager prompts;
+  - a wrong password typed at a prompt stayed in memory and was replayed on the next attempt; a typed
+    secret that fails is now forgotten, and one that works is saved when the connection asks for that;
+  - the keymap test overrode a command with `Cmd+N`, now the default of `New Connection`: the conflict
+    report was right, the test was changed.
+- MySQL / MariaDB TLS (D-018): both test containers now present the certificate signed by the test CA and
+  have a certificate-only account; `verify-ca` works (it used to refuse on any name mismatch); positive and
+  negative paths of `verify-ca`, `verify-full` and client certificates are tested on both engines.
+- Real app (release build, scratch data directory, in-memory secret store), driven with `orca computer` in
+  the background: fill from URL, test (version and round trip shown), save and connect, context menu, edit,
+  SSH section. Fixed from what the captures showed: the version line was the full build banner; sections
+  of different heights moved the buttons; title and engine search were cramped. Captures are taken once the
+  engine logos are in (owner request of the same day, CLAUDE.md §1 "Engine logos").
+- Test run with `KERNO_REQUIRE_CONTAINERS=1`, nothing skipped, all passing: app 43 (UI 13, manager 10, form
+  7, others 13), `kerno-core` 73 + 10 SSH, `kerno-postgres` 18 + 38, `kerno-mysql` 38 + 52. `cargo fmt
+  --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- Still open in this milestone: captures in `docs/screenshots/`; the client-side write block of read-only
+  connections arrives with the editor (milestone 5).
+

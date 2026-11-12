@@ -5,6 +5,8 @@
 //! workers) runs all of that work, and the functions here hand its results
 //! back as GPUI tasks the UI can await without blocking.
 
+use std::future::Future;
+
 use gpui_kit::{App, AppContext as _, Global, Task};
 
 /// Worker threads of the Tokio runtime.
@@ -23,6 +25,22 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
         .build()?;
     cx.set_global(Tokio(runtime));
     Ok(())
+}
+
+/// Runs `future` on the Tokio runtime and returns a GPUI task for its
+/// output. Dropping the task does not stop the work.
+pub fn spawn<T: Send + 'static>(
+    cx: &App,
+    future: impl Future<Output = T> + Send + 'static,
+) -> Task<T> {
+    let handle = cx.global::<Tokio>().0.spawn(future);
+    cx.background_spawn(async move {
+        match handle.await {
+            Ok(output) => output,
+            // The work panicked: carry the panic to whoever awaits it.
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        }
+    })
 }
 
 /// Runs blocking work (Kerno's SQLite store, the OS secret store) on

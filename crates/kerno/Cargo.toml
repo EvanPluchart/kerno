@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 kerno-core.workspace = true
 kerno-postgres.workspace = true
+kerno-mysql.workspace = true
 gpui-kit.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

@@ -14,6 +14,12 @@ gpui_kit::actions!(
     [
         /// Opens the command palette.
         OpenCommandPalette,
+        /// Opens the dialog to add a connection.
+        NewConnection,
+        /// Adds the connections of an exported file.
+        ImportConnections,
+        /// Writes the saved connections, without secrets, to a file.
+        ExportConnections,
         /// Opens a new query tab.
         NewQueryTab,
         /// Closes the active tab.
@@ -70,6 +76,37 @@ macro_rules! command {
 
 /// Every command, in palette order.
 pub const COMMANDS: &[Command] = &[
+    command!(
+        "new_connection",
+        "New Connection",
+        "Connections",
+        ["secondary-n"],
+        [
+            "add",
+            "server",
+            "database",
+            "postgresql",
+            "mysql",
+            "mariadb"
+        ],
+        NewConnection
+    ),
+    command!(
+        "import_connections",
+        "Import Connections…",
+        "Connections",
+        [],
+        ["json", "file"],
+        ImportConnections
+    ),
+    command!(
+        "export_connections",
+        "Export Connections…",
+        "Connections",
+        [],
+        ["json", "file", "backup", "share"],
+        ExportConnections
+    ),
     command!(
         "new_query_tab",
         "New Query Tab",
@@ -336,14 +373,14 @@ mod tests {
     fn overrides_replace_defaults_per_command() {
         let (bindings, problems) = effective_bindings(
             r#"{"bindings": {
-                "new_query_tab": "secondary-n",
+                "new_query_tab": "secondary-shift-t",
                 "close_tab": ["secondary-w", "ctrl-f4"],
                 "toggle_sidebar": null,
                 "about": "f1"
             }}"#,
         );
         assert_eq!(problems, Vec::<String>::new());
-        assert_eq!(keys_of(&bindings, "new_query_tab"), ["secondary-n"]);
+        assert_eq!(keys_of(&bindings, "new_query_tab"), ["secondary-shift-t"]);
         assert_eq!(keys_of(&bindings, "close_tab"), ["secondary-w", "ctrl-f4"]);
         assert_eq!(keys_of(&bindings, "toggle_sidebar"), Vec::<String>::new());
         assert_eq!(keys_of(&bindings, "about"), ["f1"]);

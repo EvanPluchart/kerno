@@ -116,6 +116,12 @@ async fn connection_failures_say_why() {
         "the password must not be echoed: {error}"
     );
 
+    // No password at all is its own error, so the app can ask for one.
+    let mut params = testing::params(ENGINE);
+    params.password = None;
+    let error = failure(params).await;
+    assert!(matches!(error, Error::PasswordRequired), "{error:?}");
+
     let mut params = testing::params(ENGINE);
     params.database = Some("no_such_database".into());
     let error = failure(params).await;

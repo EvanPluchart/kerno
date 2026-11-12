@@ -207,6 +207,15 @@ async fn connection_failures_say_why() {
             "the password must not be echoed: {error:?}"
         );
 
+        // No password at all is its own error, so the app can ask for one.
+        let mut params = testing::params(engine);
+        params.password = None;
+        let error = failure(params).await;
+        assert!(
+            matches!(error, Error::PasswordRequired),
+            "{engine:?}: {error:?}"
+        );
+
         let mut params = testing::params(engine);
         params.database = Some("no_such_database".into());
         let error = failure(params).await;
@@ -258,25 +267,28 @@ async fn tls_modes_without_verification() {
 }
 
 #[tokio::test]
-async fn tls_verification_refuses_a_certificate_no_authority_signed() {
+async fn tls_verification() {
     for engine in engines() {
-        // The containers present certificates their own servers generated:
-        // no authority the client trusts signed them.
+        // The test CA signed the server certificate, which carries 127.0.0.1.
         for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
-            // The system's store.
+            let session = connect(&with_tls(engine, tls(mode, Some("ca.crt"))))
+                .await
+                .unwrap_or_else(|error| panic!("{engine:?} {mode:?}: {error}"));
+            assert_ne!(cipher(&session).await, "", "{mode:?} must encrypt");
+
+            // A CA that did not sign it.
+            let error = connect(&with_tls(engine, tls(mode, Some("wrong-ca.crt"))))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{mode:?} must refuse an unknown CA"));
+            assert!(matches!(error, Error::Tls(_)), "{mode:?}: {error:?}");
+            // Without a CA file the system store is used; it does not know
+            // the test CA.
             let error = connect(&with_tls(engine, tls(mode, None)))
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{mode:?} must refuse an unknown issuer"));
             assert!(matches!(error, Error::Tls(_)), "{mode:?}: {error:?}");
-            // A CA file that did not sign it.
-            for ca in ["ca.crt", "wrong-ca.crt"] {
-                let error = connect(&with_tls(engine, tls(mode, Some(ca))))
-                    .await
-                    .err()
-                    .unwrap_or_else(|| panic!("{mode:?} must refuse with {ca}"));
-                assert!(matches!(error, Error::Tls(_)), "{mode:?} {ca}: {error:?}");
-            }
         }
         // A CA file that is not there is named.
         let error = connect(&with_tls(
@@ -288,10 +300,47 @@ async fn tls_verification_refuses_a_certificate_no_authority_signed() {
         .expect("a missing CA file");
         assert!(error.to_string().contains("absent.crt"), "{error}");
 
-        // The non-verifying modes accept the same certificate.
+        // The non-verifying modes accept the same certificate without any CA.
         connect(&with_tls(engine, tls(TlsMode::Require, None)))
             .await
             .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn client_certificate_authentication() {
+    for engine in engines() {
+        let certificate = |cert: &str, key: &str| ConnectParams {
+            user: "kerno_cert".into(),
+            password: None,
+            tls: TlsConfig {
+                mode: TlsMode::VerifyFull,
+                ca_file: Some(testing::generated("tls/ca.crt")),
+                cert_file: Some(testing::generated(&format!("tls/{cert}"))),
+                key_file: Some(testing::generated(&format!("tls/{key}"))),
+            },
+            ..testing::params(engine)
+        };
+        let session = connect(&certificate("client.crt", "client.key"))
+            .await
+            .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+        assert_eq!(
+            scalar(&session, "SELECT CURRENT_USER()").await,
+            "kerno_cert@%"
+        );
+
+        // The account requires its certificate: without one it is refused.
+        let mut params = certificate("client.crt", "client.key");
+        params.tls.cert_file = None;
+        params.tls.key_file = None;
+        assert!(connect(&params).await.is_err(), "{engine:?}");
+
+        // A certificate with a key that is not its own cannot be used.
+        let error = connect(&certificate("client.crt", "server.key"))
+            .await
+            .err()
+            .expect("a mismatched key");
+        assert!(matches!(error, Error::Tls(_)), "{engine:?}: {error:?}");
     }
 }
 
@@ -449,20 +498,45 @@ async fn tls_through_the_tunnel() {
             },
         )
         .await;
-        let with_mode = |mode: TlsMode| ConnectParams {
-            tls: tls(mode, None),
-            ..through(engine, &tunnel)
+        let alias = match engine {
+            Engine::MariaDb => "kerno-mariadb-alias",
+            _ => "kerno-mysql-alias",
+        };
+        let with_mode = |mode: TlsMode, host: Option<&str>| {
+            let mut params = through(engine, &tunnel);
+            params.tls = tls(mode, Some("ca.crt"));
+            if let Some(host) = host {
+                params.host = host.into();
+            }
+            params
         };
         // Encrypted end to end inside the tunnel.
-        let session = connect(&with_mode(TlsMode::Require)).await.unwrap();
+        let session = connect(&with_mode(TlsMode::Require, None)).await.unwrap();
         assert_ne!(cipher(&session).await, "");
-        let session = connect(&with_mode(TlsMode::Disable)).await.unwrap();
+        let session = connect(&with_mode(TlsMode::Disable, None)).await.unwrap();
         assert_eq!(cipher(&session).await, "");
-        // Verification is not weakened by the detour.
-        for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
-            let error = connect(&with_mode(mode)).await.err();
-            assert!(matches!(error, Some(Error::Tls(_))), "{mode:?}: {error:?}");
-        }
+
+        // The same server under a name its certificate does not carry:
+        // verify-full refuses it, verify-ca checks the chain only.
+        let error = connect(&with_mode(TlsMode::VerifyFull, Some(alias)))
+            .await
+            .err();
+        assert!(
+            matches!(error, Some(Error::Tls(_))),
+            "{engine:?}: verify-full must refuse a wrong name: {error:?}"
+        );
+        let session = connect(&with_mode(TlsMode::VerifyCa, Some(alias)))
+            .await
+            .unwrap_or_else(|error| panic!("{engine:?} verify-ca: {error}"));
+        assert_ne!(cipher(&session).await, "");
+        // The chain is still checked when the name is not.
+        let mut params = with_mode(TlsMode::VerifyCa, Some(alias));
+        params.tls = tls(TlsMode::VerifyCa, Some("wrong-ca.crt"));
+        let error = connect(&params).await.err();
+        assert!(
+            matches!(error, Some(Error::Tls(_))),
+            "{engine:?}: {error:?}"
+        );
     }
 }
 
