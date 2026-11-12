@@ -244,3 +244,21 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
   the conditions; they are left to the raw output now.
 - App tests: 80 passing with the containers required.
 
+## 2026-11-12 — Milestone 5, third part; milestone 6; plans for what is left
+
+- Editor: comment toggle (Cmd+/), find and replace commands, Edit menu. PostgreSQL: a paged result
+  abandoned inside an open transaction is left to finish (a cancel aborted the transaction).
+- Core, delegated and checked (tests re-run, lint): `sql::complete` (schema-aware completion from a
+  catalog) and `sql::format_sql` (token-preserving formatter). Not wired into the editor yet.
+- Table data view (milestone 6): `kerno_core::browse` and `pending`, `DataTab`, the grid's edit layer.
+  Pages, server-side sort and filter, inline edits, add / duplicate / delete, Set NULL / default, review
+  and atomic apply, read-only with the reason, foreign keys both ways, restore after a restart.
+- Found in the real app and fixed: the kit's table never opens a row menu in cell-selection mode, so the
+  copy menu of results did not exist outside tests; each cell now opens its row's menu (test with a real
+  right click). New and deleted rows are tinted as whole rows; the editor selects the cell's text.
+- Checked in the release app against `kerno-postgres` on a scratch schema (dropped afterwards): edit,
+  delete, review, apply (verified on the server), filter, restore of a data tab, dark theme. Captures
+  `m6-*.png`.
+- Tests: app 91, core 212, drivers green with the containers required; clippy and fmt clean.
+- Owner request: Fable budget nearly spent. Plans written in `docs/plans/` (README, M5–M10); from here the
+  main session plans, reviews and commits, and subagents implement.

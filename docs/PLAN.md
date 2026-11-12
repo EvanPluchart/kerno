@@ -10,12 +10,19 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |
 | 4  | Schema navigator (§4 B)                                                    | done   |
-| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | todo   |
-| 6  | Table data view and editing (§4 E)                                         | todo   |
+| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: `plans/M5.md`) |
+| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md`) |
 | 7  | Structure (§4 F)                                                           | todo   |
 | 8  | Import, export, backup, administration (§4 G, H)                           | todo   |
 | 9  | Performance pass, `docs/BENCH.md`                                          | todo   |
 | 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | todo |
+
+## Implementation plans (owner request of 2026-11-12, CLAUDE.md §7 "Model budget")
+
+`docs/plans/README.md` holds what every plan shares; `docs/plans/M5.md` to `M10.md` hold the remaining work
+of each milestone, split into parts. The main session plans, reviews and commits; each part is implemented
+by a subagent (`opus`, effort high; `sonnet` or `haiku` for mechanical work), at most two at once. If the
+main session stops, the work continues from these files.
 
 ## How each feature is built
 
