@@ -1,7 +1,8 @@
 //! What can be done to each kind of node: the content of its context menu.
 
 use kerno_core::Dialect;
-use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind};
+use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
+use kerno_core::table_draft::{AutoIncrement, ColumnDraft, TableChange};
 
 use super::model::{Group, Node, NodeKind};
 use crate::settings::TableDoubleClick;
@@ -52,6 +53,18 @@ pub enum Action {
     Export,
     ImportCsv,
     Refresh,
+    /// PostgreSQL `DROP … CASCADE`: also drops what depends on the object.
+    DropCascade,
+    CreateFunction,
+    CreateProcedure,
+    CreateSequence,
+    CreateTrigger,
+    CreateEvent,
+    AddColumn,
+    RenameColumn,
+    DropColumn,
+    /// Selects the table at the other end of a foreign key in the tree.
+    RevealTable,
 }
 
 impl Action {
@@ -80,6 +93,16 @@ impl Action {
             Action::Export => "Export…",
             Action::ImportCsv => "Import CSV…",
             Action::Refresh => "Refresh",
+            Action::DropCascade => "Drop with cascade…",
+            Action::CreateFunction => "Create function…",
+            Action::CreateProcedure => "Create procedure…",
+            Action::CreateSequence => "Create sequence…",
+            Action::CreateTrigger => "Create trigger…",
+            Action::CreateEvent => "Create event…",
+            Action::AddColumn => "Add column…",
+            Action::RenameColumn => "Rename column…",
+            Action::DropColumn => "Drop column…",
+            Action::RevealTable => "Show table in tree",
         }
     }
 
@@ -101,6 +124,9 @@ impl Action {
                 | Action::AddEnumValue
                 | Action::RenameEnumValue
                 | Action::ImportCsv
+                | Action::DropCascade
+                | Action::RenameColumn
+                | Action::DropColumn
         )
     }
 }
@@ -190,6 +216,14 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Group(Group::Views) => vec![vec![CreateView]],
         // The folder exists on PostgreSQL only.
         NodeKind::Group(Group::Types) => vec![vec![CreateEnum]],
+        NodeKind::Group(Group::Functions) => vec![vec![CreateFunction]],
+        NodeKind::Group(Group::Procedures) => vec![vec![CreateProcedure]],
+        // MySQL's one folder of routines.
+        NodeKind::Group(Group::Routines) => vec![vec![CreateFunction, CreateProcedure]],
+        NodeKind::Group(Group::Sequences) => vec![vec![CreateSequence]],
+        NodeKind::Group(Group::Triggers) => vec![vec![CreateTrigger]],
+        NodeKind::Group(Group::Events) => vec![vec![CreateEvent]],
+        NodeKind::Group(Group::Columns) => vec![vec![AddColumn]],
         NodeKind::Group(_) => Vec::new(),
         NodeKind::EnumValue { .. } => vec![vec![CopyName], vec![AddEnumValue, RenameEnumValue]],
         NodeKind::Extension { installed, .. } => {
@@ -198,9 +232,32 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 vec![if *installed { Drop } else { InstallExtension }],
             ]
         }
-        NodeKind::Column { .. } => vec![vec![CopyName]],
+        // F4 and "Open structure" show the table the column is in.
+        NodeKind::Column { .. } => vec![
+            vec![OpenStructure],
+            vec![CopyName],
+            vec![AddColumn, RenameColumn, DropColumn],
+        ],
+        NodeKind::Constraint { .. } => vec![vec![CopyName]],
+        // The structure of the table at the other end.
+        NodeKind::ForeignKey { .. } => vec![vec![OpenStructure, RevealTable], vec![CopyName]],
     };
-    groups.into_iter().chain([vec![Refresh]]).collect()
+    // PostgreSQL drops what depends on an object with CASCADE (DBeaver's
+    // cascade option of its delete confirmation); a database has none.
+    let cascade = has_schemas && !matches!(node.kind, NodeKind::Object(ObjectRef::Database(_)));
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .flat_map(|action| match action {
+                    Drop if cascade => vec![Drop, DropCascade],
+                    action => vec![action],
+                })
+                .collect()
+        })
+        .chain([vec![Refresh]])
+        .collect()
 }
 
 /// What a double click or Enter does to a node: an entry of its menu, or
@@ -220,6 +277,7 @@ pub fn default_action(node: &Node, has_schemas: bool, table: TableDoubleClick) -
         NodeKind::Object(ObjectRef::Schema(_) | ObjectRef::Database(_)) | NodeKind::Group(_) => {
             None
         }
+        NodeKind::ForeignKey { .. } => Some(Action::OpenStructure),
         _ => actions(node, has_schemas)
             .concat()
             .contains(&Action::ShowDdl)
@@ -235,6 +293,97 @@ pub fn edit_action(node: &Node, has_schemas: bool) -> Option<Action> {
     [Action::OpenStructure, Action::EditSource, Action::ShowDdl]
         .into_iter()
         .find(|action| available.contains(action))
+}
+
+/// The statement a "Create …" entry (or "Add column…") opens in a query
+/// tab, to complete and run, with its tab title. The new object is named
+/// `new_…` in `schema`; a trigger is on `table`, or on a `table_name` to
+/// replace when it is created from a schema's folder. MySQL bodies sit
+/// between `DELIMITER //` lines so that `BEGIN … END` runs as one statement.
+/// `None` when the action writes no template.
+pub fn create_template(
+    action: Action,
+    dialect: &dyn Dialect,
+    schema: &str,
+    table: Option<&TableRef>,
+) -> Option<(String, String)> {
+    let name = |object: &str| dialect.table_name(&TableRef::new(schema, object));
+    let on = table.map_or_else(|| name("table_name"), |table| dialect.table_name(table));
+    let mysql = !dialect.has_schemas();
+    let block = |head: String, body: &str| {
+        format!("DELIMITER //\n{head}\nBEGIN\n    {body}\nEND//\nDELIMITER ;\n")
+    };
+    let sql = match action {
+        Action::CreateFunction if mysql => block(
+            format!(
+                "CREATE FUNCTION {}(value INT)\nRETURNS INT\nDETERMINISTIC",
+                name("new_function")
+            ),
+            "RETURN value;",
+        ),
+        Action::CreateFunction => format!(
+            "CREATE FUNCTION {}(value integer)\nRETURNS integer\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    RETURN value;\nEND;\n$$;\n",
+            name("new_function")
+        ),
+        Action::CreateProcedure if mysql => block(
+            format!("CREATE PROCEDURE {}()", name("new_procedure")),
+            "-- statements",
+        ),
+        Action::CreateProcedure => format!(
+            "CREATE PROCEDURE {}()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    NULL;\nEND;\n$$;\n",
+            name("new_procedure")
+        ),
+        Action::CreateSequence => format!(
+            "CREATE SEQUENCE {}\n    START WITH 1\n    INCREMENT BY 1;\n",
+            name("new_sequence")
+        ),
+        Action::CreateTrigger if mysql => block(
+            format!(
+                "CREATE TRIGGER {}\nBEFORE INSERT ON {on}\nFOR EACH ROW",
+                name("new_trigger")
+            ),
+            "-- SET NEW.column = value;",
+        ),
+        // A PostgreSQL trigger calls a function that returns `trigger`.
+        Action::CreateTrigger => {
+            let function = name("new_trigger_function");
+            format!(
+                "CREATE FUNCTION {function}()\nRETURNS trigger\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    RETURN NEW;\nEND;\n$$;\n\n\
+                 CREATE TRIGGER {}\nBEFORE INSERT OR UPDATE ON {on}\nFOR EACH ROW\nEXECUTE FUNCTION {function}();\n",
+                dialect.quote_ident("new_trigger")
+            )
+        }
+        Action::CreateEvent => block(
+            format!(
+                "CREATE EVENT {}\nON SCHEDULE EVERY 1 DAY\nDO",
+                name("new_event")
+            ),
+            "-- statements",
+        ),
+        Action::AddColumn => {
+            let column = ColumnDraft {
+                original: None,
+                name: "new_column".into(),
+                data_type: "text".into(),
+                nullable: true,
+                default: None,
+                comment: None,
+                auto_increment: AutoIncrement::Off,
+                on_update: None,
+                invisible: false,
+            };
+            let statements = dialect
+                .alter_table_sql(table?, &[TableChange::AddColumn(column)])
+                .ok()?;
+            return Some((table?.name.clone(), statements.join(";\n") + ";\n"));
+        }
+        _ => return None,
+    };
+    let title = action
+        .label()
+        .trim_end_matches('…')
+        .replace("Create", "New");
+    Some((title, sql))
 }
 
 /// The name of an object with its schema (on MySQL, its database), each
@@ -283,8 +432,6 @@ fn quote_if_needed(name: &str, dialect: &dyn Dialect) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kerno_core::schema::TableRef;
-
     use super::*;
     use crate::navigator::model::Children;
 
@@ -357,17 +504,84 @@ mod tests {
         assert!(view.contains(&Export) && !view.contains(&ImportCsv));
         assert!(schema.contains(&ImportCsv) && mysql_database.contains(&ImportCsv));
         assert!(!pg_database.contains(&ImportCsv));
-        assert_eq!(flat(NodeKind::Group(Group::Triggers), true), [Refresh]);
         assert_eq!(
             flat(
                 NodeKind::Column {
-                    table: orders,
+                    table: orders.clone(),
                     name: "id".into()
+                },
+                true
+            ),
+            [
+                OpenStructure,
+                CopyName,
+                AddColumn,
+                RenameColumn,
+                DropColumn,
+                Refresh
+            ]
+        );
+        assert_eq!(
+            flat(NodeKind::Group(Group::Columns), false),
+            [AddColumn, Refresh]
+        );
+        // Constraints are copied; a key leads to the table at its other end.
+        assert_eq!(
+            flat(
+                NodeKind::Constraint {
+                    table: orders.clone(),
+                    name: "orders_pkey".into()
                 },
                 true
             ),
             [CopyName, Refresh]
         );
+        assert_eq!(
+            flat(
+                NodeKind::ForeignKey {
+                    name: "orders_customer_id_fkey".into(),
+                    other: TableRef::new("shop", "customers")
+                },
+                false
+            ),
+            [OpenStructure, RevealTable, CopyName, Refresh]
+        );
+        // A trigger under a table is a trigger.
+        let trigger = flat(
+            NodeKind::Object(ObjectRef::Trigger {
+                table: orders.clone(),
+                name: "orders_log".into(),
+            }),
+            false,
+        );
+        assert_eq!(
+            trigger,
+            [ShowDdl, CopyName, CopyQualifiedName, Rename, Drop, Refresh]
+        );
+
+        // Each folder of objects creates its kind (DBeaver's Create ▸).
+        let folder = |group, has_schemas| flat(NodeKind::Group(group), has_schemas);
+        assert_eq!(folder(Group::Functions, true), [CreateFunction, Refresh]);
+        assert_eq!(folder(Group::Procedures, true), [CreateProcedure, Refresh]);
+        assert_eq!(
+            folder(Group::Routines, false),
+            [CreateFunction, CreateProcedure, Refresh]
+        );
+        assert_eq!(folder(Group::Sequences, true), [CreateSequence, Refresh]);
+        assert_eq!(folder(Group::Triggers, true), [CreateTrigger, Refresh]);
+        assert_eq!(folder(Group::Events, false), [CreateEvent, Refresh]);
+        assert_eq!(folder(Group::Indexes, true), [Refresh]);
+
+        // PostgreSQL drops with cascade, right after Drop; MySQL has no
+        // cascade, and a database none either.
+        let at = table.iter().position(|action| *action == Drop).unwrap();
+        assert_eq!(table[at + 1], DropCascade);
+        let mysql_table = flat(
+            NodeKind::Object(ObjectRef::Relation(orders, RelationKind::Table)),
+            false,
+        );
+        assert!(mysql_table.contains(&Drop) && !mysql_table.contains(&DropCascade));
+        assert!(pg_database.contains(&Drop) && !pg_database.contains(&DropCascade));
         // Every menu ends with Refresh, in a group of its own.
         let extension = |installed| NodeKind::Extension {
             name: "pg_trgm".into(),
@@ -378,7 +592,10 @@ mod tests {
             Some(&vec![Refresh])
         );
         // An extension is installed or dropped, as it is.
-        assert_eq!(flat(extension(true), true), [CopyName, Drop, Refresh]);
+        assert_eq!(
+            flat(extension(true), true),
+            [CopyName, Drop, DropCascade, Refresh]
+        );
         assert_eq!(
             flat(extension(false), true),
             [CopyName, InstallExtension, Refresh]
@@ -495,12 +712,23 @@ mod tests {
             None
         );
         assert_eq!(open(NodeKind::Group(Group::Tables), data), None);
-        // Nothing to show for a column.
+        // Nothing to show for a column or a constraint.
         let column = NodeKind::Column {
-            table: orders,
+            table: orders.clone(),
             name: "id".into(),
         };
         assert_eq!(open(column, data), None);
+        let constraint = NodeKind::Constraint {
+            table: orders,
+            name: "orders_pkey".into(),
+        };
+        assert_eq!(open(constraint, data), None);
+        // A foreign key opens the structure of the table at its other end.
+        let key = NodeKind::ForeignKey {
+            name: "orders_customer_id_fkey".into(),
+            other: TableRef::new("shop", "customers"),
+        };
+        assert_eq!(open(key, data), Some(OpenStructure));
     }
 
     #[test]
@@ -533,14 +761,15 @@ mod tests {
         assert_eq!(edit(schema, true), Some(ShowDdl));
         let database = NodeKind::Object(ObjectRef::Database("kerno".into()));
         assert_eq!(edit(database.clone(), false), Some(ShowDdl));
-        // Nothing to edit on a PostgreSQL database, a folder or a column.
-        assert_eq!(edit(database, true), None);
-        assert_eq!(edit(NodeKind::Group(Group::Tables), true), None);
+        // A column is edited in the structure of its table.
         let column = NodeKind::Column {
             table: orders,
             name: "id".into(),
         };
-        assert_eq!(edit(column, true), None);
+        assert_eq!(edit(column, true), Some(OpenStructure));
+        // Nothing to edit on a PostgreSQL database or a folder.
+        assert_eq!(edit(database, true), None);
+        assert_eq!(edit(NodeKind::Group(Group::Tables), true), None);
     }
 
     #[test]
@@ -606,6 +835,9 @@ mod tests {
             AddEnumValue,
             RenameEnumValue,
             ImportCsv,
+            DropCascade,
+            RenameColumn,
+            DropColumn,
         ] {
             assert!(action.writes(), "{action:?}");
         }
@@ -622,8 +854,90 @@ mod tests {
             CreateView,
             Export,
             Refresh,
+            CreateFunction,
+            CreateProcedure,
+            CreateSequence,
+            CreateTrigger,
+            CreateEvent,
+            AddColumn,
+            RevealTable,
         ] {
             assert!(!action.writes(), "{action:?}");
         }
+    }
+
+    #[test]
+    fn create_entries_write_a_template_per_engine() {
+        use Action::*;
+        let pg = kerno_postgres::PgDialect;
+        let mysql = kerno_mysql::MysqlDialect::new(kerno_core::Engine::MySql);
+        let orders = TableRef::new("shop", "orders");
+        let template = |action, dialect: &dyn Dialect, table| {
+            create_template(action, dialect, "shop", table).expect("a template")
+        };
+
+        let (title, sql) = template(CreateFunction, &pg, None);
+        assert_eq!(title, "New function");
+        assert!(
+            sql.starts_with("CREATE FUNCTION \"shop\".\"new_function\"(value integer)")
+                && sql.contains("LANGUAGE plpgsql")
+                && sql.ends_with("$$;\n"),
+            "{sql}"
+        );
+        assert!(
+            template(CreateProcedure, &pg, None)
+                .1
+                .contains("CREATE PROCEDURE")
+        );
+        assert_eq!(
+            template(CreateSequence, &mysql, None).1,
+            "CREATE SEQUENCE `shop`.`new_sequence`\n    START WITH 1\n    INCREMENT BY 1;\n"
+        );
+        // A trigger comes with its function on PostgreSQL, and is on the
+        // table of its folder, or on a name to replace.
+        let (_, sql) = template(CreateTrigger, &pg, Some(&orders));
+        assert!(
+            sql.contains("RETURNS trigger")
+                && sql.contains("BEFORE INSERT OR UPDATE ON \"shop\".\"orders\"")
+                && sql.contains("EXECUTE FUNCTION \"shop\".\"new_trigger_function\"();"),
+            "{sql}"
+        );
+        assert!(
+            template(CreateTrigger, &pg, None)
+                .1
+                .contains("ON \"shop\".\"table_name\"")
+        );
+
+        // MySQL bodies are kept whole by DELIMITER lines.
+        let (title, sql) = template(CreateProcedure, &mysql, None);
+        assert_eq!(title, "New procedure");
+        assert_eq!(
+            sql,
+            "DELIMITER //\nCREATE PROCEDURE `shop`.`new_procedure`()\nBEGIN\n    -- statements\nEND//\nDELIMITER ;\n"
+        );
+        let statements = kerno_core::sql::split_statements(&sql, mysql.lex_rules());
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        assert!(
+            template(CreateFunction, &mysql, None)
+                .1
+                .contains("DETERMINISTIC")
+        );
+        assert!(
+            template(CreateTrigger, &mysql, Some(&orders))
+                .1
+                .contains("BEFORE INSERT ON `shop`.`orders`")
+        );
+        assert!(
+            template(CreateEvent, &mysql, None)
+                .1
+                .contains("ON SCHEDULE EVERY 1 DAY")
+        );
+
+        // A new column is written by the engine's ALTER TABLE.
+        let (title, sql) = template(AddColumn, &pg, Some(&orders));
+        assert_eq!(title, "orders");
+        assert!(sql.contains("ADD COLUMN \"new_column\" text"), "{sql}");
+        assert_eq!(create_template(AddColumn, &pg, "shop", None), None);
+        assert_eq!(create_template(Drop, &pg, "shop", None), None);
     }
 }

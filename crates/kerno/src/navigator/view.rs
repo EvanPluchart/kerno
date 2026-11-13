@@ -27,10 +27,15 @@ use gpui_kit::{
 use kerno_core::browse::Filter;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{delete_template, insert_template, select_template, update_template};
+use kerno_core::table_draft::TableChange;
 use kerno_core::{Session, exec};
 
-use super::actions::{Action, Template, actions, default_action, edit_action, qualified_name};
-use super::model::{self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Tree};
+use super::actions::{
+    Action, Template, actions, create_template, default_action, edit_action, qualified_name,
+};
+use super::model::{
+    self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Reveal, Tree,
+};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
@@ -107,7 +112,18 @@ pub struct Navigator {
     /// Where the active query tab runs, kept up to date by the window: what
     /// "Set as default for this tab" changes.
     tab_target: Rc<RefCell<Option<Target>>>,
+    /// The table to select once the way to it is loaded (see [`Navigator::reveal`]).
+    revealing: Option<Revealing>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A table or view [`Navigator::reveal`] is opening the way to.
+#[derive(Debug, Clone)]
+struct Revealing {
+    /// Its database; the connection's own when `None`.
+    database: Option<String>,
+    table: TableRef,
+    kind: RelationKind,
 }
 
 impl EventEmitter<NavigatorEvent> for Navigator {}
@@ -150,6 +166,7 @@ impl Navigator {
             tree_state,
             filter,
             tab_target: Rc::default(),
+            revealing: None,
             _subscriptions: subscriptions,
         }
     }
@@ -205,6 +222,7 @@ impl Navigator {
         self.root = Root::None;
         self.tree = Tree::default();
         self.sessions.clear();
+        self.revealing = None;
         self.sync(cx);
     }
 
@@ -260,6 +278,7 @@ impl Navigator {
                         if let Some(load) = this.tree.set_databases(databases, current.as_deref()) {
                             this.run(load, cx);
                         }
+                        this.advance_reveal(cx);
                     }
                     Err(error) => this.root = Root::Failed(error.to_string()),
                 }
@@ -409,11 +428,82 @@ impl Navigator {
                         &load.id,
                         outcome.map_err(|error: kerno_core::Error| error.to_string()),
                     );
+                    this.advance_reveal(cx);
                     this.sync(cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// Selects a table or view in the tree, opening and loading the way to
+    /// it (DBeaver's "Link with editor", `core.navigator.linkeditor`). The
+    /// tree shows `target`'s connection first; nothing is selected when the
+    /// table is not there.
+    pub fn reveal(
+        &mut self,
+        target: &Target,
+        table: &TableRef,
+        kind: RelationKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.connection.as_deref() != Some(target.connection.as_str()) {
+            self.set_connection(Some(target.connection.clone()), cx);
+        }
+        self.revealing = Some(Revealing {
+            database: target.database.clone(),
+            table: table.clone(),
+            kind,
+        });
+        self.advance_reveal(cx);
+    }
+
+    /// Takes the reveal one load further; called again as loads finish.
+    fn advance_reveal(&mut self, cx: &mut Context<Self>) {
+        // The databases come first.
+        if self.root != Root::Loaded {
+            return;
+        }
+        let Some(revealing) = self.revealing.clone() else {
+            return;
+        };
+        let database = revealing
+            .database
+            .or_else(|| self.meta(cx).and_then(|meta| meta.database()))
+            .unwrap_or_default();
+        let path = self
+            .tree
+            .relation_path(&database, &revealing.table, revealing.kind);
+        match self.tree.reveal(&path) {
+            Reveal::Waiting(Some(load)) => self.run(load, cx),
+            Reveal::Waiting(None) => {}
+            Reveal::Found => {
+                self.revealing = None;
+                self.sync(cx);
+                let id = SharedString::from(path.last().cloned().unwrap_or_default());
+                self.tree_state.update(cx, |state, cx| {
+                    if let Some(index) = state.index_of(&id) {
+                        state.set_selected_index(Some(index), cx);
+                        state.scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
+                    }
+                });
+                return;
+            }
+            Reveal::Missing => self.revealing = None,
+        }
+        self.sync(cx);
+    }
+
+    /// The table or view a node is in or under (itself for a table), with
+    /// its node id.
+    fn relation_above(&self, id: &str) -> Option<(TableRef, RelationKind, String)> {
+        let mut id = id;
+        loop {
+            if let NodeKind::Object(ObjectRef::Relation(table, kind)) = &self.tree.node(id)?.kind {
+                return Some((table.clone(), *kind, id.to_string()));
+            }
+            id = model::parent_of(id)?;
+        }
     }
 
     // Actions -----------------------------------------------------------------
@@ -432,10 +522,22 @@ impl Navigator {
         match action {
             Action::Refresh => self.refresh(id, cx),
             Action::OpenData | Action::OpenStructure => {
-                if let (NodeKind::Object(ObjectRef::Relation(table, kind)), Some(target)) =
-                    (&node.kind, self.target_of(&node, false))
+                // A column opens its table; a foreign key the table at its
+                // other end.
+                let opened = match &node.kind {
+                    NodeKind::Object(ObjectRef::Relation(table, kind)) => {
+                        Some((table.clone(), *kind))
+                    }
+                    NodeKind::ForeignKey { other, .. } => {
+                        Some((other.clone(), RelationKind::Table))
+                    }
+                    NodeKind::Column { .. } => self
+                        .relation_above(&node.id)
+                        .map(|(table, kind, _)| (table, kind)),
+                    _ => None,
+                };
+                if let (Some((table, kind)), Some(target)) = (opened, self.target_of(&node, false))
                 {
-                    let (table, kind) = (table.clone(), *kind);
                     cx.emit(match action {
                         Action::OpenData => NavigatorEvent::OpenData {
                             target,
@@ -500,8 +602,24 @@ impl Navigator {
                     cx.emit(NavigatorEvent::CreateTable { target, schema });
                 }
             }
-            Action::NewQueryHere | Action::CreateView => {
-                self.open_template(action, &node, window, cx)
+            Action::RevealTable => {
+                if let (NodeKind::ForeignKey { other, .. }, Some(target)) =
+                    (&node.kind, self.target_of(&node, false))
+                {
+                    self.reveal(&target, other, RelationKind::Table, cx);
+                }
+            }
+            Action::NewQueryHere
+            | Action::CreateView
+            | Action::CreateFunction
+            | Action::CreateProcedure
+            | Action::CreateSequence
+            | Action::CreateTrigger
+            | Action::CreateEvent
+            | Action::AddColumn => {
+                if self.unavailable(action, &node, cx).is_none() {
+                    self.open_template(action, &node, window, cx)
+                }
             }
             Action::Generate(template) => self.generate(template, &node, window, cx),
             Action::ShowDdl => self.show_ddl(&node, window, cx),
@@ -518,7 +636,10 @@ impl Navigator {
             | Action::InstallExtension
             | Action::CreateEnum
             | Action::AddEnumValue
-            | Action::RenameEnumValue => self.confirm(action, &node, window, cx),
+            | Action::RenameEnumValue
+            | Action::DropCascade
+            | Action::RenameColumn
+            | Action::DropColumn => self.confirm(action, &node, window, cx),
         }
     }
 
@@ -540,8 +661,17 @@ impl Navigator {
             (Action::Rename, Some(object)) if dialect.rename_sql(object, "name").is_err() => {
                 Some("not supported by this database")
             }
-            (Action::Drop, Some(object)) if dialect.drop_sql(object).is_err() => {
+            (Action::Drop | Action::DropCascade, Some(object))
+                if dialect.drop_sql(object).is_err() =>
+            {
                 Some("not supported by this database")
+            }
+            (Action::AddColumn | Action::RenameColumn | Action::DropColumn, _)
+                if !self
+                    .relation_above(&node.id)
+                    .is_some_and(|(_, kind, _)| kind.is_table()) =>
+            {
+                Some("a view's columns come from its query")
             }
             (Action::EditSource, Some(object))
                 if dialect.replace_source_sql(object, "").is_err() =>
@@ -582,6 +712,8 @@ impl Navigator {
             return;
         };
         let target = self.target_of(node, action == Action::NewQueryHere);
+        // A trigger or column made from a table's folder is on that table.
+        let table = self.relation_above(&node.id).map(|(table, _, _)| table);
         let session = self.session_for(&node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let outcome = session.await;
@@ -597,7 +729,11 @@ impl Navigator {
                             ),
                         ),
                         // An empty tab that runs in this schema.
-                        _ => (schema.clone(), String::new()),
+                        Action::NewQueryHere => (schema.clone(), String::new()),
+                        _ => match create_template(action, dialect, &schema, table.as_ref()) {
+                            Some(template) => template,
+                            None => return,
+                        },
                     };
                     cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
                 }
@@ -788,6 +924,7 @@ impl Navigator {
         let name = node.label.clone();
         let kind = match (&node.kind, &object) {
             (NodeKind::Extension { .. }, _) => "extension",
+            (NodeKind::Column { .. }, _) => "column",
             (_, Some(object)) => kind_name(object),
             _ => "object",
         };
@@ -798,8 +935,10 @@ impl Navigator {
         // Databases are listed by the connection's own session, and a
         // database is dropped from outside it.
         let on_root = matches!(object, Some(ObjectRef::Database(_)));
+        // The table a column belongs to, read again once it changed.
+        let relation = self.relation_above(&node.id);
         let (title, explanation, statement, button, destructive, after, done) = match action {
-            Action::Drop => {
+            Action::Drop | Action::DropCascade => {
                 let sql = match (&node.kind, &object) {
                     (NodeKind::Extension { name, .. }, _) => {
                         dialect_of.dialect().drop_extension_sql(name)
@@ -810,13 +949,25 @@ impl Navigator {
                 let Ok(sql) = sql else {
                     return;
                 };
+                // The dialect's DROP never ends with CASCADE or a semicolon.
+                let cascade = action == Action::DropCascade;
                 (
-                    format!("Drop {kind} “{name}”?"),
-                    format!(
-                        "The {kind} and what it holds are removed for good. This cannot be undone."
-                    ),
-                    Statement::Fixed(sql),
-                    "Drop",
+                    if cascade {
+                        format!("Drop {kind} “{name}” with cascade?")
+                    } else {
+                        format!("Drop {kind} “{name}”?")
+                    },
+                    if cascade {
+                        format!(
+                            "The {kind}, what it holds and every object that depends on it (views, foreign keys, …) are removed for good. This cannot be undone."
+                        )
+                    } else {
+                        format!(
+                            "The {kind} and what it holds are removed for good. This cannot be undone."
+                        )
+                    },
+                    Statement::Fixed(if cascade { sql + " CASCADE" } else { sql }),
+                    if cascade { "Drop with cascade" } else { "Drop" },
                     true,
                     if on_root {
                         After::Reload
@@ -873,6 +1024,63 @@ impl Navigator {
                     },
                     format!("Renamed {kind} {name}."),
                 )
+            }
+            Action::RenameColumn | Action::DropColumn => {
+                let (
+                    NodeKind::Column {
+                        table,
+                        name: column,
+                    },
+                    Some((_, _, relation)),
+                ) = (&node.kind, relation)
+                else {
+                    return;
+                };
+                let (table, current, build_for) =
+                    (table.clone(), column.clone(), dialect_of.clone());
+                let alter = move |change: TableChange| {
+                    build_for
+                        .dialect()
+                        .alter_table_sql(&table, &[change])
+                        .map(|statements| statements.join(";\n"))
+                        .map_err(|error| error.to_string())
+                };
+                if action == Action::DropColumn {
+                    let Ok(sql) = alter(TableChange::DropColumn(current)) else {
+                        return;
+                    };
+                    (
+                        format!("Drop column “{name}”?"),
+                        "The column and the values it holds are removed for good. This cannot be undone.".to_string(),
+                        Statement::Fixed(sql),
+                        "Drop column",
+                        true,
+                        After::Refresh(Some(relation)),
+                        format!("Dropped column {name}."),
+                    )
+                } else {
+                    (
+                        format!("Rename column “{name}”"),
+                        "Statements, views and functions that use the old name of the column have to be changed too.".to_string(),
+                        Statement::Named {
+                            label: "New name",
+                            initial: column.clone(),
+                            build: Rc::new(move |new_name| {
+                                if new_name == current {
+                                    return Err("Type a different name.".into());
+                                }
+                                alter(TableChange::RenameColumn {
+                                    from: current.clone(),
+                                    to: new_name.to_string(),
+                                })
+                            }),
+                        },
+                        "Rename column",
+                        false,
+                        After::Refresh(Some(relation)),
+                        format!("Renamed column {name}."),
+                    )
+                }
             }
             Action::CreateSchema => {
                 let build_for = dialect_of.clone();
@@ -1589,6 +1797,8 @@ fn glyph(kind: &NodeKind) -> Glyph {
         NodeKind::EnumValue { .. } => Glyph::ListOrdered,
         NodeKind::Group(_) => Glyph::Folder,
         NodeKind::Column { .. } => Glyph::Columns3,
+        NodeKind::Constraint { .. } => Glyph::ShieldCheck,
+        NodeKind::ForeignKey { .. } => Glyph::Link2,
     }
 }
 
@@ -1599,6 +1809,8 @@ fn name_of(node: &Node) -> String {
         NodeKind::Object(object) => plain_name(object),
         NodeKind::Column { name, .. }
         | NodeKind::Extension { name, .. }
+        | NodeKind::Constraint { name, .. }
+        | NodeKind::ForeignKey { name, .. }
         | NodeKind::EnumValue { value: name, .. } => name.clone(),
         NodeKind::Group(group) => group.label().to_string(),
     }

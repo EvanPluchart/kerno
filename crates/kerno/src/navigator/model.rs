@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use kerno_core::schema::{
-    DatabaseInfo, ExtensionInfo, ObjectRef, RelationKind, RoutineKind, SchemaInfo, SchemaObjects,
-    TableRef, TableStructure, TypeShape,
+    ConstraintKind, DatabaseInfo, ExtensionInfo, ObjectRef, RelationKind, RoutineKind, SchemaInfo,
+    SchemaObjects, TableRef, TableStructure, TypeShape,
 };
 
 /// Separates the segments of a node id. Not a character names contain.
@@ -27,7 +27,10 @@ pub enum Group {
     Events,
     Extensions,
     Columns,
+    Constraints,
+    ForeignKeys,
     Indexes,
+    References,
 }
 
 impl Group {
@@ -45,8 +48,16 @@ impl Group {
             Group::Events => "Events",
             Group::Extensions => "Extensions",
             Group::Columns => "Columns",
+            Group::Constraints => "Constraints",
+            Group::ForeignKeys => "Foreign keys",
             Group::Indexes => "Indexes",
+            Group::References => "References",
         }
+    }
+
+    /// The last segment of a folder's node id.
+    fn segment(self) -> String {
+        self.label().to_lowercase().replace(' ', "-")
     }
 }
 
@@ -64,6 +75,12 @@ pub enum NodeKind {
     Extension { name: String, installed: bool },
     /// A value of a PostgreSQL enum type.
     EnumValue { ty: TableRef, value: String },
+    /// A primary key, unique, check or exclusion constraint of a table.
+    Constraint { table: TableRef, name: String },
+    /// A foreign key, under the table that holds it ("Foreign keys") or
+    /// under the table it points at ("References"): `other` is the table
+    /// at the other end.
+    ForeignKey { name: String, other: TableRef },
 }
 
 /// The children of a node.
@@ -124,6 +141,18 @@ pub enum LoadKind {
     Objects { schema: String },
     Structure { table: TableRef },
     Extensions,
+}
+
+/// Where [`Tree::reveal`] got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reveal {
+    /// The node is there, and the way to it is open.
+    Found,
+    /// A node on the way is loading: try again once it is loaded. Holds
+    /// the load to run, when this call started one.
+    Waiting(Option<Load>),
+    /// The node is not on the server (or a node on the way failed to load).
+    Missing,
 }
 
 /// The server's answer to a [`Load`].
@@ -267,7 +296,9 @@ impl Tree {
             Ok(Loaded::Objects(objects)) => {
                 Children::Loaded(object_groups(node, *objects, has_schemas))
             }
-            Ok(Loaded::Structure(structure)) => Children::Loaded(structure_nodes(node, *structure)),
+            Ok(Loaded::Structure(structure)) => {
+                Children::Loaded(structure_nodes(node, *structure, has_schemas))
+            }
             Ok(Loaded::Extensions(extensions)) => {
                 Children::Loaded(extension_nodes(node, extensions))
             }
@@ -294,6 +325,63 @@ impl Tree {
             .iter()
             .filter_map(|node| item(node, &self.filter))
             .collect()
+    }
+
+    /// The ids from the root down to the node of a table or view in
+    /// `database` (on MySQL the database is the table's schema).
+    pub fn relation_path(
+        &self,
+        database: &str,
+        table: &TableRef,
+        kind: RelationKind,
+    ) -> Vec<String> {
+        let database = if self.has_schemas {
+            database
+        } else {
+            &table.schema
+        };
+        let mut container = format!("db:{database}");
+        let mut path = vec![container.clone()];
+        if self.has_schemas {
+            container = format!("{container}{SEP}schema:{}", table.schema);
+            path.push(container.clone());
+        }
+        let folder = match kind {
+            RelationKind::View => Group::Views,
+            RelationKind::MaterializedView => Group::MaterializedViews,
+            _ => Group::Tables,
+        };
+        let folder = format!("{container}{SEP}{}", folder.segment());
+        path.push(format!("{folder}{SEP}rel:{}", table.name));
+        path.insert(path.len() - 1, folder);
+        path
+    }
+
+    /// Opens the way to the last node of `path` (DBeaver's "link with
+    /// editor"), one load at a time: call it again when a load it waits
+    /// for has finished.
+    pub fn reveal(&mut self, path: &[String]) -> Reveal {
+        let Some((target, above)) = path.split_last() else {
+            return Reveal::Missing;
+        };
+        for id in above {
+            match self.node(id).map(|node| &node.children) {
+                None | Some(Children::Failed(_)) => return Reveal::Missing,
+                Some(Children::Loading) => {
+                    self.expand(id);
+                    return Reveal::Waiting(None);
+                }
+                Some(_) => {}
+            }
+            if let Some(load) = self.expand(id) {
+                return Reveal::Waiting(Some(load));
+            }
+        }
+        if self.node(target).is_some() {
+            Reveal::Found
+        } else {
+            Reveal::Missing
+        }
     }
 }
 
@@ -433,12 +521,7 @@ fn extension_nodes(group: &Node, extensions: Vec<ExtensionInfo>) -> Vec<Node> {
 
 /// A folder holding `children`, with their number as its hint.
 fn group(parent: &Node, kind: Group, build: impl FnOnce(&Node) -> Vec<Node>) -> Node {
-    let mut node = child(
-        parent,
-        &kind.label().to_lowercase().replace(' ', "-"),
-        NodeKind::Group(kind),
-        kind.label(),
-    );
+    let mut node = child(parent, &kind.segment(), NodeKind::Group(kind), kind.label());
     let children = build(&node);
     node.hint = Some(children.len().to_string());
     // An empty folder is there to say so, and for its "Create…" entry.
@@ -663,9 +746,20 @@ fn object_groups(parent: &Node, objects: SchemaObjects, has_schemas: bool) -> Ve
     groups
 }
 
-fn structure_nodes(relation: &Node, structure: TableStructure) -> Vec<Node> {
-    let NodeKind::Object(ObjectRef::Relation(table, _)) = &relation.kind else {
+/// The folders under a table or view, all from its one structure load.
+/// A table has DBeaver's six, in the engine's order (`ext.postgresql` and
+/// `ext.mysql` plugin.xml); a view has its columns and indexes.
+fn structure_nodes(relation: &Node, structure: TableStructure, has_schemas: bool) -> Vec<Node> {
+    let NodeKind::Object(ObjectRef::Relation(table, kind)) = &relation.kind else {
         return Vec::new();
+    };
+    // Another table is named with its schema when it is in another one.
+    let name_of = |other: &TableRef| {
+        if other.schema == table.schema {
+            other.name.clone()
+        } else {
+            format!("{}.{}", other.schema, other.name)
+        }
     };
     let columns = group(relation, Group::Columns, |folder| {
         structure
@@ -719,7 +813,124 @@ fn structure_nodes(relation: &Node, structure: TableStructure) -> Vec<Node> {
             })
             .collect()
     });
-    vec![columns, indexes]
+    if !kind.is_table() {
+        return vec![columns, indexes];
+    }
+    // DBeaver lists a constraint's columns as its children; here they are
+    // its hint, as an index's are.
+    let constraints = group(relation, Group::Constraints, |folder| {
+        structure
+            .constraints
+            .iter()
+            .map(|constraint| {
+                let hint = match constraint.kind {
+                    ConstraintKind::PrimaryKey => {
+                        format!("{} · primary", constraint.columns.join(", "))
+                    }
+                    ConstraintKind::Unique => format!("{} · unique", constraint.columns.join(", ")),
+                    ConstraintKind::Check | ConstraintKind::Exclusion => {
+                        constraint.definition.clone()
+                    }
+                };
+                Node {
+                    hint: Some(hint),
+                    ..child(
+                        folder,
+                        &format!("constraint:{}", constraint.name),
+                        NodeKind::Constraint {
+                            table: table.clone(),
+                            name: constraint.name.clone(),
+                        },
+                        constraint.name.clone(),
+                    )
+                }
+            })
+            .collect()
+    });
+    let foreign_keys = group(relation, Group::ForeignKeys, |folder| {
+        structure
+            .foreign_keys
+            .iter()
+            .map(|key| Node {
+                hint: Some(format!(
+                    "{} → {} ({})",
+                    key.columns.join(", "),
+                    name_of(&key.referenced_table),
+                    key.referenced_columns.join(", ")
+                )),
+                ..child(
+                    folder,
+                    &format!("fk:{}", key.name),
+                    NodeKind::ForeignKey {
+                        name: key.name.clone(),
+                        other: key.referenced_table.clone(),
+                    },
+                    key.name.clone(),
+                )
+            })
+            .collect()
+    });
+    let references = group(relation, Group::References, |folder| {
+        structure
+            .referenced_by
+            .iter()
+            .map(|key| Node {
+                hint: Some(format!(
+                    "{} ({})",
+                    name_of(&key.table),
+                    key.columns.join(", ")
+                )),
+                ..child(
+                    folder,
+                    // Two tables may each have a key of the same name.
+                    &format!("ref:{}.{}.{}", key.table.schema, key.table.name, key.name),
+                    NodeKind::ForeignKey {
+                        name: key.name.clone(),
+                        other: key.table.clone(),
+                    },
+                    key.name.clone(),
+                )
+            })
+            .collect()
+    });
+    let triggers = group(relation, Group::Triggers, |folder| {
+        structure
+            .triggers
+            .iter()
+            .map(|trigger| Node {
+                hint: Some(format!("{} {}", trigger.timing, trigger.events).to_lowercase()),
+                muted: !trigger.enabled,
+                ..child(
+                    folder,
+                    &format!("trigger:{}", trigger.name),
+                    NodeKind::Object(ObjectRef::Trigger {
+                        table: table.clone(),
+                        name: trigger.name.clone(),
+                    }),
+                    trigger.name.clone(),
+                )
+            })
+            .collect()
+    });
+    if has_schemas {
+        vec![
+            columns,
+            constraints,
+            foreign_keys,
+            indexes,
+            references,
+            triggers,
+        ]
+    } else {
+        vec![
+            columns,
+            constraints,
+            foreign_keys,
+            references,
+            triggers,
+            indexes,
+        ]
+    }
 }
 
 /// A line of text under `parent`.
@@ -811,7 +1022,10 @@ fn scaled(value: u64, unit: u64, suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use kerno_core::TypeKind;
-    use kerno_core::schema::{ColumnInfo, IndexInfo, RelationInfo, RoutineInfo, TypeInfo};
+    use kerno_core::schema::{
+        ColumnInfo, ConstraintInfo, ForeignKeyInfo, IndexInfo, RelationInfo, RoutineInfo,
+        TriggerInfo, TypeInfo,
+    };
 
     use super::*;
 
@@ -905,6 +1119,79 @@ mod tests {
                 },
             ],
             ..SchemaObjects::default()
+        }
+    }
+
+    fn key(name: &str, table: (&str, &str), referenced: (&str, &str)) -> ForeignKeyInfo {
+        let ((schema, table), (referenced_schema, referenced)) = (table, referenced);
+        let column = if referenced == "orders" {
+            "order_id"
+        } else {
+            "customer_id"
+        };
+        ForeignKeyInfo {
+            name: name.into(),
+            table: TableRef::new(schema, table),
+            columns: vec![column.into()],
+            referenced_table: TableRef::new(referenced_schema, referenced),
+            referenced_columns: vec!["id".into()],
+            on_update: "NO ACTION".into(),
+            on_delete: "NO ACTION".into(),
+        }
+    }
+
+    /// The structure of `shop.orders`: three columns, a key, a check, a
+    /// foreign key, two references and a disabled trigger.
+    fn orders_structure() -> TableStructure {
+        TableStructure {
+            columns: vec![
+                column("id", true, false),
+                column("customer_id", false, false),
+                column("note", false, true),
+            ],
+            indexes: vec![IndexInfo {
+                name: "orders_pkey".into(),
+                columns: vec!["id".into()],
+                unique: true,
+                primary: true,
+                backs_constraint: true,
+                method: "btree".into(),
+                predicate: None,
+                definition: None,
+            }],
+            constraints: vec![
+                ConstraintInfo {
+                    name: "orders_pkey".into(),
+                    kind: ConstraintKind::PrimaryKey,
+                    columns: vec!["id".into()],
+                    definition: "PRIMARY KEY (id)".into(),
+                },
+                ConstraintInfo {
+                    name: "orders_total_check".into(),
+                    kind: ConstraintKind::Check,
+                    columns: Vec::new(),
+                    definition: "CHECK ((total >= 0))".into(),
+                },
+            ],
+            foreign_keys: vec![key(
+                "orders_customer_id_fkey",
+                ("shop", "orders"),
+                ("shop", "customers"),
+            )],
+            referenced_by: vec![
+                key("orders_fkey", ("shop", "order_items"), ("shop", "orders")),
+                key("orders_fkey", ("audit", "log"), ("shop", "orders")),
+            ],
+            triggers: vec![TriggerInfo {
+                name: "orders_log".into(),
+                table: "orders".into(),
+                timing: "AFTER".into(),
+                events: "UPDATE".into(),
+                level: "ROW".into(),
+                enabled: false,
+                action: "EXECUTE FUNCTION shop.log()".into(),
+            }],
+            ..TableStructure::default()
         }
     }
 
@@ -1082,27 +1369,7 @@ mod tests {
         assert!(outline(&tree.items()).contains(&"        Loading…".to_string()));
         assert_eq!(tree.expand(&orders), None, "one load at a time");
 
-        tree.finish(
-            &orders,
-            Ok(Loaded::Structure(Box::new(TableStructure {
-                columns: vec![
-                    column("id", true, false),
-                    column("customer_id", false, false),
-                    column("note", false, true),
-                ],
-                indexes: vec![IndexInfo {
-                    name: "orders_pkey".into(),
-                    columns: vec!["id".into()],
-                    unique: true,
-                    primary: true,
-                    backs_constraint: true,
-                    method: "btree".into(),
-                    predicate: None,
-                    definition: None,
-                }],
-                ..TableStructure::default()
-            }))),
-        );
+        tree.finish(&orders, Ok(Loaded::Structure(Box::new(orders_structure()))));
         tree.expand(&format!("{orders}{SEP}columns"));
         let hints: Vec<_> = ["col:id", "col:customer_id", "col:note"]
             .iter()
@@ -1119,6 +1386,129 @@ mod tests {
             .node(&format!("{orders}{SEP}indexes{SEP}index:orders_pkey"))
             .unwrap();
         assert_eq!(index.hint.as_deref(), Some("id · primary"));
+
+        // The same answer fills DBeaver's other folders, in its order.
+        let folders = |tree: &Tree| {
+            let Children::Loaded(folders) = &tree.node(&orders).unwrap().children else {
+                panic!("the table is loaded");
+            };
+            folders
+                .iter()
+                .map(|folder| format!("{} {}", folder.label, folder.hint.clone().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            folders(&tree),
+            [
+                "Columns 3",
+                "Constraints 2",
+                "Foreign keys 1",
+                "Indexes 1",
+                "References 2",
+                "Triggers 1"
+            ]
+        );
+        // `path` below the table, its segments split by `/`.
+        let hint = |path: &str| {
+            let path = path.replace('/', &SEP.to_string());
+            let node = tree.node(&format!("{orders}{SEP}{path}")).unwrap();
+            (node.kind.clone(), node.hint.clone().unwrap())
+        };
+        assert_eq!(
+            hint("constraints/constraint:orders_total_check"),
+            (
+                NodeKind::Constraint {
+                    table: TableRef::new("shop", "orders"),
+                    name: "orders_total_check".into()
+                },
+                "CHECK ((total >= 0))".to_string()
+            )
+        );
+        assert_eq!(hint("constraints/constraint:orders_pkey").1, "id · primary");
+        // A key leads to the table at its other end.
+        assert_eq!(
+            hint("foreign-keys/fk:orders_customer_id_fkey"),
+            (
+                NodeKind::ForeignKey {
+                    name: "orders_customer_id_fkey".into(),
+                    other: TableRef::new("shop", "customers")
+                },
+                "customer_id → customers (id)".to_string()
+            )
+        );
+        // Two tables' keys of one name are two references; another schema
+        // is named.
+        assert_eq!(
+            hint("references/ref:shop.order_items.orders_fkey"),
+            (
+                NodeKind::ForeignKey {
+                    name: "orders_fkey".into(),
+                    other: TableRef::new("shop", "order_items")
+                },
+                "order_items (order_id)".to_string()
+            )
+        );
+        assert_eq!(
+            hint("references/ref:audit.log.orders_fkey").1,
+            "audit.log (order_id)"
+        );
+        let trigger = tree
+            .node(&format!("{orders}{SEP}triggers{SEP}trigger:orders_log"))
+            .unwrap();
+        assert_eq!(
+            trigger.kind,
+            NodeKind::Object(ObjectRef::Trigger {
+                table: TableRef::new("shop", "orders"),
+                name: "orders_log".into()
+            })
+        );
+        assert_eq!(trigger.hint.as_deref(), Some("after update"));
+        assert!(trigger.muted, "a disabled trigger is dimmed");
+
+        // MySQL keeps DBeaver's order for its engine.
+        let mut mysql = Tree::new(false);
+        mysql.set_databases(vec![database("kerno", false)], Some("kerno"));
+        mysql.finish("db:kerno", Ok(Loaded::Objects(Box::new(objects()))));
+        let mysql_orders = format!("db:kerno{SEP}tables{SEP}rel:orders");
+        mysql.expand(&format!("db:kerno{SEP}tables"));
+        mysql.expand(&mysql_orders).unwrap();
+        mysql.finish(
+            &mysql_orders,
+            Ok(Loaded::Structure(Box::new(orders_structure()))),
+        );
+        let Children::Loaded(folders) = &mysql.node(&mysql_orders).unwrap().children else {
+            panic!("the table is loaded");
+        };
+        assert_eq!(
+            folders
+                .iter()
+                .map(|folder| folder.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Columns",
+                "Constraints",
+                "Foreign keys",
+                "References",
+                "Triggers",
+                "Indexes"
+            ]
+        );
+
+        // A view has its columns and indexes only.
+        let view = format!("{shop}{SEP}views{SEP}rel:recent_orders");
+        tree.expand(&format!("{shop}{SEP}views"));
+        tree.expand(&view).unwrap();
+        tree.finish(&view, Ok(Loaded::Structure(Box::new(orders_structure()))));
+        let Children::Loaded(folders) = &tree.node(&view).unwrap().children else {
+            panic!("the view is loaded");
+        };
+        assert_eq!(
+            folders
+                .iter()
+                .map(|folder| folder.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Columns", "Indexes"]
+        );
 
         // Closing and opening again asks the server nothing.
         tree.collapse(&orders);
@@ -1232,6 +1622,60 @@ mod tests {
         let note = &template.children[0];
         assert!(is_note(&note.id) && !is_note(&shop));
         assert_eq!(parent_of(&note.id), Some("db:template1"));
+    }
+
+    #[test]
+    fn reveal_opens_the_way_to_a_table_one_load_at_a_time() {
+        let mut tree = Tree::new(true);
+        tree.set_databases(vec![database("kerno", false)], None);
+        let orders = TableRef::new("shop", "orders");
+        let path = tree.relation_path("kerno", &orders, RelationKind::Table);
+        assert_eq!(
+            path,
+            [
+                "db:kerno".to_string(),
+                format!("db:kerno{SEP}schema:shop"),
+                format!("db:kerno{SEP}schema:shop{SEP}tables"),
+                format!("db:kerno{SEP}schema:shop{SEP}tables{SEP}rel:orders"),
+            ]
+        );
+        let Reveal::Waiting(Some(load)) = tree.reveal(&path) else {
+            panic!("the database loads its schemas first");
+        };
+        assert_eq!(load.what, LoadKind::Schemas);
+        // Asked again before the answer: it waits and loads nothing more.
+        assert_eq!(tree.reveal(&path), Reveal::Waiting(None));
+        tree.finish("db:kerno", Ok(Loaded::Schemas(vec![schema("shop", false)])));
+        let Reveal::Waiting(Some(load)) = tree.reveal(&path) else {
+            panic!("then the schema its objects");
+        };
+        tree.finish(&load.id, Ok(Loaded::Objects(Box::new(objects()))));
+        assert_eq!(tree.reveal(&path), Reveal::Found);
+        assert_eq!(
+            outline(&tree.items())[..4],
+            ["v kerno", "  v shop", "    v Tables", "      > orders"]
+        );
+
+        // A table that is not there ends it.
+        let gone = tree.relation_path("kerno", &TableRef::new("shop", "gone"), RelationKind::Table);
+        assert_eq!(tree.reveal(&gone), Reveal::Missing);
+        let views = tree.relation_path("kerno", &orders, RelationKind::View);
+        assert_eq!(views[2], format!("db:kerno{SEP}schema:shop{SEP}views"));
+
+        // On MySQL the table's schema is its database.
+        let mysql = Tree::new(false);
+        assert_eq!(
+            mysql.relation_path(
+                "ignored",
+                &TableRef::new("kerno", "orders"),
+                RelationKind::Table
+            ),
+            [
+                "db:kerno".to_string(),
+                format!("db:kerno{SEP}tables"),
+                format!("db:kerno{SEP}tables{SEP}rel:orders"),
+            ]
+        );
     }
 
     #[test]
