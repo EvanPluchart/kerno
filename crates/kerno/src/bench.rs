@@ -58,6 +58,12 @@ static BENCH: OnceLock<(Mode, Instant)> = OnceLock::new();
 const WATCHDOG: Duration = Duration::from_secs(180);
 const VERTICAL_PASS: Duration = Duration::from_secs(10);
 const HORIZONTAL_PASS: Duration = Duration::from_secs(3);
+/// Why a bench waiting for a frame stops: macOS stops the display link of
+/// a window that is not on screen, so no frame comes until it is shown
+/// again, and the memory of a hidden window is not the same either (its
+/// drawables are released).
+const HIDDEN: &str = "the window is hidden (covered by another window, minimized, on another \
+                      Space or on a sleeping display): no frame is drawn, nothing is measured";
 
 /// Called first thing in `main`. In seed mode, seeds and exits.
 pub fn init() {
@@ -201,9 +207,15 @@ pub fn begin(
         return;
     };
     cx.set_global(Bench(Marks::default()));
+    let handle = window.window_handle();
     cx.spawn(async move |cx| {
         cx.background_executor().timer(WATCHDOG).await;
-        cx.update(|cx| fail(mode, "timed out", cx));
+        cx.update(|cx| {
+            let hidden = handle
+                .update(cx, |_, window, _| !window.is_visible())
+                .unwrap_or(false);
+            fail(mode, if hidden { HIDDEN } else { "timed out" }, cx)
+        });
     })
     .detach();
     match mode {
@@ -285,10 +297,10 @@ fn footprint_mb() -> Option<f64> {
 /// Polls `done` every few milliseconds.
 async fn until(
     cx: &mut gpui_kit::AsyncWindowContext,
-    mut done: impl FnMut(&mut App) -> anyhow::Result<bool>,
+    mut done: impl FnMut(&mut Window, &mut App) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     loop {
-        if cx.update(|_, cx| done(cx))?? {
+        if cx.update(|window, cx| done(window, cx))?? {
             return Ok(());
         }
         cx.background_executor()
@@ -328,7 +340,7 @@ async fn run(
         connections.update(cx, |connections, cx| connections.connect(&id, cx));
         anyhow::Ok(id)
     })??;
-    until(cx, |cx| match connections.read(cx).status(&id) {
+    until(cx, |_, cx| match connections.read(cx).status(&id) {
         Status::Connected { .. } => Ok(true),
         Status::Failed { message } => anyhow::bail!("the connection failed: {message}"),
         Status::WaitingForInput => anyhow::bail!("the connection asks for input"),
@@ -346,10 +358,17 @@ async fn run(
         })
     })?;
     cx.background_executor().timer(Duration::from_secs(2)).await;
+    // A hidden window has released its drawables: its memory is not the
+    // idle memory of the app on screen.
+    anyhow::ensure!(cx.update(|window, _| window.is_visible())?, HIDDEN);
     let (idle_rss, idle_footprint) = (rss_mb(), footprint_mb());
 
     cx.update(|window, cx| tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx)))?;
-    until(cx, |cx| Ok(marks(cx).frame.is_some())).await?;
+    until(cx, |window, cx| {
+        anyhow::ensure!(window.is_visible(), HIDDEN);
+        Ok(marks(cx).frame.is_some())
+    })
+    .await?;
     let first = cx.update(|_, cx| {
         let marks = marks(cx);
         json!({
@@ -373,7 +392,7 @@ async fn run(
     let rss_before = rss_mb();
     let fetching = Instant::now();
     cx.update(|_, cx| grid.update(cx, |table, _| table.delegate_mut().fetch_all()))?;
-    until(cx, |cx| Ok(marks(cx).complete.is_some())).await?;
+    until(cx, |_, cx| Ok(marks(cx).complete.is_some())).await?;
     let fetched = cx.update(|_, cx| marks(cx).complete)?;
     // One more frame with every row, then measure.
     cx.background_executor()
@@ -411,7 +430,9 @@ async fn run(
             // column 0 numbers the rows.
             const SORTED: usize = 4;
             // A result edited like table data is ordered by the server:
-            // there is no sort here to time.
+            // there is no sort here to time. Whether it is one is found out
+            // by a catalog query that may end after the last row.
+            until(cx, |_, cx| Ok(tab.read(cx).edit_decided(0))).await?;
             if cx.update(|_, cx| grid.read(cx).delegate().sorts_on_server())? {
                 report(json!({"bench": "sort", "rows": rows, "on_server": true}));
                 cx.update(|_, cx| cx.quit())?;
@@ -428,7 +449,7 @@ async fn run(
                     column
                 })
             })?;
-            until(cx, |cx| Ok(marks(cx).sorted.is_some())).await?;
+            until(cx, |_, cx| Ok(marks(cx).sorted.is_some())).await?;
             let sorted = cx.update(|_, cx| marks(cx).sorted)?;
             report(json!({
                 "bench": "sort",

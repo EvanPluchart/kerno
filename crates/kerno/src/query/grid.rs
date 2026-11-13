@@ -2617,6 +2617,7 @@ impl TableDelegate for Grid {
         if self.store.row_count() <= SORT_INLINE_ROWS {
             self.order = Some(sorted_rows(&self.store, source, descending).into());
             self.generation += 1;
+            crate::bench::sorted(cx);
             cx.notify();
             return;
         }

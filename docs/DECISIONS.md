@@ -942,3 +942,21 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   secrets in the OS store, one Kerno instance driven at a time, the disk rules.
 - The benchmark still runs on a quiet machine (`scripts/bench.sh` refuses above a load of 4) with nothing
   else compiling, so its numbers are honest.
+
+## D-053 — Idle memory after the owner's-test work, and what the bench measures
+
+- Idle RSS rose from 138 MB to 170 MB during the evening. Measured causes: the Dock icon set by the app
+  (owner's item 4) for about 24 MB (AppKit keeps the icon rendered at twice its size in points, and decoding
+  it touches framework pages), the main toolbar about 1.3 MB, the larger binary about 1.7 MB. Nothing on
+  the connect path.
+- **The Dock icon is the 256 px drawing shown at 128 points** (the Dock's largest tile), and **it is not
+  set inside an app bundle**, where the system already shows the bundle's icon. Idle RSS: 150.5 MB for the
+  bare binary (150.4 to 151.0 over six runs), 148.5 MB for the same binary inside `Kerno.app`.
+- **Not done:** a 16 MB region the system allocator keeps after the editor's highlighter compiled its
+  query (tree-sitter's scratch, there since milestone 9) could be returned with
+  `malloc_zone_pressure_relief`, a second `unsafe` call: the workspace keeps its single one.
+- **The bench refuses to sample a hidden window** (macOS stops its display link: no frame, and the
+  footprint reads 54 to 65 MB instead of 200 to 210) and waits for the editable decision before it sorts;
+  both had ended runs on the 180 s watchdog. No app bug behind them.
+- `docs/BENCH.md` gives both idle figures, the bare binary (what `scripts/bench.sh` runs) and the binary
+  inside the bundle (what a user runs), and says which one the verdict is about.

@@ -809,6 +809,14 @@ impl QueryTab {
         self.results.get(result).and_then(ResultPane::grid)
     }
 
+    /// Whether it is known if the rows of result `result` take changes
+    /// (an editable result is ordered by the server); for the bench.
+    pub fn edit_decided(&self, result: usize) -> bool {
+        self.results
+            .get(result)
+            .is_some_and(|pane| pane.editable.is_some())
+    }
+
     /// The server's messages of the last run; for tests.
     #[cfg(test)]
     pub fn messages(&self) -> Vec<String> {

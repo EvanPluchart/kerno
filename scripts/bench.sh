@@ -13,6 +13,12 @@
 # with one connection per server and uses the in-memory secret store: the
 # user's own Kerno data and keychain are never touched. The servers'
 # password is read from docker-compose.yml at run time.
+#
+# Keep Kerno's window on screen while it runs: macOS draws no frame for a
+# hidden window (covered, minimized, on another Space, display asleep) and
+# releases its drawables, so such a run is reported as an error, not
+# measured. The bare binary is measured; it sets its own Dock icon, which
+# costs it about 2 MB of idle memory more than Kerno.app.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
