@@ -35,6 +35,13 @@ A subagent given a part must:
   `analytics.*`, `public.all_types`): other tests assert on it.
 - Every long command through `nice -n 10`. `cargo` jobs are capped at 3 in `.cargo/config.toml`. Tests with
   `--test-threads=3`. Run `uptime` before a heavy step; if the load average is above 11 (the core count), wait.
+- Disk (owner's rule of 2026-11-13, after the disk filled up): run `df -h /` before each heavy build
+  (a release build, a full test build after a dependency change, a Docker build). With less than 10 GB
+  free, delete `target/debug/incremental` first — only when no `cargo` or `rustc` is running
+  (`pgrep -x cargo; pgrep -x rustc`); a subagent that cannot (the other agent is building) stops and
+  reports instead. `target/` must stay under about 20 GB: report its size (`du -sh target`) at the end of a
+  part. Docker images built for a check are removed when the check is done.
+- **At most 2 subagents at once, of any kind** (documentation-only agents count too).
 - One Kerno instance at a time; quit it (`pkill -x kerno`) when done. No process left running.
 - No secret in a file, a log or a panic message. No telemetry, no network call other than to the database.
 - Every statement that writes or destroys goes through `crates/kerno/src/sql_confirm.rs` (shows the SQL, asks;
