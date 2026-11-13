@@ -27,8 +27,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task,
-    TestSupportExt as _, Window, div, px,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::exec::Collected;
 use kerno_core::sql::LexRules;
@@ -388,10 +388,19 @@ impl FdwDialog {
         }
     }
 
+    /// Whether the form can be filled: the wrappers are read and one is
+    /// installed (a server needs one).
+    fn has_wrapper(&self) -> bool {
+        matches!(&self.listing, Loaded::Ready(listing) if !listing.wrappers.is_empty())
+    }
+
     /// Why Create cannot run, if it cannot.
     fn blocked(&self, cx: &App) -> Option<String> {
         if self.read_only {
             return Some("read-only connection".into());
+        }
+        if !self.has_wrapper() {
+            return Some("Install a wrapper first.".into());
         }
         fdw_script(&self.form(cx), self.meta.dialect()).err()
     }
@@ -636,11 +645,20 @@ impl FdwDialog {
             .into_any_element()
     }
 
-    fn field(label: &'static str, id: &'static str, input: &Entity<InputState>) -> AnyElement {
+    fn field(
+        label: &'static str,
+        id: &'static str,
+        input: &Entity<InputState>,
+        enabled: bool,
+    ) -> AnyElement {
         h_flex()
             .gap_3()
             .child(div().w(px(130.)).flex_none().text_sm().child(label))
-            .child(div().flex_1().child(Input::new(input).small().id(id)))
+            .child(
+                div()
+                    .flex_1()
+                    .child(Input::new(input).small().id(id).disabled(!enabled)),
+            )
             .into_any_element()
     }
 }
@@ -654,6 +672,9 @@ impl Render for FdwDialog {
         let blocked = self.blocked(cx);
         let script = fdw_script(&self.form(cx), self.meta.dialect());
         let theme = cx.theme();
+        // No wrapper installed: nothing to make a server with, the form is off.
+        let enabled = self.has_wrapper();
+        let none = matches!(&self.listing, Loaded::Ready(_)) && !enabled;
         v_flex()
             .id("fdw-dialog")
             .test_support()
@@ -670,6 +691,17 @@ impl Render for FdwDialog {
                 h_flex()
                     .gap_3()
                     .child(div().w(px(130.)).flex_none().text_sm().child("Wrapper"))
+                    .when(none, |this| {
+                        this.child(
+                            div()
+                                .id("fdw-no-wrapper")
+                                .test_support()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .aria_label("Install a wrapper first (above).")
+                                .child("Install a wrapper first (above)."),
+                        )
+                    })
                     .children(wrappers.into_iter().enumerate().map(|(index, name)| {
                         let chosen = name == self.wrapper;
                         Button::new(("fdw-wrapper", index))
@@ -688,23 +720,40 @@ impl Render for FdwDialog {
                             }))
                     })),
             )
-            .child(Self::field("Server name", "fdw-server", &self.server))
-            .child(Self::field("Host", "fdw-host", &self.host))
-            .child(Self::field("Port", "fdw-port", &self.port))
+            .child(Self::field(
+                "Server name",
+                "fdw-server",
+                &self.server,
+                enabled,
+            ))
+            .child(Self::field("Host", "fdw-host", &self.host, enabled))
+            .child(Self::field("Port", "fdw-port", &self.port, enabled))
             .when(self.wrapper != "mysql_fdw", |this| {
-                this.child(Self::field("Remote database", "fdw-dbname", &self.dbname))
+                this.child(Self::field(
+                    "Remote database",
+                    "fdw-dbname",
+                    &self.dbname,
+                    enabled,
+                ))
             })
-            .child(Self::field("Remote user", "fdw-user", &self.user))
-            .child(Self::field("Password", "fdw-password", &self.password))
+            .child(Self::field("Remote user", "fdw-user", &self.user, enabled))
+            .child(Self::field(
+                "Password",
+                "fdw-password",
+                &self.password,
+                enabled,
+            ))
             .child(Self::field(
                 "Remote schema",
                 "fdw-remote-schema",
                 &self.remote_schema,
+                enabled,
             ))
             .child(Self::field(
                 "Into schema",
                 "fdw-local-schema",
                 &self.local_schema,
+                enabled,
             ))
             .child(
                 div()
@@ -717,6 +766,9 @@ impl Render for FdwDialog {
                     .font_family(theme.mono_font_family.clone())
                     .whitespace_normal()
                     .map(|this| match &script {
+                        _ if none => this
+                            .text_color(theme.muted_foreground)
+                            .child("Install a wrapper first."),
                         Ok(script) => {
                             let shown = masked(script);
                             this.child(

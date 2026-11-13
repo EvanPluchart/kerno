@@ -312,9 +312,16 @@ fn the_chrome_takes_the_environment_colour(cx: &mut TestAppContext) {
                 "{id} {appearance:?}"
             );
         }
-        // Production is stronger than staging: its bar is the colour itself.
+        // Production is stronger than staging: its bar is the colour itself
+        // in light; in dark a deep fill of the same hue under the light text.
         let production = chrome(&app, cx).unwrap();
-        assert_eq!(production.bar, production.frame);
+        if dark {
+            assert!(production.bar.l < production.frame.l, "{production:?}");
+            let turn = (production.bar.h - production.frame.h).abs();
+            assert!(turn.min(1.0 - turn) < 0.02, "{production:?}");
+        } else {
+            assert_eq!(production.bar, production.frame);
+        }
     }
 }
 

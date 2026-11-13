@@ -3427,7 +3427,7 @@ impl Workspace {
         &self,
         item: StatusItem,
         text: impl Into<SharedString>,
-        color: Hsla,
+        (color, bold): (Hsla, bool),
         cx: &Context<Self>,
     ) -> AnyElement {
         // The connection carries its tag colour, as its tabs do, and its
@@ -3463,7 +3463,12 @@ impl Workspace {
                     .bg(dot)
             }))
             .children(logo)
-            .child(div().text_color(color).child(text.into()));
+            .child(
+                div()
+                    .text_color(color)
+                    .when(bold, |this| this.font_weight(FontWeight::SEMIBOLD))
+                    .child(text.into()),
+            );
         if self.menu_entries(MenuOf::Status(item), cx).is_empty() {
             return text.into_any_element();
         }
@@ -3492,9 +3497,45 @@ impl Workspace {
         theme::environment_chrome(&self.connection_config(Some(connection.as_str()), cx)?, cx)
     }
 
+    /// The colour of a status-bar item whose own colour is `own` (a
+    /// warning, an error), and whether it is drawn bold. On a tinted bar
+    /// every item takes the bar's text colour, the one that reads on it, and
+    /// an item that had its own colour keeps the weight as its mark.
+    fn status_look(&self, own: Option<Hsla>, cx: &App) -> (Hsla, bool) {
+        match self.active_chrome(cx) {
+            Some(chrome) => (chrome.bar_text, own.is_some()),
+            None => (own.unwrap_or(cx.theme().muted_foreground), false),
+        }
+    }
+
+    /// Every item of the status bar, left then right (the update item
+    /// aside), with its text colour, the bar's colour and whether it is
+    /// bold, as drawn; for tests.
+    #[cfg(test)]
+    pub fn status_looks(&self, cx: &App) -> Vec<(String, Hsla, Hsla, bool)> {
+        let bar = self
+            .active_chrome(cx)
+            .map_or(cx.theme().status_bar, |chrome| chrome.bar);
+        let mut items: Vec<(String, Option<Hsla>)> = self
+            .status_items(cx)
+            .into_iter()
+            .map(|(_, text, own)| (text, own))
+            .collect();
+        if !AppState::get(cx).secrets.is_persistent() {
+            items.push((MEMORY_ONLY.to_string(), Some(cx.theme().warning)));
+        }
+        items
+            .into_iter()
+            .map(|(text, own)| {
+                let (color, bold) = self.status_look(own, cx);
+                (text, color, bar, bold)
+            })
+            .collect()
+    }
+
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, warning) = (theme.muted_foreground, theme.warning);
+        let warning = theme.warning;
         let memory_only = !AppState::get(cx).secrets.is_persistent();
         let chrome = self.active_chrome(cx);
         h_flex()
@@ -3515,17 +3556,9 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_3()
-                    .children(
-                        self.status_items(cx)
-                            .into_iter()
-                            .map(|(item, text, color)| {
-                                let color = match chrome {
-                                    Some(chrome) => chrome.bar_text,
-                                    None => color.unwrap_or(muted),
-                                };
-                                self.render_status_item(item, text, color, cx)
-                            }),
-                    ),
+                    .children(self.status_items(cx).into_iter().map(|(item, text, own)| {
+                        self.render_status_item(item, text, self.status_look(own, cx), cx)
+                    })),
             )
             .child(
                 h_flex()
@@ -3534,14 +3567,17 @@ impl Workspace {
                     .when(memory_only, |this| {
                         this.child(self.render_status_item(
                             StatusItem::MemoryOnly,
-                            "Passwords are kept in memory only (no system secret store in use)",
-                            warning,
+                            MEMORY_ONLY,
+                            self.status_look(Some(warning), cx),
                             cx,
                         ))
                     }),
             )
     }
 }
+
+/// The status bar's warning when no system secret store is in use.
+const MEMORY_ONLY: &str = "Passwords are kept in memory only (no system secret store in use)";
 
 // Ending what sessions hold before they close; the keyboard after a dialog --
 

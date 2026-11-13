@@ -50,6 +50,7 @@ mod tool_wizards;
 mod toolbar;
 mod tools_menu;
 mod updates;
+mod visual4;
 
 struct Fixture {
     window: WindowHandle<Root>,

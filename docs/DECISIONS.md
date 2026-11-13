@@ -912,3 +912,22 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   the right into a "»" menu. A script that no longer exists leaves the recent list when it is picked: the
   list is not checked against the disk when it opens.
 - **Tooltips** take the shortcut from the live keymap through the kit's `tooltip_with_action`.
+
+## D-051 — Fourth visual pass: what changed after seeing the new screens
+
+- **A tinted bar in a dark theme keeps the hue and lowers the lightness until its light text reads at 7:1**
+  (D-044 asked for 4.5:1: production was then a loud `#D11322` across the window). Production in dark is
+  `#970D19` under `#E6E9ED` (7.22:1); staging `#4F4523` (7.81:1); light is unchanged (production `#C62F3D`
+  with white, 5.42:1; staging `#D6C9AA` with `#16191D`, 10.74:1). The property test holds it for any colour.
+- **Every item of a tinted status bar takes the bar's text colour**; a warning keeps its weight as its mark.
+- **A confirmation asked by an environment's rule names the environment and the connection** in its title
+  and carries the environment's band, for every-run confirmations and for the second click of a write.
+- **Tools hides what the node's kind can never use** and greys, with the reason, only what the
+  connection's state forbids (read-only, not connected).
+- **A failed connection's rows keep one line each; "Details…" shows the whole message**, selectable, with
+  Copy and "Edit connection…".
+- **Restore and Execute script look for their client before a file is chosen**, and the file is a text
+  field too: a typed path is read on Enter or when the field is left, never on each key.
+- **The settings body has one size** (400 px) and scrolls inside.
+- Driving the real app on this Mac: the keyboard layout is French, so a hotkey sent by position can be
+  another shortcut (`cmd+a` arrives as Cmd+Q). The "app quit by itself" reports were that.

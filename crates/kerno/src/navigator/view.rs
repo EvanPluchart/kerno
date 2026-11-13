@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::base::actions::{SelectLeft, SelectRight};
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::{TreeEntry, TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{
@@ -22,9 +23,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
-    WeakEntity, Window, div, img, px,
+    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    TestSupportExt as _, WeakEntity, Window, div, img, px,
 };
 use kerno_core::browse::Filter;
 use kerno_core::config::{FolderLook, ObjectFilter, exact_mask, parent_folder};
@@ -2939,18 +2940,40 @@ impl Navigator {
             .unwrap_or_default();
         match local {
             LINE_RETRY => {
+                // The rows above cannot wrap: a failed connection's whole
+                // message is one click away.
+                let failed = matches!(
+                    self.connections.read(cx).status(connection),
+                    Status::Failed { .. }
+                );
+                let details = failed.then(|| {
+                    let (connections, connection) =
+                        (self.connections.clone(), connection.to_string());
+                    Button::new(("connection-details", at))
+                        .ghost()
+                        .xsmall()
+                        .label("Details…")
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            failure_details(connections.clone(), connection.clone(), window, cx);
+                        })
+                });
                 let (view, connection) = (view.clone(), connection.to_string());
                 row.child(
-                    h_flex().pl(px(20.)).child(
-                        Button::new(("connection-retry", at))
-                            .outline()
-                            .xsmall()
-                            .label(label)
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                view.update(cx, |this, cx| this.retry(&connection, cx));
-                            }),
-                    ),
+                    h_flex()
+                        .pl(px(20.))
+                        .gap_1()
+                        .child(
+                            Button::new(("connection-retry", at))
+                                .outline()
+                                .xsmall()
+                                .label(label)
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    view.update(cx, |this, cx| this.retry(&connection, cx));
+                                }),
+                        )
+                        .children(details),
                 )
             }
             LINE_ERROR => row.child(line_text(label, theme.danger)),
@@ -3417,4 +3440,135 @@ impl Render for Navigator {
                 sidebar_menu(&area, Subject::List, menu, window, cx)
             })
     }
+}
+
+/// Why a connection failed, whole: what happened, what to do, and the
+/// driver's message (selectable), with Copy and "Edit connection…". The
+/// tree's rows show them cut to one line each.
+fn failure_details(
+    connections: Entity<Connections>,
+    id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (config, message) = {
+        let manager = connections.read(cx);
+        let (Some(saved), Status::Failed { message }) = (manager.get(&id), manager.status(&id))
+        else {
+            return;
+        };
+        (saved.config.clone(), message)
+    };
+    let explained = kerno_core::error::explain(&message, &config);
+    let copied = [
+        explained.headline.as_str(),
+        explained.next_step.as_str(),
+        explained.raw.as_str(),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let title = SharedString::from(format!("“{}” could not connect", config.name));
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (explained, copied) = (explained.clone(), copied.clone());
+        let (connections, id) = (connections.clone(), id.clone());
+        dialog
+            .title(title.clone())
+            .w(px(560.))
+            .content(move |content, _, cx| {
+                let copied = copied.clone();
+                let (connections, id) = (connections.clone(), id.clone());
+                content.child(
+                    v_flex()
+                        .id("connection-failure-dialog")
+                        .test_support()
+                        .gap_3()
+                        .child(failure_parts(&explained, cx))
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("connection-failure-copy")
+                                        .outline()
+                                        .label("Copy")
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copied.clone(),
+                                            ))
+                                        }),
+                                )
+                                .child(
+                                    Button::new("connection-failure-edit")
+                                        .outline()
+                                        .label("Edit connection…")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let (connections, id) =
+                                                (connections.clone(), id.clone());
+                                            window.defer(cx, move |window, cx| {
+                                                Sidebar::edit(connections, id, window, cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("connection-failure-close")
+                                        .primary()
+                                        .label("Close")
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                ),
+                        ),
+                )
+            })
+    });
+}
+
+/// The three parts of a failure, each selectable: what happened (strong),
+/// what to do next, the driver's message (muted).
+fn failure_parts(explained: &kerno_core::error::Explained, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let part = |id: &'static str, text: &str| {
+        div().id(id).test_support().child(
+            TextView::markdown(
+                SharedString::from(format!("{id}-text")),
+                plain_markdown(text),
+            )
+            .selectable(true),
+        )
+    };
+    v_flex()
+        .gap_1()
+        .text_sm()
+        .child(
+            part("connection-failure-headline", &explained.headline)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.danger),
+        )
+        .when(!explained.next_step.is_empty(), |this| {
+            this.child(part("connection-failure-next", &explained.next_step))
+        })
+        .child(
+            part("connection-failure-raw", &explained.raw)
+                .text_xs()
+                .text_color(theme.muted_foreground),
+        )
+        .into_any_element()
+}
+
+/// `text` as Markdown that renders as itself: every ASCII punctuation mark
+/// escaped, line breaks kept.
+fn plain_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("  \n"),
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

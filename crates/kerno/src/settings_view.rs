@@ -11,8 +11,8 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription,
-    TestSupportExt as _, Window, div, px,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 
 use crate::connections::manager::Connections;
@@ -492,7 +492,16 @@ impl Render for SettingsView {
                         )
                     })),
             )
-            .child(div().min_h(px(240.)).child(self.render_section(cx)))
+            // One size for every section, the longer ones scrolling inside:
+            // the dialog (and its title) stays put from section to section.
+            .child(
+                div()
+                    .id("settings-body")
+                    .test_support()
+                    .h(px(400.))
+                    .overflow_y_scroll()
+                    .child(self.render_section(cx)),
+            )
             .child(
                 h_flex()
                     .gap_2()

@@ -36,6 +36,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input as TextInput, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -249,7 +251,9 @@ pub struct BackupDialog {
     auth_password: Entity<InputState>,
     /// When the file names were stamped.
     stamp: Stamp,
-    /// Restore / script: the file chosen, and what reading it found.
+    /// Restore / script: the file chosen (typed, pasted or picked), and
+    /// what reading it found.
+    file_field: Entity<InputState>,
     file: Option<PathBuf>,
     input: Option<Result<Input, String>>,
     /// The explicit opt-in to a file's client commands; reset per file.
@@ -433,30 +437,47 @@ impl BackupDialog {
         let encoding = input(String::new(), "the server's");
         let jobs = input(String::new(), "1");
         let auth_user = input(String::new(), "user");
+        let file_field = input(String::new(), "Type or paste a path, or choose the file");
         let auth_password = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
                 .placeholder("password, for this run only")
         });
-        let subscriptions = [
-            &folder,
-            &pattern,
-            &extra,
-            &compression,
-            &encoding,
-            &jobs,
-            &auth_user,
-            &auth_password,
-        ]
-        .into_iter()
-        .map(|input| {
-            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
+        // A typed path is read once it is complete: Enter, or leaving the
+        // field (reading it on every key would look for the clients each time).
+        let mut subscriptions: Vec<Subscription> = vec![cx.subscribe_in(
+            &file_field,
+            window,
+            |this, field, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let typed = field.read(cx).value().trim().to_string();
+                    let path = PathBuf::from(&typed);
+                    if !typed.is_empty() && this.file.as_ref() != Some(&path) {
+                        this.load_input(path, window, cx);
+                    }
                 }
-            })
-        })
-        .collect();
+            },
+        )];
+        subscriptions.extend(
+            [
+                &folder,
+                &pattern,
+                &extra,
+                &compression,
+                &encoding,
+                &jobs,
+                &auth_user,
+                &auth_password,
+            ]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+            }),
+        );
         let mut dialog = Self {
             mode,
             connections: connections.clone(),
@@ -498,6 +519,7 @@ impl BackupDialog {
             auth_user,
             auth_password,
             stamp: Stamp::now(),
+            file_field,
             file: None,
             input: None,
             allow_commands: false,
@@ -658,9 +680,8 @@ impl BackupDialog {
         let Some(params) = self.params.clone() else {
             return;
         };
-        if self.mode.writes() && self.file.is_none() {
-            return;
-        }
+        // Without a file too: the clients are listed and the one in use is
+        // shown (a script's tool is known; a restore's waits for the file).
         self.generation += 1;
         let generation = self.generation;
         self.tool_state = ToolState::Probing;
@@ -758,7 +779,7 @@ impl BackupDialog {
     }
 
     /// Asks for the file to restore or run.
-    fn choose_input(&mut self, cx: &mut Context<Self>) {
+    fn choose_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picking = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             // A directory archive is a folder.
@@ -772,18 +793,23 @@ impl BackupDialog {
                 .into(),
             ),
         });
-        self.tasks.push(cx.spawn(async move |this, cx| {
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = picking.await
                 && let Some(path) = paths.into_iter().next()
             {
-                let _ = this.update(cx, |this, cx| this.load_input(path, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.load_input(path, window, cx));
             }
         }));
     }
 
-    /// Takes `path` as the file to restore or run. The opt-in to its client
-    /// commands starts unchecked.
-    pub fn load_input(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Takes `path` as the file to restore or run, shown in the file field.
+    /// The opt-in to its client commands starts unchecked.
+    pub fn load_input(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = path.display().to_string();
+        if self.file_field.read(cx).value() != shown {
+            self.file_field
+                .update(cx, |field, cx| field.set_value(shown, window, cx));
+        }
         self.file = Some(path);
         self.page = Page::Settings;
         self.probe(cx);
@@ -933,12 +959,12 @@ impl BackupDialog {
                 set(&self.jobs, jobs, window, cx);
                 let input = options.input.clone();
                 self.restore = options;
-                self.load_input(input, cx);
+                self.load_input(input, window, cx);
             }
             TaskSettings::ExecuteScript(options) => {
                 let input = options.input.clone();
                 self.script = options;
-                self.load_input(input, cx);
+                self.load_input(input, window, cx);
             }
         }
         cx.notify();
@@ -2496,6 +2522,31 @@ impl BackupDialog {
             .into_any_element()
     }
 
+    /// A checkbox that refines the one above it: indented under it, and
+    /// off until that one is ticked.
+    fn sub_check(
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        enabled: bool,
+        set: fn(&mut Self, bool),
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .pl(px(24.))
+            .child(
+                Checkbox::new(id)
+                    .label(label)
+                    .checked(checked && enabled)
+                    .disabled(!enabled)
+                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                        set(this, *checked);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn small_input(id: &'static str, input: &Entity<InputState>, width: f32) -> AnyElement {
         div()
             .w(px(width))
@@ -2593,6 +2644,15 @@ impl BackupDialog {
         let text = match &self.tool_state {
             ToolState::Probing => "Looking for the local clients…".to_string(),
             ToolState::Missing(text) => text.clone(),
+            // pg_restore or psql, mysql: the file's format says which.
+            ToolState::Ready { install, .. }
+                if self.mode == Mode::Restore && self.file.is_none() =>
+            {
+                format!(
+                    "{}. Choose the file first: its format says which tool restores it.",
+                    install.label()
+                )
+            }
             ToolState::Ready { path, install, .. } => {
                 format!("{} · {}", install.label(), path.display())
             }
@@ -2608,6 +2668,7 @@ impl BackupDialog {
                     .test_support()
                     .text_sm()
                     .when(missing, |this| this.text_color(theme.danger))
+                    .aria_label(SharedString::from(text.clone()))
                     .child(SharedString::from(text)),
             )
             .when_some(warning, |this, warning| {
@@ -2925,11 +2986,21 @@ impl BackupDialog {
                     "Folder",
                     h_flex()
                         .gap_2()
-                        .child(
+                        .child({
+                            // The field shows the end of a long path; the
+                            // tooltip, all of it.
+                            let folder =
+                                SharedString::from(self.folder.read(cx).value().to_string());
                             div()
+                                .id("backup-folder-field")
                                 .flex_1()
-                                .child(TextInput::new(&self.folder).small().id("backup-folder")),
-                        )
+                                .child(TextInput::new(&self.folder).small().id("backup-folder"))
+                                .when(!folder.is_empty(), |this| {
+                                    this.tooltip(move |window, cx| {
+                                        Tooltip::new(folder.clone()).build(window, cx)
+                                    })
+                                })
+                        })
                         .child(
                             Button::new("backup-choose-folder")
                                 .small()
@@ -3141,16 +3212,12 @@ impl BackupDialog {
                         },
                         cx,
                     ),
-                    Self::check(
+                    Self::sub_check(
                         "backup-if-exists",
                         "… with IF EXISTS",
                         pg.if_exists,
-                        |t, on| {
-                            pg_set(t, |p| {
-                                p.if_exists = on;
-                                p.clean |= on;
-                            })
-                        },
+                        pg.clean,
+                        |t, on| pg_set(t, |p| p.if_exists = on && p.clean),
                         cx,
                     ),
                     Self::check(
@@ -3331,30 +3398,22 @@ impl BackupDialog {
 
     fn render_input_file(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
-        let file = match &self.file {
-            Some(path) => path.display().to_string(),
-            None => "No file chosen".into(),
-        };
         let mut rows = vec![Self::field(
             "File",
             h_flex()
                 .gap_2()
                 .child(
                     div()
-                        .id("restore-file")
-                        .test_support()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .child(SharedString::from(file)),
+                        .child(TextInput::new(&self.file_field).small().id("restore-file")),
                 )
                 .child(
                     Button::new("restore-choose-file")
                         .small()
                         .outline()
                         .label("Choose…")
-                        .on_click(cx.listener(|this, _, _, cx| this.choose_input(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.choose_input(window, cx))),
                 )
                 .into_any_element(),
             cx,
@@ -3403,14 +3462,12 @@ impl BackupDialog {
                     },
                     cx,
                 ),
-                Self::check(
+                Self::sub_check(
                     "restore-if-exists",
                     "… with IF EXISTS",
                     r.if_exists,
-                    |t, on| {
-                        t.restore.if_exists = on;
-                        t.restore.clean |= on;
-                    },
+                    r.clean,
+                    |t, on| t.restore.if_exists = on && t.restore.clean,
                     cx,
                 ),
                 Self::check(
@@ -3562,10 +3619,30 @@ impl BackupDialog {
             .into_any_element()
     }
 
-    /// "Local client…": every client found for the engine, the one in use,
-    /// the default, Browse….
-    fn render_clients(&self, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
+    /// What the server is and what it asks of a client: the one line at
+    /// the top of "Local client…".
+    fn server_line(&self) -> String {
+        let (major, minor, _) = self.server_version;
+        match self.engine {
+            Engine::Postgres => format!(
+                "Server: PostgreSQL {major}. {} must be {major} or newer.",
+                self.tool().unwrap_or(Tool::PgRestore).name()
+            ),
+            engine => format!(
+                "Server: {} {major}.{minor}. A client of the same product and version suits it \
+                 best; another one usually works.",
+                engine.label()
+            ),
+        }
+    }
+
+    /// The clients "Local client…" lists: each with its label, a short
+    /// note on its version against the server's, and whether it can be
+    /// used (a PostgreSQL client older than the server never could).
+    fn client_choices(
+        &self,
+        cx: &App,
+    ) -> Vec<(&ClientInstall, String, Option<&'static str>, bool)> {
         let family = ClientFamily::of(self.engine);
         let in_use = match &self.tool_state {
             ToolState::Ready { install, .. } => Some(install.dir.clone()),
@@ -3576,18 +3653,21 @@ impl BackupDialog {
             .default_clients
             .get(&family)
             .cloned();
-        let rows = self
-            .detected
+        self.detected
             .iter()
             .filter(|install| install.family == family)
-            .enumerate()
-            .map(|(index, install)| {
-                let dir = install.dir.clone();
+            .map(|install| {
                 let compat = tools::compatibility(
                     install.version.as_ref(),
                     self.engine,
                     self.server_version,
                 );
+                let note = match compat {
+                    Compatibility::Ok => None,
+                    Compatibility::ClientOlder { .. } => Some("older than the server"),
+                    Compatibility::OtherVersion { .. } => Some("another version than the server"),
+                    Compatibility::Unknown => Some("its version could not be read"),
+                };
                 let marks: Vec<&str> = [
                     (in_use.as_ref() == Some(&install.dir), "in use"),
                     (
@@ -3604,9 +3684,33 @@ impl BackupDialog {
                 } else {
                     format!("{} · {}", install.label(), marks.join(", "))
                 };
+                (install, label, note, !compat.blocks())
+            })
+            .collect()
+    }
+
+    /// The clients of "Local client…" as listed: folder, note, whether Use
+    /// is on; for tests.
+    #[cfg(test)]
+    pub fn client_rows(&self, cx: &App) -> Vec<(PathBuf, Option<&'static str>, bool)> {
+        self.client_choices(cx)
+            .into_iter()
+            .map(|(install, _, note, usable)| (install.dir.clone(), note, usable))
+            .collect()
+    }
+
+    /// "Local client…": what the server asks, then every client found for
+    /// the engine (the one in use, the default), Browse….
+    fn render_clients(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let family = ClientFamily::of(self.engine);
+        let rows = self.client_choices(cx).into_iter().enumerate().map(
+            |(index, (install, label, note, usable))| {
+                let dir = install.dir.clone();
                 h_flex()
                     .id(("client-install", index))
                     .test_support()
+                    .flex_none()
                     .gap_2()
                     .p_1()
                     .rounded(theme.radius)
@@ -3616,28 +3720,38 @@ impl BackupDialog {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().child(SharedString::from(label)))
-                            .child(Self::muted(install.dir.display().to_string(), cx))
-                            .when(compat.blocks(), |this| {
-                                this.child(div().text_xs().text_color(theme.danger).child(
-                                    SharedString::from(
-                                        compat.warning(self.engine).unwrap_or_default(),
-                                    ),
-                                ))
-                            }),
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().text_sm().child(SharedString::from(label)))
+                                    .children(note.map(|note| Self::muted(note, cx))),
+                            )
+                            .child(Self::muted(install.dir.display().to_string(), cx)),
                     )
                     .child(
                         Button::new(("client-use", index))
                             .small()
                             .outline()
                             .label("Use")
+                            .disabled(!usable)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.use_client(Some(dir.clone()), cx)
                             })),
                     )
-            });
+            },
+        );
+        let server = self.server_line();
         v_flex()
             .gap_2()
+            .child(
+                div()
+                    .id("client-server")
+                    .test_support()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .aria_label(SharedString::from(server.clone()))
+                    .child(SharedString::from(server)),
+            )
             .child(Self::muted(
                 format!(
                     "The {} clients found on this computer and in Settings ▸ Local clients. The one \
@@ -3679,7 +3793,16 @@ impl BackupDialog {
                             })),
                     ),
             )
-            .children(rows)
+            // The list scrolls; the line and the buttons above stay.
+            .child(
+                v_flex()
+                    .id("client-list")
+                    .test_support()
+                    .gap_2()
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
             .when_some(self.client_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -3695,24 +3818,34 @@ impl BackupDialog {
 
     fn render_command(&self, text: Result<String, String>, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        // A long command wraps and scrolls inside its bound, with a
+        // scrollbar that says there is more.
+        let scrolled = div()
+            .id("backup-command-scroll")
+            .p_2()
+            .max_h(px(108.))
+            .map(|this| match text {
+                Ok(command) => this.child(
+                    div()
+                        .id("backup-command-text")
+                        .test_support()
+                        .child(SharedString::from(command)),
+                ),
+                Err(reason) => this
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(reason)),
+            })
+            .overflow_y_scrollbar();
         div()
             .id("backup-command")
             .test_support()
-            .p_2()
-            .max_h(px(110.))
-            .overflow_y_scroll()
             .rounded(theme.radius)
             .border_1()
             .border_color(theme.border)
             .bg(theme.muted)
             .font_family(theme.mono_font_family.clone())
             .text_xs()
-            .map(|this| match text {
-                Ok(command) => this.child(SharedString::from(command)),
-                Err(reason) => this
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(reason)),
-            })
+            .child(scrolled)
             .into_any_element()
     }
 
@@ -3796,7 +3929,9 @@ impl BackupDialog {
                     Mode::Restore => self.render_restore_settings(cx),
                     Mode::ExecuteScript => self.render_script_settings(cx),
                 });
-                if matches!(self.tool_state, ToolState::Ready { .. }) {
+                if matches!(self.tool_state, ToolState::Ready { .. })
+                    && (!self.mode.writes() || self.input.is_some())
+                {
                     let command = self.command(cx).map(|command| command.display());
                     body.push(Self::field("Command", self.render_command(command, cx), cx));
                 }
@@ -4021,15 +4156,27 @@ impl Render for BackupDialog {
                     .items_start()
                     .child(self.render_steps(cx))
                     .child(
-                        v_flex()
+                        div()
                             .id("wizard-page")
                             .test_support()
                             .flex_1()
                             .min_w_0()
-                            .gap_3()
-                            .max_h(px(520.))
-                            .overflow_y_scroll()
-                            .children(self.render_page(cx)),
+                            .child(
+                                // Each part keeps its height and the page
+                                // scrolls, with a scrollbar that says so: a
+                                // bounded box (the command) is never squeezed
+                                // to a sliver at the page's bottom edge.
+                                v_flex()
+                                    .id("wizard-page-scroll")
+                                    .gap_3()
+                                    .max_h(px(520.))
+                                    .children(
+                                        self.render_page(cx)
+                                            .into_iter()
+                                            .map(|part| div().flex_none().child(part)),
+                                    )
+                                    .overflow_y_scrollbar(),
+                            ),
                     ),
             )
             .child(self.render_footer(cx))

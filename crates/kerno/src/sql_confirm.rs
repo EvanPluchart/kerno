@@ -12,8 +12,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
+    App, AppContext as _, Context, Entity, Focusable as _, FontWeight, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::environment;
 
@@ -89,6 +90,9 @@ struct ConfirmView {
     /// The environment's name when it asks twice: the first click on the
     /// action arms it and the second runs it.
     twice: Option<String>,
+    /// The environment's name when its rules ask (every run, or a write
+    /// twice): the title names it and the connection.
+    asked_by: Option<String>,
     armed: bool,
     run: Rc<Run>,
     _subscriptions: Vec<Subscription>,
@@ -101,13 +105,19 @@ pub fn open(
     cx: &mut App,
     run: impl Fn(String, &mut Window, &mut App) + 'static,
 ) {
-    let title = SharedString::from(confirmation.title.clone());
     let view = cx.new(|cx| ConfirmView::new(confirmation, Rc::new(run), window, cx));
+    let title = SharedString::from(view.read(cx).title());
     let focus = view.read(cx).name.clone();
     window.open_dialog(cx, move |dialog, _, _| {
         let view = view.clone();
         dialog
-            .title(title.clone())
+            .title(
+                div()
+                    .id("sql-title")
+                    .test_support()
+                    .aria_label(title.clone())
+                    .child(title.clone()),
+            )
             .w(px(560.))
             // Enter never runs a statement: that takes a click on its button.
             .on_ok(|_, _, _| false)
@@ -158,14 +168,32 @@ impl ConfirmView {
         let environment = environment::environment(environments, &confirmation.environment);
         let twice = (confirmation.writes && environment.rules.confirm_writes_twice)
             .then(|| environment.name.clone());
+        let asked_by = (twice.is_some() || environment.rules.confirm_execute)
+            .then(|| environment.name.clone());
         Self {
             confirmation,
             name,
             list,
             twice,
+            asked_by,
             armed: false,
             run,
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// The dialog's title: the caller's, naming the environment and the
+    /// connection when the environment's rules are why it asks ("Run this
+    /// statement on Production: Reporting?").
+    fn title(&self) -> String {
+        let title = &self.confirmation.title;
+        match &self.asked_by {
+            Some(environment) => format!(
+                "{} on {environment}: {}?",
+                title.trim_end_matches('?'),
+                self.confirmation.connection
+            ),
+            None => title.clone(),
         }
     }
 
@@ -253,9 +281,30 @@ impl Render for ConfirmView {
             )),
             _ => None,
         };
+        // The environment's colour, as its chrome carries it (the bar's
+        // colours: its text reads on it in both themes).
+        let band = self.asked_by.as_ref().and_then(|environment| {
+            let chrome = crate::theme::environment_chrome_of(&self.confirmation.environment, cx)?;
+            let text = format!("{environment} · {}", self.confirmation.connection);
+            Some(
+                div()
+                    .id("sql-environment")
+                    .test_support()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme.radius)
+                    .bg(chrome.bar)
+                    .text_color(chrome.bar_text)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .aria_label(SharedString::from(text.clone()))
+                    .child(SharedString::from(text)),
+            )
+        });
         v_flex()
             .gap_3()
             .pt_1()
+            .children(band)
             .child(
                 div()
                     .text_sm()

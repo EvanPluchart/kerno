@@ -1,6 +1,7 @@
-//! The Tools submenu (M10 Part 11b): per engine and kind of node, each
-//! entry disabled with its reason where it does not apply; a real
-//! right-click; the foreign data wrappers.
+//! The Tools submenu (M10 Part 11b): per engine and kind of node, only the
+//! entries that can apply to it, each disabled with its reason when the
+//! connection's state forbids it; a real right-click; the foreign data
+//! wrappers.
 
 use super::tool_wizards::paints;
 use super::*;
@@ -67,34 +68,31 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
             database[..2],
             [
                 "Back up…, Global backup…, Restore…, Execute script…",
-                "Analyze…, Vacuum…, Truncate… (on a table), Refresh materialized view… (on a \
-                 materialized view), Disable trigger… (on a trigger)",
+                "Analyze…, Vacuum…",
             ]
         );
         assert_eq!(database[2..], tail);
+        // A schema has no maintenance tool of its own: no group for it.
         let schema_menu = app.tool_menu(cx, &schema);
         assert_eq!(
             schema_menu[0],
             "Back up…, Global backup…, Restore…, Execute script…"
         );
-        assert!(
-            schema_menu[1].starts_with("Analyze… (on a database, table or materialized view)"),
-            "{schema_menu:?}"
-        );
+        assert_eq!(schema_menu[1..], tail);
+        // A table lists what applies to a table, nothing greyed for its kind.
+        let table_menu = app.tool_menu(cx, &table);
         assert_eq!(
-            app.tool_menu(cx, &table)[..2],
-            [
-                "Back up…, Global backup…, Restore… (into a database), Execute script… (into a \
-                 database)",
-                "Analyze…, Vacuum…, Truncate…, Refresh materialized view… (on a materialized \
-                 view), Disable trigger… (on a trigger)",
-            ]
+            table_menu[..2],
+            ["Back up…, Global backup…", "Analyze…, Vacuum…, Truncate…"]
         );
+        assert_eq!(table_menu[2..], tail);
         let matview_menu = app.tool_menu(cx, &matview);
         assert_eq!(
-            matview_menu[1],
-            "Analyze…, Vacuum…, Truncate… (on a table), Refresh materialized view…, Disable \
-             trigger… (on a trigger)"
+            matview_menu[..2],
+            [
+                "Global backup…",
+                "Analyze…, Vacuum…, Refresh materialized view…"
+            ]
         );
         // The Truncate key on a table still runs it, now from Tools ▸.
         app.act(cx, Action::Truncate, &table);
@@ -117,8 +115,11 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
             "{database:?}"
         );
         assert_eq!(database[2..], tail);
-        // A table's own reason comes first.
-        assert!(app.tool_menu(cx, &table)[0].contains("Restore… (into a database)"));
+        assert_eq!(
+            app.tool_menu(cx, &table)[1],
+            "Analyze… (read-only connection), Vacuum… (read-only connection), Truncate… \
+             (read-only connection)"
+        );
     }
 
     for (engine, scratch) in [
@@ -145,20 +146,15 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
         ];
         let database = app.tool_menu(cx, &[scratch]);
         assert_eq!(
-            database[..2],
-            [
-                "Back up…, Restore…, Execute script…",
-                "Analyze… (on a table), Check… (on a table), Optimize… (on a table), Repair… \
-                 (on a table), Truncate… (on a table)",
-            ],
+            database[0], "Back up…, Restore…, Execute script…",
             "{engine:?}"
         );
-        assert_eq!(database[2..], tail, "{engine:?}");
+        assert_eq!(database[1..], tail, "{engine:?}");
         assert_eq!(
             app.tool_menu(cx, &table)[..2],
             [
-                "Back up…, Restore… (into a database), Execute script… (into a database)",
-                "Analyze…, Check…, Optimize…, Repair…, Truncate…",
+                "Back up…",
+                "Analyze…, Check…, Optimize…, Repair…, Truncate…"
             ],
             "{engine:?}"
         );
@@ -185,18 +181,15 @@ fn a_right_click_opens_tools_and_each_entry_opens_its_tool(cx: &mut TestAppConte
     let app = connected(cx, Engine::Postgres);
     app.open_path(cx, &table);
 
-    // A real right-click on a table: Tools ▸ with every group, the
-    // entries that do not apply disabled with their reason.
+    // A real right-click on a table: Tools ▸ with what applies to a table;
+    // what never could is not there at all.
     app.open_tools_menu(cx, &table);
     for label in [
         "Back up…",
         "Global backup…",
-        "Restore… (into a database)",
-        "Execute script… (into a database)",
         "Analyze…",
         "Vacuum…",
         "Truncate…",
-        "Refresh materialized view… (on a materialized view)",
         "Foreign data wrappers…",
         "Open dashboard",
         "Session manager",
@@ -205,6 +198,18 @@ fn a_right_click_opens_tools_and_each_entry_opens_its_tool(cx: &mut TestAppConte
         "Tasks",
     ] {
         assert!(menu_entry(&app, cx, label).is_some(), "{label}");
+    }
+    for label in [
+        "Restore…",
+        "Restore… (into a database)",
+        "Execute script…",
+        "Execute script… (into a database)",
+        "Refresh materialized view…",
+        "Refresh materialized view… (on a materialized view)",
+        "Disable trigger…",
+        "Disable trigger… (on a trigger)",
+    ] {
+        assert!(menu_entry(&app, cx, label).is_none(), "{label}");
     }
     // Backup and Truncate are under Tools ▸ only.
     click_menu_entry(&app, cx, "Back up…");

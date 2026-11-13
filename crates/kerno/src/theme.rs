@@ -259,7 +259,16 @@ pub fn chrome_colors(
         Tint::Soft => (0.3, 0.08),
         Tint::Strong => (1.0, 0.16),
     };
-    let bar = mix(status_bar, color, bar);
+    let mut bar = mix(status_bar, color, bar);
+    // In a dark theme the bar is a deep fill under the theme's light text,
+    // never a band brighter than that text: the colour keeps its hue and
+    // loses lightness until the text reads on it at AAA's 7:1 (at AA's 4.5:1
+    // production's red stays a loud mid red across the window).
+    if luminance(foreground) > luminance(background)
+        && contrast(foreground, bar) < DARK_BAR_CONTRAST
+    {
+        bar = darkened_under(foreground, bar, DARK_BAR_CONTRAST);
+    }
     // Lighter until the theme's text reads on it: the toolbar's buttons
     // keep their own colours.
     let wash = (0..=(wash * 100.0) as u32)
@@ -275,8 +284,28 @@ pub fn chrome_colors(
     })
 }
 
+/// How well the light text of a dark theme reads on a tinted bar.
+const DARK_BAR_CONTRAST: f64 = 7.0;
+
+/// `color` with its HSL lightness lowered step by step, hue and saturation
+/// kept, until `text` reads on it at `ratio` (black, at the end, does for
+/// any light text of a dark theme).
+fn darkened_under(text: u32, color: u32, ratio: f64) -> u32 {
+    let hsla: Hsla = rgb(color).into();
+    (0..=100)
+        .rev()
+        .map(|percent| {
+            rgb_of(Hsla {
+                l: hsla.l * percent as f32 / 100.0,
+                ..hsla
+            })
+        })
+        .find(|fill| contrast(text, *fill) >= ratio)
+        .unwrap_or(0x000000)
+}
+
 /// `0xRRGGBB` of a theme colour (its alpha left out).
-fn rgb_of(color: Hsla) -> u32 {
+pub(crate) fn rgb_of(color: Hsla) -> u32 {
     let color = color.to_rgb();
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
     (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
@@ -295,8 +324,13 @@ pub struct EnvironmentChrome {
 /// The chrome of `config`'s environment; `None` for an environment that
 /// tints nothing (local, by default) or has no colour for this theme.
 pub fn environment_chrome(config: &ConnectionConfig, cx: &App) -> Option<EnvironmentChrome> {
+    environment_chrome_of(&config.environment, cx)
+}
+
+/// The chrome of the environment `id`, as [`environment_chrome`].
+pub fn environment_chrome_of(id: &str, cx: &App) -> Option<EnvironmentChrome> {
     let state = cx.try_global::<crate::state::AppState>()?;
-    let def = environment::environment(&state.settings.environments, &config.environment);
+    let def = environment::environment(&state.settings.environments, id);
     let theme = cx.theme();
     let colors = chrome_colors(
         def.tint,
@@ -752,6 +786,33 @@ mod tests {
             assert_eq!(chrome_in(&theme, local.tint, 0xFF0000), None);
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        // The bars they give, measured: production in dark is a deep red
+        // under the light text, not the bright tag red across the window.
+        let table = [
+            // 10.74:1, 5.42:1, 7.81:1, 7.22:1.
+            (LIGHT, environment::STAGING, 0xD6C9AA, 0x16191D),
+            (LIGHT, environment::PRODUCTION, 0xC62F3D, 0xFFFFFF),
+            (DARK, environment::STAGING, 0x4F4523, 0xE6E9ED),
+            (DARK, environment::PRODUCTION, 0x970D19, 0xE6E9ED),
+        ];
+        let themes = themes();
+        let mut wrong = Vec::new();
+        for (name, id, bar, text) in table {
+            let theme = themes.iter().find(|theme| theme.name == name).unwrap();
+            let def = environment::environment(&builtins, id);
+            let color = def.color(theme.mode == "dark").unwrap();
+            let chrome = chrome_in(theme, def.tint, color).unwrap();
+            if (chrome.bar, chrome.bar_text) != (bar, text) {
+                wrong.push(format!(
+                    "{name} {id}: bar #{:06X}, text #{:06X} ({:.2}:1)",
+                    chrome.bar,
+                    chrome.bar_text,
+                    super::contrast(chrome.bar, chrome.bar_text)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// Whatever colour the user picks, text on the tinted chrome reaches
@@ -776,6 +837,8 @@ mod tests {
                 hex(&theme.colors["foreground"]),
                 hex(&theme.colors["muted.foreground"]),
             );
+            let dark = theme.mode == "dark";
+            let status_bar = hex(&theme.colors["status_bar.background"]);
             for tint in [Tint::Soft, Tint::Strong] {
                 for &color in &colors {
                     let chrome = chrome_in(&theme, tint, color).unwrap();
@@ -785,6 +848,28 @@ mod tests {
                         "{} {tint:?} #{color:06X}: bar {ratio:.2}",
                         theme.name
                     );
+                    if dark {
+                        // A deep fill under the theme's own light text,
+                        // never brighter than that text...
+                        assert_eq!(chrome.bar_text, foreground, "#{color:06X}");
+                        assert!(luminance(chrome.bar) < luminance(foreground));
+                        assert!(ratio >= DARK_BAR_CONTRAST, "#{color:06X}: {ratio:.2}");
+                        // ...of the colour's hue: only its lightness went
+                        // down (greys and the darkest fills, whose 8-bit
+                        // channels cannot hold a hue, left out).
+                        let blended = mix(
+                            status_bar,
+                            color,
+                            if tint == Tint::Strong { 1.0 } else { 0.3 },
+                        );
+                        let (before, after): (Hsla, Hsla) =
+                            (rgb(blended).into(), rgb(chrome.bar).into());
+                        if before.s > 0.2 && after.l > 0.1 {
+                            let turn = ((before.h - after.h).abs() * 360.0) as f64;
+                            let turn = turn.min(360.0 - turn);
+                            assert!(turn <= 6.0, "#{color:06X} {tint:?}: hue moved {turn:.1}");
+                        }
+                    }
                     for text in [foreground, muted] {
                         let ratio = super::contrast(text, chrome.wash);
                         assert!(

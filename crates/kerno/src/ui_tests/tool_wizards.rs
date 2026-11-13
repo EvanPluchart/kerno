@@ -110,7 +110,8 @@ impl Fixture {
         });
     }
 
-    /// Scrolls the wizard's page until `id` shows, then clicks it.
+    /// Scrolls the wizard's page (or the settings' section) until `id`
+    /// shows, then clicks it.
     pub(super) fn tap(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
         let id = id.into();
         for step in 0..40 {
@@ -119,13 +120,19 @@ impl Fixture {
                     .try_find(id.clone())
                     .is_none_or(|element| element.visible())
             });
-            if visible || !self.has(cx, "wizard-page") {
+            let Some(page) = ["wizard-page", "settings-body"]
+                .into_iter()
+                .find(|page| self.has(cx, *page))
+            else {
+                break;
+            };
+            if visible {
                 break;
             }
             let delta = if step < 15 { -120. } else { 120. };
             self.step(cx, |window, cx| {
                 window.scroll(
-                    "wizard-page",
+                    page,
                     gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(delta))),
                     cx,
                 )

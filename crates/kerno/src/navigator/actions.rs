@@ -416,8 +416,9 @@ impl ToolEntry {
 }
 
 /// The Tools ▸ menu of `node` (of a connection when `None`) in groups,
-/// each entry with why it does not apply there when it does not, as
-/// DBeaver lists its tools per engine: PostgreSQL — Backup, Global backup,
+/// with only the entries that can apply to its kind (an entry that never
+/// could is left out, not greyed: its menu stays short), as DBeaver lists
+/// its tools per engine: PostgreSQL — Backup, Global backup,
 /// Restore, Execute script | Analyze, Vacuum, Truncate, Refresh
 /// materialized view, Enable / Disable trigger | Foreign data wrappers |
 /// dashboard, sessions, locks | tasks; MySQL and MariaDB — Backup, Restore,
@@ -425,7 +426,8 @@ impl ToolEntry {
 /// sessions, locks | tasks. `maintenance` is what the dialect offers for the
 /// node ([`tools`]). Only databases, schemas, tables, views and triggers
 /// have the menu; a connection has no maintenance group (its tools act on
-/// objects of the tree).
+/// objects of the tree). The reasons are left to [`tools_now`]: what the
+/// connection's state forbids.
 pub fn tool_entries(
     node: Option<&Node>,
     has_schemas: bool,
@@ -447,65 +449,54 @@ pub fn tool_entries(
         None | Some(ObjectRef::Database(_) | ObjectRef::Schema(_))
     );
     let backup = match object {
-        Some(ObjectRef::Relation(_, kind)) if !kind.is_table() => {
-            Some("on a database, schema or table")
-        }
-        Some(ObjectRef::Trigger { .. }) => Some("on a database, schema or table"),
-        _ => None,
+        Some(ObjectRef::Relation(_, kind)) => kind.is_table(),
+        Some(ObjectRef::Trigger { .. }) => false,
+        _ => true,
     };
-    let into_database = (!whole).then_some("into a database");
-    let mut groups = vec![if has_schemas {
-        vec![
-            (Backup, backup),
-            (GlobalBackup, None),
-            (Restore, into_database),
-            (ExecuteScript, into_database),
-        ]
-    } else {
-        vec![
-            (Backup, backup),
-            (Restore, into_database),
-            (ExecuteScript, into_database),
-        ]
-    }];
+    let client_tools = [
+        (Backup, backup),
+        (GlobalBackup, has_schemas),
+        (Restore, whole),
+        (ExecuteScript, whole),
+    ];
+    let mut groups = vec![
+        client_tools
+            .into_iter()
+            .filter(|(_, applies)| *applies)
+            .map(|(entry, _)| (entry, None))
+            .collect(),
+    ];
     if object.is_some() {
-        let offered = |wanted: &Maintenance| {
-            maintenance
-                .iter()
-                .find(|tool| std::mem::discriminant(*tool) == std::mem::discriminant(wanted))
-                .cloned()
-        };
-        let entry = |default: Maintenance, reason: &'static str| match offered(&default) {
-            Some(tool) => (Maintain(tool), None),
-            None => (Maintain(default), Some(reason)),
-        };
-        let relation = "on a database, table or materialized view";
-        groups.push(if has_schemas {
-            // A trigger offers the one switch that changes it.
-            let switch = if offered(&Maintenance::EnableTrigger).is_some() {
-                Maintenance::EnableTrigger
-            } else {
-                Maintenance::DisableTrigger
-            };
-            vec![
-                entry(Maintenance::Analyze, relation),
-                entry(Maintenance::Vacuum(Default::default()), relation),
-                entry(Maintenance::Truncate(Default::default()), "on a table"),
-                entry(
-                    Maintenance::RefreshMaterializedView(Default::default()),
-                    "on a materialized view",
-                ),
-                entry(switch, "on a trigger"),
+        // The tools the dialect offers for the node, in DBeaver's order.
+        let order: &[Maintenance] = if has_schemas {
+            &[
+                Maintenance::Analyze,
+                Maintenance::Vacuum(Default::default()),
+                Maintenance::Truncate(Default::default()),
+                Maintenance::RefreshMaterializedView(Default::default()),
+                Maintenance::EnableTrigger,
+                Maintenance::DisableTrigger,
             ]
         } else {
-            vec![
-                entry(Maintenance::Analyze, "on a table"),
-                entry(Maintenance::Check(None), "on a table"),
-                entry(Maintenance::Optimize, "on a table"),
-                entry(Maintenance::Repair(Default::default()), "on a table"),
-                entry(Maintenance::Truncate(Default::default()), "on a table"),
+            &[
+                Maintenance::Analyze,
+                Maintenance::Check(None),
+                Maintenance::Optimize,
+                Maintenance::Repair(Default::default()),
+                Maintenance::Truncate(Default::default()),
             ]
-        });
+        };
+        groups.push(
+            order
+                .iter()
+                .filter_map(|wanted| {
+                    maintenance.iter().find(|tool| {
+                        std::mem::discriminant(*tool) == std::mem::discriminant(wanted)
+                    })
+                })
+                .map(|tool| (Maintain(tool.clone()), None))
+                .collect(),
+        );
     }
     if has_schemas {
         groups.push(vec![(ForeignDataWrappers, None)]);
@@ -516,6 +507,7 @@ pub fn tool_entries(
         (LockManager, None),
     ]);
     groups.push(vec![(NewTask, None), (Tasks, None)]);
+    groups.retain(|group| !group.is_empty());
     groups
 }
 
@@ -1293,48 +1285,51 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // PostgreSQL: a database, a schema, a table, a materialized view,
-        // a view, a trigger.
+        // a view, a trigger. Only what can apply to the kind is listed (no
+        // entry greyed "on a trigger" on a table).
         assert_eq!(
             tool_labels(Some(&database), &pg),
             with_tail(&[
                 "Back up…, Global backup…, Restore…, Execute script…",
-                "Analyze…, Vacuum…, Truncate… (on a table), Refresh materialized view… (on a \
-                 materialized view), Disable trigger… (on a trigger)",
+                "Analyze…, Vacuum…",
             ])
         );
         assert_eq!(
             tool_labels(Some(&schema), &pg),
-            with_tail(&[
-                "Back up…, Global backup…, Restore…, Execute script…",
-                "Analyze… (on a database, table or materialized view), Vacuum… (on a database, \
-                 table or materialized view), Truncate… (on a table), Refresh materialized \
-                 view… (on a materialized view), Disable trigger… (on a trigger)",
-            ])
+            with_tail(&["Back up…, Global backup…, Restore…, Execute script…"])
         );
         assert_eq!(
             tool_labels(Some(&relation(RelationKind::Table)), &pg),
+            with_tail(&["Back up…, Global backup…", "Analyze…, Vacuum…, Truncate…"])
+        );
+        assert_eq!(
+            tool_labels(Some(&relation(RelationKind::MaterializedView)), &pg),
             with_tail(&[
-                "Back up…, Global backup…, Restore… (into a database), Execute script… (into a \
-                 database)",
-                "Analyze…, Vacuum…, Truncate…, Refresh materialized view… (on a materialized \
-                 view), Disable trigger… (on a trigger)",
+                "Global backup…",
+                "Analyze…, Vacuum…, Refresh materialized view…"
             ])
         );
-        let matview = tool_labels(Some(&relation(RelationKind::MaterializedView)), &pg);
-        assert!(
-            matview[0].starts_with("Back up… (on a database, schema or table)")
-                && matview[1].contains("Truncate… (on a table), Refresh materialized view…, "),
-            "{matview:?}"
+        assert_eq!(
+            tool_labels(Some(&relation(RelationKind::View)), &pg),
+            with_tail(&["Global backup…"])
         );
-        let view = tool_labels(Some(&relation(RelationKind::View)), &pg);
-        assert!(view[1].starts_with("Analyze… (on a database"), "{view:?}");
         let mut trigger = node(NodeKind::Object(ObjectRef::Trigger {
             table: orders.clone(),
             name: "orders_log".into(),
         }));
-        assert!(tool_labels(Some(&trigger), &pg)[1].ends_with(", Disable trigger…"));
+        assert_eq!(
+            tool_labels(Some(&trigger), &pg),
+            with_tail(&["Global backup…", "Disable trigger…"])
+        );
         trigger.muted = true;
-        assert!(tool_labels(Some(&trigger), &pg)[1].ends_with(", Enable trigger…"));
+        assert_eq!(tool_labels(Some(&trigger), &pg)[1], "Enable trigger…");
+        // No reason is left for the kind: what is listed applies.
+        assert!(
+            tool_labels(Some(&relation(RelationKind::Table)), &pg)
+                .concat()
+                .find('(')
+                .is_none()
+        );
         // A connection: the client tools and the rest, no maintenance.
         assert_eq!(
             tool_labels(None, &pg),
@@ -1345,21 +1340,17 @@ mod tests {
         let mysql_tail = &tail[1..];
         assert_eq!(
             tool_labels(Some(&database), &mysql),
-            [
-                "Back up…, Restore…, Execute script…",
-                "Analyze… (on a table), Check… (on a table), Optimize… (on a table), Repair… \
-                 (on a table), Truncate… (on a table)",
-            ]
-            .iter()
-            .chain(mysql_tail)
-            .map(|group| group.to_string())
-            .collect::<Vec<_>>()
+            ["Back up…, Restore…, Execute script…"]
+                .iter()
+                .chain(mysql_tail)
+                .map(|group| group.to_string())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             tool_labels(Some(&relation(RelationKind::Table)), &mysql)[..2],
             [
-                "Back up…, Restore… (into a database), Execute script… (into a database)",
-                "Analyze…, Check…, Optimize…, Repair…, Truncate…",
+                "Back up…",
+                "Analyze…, Check…, Optimize…, Repair…, Truncate…"
             ]
         );
         assert_eq!(
