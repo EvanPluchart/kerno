@@ -28,6 +28,8 @@ Community; its look follows the calm, dense style of modern editors. Licensed un
 | ![Structure editor, dark](docs/screenshots/structure-editor-dark.png) | ![Structure editor, light](docs/screenshots/structure-editor-light.png) |
 | ![EXPLAIN plan, dark](docs/screenshots/explain-plan-dark.png) | ![EXPLAIN plan, light](docs/screenshots/explain-plan-light.png) |
 | ![New connection dialog, dark](docs/screenshots/new-connection-dark.png) | ![New connection dialog, light](docs/screenshots/new-connection-light.png) |
+| ![Backup wizard, dark](docs/screenshots/final/backup-settings-dark.png) | ![Backup wizard, light](docs/screenshots/final/backup-settings-light.png) |
+| ![A production connection, dark](docs/screenshots/final/chrome-production-dark.png) | ![A production connection, light](docs/screenshots/final/chrome-production-light.png) |
 
 ## What it does
 
