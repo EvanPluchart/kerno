@@ -57,6 +57,28 @@ gpui_kit::actions!(
         RunAll,
         /// Cancels the statement the active tab is running.
         CancelQuery,
+        /// Runs the statement at the cursor and keeps the earlier results.
+        RunStatementInNewTab,
+        /// Runs the statements from the one at the cursor to the end.
+        RunFromCursor,
+        /// Moves the cursor to the start of the next statement.
+        NextStatement,
+        /// Moves the cursor to the start of the previous statement.
+        PreviousStatement,
+        /// Counts the rows the statement at the cursor would return.
+        CountStatementRows,
+        /// Pins the result on screen, or unpins it.
+        TogglePinnedResult,
+        /// Closes the result tab on screen.
+        CloseResultTab,
+        /// Hides the results of the active query tab, or shows them.
+        ToggleResultsPanel,
+        /// Shows only the results of the active query tab, or both again.
+        MaximizeResultsPanel,
+        /// Moves the keyboard between the editor and the results.
+        SwitchResultsFocus,
+        /// Closes the tabs to the left of the active one.
+        CloseTabsToTheLeft,
         /// Comments the selected lines out, or back in.
         ToggleComment,
         /// Lays out the SQL of the selection, or of the whole editor.
@@ -455,6 +477,101 @@ pub const COMMANDS: &[Command] = &[
         ["stop", "abort", "kill"],
         CancelQuery
     ),
+    // DBeaver's keys of the SQL editor (`ui.editors.sql` plugin.xml): those
+    // of `sql.script.focused` work while the editor has the focus, those of
+    // `sql.script` anywhere in the query tab. Ctrl is Ctrl on macOS too.
+    command!(
+        "run_statement_new_tab",
+        "Run Statement in New Result Tab",
+        "Query",
+        ["secondary-\\"],
+        ["execute", "keep results", "another tab"],
+        RunStatementInNewTab,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "run_from_cursor",
+        "Run Script From the Cursor",
+        "Query",
+        ["alt-p"],
+        ["execute", "rest", "position"],
+        RunFromCursor,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "next_statement",
+        "Go to Next Statement",
+        "Query",
+        ["alt-down"],
+        ["query", "move", "jump"],
+        NextStatement,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "previous_statement",
+        "Go to Previous Statement",
+        "Query",
+        ["alt-up"],
+        ["query", "move", "jump"],
+        PreviousStatement,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "count_statement_rows",
+        "Count Rows of Statement",
+        "Query",
+        [],
+        ["count", "select count", "how many"],
+        CountStatementRows
+    ),
+    command!(
+        "toggle_pinned_result",
+        "Pin or Unpin Result Tab",
+        "Query",
+        ["ctrl-shift-p"],
+        ["keep", "result tab"],
+        TogglePinnedResult,
+        "QueryTab"
+    ),
+    // DBeaver's Ctrl+Shift+\: keyboards report a shifted symbol as the
+    // symbol itself, `|` on a US layout.
+    command!(
+        "close_result_tab",
+        "Close Result Tab",
+        "Query",
+        ["ctrl-|"],
+        ["result tab"],
+        CloseResultTab,
+        "QueryTab"
+    ),
+    // DBeaver toggles the panel with Ctrl+T, which is New Query Tab on Linux.
+    command!(
+        "toggle_results_panel",
+        "Toggle Results Panel",
+        "View",
+        ["alt-shift-t"],
+        ["hide", "show", "results"],
+        ToggleResultsPanel,
+        "QueryTab"
+    ),
+    command!(
+        "maximize_results_panel",
+        "Maximize Results Panel",
+        "View",
+        ["ctrl-shift-t"],
+        ["results", "full", "restore"],
+        MaximizeResultsPanel,
+        "QueryTab"
+    ),
+    command!(
+        "switch_results_focus",
+        "Focus Results / Editor",
+        "View",
+        ["alt-t"],
+        ["switch panel", "grid", "keyboard"],
+        SwitchResultsFocus,
+        "QueryTab"
+    ),
     command!(
         "refresh_data",
         "Refresh Rows",
@@ -662,6 +779,14 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["keep"],
         CloseOtherTabs
+    ),
+    command!(
+        "close_tabs_to_the_left",
+        "Close Tabs to the Left",
+        "Tabs",
+        [],
+        [],
+        CloseTabsToTheLeft
     ),
     command!(
         "close_tabs_to_the_right",
@@ -1154,6 +1279,33 @@ mod tests {
             ["alt-insert", "secondary-shift-n"]
         );
         assert_eq!(keys_of(&bindings, "revert_cells"), ["escape"]);
+    }
+
+    #[test]
+    fn the_query_tab_keys_shadow_no_global_key_on_either_system() {
+        // A key of the query tab would win over a global one while the tab
+        // has the focus: none may be the same keystroke, on either system.
+        let (bindings, _) = effective_bindings("");
+        for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
+            let mut seen = BTreeMap::new();
+            for (key, id) in &bindings {
+                if context_of(id).is_some_and(|context| !context.starts_with("QueryTab")) {
+                    continue;
+                }
+                let stroke = Keystroke::parse_with_os(key, os).unwrap().unparse(os);
+                if let Some(other) = seen.insert(stroke.clone(), *id)
+                    && other != *id
+                {
+                    panic!("{os:?}: {stroke} is bound to both {other} and {id}");
+                }
+            }
+        }
+        assert_eq!(
+            keys_of(&bindings, "run_statement_new_tab"),
+            ["secondary-\\"]
+        );
+        assert_eq!(keys_of(&bindings, "toggle_pinned_result"), ["ctrl-shift-p"]);
+        assert!(KeyBindingContextPredicate::parse("QueryTab > mode == editor").is_ok());
     }
 
     #[test]

@@ -129,6 +129,10 @@ struct Runtime {
     connector: Option<Arc<Connector>>,
     /// The session used for the navigator and for keep-alive.
     meta: Option<Arc<dyn Session>>,
+    /// The other sessions opened on this connection (tabs, dialogs, the
+    /// navigator's other databases): disconnecting closes those still open,
+    /// whoever holds them.
+    opened: Opened,
     attempt: Option<Task<()>>,
     keep_alive: Option<Task<()>>,
 }
@@ -145,6 +149,10 @@ pub struct Connections {
 }
 
 impl EventEmitter<ConnectionsEvent> for Connections {}
+
+/// Sessions opened through [`Connections::open_session`], not kept alive by
+/// the list.
+type Opened = Arc<std::sync::Mutex<Vec<std::sync::Weak<dyn Session>>>>;
 
 /// What one connection attempt produced.
 type Attempt = kerno_core::Result<(Arc<Connector>, Arc<dyn Session>)>;
@@ -214,14 +222,21 @@ impl Connections {
         database: Option<String>,
         cx: &App,
     ) -> Task<kerno_core::Result<Arc<dyn Session>>> {
-        let connector = self
-            .runtime
-            .get(id)
-            .and_then(|runtime| runtime.connector.clone());
+        let runtime = self.runtime.get(id);
+        let connector = runtime.and_then(|runtime| runtime.connector.clone());
+        let opened = runtime.map(|runtime| runtime.opened.clone());
         bridge::spawn(cx, async move {
             let connector =
                 connector.ok_or_else(|| Error::Closed("the connection is not open".into()))?;
-            connector.session(database.as_deref()).await
+            let session = connector.session(database.as_deref()).await?;
+            if let Some(opened) = opened {
+                let mut opened = opened
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                opened.retain(|session| session.strong_count() > 0);
+                opened.push(Arc::downgrade(&session));
+            }
+            Ok(session)
         })
     }
 
@@ -835,9 +850,8 @@ impl Connections {
         runtime.attempt = None;
         runtime.keep_alive = None;
         runtime.connector = None;
-        if let Some(meta) = runtime.meta.take() {
-            bridge::spawn(cx, async move { meta.close().await }).detach();
-        }
+        let meta = runtime.meta.take();
+        close_all(meta, &runtime.opened, cx);
         self.set_status(id, Status::Disconnected, cx);
     }
 
@@ -869,7 +883,8 @@ impl Connections {
         if let Some(runtime) = self.runtime.get_mut(id) {
             runtime.keep_alive = None;
             runtime.connector = None;
-            runtime.meta = None;
+            // Gone with the server, or left half-open: closed either way.
+            close_all(runtime.meta.take(), &runtime.opened, cx);
             runtime.status = Some(Status::Disconnected);
         }
         tracing::info!(connection = id, "connection lost; reconnecting");
@@ -898,6 +913,25 @@ impl Connections {
             session.close().await;
             Ok(TestReport { version, latency })
         })
+    }
+}
+
+/// Closes `meta` and every session in `opened` still open, off the UI thread.
+fn close_all(meta: Option<Arc<dyn Session>>, opened: &Opened, cx: &App) {
+    let sessions: Vec<Arc<dyn Session>> = opened
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(..)
+        .filter_map(|session| session.upgrade())
+        .chain(meta)
+        .collect();
+    if !sessions.is_empty() {
+        bridge::spawn(cx, async move {
+            for session in sessions {
+                session.close().await;
+            }
+        })
+        .detach();
     }
 }
 

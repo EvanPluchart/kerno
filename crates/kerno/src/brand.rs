@@ -48,7 +48,8 @@ const LOCKUP_RATIO: f32 = 820.852 / 256.0;
 
 /// The horizontal lockup, `width` wide (BRAND.md: 96 px at least): ink on
 /// light, the reversed file on dark. The reversed file paints its own Night
-/// background, so it sits on a Night panel that continues it.
+/// background, so on dark it sits on a Night panel that continues it, with
+/// room around it: a deliberate band, not a lighter rectangle.
 pub fn lockup(width: Pixels, cx: &App) -> impl IntoElement {
     let dark = cx.theme().is_dark();
     div()
@@ -57,7 +58,7 @@ pub fn lockup(width: Pixels, cx: &App) -> impl IntoElement {
         .flex()
         .justify_center()
         .rounded(cx.theme().radius_lg)
-        .when(dark, |panel| panel.bg(rgb(theme::NIGHT)).px_4())
+        .when(dark, |panel| panel.w_full().bg(rgb(theme::NIGHT)).py_2())
         .child(
             img(if dark { LOCKUP_REVERSED } else { LOCKUP })
                 .w(width)
@@ -83,7 +84,8 @@ pub fn mark(size: Pixels, cx: &App) -> impl IntoElement {
 fn about_lines() -> [String; 5] {
     [
         format!("Version {}", env!("CARGO_PKG_VERSION")),
-        "A fast, native database client for PostgreSQL, MySQL and MariaDB.".into(),
+        // Two balanced lines, broken where the sentence breaks.
+        "A fast, native database client\nfor PostgreSQL, MySQL and MariaDB.".into(),
         "Licensed under MIT or Apache-2.0, at your option.".into(),
         "Nothing leaves your machine: no telemetry, no update checks.".into(),
         "Third-party notices: THIRD_PARTY_NOTICES.md".into(),
@@ -96,6 +98,7 @@ pub fn about(cx: &App) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
     v_flex()
         .items_center()
+        .text_center()
         .gap_1()
         .child(lockup(px(240.), cx))
         .child(
@@ -106,7 +109,13 @@ pub fn about(cx: &App) -> impl IntoElement {
                 .font_semibold()
                 .child(version),
         )
-        .child(div().child(what))
+        .child(
+            v_flex()
+                .id("about-what")
+                .test_support()
+                .items_center()
+                .children(what.lines().map(|line| div().child(line.to_string()))),
+        )
         .child(div().text_color(muted).child(licence))
         .child(div().text_color(muted).child(privacy))
         .child(div().text_color(muted).child(notices))
@@ -149,5 +158,9 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle}");
         }
+        // What Kerno is: two lines of about the same length, no word alone.
+        let what: Vec<&str> = lines[1].lines().collect();
+        assert_eq!(what.len(), 2, "{what:?}");
+        assert!(what[0].len().abs_diff(what[1].len()) <= 6, "{what:?}");
     }
 }

@@ -7,8 +7,9 @@
 
 use std::borrow::Cow;
 
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
-use gpui_kit::{App, Hsla, Window, rgb};
+use gpui_kit::{App, ElementId, Hsla, Window, rgb};
 use kerno_core::Environment;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +93,18 @@ pub fn apply(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) 
 /// lockup is drawn on it, as its file is. The other brand colours (Lime,
 /// Ink, Olive, Lime wash) live in the theme file.
 pub const NIGHT: u32 = 0x0E1116;
+
+/// An option chip (a format, an encoding, a column of a key): selected, it
+/// is drawn as a primary button, Lime with Ink, the one selected style of
+/// every chip; otherwise outlined.
+pub fn chip(id: impl Into<ElementId>, selected: bool) -> Button {
+    let chip = Button::new(id);
+    if selected {
+        chip.primary()
+    } else {
+        chip.outline()
+    }
+}
 
 /// A colour tag a connection can carry: `(key, light mode, dark mode)`.
 /// Keys are what is stored in the connection's settings.
@@ -270,6 +283,9 @@ mod tests {
             ("link", "muted.background"),
             ("link", "sidebar.background"),
             ("link", "popover.background"),
+            // The kit's highlight of matched characters (completion list,
+            // palette): the text accent, on the popup.
+            ("base.blue", "popover.background"),
             ("link", "status_bar.background"),
             ("link", "table.active.background"),
             // The accent as text (an outline primary button's label).

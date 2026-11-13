@@ -43,6 +43,11 @@ use crate::actions::{
     SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries, ToggleComment, ToggleCommitMode,
     ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
+use crate::actions::{
+    CloseResultTab, CloseTabsToTheLeft, CountStatementRows, MaximizeResultsPanel, NextStatement,
+    PreviousStatement, RunFromCursor, RunStatementInNewTab, SwitchResultsFocus, TogglePinnedResult,
+    ToggleResultsPanel,
+};
 use crate::admin::tab::AdminTab;
 use crate::backup_dialog::{self, BackupDialog};
 use crate::bridge;
@@ -572,6 +577,17 @@ impl Workspace {
                     DataTabEvent::OpenStructure { table, kind } => {
                         this.open_structure(target, table.clone(), *kind, window, cx);
                     }
+                    DataTabEvent::TableGone { table } => {
+                        let navigator = this.sidebar.read(cx).navigator().clone();
+                        navigator.update(cx, |navigator, cx| {
+                            navigator.refresh_tables(
+                                &target.connection,
+                                target.database.as_deref(),
+                                &table.schema,
+                                cx,
+                            )
+                        });
+                    }
                 }
             },
         ));
@@ -868,8 +884,17 @@ impl Workspace {
         if index >= self.tabs.len() {
             return;
         }
+        let tab = self.tabs.remove(index);
+        // Its server session is closed now, not whenever the tab is dropped
+        // (its results may be held a while longer).
+        match &tab {
+            OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
+            OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
+            OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
+            OpenTab::Structure(_) | OpenTab::TableEditor(_) => {}
+        }
         // A closed query tab can be opened again, with its text.
-        if let OpenTab::Query(tab) = self.tabs.remove(index) {
+        if let OpenTab::Query(tab) = tab {
             self.closed.push(tab.read(cx).snapshot(cx));
             if self.closed.len() > CLOSED_TABS {
                 self.closed.remove(0);
@@ -1475,6 +1500,9 @@ impl Workspace {
                         });
                     }
                     let target = target.clone();
+                    // Ranked for what is typed: the list follows the query.
+                    let query = palette.read(cx).query(cx);
+                    let confirmed = palette.clone();
                     let mut command = Command::new(&palette)
                         .bordered(false)
                         .rounded(cx.theme().radius_lg)
@@ -1482,7 +1510,9 @@ impl Workspace {
                         .max_h(px(420.))
                         .on_confirm(move |index, window, cx| {
                             window.close_dialog(cx);
-                            if let Some(command) = palette_command(index.section, index.row) {
+                            let query = confirmed.read(cx).query(cx);
+                            if let Some(command) = palette_command(&query, index.section, index.row)
+                            {
                                 let action = (command.action)();
                                 let target = target.clone();
                                 window.defer(cx, move |window, cx| {
@@ -1491,7 +1521,7 @@ impl Workspace {
                                 });
                             }
                         });
-                    for (group, commands) in palette_groups() {
+                    for (group, commands) in palette_groups(&query) {
                         command = command.group(CommandGroup::new().label(group).items(
                             commands.into_iter().map(|command| {
                                 CommandItem::new()
@@ -1865,6 +1895,18 @@ impl Workspace {
     fn run_statement(&mut self, _: &RunStatement, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.run(Scope::AtCursor, window, cx));
+        }
+    }
+
+    /// Runs a command on the active query tab, when there is one.
+    fn on_query(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        command: impl FnOnce(&mut QueryTab, &mut Window, &mut Context<QueryTab>),
+    ) {
+        if let Some(tab) = self.active_query_tab() {
+            tab.update(cx, |tab, cx| command(tab, window, cx));
         }
     }
 
@@ -2692,6 +2734,18 @@ impl Workspace {
                 .into_any_element();
         }
 
+        // The active tab's accent marker under its title: olive on light,
+        // Lime on dark (the theme's primary).
+        let (active, accent, none) = (self.active_tab, theme.primary, theme.transparent);
+        let marker = move |index| if index == active { accent } else { none };
+        let marked = |title: gpui_kit::Stateful<gpui_kit::Div>, index| {
+            title
+                .h_full()
+                .flex()
+                .items_center()
+                .border_b_2()
+                .border_color(marker(index))
+        };
         let tab_bar = TabBar::new("tabs")
             .track_scroll(&self.tab_scroll)
             .selected_index(self.active_tab)
@@ -2713,6 +2767,7 @@ impl Workspace {
                     .child(
                         div()
                             .id(("tab-title", index))
+                            .map(|title| marked(title, index))
                             .test_support()
                             .context_menu(self.menu(MenuOf::Tab(index), cx))
                             .child(tab.label(cx)),
@@ -2744,6 +2799,7 @@ impl Workspace {
                 Button::new("new-tab")
                     .ghost()
                     .xsmall()
+                    .flex_none()
                     .icon(IconName::Plus)
                     .tooltip("New query tab")
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(NewQueryTab), cx)),
@@ -2925,8 +2981,11 @@ fn connection_target(id: &str) -> Target {
     }
 }
 
-/// The commands shown in the palette, grouped, in display order.
-fn palette_groups() -> Vec<(&'static str, Vec<&'static actions::Command>)> {
+/// The commands shown in the palette for `query`: grouped, in display
+/// order, when nothing is typed; otherwise one list of the matches, the
+/// title itself first, then titles that start with it, then the others
+/// (other words of a title, keywords) in display order.
+fn palette_groups(query: &str) -> Vec<(&'static str, Vec<&'static actions::Command>)> {
     let mut groups: Vec<(&'static str, Vec<&'static actions::Command>)> = Vec::new();
     for command in actions::COMMANDS {
         match groups.iter_mut().find(|(group, _)| *group == command.group) {
@@ -2934,12 +2993,39 @@ fn palette_groups() -> Vec<(&'static str, Vec<&'static actions::Command>)> {
             None => groups.push((command.group, vec![command])),
         }
     }
-    groups
+    // As the kit filters: case aside, the query as typed.
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return groups;
+    }
+    let rank = |command: &actions::Command| {
+        let title = command.label.to_lowercase();
+        let title = title.trim_end_matches('…');
+        if title == query {
+            Some(0)
+        } else if title.starts_with(&query) {
+            Some(1)
+        } else if title.contains(&query)
+            || (command.keywords.iter()).any(|word| word.to_lowercase().contains(&query))
+        {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let mut ranked: Vec<(u8, &'static actions::Command)> = groups
+        .into_iter()
+        .flat_map(|(_, commands)| commands)
+        .filter_map(|command| Some((rank(command)?, command)))
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    let matches = ranked.into_iter().map(|(_, command)| command).collect();
+    vec![("Matches", matches)]
 }
 
-/// The command at a palette position.
-fn palette_command(section: usize, row: usize) -> Option<&'static actions::Command> {
-    palette_groups().get(section)?.1.get(row).copied()
+/// The command at a palette position, for `query`.
+fn palette_command(query: &str, section: usize, row: usize) -> Option<&'static actions::Command> {
+    palette_groups(query).get(section)?.1.get(row).copied()
 }
 
 impl Focusable for Workspace {
@@ -3062,6 +3148,50 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_saved_queries))
             .on_action(cx.listener(Self::save_query))
             .on_action(cx.listener(Self::run_statement))
+            .on_action(cx.listener(|this, _: &RunStatementInNewTab, window, cx| {
+                this.on_query(window, cx, QueryTab::run_in_new_tab)
+            }))
+            .on_action(cx.listener(|this, _: &RunFromCursor, window, cx| {
+                this.on_query(window, cx, |tab, window, cx| {
+                    tab.run(Scope::FromCursor, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &NextStatement, window, cx| {
+                this.on_query(window, cx, |tab, window, cx| {
+                    tab.go_to_statement(true, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &PreviousStatement, window, cx| {
+                this.on_query(window, cx, |tab, window, cx| {
+                    tab.go_to_statement(false, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &CountStatementRows, window, cx| {
+                this.on_query(window, cx, QueryTab::count_rows)
+            }))
+            .on_action(cx.listener(|this, _: &TogglePinnedResult, window, cx| {
+                this.on_query(window, cx, |tab, window, cx| {
+                    tab.perform_on_active_result(TabAction::Pin, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &CloseResultTab, window, cx| {
+                this.on_query(window, cx, |tab, window, cx| {
+                    tab.perform_on_active_result(TabAction::Close, window, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &ToggleResultsPanel, window, cx| {
+                this.on_query(window, cx, QueryTab::toggle_results)
+            }))
+            .on_action(cx.listener(|this, _: &MaximizeResultsPanel, window, cx| {
+                this.on_query(window, cx, QueryTab::maximize_results)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchResultsFocus, window, cx| {
+                this.on_query(window, cx, QueryTab::switch_focus)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTabsToTheLeft, window, cx| {
+                let left = this.tabs[..this.active_tab.min(this.tabs.len())].to_vec();
+                this.close_tabs(left, window, cx)
+            }))
             .on_action(cx.listener(Self::run_all))
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::toggle_comment))

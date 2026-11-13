@@ -159,7 +159,9 @@ pub fn render(plan: &Plan, cx: &App) -> AnyElement {
             .test_support()
             .px_3()
             .py_1()
-            .when(hot, |this| this.bg(theme.danger.opacity(0.12)))
+            // The accent of a selected row: a red tint at low opacity did not
+            // show on the dark surfaces.
+            .when(hot, |this| this.bg(theme.table_active))
             .child(
                 h_flex()
                     .gap_3()

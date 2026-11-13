@@ -8,27 +8,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::FocusableExt as _;
 use gpui_kit::base::input;
 use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    CompletionProvider, Editor, EditorState, InputEvent, Position, RopeExt as _,
+    CompletionProvider, Editor, EditorState, Input, InputEvent, InputState, Position, RopeExt as _,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
     h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
-    div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::Environment;
 use kerno_core::sql::{
@@ -56,7 +58,7 @@ use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
-use crate::tabs::{self, EditorFacts, TabAction, TabSnapshot, Target};
+use crate::tabs::{self, EditorFacts, ResultFacts, TabAction, TabSnapshot, Target};
 
 /// A statement to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +96,32 @@ pub enum Scope {
     AtCursor,
     /// The selection if there is one, otherwise the whole text.
     All,
+    /// The statement the cursor is in and every one after it (DBeaver's
+    /// `run.scriptFromPosition`); the selection does not count.
+    FromCursor,
+}
+
+/// What the user asked for while the tab's connection was closed: done
+/// once it is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    Launch {
+        scope: Scope,
+        explain: Option<bool>,
+        keep: bool,
+    },
+    ApplySource,
+    CountRows,
+}
+
+/// Which parts of the tab are on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panels {
+    Both,
+    /// The results are hidden.
+    Editor,
+    /// The editor is hidden.
+    Results,
 }
 
 /// Why a statement failed, as the server said it.
@@ -153,12 +181,21 @@ pub enum Outcome {
 
 /// One statement of a run and what came of it.
 pub struct ResultPane {
+    /// Stays the same while the pane lives: what a run, a menu and the
+    /// result tab bar refer to, whatever closes around it.
+    id: u64,
     pub statement: String,
     pub outcome: Outcome,
     /// Count the server reported: rows changed, or rows returned.
     pub rows_affected: Option<u64>,
     /// From sending the statement to its end (or to now, while it runs).
     pub elapsed: Option<Duration>,
+    /// The name given to its tab.
+    name: Option<String>,
+    /// Kept by the next runs until unpinned or closed.
+    pinned: bool,
+    /// The grid's selection and double click; dropped with the pane.
+    _grid_events: Option<Subscription>,
 }
 
 impl ResultPane {
@@ -253,7 +290,21 @@ pub struct QueryTab {
     unsaved: bool,
     /// The run being prepared asks for a plan: `Some(analyze)`.
     explain_mode: Option<bool>,
-    grid_subscriptions: Vec<Subscription>,
+    /// The run being prepared adds its results after the ones shown,
+    /// instead of replacing those that are not pinned.
+    keep_results: bool,
+    /// What runs once the connection, being opened, is open.
+    pending: Option<Request>,
+    /// Id the next result pane gets.
+    next_pane: u64,
+    /// The pane whose rows are arriving, or waiting to be paged.
+    receiving: Option<u64>,
+    results_scroll: ScrollHandle,
+    /// The pane the result tab bar was last scrolled to.
+    revealed_result: Option<u64>,
+    panels: Panels,
+    /// The results area, focused when the result on screen is no grid.
+    results_focus: FocusHandle,
     /// Bumped at every run and target change, so late answers are dropped.
     generation: u64,
     /// What completion offers; empty until loaded.
@@ -309,16 +360,21 @@ impl QueryTab {
                 cx.notify();
             }
         });
-        let subscription = cx.subscribe(&connections, |this, _, event: &ConnectionsEvent, cx| {
-            if let ConnectionsEvent::StatusChanged { id } = event
-                && this
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| target.connection == *id)
-            {
-                this.follow_connection(cx);
-            }
-        });
+        let subscription = cx.subscribe_in(
+            &connections,
+            window,
+            |this, _, event: &ConnectionsEvent, window, cx| {
+                if let ConnectionsEvent::StatusChanged { id } = event
+                    && this
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.connection == *id)
+                {
+                    this.follow_connection(cx);
+                    this.resume(window, cx);
+                }
+            },
+        );
         // The connection's commit mode: manual on production unless chosen.
         let manual_commit = target
             .as_ref()
@@ -344,7 +400,14 @@ impl QueryTab {
             file: None,
             unsaved: false,
             explain_mode: None,
-            grid_subscriptions: Vec::new(),
+            keep_results: false,
+            pending: None,
+            next_pane: 0,
+            receiving: None,
+            results_scroll: ScrollHandle::new(),
+            revealed_result: None,
+            panels: Panels::Both,
+            results_focus: cx.focus_handle(),
             generation: 0,
             catalog: SharedCatalog::default(),
             catalog_load: None,
@@ -512,6 +575,35 @@ impl QueryTab {
             .collect()
     }
 
+    /// The labels of the result tabs, `*` before a pinned one; for tests.
+    #[cfg(test)]
+    pub fn result_tabs(&self) -> Vec<String> {
+        (0..self.results.len())
+            .map(|index| {
+                let pin = if self.results[index].pinned { "*" } else { "" };
+                format!("{pin}{}", self.result_label(index))
+            })
+            .collect()
+    }
+
+    /// The result on screen, from 0; for tests.
+    #[cfg(test)]
+    pub fn active_result(&self) -> usize {
+        self.active_result
+    }
+
+    /// How far the result tab bar is scrolled; for tests.
+    #[cfg(test)]
+    pub fn result_bar_offset(&self) -> gpui_kit::Pixels {
+        self.results_scroll.offset().x
+    }
+
+    /// Which parts of the tab are on screen; for tests.
+    #[cfg(test)]
+    pub fn panels(&self) -> Panels {
+        self.panels
+    }
+
     /// How many places the editor marks as errors; for tests.
     #[cfg(test)]
     pub fn error_marks(&self, cx: &App) -> usize {
@@ -579,10 +671,11 @@ impl QueryTab {
             return;
         }
         self.stop(cx);
+        self.pending = None;
         self.target = target;
         // The source replaces an object where it was read from.
         self.source = None;
-        self.session = None;
+        self.close_session(cx);
         self.databases.clear();
         self.schemas.clear();
         self.generation += 1;
@@ -601,7 +694,7 @@ impl QueryTab {
         };
         if !self.connected(cx) {
             self.stop(cx);
-            self.session = None;
+            self.close_session(cx);
             self.complete_with(None, cx);
             cx.notify();
             return;
@@ -788,13 +881,39 @@ impl QueryTab {
                     });
                 }
             }
-            let _ = this.update(cx, |this, _| {
-                if this.generation == generation {
+            // One session per tab: one opened at the same time as the tab's
+            // own (a run and the completion list) is closed at once, and the
+            // tab's is used.
+            let session = this.update(cx, |this, cx| match &this.session {
+                _ if this.generation != generation => session,
+                Some(kept) if !Arc::ptr_eq(kept, &session) => {
+                    let kept = kept.clone();
+                    bridge::spawn(cx, async move { session.close().await }).detach();
+                    kept
+                }
+                _ => {
                     this.session = Some(session.clone());
+                    session
                 }
             });
-            Ok(session)
+            session.map_err(|_| Error::Closed("the tab was closed".into()))
         })
+    }
+
+    /// Closes the tab's session now: the tab is closing, moving to another
+    /// target, or its connection closed. Results on screen stay.
+    pub fn close_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.take() {
+            bridge::spawn(cx, async move {
+                // A transaction is rolled back before, not cancelled by, the
+                // close (the server would roll it back too).
+                if session.tx_state() != TxState::Idle {
+                    let _ = exec::collect(session.clone(), "ROLLBACK").await;
+                }
+                session.close().await
+            })
+            .detach();
+        }
     }
 
     /// Whether the result of `pane` can be exported: rows of a statement
@@ -852,7 +971,8 @@ impl QueryTab {
             sql: span.text(source).to_string(),
             origin: Some(base + span.range.start),
         };
-        if let Some(selected) = text.get(selection.clone())
+        if scope != Scope::FromCursor
+            && let Some(selected) = text.get(selection.clone())
             && !selected.trim().is_empty()
         {
             return split_statements(selected, rules)
@@ -866,7 +986,44 @@ impl QueryTab {
             Scope::AtCursor => statement_at(&spans, editor.cursor())
                 .map(|span| vec![from(&text, 0, span)])
                 .unwrap_or_default(),
+            Scope::FromCursor => {
+                // As `statement_at` finds the statement of the cursor.
+                let cursor = editor.cursor();
+                let first = spans
+                    .iter()
+                    .position(|span| cursor <= span.reach)
+                    .unwrap_or(spans.len().saturating_sub(1));
+                spans
+                    .iter()
+                    .skip(first)
+                    .map(|span| from(&text, 0, span))
+                    .collect()
+            }
         }
+    }
+
+    /// Moves the cursor to the start of the next statement, or of the one
+    /// before the statement it is in (DBeaver's `query.next` / `query.prev`).
+    pub fn go_to_statement(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let spans = split_statements(&text, rules);
+            let cursor = editor.cursor();
+            let target = if forward {
+                spans.iter().find(|span| span.range.start > cursor)
+            } else {
+                // The statement the cursor is in or before, then the one ahead.
+                let here = spans
+                    .iter()
+                    .position(|span| span.range.end >= cursor)
+                    .unwrap_or(spans.len());
+                here.checked_sub(1).map(|previous| &spans[previous])
+            };
+            if let Some(span) = target {
+                editor.set_cursor_position(position_of(&text, span.range.start), window, cx);
+            }
+        });
     }
 
     /// Opens the editor's search panel, with its replace row when asked.
@@ -937,7 +1094,10 @@ impl QueryTab {
         // Dropping the run drops the execution, which stops the statement.
         if self.run.take().is_some() {
             for pane in &mut self.results {
-                if let Outcome::Rows(grid) = &pane.outcome {
+                // A result kept from an earlier run stays complete.
+                if let Outcome::Rows(grid) = &pane.outcome
+                    && !grid.read(cx).delegate().is_complete()
+                {
                     grid.update(cx, |grid, cx| {
                         grid.delegate_mut().finish(false);
                         // A result that stopped arriving can be sorted: its
@@ -948,12 +1108,18 @@ impl QueryTab {
                 }
             }
         }
+        self.receiving = None;
         self.activity = Activity::Idle;
     }
 
     /// Asks the server to cancel the running statement. It ends with the
     /// server's cancellation error and keeps the rows that arrived.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        // A run waiting for its connection is simply forgotten.
+        if self.pending.take().is_some() {
+            cx.notify();
+            return;
+        }
         if !matches!(self.activity, Activity::Running { .. }) {
             // Nothing is being computed; a result waiting to be paged is
             // simply let go.
@@ -970,28 +1136,126 @@ impl QueryTab {
     /// Runs the statements of `scope`, one after the other, stopping at
     /// the first that fails.
     pub fn run(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        self.launch(scope, None, window, cx);
+        self.launch(scope, None, false, window, cx);
+    }
+
+    /// Runs the statement at the cursor (or the selection) and adds its
+    /// results after the ones on screen (DBeaver's `run.statementNew`).
+    pub fn run_in_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch(Scope::AtCursor, None, true, window, cx);
     }
 
     /// Shows the plan of the statement at the cursor. With `analyze` the
     /// statement is run and the plan carries what really happened.
     pub fn explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.launch(Scope::AtCursor, Some(analyze), window, cx);
+        self.launch(Scope::AtCursor, Some(analyze), false, window, cx);
+    }
+
+    /// When the tab's saved connection is closed: opens it, with its usual
+    /// prompts, and keeps `request` for when it is open (DBeaver connects
+    /// on execute, `EDITOR_CONNECT_ON_EXECUTE`). Whether it waits.
+    fn connect_first(&mut self, request: Request, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.target.as_ref().map(|target| target.connection.clone()) else {
+            return false;
+        };
+        let connections = self.connections.read(cx);
+        if connections.get(&id).is_none() {
+            return false;
+        }
+        match connections.status(&id) {
+            Status::Connected { .. } => return false,
+            // Already on its way, or asking the user: wait for it.
+            Status::Connecting | Status::WaitingForInput => self.pending = Some(request),
+            Status::Disconnected | Status::Failed { .. } => {
+                self.pending = Some(request);
+                self.connections
+                    .update(cx, |connections, cx| connections.connect(&id, cx));
+            }
+        }
+        // The results area says it is connecting.
+        self.show_results();
+        cx.notify();
+        true
+    }
+
+    /// Does what was asked while the connection was opening, once it is
+    /// open; says why nothing ran when it did not open.
+    fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(request) = self.pending else {
+            return;
+        };
+        let Some(target) = &self.target else {
+            return;
+        };
+        let connections = self.connections.read(cx);
+        let name = connections
+            .get(&target.connection)
+            .map(|saved| saved.config.name.clone())
+            .unwrap_or_default();
+        let message = match connections.status(&target.connection) {
+            Status::Connecting | Status::WaitingForInput => return,
+            Status::Connected { .. } => {
+                self.pending = None;
+                match request {
+                    Request::Launch {
+                        scope,
+                        explain,
+                        keep,
+                    } => self.launch(scope, explain, keep, window, cx),
+                    Request::ApplySource => self.apply_source(window, cx),
+                    Request::CountRows => self.count_rows(window, cx),
+                }
+                return;
+            }
+            Status::Failed { message } => {
+                format!("“{name}” could not connect, and nothing was run: {message}")
+            }
+            Status::Disconnected => {
+                format!("“{name}” was not connected, and nothing was run.")
+            }
+        };
+        self.pending = None;
+        if let Request::Launch { keep, .. } = request {
+            self.keep_results = keep;
+        }
+        self.refuse(
+            String::new(),
+            Failure {
+                message,
+                code: None,
+                detail: None,
+                hint: Some("Run again to connect again.".into()),
+                position: None,
+            },
+            cx,
+        );
     }
 
     fn launch(
         &mut self,
         scope: Scope,
         explain: Option<bool>,
+        keep: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.connect_first(
+            Request::Launch {
+                scope,
+                explain,
+                keep,
+            },
+            cx,
+        ) {
+            return;
+        }
         let mut statements = self.statements(scope, cx);
         if explain.is_some() {
             // One plan at a time: the first statement of a selection.
             statements.truncate(1);
         }
         self.explain_mode = explain;
+        self.keep_results = keep;
         if statements.is_empty() {
             return;
         }
@@ -1182,13 +1446,9 @@ impl QueryTab {
 
     /// Shows why a statement was not run on a read-only connection.
     fn refuse_read_only(&mut self, statement: &str, connection: &str, cx: &mut Context<Self>) {
-        self.stop(cx);
-        self.results.clear();
-        self.grid_subscriptions.clear();
-        self.notices.clear();
-        self.results.push(ResultPane {
-            statement: statement.to_string(),
-            outcome: Outcome::Failed(Failure {
+        self.refuse(
+            statement.to_string(),
+            Failure {
                 message: format!(
                     "“{connection}” is a read-only connection: this statement would change the database and was not run."
                 ),
@@ -1198,12 +1458,73 @@ impl QueryTab {
                     "Untick “Read-only” in the connection's settings to allow changes.".into(),
                 ),
                 position: None,
-            }),
-            rows_affected: None,
-            elapsed: None,
-        });
-        self.active_result = 0;
+            },
+            cx,
+        );
+    }
+
+    /// Shows why a run did not happen, as its result.
+    fn refuse(&mut self, statement: String, failure: Failure, cx: &mut Context<Self>) {
+        self.stop(cx);
+        self.show_results();
+        self.clear_results();
+        self.notices.clear();
+        self.push_pane(statement, Outcome::Failed(failure), None, None);
+        self.active_result = self.results.len() - 1;
         cx.notify();
+    }
+
+    /// The results come back on screen when they were hidden.
+    fn show_results(&mut self) {
+        if self.panels == Panels::Editor {
+            self.panels = Panels::Both;
+        }
+    }
+
+    /// Before a run: the results that are not pinned go, unless the run
+    /// keeps them. Their rows are freed with them.
+    fn clear_results(&mut self) {
+        if !self.keep_results {
+            self.results.retain(|pane| pane.pinned);
+        }
+    }
+
+    /// Adds a result pane at the end; returns its id.
+    fn push_pane(
+        &mut self,
+        statement: String,
+        outcome: Outcome,
+        rows_affected: Option<u64>,
+        elapsed: Option<Duration>,
+    ) -> u64 {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        self.results.push(ResultPane {
+            id,
+            statement,
+            outcome,
+            rows_affected,
+            elapsed,
+            name: None,
+            pinned: false,
+            _grid_events: None,
+        });
+        id
+    }
+
+    fn pane_index(&self, id: u64) -> Option<usize> {
+        self.results.iter().position(|pane| pane.id == id)
+    }
+
+    fn pane_mut(&mut self, id: u64) -> Option<&mut ResultPane> {
+        self.results.iter_mut().find(|pane| pane.id == id)
+    }
+
+    fn pane_grid(&self, id: u64) -> Option<Entity<TableState<Grid>>> {
+        self.results
+            .iter()
+            .find(|pane| pane.id == id)
+            .and_then(ResultPane::grid)
     }
 
     /// Runs the whole text, the script of a source, once its SQL was
@@ -1213,6 +1534,10 @@ impl QueryTab {
         if self.source.is_none() || matches!(self.activity, Activity::Running { .. }) {
             return;
         }
+        if self.connect_first(Request::ApplySource, cx) {
+            return;
+        }
+        self.keep_results = false;
         let rules = self.lex_rules(cx);
         let text = self.sql(cx);
         let statements: Vec<Statement> = split_statements(&text, rules)
@@ -1297,10 +1622,12 @@ impl QueryTab {
     ) {
         self.stop(cx);
         self.generation += 1;
-        self.results.clear();
-        self.grid_subscriptions.clear();
+        self.clear_results();
         self.notices.clear();
-        self.active_result = 0;
+        // The first result of this run is shown; the editor and the
+        // results are both on screen again, as DBeaver does on execute.
+        self.active_result = self.results.len();
+        self.panels = Panels::Both;
         self.cancel_requested = false;
         let total = statements.len();
         self.activity = Activity::Running {
@@ -1318,12 +1645,12 @@ impl QueryTab {
                 Ok(session) => session,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.results.push(ResultPane {
-                            statement: String::new(),
-                            outcome: Outcome::Failed(Failure::from(&error)),
-                            rows_affected: None,
-                            elapsed: None,
-                        });
+                        this.push_pane(
+                            String::new(),
+                            Outcome::Failed(Failure::from(&error)),
+                            None,
+                            None,
+                        );
                         this.activity = Activity::Idle;
                         cx.notify();
                     });
@@ -1344,12 +1671,12 @@ impl QueryTab {
                 };
                 if let Err(error) = beginning.await {
                     let _ = this.update(cx, |this, cx| {
-                        this.results.push(ResultPane {
-                            statement: begin.to_string(),
-                            outcome: Outcome::Failed(Failure::from(&error)),
-                            rows_affected: None,
-                            elapsed: None,
-                        });
+                        this.push_pane(
+                            begin.to_string(),
+                            Outcome::Failed(Failure::from(&error)),
+                            None,
+                            None,
+                        );
                         this.activity = Activity::Idle;
                         this.run = None;
                         cx.notify();
@@ -1376,7 +1703,7 @@ impl QueryTab {
                         | StatementKind::Copy
                 );
                 // The pane the statement's rows went to, for its plan.
-                let mut rows_pane: Option<usize> = None;
+                let mut rows_pane: Option<u64> = None;
                 let _ = this.update(cx, |this, cx| {
                     this.activity = Activity::Running {
                         index,
@@ -1404,7 +1731,7 @@ impl QueryTab {
                 let mut execution = starting.await;
                 let demand = execution.demand();
                 // The pane of the result set being received.
-                let mut pane: Option<usize> = None;
+                let mut pane: Option<u64> = None;
                 let mut failed = false;
                 while let Some(event) = execution.next().await {
                     let last = index + 1 == total;
@@ -1419,9 +1746,11 @@ impl QueryTab {
                                 );
                                 pane = Some(this.open_grid(&statement.sql, grid, window, cx));
                                 rows_pane = pane;
+                                this.receiving = pane;
                             }
                             ExecEvent::Rows(batch) => {
-                                if let Some(grid) = pane.and_then(|pane| this.results[pane].grid())
+                                if let Some(id) = pane
+                                    && let Some(grid) = this.pane_grid(id)
                                 {
                                     let paused = grid.update(cx, |grid, cx| {
                                         grid.delegate_mut().push(batch);
@@ -1432,8 +1761,8 @@ impl QueryTab {
                                         // The rows asked for are here: the tab is not
                                         // waiting for the server any more.
                                         this.activity = Activity::Idle;
-                                        if let Some(pane) = pane {
-                                            this.results[pane].elapsed = Some(started.elapsed());
+                                        if let Some(pane) = this.pane_mut(id) {
+                                            pane.elapsed = Some(started.elapsed());
                                         }
                                         // In a script the next statement needs the
                                         // session: this one stops at its first page.
@@ -1442,6 +1771,7 @@ impl QueryTab {
                                                 grid.delegate_mut().finish(false);
                                                 grid.refresh(cx);
                                             });
+                                            this.receiving = None;
                                             cx.notify();
                                             return false;
                                         }
@@ -1449,30 +1779,30 @@ impl QueryTab {
                                 }
                             }
                             ExecEvent::Complete { rows_affected } => match pane.take() {
-                                Some(pane) => {
-                                    if let Outcome::Rows(grid) = &this.results[pane].outcome {
+                                Some(id) => {
+                                    this.receiving = None;
+                                    if let Some(grid) = this.pane_grid(id) {
                                         grid.update(cx, |grid, cx| {
                                             grid.delegate_mut().finish(true);
                                             grid.refresh(cx);
                                             cx.notify();
                                         });
+                                        row_count = rows_affected
+                                            .or(Some(grid.read(cx).delegate().row_count() as u64));
                                     }
-                                    this.results[pane].rows_affected = rows_affected;
-                                    this.results[pane].elapsed = Some(started.elapsed());
-                                    row_count = rows_affected.or_else(|| {
-                                        this.results[pane]
-                                            .grid()
-                                            .map(|grid| grid.read(cx).delegate().row_count() as u64)
-                                    });
+                                    if let Some(pane) = this.pane_mut(id) {
+                                        pane.rows_affected = rows_affected;
+                                        pane.elapsed = Some(started.elapsed());
+                                    }
                                 }
                                 None => {
                                     row_count = rows_affected;
-                                    this.results.push(ResultPane {
-                                        statement: statement.sql.clone(),
-                                        outcome: Outcome::Done,
-                                        rows_affected: rows_affected.filter(|_| counts_rows),
-                                        elapsed: Some(started.elapsed()),
-                                    })
+                                    this.push_pane(
+                                        statement.sql.clone(),
+                                        Outcome::Done,
+                                        rows_affected.filter(|_| counts_rows),
+                                        Some(started.elapsed()),
+                                    );
                                 }
                             },
                             ExecEvent::Notice(notice) => this.notices.push(notice),
@@ -1483,21 +1813,22 @@ impl QueryTab {
                                 if std::mem::take(&mut this.cancel_requested) {
                                     failed = true;
                                     ended = Some((HistoryStatus::Cancelled, None));
-                                    this.results.push(ResultPane {
-                                        statement: statement.sql.clone(),
-                                        outcome: Outcome::Cancelled,
-                                        rows_affected: None,
-                                        elapsed: Some(started.elapsed()),
-                                    });
+                                    this.push_pane(
+                                        statement.sql.clone(),
+                                        Outcome::Cancelled,
+                                        None,
+                                        Some(started.elapsed()),
+                                    );
                                     this.active_result = this.results.len() - 1;
                                 }
                             }
                             ExecEvent::Finished(Err(error)) => {
                                 failed = true;
+                                this.receiving = None;
                                 // Rows that arrived before the failure stay; a
                                 // result without any goes.
-                                if let Some(pane) = pane
-                                    && let Some(grid) = this.results[pane].grid()
+                                if let Some(id) = pane
+                                    && let Some(grid) = this.pane_grid(id)
                                 {
                                     let empty = grid.update(cx, |grid, cx| {
                                         grid.delegate_mut().finish(false);
@@ -1505,7 +1836,7 @@ impl QueryTab {
                                         grid.delegate().row_count() == 0
                                     });
                                     if empty {
-                                        this.results.remove(pane);
+                                        this.results.retain(|pane| pane.id != id);
                                     }
                                 }
                                 // The server words a cancellation its own way
@@ -1517,16 +1848,16 @@ impl QueryTab {
                                 } else {
                                     (HistoryStatus::Error, Some(Failure::from(&error)))
                                 });
-                                this.results.push(ResultPane {
-                                    statement: statement.sql.clone(),
-                                    outcome: if cancelled {
+                                this.push_pane(
+                                    statement.sql.clone(),
+                                    if cancelled {
                                         Outcome::Cancelled
                                     } else {
                                         Outcome::Failed(Failure::from(&error))
                                     },
-                                    rows_affected: None,
-                                    elapsed: Some(started.elapsed()),
-                                });
+                                    None,
+                                    Some(started.elapsed()),
+                                );
                                 this.active_result = this.results.len() - 1;
                             }
                         }
@@ -1667,7 +1998,10 @@ impl QueryTab {
             let range = position_of(&text, start)..position_of(&text, end);
             if let Some(diagnostics) = editor.diagnostics_mut() {
                 diagnostics.clear();
-                diagnostics.push(Diagnostic::new(range, message));
+                diagnostics.push(
+                    // An error: the danger colour, not the hint's.
+                    Diagnostic::new(range, message).with_severity(input::DiagnosticSeverity::Error),
+                );
             }
             cx.notify();
         });
@@ -1721,7 +2055,11 @@ impl QueryTab {
     fn editor_facts(&self, cx: &App) -> EditorFacts {
         let editor = self.editor.read(cx);
         EditorFacts {
-            connected: self.connected(cx),
+            // Running connects a saved connection first.
+            connected: self
+                .target
+                .as_ref()
+                .is_some_and(|target| self.connections.read(cx).get(&target.connection).is_some()),
             running: self.running(),
             selection: !editor.selected_range().is_empty(),
             empty: editor.text().len() == 0,
@@ -1791,12 +2129,12 @@ impl QueryTab {
     /// Replaces the rows an EXPLAIN returned by its plan as a tree.
     fn show_plan(
         &mut self,
-        pane: usize,
+        pane: u64,
         dialect: &dyn Dialect,
         analyze: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(grid) = self.results.get(pane).and_then(ResultPane::grid) else {
+        let Some(grid) = self.pane_grid(pane) else {
             return;
         };
         // The output is one cell, or one line per row for text plans.
@@ -1812,23 +2150,25 @@ impl QueryTab {
             Ok(plan) => (Some(plan), None),
             Err(error) => (None, Some(error.to_string())),
         };
-        self.results[pane].outcome = Outcome::Plan {
-            show_raw: plan.is_none(),
-            plan,
-            raw,
-            problem,
-        };
+        if let Some(pane) = self.pane_mut(pane) {
+            pane.outcome = Outcome::Plan {
+                show_raw: plan.is_none(),
+                plan,
+                raw,
+                problem,
+            };
+        }
         cx.notify();
     }
 
-    /// Adds the pane of a result set that starts to arrive.
+    /// Adds the pane of a result set that starts to arrive; returns its id.
     fn open_grid(
         &mut self,
         statement: &str,
         grid: Grid,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> usize {
+    ) -> u64 {
         // The menu of a cell exports the result of its own statement (it
         // says when that statement writes, and does not run it).
         let view = cx.weak_entity();
@@ -1859,7 +2199,7 @@ impl QueryTab {
                 .row_header(false)
         });
         // A double click on a cell shows its whole value.
-        self.grid_subscriptions.push(cx.subscribe_in(
+        let events = cx.subscribe_in(
             &table,
             window,
             |_, table, event: &TableEvent, window, cx| {
@@ -1884,14 +2224,12 @@ impl QueryTab {
                     }
                 }
             },
-        ));
-        self.results.push(ResultPane {
-            statement: statement.to_string(),
-            outcome: Outcome::Rows(table),
-            rows_affected: None,
-            elapsed: None,
-        });
-        self.results.len() - 1
+        );
+        let id = self.push_pane(statement.to_string(), Outcome::Rows(table), None, None);
+        if let Some(pane) = self.pane_mut(id) {
+            pane._grid_events = Some(events);
+        }
+        id
     }
 
     /// Copies the selection of the result on screen (`None`: its column
@@ -1919,6 +2257,394 @@ impl QueryTab {
                 cx.notify();
             });
         }
+    }
+
+    // Result tabs ---------------------------------------------------------------
+
+    /// The label of the result tab at `index`: its name, or what it is.
+    fn result_label(&self, index: usize) -> String {
+        let pane = &self.results[index];
+        pane.name.clone().unwrap_or_else(|| match &pane.outcome {
+            Outcome::Failed(_) => format!("Error {}", index + 1),
+            Outcome::Plan { .. } => format!("Plan {}", index + 1),
+            _ => format!("Result {}", index + 1),
+        })
+    }
+
+    fn result_facts(&self, id: u64) -> Option<ResultFacts> {
+        let index = self.pane_index(id)?;
+        let unpinned = |panes: &[ResultPane]| panes.iter().filter(|pane| !pane.pinned).count();
+        Some(ResultFacts {
+            pinned: self.results[index].pinned,
+            left: unpinned(&self.results[..index]),
+            right: unpinned(&self.results[index + 1..]),
+            pinned_count: self.results.iter().filter(|pane| pane.pinned).count(),
+            statement: !self.results[index].statement.is_empty(),
+        })
+    }
+
+    /// The menu of the result tab of pane `id`, built when it opens.
+    fn result_menu(
+        &self,
+        id: u64,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity();
+        move |menu, _, cx| {
+            let Some(facts) = view.read(cx).result_facts(id) else {
+                return menu;
+            };
+            let view = view.clone();
+            tabs::fill_menu(
+                menu,
+                tabs::result_menu(facts),
+                Rc::new(move |action, window, cx| {
+                    let view = view.clone();
+                    // Once the menu is gone: Rename opens a prompt.
+                    window.defer(cx, move |window, cx| {
+                        view.update(cx, |this, cx| this.perform_result(id, action, window, cx))
+                    });
+                }),
+            )
+        }
+    }
+
+    /// Does what an entry of a result tab's menu says, on pane `id`.
+    pub fn perform_result(
+        &mut self,
+        id: u64,
+        action: TabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.pane_index(id) else {
+            return;
+        };
+        // The bulk closes leave pinned results alone.
+        let unpinned = |panes: &[ResultPane]| -> Vec<u64> {
+            panes
+                .iter()
+                .filter(|pane| !pane.pinned)
+                .map(|pane| pane.id)
+                .collect()
+        };
+        match action {
+            TabAction::Close => self.close_results(&[id], cx),
+            TabAction::CloseOthers => {
+                let mut others = unpinned(&self.results);
+                others.retain(|other| *other != id);
+                self.close_results(&others, cx)
+            }
+            TabAction::CloseToLeft => {
+                let left = unpinned(&self.results[..index]);
+                self.close_results(&left, cx)
+            }
+            TabAction::CloseToRight => {
+                let right = unpinned(&self.results[index + 1..]);
+                self.close_results(&right, cx)
+            }
+            TabAction::CloseAll => {
+                let all = unpinned(&self.results);
+                self.close_results(&all, cx)
+            }
+            TabAction::Pin | TabAction::Unpin => {
+                self.results[index].pinned = action == TabAction::Pin;
+                cx.notify();
+            }
+            TabAction::UnpinAll => {
+                for pane in &mut self.results {
+                    pane.pinned = false;
+                }
+                cx.notify();
+            }
+            TabAction::Rename => self.rename_result(id, window, cx),
+            TabAction::CopyStatement => cx.write_to_clipboard(ClipboardItem::new_string(
+                self.results[index].statement.clone(),
+            )),
+            other => tracing::warn!(?other, "not an action of a result tab"),
+        }
+    }
+
+    /// Does `action` on the result on screen, when it is a result (not the
+    /// messages).
+    pub fn perform_on_active_result(
+        &mut self,
+        action: TabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.results.get(self.active_result) else {
+            return;
+        };
+        let action = match action {
+            TabAction::Pin if pane.pinned => TabAction::Unpin,
+            other => other,
+        };
+        self.perform_result(pane.id, action, window, cx)
+    }
+
+    /// Closes the result panes `ids`, which frees their rows. A pane still
+    /// receiving or waiting to be paged stops its statement first.
+    fn close_results(&mut self, ids: &[u64], cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.receiving.is_some_and(|id| ids.contains(&id)) {
+            self.stop(cx);
+        }
+        let on_messages = self.active_result >= self.results.len();
+        let shown = self.results.get(self.active_result).map(|pane| pane.id);
+        let before = self.active_result;
+        self.results.retain(|pane| !ids.contains(&pane.id));
+        self.active_result = if on_messages {
+            self.results.len()
+        } else {
+            // The same result, or the one that took the place of the closed one.
+            shown
+                .and_then(|id| self.pane_index(id))
+                .unwrap_or(before.min(self.results.len().saturating_sub(1)))
+        };
+        cx.notify();
+    }
+
+    /// Asks for the name of a result tab; an empty name gives back the one
+    /// it had.
+    fn rename_result(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.pane_index(id) else {
+            return;
+        };
+        let current = self.result_label(index);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        let view = cx.weak_entity();
+        let submit = {
+            let input = input.clone();
+            Rc::new(move |cx: &mut App| {
+                let name = input.read(cx).value().trim().to_string();
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(pane) = this.pane_mut(id) {
+                        pane.name = (!name.is_empty()).then_some(name);
+                    }
+                    cx.notify();
+                });
+            })
+        };
+        let focus = input.clone();
+        // The keyboard goes back to the editor once the prompt is gone.
+        let editor = self.editor.read(cx).focus_handle(cx);
+        let give_back = Rc::new(move |window: &mut Window, cx: &mut App| {
+            let editor = editor.clone();
+            window.defer(cx, move |window, cx| editor.focus(window, cx));
+        });
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, on_enter, on_click) = (input.clone(), submit.clone(), submit.clone());
+            let (after_enter, after_click, after_cancel) =
+                (give_back.clone(), give_back.clone(), give_back.clone());
+            dialog
+                .title("Rename result tab")
+                .w(px(380.))
+                .on_ok(move |_, window, cx| {
+                    on_enter(cx);
+                    after_enter(window, cx);
+                    true
+                })
+                .content(move |content, _, _| {
+                    let (on_click, after_click, after_cancel) =
+                        (on_click.clone(), after_click.clone(), after_cancel.clone());
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .child(Input::new(&input).id("result-name"))
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("result-name-cancel")
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                after_cancel(window, cx);
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("result-name-ok")
+                                            .primary()
+                                            .label("Rename")
+                                            .on_click(move |_, window, cx| {
+                                                on_click(cx);
+                                                window.close_dialog(cx);
+                                                after_click(window, cx);
+                                            }),
+                                    ),
+                            ),
+                    )
+                })
+        });
+        window.defer(cx, move |window, cx| {
+            focus.read(cx).focus_handle(cx).focus(window, cx)
+        });
+    }
+
+    /// Counts the rows the statement at the cursor would return (DBeaver's
+    /// `run.count`): a SELECT only, wrapped in `SELECT COUNT(*)`, on the
+    /// tab's session. The number goes to the messages and a notification.
+    pub fn count_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running() {
+            return;
+        }
+        if self.connect_first(Request::CountRows, cx) {
+            return;
+        }
+        let rules = self.lex_rules(cx);
+        let Some(statement) = self.statements(Scope::AtCursor, cx).into_iter().next() else {
+            return;
+        };
+        let refusal = if classify(&statement.sql, rules).kind != StatementKind::Select {
+            Some("only a SELECT returns rows to count")
+        } else if !find_params(&statement.sql, rules).is_empty() {
+            Some("the statement has parameters")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            window.push_notification(
+                Notification::warning(SharedString::from(format!(
+                    "Count rows of statement: {reason}."
+                ))),
+                cx,
+            );
+            return;
+        }
+        // A result waiting to be paged holds the session.
+        self.stop(cx);
+        let sql = format!("SELECT COUNT(*) FROM ({}) kerno_count", statement.sql);
+        let session = self.session(cx);
+        self.cancel_requested = false;
+        self.activity = Activity::Running {
+            index: 0,
+            total: 1,
+            since: Instant::now(),
+        };
+        self.run = Some(cx.spawn_in(window, async move |this, cx| {
+            let counted = match session.await {
+                Ok(session) => {
+                    match cx.update(|_, cx| bridge::spawn(cx, exec::collect(session, sql))) {
+                        Ok(counting) => counting.await,
+                        Err(_) => return,
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let cancelled = std::mem::take(&mut this.cancel_requested);
+                let message = match counted {
+                    _ if cancelled => "The count was cancelled.".to_string(),
+                    Ok(collected) => {
+                        let count = collected
+                            .results
+                            .last()
+                            .and_then(|result| result.rows().first().cloned())
+                            .and_then(|row| row.into_iter().next().flatten())
+                            .unwrap_or_default();
+                        format!(
+                            "{count} row{} in the result of the statement.",
+                            if count == "1" { "" } else { "s" }
+                        )
+                    }
+                    Err(error) => format!("The rows could not be counted: {error}"),
+                };
+                window
+                    .push_notification(Notification::info(SharedString::from(message.clone())), cx);
+                this.notices.push(Notice {
+                    severity: "Count".into(),
+                    message,
+                    code: None,
+                    detail: Some(one_line(&statement.sql)),
+                });
+                // The messages, after the results.
+                this.active_result = this.results.len();
+                this.show_results();
+                this.activity = Activity::Idle;
+                this.run = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    // Panels ------------------------------------------------------------------
+
+    /// Hides the results, or shows them again (DBeaver's
+    /// `toggle.result.panel`). The editor keeps the keyboard.
+    pub fn toggle_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panels = match self.panels {
+            Panels::Editor => Panels::Both,
+            Panels::Both | Panels::Results => Panels::Editor,
+        };
+        if self.panels == Panels::Editor {
+            self.focus_editor(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shows only the results, or both again (DBeaver's
+    /// `maximize.result.panel`).
+    pub fn maximize_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panels = match self.panels {
+            Panels::Results => Panels::Both,
+            Panels::Both | Panels::Editor => Panels::Results,
+        };
+        if self.panels == Panels::Results {
+            self.focus_results(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Gives the keyboard to the results when the editor has it, and back
+    /// (DBeaver's `switch.panel`); the side it goes to is shown.
+    pub fn switch_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .editor
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            if self.panels == Panels::Editor {
+                self.panels = Panels::Both;
+            }
+            self.focus_results(window, cx);
+        } else {
+            if self.panels == Panels::Results {
+                self.panels = Panels::Both;
+            }
+            self.focus_editor(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn focus_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.read(cx).focus_handle(cx);
+        window.defer(cx, move |window, cx| editor.focus(window, cx));
+    }
+
+    /// The grid on screen, or the results area.
+    fn focus_results(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self
+            .results
+            .get(self.active_result)
+            .and_then(ResultPane::grid)
+            .map_or_else(
+                || self.results_focus.clone(),
+                |grid| grid.read(cx).focus_handle(cx),
+            );
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+
+    /// Whether the results area has the keyboard; for tests.
+    #[cfg(test)]
+    pub fn results_focused(&self, window: &Window, cx: &App) -> bool {
+        self.results_focus.contains_focused(window, cx)
     }
 
     // Rendering ---------------------------------------------------------------
@@ -1971,7 +2697,7 @@ impl QueryTab {
             .collect();
         let (databases, schemas) = (self.databases.clone(), self.schemas.clone());
         let running = matches!(self.activity, Activity::Running { .. });
-        let waiting = self.run.is_some();
+        let waiting = self.run.is_some() || self.pending.is_some();
         let transaction = self
             .session
             .as_ref()
@@ -2251,7 +2977,10 @@ impl QueryTab {
         let theme = cx.theme();
         match &pane.outcome {
             // Striped by the grid itself (`Grid::render_tr`).
-            Outcome::Rows(grid) => DataTable::new(grid).xsmall().into_any_element(),
+            Outcome::Rows(grid) => DataTable::new(grid)
+                .xsmall()
+                .focus_ring(false)
+                .into_any_element(),
             Outcome::Done => div()
                 .id("result-done")
                 .test_support()
@@ -2411,19 +3140,46 @@ impl QueryTab {
         // The server's messages get a tab of their own after the results.
         let messages = !self.notices.is_empty();
         let tab_count = self.results.len() + usize::from(messages);
+        // While a run starts, its first result is not there yet: kept
+        // results stay in their tabs, and the area says it is running.
+        let starting =
+            (self.run.is_some() || self.pending.is_some()) && self.active_result >= tab_count;
         let active = self.active_result.min(tab_count.saturating_sub(1));
         let tabs = TabBar::new("results")
-            .selected_index(active)
+            .track_scroll(&self.results_scroll)
+            .when(!starting, |bar| bar.selected_index(active))
             .on_click(cx.listener(|this, index: &usize, _, cx| {
                 this.active_result = *index;
                 cx.notify();
             }))
             .children(self.results.iter().enumerate().map(|(index, pane)| {
-                Tab::new().label(SharedString::from(match &pane.outcome {
-                    Outcome::Failed(_) => format!("Error {}", index + 1),
-                    Outcome::Plan { .. } => format!("Plan {}", index + 1),
-                    _ => format!("Result {}", index + 1),
-                }))
+                let id = pane.id;
+                let statement = SharedString::from(pane.statement.clone());
+                Tab::new()
+                    .when(pane.pinned, |tab| {
+                        tab.prefix(Icon::new(Glyph::Bookmark).xsmall())
+                    })
+                    // A middle click closes the result, as in a browser.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_results(&[id], cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(("result-tab", index))
+                            .test_support()
+                            // Which statement it is the result of.
+                            .when(!statement.is_empty(), |this| {
+                                this.tooltip(move |window, cx| {
+                                    Tooltip::new(statement.clone()).build(window, cx)
+                                })
+                            })
+                            .context_menu(self.result_menu(id, cx))
+                            .child(SharedString::from(self.result_label(index))),
+                    )
             }))
             .children(messages.then(|| {
                 Tab::new().label(SharedString::from(format!(
@@ -2431,20 +3187,40 @@ impl QueryTab {
                     self.notices.len()
                 )))
             }));
-        let Some(pane) = self.results.get(active) else {
-            if messages {
+        let pane = (!starting).then(|| self.results.get(active)).flatten();
+        let Some(pane) = pane else {
+            if messages && !starting {
                 return v_flex()
                     .size_full()
                     .child(tabs)
                     .child(self.render_messages(cx));
             }
-            let text = match self.activity {
-                Activity::Running { .. } => "Running…",
-                Activity::Idle => "Run a statement to see its result here.",
+            let connecting = self.pending.and(self.target.as_ref()).map(|target| {
+                let name = self
+                    .connections
+                    .read(cx)
+                    .get(&target.connection)
+                    .map(|saved| saved.config.name.clone())
+                    .unwrap_or_default();
+                format!("Connecting to “{name}”… The statements run once it is open.")
+            });
+            let text = match (connecting, self.activity) {
+                (Some(connecting), _) => connecting,
+                (None, Activity::Running { .. }) => "Running…".to_string(),
+                (None, Activity::Idle) => "Run a statement to see its result here.".to_string(),
             };
             return v_flex()
                 .size_full()
-                .child(div().p_3().text_sm().text_color(muted).child(text));
+                .when(tab_count > 0, |this| this.child(tabs))
+                .child(
+                    div()
+                        .id("results-waiting")
+                        .test_support()
+                        .p_3()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(SharedString::from(text)),
+                );
         };
         // What the footer says about the result on screen.
         let (summary, has_more) = match &pane.outcome {
@@ -2600,7 +3376,27 @@ impl Focusable for QueryTab {
 }
 
 impl Render for QueryTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shows_results = !self.results.is_empty()
+            || !self.notices.is_empty()
+            || self.run.is_some()
+            || self.pending.is_some();
+        let panels = if shows_results {
+            self.panels
+        } else {
+            Panels::Editor
+        };
+        // The result on screen is scrolled into the tab bar's view.
+        let shown = self.results.get(self.active_result).map(|pane| pane.id);
+        if panels != Panels::Editor && shown.is_some() && self.revealed_result != shown {
+            self.results_scroll.scroll_to_item(self.active_result);
+            // Before the bar's first layout there is no width to scroll in.
+            if self.results_scroll.bounds().size.width > px(0.) {
+                self.revealed_result = shown;
+            } else {
+                window.request_animation_frame();
+            }
+        }
         // The editor's own menu is native and closed to tests: an empty one
         // keeps its cursor placement, and the drawn menu around it shows.
         let editor = div()
@@ -2615,55 +3411,46 @@ impl Render for QueryTab {
                     .appearance(false)
                     .context_menu(|menu, _, _| menu),
             );
-        let shows_results = !self.results.is_empty() || self.run.is_some();
+        let results = div()
+            .id("results")
+            .test_support()
+            .track_focus(&self.results_focus)
+            .size_full()
+            // With the grid focused: copy what is selected, select everything.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let keystroke = &event.keystroke;
+                if !keystroke.modifiers.secondary(cx) || keystroke.modifiers.shift {
+                    return;
+                }
+                match keystroke.key.as_str() {
+                    "c" => {
+                        if this.copy_selection(Some(CopyFormat::Tsv), cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "a" => {
+                        this.select_all_rows(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(self.render_results(cx));
         v_flex()
             .id("query-tab")
+            .key_context("QueryTab")
             .test_support()
             .size_full()
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().map(|area| {
-                if shows_results {
-                    area.child(
+                match panels {
+                    Panels::Editor => area.child(editor),
+                    Panels::Results => area.child(results),
+                    Panels::Both => area.child(
                         v_resizable("query-split")
                             .child(resizable_panel().child(editor))
-                            .child(
-                                resizable_panel().child(
-                                    div()
-                                        .id("results")
-                                        .size_full()
-                                        // With the grid focused: copy what is
-                                        // selected, select everything.
-                                        .on_key_down(cx.listener(
-                                            |this, event: &KeyDownEvent, _, cx| {
-                                                let keystroke = &event.keystroke;
-                                                if !keystroke.modifiers.secondary(cx)
-                                                    || keystroke.modifiers.shift
-                                                {
-                                                    return;
-                                                }
-                                                match keystroke.key.as_str() {
-                                                    "c" => {
-                                                        if this.copy_selection(
-                                                            Some(CopyFormat::Tsv),
-                                                            cx,
-                                                        ) {
-                                                            cx.stop_propagation();
-                                                        }
-                                                    }
-                                                    "a" => {
-                                                        this.select_all_rows(cx);
-                                                        cx.stop_propagation();
-                                                    }
-                                                    _ => {}
-                                                }
-                                            },
-                                        ))
-                                        .child(self.render_results(cx)),
-                                ),
-                            ),
-                    )
-                } else {
-                    area.child(editor)
+                            .child(resizable_panel().child(results)),
+                    ),
                 }
             }))
     }

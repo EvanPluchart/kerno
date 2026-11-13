@@ -131,6 +131,12 @@ pub enum TabAction {
     CopyText(String),
     AboutReadOnly,
     AboutMemoryOnly,
+    // A result tab of a query tab.
+    CloseToLeft,
+    Pin,
+    Unpin,
+    UnpinAll,
+    CopyStatement,
 }
 
 impl TabAction {
@@ -180,6 +186,11 @@ impl TabAction {
             Self::CopyText(_) => "Copy",
             Self::AboutReadOnly => "What read-only means…",
             Self::AboutMemoryOnly => "What this means…",
+            Self::CloseToLeft => "Close tabs to the left",
+            Self::Pin => "Pin tab",
+            Self::Unpin => "Unpin tab",
+            Self::UnpinAll => "Unpin all tabs",
+            Self::CopyStatement => "Copy statement",
         }
         .to_string()
     }
@@ -312,6 +323,61 @@ pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
         Item(TabAction::SaveQuery, empty),
     ]);
     entries
+}
+
+/// What the menu of a result tab depends on. The bulk closes leave pinned
+/// results alone, as DBeaver's do (`SQLEditor`, result tab menu); Close
+/// closes the tab it is on, pinned or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResultFacts {
+    pub pinned: bool,
+    /// Unpinned results before and after this one.
+    pub left: usize,
+    pub right: usize,
+    /// Pinned results, this one included.
+    pub pinned_count: usize,
+    /// The result came from a statement (not from a failed connection).
+    pub statement: bool,
+}
+
+/// The menu of a result tab.
+pub fn result_menu(facts: ResultFacts) -> Vec<Entry> {
+    let others = facts.left + facts.right;
+    vec![
+        enabled(TabAction::Close),
+        Item(
+            TabAction::CloseOthers,
+            (others == 0).then_some("no other unpinned result"),
+        ),
+        Item(
+            TabAction::CloseToLeft,
+            (facts.left == 0).then_some("none unpinned to the left"),
+        ),
+        Item(
+            TabAction::CloseToRight,
+            (facts.right == 0).then_some("none unpinned to the right"),
+        ),
+        Item(
+            TabAction::CloseAll,
+            (others == 0 && facts.pinned).then_some("all pinned"),
+        ),
+        Separator,
+        enabled(if facts.pinned {
+            TabAction::Unpin
+        } else {
+            TabAction::Pin
+        }),
+        Item(
+            TabAction::UnpinAll,
+            (facts.pinned_count == 0).then_some("none pinned"),
+        ),
+        enabled(TabAction::Rename),
+        Separator,
+        Item(
+            TabAction::CopyStatement,
+            (!facts.statement).then_some("no statement"),
+        ),
+    ]
 }
 
 /// An item of the status bar, left to right.
@@ -664,6 +730,58 @@ mod tests {
             ["Apply source… (running)", "—", "Run statement (running)"]
         );
         assert_eq!(busy[20], "Save (saved)");
+    }
+
+    #[test]
+    fn a_result_tab_closes_pins_and_names_as_in_dbeaver() {
+        // The middle one of three unpinned results.
+        let middle = ResultFacts {
+            left: 1,
+            right: 1,
+            statement: true,
+            ..ResultFacts::default()
+        };
+        assert_eq!(
+            labels(&result_menu(middle)),
+            [
+                "Close",
+                "Close others",
+                "Close tabs to the left",
+                "Close tabs to the right",
+                "Close all",
+                "—",
+                "Pin tab",
+                "Unpin all tabs (none pinned)",
+                "Rename…",
+                "—",
+                "Copy statement",
+            ]
+        );
+        // The only result, pinned: the bulk closes have nothing to close.
+        let alone = labels(&result_menu(ResultFacts {
+            pinned: true,
+            pinned_count: 1,
+            statement: true,
+            ..ResultFacts::default()
+        }));
+        assert_eq!(
+            alone[..7],
+            [
+                "Close",
+                "Close others (no other unpinned result)",
+                "Close tabs to the left (none unpinned to the left)",
+                "Close tabs to the right (none unpinned to the right)",
+                "Close all (all pinned)",
+                "—",
+                "Unpin tab",
+            ]
+        );
+        assert_eq!(alone[7], "Unpin all tabs");
+        // An unpinned result alone still closes with Close all; a refusal
+        // before anything ran has no statement to copy.
+        let refused = labels(&result_menu(ResultFacts::default()));
+        assert_eq!(refused[4], "Close all");
+        assert_eq!(refused[10], "Copy statement (no statement)");
     }
 
     #[test]

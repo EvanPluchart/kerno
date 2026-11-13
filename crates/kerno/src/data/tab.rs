@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -59,6 +60,9 @@ pub enum DataTabEvent {
     },
     /// Show the structure of this table.
     OpenStructure { table: TableRef, kind: RelationKind },
+    /// The table is gone from the server (dropped or renamed elsewhere):
+    /// the tree lists its schema's tables again.
+    TableGone { table: TableRef },
 }
 
 /// One line of the filter bar.
@@ -193,7 +197,7 @@ impl DataTab {
                     (State::Waiting, true) => this.reload(window, cx),
                     (State::Waiting, false) => {}
                     (_, false) => {
-                        this.session = None;
+                        this.close_session(cx);
                         this.state = State::Waiting;
                         cx.notify();
                     }
@@ -301,14 +305,21 @@ impl DataTab {
             }),
             transaction: TxState::Idle,
             running: self.state == State::Loading || self.applying,
+            // A failed read says nothing about rows: the error says it all.
             rows: self
                 .grid
                 .as_ref()
+                .filter(|_| !self.read_failed())
                 .map(|grid| grid.read(cx).delegate().total_rows()),
-            elapsed: self.elapsed,
+            elapsed: self.elapsed.filter(|_| !self.read_failed()),
             notices: 0,
             pending: self.pending_count(cx),
         }
+    }
+
+    /// The last read failed: its error is shown instead of rows.
+    fn read_failed(&self) -> bool {
+        matches!(self.state, State::Failed { .. })
     }
 
     /// Why the rows cannot be edited, in a few words, when they cannot.
@@ -355,12 +366,20 @@ impl DataTab {
         }
     }
 
+    /// Closes the tab's session now: the tab is closing, or its connection
+    /// closed. What is on screen stays.
+    pub fn close_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.take() {
+            bridge::spawn(cx, async move { session.close().await }).detach();
+        }
+    }
+
     /// Reads nothing until shown (a restored tab): see `reveal`.
     pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
         self.hidden = true;
         self.generation += 1;
         self.load = None;
-        self.session = None;
+        self.close_session(cx);
         self.state = State::Waiting;
         cx.notify();
     }
@@ -377,7 +396,7 @@ impl DataTab {
         self.generation += 1;
         let generation = self.generation;
         if self.hidden || !self.connected(cx) {
-            self.session = None;
+            self.close_session(cx);
             self.state = State::Waiting;
             cx.notify();
             return;
@@ -487,13 +506,19 @@ impl DataTab {
             return;
         }
         if error.is_disconnect() {
-            self.session = None;
+            self.close_session(cx);
         }
         self.counting = false;
+        let gone = table_gone(error);
         self.state = State::Failed {
             message: error.to_string(),
-            gone: table_gone(error),
+            gone,
         };
+        if gone {
+            cx.emit(DataTabEvent::TableGone {
+                table: self.table.clone(),
+            });
+        }
         cx.notify();
     }
 
@@ -1490,6 +1515,7 @@ impl DataTab {
             .when(editable, |bar| {
                 bar.child(
                     action("data-add-row", "Add row", "Add an empty row")
+                        .disabled(self.read_failed())
                         .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
                 )
                 .child(
@@ -1761,7 +1787,7 @@ impl DataTab {
         let loading = self.state == State::Loading;
         let range = match (&self.state, &self.grid) {
             (State::Loading, None) => "Loading rows…".to_string(),
-            (_, None) => String::new(),
+            (State::Failed { .. }, _) | (_, None) => String::new(),
             _ => self.range_text(cx),
         };
         h_flex()
@@ -1791,30 +1817,38 @@ impl DataTab {
             })
             .children(
                 self.elapsed
-                    .filter(|_| !loading)
+                    .filter(|_| !loading && !self.read_failed())
                     .map(|elapsed| SharedString::from(duration_text(elapsed))),
             )
             .child(div().flex_1())
-            .child(SharedString::from(format!(
-                "Page {}",
-                number((self.page + 1) as f64)
-            )))
-            .child(
-                Button::new("data-previous")
-                    .ghost()
-                    .xsmall()
-                    .label("Previous")
-                    .disabled(self.page == 0 || loading)
-                    .on_click(cx.listener(|this, _, window, cx| this.turn_page(-1, window, cx))),
-            )
-            .child(
-                Button::new("data-next")
-                    .ghost()
-                    .xsmall()
-                    .label("Next")
-                    .disabled(!self.has_next(cx) || loading)
-                    .on_click(cx.listener(|this, _, window, cx| this.turn_page(1, window, cx))),
-            )
+            // No pages to turn when the rows could not be read.
+            .when(!self.read_failed(), |footer| {
+                footer
+                    .child(SharedString::from(format!(
+                        "Page {}",
+                        number((self.page + 1) as f64)
+                    )))
+                    .child(
+                        Button::new("data-previous")
+                            .ghost()
+                            .xsmall()
+                            .label("Previous")
+                            .disabled(self.page == 0 || loading)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.turn_page(-1, window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("data-next")
+                            .ghost()
+                            .xsmall()
+                            .label("Next")
+                            .disabled(!self.has_next(cx) || loading)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.turn_page(1, window, cx)),
+                            ),
+                    )
+            })
     }
 
     /// A message in place of the rows, with what to do next.
@@ -1910,7 +1944,7 @@ impl DataTab {
                 div()
                     .size_full()
                     .relative()
-                    .child(DataTable::new(table).xsmall())
+                    .child(DataTable::new(table).xsmall().focus_ring(false))
                     .when(empty, |area| {
                         area.child(
                             div()

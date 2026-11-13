@@ -2,6 +2,7 @@
 //! indexes, constraints, foreign keys both ways, triggers and DDL, each in
 //! a sub-tab of its own. Nothing here changes the database.
 
+use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -291,13 +292,16 @@ impl StructureTab {
             // The session goes with the reading: it closes once read.
             let reading = cx.update(|_, cx| {
                 bridge::spawn(cx, async move {
-                    let structure = session.table_structure(&table).await?;
+                    let structure = session.table_structure(&table).await;
                     // The columns are worth showing when the DDL is not.
-                    let ddl = session
-                        .ddl(&object)
-                        .await
-                        .unwrap_or_else(|error| format!("-- The DDL could not be read: {error}\n"));
-                    Ok::<_, Error>((structure, ddl))
+                    let ddl = match structure {
+                        Ok(_) => session.ddl(&object).await.unwrap_or_else(|error| {
+                            format!("-- The DDL could not be read: {error}\n")
+                        }),
+                        Err(_) => String::new(),
+                    };
+                    session.close().await;
+                    Ok::<_, Error>((structure?, ddl))
                 })
             });
             let Ok(reading) = reading else {
@@ -708,7 +712,7 @@ impl StructureTab {
                             div()
                                 .flex_1()
                                 .min_h_0()
-                                .child(DataTable::new(grid).xsmall()),
+                                .child(DataTable::new(grid).xsmall().focus_ring(false)),
                         ),
                 )
             }))

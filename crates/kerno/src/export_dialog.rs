@@ -10,9 +10,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
@@ -31,6 +29,7 @@ use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::query::plan_view::number;
 use crate::tabs::Target;
+use crate::theme;
 
 /// What is exported.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,11 +435,9 @@ impl ExportDialog {
                 .gap_1()
                 .flex_wrap()
                 .children(Format::ALL.into_iter().enumerate().map(|(index, format)| {
-                    Button::new(("export-format", index))
+                    theme::chip(("export-format", index), self.format == format)
                         .small()
-                        .outline()
                         .label(format.label())
-                        .selected(self.format == format)
                         .on_click(cx.listener(move |this, _, _, cx| this.set_format(format, cx)))
                 }))
                 .into_any_element(),
@@ -449,9 +446,9 @@ impl ExportDialog {
             if self.format == Format::Csv {
                 rows.push(field(
                     "Delimiter",
-                    // Room for `\t` and a couple more characters.
+                    // As wide as the box below it: one column of inputs.
                     div()
-                        .w(px(96.))
+                        .w(px(160.))
                         .child(Input::new(&self.delimiter).small().id("export-delimiter"))
                         .into_any_element(),
                 ));
@@ -481,15 +478,18 @@ impl ExportDialog {
                             .into_iter()
                             .enumerate()
                             .map(|(index, (ending, label))| {
-                                Button::new(("export-line-ending", index))
-                                    .xsmall()
-                                    .outline()
-                                    .label(label)
-                                    .selected(self.line_ending == ending)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                theme::chip(
+                                    ("export-line-ending", index),
+                                    self.line_ending == ending,
+                                )
+                                .xsmall()
+                                .label(label)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.line_ending = ending;
                                         cx.notify();
-                                    }))
+                                    },
+                                ))
                             }),
                     )
                     .into_any_element(),
@@ -517,11 +517,9 @@ impl ExportDialog {
                         .into_iter()
                         .enumerate()
                         .map(|(index, (encoding, label))| {
-                            Button::new(("export-encoding", index))
+                            theme::chip(("export-encoding", index), self.encoding == encoding)
                                 .xsmall()
-                                .outline()
                                 .label(label)
-                                .selected(self.encoding == encoding)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.encoding = encoding;
                                     cx.notify();

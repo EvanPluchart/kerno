@@ -19,8 +19,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input as TextInput, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -44,6 +43,7 @@ use crate::connections::manager::{Connections, Status};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
+use crate::theme;
 
 /// Backing a database up, or restoring a file into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,11 +1211,9 @@ impl BackupDialog {
                     .gap_1()
                     .children(formats.iter().enumerate().map(|(index, (format, label))| {
                         let format = *format;
-                        Button::new(("backup-format", index))
+                        theme::chip(("backup-format", index), self.format == format)
                             .small()
-                            .outline()
                             .label(*label)
-                            .selected(self.format == format)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.format = format;
                                 cx.notify();
@@ -1233,11 +1231,9 @@ impl BackupDialog {
                             .into_iter()
                             .enumerate()
                             .map(|(index, (content, label))| {
-                                Button::new(("backup-content", index))
+                                theme::chip(("backup-content", index), self.content == content)
                                     .small()
-                                    .outline()
                                     .label(label)
-                                    .selected(self.content == content)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.content = content;
                                         cx.notify();

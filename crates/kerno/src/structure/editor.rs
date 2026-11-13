@@ -33,6 +33,7 @@ use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::query::tab::TabStatus;
 use crate::tabs::Target;
+use crate::theme;
 
 /// What a table editor tells the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,7 +353,7 @@ impl TableEditor {
             let reading = cx.update(|_, cx| {
                 bridge::spawn(cx, async move {
                     let structure = match &table {
-                        Some(table) => Some(session.table_structure(table).await?),
+                        Some(table) => Some(session.table_structure(table).await),
                         None => None,
                     };
                     // The form works without them.
@@ -368,7 +369,8 @@ impl TableEditor {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    Ok::<_, Error>((structure, tables))
+                    session.close().await;
+                    Ok::<_, Error>((structure.transpose()?, tables))
                 })
             });
             let Ok(reading) = reading else {
@@ -926,8 +928,14 @@ impl TableEditor {
                 }
             };
             let transactional = session.dialect().engine() == Engine::Postgres;
-            let running =
-                cx.update(|_, cx| bridge::spawn(cx, run_statements(session, statements.clone())));
+            let to_run = statements.clone();
+            let running = cx.update(|_, cx| {
+                bridge::spawn(cx, async move {
+                    let outcome = run_statements(session.clone(), to_run).await;
+                    session.close().await;
+                    outcome
+                })
+            });
             let Ok(running) = running else {
                 return;
             };
@@ -1153,6 +1161,15 @@ impl TableEditor {
             };
             h_flex()
                 .gap_1()
+                // Removing a row is the first thing on it, next to its name.
+                .child(
+                    Button::new(("column-remove", index))
+                        .ghost()
+                        .small()
+                        .icon(IconName::Close)
+                        .tooltip("Remove column")
+                        .on_click(cx.listener(move |this, _, _, cx| this.remove_column(index, cx))),
+                )
                 .when(creating, |line| {
                     line.child(
                         Button::new(("column-up", index))
@@ -1259,14 +1276,6 @@ impl TableEditor {
                             .id(("column-comment", index)),
                     ),
                 )
-                .child(
-                    Button::new(("column-remove", index))
-                        .ghost()
-                        .small()
-                        .icon(IconName::Close)
-                        .tooltip("Remove column")
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_column(index, cx))),
-                )
                 .children(note.map(|(text, warning)| {
                     div()
                         .id(("column-note", index))
@@ -1331,15 +1340,8 @@ impl TableEditor {
                     _ => name,
                 };
                 let (id, on_click) = (row.id, on_click.clone());
-                Button::new(format!("{prefix}-column-{position}"))
+                theme::chip(format!("{prefix}-column-{position}"), rank.is_some())
                     .xsmall()
-                    .map(|button| {
-                        if rank.is_some() {
-                            button.primary()
-                        } else {
-                            button.outline()
-                        }
-                    })
                     .label(SharedString::from(label))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         on_click(this, id, cx);
@@ -1357,6 +1359,19 @@ impl TableEditor {
                 h_flex()
                     .gap_1()
                     .items_start()
+                    .child(
+                        Button::new(("index-remove", index))
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip("Remove index")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if index < this.indexes.len() {
+                                    this.indexes.remove(index);
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .flex_none()
@@ -1384,19 +1399,6 @@ impl TableEditor {
                         },
                         cx,
                     )))
-                    .child(
-                        Button::new(("index-remove", index))
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .tooltip("Remove index")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if index < this.indexes.len() {
-                                    this.indexes.remove(index);
-                                }
-                                cx.notify();
-                            })),
-                    )
                     .into_any_element()
             })
             .collect();
@@ -1463,6 +1465,19 @@ impl TableEditor {
                         h_flex()
                             .gap_1()
                             .child(
+                                Button::new(("key-remove", index))
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Close)
+                                    .tooltip("Remove foreign key")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if index < this.keys.len() {
+                                            this.keys.remove(index);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
                                 div()
                                     .flex_none()
                                     .w(px(180.))
@@ -1491,19 +1506,6 @@ impl TableEditor {
                                         .small()
                                         .id(("key-referenced", index)),
                                 ),
-                            )
-                            .child(
-                                Button::new(("key-remove", index))
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::Close)
-                                    .tooltip("Remove foreign key")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if index < this.keys.len() {
-                                            this.keys.remove(index);
-                                        }
-                                        cx.notify();
-                                    })),
                             ),
                     )
                     .child(

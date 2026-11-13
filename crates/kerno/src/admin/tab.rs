@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -233,7 +234,7 @@ impl AdminTab {
             if connected {
                 this.read_section(window, cx);
             } else {
-                this.session = None;
+                this.close_session(cx);
                 cx.notify();
             }
         });
@@ -428,11 +429,19 @@ impl AdminTab {
         self.read(SECTIONS[self.section].1.to_vec(), window, cx);
     }
 
+    /// Closes the tab's session now: the tab is closing, or its connection
+    /// closed. What is on screen stays.
+    pub fn close_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.take() {
+            bridge::spawn(cx, async move { session.close().await }).detach();
+        }
+    }
+
     /// Reads nothing until shown (a restored tab): see `reveal`.
     pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
         self.hidden = true;
         self.job = None;
-        self.session = None;
+        self.close_session(cx);
         for pane in &mut self.panes {
             if pane.state == PaneState::Loading {
                 pane.state = PaneState::Idle;
@@ -453,7 +462,7 @@ impl AdminTab {
             return;
         }
         if !self.connected(cx) {
-            self.session = None;
+            self.close_session(cx);
             cx.notify();
             return;
         }
@@ -507,7 +516,7 @@ impl AdminTab {
 
     fn failed(&mut self, pane: Pane, error: &Error, cx: &mut Context<Self>) {
         if error.is_disconnect() {
-            self.session = None;
+            self.close_session(cx);
         }
         self.panes[pane as usize].state = PaneState::Failed(error.to_string());
         cx.notify();
@@ -1163,7 +1172,7 @@ impl AdminTab {
                     _ => div()
                         .size_full()
                         .relative()
-                        .child(DataTable::new(&view.grid).xsmall())
+                        .child(DataTable::new(&view.grid).xsmall().focus_ring(false))
                         .child(
                             div()
                                 .absolute()
@@ -1469,6 +1478,15 @@ impl AdminGrid {
             .unwrap_or_default()
     }
 
+    /// Whether a column of `columns` holds numbers, right-aligned. The
+    /// connection limit reads "no limit" more often than not: it stays with
+    /// its neighbours, on the left.
+    fn right_aligned(&self, source: usize) -> bool {
+        let column = &self.columns[source];
+        column.name != "connection_limit"
+            && (column.kind.is_numeric() || column.name.ends_with("_bytes"))
+    }
+
     /// What a cell shows, by a row of `rows` and a column on screen.
     fn text_of(&self, row: usize, column: usize) -> String {
         let source = self.shown[column];
@@ -1597,8 +1615,7 @@ impl TableDelegate for AdminGrid {
             .resizable(true)
             .movable(false)
             .sortable();
-        let numeric =
-            self.columns[source].kind.is_numeric() || self.columns[source].name.ends_with("_bytes");
+        let numeric = self.right_aligned(source);
         if numeric { column.text_right() } else { column }
     }
 
@@ -1661,8 +1678,7 @@ impl TableDelegate for AdminGrid {
         let text = self.text(row, column);
         let table = cx.entity();
         let source = self.shown[column];
-        let numeric =
-            self.columns[source].kind.is_numeric() || self.columns[source].name.ends_with("_bytes");
+        let numeric = self.right_aligned(source);
         // This tab's own session: a dot before its first cell (its words,
         // " · this tab", are the cell's label), never cutting the cell.
         h_flex()
@@ -1873,6 +1889,8 @@ mod tests {
         );
         assert_eq!(roles.text(0, 1), "no limit");
         assert_eq!(roles.text(1, 1), "10");
+        // Aligned with the role's other columns, not as a number.
+        assert!(!roles.right_aligned(1));
     }
 
     #[test]
