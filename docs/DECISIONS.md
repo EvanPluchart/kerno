@@ -851,3 +851,26 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **The Dock icon is set at every start**, inside `Kerno.app` too (setting it twice is harmless). The one
   `unsafe` call is in `crates/kerno/src/app_icon.rs`, as D-042 allowed; nothing else in the workspace uses
   `unsafe`. Linux: `app_id` / `WM_CLASS` `kerno`, `StartupWMClass` in the desktop entry, the X11 window icon.
+
+## D-048 — Update check and install: what was decided while building it
+
+- **The request.** `curl --disable --silent --head --max-time 10 --proto =https --max-redirs 0
+  --user-agent Kerno/<version> -- <releases/latest>`; `--disable` comes first so a `~/.curlrc` cannot add
+  headers, cookies or a proxy. Only a 302 to one of Kerno's own release tags naming a plain, strictly
+  newer `X.Y.Z` is an offer; every URL is built from constants and the three parsed numbers, never from
+  text the server sent. Downloads are capped (`--max-filesize`: 64 KiB for `SHA256SUMS`, 1 GiB for the
+  artifact) and restricted to HTTPS through redirects.
+- **Switches.** `KERNO_NO_UPDATE_CHECK` and `KERNO_BENCH` install no updater at all; the setting stops
+  the timed checks; "Check for Updates…" still asks when the setting is off (the user clicked it) but not
+  when the environment variable is set. Tests never build the real runner.
+- **Linux replaces the tarball's files one by one** (each by rename, the old one kept aside for the
+  rollback) instead of renaming the install folder: `bundle-linux.sh` installs into `~/.local`, and
+  renaming that would move the user's whole `~/.local`. A tarball holding a link, an absolute path or `..`
+  is refused before anything is extracted.
+- **macOS swaps the bundle by rename** after copying the new one beside it from the read-only mounted
+  image; any failure puts the old name back; the old bundle is deleted at the next start. An ad-hoc-signed
+  update changes the signature, so the keychain asks again for saved passwords (README).
+- **Before installing**, tabs and settings are written and the same question as disconnecting is asked;
+  declining keeps the verified download for the next click. A changed table form is not kept, as with Quit.
+- The setting lives in its own "Updates" section of the settings, with the line saying what is requested.
+- Not verifiable here: the real request and a real install (no repository, nothing published).
