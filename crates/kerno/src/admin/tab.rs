@@ -19,6 +19,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{
     Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableSelection, TableState,
@@ -38,7 +39,7 @@ use kerno_core::exec::Collected;
 use kerno_core::format::byte_size;
 use kerno_core::result::Column as ResultColumn;
 use kerno_core::sort::compare_cells;
-use kerno_core::{AdminView, Engine, Error, Session, TxState, exec};
+use kerno_core::{AdminView, Engine, Error, Session, TxState, TypeKind, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -186,6 +187,8 @@ pub struct AdminTab {
     connections: Entity<Connections>,
     target: Target,
     session: Option<Arc<dyn Session>>,
+    /// Restored and not shown yet: nothing is read, no session is open.
+    hidden: bool,
     /// The connection was open when last seen.
     was_connected: bool,
     /// One per pane, in `Pane::ALL` order.
@@ -290,6 +293,7 @@ impl AdminTab {
             connections,
             target,
             session: None,
+            hidden: false,
             was_connected: false,
             panes,
             filters,
@@ -424,7 +428,30 @@ impl AdminTab {
         self.read(SECTIONS[self.section].1.to_vec(), window, cx);
     }
 
+    /// Reads nothing until shown (a restored tab): see `reveal`.
+    pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
+        self.hidden = true;
+        self.job = None;
+        self.session = None;
+        for pane in &mut self.panes {
+            if pane.state == PaneState::Loading {
+                pane.state = PaneState::Idle;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The tab is on screen: a deferred tab reads its lists now.
+    pub fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.hidden) {
+            self.read_section(window, cx);
+        }
+    }
+
     fn read(&mut self, panes: Vec<Pane>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hidden {
+            return;
+        }
         if !self.connected(cx) {
             self.session = None;
             cx.notify();
@@ -1131,7 +1158,28 @@ impl AdminTab {
                         None,
                         cx,
                     ),
-                    _ => DataTable::new(&view.grid).xsmall().into_any_element(),
+                    // The lists are wider than the pane: the scrollbar stays
+                    // in view so the columns past the edge are not missed.
+                    _ => div()
+                        .size_full()
+                        .relative()
+                        .child(DataTable::new(&view.grid).xsmall())
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(Scrollbar::width())
+                                .child(
+                                    Scrollbar::horizontal(
+                                        &view.grid.read(cx).horizontal_scroll_handle,
+                                    )
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                                ),
+                        )
+                        .into_any_element(),
                 };
                 v_flex()
                     // Each table keeps its own element state.
@@ -1209,6 +1257,25 @@ fn select_in_place(
     let mut scroll = table.vertical_scroll_handle.0.borrow_mut();
     scroll.deferred_scroll_to_item = None;
     scroll.base_handle.set_offset(offset);
+}
+
+/// Width of the dot that marks this tab's own session, with its gap.
+const OWN_MARK_WIDTH: Pixels = px(10.);
+
+/// A time without its fraction of a second: `02:37:45.132677+00` is
+/// `02:37:45+00`.
+fn to_the_second(text: &str) -> String {
+    match text.find('.') {
+        // The fraction follows the seconds of `hh:mm:ss`.
+        Some(dot)
+            if text[..dot].contains(':') && text[..dot].ends_with(|c: char| c.is_ascii_digit()) =>
+        {
+            let rest = &text[dot + 1..];
+            let fraction = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            format!("{}{}", &text[..dot], &rest[fraction..])
+        }
+        _ => text.to_string(),
+    }
 }
 
 // Lists ---------------------------------------------------------------------------
@@ -1291,6 +1358,12 @@ impl AdminGrid {
                     px(longest.clamp(4, 60) as f32 * 7. + 24.)
                 })
                 .collect();
+            // Room for the dot that marks this tab's own session.
+            if self.own.is_some()
+                && let Some(first) = self.widths.first_mut()
+            {
+                *first += OWN_MARK_WIDTH;
+            }
         }
         self.recompute();
         changed
@@ -1399,17 +1472,26 @@ impl AdminGrid {
     /// What a cell shows, by a row of `rows` and a column on screen.
     fn text_of(&self, row: usize, column: usize) -> String {
         let source = self.shown[column];
+        let described = &self.columns[source];
         let Some(text) = self.rows[row][source].as_deref() else {
-            return String::new();
+            // The server sends no limit as NULL.
+            return if described.name == "connection_limit" {
+                "no limit".into()
+            } else {
+                String::new()
+            };
         };
-        if self.columns[source].name.ends_with("_bytes")
+        if described.name.ends_with("_bytes")
             && let Ok(bytes) = text.parse::<u64>()
         {
             return byte_size(bytes);
         }
-        kerno_core::format::display(Some(text.as_bytes()), &self.columns[source], 300)
-            .text
-            .into_owned()
+        let shown = kerno_core::format::display(Some(text.as_bytes()), described, 300).text;
+        // To the second on screen; the copy keeps the fraction.
+        match described.kind {
+            TypeKind::DateTime | TypeKind::DateTimeTz | TypeKind::Time => to_the_second(&shown),
+            _ => shown.into_owned(),
+        }
     }
 
     /// What a cell on screen shows.
@@ -1576,18 +1658,40 @@ impl TableDelegate for AdminGrid {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let own = column == 0 && self.is_own(row);
-        let text = self.label(row, column);
+        let text = self.text(row, column);
         let table = cx.entity();
-        div()
+        let source = self.shown[column];
+        let numeric =
+            self.columns[source].kind.is_numeric() || self.columns[source].name.ends_with("_bytes");
+        // This tab's own session: a dot before its first cell (its words,
+        // " · this tab", are the cell's label), never cutting the cell.
+        h_flex()
             .id((self.pane.cell_id(), (row << 12) | column))
             .test_support()
             .w_full()
-            .truncate()
-            .when(own, |cell| cell.font_semibold())
-            .when(self.raw(row, self.shown[column]).is_none(), |cell| {
-                cell.text_color(theme.muted_foreground)
+            .gap_1()
+            .when(numeric, |cell| cell.justify_end())
+            .when(own, |cell| {
+                cell.child(
+                    div()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(theme.primary),
+                )
             })
-            .child(SharedString::from(text))
+            // The text's style stays on the text: the menu, drawn inside the
+            // element that opens it, would inherit it.
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .when(own, |text| text.font_semibold())
+                    .when(self.raw(row, source).is_none(), |text| {
+                        text.text_color(theme.muted_foreground)
+                    })
+                    .child(SharedString::from(text)),
+            )
             // The table keeps a right click on a cell to itself: each cell
             // opens its own menu, built when it opens.
             .context_menu(move |menu, _, cx| Self::cell_menu(&table, row, column, menu, cx))
@@ -1628,7 +1732,6 @@ impl TableDelegate for AdminGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kerno_core::TypeKind;
 
     #[test]
     fn signals_are_refused_on_a_read_only_connection_and_to_this_tab() {
@@ -1712,6 +1815,64 @@ mod tests {
             sessions.find(&[Some("99".into()), Some("kerno".into())]),
             None
         );
+    }
+
+    #[test]
+    fn times_show_to_the_second_and_copy_in_full() {
+        assert_eq!(
+            to_the_second("2026-11-13 02:37:45.132677+00"),
+            "2026-11-13 02:37:45+00"
+        );
+        assert_eq!(to_the_second("02:37:45.5"), "02:37:45");
+        assert_eq!(to_the_second("2026-11-13 02:37:45"), "2026-11-13 02:37:45");
+        let sessions = grid(
+            Pane::Sessions,
+            &[
+                ("pid", TypeKind::Integer),
+                ("connected_at", TypeKind::DateTimeTz),
+                ("this_session", TypeKind::Boolean),
+            ],
+            &[&[
+                Some("129864"),
+                Some("2026-11-13 02:37:45.132677+00"),
+                Some("t"),
+            ]],
+        );
+        assert_eq!(sessions.text(0, 1), "2026-11-13 02:37:45+00");
+        // What a copy takes (`cell_text`): the server's text.
+        assert_eq!(
+            sessions.raw(0, sessions.shown[1]),
+            Some("2026-11-13 02:37:45.132677+00")
+        );
+    }
+
+    #[test]
+    fn the_own_session_mark_takes_room_of_its_own() {
+        let columns = [
+            ("pid", TypeKind::Integer),
+            ("this_session", TypeKind::Boolean),
+        ];
+        let row: &[Option<&str>] = &[Some("129864"), Some("t")];
+        let marked = grid(Pane::Sessions, &columns, &[row]);
+        let plain = grid(Pane::Sessions, &columns[..1], &[&row[..1]]);
+        // The pid keeps the width it needs; the dot has its own room.
+        assert_eq!(marked.widths[0], plain.widths[0] + OWN_MARK_WIDTH);
+        assert_eq!(marked.text(0, 0), "129864");
+        assert_eq!(marked.label(0, 0), "129864 · this tab");
+    }
+
+    #[test]
+    fn no_connection_limit_says_so() {
+        let roles = grid(
+            Pane::Roles,
+            &[
+                ("role", TypeKind::Text),
+                ("connection_limit", TypeKind::Integer),
+            ],
+            &[&[Some("kerno"), None], &[Some("app"), Some("10")]],
+        );
+        assert_eq!(roles.text(0, 1), "no limit");
+        assert_eq!(roles.text(1, 1), "10");
     }
 
     #[test]

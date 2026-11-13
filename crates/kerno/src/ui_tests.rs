@@ -49,6 +49,7 @@ struct Fixture {
 
 /// Starts the app's globals on an in-memory store and opens a workspace.
 fn open(cx: &mut TestAppContext, storage: Arc<Storage>) -> Fixture {
+    testing::exclusive_run();
     // Storage work runs on real threads; let the test clock wait for them.
     cx.executor().allow_parking();
     let data_dir = Arc::new(tempfile::tempdir().unwrap());
@@ -3084,17 +3085,21 @@ fn a_right_click_on_a_cell_opens_the_menu_of_its_row(cx: &mut TestAppContext) {
     for label in [
         "Copy",
         "Copy as",
-        "Copy column name",
         "Order by this column",
         "View value",
-        "Hide column",
+        "Column",
         "Export…",
     ] {
         assert!(menu_has(&app, cx, label), "{label}");
     }
     // A result has no edits and no server-side filter.
-    for label in ["Paste", "Edit cell", "Filter by this value"] {
+    for label in ["Paste", "Edit cell", "Filter by this value", "Row"] {
         assert!(!menu_has(&app, cx, label), "{label}");
+    }
+    // The column's entries are in its submenu.
+    click_menu_entry(&app, cx, "Column");
+    for label in ["Copy column name", "Hide column"] {
+        assert!(menu_has(&app, cx, label), "{label}");
     }
 }
 
@@ -3154,6 +3159,7 @@ fn the_menu_of_a_result_cell_acts_on_the_selection_or_on_its_cell(cx: &mut TestA
     click_menu_entry(&app, cx, "Copy");
     assert_eq!(clipboard(cx), "1\tv1\n2\tv2\n");
     app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Column");
     click_menu_entry(&app, cx, "Copy column name");
     assert_eq!(clipboard(cx), "n\nlabel");
     // Outside the selection, the right-click selects its cell.
@@ -3823,6 +3829,8 @@ fn statements_that_destroy_or_write_are_guarded(cx: &mut TestAppContext) {
     );
     let mut config = testing::config(Engine::MySql);
     config.environment = kerno_core::config::Environment::Production;
+    // Production tabs start in manual commit; this test is about confirming.
+    config.auto_commit = Some(true);
     let app = connected_as(cx, config);
     app.run_in_new_tab(
         cx,
@@ -8290,4 +8298,497 @@ fn the_empty_state_shows_the_mark_and_the_theme_carries_the_brand(cx: &mut TestA
     assert_eq!(label, gpui_kit::rgb(0x111111).into());
     app.click(cx, "empty-new-query");
     assert!(!app.has(cx, "brand-mark"));
+}
+
+// Connection settings (G13) --------------------------------------------------
+
+#[gpui_kit::test]
+fn a_production_connection_starts_its_tabs_in_manual_commit(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    use kerno_core::config::Environment::{Local, Production};
+    let storage = memory_storage();
+    let cases = [
+        (Production, None, true),
+        (Production, Some(true), false),
+        (Local, None, false),
+        (Local, Some(false), true),
+    ];
+    for (environment, auto_commit, _) in cases {
+        let config = ConnectionConfig {
+            environment,
+            auto_commit,
+            ..testing::config(Engine::Postgres)
+        };
+        storage.save_connection(None, &config).unwrap();
+    }
+    let ids: Vec<String> = storage
+        .connections()
+        .unwrap()
+        .into_iter()
+        .map(|saved| saved.id)
+        .collect();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &ids[0], &testing::secrets()).unwrap();
+
+    // Cmd+T on the connected production connection.
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    assert!(cx.update(|cx| tab.read(cx).manual_commit()));
+
+    // A tab of each connection starts in the connection's mode.
+    for (id, (environment, auto_commit, manual)) in ids.into_iter().zip(cases) {
+        let connections = app.connections.clone();
+        let tab = app.step(cx, |window, cx| {
+            cx.new(|cx| {
+                crate::query::tab::QueryTab::new(
+                    "t",
+                    "",
+                    Some(Target {
+                        connection: id,
+                        database: None,
+                        schema: None,
+                    }),
+                    connections,
+                    window,
+                    cx,
+                )
+            })
+        });
+        assert_eq!(
+            cx.update(|cx| tab.read(cx).manual_commit()),
+            manual,
+            "{environment:?} {auto_commit:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn bootstrap_statements_run_in_each_tab_and_a_failing_one_is_named(cx: &mut TestAppContext) {
+    let mut apps = Vec::new();
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (init_sql, query, expected) = match engine {
+            Engine::Postgres => (
+                "SET TIME ZONE 'Pacific/Auckland'",
+                "select current_setting('TimeZone') || ' ' || current_schema()",
+                "Pacific/Auckland shop",
+            ),
+            _ => (
+                "SET time_zone = '+05:30'",
+                "select @@session.time_zone",
+                "+05:30",
+            ),
+        };
+        let app = connected_as(
+            cx,
+            ConnectionConfig {
+                init_sql: vec![init_sql.into()],
+                default_schema: Some("shop".into()),
+                ..testing::config(engine)
+            },
+        );
+        app.run_in_new_tab(cx, query, "secondary-enter");
+        app.wait_until(cx, "the query", |app, cx| app.outcomes(cx) == ["1 rows"]);
+        assert_eq!(app.result(cx, 0, 1).1, [cells(&[expected])], "{engine:?}");
+        apps.push(app);
+
+        // A failing statement fails the connection, and says which one.
+        let storage = memory_storage();
+        let config = ConnectionConfig {
+            init_sql: vec![init_sql.into(), "SET kerno_ui_no_such = 1".into()],
+            ..testing::config(engine)
+        };
+        let id = storage.save_connection(None, &config).unwrap();
+        let app = open(cx, storage);
+        let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+        kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+        app.step(cx, |window, cx| {
+            window.double_click(("connection", 0usize), cx)
+        });
+        app.wait_until(cx, "the failure", |app, cx| {
+            matches!(app.status(cx, 0), Status::Failed { .. })
+        });
+        let Status::Failed { message } = app.status(cx, 0) else {
+            unreachable!()
+        };
+        assert!(
+            message.contains("bootstrap statement 2 failed: SET kerno_ui_no_such = 1"),
+            "{engine:?}: {message}"
+        );
+        assert!(!message.contains(testing::DB_PASSWORD), "{message}");
+        apps.push(app);
+    }
+}
+
+#[gpui_kit::test]
+fn the_connection_dialog_keeps_the_commit_mode_and_the_bootstrap(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let config = ConnectionConfig {
+        name: "Boot".into(),
+        auto_commit: Some(false),
+        default_schema: Some("shop".into()),
+        init_sql: vec![
+            "SET TIME ZONE 'UTC'".into(),
+            "SET application_name = 'a;b'".into(),
+        ],
+        ignore_init_errors: true,
+        ..testing::config(Engine::Postgres)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Edit);
+    app.wait_until(cx, "the connection dialog", |app, cx| {
+        app.has(cx, "conn-name")
+    });
+    app.click(cx, "conn-name");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "Booted");
+    app.click(cx, "conn-save");
+    app.wait_until(cx, "the change to be stored", |app, _| {
+        app.first_stored().name == "Booted"
+    });
+    assert_eq!(
+        app.first_stored(),
+        ConnectionConfig {
+            name: "Booted".into(),
+            ..config
+        }
+    );
+}
+
+#[gpui_kit::test]
+fn a_refused_bootstrap_statement_is_shown_in_the_advanced_section(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    // Stored by an older build or by hand: the dialog refuses to save it.
+    let config = ConnectionConfig {
+        init_sql: vec![
+            "SET TIME ZONE 'UTC'".into(),
+            "DELETE FROM shop.orders".into(),
+        ],
+        ..testing::config(Engine::Postgres)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Edit);
+    app.wait_until(cx, "the connection dialog", |app, cx| {
+        app.has(cx, "conn-name")
+    });
+    assert!(
+        !app.has(cx, "conn-default-schema"),
+        "the General section is shown"
+    );
+    app.click(cx, "conn-save");
+    // The dialog stays, on the Advanced section, with the error.
+    assert!(app.has(cx, "conn-save"));
+    assert!(app.has(cx, "conn-default-schema") && app.has(cx, "conn-field-error"));
+    assert_eq!(app.first_stored(), config);
+}
+
+// Real-app pass of 2026-11-13 (docs/plans/M10.md, Part 4) ------------------------
+
+/// The sessions the server has for `role`.
+fn sessions_of(role: &str) -> usize {
+    on_server(
+        Engine::Postgres,
+        &format!("SELECT count(*) FROM pg_stat_activity WHERE usename = '{role}'"),
+    )
+    .parse()
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn restored_tabs_open_a_session_once_shown_and_structure_tabs_close_theirs(
+    cx: &mut TestAppContext,
+) {
+    // A role of its own: the sessions counted are this test's only.
+    const ROLE: &str = "kerno_ui_sessions";
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE usename = 'kerno_ui_sessions'",
+            "DROP SCHEMA IF EXISTS kerno_ui_sessions CASCADE",
+            "DROP ROLE IF EXISTS kerno_ui_sessions",
+        ],
+        &[
+            "CREATE ROLE kerno_ui_sessions LOGIN PASSWORD 'kerno_ui_sessions_pw'",
+            "CREATE SCHEMA kerno_ui_sessions AUTHORIZATION kerno_ui_sessions",
+            "CREATE TABLE kerno_ui_sessions.items (id INT PRIMARY KEY, name TEXT)",
+            "ALTER TABLE kerno_ui_sessions.items OWNER TO kerno_ui_sessions",
+            "INSERT INTO kerno_ui_sessions.items VALUES (1, 'a'), (2, 'b')",
+        ],
+    );
+    let storage = memory_storage();
+    let config = ConnectionConfig {
+        user: ROLE.into(),
+        ..testing::config(Engine::Postgres)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let target = Target {
+        connection: id.clone(),
+        database: None,
+        schema: None,
+    };
+    let (schema, table) = (ROLE.to_string(), "items".to_string());
+    storage
+        .save_tabs(&[
+            TabSnapshot::Query {
+                title: "Query 1".into(),
+                sql: "select 1".into(),
+                target: Some(target.clone()),
+                file: None,
+                unsaved: false,
+                source: None,
+            },
+            TabSnapshot::Data {
+                target: target.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                view: false,
+            },
+            TabSnapshot::Structure {
+                target: target.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                view: false,
+                materialized: false,
+            },
+            TabSnapshot::Admin {
+                target: target.clone(),
+            },
+        ])
+        .unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    let password = Secrets {
+        password: Some(Secret::new("kerno_ui_sessions_pw")),
+        ..Secrets::default()
+    };
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &password).unwrap();
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    // The schema tree reads on the connection's own session meanwhile.
+    app.wait_until(cx, "the schemas", |app, cx| {
+        app.tree(cx).contains(&row(1, ROLE))
+    });
+    // The connection holds one session; the tabs behind the query tab
+    // (which opens its own on its first run) hold none.
+    app.step(cx, |_, _| ());
+    let connection = sessions_of(ROLE);
+    assert_eq!(connection, 1);
+    // Nor have they read anything.
+    let (data, structure, admin) = cx.update(|cx| {
+        let workspace = app.workspace.read(cx);
+        (
+            workspace.data_tab_at(1).unwrap(),
+            workspace.structure_tab_at(2).unwrap(),
+            workspace.admin_tab_at(3).unwrap(),
+        )
+    });
+    cx.update(|cx| {
+        assert_eq!(data.read(cx).state(cx), "waiting");
+        assert_eq!(structure.read(cx).state(), "waiting");
+        assert_eq!(admin.read(cx).reads(), 0);
+    });
+
+    // Shown, the data tab reads its rows and keeps its session.
+    app.press(cx, &["ctrl-tab"]);
+    app.wait_for_rows(cx, "Rows 1–2 of 2");
+    app.wait_until(cx, "the data tab's session", |_, _| {
+        sessions_of(ROLE) == connection + 1
+    });
+    // The structure tab reads its table, then closes its session.
+    app.press(cx, &["ctrl-tab"]);
+    app.wait_for_structure(cx);
+    app.wait_until(cx, "the structure tab's session to close", |_, _| {
+        sessions_of(ROLE) == connection + 1
+    });
+    // So does the table form, opened from it.
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_table_editor(
+                target.clone(),
+                schema.clone(),
+                Some(TableRef::new(schema.clone(), table.clone())),
+                window,
+                cx,
+            )
+        });
+    });
+    app.wait_for_editor(cx);
+    app.wait_until(cx, "the table form's session to close", |_, _| {
+        sessions_of(ROLE) == connection + 1
+    });
+    // The administration tab, just before the form, keeps one.
+    app.press(cx, &["ctrl-shift-tab"]);
+    app.wait_admin(cx, Pane::Sessions);
+    app.wait_until(cx, "the administration tab's session", |_, _| {
+        sessions_of(ROLE) == connection + 2
+    });
+    // Its times show to the second.
+    let (headers, rows) = app.admin_shown(cx, Pane::Sessions);
+    let connected_at = headers.iter().position(|header| header == "Connected at");
+    let connected_at = &rows[0][connected_at.expect("a Connected at column")];
+    assert!(
+        !connected_at.contains('.'),
+        "{connected_at:?} shows a fraction of a second"
+    );
+    drop(app);
+}
+
+#[gpui_kit::test]
+fn the_tab_strip_keeps_the_active_tab_in_view(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    for _ in 0..15 {
+        app.press(cx, &["secondary-t"]);
+    }
+    let in_view = |app: &Fixture, cx: &mut TestAppContext| {
+        // The frames that scroll the strip: a strip never laid out yet
+        // scrolls on its second frame (the app asks for it at once).
+        app.step(cx, |_, _| ());
+        app.step(cx, |_, _| ());
+        cx.update(|cx| app.workspace.read(cx).active_tab_in_view())
+    };
+    // A new tab, at the far end of a strip that overflows.
+    assert_eq!(app.active(cx), Some(14));
+    assert_eq!(in_view(&app, cx), (true, true));
+    // Activated by key, from one end to the other.
+    app.press(cx, &["ctrl-tab"]);
+    assert_eq!(app.active(cx), Some(0));
+    assert_eq!(in_view(&app, cx), (true, true));
+    app.press(cx, &["ctrl-shift-tab"]);
+    assert_eq!(app.active(cx), Some(14));
+    assert_eq!(in_view(&app, cx), (true, true));
+
+    // Restored, the active tab is in view from the first frame.
+    let storage = memory_storage();
+    let tabs: Vec<TabSnapshot> = (1..=15)
+        .map(|number| TabSnapshot::Query {
+            title: format!("Query {number}"),
+            sql: String::new(),
+            target: None,
+            file: None,
+            unsaved: false,
+            source: None,
+        })
+        .collect();
+    storage.save_tabs(&tabs).unwrap();
+    storage
+        .set_setting(crate::state::ACTIVE_TAB_KEY, &12usize)
+        .unwrap();
+    let restored = open(cx, storage);
+    assert_eq!(restored.active(cx), Some(12));
+    assert_eq!(in_view(&restored, cx), (true, true));
+}
+
+#[gpui_kit::test]
+fn a_table_dropped_under_its_data_tab_says_so_and_offers_to_close_it(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_dropped";
+        let (drop_schema, create_schema) = scratch_schema(engine, schema);
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                &scratch_table(engine, &format!("{schema}.items"), "name VARCHAR(10)"),
+                &format!("INSERT INTO {schema}.items (name) VALUES ('a')"),
+            ],
+        );
+        let app = connected(cx, engine);
+        app.open_table(cx, schema, "items", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        on_server(engine, &format!("DROP TABLE {schema}.items"));
+        app.click(cx, "data-refresh");
+        app.wait_until(cx, "the failure", |app, cx| {
+            app.data_state(cx).starts_with("failed")
+        });
+        let advice = cx.update(|cx| {
+            app.workspace
+                .read(cx)
+                .active_data_tab()
+                .unwrap()
+                .read(cx)
+                .advice()
+        });
+        assert!(
+            advice.ends_with(". The table may have been dropped or renamed."),
+            "{engine:?}: {advice}"
+        );
+        assert!(app.has(cx, "data-retry"), "{engine:?}");
+        app.click(cx, "data-close-tab");
+        assert!(app.titles(cx).is_empty(), "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_cell_menu_taller_than_the_window_scrolls_inside_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = filter_scratch(Engine::Postgres, "kerno_ui_menu_fits");
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_menu_fits", "items", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–4 of 4");
+    // A short window: the data cell's menu is taller than it.
+    let height = px(360.);
+    cx.simulate_window_resize(app.window.into(), size(px(1200.), height));
+    app.right_click(cx, "table-cell-3:2", None);
+    let menu = app.step(cx, |window, _| window.find("popup-menu").bounds());
+    assert!(
+        menu.top() >= px(0.) && menu.bottom() <= height,
+        "{menu:?} in a window {height:?} tall"
+    );
+    // The entries past the bottom are reached by scrolling, and the row's
+    // and the column's are in their submenus.
+    assert!(menu_entry(&app, cx, "Copy").is_some());
+    click_menu_entry(&app, cx, "Copy as");
+    assert!(menu_entry(&app, cx, "JSON").is_some());
+}
+
+#[gpui_kit::test]
+fn the_status_bar_menus_open_inside_the_window(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let inside = |app: &Fixture, cx: &mut TestAppContext, how: &str| {
+        let menu = app.step(cx, |window, _| window.find("popup-menu").bounds());
+        assert!(
+            menu.left() >= px(0.)
+                && menu.right() <= px(1200.)
+                && menu.top() >= px(0.)
+                && menu.bottom() <= px(800.),
+            "{how}: {menu:?}"
+        );
+    };
+    // A click on the connection opens its menu above the bar; so does a
+    // right-click.
+    app.click(cx, "status-connection-button");
+    inside(&app, cx, "click");
+    app.press(cx, &["escape"]);
+    app.right_click(cx, "status-connection", None);
+    inside(&app, cx, "right-click");
 }

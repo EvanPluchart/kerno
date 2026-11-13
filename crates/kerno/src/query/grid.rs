@@ -267,9 +267,10 @@ fn order_menu(column: &HeaderFacts) -> Entry {
 }
 
 /// The menu of a cell, in DBeaver's order: copy and paste, filters, order,
-/// foreign keys, the value and its edits, the row, the columns, export.
-/// What a query result never has is left out; what this cell does not
-/// allow is there, with the reason.
+/// foreign keys, the value and its edits, the row, the column, export. The
+/// row's and the column's entries sit in submenus so the menu fits a
+/// window. What a query result never has is left out; what this cell does
+/// not allow is there, with the reason.
 pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
     use GridAction as A;
     let read_only = facts.read_only;
@@ -284,11 +285,7 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
         .into_iter()
         .map(|format| enabled(A::CopyAs(format)))
         .collect();
-    let mut entries = vec![
-        enabled(A::Copy),
-        Entry::Submenu("Copy as", copy_as),
-        enabled(A::CopyColumnName),
-    ];
+    let mut entries = vec![enabled(A::Copy), Entry::Submenu("Copy as", copy_as)];
     if facts.data {
         let paste = read_only
             .or((!facts.clipboard).then_some("clipboard empty"))
@@ -347,21 +344,32 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
                 takes_value.or(this_cell((!facts.nullable).then_some("NOT NULL"))),
             ),
             item(A::SetDefault, takes_value),
-            item(A::CopyFromRow(true), takes_value),
-            item(A::CopyFromRow(false), takes_value),
             Entry::Separator,
-            item(A::DuplicateRow, read_only),
-            item(A::DeleteRow, read_only.or(deleted)),
-            item(A::RevertRow, read_only.or(revert)),
+            Entry::Submenu(
+                "Row",
+                vec![
+                    item(A::DuplicateRow, read_only),
+                    item(A::DeleteRow, read_only.or(deleted)),
+                    item(A::RevertRow, read_only.or(revert)),
+                    item(A::CopyFromRow(true), takes_value),
+                    item(A::CopyFromRow(false), takes_value),
+                ],
+            ),
         ]);
     }
     entries.extend([
         Entry::Separator,
-        enabled(A::Pin(facts.column.pinned)),
-        enabled(A::HideColumn),
-        item(
-            A::ShowAll(facts.column.hidden),
-            (facts.column.hidden == 0).then_some("none hidden"),
+        Entry::Submenu(
+            "Column",
+            vec![
+                enabled(A::CopyColumnName),
+                enabled(A::Pin(facts.column.pinned)),
+                enabled(A::HideColumn),
+                item(
+                    A::ShowAll(facts.column.hidden),
+                    (facts.column.hidden == 0).then_some("none hidden"),
+                ),
+            ],
         ),
         Entry::Separator,
         item(A::Export, facts.export),
@@ -1298,7 +1306,8 @@ impl Grid {
             cell_menu(&table.delegate().cell_facts(row, column, many, clipboard))
         });
         let pick = Self::pick(table, Some(row), column, cx);
-        fill_menu(menu, &entries, &pick, window, cx)
+        let menu = fill_menu(menu, &entries, &pick, window, cx);
+        crate::tabs::fit_window(menu, window)
     }
 
     /// Opens the menu of a column header.
@@ -1311,7 +1320,8 @@ impl Grid {
     ) -> PopupMenu {
         let entries = header_menu(&table.read(cx).delegate().header_facts(column));
         let pick = Self::pick(table, None, column, cx);
-        fill_menu(menu, &entries, &pick, window, cx)
+        let menu = fill_menu(menu, &entries, &pick, window, cx);
+        crate::tabs::fit_window(menu, window)
     }
 
     /// What runs an entry of the menu of a cell (`row`) or of a header.
@@ -1660,6 +1670,9 @@ impl TableDelegate for Grid {
         match self.pending() {
             Some(pending) if pending.is_new(fetched, row) => tr.bg(theme.success.opacity(0.22)),
             Some(pending) if pending.is_deleted(row) => tr.bg(theme.danger.opacity(0.18)),
+            // A result is striped here, not by the table: the table's own
+            // stripes fill the pane below the last row with empty rows.
+            _ if self.table.is_none() && row % 2 == 1 => tr.bg(theme.table_even),
             _ => tr,
         }
     }
@@ -1742,7 +1755,6 @@ impl TableDelegate for Grid {
             MAX_CELL_CHARS,
         );
         let table = cx.entity();
-        let cell = cell.id(("cell", (row << 12) | column));
         let text = if pending == Some(&CellValue::Default) {
             // The server gives the value when the row is written.
             SharedString::from("default")
@@ -1751,7 +1763,7 @@ impl TableDelegate for Grid {
         } else {
             SharedString::from(shown.text.into_owned())
         };
-        cell
+        let text = cell
             // NULL is not the empty string: it is drawn apart.
             .when(
                 shown.style == CellStyle::Null || pending == Some(&CellValue::Default),
@@ -1761,12 +1773,19 @@ impl TableDelegate for Grid {
                 matches!(shown.style, CellStyle::Boolean | CellStyle::Binary),
                 |cell| cell.text_color(theme.muted_foreground),
             )
+            .when(mark == Mark::Deleted, |cell| {
+                cell.line_through().text_color(theme.muted_foreground)
+            })
+            .child(text);
+        // The text's style stays on the text: the menu, drawn inside the
+        // element that opens it, would inherit it.
+        div()
+            .id(("cell", (row << 12) | column))
+            .w_full()
             // What is not on the server yet shows (a new or deleted row is
             // tinted as a whole, by `render_tr`).
-            .map(|cell| match mark {
-                Mark::Fetched | Mark::New => cell,
-                Mark::Edited => cell.bg(theme.warning.opacity(0.22)),
-                Mark::Deleted => cell.line_through().text_color(theme.muted_foreground),
+            .when(mark == Mark::Edited, |cell| {
+                cell.bg(theme.warning.opacity(0.22))
             })
             .when(self.in_range(row, column), |cell| cell.bg(theme.selection))
             // Shift and click stretches the selection to this cell; a plain
@@ -1823,6 +1842,17 @@ mod tests {
             .collect()
     }
 
+    /// The labels of a menu with those of its submenus, for `contains`.
+    fn flat(entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .flat_map(|entry| match entry {
+                Entry::Submenu(_, items) => flat(items),
+                entry => labels(std::slice::from_ref(entry)),
+            })
+            .collect()
+    }
+
     fn column() -> HeaderFacts {
         HeaderFacts {
             data: false,
@@ -1866,6 +1896,8 @@ mod tests {
 
     const COPY_AS: &str = "Copy as ▸ With column names | CSV | JSON | Markdown | SQL INSERT";
     const ORDER: &str = "Order by this column ▸ Ascending | Descending | Clear order (not ordered)";
+    const COLUMN: &str = "Column ▸ Copy column name | Pin column | Hide column | \
+                          Show all columns (none hidden)";
 
     #[test]
     fn a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters() {
@@ -1874,17 +1906,14 @@ mod tests {
             [
                 "Copy",
                 COPY_AS,
-                "Copy column name",
                 "—",
                 ORDER,
                 "—",
                 "View value",
                 "—",
-                "Pin column",
-                "Hide column",
-                "Show all columns (none hidden)",
+                COLUMN,
                 "—",
-                "Export…",
+                "Export…"
             ]
         );
         // Ordered descending, with a column hidden, a statement that writes.
@@ -1902,6 +1931,7 @@ mod tests {
         assert!(menu.contains(
             &"Order by this column ▸ Ascending | ✓ Descending | Clear order".to_string()
         ));
+        let menu = flat(&cell_menu(&facts));
         assert!(menu.contains(&"Unpin column".to_string()));
         assert!(menu.contains(&"Show all columns (2 hidden)".to_string()));
         assert!(menu.contains(&"Export… (the statement writes)".to_string()));
@@ -1924,6 +1954,8 @@ mod tests {
 
     #[test]
     fn a_data_cell_adds_paste_filters_edits_and_the_row_in_dbeavers_order() {
+        // The plan's grouping (docs/plans/M10.md, Part 4): the row's and the
+        // column's entries in submenus, so the menu fits an 800-point window.
         let facts = CellFacts {
             related: vec!["Go to customers (customer_id = 7)".into()],
             ..data_cell()
@@ -1936,7 +1968,6 @@ mod tests {
             [
                 "Copy",
                 COPY_AS,
-                "Copy column name",
                 "Paste",
                 "—",
                 "Filter by this value",
@@ -1944,7 +1975,7 @@ mod tests {
                 filter,
                 "Clear filters (no filter)",
                 "—",
-                "Order by this column ▸ Ascending | Descending | Clear order (not ordered)",
+                ORDER,
                 "—",
                 "Go to customers (customer_id = 7)",
                 "—",
@@ -1952,16 +1983,11 @@ mod tests {
                 "Edit cell",
                 "Set NULL",
                 "Set default",
-                "Copy from row above",
-                "Copy from row below",
                 "—",
-                "Duplicate row",
-                "Delete row",
-                "Revert row (no change)",
+                "Row ▸ Duplicate row | Delete row | Revert row (no change) | \
+                 Copy from row above | Copy from row below",
                 "—",
-                "Pin column",
-                "Hide column",
-                "Show all columns (none hidden)",
+                COLUMN,
                 "—",
                 "Export…",
             ]
@@ -1970,7 +1996,7 @@ mod tests {
 
     #[test]
     fn what_a_cell_does_not_allow_is_disabled_with_the_reason() {
-        let menu = |facts: CellFacts| labels(&cell_menu(&facts));
+        let menu = |facts: CellFacts| flat(&cell_menu(&facts));
         // A read-only table (or a view): every change says why.
         let view = menu(CellFacts {
             read_only: Some("view"),
@@ -1997,10 +2023,7 @@ mod tests {
             ..data_cell()
         });
         assert!(null.contains(&"Exclude this value".to_string()));
-        assert!(
-            null.iter()
-                .any(|entry| entry.starts_with("Filter ▸ > this value… (NULL value)"))
-        );
+        assert!(null.contains(&"> this value… (NULL value)".to_string()));
 
         // A binary cell: no value filter, no typing, but NULL is fine.
         let binary = menu(CellFacts {

@@ -23,8 +23,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, BorrowAppContext as _, ClipboardItem,
     Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
+    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
@@ -132,6 +132,28 @@ impl OpenTab {
         match self {
             OpenTab::TableEditor(tab) => Some(tab),
             _ => None,
+        }
+    }
+
+    /// A restored tab reads nothing, and opens no session, until it is
+    /// shown.
+    fn defer_until_shown(&self, cx: &mut App) {
+        match self {
+            OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            // A query tab opens its session on its first run.
+            OpenTab::Query(_) | OpenTab::TableEditor(_) => {}
+        }
+    }
+
+    /// The tab is on screen: a deferred one reads what it shows.
+    fn reveal(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::Query(_) | OpenTab::TableEditor(_) => {}
         }
     }
 
@@ -299,6 +321,10 @@ pub struct Workspace {
     /// The active tab, written on each frame: an administration tab
     /// refreshes on its own only while it is the one shown.
     shown_tab: Rc<Cell<Option<EntityId>>>,
+    /// The scroll of the tab strip.
+    tab_scroll: ScrollHandle,
+    /// The active tab and the tab count the strip last scrolled for.
+    revealed_tab: Option<(usize, usize)>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -347,6 +373,8 @@ impl Workspace {
             pending_editor: None,
             tab_target,
             shown_tab: Rc::new(Cell::new(None)),
+            tab_scroll: ScrollHandle::new(),
+            revealed_tab: None,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -358,6 +386,9 @@ impl Workspace {
         };
         for snapshot in tabs {
             workspace.push_snapshot(snapshot, window, cx);
+            if let Some(tab) = workspace.tabs.last() {
+                tab.defer_until_shown(cx);
+            }
         }
         // The tab that was active is active again.
         workspace.active_tab = active_tab.min(workspace.tabs.len().saturating_sub(1));
@@ -444,6 +475,38 @@ impl Workspace {
             .iter()
             .map(|tab| tab.label(cx).to_string())
             .collect()
+    }
+
+    /// The tab at `index`, when it shows a table's structure; for tests.
+    #[cfg(test)]
+    pub fn structure_tab_at(&self, index: usize) -> Option<Entity<StructureTab>> {
+        self.tabs.get(index)?.structure().cloned()
+    }
+
+    /// The tab at `index`, when it shows a table's data; for tests.
+    #[cfg(test)]
+    pub fn data_tab_at(&self, index: usize) -> Option<Entity<DataTab>> {
+        self.tabs.get(index)?.data().cloned()
+    }
+
+    /// The tab at `index`, when it administers a server; for tests.
+    #[cfg(test)]
+    pub fn admin_tab_at(&self, index: usize) -> Option<Entity<AdminTab>> {
+        self.tabs.get(index)?.admin().cloned()
+    }
+
+    /// Whether the active tab is wholly inside the tab strip, and whether
+    /// the strip overflows; for tests.
+    #[cfg(test)]
+    pub fn active_tab_in_view(&self) -> (bool, bool) {
+        let strip = &self.tab_scroll;
+        let (viewport, offset) = (strip.bounds(), strip.offset().x);
+        // Item bounds are laid out unscrolled: on screen at x + offset.
+        let inside = strip.bounds_for_item(self.active_tab).is_some_and(|tab| {
+            tab.left() + offset >= viewport.left() - px(1.)
+                && tab.right() + offset <= viewport.right() + px(1.)
+        });
+        (inside, strip.max_offset().x > px(0.))
     }
 
     /// Index of the active tab, when there is one.
@@ -793,6 +856,7 @@ impl Workspace {
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(index) {
             self.active_tab = index;
+            tab.reveal(window, cx);
             tab.focus_handle(cx).focus(window, cx);
             self.schedule_save(cx);
             cx.notify();
@@ -932,14 +996,14 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let workspace = cx.entity();
-        move |menu, _, cx| {
+        move |menu, window, cx| {
             let entries = workspace.read(cx).menu_entries(of, cx);
             let workspace = workspace.clone();
             let index = match of {
                 MenuOf::Tab(index) => Some(index),
                 _ => None,
             };
-            tabs::fill_menu(
+            let menu = tabs::fill_menu(
                 menu,
                 entries,
                 Rc::new(move |action, window, cx| {
@@ -957,7 +1021,8 @@ impl Workspace {
                         })
                     });
                 }),
-            )
+            );
+            tabs::fit_window(menu, window)
         }
     }
 
@@ -2628,6 +2693,7 @@ impl Workspace {
         }
 
         let tab_bar = TabBar::new("tabs")
+            .track_scroll(&self.tab_scroll)
             .selected_index(self.active_tab)
             .on_click(
                 cx.listener(|this, index: &usize, window, cx| {
@@ -2883,7 +2949,24 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.reveal(window, cx);
+        }
+        // The active tab is scrolled into view whenever it or the tabs
+        // change (a tab opened, restored, closed or activated by key); a
+        // scroll of the strip by hand is left alone until then.
+        let shown = (self.active_tab, self.tabs.len());
+        if self.revealed_tab != Some(shown) {
+            self.tab_scroll.scroll_to_item(self.active_tab);
+            // Before the strip's first layout there is no width to scroll
+            // in: again on the next frame.
+            if self.tab_scroll.bounds().size.width > px(0.) {
+                self.revealed_tab = Some(shown);
+            } else {
+                window.request_animation_frame();
+            }
+        }
         *self.tab_target.borrow_mut() = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).target().cloned());

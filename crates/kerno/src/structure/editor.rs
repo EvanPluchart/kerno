@@ -10,8 +10,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -145,7 +145,6 @@ pub struct TableEditor {
     /// The table on the server; `None` while it is being created.
     table: Option<TableRef>,
     structure: Option<TableStructure>,
-    session: Option<Arc<dyn Session>>,
     name: Entity<InputState>,
     comment: Entity<InputState>,
     columns: Vec<ColumnRow>,
@@ -187,7 +186,6 @@ impl TableEditor {
                 (State::Waiting, true) => this.reload(false, window, cx),
                 (State::Waiting, false) | (_, true) => {}
                 (_, false) => {
-                    this.session = None;
                     this.state = State::Waiting;
                     cx.notify();
                 }
@@ -200,7 +198,6 @@ impl TableEditor {
             schema: schema.clone(),
             table,
             structure: None,
-            session: None,
             name,
             comment,
             columns: Vec::new(),
@@ -310,15 +307,14 @@ impl TableEditor {
 
     // Loading -----------------------------------------------------------------
 
+    /// A session for one load or one apply, closed once it is done: an
+    /// open form holds no connection to the server.
     fn session(&self, cx: &App) -> Task<kerno_core::Result<Arc<dyn Session>>> {
-        match &self.session {
-            Some(session) => Task::ready(Ok(session.clone())),
-            None => self.connections.read(cx).open_session(
-                &self.target.connection,
-                self.target.database.clone(),
-                cx,
-            ),
-        }
+        self.connections.read(cx).open_session(
+            &self.target.connection,
+            self.target.database.clone(),
+            cx,
+        )
     }
 
     /// Reads the table (when there is one) and the tables of the schema.
@@ -328,7 +324,6 @@ impl TableEditor {
         self.generation += 1;
         let generation = self.generation;
         if !self.connected(cx) {
-            self.session = None;
             self.state = State::Waiting;
             cx.notify();
             return;
@@ -353,31 +348,29 @@ impl TableEditor {
                     return;
                 }
             };
-            let reading = {
-                let session = session.clone();
-                cx.update(|_, cx| {
-                    bridge::spawn(cx, async move {
-                        let structure = match &table {
-                            Some(table) => Some(session.table_structure(table).await?),
-                            None => None,
-                        };
-                        // The form works without them.
-                        let tables = session
-                            .objects(&schema)
-                            .await
-                            .map(|objects| {
-                                objects
-                                    .relations
-                                    .into_iter()
-                                    .filter(|relation| relation.kind.is_table())
-                                    .map(|relation| relation.name)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Ok::<_, Error>((structure, tables))
-                    })
+            // The session goes with the reading: it closes once read.
+            let reading = cx.update(|_, cx| {
+                bridge::spawn(cx, async move {
+                    let structure = match &table {
+                        Some(table) => Some(session.table_structure(table).await?),
+                        None => None,
+                    };
+                    // The form works without them.
+                    let tables = session
+                        .objects(&schema)
+                        .await
+                        .map(|objects| {
+                            objects
+                                .relations
+                                .into_iter()
+                                .filter(|relation| relation.kind.is_table())
+                                .map(|relation| relation.name)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok::<_, Error>((structure, tables))
                 })
-            };
+            });
             let Ok(reading) = reading else {
                 return;
             };
@@ -385,7 +378,6 @@ impl TableEditor {
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(_) if this.generation != generation => {}
                 Ok((structure, tables)) => {
-                    this.session = Some(session);
                     this.tables = tables;
                     this.state = State::Ready;
                     if let (Some(structure), Some(table)) = (structure, this.table.clone()) {
@@ -406,9 +398,6 @@ impl TableEditor {
     fn failed(&mut self, generation: u64, error: &Error, cx: &mut Context<Self>) {
         if self.generation != generation {
             return;
-        }
-        if error.is_disconnect() {
-            self.session = None;
         }
         self.state = State::Failed(error.to_string());
         cx.notify();
@@ -912,7 +901,7 @@ impl TableEditor {
         );
     }
 
-    /// Runs confirmed statements on the tab's session.
+    /// Runs confirmed statements on a session of their own.
     fn run(&mut self, statements: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let opening = self.session(cx);
         self.applying = true;
@@ -936,18 +925,15 @@ impl TableEditor {
                     return;
                 }
             };
-            let running = {
-                let (session, statements) = (session.clone(), statements.clone());
-                cx.update(|_, cx| bridge::spawn(cx, run_statements(session, statements)))
-            };
+            let transactional = session.dialect().engine() == Engine::Postgres;
+            let running =
+                cx.update(|_, cx| bridge::spawn(cx, run_statements(session, statements.clone())));
             let Ok(running) = running else {
                 return;
             };
             let outcome = running.await;
-            let transactional = session.dialect().engine() == Engine::Postgres;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.applying = false;
-                this.session = Some(session);
                 this.load = None;
                 match outcome {
                     Ok(()) => {
@@ -1276,9 +1262,9 @@ impl TableEditor {
                 .child(
                     Button::new(("column-remove", index))
                         .ghost()
-                        .xsmall()
-                        .label("×")
-                        .tooltip("Remove this column")
+                        .small()
+                        .icon(IconName::Close)
+                        .tooltip("Remove column")
                         .on_click(cx.listener(move |this, _, _, cx| this.remove_column(index, cx))),
                 )
                 .children(note.map(|(text, warning)| {
@@ -1401,9 +1387,9 @@ impl TableEditor {
                     .child(
                         Button::new(("index-remove", index))
                             .ghost()
-                            .xsmall()
-                            .label("×")
-                            .tooltip("Remove this index")
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip("Remove index")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if index < this.indexes.len() {
                                     this.indexes.remove(index);
@@ -1509,9 +1495,9 @@ impl TableEditor {
                             .child(
                                 Button::new(("key-remove", index))
                                     .ghost()
-                                    .xsmall()
-                                    .label("×")
-                                    .tooltip("Remove this foreign key")
+                                    .small()
+                                    .icon(IconName::Close)
+                                    .tooltip("Remove foreign key")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if index < this.keys.len() {
                                             this.keys.remove(index);
@@ -1610,9 +1596,11 @@ impl TableEditor {
                 )
                 .into_any_element(),
         };
+        // The remaining height, at least 200 px: the form above takes what
+        // it needs, so a short table leaves no empty band between the two.
         v_flex()
-            .flex_none()
-            .h(px(200.))
+            .flex_1()
+            .min_h(px(200.))
             .border_t_1()
             .border_color(theme.border)
             .child(
@@ -1708,7 +1696,7 @@ impl TableEditor {
                 .child(
                     v_flex()
                         .id("editor-form")
-                        .flex_1()
+                        .flex_initial()
                         .min_h_0()
                         .overflow_y_scroll()
                         .p_3()

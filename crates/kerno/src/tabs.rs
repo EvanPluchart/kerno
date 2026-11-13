@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::{App, SharedString, Window};
+use gpui_kit::{App, SharedString, Window, px};
 use kerno_core::TxState;
 use serde::{Deserialize, Serialize};
 
@@ -438,6 +438,14 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
         StatusItem::Rows | StatusItem::Timing => vec![enabled(TabAction::CopyText(text.into()))],
         StatusItem::MemoryOnly => vec![enabled(TabAction::AboutMemoryOnly)],
     }
+}
+
+/// A menu taller than the window scrolls instead of being cut: the kit
+/// moves a menu inside the window but does not shorten it.
+pub fn fit_window(menu: PopupMenu, window: &Window) -> PopupMenu {
+    // The kit keeps 8 px from each edge; the frame and padding take 10.
+    menu.scrollable(true)
+        .max_h(window.bounds().size.height - px(26.))
 }
 
 /// What runs the entry chosen in a menu.

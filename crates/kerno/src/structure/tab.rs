@@ -2,8 +2,6 @@
 //! indexes, constraints, foreign keys both ways, triggers and DDL, each in
 //! a sub-tab of its own. Nothing here changes the database.
 
-use std::sync::Arc;
-
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -20,7 +18,7 @@ use gpui_kit::{
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ConstraintKind, ObjectRef, RelationKind, TableRef, TableStructure,
 };
-use kerno_core::{Error, Session, TxState};
+use kerno_core::{Error, TxState};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -93,7 +91,8 @@ pub struct StructureTab {
     target: Target,
     table: TableRef,
     kind: RelationKind,
-    session: Option<Arc<dyn Session>>,
+    /// Restored and not shown yet: nothing is read, no session is open.
+    hidden: bool,
     structure: Option<TableStructure>,
     /// One per list, in `List::ALL` order, once read.
     grids: Vec<Entity<TableState<ListGrid>>>,
@@ -127,7 +126,6 @@ impl StructureTab {
                 (State::Waiting, true) => this.reload(window, cx),
                 (State::Waiting, false) | (_, true) => {}
                 (_, false) => {
-                    this.session = None;
                     this.state = State::Waiting;
                     cx.notify();
                 }
@@ -139,7 +137,7 @@ impl StructureTab {
             target,
             table,
             kind,
-            session: None,
+            hidden: false,
             structure: None,
             grids: Vec::new(),
             ddl: None,
@@ -242,31 +240,40 @@ impl StructureTab {
 
     // Loading -----------------------------------------------------------------
 
-    /// This tab's session, opened if needed.
-    fn session(&self, cx: &App) -> Task<kerno_core::Result<Arc<dyn Session>>> {
-        match &self.session {
-            Some(session) => Task::ready(Ok(session.clone())),
-            None => self.connections.read(cx).open_session(
-                &self.target.connection,
-                self.target.database.clone(),
-                cx,
-            ),
+    /// Reads nothing until shown (a restored tab): see `reveal`.
+    pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
+        self.hidden = true;
+        self.generation += 1;
+        self.load = None;
+        self.state = State::Waiting;
+        cx.notify();
+    }
+
+    /// The tab is on screen: a deferred tab reads the structure now.
+    pub fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.hidden) {
+            self.reload(window, cx);
         }
     }
 
-    /// Reads the structure and the DDL again.
+    /// Reads the structure and the DDL again, on a session of its own that
+    /// closes once they are read: a tab that only shows what it read holds
+    /// no connection to the server.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        if !self.connected(cx) {
-            self.session = None;
+        if self.hidden || !self.connected(cx) {
             self.state = State::Waiting;
             cx.notify();
             return;
         }
         self.state = State::Loading;
         let previous = self.load.take();
-        let opening = self.session(cx);
+        let opening = self.connections.read(cx).open_session(
+            &self.target.connection,
+            self.target.database.clone(),
+            cx,
+        );
         let table = self.table.clone();
         let object = ObjectRef::Relation(table.clone(), self.kind);
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
@@ -281,26 +288,25 @@ impl StructureTab {
                     return;
                 }
             };
-            let reading = {
-                let session = session.clone();
-                cx.update(|_, cx| {
-                    bridge::spawn(cx, async move {
-                        let structure = session.table_structure(&table).await?;
-                        // The columns are worth showing when the DDL is not.
-                        let ddl = session.ddl(&object).await.unwrap_or_else(|error| {
-                            format!("-- The DDL could not be read: {error}\n")
-                        });
-                        Ok::<_, Error>((structure, ddl))
-                    })
+            // The session goes with the reading: it closes once read.
+            let reading = cx.update(|_, cx| {
+                bridge::spawn(cx, async move {
+                    let structure = session.table_structure(&table).await?;
+                    // The columns are worth showing when the DDL is not.
+                    let ddl = session
+                        .ddl(&object)
+                        .await
+                        .unwrap_or_else(|error| format!("-- The DDL could not be read: {error}\n"));
+                    Ok::<_, Error>((structure, ddl))
                 })
-            };
+            });
             let Ok(reading) = reading else {
                 return;
             };
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok((structure, ddl)) if this.generation == generation => {
-                    this.show(session, structure, ddl, window, cx)
+                    this.show(structure, ddl, window, cx)
                 }
                 Ok(_) => {}
                 Err(error) => this.failed(generation, &error, cx),
@@ -313,9 +319,6 @@ impl StructureTab {
         if self.generation != generation {
             return;
         }
-        if error.is_disconnect() {
-            self.session = None;
-        }
         self.state = State::Failed(error.to_string());
         cx.notify();
     }
@@ -323,13 +326,11 @@ impl StructureTab {
     /// Puts what was read on screen.
     fn show(
         &mut self,
-        session: Arc<dyn Session>,
         structure: TableStructure,
         ddl: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.session = Some(session);
         self.state = State::Ready;
         let noun = self.noun();
         self.grid_subscriptions.clear();

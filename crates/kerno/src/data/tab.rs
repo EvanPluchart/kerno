@@ -29,6 +29,7 @@ use kerno_core::schema::{ColumnGeneration, RelationKind, TableRef, TableStructur
 use kerno_core::sql::{CellValue, RowChange, apply_edits, edit_statements};
 use kerno_core::{Error, ResultStore, Session, TxState, exec};
 
+use crate::actions::CloseTab;
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
@@ -75,7 +76,43 @@ enum State {
     Waiting,
     Loading,
     Ready,
-    Failed(String),
+    /// What the server said, and whether the table itself is gone.
+    Failed {
+        message: String,
+        gone: bool,
+    },
+}
+
+/// Whether the server says the table itself does not exist: PostgreSQL's
+/// SQLSTATE 42P01, MySQL's and MariaDB's error 1146 (`1146 (42S02)`).
+fn table_gone(error: &Error) -> bool {
+    match error {
+        Error::Db(db) => db
+            .code
+            .as_deref()
+            .is_some_and(|code| code == "42P01" || code.starts_with("1146 ")),
+        _ => false,
+    }
+}
+
+/// What the error state says: the server's message, then what to do.
+fn failure_text(message: &str, gone: bool) -> String {
+    let advice = if gone {
+        "The table may have been dropped or renamed."
+    } else {
+        "Check the filter, then try again."
+    };
+    format!("{} {advice}", sentence(message))
+}
+
+/// The server's message as a sentence, before Kerno's advice.
+fn sentence(message: &str) -> String {
+    let message = message.trim_end();
+    if message.ends_with(['.', '!', '?']) {
+        message.to_string()
+    } else {
+        format!("{message}.")
+    }
 }
 
 /// What a load brought back.
@@ -93,6 +130,8 @@ pub struct DataTab {
     table: TableRef,
     kind: RelationKind,
     session: Option<Arc<dyn Session>>,
+    /// Restored and not shown yet: nothing is read, no session is open.
+    hidden: bool,
     structure: Option<Arc<TableStructure>>,
     filter_rows: Vec<FilterRow>,
     raw_filter: Entity<InputState>,
@@ -169,6 +208,7 @@ impl DataTab {
             table,
             kind,
             session: None,
+            hidden: false,
             structure: None,
             filter_rows: Vec::new(),
             raw_filter,
@@ -315,11 +355,28 @@ impl DataTab {
         }
     }
 
+    /// Reads nothing until shown (a restored tab): see `reveal`.
+    pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
+        self.hidden = true;
+        self.generation += 1;
+        self.load = None;
+        self.session = None;
+        self.state = State::Waiting;
+        cx.notify();
+    }
+
+    /// The tab is on screen: a deferred tab reads its rows now.
+    pub fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.hidden) {
+            self.reload(window, cx);
+        }
+    }
+
     /// Reads the page again, with the filter and sort as they are.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        if !self.connected(cx) {
+        if self.hidden || !self.connected(cx) {
             self.session = None;
             self.state = State::Waiting;
             cx.notify();
@@ -433,7 +490,10 @@ impl DataTab {
             self.session = None;
         }
         self.counting = false;
-        self.state = State::Failed(error.to_string());
+        self.state = State::Failed {
+            message: error.to_string(),
+            gone: table_gone(error),
+        };
         cx.notify();
     }
 
@@ -1336,13 +1396,23 @@ impl DataTab {
         self.grid.clone()
     }
 
+    /// What the error state says, when the rows could not be read; for
+    /// tests.
+    #[cfg(test)]
+    pub fn advice(&self) -> String {
+        match &self.state {
+            State::Failed { message, gone } => failure_text(message, *gone),
+            _ => String::new(),
+        }
+    }
+
     /// Where the tab is with its rows, in words; for tests.
     #[cfg(test)]
     pub fn state(&self, cx: &App) -> String {
         match &self.state {
             State::Waiting => "waiting".into(),
             State::Loading => "loading".into(),
-            State::Failed(error) => format!("failed: {error}"),
+            State::Failed { message, .. } => format!("failed: {message}"),
             State::Ready => self.range_text(cx),
         }
     }
@@ -1806,17 +1876,25 @@ impl DataTab {
                     cx,
                 )
             }
-            (State::Failed(error), _) => {
+            (State::Failed { message, gone }, _) => {
                 let retry = Button::new("data-retry")
                     .outline()
                     .label("Try again")
-                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx)))
-                    .into_any_element();
+                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx)));
+                let actions = if *gone {
+                    let close = Button::new("data-close-tab")
+                        .outline()
+                        .label("Close tab")
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(CloseTab), cx));
+                    h_flex().gap_2().child(close).child(retry)
+                } else {
+                    h_flex().child(retry)
+                };
                 self.render_notice(
                     "data-error",
                     "The rows could not be read",
-                    format!("{error} Check the filter, then try again."),
-                    Some(retry),
+                    failure_text(message, *gone),
+                    Some(actions.into_any_element()),
                     cx,
                 )
             }
@@ -2002,5 +2080,43 @@ impl Render for DataTab {
             }))
             .child(div().flex_1().min_h_0().child(self.render_rows(cx)))
             .child(self.render_footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kerno_core::DbError;
+
+    fn server(code: &str, message: &str) -> Error {
+        Error::Db(Box::new(DbError {
+            code: Some(code.into()),
+            ..DbError::message(message)
+        }))
+    }
+
+    #[test]
+    fn a_missing_table_is_told_from_other_failures() {
+        assert!(table_gone(&server(
+            "42P01",
+            "relation \"x\" does not exist"
+        )));
+        assert!(table_gone(&server(
+            "1146 (42S02)",
+            "Table 'kerno.x' doesn't exist"
+        )));
+        // A missing column (a bad filter) is not a missing table.
+        assert!(!table_gone(&server("42703", "column \"y\" does not exist")));
+        assert!(!table_gone(&server("1054 (42S22)", "Unknown column 'y'")));
+        assert!(!table_gone(&Error::Closed("gone".into())));
+    }
+
+    #[test]
+    fn the_servers_message_ends_with_a_full_stop() {
+        assert_eq!(
+            sentence("relation \"x\" does not exist [42P01]"),
+            "relation \"x\" does not exist [42P01]."
+        );
+        assert_eq!(sentence("Already a sentence. "), "Already a sentence.");
     }
 }

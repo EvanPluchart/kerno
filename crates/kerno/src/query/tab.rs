@@ -319,6 +319,11 @@ impl QueryTab {
                 this.follow_connection(cx);
             }
         });
+        // The connection's commit mode: manual on production unless chosen.
+        let manual_commit = target
+            .as_ref()
+            .and_then(|target| connections.read(cx).get(&target.connection))
+            .is_some_and(|saved| saved.config.starts_in_manual_commit());
         let mut tab = Self {
             title: title.into(),
             editor,
@@ -333,7 +338,7 @@ impl QueryTab {
             activity: Activity::Idle,
             run: None,
             cancel_requested: false,
-            manual_commit: false,
+            manual_commit,
             param_values: HashMap::new(),
             error_marked: false,
             file: None,
@@ -2245,10 +2250,8 @@ impl QueryTab {
     fn render_pane(&self, pane: &ResultPane, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         match &pane.outcome {
-            Outcome::Rows(grid) => DataTable::new(grid)
-                .xsmall()
-                .stripe(true)
-                .into_any_element(),
+            // Striped by the grid itself (`Grid::render_tr`).
+            Outcome::Rows(grid) => DataTable::new(grid).xsmall().into_any_element(),
             Outcome::Done => div()
                 .id("result-done")
                 .test_support()

@@ -181,14 +181,19 @@ impl ExportDialog {
             Source::Table { table, .. } => format!("{}.{}", table.schema, table.name),
             Source::Query { .. } => "schema_name.table_name".into(),
         };
-        let mut input = |value: &str, cx: &mut Context<Self>| {
+        let mut input = |value: &str, placeholder: &'static str, cx: &mut Context<Self>| {
             let value = value.to_string();
-            cx.new(|cx| InputState::new(window, cx).default_value(value))
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value)
+                    .placeholder(placeholder)
+            })
         };
         Self {
-            delimiter: input(",", cx),
-            null_text: input("", cx),
-            insert_table: input(&table, cx),
+            delimiter: input(",", "", cx),
+            // An empty box writes NULL as nothing: the placeholder says so.
+            null_text: input("", "empty", cx),
+            insert_table: input(&table, "", cx),
             connections,
             target,
             source,
@@ -227,12 +232,19 @@ impl ExportDialog {
         Ok(match self.format {
             Format::Csv => {
                 let typed = self.delimiter.read(cx).value().to_string();
+                // `\t` stands for a tab, which cannot be typed in the box.
+                let typed = if typed == "\\t" { "\t".into() } else { typed };
                 let mut chars = typed.chars();
                 match (chars.next(), chars.next()) {
                     (Some(delimiter), None) if delimiter != '"' && delimiter != '\n' => {
                         delimited(delimiter)
                     }
-                    _ => return Err("The delimiter is one character, other than a quote.".into()),
+                    _ => {
+                        return Err(
+                            "The delimiter is one character other than a quote, or \\t for a tab."
+                                .into(),
+                        );
+                    }
                 }
             }
             Format::Tsv => delimited('\t'),
@@ -437,8 +449,9 @@ impl ExportDialog {
             if self.format == Format::Csv {
                 rows.push(field(
                     "Delimiter",
+                    // Room for `\t` and a couple more characters.
                     div()
-                        .w(px(64.))
+                        .w(px(96.))
                         .child(Input::new(&self.delimiter).small().id("export-delimiter"))
                         .into_any_element(),
                 ));
