@@ -606,3 +606,18 @@ name a secret — a deviation from DBeaver recorded in DECISIONS). Left:
 - `SET password_encryption = …` is refused as a bootstrap statement because the word contains
   "password": match secrets as values (`PASSWORD '…'`, `IDENTIFIED BY`), not as substrings of identifiers.
 - A tunnel test with a bootstrap statement; a capture of the dialog's Advanced section.
+
+## G12 — app half delivered on 2026-11-13, and what it left (one `opus` agent, app: `maintenance_dialog.rs`,
+`navigator/actions.rs`, `navigator/view.rs`, `actions.rs`, `workspace.rs`, `ui_tests.rs`; not yet committed
+when this note was written; the core half is `7ac5318`)
+
+Done: TOOL-05, TOOL-06, TOOL-08, TOOL-09, TOOL-10, TOOL-11, CM-40, CM-56, CM-57, CM-70, CM-90. The Tools ▸
+menu of the tree (and a palette command) lists what the engine offers for each object and opens a
+maintenance dialog that runs the tool on a session of its own, shows the SQL, the log and the server's
+status rows, and can cancel a waiting statement; a read-only connection refuses, production asks twice.
+Left:
+- Closing the dialog while its statement waits (a lock) cancels it on the server; foreign tables keep Truncate (PostgreSQL 14+ truncates them through their wrapper).
+- A trigger shows twice in the tree and only the copy acted on is refreshed after Enable / Disable.
+- Concurrently is offered on Refresh materialized view without checking for a unique index; the server's
+  error is shown instead.
+- The "Done in" time includes opening the session.

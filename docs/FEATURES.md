@@ -4,7 +4,7 @@ Every v1 item of CLAUDE.md §4, with its status, the tests that cover it and the
 Status: `done` (in the committed code and covered by a test), `done, untested` (it exists, no test covers it),
 `partial: <what is missing>`, `todo: <plan file and part>` (not built yet). Test names are functions; the file is
 given once per group. Screenshot: files of `docs/screenshots/`; `to capture` where the plan has captures not yet
-taken (milestones 7 and 8); `—` where there is none. Committed code only (HEAD `712b7cf`), 2026-11-13.
+taken (milestones 7 and 8); `—` where there is none. Committed code (HEAD `f982e77`) plus the maintenance dialog of the working tree (G12 app half, not yet committed), 2026-11-13.
 
 Engines: PG = PostgreSQL 17, My = MySQL 8.4, Ma = MariaDB 11.
 
@@ -30,6 +30,9 @@ Tests: `crates/kerno/src/ui_tests.rs` (UI), `crates/kerno/src/connections/manage
 | A5 Sidebar menus: empty area, folder, connection (Reconnect, New SQL editor, Move to folder, Copy name / URL without the password / host) | done | `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does`, `a_connection_disables_what_does_not_apply_to_its_status`, `the_copied_connection_url_has_no_password`, `the_connection_url_has_no_password_and_reads_back`, `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection` | `m3-sidebar-menu-light.png` |
 | A5 A double click or Enter on a connection connects it and never disconnects; F4 edits it | done | `a_double_click_on_a_connection_connects_and_never_disconnects` | — |
 | A5 Import / export as JSON without secrets | done | `connections_are_exported_without_secrets_and_imported_back`, `connections_export_and_import_without_secrets`, `import_rejects_what_is_not_a_valid_connections_file` | — (file dialog) |
+| A5 Commit mode per connection (manual by default on production); default schema (PostgreSQL); bootstrap statements run on every session, checked by a strict grammar (D-034) | done | `the_commit_mode_follows_the_environment_unless_chosen`, `a_production_connection_starts_its_tabs_in_manual_commit`, `the_connection_dialog_keeps_the_commit_mode_and_the_bootstrap`, `bootstrap_statements_are_split_and_checked`, `bootstrap_statements_run_in_each_tab_and_a_failing_one_is_named`, `a_refused_bootstrap_statement_is_shown_in_the_advanced_section`; drivers: `connector_runs_the_bootstrap_on_every_session` (PG, My) | — |
+| A5 Disconnect closes every session the connection handed out | done | `every_owner_of_a_session_closes_it_when_it_goes_away` (PG, My) | — |
+| A5 Read-only toggle, Disconnect all / others, connection colour on tabs and the status bar | todo: another agent is working on them (PARITY-GAPS G13 leftovers) | | |
 
 Engine logos (CLAUDE.md §1): engine picker and sidebar connections show the vendors' logos
 (`every_engine_has_its_logo_and_the_kit_icons_still_load`; visible in every `m3-*` capture). Navigator root,
@@ -61,6 +64,10 @@ and `actions.rs` (tree and menus), `crates/kerno-core/src/sql/generate.rs` and t
 | B3 Empty area below the tree: Refresh, Collapse all, New query here | done | `a_right_click_below_the_schema_tree_opens_its_menu` | — |
 | B1 Clicks (§4.B item 1): a click selects; the chevron, Right and Left expand and collapse; a double click or Enter runs the default action (table, view: data, structure or expand by the `table_double_click` setting; routines: source; other objects: DDL; folders: toggle) | done | `a_click_selects_a_row_and_the_chevron_or_the_arrows_open_it`, `a_double_click_or_enter_opens_what_the_row_is_for`, `a_double_click_opens_what_the_node_is_for`, `f4_opens_the_editor_of_what_the_node_is` | — |
 | B Keys, as DBeaver: F4 edit, F2 rename, Delete / Backspace drop (with the SQL confirmation), F5 refresh, Cmd+C copy name, Cmd+Shift+C qualified name, Cmd+] new query, Cmd+Shift+A set as default; each a named command in the palette and the keymap file | done | `navigator_keys_run_the_actions_of_the_selected_node`, `command_ids_are_unique_and_shortcuts_valid`, `a_shortcut_is_unique_within_its_context`, `shortcuts_need_a_real_key` | — |
+| B1 Under a table: Columns, Constraints, Foreign keys, Indexes, References, Triggers from one structure load; a double click on a key or a reference opens the other table | done | `a_table_lists_its_constraints_keys_references_and_triggers`, `reveal_opens_the_way_to_a_table_one_load_at_a_time` | `m4-navigator-table-folders-light.png` |
+| B3 Create function / procedure / sequence / trigger / event: a template per engine in a query tab | done | `create_entries_open_templates_that_run_once_named`, `create_entries_write_a_template_per_engine` | — |
+| B3 Rename column, drop column (SQL confirmation); drop with cascade (PostgreSQL) | done | `columns_are_added_renamed_and_dropped_from_the_tree`, `a_drop_with_cascade_also_drops_what_depends_on_the_table`; the column test runs on PostgreSQL and MySQL, not MariaDB | — |
+| B3 Tools ▸ on a table, view, materialized view, trigger or database: Vacuum, Analyze, Refresh, Truncate options, Enable / Disable trigger (PG); Analyze, Check, Optimize, Repair (My, Ma) | done (the app half is not yet committed); foreign tables lack Truncate | `the_tools_menu_lists_what_the_engine_offers_for_each_object`, `postgres_tools_analyze_vacuum_refresh_switch_triggers_and_truncate`, `a_postgres_database_is_vacuumed_and_analysed_from_its_node`, `a_vacuum_waiting_for_a_lock_is_cancelled`, `mysql_and_mariadb_tools_show_their_status_rows`, `the_tools_menu_and_command_open_the_dialog_and_read_only_or_production_guard_it`, `options_are_dbeavers_and_what_the_server_refuses_together_is_blocked`; core: `table_tools_and_their_options`, `tools_act_on_tables_views_and_triggers`, `vacuum_and_analyze_run_on_the_connected_database` | to capture |
 
 ## C. SQL editor
 
@@ -98,6 +105,9 @@ Status words: `done` (in the committed code and a test covers it), `done, untest
 | C6 Transaction mode per tab: auto-commit or manual, visible state, Commit and Rollback | done | `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended`; drivers: `transaction_state_follows_the_server` (PG, My, Ma), `abandoning_a_result_inside_a_transaction_keeps_the_transaction` (PG) | — |
 | C7 Query history: searchable, per connection, duration and status | done | `history_and_saved_queries_are_searched_and_reopened`, `messages_errors_and_history_of_a_run`; core: `history_is_newest_first_filtered_and_searchable`, `history_never_stores_a_password`, `passwords_in_statements_are_redacted`; app: `times_are_told_in_the_largest_unit_that_fits`, `a_statement_is_shown_on_one_line` | `m5-history-light.png` |
 | C7 Saved queries: named, foldered | done | `history_and_saved_queries_are_searched_and_reopened`; core: `saved_queries_are_created_updated_sorted_and_deleted` | `m5-history-light.png` |
+| C3 Run on a saved but closed connection connects first; run in a new result tab (`Cmd+\`) keeps earlier results; run from the cursor; next / previous statement; count the rows of a statement; hide, maximise and focus the results panel | done | `running_in_a_tab_of_a_closed_connection_connects_first`, `result_tabs_close_pin_and_rename`, `statements_are_reached_and_run_from_the_cursor`, `the_rows_of_a_statement_are_counted`, `the_results_panel_hides_maximizes_and_takes_the_keyboard` | — |
+| C3 Result tabs close, pin and rename from a right-click menu or a middle click | done | `result_tabs_close_pin_and_rename`, `a_result_tab_closes_pins_and_names_as_in_dbeaver` | — |
+| C1 Rename a query tab (kept after a restart); closing tabs asks once for what would be lost | done | `a_renamed_query_tab_keeps_its_name_after_a_restart`, `a_file_with_unsaved_text_asks_before_its_tab_closes`, `closing_rolls_back_and_discards_only_once_confirmed` | — |
 
 ## D. Results grid
 
@@ -120,6 +130,7 @@ Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno-core/src/{format,sort,expor
 | D3 Copy as TSV, CSV, JSON, Markdown, SQL INSERT; copy column names | done | `the_grid_sorts_copies_and_rearranges_what_it_shows`; core: `sample_as_csv`, `sample_as_tsv`, `sample_as_json_array`, `sample_as_markdown`, `sample_as_sql_insert`, `delimited_fields_are_quoted_only_when_they_must_be` | — |
 | D3 The row menu opens from any cell and offers the copy formats | done | `a_right_click_on_a_cell_opens_the_menu_of_its_row` | `m6-row-menu-dark.png` |
 | D3 Export the full result | done | `a_query_result_is_exported_by_running_its_statement_again`, `the_million_row_table_exports_line_by_line` (PG, My, Ma) | — |
+| D Cell menu knows its cell: Copy, Copy as, Order by, View value, Pin, Hide, Export…; acts on the selection when the click is inside it; header menu with Order by, Filter on this column, Fit width, Fit all widths | done | `a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters`, `the_menu_of_a_result_cell_acts_on_the_selection_or_on_its_cell`, `a_header_copies_orders_filters_and_fits_its_column`, `the_menu_of_a_column_header_orders_filters_and_fits` | — |
 
 ## E. Table data view
 
@@ -137,6 +148,10 @@ Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno-core/src/{browse,pending}.r
 | E2 A primary or unique key is required, else read-only with the reason | done | `rows_that_cannot_be_addressed_are_read_only_and_say_why` (PG); core: `row_identity_prefers_the_primary_key_in_key_order`, `no_key_means_no_row_identity`, `without_a_key_only_new_rows_can_be_written`, `a_row_without_identity_is_never_updated_or_deleted` | — |
 | E2 Enum and boolean cells edited from a list; paste into cells; Delete sets NULL; Cmd+Z takes a change back | todo: plans/M6.md Part 1 | | — |
 | E3 Follow a foreign key to the referenced row; list the rows that reference the current one | done | `foreign_keys_lead_to_the_referenced_row_and_back` | `m6-row-menu-dark.png` |
+| E2 Keys: Cmd+S reviews the pending changes, add / duplicate / delete rows, copy from the row above or below, set default, Escape reverts the selected cells, Cmd+Z undoes the last change, Cmd+Shift+C copies with column names | done | `data_keys_edit_rows_and_apply`, `the_grid_keys_differ_on_both_systems`, `undo_takes_back_one_step_at_a_time` | — |
+| E2 Paste a value or a tab-separated block as pending changes; Delete sets nullable cells to NULL | done (PG only) | `pasting_fills_cells_from_the_clipboard_and_delete_empties_them`, `a_pasted_block_is_split_in_rows_and_cells` | — |
+| E1 Filter by this value, Exclude this value, other operators from a cell, Clear filters | done | `filter_by_this_value_and_exclude_it_change_the_rows`, `a_data_cell_adds_paste_filters_edits_and_the_row_in_dbeavers_order` | — |
+| E2 A table that no longer exists says so and offers to close the tab | done | `a_data_tab_whose_table_is_gone_shows_no_rows_and_the_tree_forgets_it`, `a_table_dropped_under_its_data_tab_says_so_and_offers_to_close_it` | — |
 
 ## F. Structure
 
@@ -169,20 +184,24 @@ Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno/src/import_dialog.rs`, `cra
 | G2 Parsing: quotes, line breaks, delimiters, encodings, NULL rule | done | core: `quotes_doubled_quotes_and_line_breaks`, `other_delimiters`, `encodings_and_byte_order_marks`, `null_text_unquoted_is_null_quoted_is_a_value`, `an_unclosed_quote_and_bad_utf8_name_their_line`; app: `the_confirmation_writes_null_where_the_reader_reads_null` | — |
 | G2 Batches in one transaction; an error rolls everything back and names the line; read-only refused | done | `a_failed_import_says_which_line_and_keeps_nothing`, `a_read_only_connection_cannot_import`; drivers: `a_bad_record_rolls_everything_back_and_names_its_line`, `a_hundred_thousand_rows_go_into_a_new_table` (PG, My, Ma) | to capture |
 | G2 Cancel an import from the dialog; the double confirmation on production; the MySQL "created first" sentence | partial: the core cancel is tested (`cancel_rolls_the_import_back`, PG, My, Ma); the dialog's cancel, the production confirmation and that sentence have no UI test (plans/M8.md, left over from Parts 1 and 2) | `cancel_rolls_the_import_back` | to capture |
-| G3 Backup and restore through the installed client tools: find the binaries and their version, command lines without the secret, streamed output, cancel | partial: the core (`tools.rs`) is done; the dialog (detected binary, chosen path, the command shown, log pane, missing-tool message) is todo: plans/M8.md Part 3 (app half) | `find_searches_the_path_then_the_fallbacks`, `versions_are_read_from_each_tool`, `pg_dump_command_lines`, `pg_restore_command_lines`, `mysql_command_lines`, `no_password_means_no_password_variable`, `run_streams_lines_and_reports_the_exit_status`, `cancel_kills_the_child`, `run_reports_a_tool_that_cannot_start`; drivers: `pg_dump_then_psql_and_pg_restore_copy_a_database`, `pg_dump_through_the_ssh_tunnel_with_verify_full`, `an_older_pg_dump_fails_with_its_reason` (PG), `mysqldump_then_mysql_copy_a_database` (My, Ma) | to capture |
-| G3 A restored SQL file cannot run commands on this computer unasked | done (core; the dialog's opt-in checkbox is todo: plans/M8.md Part 3) | `a_restore_uses_the_client_sandbox_or_a_check_unless_allowed`, `the_sandbox_option_follows_the_client_version`, `psql_commands_that_reach_the_computer_are_found_with_their_line`, `mysql_commands_that_reach_the_computer_are_found_with_their_line`, `what_pg_dump_writes_is_not_flagged`, `what_mysqldump_writes_is_not_flagged`, `a_refused_script_runs_nothing`, `a_200_mb_script_is_scanned_in_constant_memory`; drivers: `a_plain_file_with_client_commands_runs_nothing` (PG), `a_file_with_client_commands_runs_nothing` (My, Ma), `a_genuine_plain_dump_passes_the_check_and_restores` (PG), `a_genuine_dump_passes_the_check_and_restores_both_ways` (My, Ma) | — |
+| G3 Backup and restore through the installed client tools: find the binaries and their version, command lines without the secret, streamed output, cancel | done | `a_backup_tool_is_found_or_chosen_and_its_output_streams`, `a_database_is_backed_up_and_restored_with_the_real_tools`, `a_running_tool_is_cancelled`, `a_backup_goes_through_the_ssh_tunnel`; core in `tools.rs` | to capture |
+| G3 A restore asks (twice on production, refused on read-only); a restored SQL file cannot run commands on this computer unasked, the opt-in checkbox is never pre-checked | done | `a_restore_asks_twice_on_production_and_is_refused_on_read_only`, `the_restore_confirmation_names_what_it_runs_and_what_a_failure_keeps`, `a_file_with_client_commands_is_refused_until_explicitly_allowed`, `a_restore_uses_the_client_sandbox_or_a_check_unless_allowed` | to capture |
+| G3 Backup of selected tables only | todo: no tables option in the dialog (plans/M8.md Part 3, DBEAVER-PARITY CM-58) | | |
 
 ## H. Administration
 
-Only the data layer exists: the six views of `Session::admin_query` and the two session calls. The tab that shows
-them is milestone 8 Part 4 (`plans/M8.md`).
+The Administration tab (palette "Server Administration", the connection menu and the status bar; restored after a
+restart) shows `Session::admin_query` in four sub-tabs. PostgreSQL, MySQL and MariaDB. Tests:
+`crates/kerno/src/ui_tests.rs`, `crates/kerno/src/admin/tab.rs`, the drivers' `tests/introspect.rs`. Captures of
+milestone 8 are not taken yet.
 
 | Item | Status | Tests | Screenshot |
 | ---- | ------ | ----- | ---------- |
-| H1 Sessions / processes view: refresh, cancel query, terminate session | todo: plans/M8.md Part 4 (the query and the cancel / terminate calls exist) | `administrative_views` (PG, My, Ma), `the_session_list_reads_the_table_the_server_has`, `another_sessions_statement_can_be_cancelled`, `a_session_killed_by_the_server_reports_it` | to capture |
-| H2 Users and roles with their grants (read view) | todo: plans/M8.md Part 4 (the queries exist) | `administrative_views` (PG, My, Ma), `every_view_has_a_query_on_both_engines` | to capture |
-| H2 Database and table sizes | todo: plans/M8.md Part 4 (the queries exist) | `administrative_views` (PG, My, Ma) | to capture |
-| H2 Server version and settings | todo: plans/M8.md Part 4 for the settings view; the version is already read at connect | `reports_the_server_and_database` (PG, My, Ma), `test_connection_reports_version_and_latency` | to capture |
+| H1 Sessions / processes view: filter, refresh and auto-refresh while shown, Cancel query and Terminate session shown and confirmed, refused on a read-only connection and on the tab's own session | done | `the_sessions_list_cancels_and_terminates_what_the_test_opened`, `the_sessions_refresh_on_their_own_only_while_shown`, `a_read_only_connection_sends_no_signal`, `the_selected_session_stays_selected_through_a_refresh_and_a_sort`, `an_account_without_the_privileges_sees_what_the_server_refused`; drivers: `administrative_views` (PG, My, Ma), `another_sessions_statement_can_be_cancelled` | to capture |
+| H2 Users and roles with their grants (read view) | done | `roles_and_their_grants_sizes_and_settings_are_listed`, `grants_show_the_selected_role_only` | to capture |
+| H2 Database and table sizes | done | `roles_and_their_grants_sizes_and_settings_are_listed`, `sizes_show_for_people_and_sort_by_bytes` | to capture |
+| H2 Server version and settings | done | `roles_and_their_grants_sizes_and_settings_are_listed`, `the_admin_tab_opens_from_the_status_bar_and_comes_back_after_a_restart`; `reports_the_server_and_database` (PG, My, Ma) | to capture |
+| H1 Lock manager, hide idle sessions | todo: PARITY-GAPS G16 | | |
 
 ## Context menus (CLAUDE.md §3)
 
@@ -197,11 +216,12 @@ a real right-click test is named where one exists.
 | Navigator: below the tree (Refresh, Collapse all, New query here) | yes | `a_right_click_below_the_schema_tree_opens_its_menu` | — |
 | Navigator: object rows (per kind of node) | yes; the entry lists are tested, no test right-clicks a row (plans/CTX.md acceptance) | `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` | `m4-navigator-menu-light.png`, `m4-navigator-menu-readonly-light.png` |
 | Results grid and table data: cell (row menu: owner extras, copy formats) | yes | `a_right_click_on_a_cell_opens_the_menu_of_its_row` | `m6-row-menu-dark.png` |
-| Results grid and table data: column header (Copy name, Pin, Hide, Show all) | yes, untested | | — |
-| Grid: cell-aware entries (Order by, Filter by this value, Exclude, Set NULL, Edit cell, Paste, Export…) and the extended header menu | no | | todo: plans/CTX.md Part 3 |
-| Tabs bar: a tab (Close, Close others, Close to the right, Close all, Rename) and the empty area | no | | todo: plans/CTX.md Part 2 |
-| SQL editor (Run statement, Run script, Explain, Format, Cut, Copy, Paste, Comment, Save) | no | | todo: plans/CTX.md Part 2 |
-| Status bar items (connection, database, transaction, read-only, rows, pending changes) | no | | todo: plans/CTX.md Part 2 |
+| Results grid and table data: column header (Copy name, Order by, Filter on this column, Pin, Hide, Show all, Fit width, Fit all widths) | yes | `a_header_copies_orders_filters_and_fits_its_column`, `the_menu_of_a_column_header_orders_filters_and_fits` | — |
+| Grid: cell-aware entries (Order by, Filter by this value, Exclude, Set NULL, Edit cell, Paste, Export…) | yes; what a cell does not allow is disabled with the reason | `a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters`, `a_data_cell_adds_paste_filters_edits_and_the_row_in_dbeavers_order`, `what_a_cell_does_not_allow_is_disabled_with_the_reason`, `the_menu_of_a_result_cell_acts_on_the_selection_or_on_its_cell`, `filter_by_this_value_and_exclude_it_change_the_rows` | — |
+| Tabs bar: a tab (Close, Close others, Close to the right, Close all, Rename, Duplicate) and the empty area (New query tab, Reopen closed tab) | yes | `tabs_answer_a_right_click_and_close_or_come_back_from_their_menus`, `a_tab_offers_what_dbeaver_does_and_says_what_does_not_apply`, `the_empty_tab_bar_reopens_only_what_was_closed` | — |
+| Result tabs (Close, Close others, Close to the left / right, Close all, Pin, Rename, Copy statement) | yes | `result_tabs_close_pin_and_rename`, `a_result_tab_closes_pins_and_names_as_in_dbeaver` | — |
+| SQL editor (Run statement, Run script, Explain, Format, Cut, Copy, Paste, Comment, Save) | yes | `the_editor_answers_a_right_click_with_its_commands`, `the_editor_menu_is_enabled_as_the_toolbar_is` | — |
+| Status bar items (connection, database, transaction, read-only, rows, pending changes) | yes; the entry lists are tested, no test right-clicks an item | `each_status_item_has_its_own_actions_or_none`, `a_read_only_connection_explains_itself_in_the_status_bar`, `the_status_bar_menus_open_inside_the_window` | — |
 | Drag and drop of connections between folders | yes | `a_folder_is_made_renamed_filled_by_drag_and_deleted` | — |
 
 ## I. App

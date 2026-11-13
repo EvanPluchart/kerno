@@ -10,13 +10,13 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |
 | 4  | Schema navigator (§4 B)                                                    | done   |
-| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: `plans/M5.md` Part 4 tab-close confirmations, Ctrl+Space and catalog leftovers of Part 2, captures; Parts 1, 2, 3 and the docs are done) |
-| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md` Part 1 editing comfort, Part 2 counting large tables; the table view, editing and the docs are done) |
+| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: Ctrl+Space and catalog leftovers of Part 2, captures; Parts 1, 2, 3, 4 (tab-close confirmations, `5864bc9`) and the docs are done) |
+| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md` Part 1 lists for boolean and enum cells, Part 2 counting large tables; the table view, editing, paste, Delete, Cmd+Z and the docs are done) |
 | 7  | Structure (§4 F)                                                           | doing (left: two tests of `plans/M7.md` Part 1c item 4, captures `m7-*`; Parts 1 to 4 are done) |
-| 8  | Import, export, backup, administration (§4 G, H)                           | doing (left: `plans/M8.md` Part 3 backup / restore dialog, Part 4 administration tab, UI tests left over from Parts 1 and 2, captures; export, import and the backup core are done) |
+| 8  | Import, export, backup, administration (§4 G, H)                           | doing (left: UI tests left over from Parts 1 and 2, the selected-tables option of backup, captures; export, import, backup and restore with their dialog (`514c0ba`) and the administration tab (`d4be8c4`) are done) |
 | 9  | Performance pass, `docs/BENCH.md`                                          | todo   |
-| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | doing (packaging and the Linux container build done, `plans/M10.md` Part 6; the rest todo) |
-| —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | doing: done are CTX Parts 0 and 1 (clicks, folders, drag and drop, sidebar menus) and PARITY-GAPS G1 (keys of the tree and the connection list); left are CTX Parts 2 and 3 (tabs bar, editor, status bar, grid menus), PARITY-GAPS G2 to G18, and 99 gap rows in `DBEAVER-PARITY.md` |
+| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | doing (packaging and the Linux container build done, `plans/M10.md` Part 6; the brand colours, lockup and mark done, Part 5, `9b3e1ae`; the rest todo) |
+| —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | doing: done are CTX Parts 0 to 3 and PARITY-GAPS G1, G2, G4, G10, G13 (but CON-12, CON-33, CON-34, CON-47, CM-12) and the G12 core half; the G12 app half is in the working tree; left are G3, G5 to G9, G11, G14 to G18, and 61 gap rows in `DBEAVER-PARITY.md` |
 
 ## Implementation plans (owner request of 2026-11-12, CLAUDE.md §7 "Model budget")
 

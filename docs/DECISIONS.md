@@ -625,3 +625,41 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   240 px, the mark (olive on light, lime on dark) in the empty tab area in an 80 px square that holds its
   clear space. The Linux window icon (`WindowOptions::icon`, X11 only) needs the `image` crate: left to the
   packaging part, the `.desktop` entry and hicolor icons cover it.
+
+## D-033 — Commit mode per connection; production starts in manual commit
+
+- A connection chooses the commit mode its query tabs start in. Left unset it follows the environment:
+  manual on `production`, auto-commit elsewhere, as DBeaver's connection types do (`DBPConnectionType`:
+  Production off, Development and Test on; `docs/plans/PARITY-GAPS.md` G13). Old stores and exports load
+  unchanged. Commit `45b7470`; query tabs read it in `5f38692` ("Query tabs of a production connection
+  start in manual commit").
+
+## D-034 — Bootstrap statements are a small grammar, and read-only is applied again after them
+
+- A bootstrap statement runs at every connect without being shown, also for an imported connection. First
+  version (`45b7470`): refuse statements that write, change the schema or name a secret. Security review
+  (`68033d6`): that could still run code (SELECT, CALL, DO, a function in a value), reach beyond the
+  session, change who the session runs as, or switch off the read-only state a read-only connection relies
+  on; so only one SET or RESET of a session setting with literal values is accepted, checked when the
+  connection is saved, imported, exported, and again where the statement would run. A read-only connection
+  re-applies its read-only state after the bootstrap.
+- Second review (`d46bc23`): the server and the check did not read a statement the same way (MySQL runs
+  `/*! … */`, `sql_mode` changes what a quote or a backslash means, PostgreSQL decodes `U&"…"`, `@@session.name`
+  hid a refused name behind its scope). A list of refusals was replaced by what is accepted: `SET
+  [SESSION|LOCAL] name (= | TO) value[, …]`, `SET TIME ZONE`, `SET NAMES`, `SET CHARACTER SET`, `SET @variable`
+  on MySQL and `RESET name`, with no comment anywhere, a bare ASCII name and plain values; names that reach
+  beyond the session or touch the transaction and its read-only state stay refused, compared part by part.
+  This is narrower than DBeaver's bootstrap queries, which run anything.
+
+## D-035 — One lock for the processes that talk to the test servers
+
+- Test processes that talk to the `kerno-*` servers take one lock, so two `cargo test` runs started side
+  by side no longer trip over each other's scratch objects (`45b7470`, `kerno-core/src/testing.rs`).
+
+## D-036 — A connection closes every session it handed out
+
+- Disconnecting closed only the connection's own session: a result grid still held its tab's session, which
+  stayed open (inside a transaction, in manual commit) for as long as the rows were shown. The manager now
+  closes every session it handed out; tabs and dialogs close theirs explicitly. A test counts a scratch
+  role's sessions after each kind of owner goes away, on PostgreSQL and MySQL (`1aa6f04`,
+  `every_owner_of_a_session_closes_it_when_it_goes_away`).

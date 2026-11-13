@@ -309,3 +309,38 @@ Still open:
 - Context menus on the tabs bar, the editor, the status bar and the extended grid menus
   (`plans/CTX.md` Parts 2 and 3); `plans/PARITY-GAPS.md` G2 to G18; milestone 9 (performance, BENCH) and 10
   (polish, icon, README, final captures, Docker image `kerno-linux-build` to remove).
+
+## 2026-11-13 — Menus on every surface, tree, maintenance, administration, backup, brand, connection settings
+
+Committed since `fc0ade2` (HEAD `f982e77`, 22 commits). One line per commit or group:
+
+- `5864bc9`: context menus on tabs, the editor and the status bar; closing a tab asks once for what it
+  would lose (CTX Part 2, M5 Part 4). `c086743` notes what it left.
+- `d7a0f70`: the tree lists a table's constraints, foreign keys, references and triggers; create templates
+  for the other folders; rename and drop a column; drop with cascade (G10). `7c6755f` notes what it left.
+- `521e23c`: cell and header menus of the grids, paste and filters from a cell (CTX Part 3, M6 Part 1).
+  `4f20be0` notes what it left.
+- `7ac5318`: maintenance tools per engine in core (vacuum, analyze, refresh, truncate options, trigger
+  switch; analyze, check, optimize, repair), session signals as dialect SQL, undo of pending changes (G12
+  core half). `3c6c179`: disk checks and the two-subagent rule in the plans.
+- `d4be8c4`: the administration tab (sessions, roles and grants, sizes, settings) and the keys for
+  editing table data (G2, M8 Part 4).
+- `b324aba`, `fd688e9`, `9b3e1ae`, `ca0434d`: Kerno identity, icons and colours; the theme carries the brand;
+  lockup in About and the README, mark in the empty state; M10 Part 5 becomes the brand part (D-032).
+- `514c0ba`: back up and restore a database with the installed client tools (M8 Part 3 app half).
+- `45b7470`, `c6d0aa7`: commit mode per connection, default schema and bootstrap statements; one test
+  process at a time (G13; D-033, D-035). `68033d6`, `d46bc23`: bootstrap statements reduced to a small
+  grammar after two security reviews (D-034).
+- `5f38692`: what the first real-app pass found (menus in submenus, sessions held only while shown, tab
+  strip, administration and export polish, a missing table says so).
+- `1aa6f04`: run on a closed connection, results in new tabs, run from the cursor, count rows, results
+  panel keys (G4); every session closed with its owner (D-036); a second pass of visual fixes.
+- `7c17a81`, `f982e77`: screens recaptured with the brand colours; second list of visual defects; what the
+  session and running work left.
+- Not committed at the time of writing: the maintenance dialog (G12 app half, `maintenance_dialog.rs`) and
+  work on CON-12, CON-33, CON-34, CON-47 and the questions asked before a transaction ends.
+
+`docs/DBEAVER-PARITY.md` recounted: 238 done, 6 done untested, 17 planned, 61 gap, 96 roadmap (418 rows).
+No full test run was made while writing this entry; test names in the docs were checked to exist by
+searching the code, not by running them.
+
