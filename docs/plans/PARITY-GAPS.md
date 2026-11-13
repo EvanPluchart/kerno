@@ -575,3 +575,17 @@ These rows were accepted for `docs/ROADMAP.md` with the reasons below and are no
 - **CM-09 — Paste in the sidebar's empty area**: decided for the roadmap. DBeaver pastes a copied
   connection; Kerno's "Duplicate" on the connection does the same in one step. Mark the row `roadmap` with
   that reason at the next update of `docs/DBEAVER-PARITY.md` and list it in `docs/ROADMAP.md`.
+
+## G10 — delivered on 2026-11-13, and what it left (small part, `opus`, app: `actions.rs`, `workspace.rs`,
+`structure/editor.rs`, `sql_confirm.rs`)
+
+Done: NAV-04 to NAV-07 (folders under a table), NAV-42 (create templates), CM-76 / CM-77 (rename and drop
+a column), NAV-44 as a separate "Drop with cascade…" entry on PostgreSQL. Left:
+- NAV-21 / CM-07 "Link with editor": `Navigator::reveal(&target, &table, kind, cx)` exists; add the command
+  (`secondary-shift-,`, as DBeaver's Ctrl+Shift+,) and its workspace handler taking the active data or
+  structure tab, and keep the sidebar's selected connection in step. UI test.
+- CM-72 / CM-73: F4 on a column and "Add column…" should open the table form (`open_table_editor`) with
+  that column selected or a new column row added, instead of the structure tab and an `ALTER` template.
+- NAV-44: DBeaver offers cascade as a checkbox in the drop confirmation; fold the separate entry into a
+  checkbox of `sql_confirm` when that dialog is next touched (PostgreSQL only).
+- Tests: the column test on MariaDB; the table-level trigger and MariaDB sequence templates on a server.
