@@ -773,9 +773,12 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Failure kinds.** `SshHostKeyUnknown` is its own kind; "the server asks for a password and none was
   given" is a login failure. In a query tab the next step is part of the message, because that view prints
   the detail before the hint. The raw message is selectable text.
-- **Database list of the dialog.** Loaded 600 ms after host, port or user last changed, or when the
-  password field loses the focus (never with half a password); it ignores the database typed in the field,
-  and on PostgreSQL goes through `postgres` when there is no database named after the user, as DBeaver does.
+- **Database list of the dialog.** Read only when the user presses "List…" beside the Database field:
+  listing logs in with what the fields hold, and a first version that listed by itself 600 ms after the
+  last keystroke could send the password to a host half typed (found by the security review of the
+  commit). Changing host, port, user or password forgets the list. It ignores the database typed in the
+  field, and on PostgreSQL goes through `postgres` when there is no database named after the user, as
+  DBeaver does.
 - **Secret cache.** Around the OS store only; one lock held across the read, so two connects starting
   together prompt once; "no such secret" is remembered, an error is not (a refused keychain prompt can be
   tried again). A secret added outside Kerno while it runs is seen at the next start.

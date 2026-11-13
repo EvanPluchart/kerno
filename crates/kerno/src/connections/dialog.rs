@@ -65,15 +65,14 @@ enum TestState {
 
 /// The server's databases, offered by the Database field.
 enum DatabaseList {
-    /// The fields do not allow a test yet.
+    /// Not asked for yet, or the fields changed since.
     Unknown,
+    /// Asked for while the host, the port or the user is missing.
+    Incomplete,
     Loading,
     Listed(Vec<String>),
     Failed(Explained),
 }
-
-/// How long the fields stay unchanged before the databases are listed.
-const LIST_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// The Database field's placeholder: PostgreSQL always opens a database.
 fn database_placeholder(engine: Engine) -> &'static str {
@@ -246,25 +245,19 @@ impl ConnectionDialog {
             }
         });
         let refilter = cx.observe(&engine_filter, |_, _, cx| cx.notify());
-        // What reaches the server changed: list its databases again. The
-        // password only once its field is left, so a pause in the middle of
-        // typing it never tries a login with half of it.
+        // What reaches the server changed: the list read before is another
+        // server's or another login's. It is read again only when asked
+        // for: nothing is sent to a server while the user types.
         let mut subscriptions = vec![fill_on_enter, refilter];
         for input in [&host, &port, &user, &password] {
-            let on_blur = input == &password;
-            subscriptions.push(cx.subscribe(input, move |this, _, event, cx| {
-                let settled = match event {
-                    InputEvent::Change => !on_blur,
-                    InputEvent::Blur => on_blur,
-                    _ => false,
-                };
-                if settled {
-                    this.list_databases(cx);
+            subscriptions.push(cx.subscribe(input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.forget_databases(cx);
                 }
             }));
         }
 
-        let mut this = Self {
+        Self {
             connections,
             editing,
             form,
@@ -301,14 +294,21 @@ impl ConnectionDialog {
             databases: DatabaseList::Unknown,
             listing: None,
             _subscriptions: subscriptions,
-        };
-        this.list_databases(cx);
-        this
+        }
     }
 
-    /// Lists the server's databases for the Database field, once the fields
-    /// allow a test and have not changed for [`LIST_DELAY`]. Quiet while
-    /// they do not: no field errors while the user is typing.
+    /// Drops the databases listed for other values of the fields.
+    fn forget_databases(&mut self, cx: &mut Context<Self>) {
+        self.listing = None;
+        if !matches!(self.databases, DatabaseList::Unknown) {
+            self.databases = DatabaseList::Unknown;
+            cx.notify();
+        }
+    }
+
+    /// Lists the server's databases for the Database field. Only when the
+    /// user asks for it: it logs in with what the fields hold, and a host
+    /// half typed must never be sent a password.
     fn list_databases(&mut self, cx: &mut Context<Self>) {
         let form = ConnectionForm {
             // Not needed to reach the server.
@@ -321,22 +321,18 @@ impl ConnectionDialog {
         let built = if filled { form.build().ok() } else { None };
         let Some((config, secrets)) = built else {
             self.listing = None;
-            self.databases = DatabaseList::Unknown;
+            self.databases = DatabaseList::Incomplete;
             cx.notify();
             return;
         };
         let trusted = self.trusted_fingerprint.clone();
+        self.databases = DatabaseList::Loading;
+        cx.notify();
+        let listing =
+            self.connections
+                .read(cx)
+                .list_databases(config.clone(), secrets, trusted, cx);
         self.listing = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(LIST_DELAY).await;
-            let Ok(listing) = this.update(cx, |this, cx| {
-                this.databases = DatabaseList::Loading;
-                cx.notify();
-                this.connections
-                    .read(cx)
-                    .list_databases(config.clone(), secrets, trusted, cx)
-            }) else {
-                return;
-            };
             let outcome = listing.await;
             let _ = this.update(cx, |this, cx| {
                 this.databases = match outcome {
@@ -403,7 +399,7 @@ impl ConnectionDialog {
         }
         self.form = form;
         self.test = TestState::NotRun;
-        self.list_databases(cx);
+        self.forget_databases(cx);
         cx.notify();
     }
 
@@ -566,12 +562,19 @@ impl ConnectionDialog {
             })
     }
 
-    /// The server's databases, to fill the Database field (still free text).
-    fn database_picker(&self) -> impl IntoElement {
-        let names = match &self.databases {
-            DatabaseList::Listed(names) => names.clone(),
-            _ => Vec::new(),
+    /// The server's databases, to fill the Database field (still free
+    /// text): a button that lists them, then the list to pick from.
+    fn database_picker(&self, cx: &Context<Self>) -> AnyElement {
+        let DatabaseList::Listed(names) = &self.databases else {
+            return Button::new("conn-database-load")
+                .outline()
+                .label("List…")
+                .loading(matches!(self.databases, DatabaseList::Loading))
+                .tooltip("Connect with the fields above and list the server's databases")
+                .on_click(cx.listener(|this, _, _, cx| this.list_databases(cx)))
+                .into_any_element();
         };
+        let names = names.clone();
         let input = self.inputs.database.clone();
         Button::new("conn-database-list")
             .outline()
@@ -592,6 +595,7 @@ impl ConnectionDialog {
                 }
                 menu
             })
+            .into_any_element()
     }
 
     /// What the listing of the databases found, under the field.
@@ -599,6 +603,13 @@ impl ConnectionDialog {
         let muted = cx.theme().muted_foreground;
         match &self.databases {
             DatabaseList::Unknown | DatabaseList::Listed(_) => div().into_any_element(),
+            DatabaseList::Incomplete => div()
+                .id("conn-database-incomplete")
+                .test_support()
+                .text_xs()
+                .text_color(muted)
+                .child("Fill in the host, the port and the user to list the databases.")
+                .into_any_element(),
             DatabaseList::Loading => div()
                 .id("conn-database-loading")
                 .test_support()
@@ -911,7 +922,7 @@ impl ConnectionDialog {
                                         Input::new(&self.inputs.database).id("conn-database"),
                                     ),
                                 )
-                                .child(self.database_picker()),
+                                .child(self.database_picker(cx)),
                         )
                         .child(self.render_databases(cx)),
                     cx,

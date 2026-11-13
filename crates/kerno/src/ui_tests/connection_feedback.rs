@@ -124,11 +124,19 @@ fn the_database_field_lists_the_servers_databases(cx: &mut TestAppContext) {
                 "kerno_ui_no_such_database",
             ),
         );
-        cx.executor().advance_clock(Duration::from_secs(1));
+        // Nothing is sent to the server until the list is asked for.
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        for id in [
+            "conn-database-list",
+            "conn-database-loading",
+            "conn-database-failed",
+        ] {
+            assert!(!app.has(cx, id), "{engine:?}: {id}");
+        }
+        app.click(cx, "conn-database-load");
         app.wait_until(cx, "the list of databases", |app, cx| {
-            app.step(cx, |window, _| {
-                window.find("conn-database-list").disabled() != Some(true)
-            })
+            app.has(cx, "conn-database-list")
         });
         assert!(!app.has(cx, "conn-database-failed"));
         app.click(cx, "conn-database-list");
@@ -163,7 +171,7 @@ fn a_database_list_that_fails_leaves_the_field_usable(cx: &mut TestAppContext) {
             "kerno",
         ),
     );
-    cx.executor().advance_clock(Duration::from_secs(1));
+    app.click(cx, "conn-database-load");
     app.wait_until(cx, "the failed list", |app, cx| {
         app.has(cx, "conn-database-failed")
     });
@@ -284,16 +292,14 @@ fn a_postgres_user_without_a_database_of_its_name_lists_through_postgres(cx: &mu
             testing::port(Engine::Postgres)
         ),
     );
-    cx.executor().advance_clock(Duration::from_secs(1));
+    app.click(cx, "conn-database-load");
     app.wait_until(cx, "the list of databases", |app, cx| {
         assert!(
             !app.has(cx, "conn-database-failed"),
             "{:?}",
             painted(app, cx)
         );
-        app.step(cx, |window, _| {
-            window.find("conn-database-list").disabled() != Some(true)
-        })
+        app.has(cx, "conn-database-list")
     });
     app.click(cx, "conn-database-list");
     assert!(app.shows_label(cx, "kerno"));
