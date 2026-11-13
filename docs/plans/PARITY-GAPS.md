@@ -589,3 +589,20 @@ a column), NAV-44 as a separate "Drop with cascade…" entry on PostgreSQL. Left
 - NAV-44: DBeaver offers cascade as a checkbox in the drop confirmation; fold the separate entry into a
   checkbox of `sql_confirm` when that dialog is next touched (PostgreSQL only).
 - Tests: the column test on MariaDB; the table-level trigger and MariaDB sequence templates on a server.
+
+## G13 — delivered on 2026-11-13, and what it left (one `opus` agent, app: `sidebar.rs`, `actions.rs`,
+`workspace.rs`, `tabs.rs`, `connections/manager.rs`)
+
+Done: CON-07 and CON-13 (commit mode per connection, manual by default on production), CON-16 (default
+schema on PostgreSQL), CON-17 (bootstrap statements; Kerno refuses ones that write, change the schema or
+name a secret — a deviation from DBeaver recorded in DECISIONS). Left:
+- CON-12: toggle read-only from the connection's menu and the palette (save the flag, then reconnect so
+  every session reopens read-only).
+- CON-33, CON-34, CM-12: disconnect / reconnect commands that first ask about open transactions of that
+  connection's tabs (the same question as closing a tab), and "Disconnect all".
+- CON-47: the connection's tag colour on its tabs (a stripe) and on the status bar's connection item.
+- The commit mode is read when a query tab is created: a tab switched to another connection keeps its
+  mode — make `set_target` re-read it when the tab has no open transaction.
+- `SET password_encryption = …` is refused as a bootstrap statement because the word contains
+  "password": match secrets as values (`PASSWORD '…'`, `IDENTIFIED BY`), not as substrings of identifiers.
+- A tunnel test with a bootstrap statement; a capture of the dialog's Advanced section.
