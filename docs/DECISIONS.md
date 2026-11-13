@@ -893,3 +893,22 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   scheduler (TOOL-30: DBeaver Community has none) are on the roadmap.
 - **The Tasks view reads its list on events** (opening, a task saved, run or deleted, Refresh), never
   while drawing: a first version reloaded at each frame and never came to rest.
+
+## D-050 — Main toolbar: what was decided while building it
+
+- **The toolbar acts on the active tab's connection**, else on the one selected in the sidebar: the same
+  connection its pickers show. (The first plan said the selected tree row first.)
+- **DBeaver's order**: Connect, Reconnect, Disconnect; the transaction log sits with the read-only toggle.
+  Groups are separated by a gap, not a drawn rule (owner's item 1).
+- **Tools is a list**, the sidebar's Tools entries for that connection; it has no command of its own. Two
+  commands are new and have no key: Connect, Show Main Toolbar.
+- **Isolation level.** PostgreSQL: `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …`, read
+  with `SHOW transaction_isolation`; MySQL: `SET SESSION TRANSACTION ISOLATION LEVEL …`, read with
+  `@@transaction_isolation`; MariaDB reads `@@tx_isolation`, which every version has. The level is the
+  session's, never a server default; a change is refused while a transaction is open. A query tab reads
+  the level when its session opens: one more round trip before the first run; a failure there only leaves
+  the tick out.
+- **Overflow.** The pickers shrink first (names cut, whole in the tooltip), then whole groups move from
+  the right into a "»" menu. A script that no longer exists leaves the recent list when it is picked: the
+  list is not checked against the disk when it opens.
+- **Tooltips** take the shortcut from the live keymap through the kit's `tooltip_with_action`.

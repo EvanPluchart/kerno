@@ -791,3 +791,31 @@ async fn another_sessions_statement_can_be_cancelled() {
     assert_eq!(scalar(&session, "SELECT 1").await, "1");
     let _ = rows(&session, "SELECT 1").await;
 }
+
+#[tokio::test]
+async fn the_isolation_level_is_set_for_this_session_only() {
+    use kerno_core::IsolationLevel;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let Some(other) = common::session().await else {
+        return;
+    };
+    let default = exec::isolation(other.clone()).await.unwrap();
+    assert_eq!(default, Some(IsolationLevel::ReadCommitted));
+    for &level in session.dialect().isolation_levels() {
+        let now = exec::set_isolation(session.clone(), level).await.unwrap();
+        assert_eq!(now, Some(level));
+        // The session's next transaction runs at that level.
+        exec_ok(&session, "BEGIN").await;
+        assert_eq!(
+            IsolationLevel::parse(&scalar(&session, "SHOW transaction_isolation").await),
+            Some(level)
+        );
+        exec_ok(&session, "ROLLBACK").await;
+    }
+    // Another session keeps the server's default.
+    assert_eq!(exec::isolation(other.clone()).await.unwrap(), default);
+    session.close().await;
+    other.close().await;
+}

@@ -111,7 +111,17 @@ pub struct Settings {
     pub check_updates: bool,
     /// The release "Skip this version" chose: not offered by the checks.
     pub skipped_update: Option<String>,
+    /// The main toolbar is shown under the title bar.
+    pub toolbar_visible: bool,
+    /// The main toolbar's items the user hid (its right-click menu), by id.
+    pub toolbar_hidden: BTreeSet<String>,
+    /// The `.sql` files opened or saved last, the latest first (the main
+    /// toolbar's New SQL editor lists them).
+    pub recent_scripts: Vec<PathBuf>,
 }
+
+/// How many `.sql` files the main toolbar lists.
+pub const RECENT_SCRIPTS: usize = 10;
 
 /// The sizes the settings allow, in points.
 pub const UI_FONT_SIZES: std::ops::RangeInclusive<f32> = 12.0..=18.0;
@@ -150,6 +160,9 @@ impl Default for Settings {
             environments: environment::builtin_environments(),
             check_updates: true,
             skipped_update: None,
+            toolbar_visible: true,
+            toolbar_hidden: BTreeSet::new(),
+            recent_scripts: Vec::new(),
         }
     }
 }
@@ -214,6 +227,14 @@ impl Settings {
     pub fn save(&self, storage: &Storage) -> kerno_core::Result<()> {
         storage.set_setting(KEY, self)
     }
+
+    /// Puts `path` first in the recent scripts, once, keeping the last
+    /// [`RECENT_SCRIPTS`].
+    pub fn remember_script(&mut self, path: PathBuf) {
+        self.recent_scripts.retain(|recent| *recent != path);
+        self.recent_scripts.insert(0, path);
+        self.recent_scripts.truncate(RECENT_SCRIPTS);
+    }
 }
 
 #[cfg(test)]
@@ -273,9 +294,41 @@ mod tests {
             },
             check_updates: false,
             skipped_update: Some("0.2.0".into()),
+            toolbar_visible: false,
+            toolbar_hidden: ["commit".to_string()].into(),
+            recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);
+    }
+
+    #[test]
+    fn recent_scripts_keep_the_last_ten_latest_first_once_each() {
+        let mut settings = Settings::default();
+        for n in 0..12 {
+            settings.remember_script(PathBuf::from(format!("/s/{n}.sql")));
+        }
+        settings.remember_script(PathBuf::from("/s/5.sql"));
+        let names: Vec<String> = settings
+            .recent_scripts
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "/s/5.sql",
+                "/s/11.sql",
+                "/s/10.sql",
+                "/s/9.sql",
+                "/s/8.sql",
+                "/s/7.sql",
+                "/s/6.sql",
+                "/s/4.sql",
+                "/s/3.sql",
+                "/s/2.sql"
+            ]
+        );
     }
 
     #[test]
@@ -318,6 +371,8 @@ mod tests {
         assert_eq!(loaded.table_double_click, TableDoubleClick::Data);
         // And ask before a tab with pending work is closed.
         assert!(loaded.confirm_close_tab);
+        // The main toolbar came later: shown, with every item.
+        assert!(loaded.toolbar_visible && loaded.toolbar_hidden.is_empty());
         // The settings view's values came later: their defaults.
         assert_eq!(loaded.grid_font_size, 11.5);
         assert_eq!(loaded.null_text, "NULL");

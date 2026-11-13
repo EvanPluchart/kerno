@@ -327,10 +327,16 @@ Found and fixed on the way:
   foreign data wrappers, saved tasks and the Tasks view; the update check through the system's `curl` with
   a verified install by swap on macOS and Linux; no GitHub Actions: `scripts/check.sh` and
   `scripts/release.sh`.
+- Owner's test, item 11 (D-050): the main toolbar under the title bar (DBeaver's items and order, greyed
+  with the menus' reasons, shortcuts in tooltips, items hidden by right-click, overflow menu) and isolation
+  levels per session on the three engines. All thirteen items of the owner's test are built. Workspace:
+  1,087 tests green.
+- First look at the new screens in the real app (`docs/screenshots/m10-p9-*`): eleven defects listed in
+  `plans/M10.md` Part 15.
 
 Still open:
 
-- Owner's test, what is left: the main toolbar (item 11).
+- The fourth visual list (`plans/M10.md` Part 15).
 - One test still fails about once in forty full runs:
   `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user, both idle in
   a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test

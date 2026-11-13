@@ -274,6 +274,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Command Palette…", OpenCommandPalette),
                 command("quick_open"),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                command("toggle_main_toolbar"),
                 command("focus_navigator_filter"),
                 command("link_with_editor"),
                 separator(),
@@ -369,6 +370,7 @@ fn menus() -> Vec<Menu> {
         menu(
             "Database",
             vec![
+                command("connect"),
                 MenuItem::action("Disconnect", actions::DisconnectTabConnection),
                 MenuItem::action("Reconnect", actions::ReconnectTabConnection),
                 MenuItem::action("Disconnect Others", actions::DisconnectOtherConnections),

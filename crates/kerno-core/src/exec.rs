@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
 
+use crate::dialect::IsolationLevel;
 use crate::driver::Session;
 use crate::error::{DbError, Error, Result};
 use crate::result::{BatchBuilder, Column, RowBatch};
@@ -408,6 +409,29 @@ pub async fn collect(session: Arc<dyn Session>, sql: impl Into<String>) -> Resul
         }
     }
     Ok(collected)
+}
+
+/// The isolation level the server gives `session`'s next transactions
+/// ([`Dialect::isolation_sql`]); `None` for a name of no standard level.
+pub async fn isolation(session: Arc<dyn Session>) -> Result<Option<IsolationLevel>> {
+    let sql = session.dialect().isolation_sql();
+    let collected = collect(session, sql).await?;
+    Ok(collected
+        .results
+        .first()
+        .and_then(|result| result.rows().into_iter().next())
+        .and_then(|row| row.into_iter().next().flatten())
+        .and_then(|name| IsolationLevel::parse(&name)))
+}
+
+/// Gives `session`'s next transactions `level` (for this session only),
+/// then reads back the level the server now gives them.
+pub async fn set_isolation(
+    session: Arc<dyn Session>,
+    level: IsolationLevel,
+) -> Result<Option<IsolationLevel>> {
+    collect(session.clone(), session.dialect().set_isolation_sql(level)).await?;
+    isolation(session).await
 }
 
 impl From<DbError> for Notice {

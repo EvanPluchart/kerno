@@ -147,6 +147,17 @@ impl Dialect for MysqlDialect {
         self.engine
     }
 
+    /// MariaDB names the variable `transaction_isolation` only from 11.1;
+    /// `tx_isolation` is there in every version. MySQL 8 dropped
+    /// `tx_isolation`. Both take the standard `SET SESSION TRANSACTION`.
+    fn isolation_sql(&self) -> &'static str {
+        if self.engine == Engine::MariaDb {
+            "SELECT @@tx_isolation"
+        } else {
+            "SELECT @@transaction_isolation"
+        }
+    }
+
     fn has_schemas(&self) -> bool {
         false
     }
@@ -711,6 +722,22 @@ mod tests {
             collation: None,
             enum_values: Vec::new(),
         }
+    }
+
+    #[test]
+    fn isolation_is_read_from_the_variable_each_server_has() {
+        use kerno_core::IsolationLevel;
+        let d = mysql();
+        assert_eq!(d.isolation_levels(), IsolationLevel::ALL);
+        assert_eq!(
+            d.set_isolation_sql(IsolationLevel::ReadUncommitted),
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+        );
+        assert_eq!(d.isolation_sql(), "SELECT @@transaction_isolation");
+        assert_eq!(
+            MysqlDialect::new(Engine::MariaDb).isolation_sql(),
+            "SELECT @@tx_isolation"
+        );
     }
 
     #[test]

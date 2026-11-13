@@ -149,6 +149,22 @@ impl ConnectionDialog {
         Self::show(view, title, window, cx);
     }
 
+    /// Opens the dialog for a new connection of `engine` (the main
+    /// toolbar's engine list).
+    pub fn open_for_engine(
+        connections: Entity<Connections>,
+        engine: Engine,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let view = cx.new(|cx| {
+            let mut dialog = Self::new(connections, None, None, window, cx);
+            dialog.pick_engine(engine, window, cx);
+            dialog
+        });
+        Self::show(view, "New connection".into(), window, cx);
+    }
+
     /// Opens the dialog for a new connection in `folder`.
     pub fn open_in(
         connections: Entity<Connections>,

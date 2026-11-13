@@ -36,7 +36,7 @@ pub use config::{
     TlsMode,
 };
 pub use connector::{Connector, HostKeyStore};
-pub use dialect::Dialect;
+pub use dialect::{Dialect, IsolationLevel};
 pub use driver::{AdminView, Driver, Session, TxState};
 pub use error::{DbError, Error, Result};
 pub use exec::{ExecEvent, ExecSink, Execution, Notice, RowDemand, RowLimit};

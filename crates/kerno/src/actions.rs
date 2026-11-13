@@ -160,6 +160,9 @@ gpui_kit::actions!(
         RollbackTransaction,
         /// Switches the active tab between auto-commit and manual commit.
         ToggleCommitMode,
+        /// Connects the connection selected in the sidebar when it has the
+        /// keyboard, else the active tab's.
+        Connect,
         /// Disconnects the connection of the active tab.
         DisconnectTabConnection,
         /// Disconnects and connects again the connection of the active tab.
@@ -223,6 +226,8 @@ gpui_kit::actions!(
         PreviousTab,
         /// Shows or hides the sidebar.
         ToggleSidebar,
+        /// Shows or hides the main toolbar.
+        ToggleMainToolbar,
         /// Opens the settings.
         OpenSettings,
         /// Follows the system's light or dark appearance.
@@ -1414,6 +1419,16 @@ pub const COMMANDS: &[Command] = &[
         ["transaction", "autocommit"],
         ToggleCommitMode
     ),
+    // The main toolbar's Connect: the connection selected in the sidebar
+    // when it has the keyboard, else the active tab's.
+    command!(
+        "connect",
+        "Connect",
+        "Connections",
+        [],
+        ["open", "login", "server"],
+        Connect
+    ),
     command!(
         "disconnect_tab_connection",
         "Disconnect the Active Tab's Connection",
@@ -1690,6 +1705,14 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-b"],
         ["connections", "navigator"],
         ToggleSidebar
+    ),
+    command!(
+        "toggle_main_toolbar",
+        "Show Main Toolbar",
+        "View",
+        [],
+        ["toolbar", "hide", "buttons"],
+        ToggleMainToolbar
     ),
     // DBeaver's `core.navigator.linkeditor` (Ctrl+Shift+,).
     command!(

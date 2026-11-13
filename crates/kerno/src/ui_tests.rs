@@ -47,6 +47,7 @@ mod menus;
 mod sidebar_tree;
 mod tasks;
 mod tool_wizards;
+mod toolbar;
 mod tools_menu;
 mod updates;
 

@@ -118,7 +118,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-38 | Delete connection | Removes the saved connection after asking | core `org.eclipse.ui.edit.delete` | PG, My | **done**: `deleting_a_connection_asks_first` |
 | CON-39 | Rename connection | F2 on the connection | core `org.eclipse.ui.edit.rename` | PG, My | **done**: Rename… in the connection menu; `the_sidebar_answers_a_right_click_on_each_part`, `folders_are_made_renamed_and_removed_with_what_they_hold`; F2 is not bound in the connection list |
 | CON-40 | Import / export connections | Moves connection definitions between installs | core `org.eclipse.ui.file.import` / `export` (project import) | PG, My | **done**: JSON without secrets; `connections_are_exported_without_secrets_and_imported_back` |
-| CON-41 | Transaction mode menu | Auto-commit, manual commit, smart commit and isolation level for the active session | core `DataSourceTransactionModeContributor` | PG, My | **done**: Per-tab auto / manual mode; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
+| CON-41 | Transaction mode menu | Auto-commit, manual commit, smart commit and isolation level for the active session | core `DataSourceTransactionModeContributor` | PG, My | **done**: Per-tab auto / manual mode, and the engine's isolation levels with the session's ticked (main toolbar ▸ transaction mode; PostgreSQL 3, MySQL and MariaDB 4; this session only); `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended`, `the_mode_list_switches_the_commit_mode_and_sets_the_isolation_level`, drivers `the_isolation_level_is_set_for_this_session_only` |
 | CON-42 | Smart commit mode | Switches to manual mode when a modifying statement runs, back to auto after commit | ui.editors.connection `action_menu_transaction_smart_auto_commit` | PG, My | **roadmap**: Off by default in DBeaver; manual mode per tab covers the need |
 | CON-43 | Commit / Rollback | Ends the transaction of the active session | core `core.commit` (Ctrl+4), `core.rollback` (Ctrl+8) | PG, My | **done**: Toolbar Commit / Rollback; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
 | CON-44 | Commit / Rollback shortcuts | Keys for commit and rollback | core key bindings of `core.commit` / `core.rollback` | PG, My | **done**: Commit (Ctrl+4), Roll back (Ctrl+8), toggle commit mode (Ctrl+Alt+A). `commit_rollback_and_the_commit_mode_have_keys` |
@@ -129,6 +129,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-49 | Shell commands on connection events | Runs local commands before / after connect | ui.editors.connection `ConnectionPageShellCommands` | PG, My | **roadmap**: Runs local programs from a connection; outside CLAUDE.md §4.A and a security surface |
 | CON-50 | Driver manager, change connection driver | Edits JDBC drivers; migrates a connection to another driver | ui.editors.connection `core.driver.manager`, `core.migrate.connection` | PG, My | **roadmap**: Kerno has native drivers, no JDBC (Eclipse / JDBC plumbing) |
 | CON-51 | Connection permissions, lock password, project sync | Team and project features | ui.editors.connection `EditConnectionPermissionsDialog`; core `core.connection.synchronize` | PG, My | **roadmap**: Eclipse project / team features |
+| CON-52 | Main toolbar | New connection (engines) · Connect, Invalidate/Reconnect, Disconnect · SQL editor (recent scripts) · Commit, Rollback, transaction mode · Transaction log, Read-only · active connection and schema selectors · tools and search, each greyed when it does not apply | core `plugin.xml` toolbars `dbeaver-general`, `dbeaver-transactions`, `dbeaver-transaction-monitor`; ui.editors.sql `menu.sql.open`; ui.navigator `ui.tools.select.connection`, `.schema` | PG, My | **done**: the same items in the same order under the title bar, each running its palette command with its shortcut in the tooltip; hidden items and the row itself stored in the settings; a narrow window sends the rightmost groups under "»". `every_item_is_there_and_greyed_with_its_reason_when_nothing_is_open`, `commit_and_rollback_apply_while_a_transaction_is_open`, `the_pickers_change_the_active_tab_s_connection_and_schema` (`ui_tests/toolbar.rs`) |
 
 ## Navigator
 
@@ -615,9 +616,15 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-131 | Active connection / schema selector | Switch the editor's target | core / ui.navigator `ui.tools.select.connection`, `.schema` (toolbar) | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
-| CM-132 | Transaction mode, Commit, Rollback | Transaction controls | core `menu.txn`, `commit.menu`, `rollback.menu` | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
+| CM-131 | Active connection / schema selector | Switch the editor's target | core / ui.navigator `ui.tools.select.connection`, `.schema` (toolbar) | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed`, main toolbar pickers: `the_pickers_change_the_active_tab_s_connection_and_schema` |
+| CM-132 | Transaction mode, Commit, Rollback | Transaction controls | core `menu.txn`, `commit.menu`, `rollback.menu` | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed`, main toolbar: `commit_and_rollback_apply_while_a_transaction_is_open`, `the_mode_list_switches_the_commit_mode_and_sets_the_isolation_level` |
 | CM-133 | Transaction log, pending transactions | Transaction monitor entries | core `menu.txn.log` (`core.txn.log`, `core.txn.pending`) | PG, My | **done**: Transaction log… on the status bar's transaction item; pending list on the roadmap (CON-46). `the_transaction_log_lists_the_statements_until_the_transaction_ends` |
+
+### Main toolbar
+
+| ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
+| -- | ---- | ---- | ---- | ---- | ---- |
+| CM-134 | Hide an item, reset | The toolbar's right-click hides or shows its items | Eclipse toolbar context menu (Hide, Customize Perspective…) | PG, My | **done**: every item with a tick, Reset toolbar, stored in the settings; `a_right_click_hides_an_item_and_the_choice_survives_a_restart` (`ui_tests/toolbar.rs`) |
 
 ## Summary
 
@@ -625,13 +632,13 @@ Counts per status and per area, recounted from the rows above at HEAD `409c4fc` 
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
-| Connections | 36 | 0 | 0 | 0 | 15 | 51 |
+| Connections | 37 | 0 | 0 | 0 | 15 | 52 |
 | Navigator | 41 | 0 | 0 | 0 | 18 | 59 |
 | SQL editor | 38 | 0 | 0 | 0 | 16 | 54 |
 | Results and data editing | 57 | 0 | 0 | 0 | 15 | 72 |
 | Object editors (structure) | 15 | 0 | 0 | 0 | 6 | 21 |
 | Tools and administration | 15 | 0 | 0 | 0 | 16 | 31 |
-| Context menus | 122 | 0 | 0 | 0 | 11 | 133 |
-| **All** | **324** | **0** | **0** | **0** | **97** | **421** |
+| Context menus | 123 | 0 | 0 | 0 | 11 | 134 |
+| **All** | **326** | **0** | **0** | **0** | **97** | **423** |
 
 CM-09 (Paste of a copied connection), CM-15 (Refresh on a folder), NAV-48 and CM-33, once gaps, are done: each row names its test.

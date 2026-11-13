@@ -1,6 +1,8 @@
 //! PostgreSQL's SQL dialect.
 
-use kerno_core::dialect::{DatabaseOptions, Dialect, default_drop_sql, default_rename_sql, hex};
+use kerno_core::dialect::{
+    DatabaseOptions, Dialect, IsolationLevel, default_drop_sql, default_rename_sql, hex,
+};
 use kerno_core::maintenance::{Maintenance, MaintenanceSql};
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::LexRules;
@@ -91,6 +93,27 @@ impl Dialect for PgDialect {
 
     fn read_only_session_sql(&self) -> &'static str {
         "SET default_transaction_read_only = on"
+    }
+
+    /// READ UNCOMMITTED is accepted but behaves as READ COMMITTED here: it
+    /// is not offered.
+    fn isolation_levels(&self) -> &'static [IsolationLevel] {
+        &[
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+        ]
+    }
+
+    fn set_isolation_sql(&self, level: IsolationLevel) -> String {
+        format!(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}",
+            level.sql()
+        )
+    }
+
+    fn isolation_sql(&self) -> &'static str {
+        "SHOW transaction_isolation"
     }
 
     /// `CHAR` without a length is one character here.
@@ -466,6 +489,24 @@ WHERE n.nspname = {}",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_is_set_for_the_session_s_transactions() {
+        let d = PgDialect;
+        assert_eq!(
+            d.isolation_levels(),
+            [
+                IsolationLevel::ReadCommitted,
+                IsolationLevel::RepeatableRead,
+                IsolationLevel::Serializable
+            ]
+        );
+        assert_eq!(
+            d.set_isolation_sql(IsolationLevel::Serializable),
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        );
+        assert_eq!(d.isolation_sql(), "SHOW transaction_isolation");
+    }
 
     #[test]
     fn identifiers_are_always_quoted() {

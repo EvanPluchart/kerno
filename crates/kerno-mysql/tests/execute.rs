@@ -1314,3 +1314,22 @@ async fn another_sessions_statement_can_be_cancelled() {
         assert_eq!(scalar(&session, "SELECT CONNECTION_ID()").await, id);
     }
 }
+
+#[tokio::test]
+async fn the_isolation_level_is_set_for_this_session_only() {
+    use kerno_core::IsolationLevel;
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let other = common::session(engine).await;
+        let default = exec::isolation(other.clone()).await.unwrap();
+        assert_eq!(default, Some(IsolationLevel::RepeatableRead));
+        for &level in session.dialect().isolation_levels() {
+            let now = exec::set_isolation(session.clone(), level).await.unwrap();
+            assert_eq!(now, Some(level), "{engine:?}");
+        }
+        // Another session keeps the server's default.
+        assert_eq!(exec::isolation(other.clone()).await.unwrap(), default);
+        session.close().await;
+        other.close().await;
+    }
+}

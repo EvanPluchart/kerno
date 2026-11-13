@@ -49,7 +49,8 @@ use kerno_core::sql::{
 };
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
-    Dialect, Error, ExecEvent, Notice, Plan, ResultStore, RowLimit, Session, TxState, exec,
+    Dialect, Error, ExecEvent, IsolationLevel, Notice, Plan, ResultStore, RowLimit, Session,
+    TxState, exec,
 };
 
 use super::comment;
@@ -343,6 +344,12 @@ pub struct QueryTab {
     cancel_requested: bool,
     /// Statements run in a transaction that the user commits or rolls back.
     manual_commit: bool,
+    /// The isolation level chosen for this tab's connection (the main
+    /// toolbar), given again to each session the tab opens on it.
+    chosen_isolation: Option<IsolationLevel>,
+    /// The isolation level the server gives the session's transactions, as
+    /// read back when it opened or was last set.
+    isolation: Option<IsolationLevel>,
     /// The statements of the open transaction, in manual commit.
     tx_log: Vec<TxLogEntry>,
     /// What was typed for each parameter last time, by its label.
@@ -522,6 +529,8 @@ impl QueryTab {
             run: None,
             cancel_requested: false,
             manual_commit,
+            chosen_isolation: None,
+            isolation: None,
             tx_log: Vec::new(),
             param_values: HashMap::new(),
             error_marked: false,
@@ -867,6 +876,10 @@ impl QueryTab {
             return;
         }
         let connection = |target: &Option<Target>| target.as_ref().map(|t| t.connection.clone());
+        if connection(&self.target) != connection(&target) {
+            // A level is chosen for one server.
+            self.chosen_isolation = None;
+        }
         if connection(&self.target) != connection(&target) && self.tx_state() == TxState::Idle {
             let environments = &AppState::get(cx).settings.environments;
             self.manual_commit = target
@@ -1079,8 +1092,23 @@ impl QueryTab {
                 .read(cx)
                 .open_session(&target.connection, target.database.clone(), cx);
         let generation = self.generation;
+        let chosen = self.chosen_isolation;
         cx.spawn(async move |this, cx| {
             let session = opening.await?;
+            // The level chosen for the tab, or the server's, for the tick
+            // of the toolbar's transaction mode.
+            let reading = {
+                let session = session.clone();
+                cx.update(|cx| {
+                    bridge::spawn(cx, async move {
+                        match chosen {
+                            Some(level) => exec::set_isolation(session, level).await,
+                            None => exec::isolation(session).await,
+                        }
+                    })
+                })
+            };
+            let isolation = reading.await.ok().flatten();
             if session.dialect().has_schemas() {
                 if let Some(schema) = &target.schema {
                     let sql = format!(
@@ -1122,6 +1150,7 @@ impl QueryTab {
                 }
                 _ => {
                     this.session = Some(session.clone());
+                    this.isolation = isolation;
                     session
                 }
             });
@@ -1132,6 +1161,7 @@ impl QueryTab {
     /// Closes the tab's session now: the tab is closing, moving to another
     /// target, or its connection closed. Results on screen stay.
     pub fn close_session(&mut self, cx: &mut Context<Self>) {
+        self.isolation = None;
         if let Some(session) = self.session.take() {
             bridge::spawn(cx, async move {
                 // A transaction is rolled back before, not cancelled by, the
@@ -2595,8 +2625,9 @@ impl QueryTab {
         }
     }
 
-    /// What the editor's menu offers to run on.
-    fn choices(&self, cx: &App) -> Choices {
+    /// What the editor's menu (and the main toolbar's pickers) offer to
+    /// run on.
+    pub(crate) fn choices(&self, cx: &App) -> Choices {
         let connections = self.connections.read(cx);
         let target = self.target.as_ref();
         Choices {
@@ -2649,6 +2680,73 @@ impl QueryTab {
             );
             tabs::fit_window(menu, window)
         }
+    }
+
+    /// The isolation level of the tab's session, as the server gave it;
+    /// `None` before the session opens.
+    pub fn isolation(&self) -> Option<IsolationLevel> {
+        self.isolation
+    }
+
+    /// Why the isolation level cannot be changed now, when it cannot: the
+    /// session must be free and outside a transaction.
+    pub fn isolation_why_not(&self, cx: &App) -> Option<&'static str> {
+        if self.target.is_none() {
+            Some("no connection")
+        } else if !self.connected(cx) {
+            Some("not connected")
+        } else if self.tx_state() != TxState::Idle {
+            Some("a transaction is open")
+        } else if self.running() {
+            Some("running")
+        } else {
+            // A result still being paged holds the session.
+            self.run.is_some().then_some("a result is being read")
+        }
+    }
+
+    /// Gives the tab's session `level` (opened first if needed), for this
+    /// session only, then shows the level the server reads back. Its next
+    /// sessions on the same connection take it too.
+    pub fn set_isolation(
+        &mut self,
+        level: IsolationLevel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.isolation_why_not(cx) {
+            window.push_notification(
+                Notification::warning(SharedString::from(format!("Isolation level: {reason}."))),
+                cx,
+            );
+            return;
+        }
+        self.chosen_isolation = Some(level);
+        let opening = self.session(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = match opening.await {
+                Ok(session) => match cx
+                    .update(|_, cx| bridge::spawn(cx, exec::set_isolation(session, level)))
+                {
+                    Ok(setting) => setting.await,
+                    Err(_) => return,
+                },
+                Err(error) => Err(error),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                match outcome {
+                    Ok(isolation) => this.isolation = isolation,
+                    Err(error) => window.push_notification(
+                        Notification::error(SharedString::from(format!(
+                            "Isolation level: {error}"
+                        ))),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Statements run in a transaction the user ends (`true`), or each is
@@ -5901,7 +5999,7 @@ impl QueryTab {
 
 /// Runs an entry of the editor's menu as its command does: through the
 /// editor, which has the focus.
-fn run_editor_action(
+pub(crate) fn run_editor_action(
     view: &Entity<QueryTab>,
     action: TabAction,
     window: &mut Window,

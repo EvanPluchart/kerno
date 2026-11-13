@@ -309,6 +309,72 @@ pub trait Dialect: Send + Sync {
     fn alter_table_sql(&self, table: &TableRef, changes: &[TableChange]) -> Result<Vec<String>> {
         default_alter_table_sql(self, table, changes)
     }
+
+    /// The isolation levels a session can be set to, weakest first (the
+    /// main toolbar's transaction mode lists them). The default is the
+    /// standard's four.
+    fn isolation_levels(&self) -> &'static [IsolationLevel] {
+        &IsolationLevel::ALL
+    }
+
+    /// The statement that gives the session's next transactions `level`;
+    /// never the server's default for other sessions.
+    fn set_isolation_sql(&self, level: IsolationLevel) -> String {
+        format!("SET SESSION TRANSACTION ISOLATION LEVEL {}", level.sql())
+    }
+
+    /// The statement that reads the level back: one row, one column, a
+    /// name [`IsolationLevel::parse`] reads.
+    fn isolation_sql(&self) -> &'static str {
+        "SELECT @@transaction_isolation"
+    }
+}
+
+/// A transaction isolation level of the SQL standard, as DBeaver lists them
+/// (`JDBCTransactionIsolation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Every level, weakest first.
+    pub const ALL: [IsolationLevel; 4] = [
+        Self::ReadUncommitted,
+        Self::ReadCommitted,
+        Self::RepeatableRead,
+        Self::Serializable,
+    ];
+
+    /// Its name in SQL: `READ COMMITTED`.
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "READ UNCOMMITTED",
+            Self::ReadCommitted => "READ COMMITTED",
+            Self::RepeatableRead => "REPEATABLE READ",
+            Self::Serializable => "SERIALIZABLE",
+        }
+    }
+
+    /// Its name in menus.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "Read uncommitted",
+            Self::ReadCommitted => "Read committed",
+            Self::RepeatableRead => "Repeatable read",
+            Self::Serializable => "Serializable",
+        }
+    }
+
+    /// The level a server names: PostgreSQL says `read committed`, MySQL
+    /// and MariaDB `READ-COMMITTED`. `None` for a name of no standard level.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim().replace('-', " ").to_ascii_uppercase();
+        Self::ALL.into_iter().find(|level| level.sql() == name)
+    }
 }
 
 /// `("a", "b")`: names quoted, in a parenthesised list.
@@ -716,6 +782,36 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::AnsiDialect;
     use super::*;
+
+    #[test]
+    fn isolation_levels_read_the_names_each_server_gives() {
+        use IsolationLevel::*;
+        for (name, level) in [
+            ("read committed", ReadCommitted),
+            ("REPEATABLE-READ", RepeatableRead),
+            ("READ-UNCOMMITTED", ReadUncommitted),
+            (" Serializable ", Serializable),
+            ("REPEATABLE READ", RepeatableRead),
+        ] {
+            assert_eq!(IsolationLevel::parse(name), Some(level), "{name}");
+        }
+        assert_eq!(IsolationLevel::parse("snapshot"), None);
+        for level in IsolationLevel::ALL {
+            assert_eq!(IsolationLevel::parse(level.sql()), Some(level));
+        }
+        assert_eq!(ReadUncommitted.label(), "Read uncommitted");
+    }
+
+    #[test]
+    fn the_standard_sets_the_session_s_isolation_level() {
+        let dialect = AnsiDialect;
+        assert_eq!(dialect.isolation_levels(), IsolationLevel::ALL);
+        assert_eq!(
+            dialect.set_isolation_sql(IsolationLevel::ReadCommitted),
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+        );
+        assert_eq!(dialect.isolation_sql(), "SELECT @@transaction_isolation");
+    }
 
     fn column(kind: TypeKind) -> ColumnInfo {
         ColumnInfo {

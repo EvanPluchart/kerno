@@ -36,6 +36,11 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
   Each connection is in an environment (local, staging, production or one of your own) whose colour tints
   the window around it and whose rules apply: commit mode, confirmations, read-only default, idle
   transactions rolled back.
+- A main toolbar under the title bar, as DBeaver's: new connection (by engine), connect, reconnect,
+  disconnect, new SQL editor (with the recent scripts), commit, rollback, the transaction mode with the
+  isolation level, the transaction log, read-only, the active connection and `schema@connection`, the
+  dashboard, the connection's tools and Open table. Right-click it to hide items; View ▸ Show Main Toolbar
+  hides it.
 - A lazy schema navigator, a SQL editor with schema-aware completion, a streamed results grid, EXPLAIN as a
   plan tree, per-tab transactions, query history and saved queries.
 - A table data view with inline editing, SQL review and one-transaction apply; structure views and a form

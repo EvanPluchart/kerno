@@ -90,6 +90,7 @@ const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
 /// How many closed query tabs can be reopened.
 const CLOSED_TABS: usize = 10;
 
+pub(crate) mod toolbar;
 pub(crate) mod updates;
 
 /// Where a menu of the central area opens.
@@ -1871,16 +1872,25 @@ impl Workspace {
                 Ok(sql) => {
                     let target = this.default_target(cx);
                     let tab = this.open_query(String::new(), &sql, target, window, cx);
+                    AppState::update_settings(cx, |settings| {
+                        settings.remember_script(path.clone())
+                    });
                     tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
                     this.schedule_save(cx);
                 }
-                Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "{} could not be opened: {error}",
-                        path.display()
-                    ))),
-                    cx,
-                ),
+                Err(error) => {
+                    // A recent script that went away leaves the list.
+                    AppState::update_settings(cx, |settings| {
+                        settings.recent_scripts.retain(|recent| *recent != path)
+                    });
+                    window.push_notification(
+                        Notification::error(SharedString::from(format!(
+                            "{} could not be opened: {error}",
+                            path.display()
+                        ))),
+                        cx,
+                    )
+                }
             });
         })
         .detach();
@@ -1960,6 +1970,9 @@ impl Workspace {
             let outcome = writing.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(()) => {
+                    AppState::update_settings(cx, |settings| {
+                        settings.remember_script(path.clone())
+                    });
                     tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
                     this.schedule_save(cx);
                     cx.notify();
@@ -4727,6 +4740,7 @@ impl Render for Workspace {
                     .update(cx, |sidebar, cx| sidebar.open_selected(cx))
             }))
             .map(|root| self.more_actions(root, cx))
+            .map(|root| self.toolbar_actions(root, cx))
             .size_full()
             .bg(background)
             .text_color(foreground)
@@ -4739,6 +4753,9 @@ impl Render for Workspace {
                         .child("Kerno"),
                 ),
             )
+            .when(AppState::get(cx).settings.toolbar_visible, |this| {
+                this.child(self.render_toolbar(window, cx))
+            })
             .child(div().flex_1().min_h_0().child(body))
             .child(self.render_status_bar(cx))
     }
