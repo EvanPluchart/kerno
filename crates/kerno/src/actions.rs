@@ -163,6 +163,14 @@ gpui_kit::actions!(
         DisconnectTabConnection,
         /// Disconnects and connects again the connection of the active tab.
         ReconnectTabConnection,
+        /// Disconnects every open connection.
+        DisconnectAll,
+        /// Disconnects every open connection but the active tab's (or the
+        /// one selected in the sidebar).
+        DisconnectOtherConnections,
+        /// Makes the active tab's connection (or the one selected in the
+        /// sidebar) read-only, or lets it write again.
+        ToggleReadOnly,
         /// Opens the dialog of the connection of the active tab.
         EditTabConnection,
         /// Opens the administration of the active tab's connection, or of
@@ -172,6 +180,8 @@ gpui_kit::actions!(
         BackupDatabase,
         /// Restores a backup file into a database with the engine's client tool.
         RestoreDatabase,
+        /// Opens the maintenance tools of the selected tree node.
+        MaintenanceTools,
         /// Activates the next tab.
         NextTab,
         /// Activates the previous tab.
@@ -480,6 +490,10 @@ pub const COMMANDS: &[Command] = &[
     // DBeaver's keys of the SQL editor (`ui.editors.sql` plugin.xml): those
     // of `sql.script.focused` work while the editor has the focus, those of
     // `sql.script` anywhere in the query tab. Ctrl is Ctrl on macOS too.
+    // On a Mac, Option with a letter types a character (Option+P is π)
+    // instead of reaching the app, so each Alt key comes after a Cmd+Option
+    // one, which types nothing; Cmd+Option+Up/Down add cursors in the
+    // editor, so the statements move with Cmd+Option+] and [.
     command!(
         "run_statement_new_tab",
         "Run Statement in New Result Tab",
@@ -493,7 +507,7 @@ pub const COMMANDS: &[Command] = &[
         "run_from_cursor",
         "Run Script From the Cursor",
         "Query",
-        ["alt-p"],
+        ["cmd-alt-enter", "alt-p"],
         ["execute", "rest", "position"],
         RunFromCursor,
         "QueryTab > mode == editor"
@@ -502,7 +516,7 @@ pub const COMMANDS: &[Command] = &[
         "next_statement",
         "Go to Next Statement",
         "Query",
-        ["alt-down"],
+        ["cmd-alt-]", "alt-down"],
         ["query", "move", "jump"],
         NextStatement,
         "QueryTab > mode == editor"
@@ -511,7 +525,7 @@ pub const COMMANDS: &[Command] = &[
         "previous_statement",
         "Go to Previous Statement",
         "Query",
-        ["alt-up"],
+        ["cmd-alt-[", "alt-up"],
         ["query", "move", "jump"],
         PreviousStatement,
         "QueryTab > mode == editor"
@@ -549,7 +563,7 @@ pub const COMMANDS: &[Command] = &[
         "toggle_results_panel",
         "Toggle Results Panel",
         "View",
-        ["alt-shift-t"],
+        ["cmd-alt-r", "alt-shift-t"],
         ["hide", "show", "results"],
         ToggleResultsPanel,
         "QueryTab"
@@ -567,7 +581,7 @@ pub const COMMANDS: &[Command] = &[
         "switch_results_focus",
         "Focus Results / Editor",
         "View",
-        ["alt-t"],
+        ["cmd-alt-t", "alt-t"],
         ["switch panel", "grid", "keyboard"],
         SwitchResultsFocus,
         "QueryTab"
@@ -885,6 +899,30 @@ pub const COMMANDS: &[Command] = &[
         ReconnectTabConnection
     ),
     command!(
+        "disconnect_all",
+        "Disconnect All Connections",
+        "Connections",
+        [],
+        ["close", "every"],
+        DisconnectAll
+    ),
+    command!(
+        "disconnect_other_connections",
+        "Disconnect Other Connections",
+        "Connections",
+        [],
+        ["close", "others", "keep"],
+        DisconnectOtherConnections
+    ),
+    command!(
+        "toggle_read_only",
+        "Toggle Read-Only Connection",
+        "Connections",
+        [],
+        ["readonly", "protect", "writes", "safe"],
+        ToggleReadOnly
+    ),
+    command!(
         "edit_tab_connection",
         "Edit the Active Tab's Connection…",
         "Connections",
@@ -926,6 +964,16 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["restore", "load dump", "pg_restore", "psql", "mysql"],
         RestoreDatabase
+    ),
+    command!(
+        "maintenance_tools",
+        "Maintenance Tools…",
+        "Navigator",
+        [],
+        [
+            "vacuum", "analyze", "refresh", "truncate", "trigger", "check", "optimize", "repair"
+        ],
+        MaintenanceTools
     ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(
@@ -1306,6 +1354,73 @@ mod tests {
         );
         assert_eq!(keys_of(&bindings, "toggle_pinned_result"), ["ctrl-shift-p"]);
         assert!(KeyBindingContextPredicate::parse("QueryTab > mode == editor").is_ok());
+    }
+
+    #[test]
+    fn every_alt_key_has_one_a_mac_keyboard_reaches() {
+        // Option with a letter types a character on a Mac (Option+P is π),
+        // so a command bound to Alt alone has a Cmd or Ctrl key too.
+        let (bindings, _) = effective_bindings("");
+        let mac = |key: &str| Keystroke::parse_with_os(key, OperatingSystem::Mac).unwrap();
+        let alt_only = |key: &str| {
+            let modifiers = mac(key).modifiers;
+            modifiers.alt && !modifiers.platform && !modifiers.control
+        };
+        for command in COMMANDS {
+            let keys = keys_of(&bindings, command.id);
+            if keys.iter().any(|key| alt_only(key)) {
+                assert!(
+                    keys.iter().any(|key| {
+                        let modifiers = mac(key).modifiers;
+                        modifiers.platform || modifiers.control
+                    }),
+                    "{}: {keys:?}",
+                    command.id
+                );
+            }
+        }
+        // DBeaver's key stays, second.
+        assert_eq!(
+            keys_of(&bindings, "run_from_cursor"),
+            ["cmd-alt-enter", "alt-p"]
+        );
+        assert_eq!(
+            keys_of(&bindings, "next_statement"),
+            ["cmd-alt-]", "alt-down"]
+        );
+        assert_eq!(
+            keys_of(&bindings, "previous_statement"),
+            ["cmd-alt-[", "alt-up"]
+        );
+        assert_eq!(
+            keys_of(&bindings, "toggle_results_panel"),
+            ["cmd-alt-r", "alt-shift-t"]
+        );
+        assert_eq!(
+            keys_of(&bindings, "switch_results_focus"),
+            ["cmd-alt-t", "alt-t"]
+        );
+        // The editor's own Mac keys (gpui-base `input/base/state.rs`) are
+        // not taken by the query tab's: they would stop working in it.
+        for editor in [
+            "cmd-alt-up",
+            "cmd-alt-down",
+            "cmd-up",
+            "cmd-down",
+            "cmd-[",
+            "cmd-]",
+            "alt-left",
+            "alt-right",
+            "cmd-left",
+            "cmd-right",
+        ] {
+            let unparse = |key: &str| mac(key).unparse(OperatingSystem::Mac);
+            for (key, id) in &bindings {
+                if context_of(id).is_some_and(|context| context.starts_with("QueryTab")) {
+                    assert_ne!(unparse(key), unparse(editor), "{id} takes the editor's key");
+                }
+            }
+        }
     }
 
     #[test]

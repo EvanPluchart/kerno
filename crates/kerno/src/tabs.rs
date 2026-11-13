@@ -98,10 +98,18 @@ pub enum TabAction {
     // The SQL editor.
     ApplySource,
     RunStatement,
+    RunInNewTab,
+    RunFromCursor,
     RunScript,
     Explain,
     ExplainAnalyze,
+    CountRows,
     Format,
+    NextStatement,
+    PreviousStatement,
+    ToggleResults,
+    MaximizeResults,
+    SwitchFocus,
     Undo,
     Redo,
     Cut,
@@ -137,6 +145,8 @@ pub enum TabAction {
     Unpin,
     UnpinAll,
     CopyStatement,
+    /// Runs the statement of an incomplete result again.
+    RunAgain,
 }
 
 impl TabAction {
@@ -155,10 +165,18 @@ impl TabAction {
             Self::ReopenClosed => "Reopen closed tab",
             Self::ApplySource => "Apply source…",
             Self::RunStatement => "Run statement",
+            Self::RunInNewTab => "Run statement in new result tab",
+            Self::RunFromCursor => "Run script from the cursor",
             Self::RunScript => "Run script",
             Self::Explain => "Explain plan",
             Self::ExplainAnalyze => "Explain analyze",
+            Self::CountRows => "Count rows of statement",
             Self::Format => "Format SQL",
+            Self::NextStatement => "Go to next statement",
+            Self::PreviousStatement => "Go to previous statement",
+            Self::ToggleResults => "Toggle results panel",
+            Self::MaximizeResults => "Maximize results panel",
+            Self::SwitchFocus => "Focus results / editor",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::Cut => "Cut",
@@ -191,6 +209,7 @@ impl TabAction {
             Self::Unpin => "Unpin tab",
             Self::UnpinAll => "Unpin all tabs",
             Self::CopyStatement => "Copy statement",
+            Self::RunAgain => "Run again",
         }
         .to_string()
     }
@@ -294,10 +313,20 @@ pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
     }
     entries.extend([
         Item(TabAction::RunStatement, run),
+        Item(TabAction::RunInNewTab, run),
+        Item(TabAction::RunFromCursor, run),
         Item(TabAction::RunScript, run),
         Item(TabAction::Explain, run),
         Item(TabAction::ExplainAnalyze, run),
+        Item(TabAction::CountRows, run),
         Item(TabAction::Format, empty),
+        Separator,
+        Item(TabAction::NextStatement, empty),
+        Item(TabAction::PreviousStatement, empty),
+        Separator,
+        enabled(TabAction::ToggleResults),
+        enabled(TabAction::MaximizeResults),
+        enabled(TabAction::SwitchFocus),
         Separator,
         enabled(TabAction::Undo),
         enabled(TabAction::Redo),
@@ -325,6 +354,31 @@ pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
     entries
 }
 
+/// The toolbar's Run dropdown: the other ways to run, and to move between
+/// statements and panels; enabled as the editor menu is.
+pub fn run_menu(facts: EditorFacts) -> Vec<Entry> {
+    let run = if !facts.connected {
+        Some("not connected")
+    } else {
+        facts.running.then_some("running")
+    };
+    let empty = facts.empty.then_some("empty");
+    vec![
+        Item(TabAction::RunStatement, run),
+        Item(TabAction::RunInNewTab, run),
+        Item(TabAction::RunFromCursor, run),
+        Item(TabAction::RunScript, run),
+        Item(TabAction::CountRows, run),
+        Separator,
+        Item(TabAction::NextStatement, empty),
+        Item(TabAction::PreviousStatement, empty),
+        Separator,
+        enabled(TabAction::ToggleResults),
+        enabled(TabAction::MaximizeResults),
+        enabled(TabAction::SwitchFocus),
+    ]
+}
+
 /// What the menu of a result tab depends on. The bulk closes leave pinned
 /// results alone, as DBeaver's do (`SQLEditor`, result tab menu); Close
 /// closes the tab it is on, pinned or not.
@@ -338,12 +392,17 @@ pub struct ResultFacts {
     pub pinned_count: usize,
     /// The result came from a statement (not from a failed connection).
     pub statement: bool,
+    /// Its rows stopped arriving before the end: another statement took
+    /// the session while it was waiting to be paged.
+    pub incomplete: bool,
+    /// Its statement writes: running it again would write again.
+    pub writes: bool,
 }
 
 /// The menu of a result tab.
 pub fn result_menu(facts: ResultFacts) -> Vec<Entry> {
     let others = facts.left + facts.right;
-    vec![
+    let mut entries = vec![
         enabled(TabAction::Close),
         Item(
             TabAction::CloseOthers,
@@ -377,7 +436,14 @@ pub fn result_menu(facts: ResultFacts) -> Vec<Entry> {
             TabAction::CopyStatement,
             (!facts.statement).then_some("no statement"),
         ),
-    ]
+    ];
+    if facts.incomplete {
+        entries.push(Item(
+            TabAction::RunAgain,
+            facts.writes.then_some("the statement writes"),
+        ));
+    }
+    entries
 }
 
 /// An item of the status bar, left to right.
@@ -428,32 +494,20 @@ pub struct StatusFacts {
     pub database: Option<String>,
     /// The tab's own transaction.
     pub transaction: TxState,
-    /// Some query tab on the same connection has a transaction open, which
-    /// closing the connection would end.
-    pub connection_transaction: bool,
     pub manual_commit: bool,
     pub running: bool,
 }
 
 /// The actions of a status bar item showing `text`; none when it has none.
+/// Switching or closing a session that holds a transaction asks first
+/// ([`end_question`]), so those entries stay enabled.
 pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Entry> {
-    // Switching or closing a session ends its transaction: never silently.
     let not_connected = (!facts.connected).then_some("not connected");
-    let keeps_session = if facts.transaction != TxState::Idle {
-        Some("transaction open")
-    } else {
-        not_connected
-    };
-    let keeps_connection = if facts.connection_transaction {
-        Some("transaction open")
-    } else {
-        not_connected
-    };
     match item {
         StatusItem::Summary | StatusItem::Messages => Vec::new(),
         StatusItem::Connection => vec![
-            Item(TabAction::Disconnect, keeps_connection),
-            Item(TabAction::Reconnect, keeps_connection),
+            Item(TabAction::Disconnect, not_connected),
+            Item(TabAction::Reconnect, not_connected),
             Separator,
             Item(TabAction::Administration, not_connected),
             enabled(TabAction::EditConnection),
@@ -468,7 +522,7 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
                     if current {
                         Some("current")
                     } else {
-                        keeps_session
+                        not_connected
                     },
                 )
             })
@@ -545,12 +599,87 @@ pub fn fill_menu(mut menu: PopupMenu, entries: Vec<Entry>, pick: Pick) -> PopupM
 pub enum Loss {
     /// An open transaction, rolled back.
     Transaction,
+    /// A transaction a statement failed in: it can only be rolled back.
+    FailedTransaction,
     /// Rows with changes not applied.
     Pending(usize),
     /// Text not written to the tab's file.
     Unsaved,
     /// A table form with changes not applied.
     Form,
+}
+
+impl Loss {
+    fn is_transaction(&self) -> bool {
+        matches!(self, Loss::Transaction | Loss::FailedTransaction)
+    }
+
+    /// What happens to it, after the tab's title.
+    fn what(&self) -> String {
+        match self {
+            Loss::Transaction => "its open transaction is rolled back".to_string(),
+            Loss::FailedTransaction => "its failed transaction is rolled back".to_string(),
+            Loss::Pending(count) => format!(
+                "{count} pending change{} {} discarded",
+                if *count == 1 { "" } else { "s" },
+                if *count == 1 { "is" } else { "are" }
+            ),
+            Loss::Unsaved => "the changes not saved to its file are lost".to_string(),
+            Loss::Form => "the changes not applied to the table are lost".to_string(),
+        }
+    }
+}
+
+/// How what a session holds is ended before it closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ending {
+    /// Open transactions: committed or rolled back. Commit is refused, with
+    /// why, when one of them failed.
+    Transactions { commit: Option<&'static str> },
+    /// Only pending changes: discarded.
+    Discard,
+}
+
+/// The question to ask before `action` (“Disconnect “prod””) closes
+/// sessions that hold `losses` (tab title, what it holds): title, text and
+/// how they may be ended; `None` to go ahead without asking. Unsaved text
+/// and table forms survive a closed session and are not asked about.
+pub fn end_question(action: &str, losses: &[(String, Loss)]) -> Option<(String, String, Ending)> {
+    let asked: Vec<&(String, Loss)> = losses
+        .iter()
+        .filter(|(_, loss)| loss.is_transaction() || matches!(loss, Loss::Pending(_)))
+        .collect();
+    if asked.is_empty() {
+        return None;
+    }
+    let transactions = asked.iter().any(|(_, loss)| loss.is_transaction());
+    let mut lines: Vec<String> = asked
+        .iter()
+        .map(|(tab, loss)| match loss {
+            Loss::Transaction => format!("“{tab}”: a transaction is open."),
+            Loss::FailedTransaction => {
+                format!(
+                    "“{tab}”: a statement failed in its transaction, which can only be rolled back."
+                )
+            }
+            other => format!("“{tab}”: {}.", other.what()),
+        })
+        .collect();
+    let ending = if transactions {
+        let failed = asked
+            .iter()
+            .any(|(_, loss)| *loss == Loss::FailedTransaction);
+        lines.push(
+            "End the open transactions first, or cancel to keep everything as it is.".to_string(),
+        );
+        Ending::Transactions {
+            commit: failed.then_some("a transaction failed"),
+        }
+    } else {
+        lines.push("Cancel to keep everything as it is.".to_string());
+        Ending::Discard
+    };
+    Some((format!("{action}?"), lines.join("\n"), ending))
 }
 
 /// The question to ask before closing tabs that would lose `losses`
@@ -563,12 +692,12 @@ pub fn close_question(
 ) -> Option<(String, String, &'static str)> {
     let asked: Vec<&(String, Loss)> = losses
         .iter()
-        .filter(|(_, loss)| confirm || *loss == Loss::Transaction)
+        .filter(|(_, loss)| confirm || loss.is_transaction())
         .collect();
-    let rolls_back = asked.iter().any(|(_, loss)| *loss == Loss::Transaction);
+    let rolls_back = asked.iter().any(|(_, loss)| loss.is_transaction());
     let title = match asked.as_slice() {
         [] => return None,
-        [(_, Loss::Transaction)] => "Close and roll back?".to_string(),
+        [(_, Loss::Transaction | Loss::FailedTransaction)] => "Close and roll back?".to_string(),
         [(_, Loss::Pending(count))] => format!(
             "Discard {count} pending change{}?",
             if *count == 1 { "" } else { "s" }
@@ -579,19 +708,7 @@ pub fn close_question(
     };
     let lines: Vec<String> = asked
         .iter()
-        .map(|(tab, loss)| {
-            let what = match loss {
-                Loss::Transaction => "its open transaction is rolled back".to_string(),
-                Loss::Pending(count) => format!(
-                    "{count} pending change{} {} discarded",
-                    if *count == 1 { "" } else { "s" },
-                    if *count == 1 { "is" } else { "are" }
-                ),
-                Loss::Unsaved => "the changes not saved to its file are lost".to_string(),
-                Loss::Form => "the changes not applied to the table are lost".to_string(),
-            };
-            format!("“{tab}”: {what}.")
-        })
+        .map(|(tab, loss)| format!("“{tab}”: {}.", loss.what()))
         .collect();
     let ok = if rolls_back {
         "Roll back and close"
@@ -684,10 +801,20 @@ mod tests {
             labels(&editor_menu(ready)),
             [
                 "Run statement",
+                "Run statement in new result tab",
+                "Run script from the cursor",
                 "Run script",
                 "Explain plan",
                 "Explain analyze",
+                "Count rows of statement",
                 "Format SQL",
+                "—",
+                "Go to next statement",
+                "Go to previous statement",
+                "—",
+                "Toggle results panel",
+                "Maximize results panel",
+                "Focus results / editor",
                 "—",
                 "Undo",
                 "Redo",
@@ -712,10 +839,14 @@ mod tests {
             ..EditorFacts::default()
         }));
         assert_eq!(idle[0], "Run statement (not connected)");
-        assert_eq!(idle[3], "Explain analyze (not connected)");
-        assert_eq!(idle[9], "Cut (no selection)");
+        assert_eq!(idle[2], "Run script from the cursor (not connected)");
+        assert_eq!(idle[5], "Explain analyze (not connected)");
+        assert_eq!(idle[6], "Count rows of statement (not connected)");
+        assert_eq!(idle[9], "Go to next statement (empty)");
+        assert_eq!(idle[12], "Toggle results panel");
+        assert_eq!(idle[19], "Cut (no selection)");
         assert_eq!(
-            idle[18..],
+            idle[28..],
             ["Save (empty)", "Save as… (empty)", "Save as query… (empty)"]
         );
         // While a statement runs; a file saved as it is; source mode.
@@ -729,7 +860,30 @@ mod tests {
             busy[..3],
             ["Apply source… (running)", "—", "Run statement (running)"]
         );
-        assert_eq!(busy[20], "Save (saved)");
+        assert_eq!(busy[3], "Run statement in new result tab (running)");
+        assert_eq!(busy[30], "Save (saved)");
+        // The toolbar's Run dropdown offers the same commands.
+        assert_eq!(
+            labels(&run_menu(ready)),
+            [
+                "Run statement",
+                "Run statement in new result tab",
+                "Run script from the cursor",
+                "Run script",
+                "Count rows of statement",
+                "—",
+                "Go to next statement",
+                "Go to previous statement",
+                "—",
+                "Toggle results panel",
+                "Maximize results panel",
+                "Focus results / editor",
+            ]
+        );
+        assert_eq!(
+            labels(&run_menu(EditorFacts::default()))[4],
+            "Count rows of statement (not connected)"
+        );
     }
 
     #[test]
@@ -782,6 +936,20 @@ mod tests {
         let refused = labels(&result_menu(ResultFacts::default()));
         assert_eq!(refused[4], "Close all");
         assert_eq!(refused[10], "Copy statement (no statement)");
+        assert_eq!(refused.len(), 11);
+        // A result whose rows stopped coming can be run again.
+        let incomplete = labels(&result_menu(ResultFacts {
+            incomplete: true,
+            ..middle
+        }));
+        assert_eq!(incomplete[10..], ["Copy statement", "Run again"]);
+        // An INSERT … RETURNING would write a second time.
+        let writes = labels(&result_menu(ResultFacts {
+            incomplete: true,
+            writes: true,
+            ..middle
+        }));
+        assert_eq!(writes[11], "Run again (the statement writes)");
     }
 
     #[test]
@@ -830,10 +998,10 @@ mod tests {
         assert!(menu(StatusItem::Summary, &facts).is_empty());
         assert!(menu(StatusItem::Messages, &facts).is_empty());
 
-        // An open transaction: ended from here, and kept from being lost.
+        // An open transaction: ended from here; switching or closing the
+        // session asks first (`end_question`), so they stay offered.
         let open = StatusFacts {
             transaction: TxState::Open,
-            connection_transaction: true,
             ..facts.clone()
         };
         assert_eq!(
@@ -847,26 +1015,9 @@ mod tests {
         );
         assert_eq!(
             menu(StatusItem::Connection, &open)[..2],
-            [
-                "Disconnect (transaction open)",
-                "Reconnect (transaction open)"
-            ]
+            ["Disconnect", "Reconnect"]
         );
-        assert_eq!(
-            menu(StatusItem::Database, &open)[1],
-            "other (transaction open)"
-        );
-        // Another tab's transaction on the connection keeps it open, and
-        // does not keep this tab in its database.
-        let other = StatusFacts {
-            connection_transaction: true,
-            ..facts.clone()
-        };
-        assert_eq!(
-            menu(StatusItem::Connection, &other)[0],
-            "Disconnect (transaction open)"
-        );
-        assert_eq!(menu(StatusItem::Database, &other)[1], "other");
+        assert_eq!(menu(StatusItem::Database, &open)[1], "other");
         let failed = StatusFacts {
             transaction: TxState::Failed,
             ..facts.clone()
@@ -935,6 +1086,72 @@ mod tests {
         assert_eq!(
             close_question(&several, false).map(|(title, _, _)| title),
             Some("Close and roll back?".into())
+        );
+    }
+
+    #[test]
+    fn ending_a_session_asks_once_for_its_transactions_and_pending_changes() {
+        let tab = |title: &str, loss| (title.to_string(), loss);
+        // Text and forms survive a closed session: nothing to ask.
+        assert_eq!(end_question("Disconnect “pg”", &[]), None);
+        assert_eq!(
+            end_question(
+                "Disconnect “pg”",
+                &[tab("a.sql", Loss::Unsaved), tab("t · edit", Loss::Form)]
+            ),
+            None
+        );
+        assert_eq!(
+            end_question("Disconnect “pg”", &[tab("Query 1", Loss::Transaction)]),
+            Some((
+                "Disconnect “pg”?".into(),
+                "“Query 1”: a transaction is open.\n\
+                 End the open transactions first, or cancel to keep everything as it is."
+                    .into(),
+                Ending::Transactions { commit: None }
+            ))
+        );
+        // A failed transaction can only be rolled back; pending changes
+        // are listed with the transactions.
+        let (_, text, ending) = end_question(
+            "Reconnect “pg”",
+            &[
+                tab("Query 1", Loss::FailedTransaction),
+                tab("people", Loss::Pending(2)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "“Query 1”: a statement failed in its transaction, which can only be rolled back.\n\
+             “people”: 2 pending changes are discarded.\n\
+             End the open transactions first, or cancel to keep everything as it is."
+        );
+        assert_eq!(
+            ending,
+            Ending::Transactions {
+                commit: Some("a transaction failed")
+            }
+        );
+        // Only pending changes: discarded, or nothing happens.
+        assert_eq!(
+            end_question("Disconnect all", &[tab("people", Loss::Pending(1))]),
+            Some((
+                "Disconnect all?".into(),
+                "“people”: 1 pending change is discarded.\n\
+                 Cancel to keep everything as it is."
+                    .into(),
+                Ending::Discard
+            ))
+        );
+        // Closing a tab whose transaction failed rolls it back too.
+        assert_eq!(
+            close_question(&[tab("Query 1", Loss::FailedTransaction)], false),
+            Some((
+                "Close and roll back?".into(),
+                "“Query 1”: its failed transaction is rolled back.".into(),
+                "Roll back and close"
+            ))
         );
     }
 

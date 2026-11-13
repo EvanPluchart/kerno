@@ -11,7 +11,7 @@ use gpui_kit::base::actions::{SelectLeft, SelectRight};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tree::{TreeEntry, TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{
@@ -25,13 +25,14 @@ use gpui_kit::{
     div, px,
 };
 use kerno_core::browse::Filter;
+use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{delete_template, insert_template, select_template, update_template};
 use kerno_core::table_draft::TableChange;
 use kerno_core::{Session, exec};
 
 use super::actions::{
-    Action, Template, actions, create_template, default_action, edit_action, qualified_name,
+    Action, Template, actions, create_template, default_action, edit_action, qualified_name, tools,
 };
 use super::model::{
     self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Reveal, Tree,
@@ -40,6 +41,7 @@ use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, Source};
+use crate::maintenance_dialog::{self, MaintenanceDialog};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
@@ -649,6 +651,17 @@ impl Navigator {
                     self.open_template(action, &node, window, cx)
                 }
             }
+            Action::Truncate => {
+                self.open_tools(
+                    id,
+                    Some(&Maintenance::Truncate(Default::default())),
+                    window,
+                    cx,
+                );
+            }
+            Action::Tools => {
+                self.open_tools(id, None, window, cx);
+            }
             Action::Generate(template) => self.generate(template, &node, window, cx),
             Action::ShowDdl => self.show_ddl(&node, window, cx),
             Action::EditSource => {
@@ -657,7 +670,6 @@ impl Navigator {
                 }
             }
             Action::Rename
-            | Action::Truncate
             | Action::Drop
             | Action::CreateSchema
             | Action::CreateDatabase
@@ -694,6 +706,14 @@ impl Navigator {
             {
                 Some("not supported by this database")
             }
+            (Action::Truncate, Some(object))
+                if !dialect
+                    .maintenance_tools(object)
+                    .iter()
+                    .any(|tool| matches!(tool, Maintenance::Truncate(_))) =>
+            {
+                Some("not supported by this database")
+            }
             (Action::AddColumn | Action::RenameColumn | Action::DropColumn, _)
                 if !self
                     .relation_above(&node.id)
@@ -720,6 +740,65 @@ impl Navigator {
                 Some(_) => None,
             },
             _ => None,
+        }
+    }
+
+    /// Opens the maintenance tools of the node `id` on the tool like
+    /// `wanted` (the first of its tools when `None`), or says why it cannot.
+    /// Once a tool ran, the node's parent is read again (row counts, a
+    /// refreshed view, a trigger switched).
+    pub fn open_tools(
+        &mut self,
+        id: &str,
+        wanted: Option<&Maintenance>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<MaintenanceDialog>> {
+        let node = self.tree.node(id)?.clone();
+        let (connection, meta) = (self.connection.clone()?, self.meta(cx)?);
+        let warn = |text: String, window: &mut Window, cx: &mut Context<Self>| {
+            window.push_notification(Notification::warning(SharedString::from(text)), cx);
+        };
+        let available = tools(&node, meta.dialect());
+        let (NodeKind::Object(object), false) = (&node.kind, available.is_empty()) else {
+            warn(NO_TOOLS.into(), window, cx);
+            return None;
+        };
+        if let Some(reason) = self.unavailable(Action::Tools, &node, cx) {
+            warn(format!("Maintenance tools: {reason}."), window, cx);
+            return None;
+        }
+        // A database is the root of the tree: nothing above it to read again.
+        let above = model::parent_of(id)
+            .filter(|_| !matches!(object, ObjectRef::Database(_)))
+            .map(str::to_string);
+        let navigator = cx.entity().downgrade();
+        let opening = maintenance_dialog::Opening {
+            connection,
+            database: node.database.clone(),
+            object: object.clone(),
+            kind: kind_name(object),
+            name: plain_name(object),
+            selected: maintenance_dialog::position(&available, wanted),
+            tools: available,
+        };
+        Some(maintenance_dialog::open(
+            self.connections.clone(),
+            opening,
+            window,
+            cx,
+            move |_, cx| {
+                if let Some(above) = &above {
+                    let _ = navigator.update(cx, |this, cx| this.refresh(above, cx));
+                }
+            },
+        ))
+    }
+
+    /// What "Maintenance Tools…" does: the tools of the selected node.
+    pub fn tools_on_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(node) = self.selected_node(window, cx) {
+            self.open_tools(&node.id, None, window, cx);
         }
     }
 
@@ -1003,20 +1082,6 @@ impl Navigator {
                         After::Refresh(above.clone())
                     },
                     format!("Dropped {kind} {name}."),
-                )
-            }
-            Action::Truncate => {
-                let Some(ObjectRef::Relation(table, _)) = &object else {
-                    return;
-                };
-                (
-                    format!("Truncate table “{name}”?"),
-                    "Every row of the table is deleted. This cannot be undone.".to_string(),
-                    Statement::Fixed(dialect_of.dialect().truncate_sql(table)),
-                    "Truncate",
-                    true,
-                    After::Refresh(above.clone()),
-                    format!("Truncated table {name}."),
                 )
             }
             Action::Rename => {
@@ -1574,6 +1639,18 @@ impl Navigator {
         self.unavailable(action, node, cx)
     }
 
+    /// The maintenance tools of the node on a row, by label; for tests.
+    #[cfg(test)]
+    pub fn tools_at(&self, row: usize, cx: &App) -> Vec<&'static str> {
+        match (self.tree.node(&self.id_at(row, cx)), self.meta(cx)) {
+            (Some(node), Some(meta)) => tools(node, meta.dialect())
+                .iter()
+                .map(maintenance_dialog::label)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The row of the node with this id; for tests.
     #[cfg(test)]
     pub fn row_of(&self, label_path: &[&str], cx: &App) -> Option<usize> {
@@ -1743,6 +1820,10 @@ impl Navigator {
     }
 }
 
+/// What "Maintenance Tools…" says on a node that has none.
+const NO_TOOLS: &str = "No maintenance tool for this object: they act on tables, materialized \
+                        views, PostgreSQL triggers and PostgreSQL databases.";
+
 /// How a confirmed statement is run.
 #[derive(Debug, Clone)]
 struct Plan {
@@ -1903,27 +1984,65 @@ impl Render for Navigator {
                 let tree_view = tree(&self.tree_state, move |index, entry, _, _, cx| {
                     view.read(cx).render_row(&view, index, entry, cx)
                 })
-                .context_menu(move |_, entry, mut menu, _, cx| {
+                .context_menu(move |_, entry, mut menu, window, cx| {
                     let id = entry.item().id.to_string();
                     let navigator = menu_view.read(cx);
                     let Some(node) = navigator.tree.node(&id) else {
                         return menu;
                     };
-                    let has_schemas = navigator.has_schemas(cx);
-                    for (index, group) in actions(node, has_schemas).into_iter().enumerate() {
+                    // Each entry with why it cannot be used, if it cannot;
+                    // read first, the Tools submenu is built afterwards.
+                    let groups: Vec<Vec<(Action, Option<&'static str>)>> =
+                        actions(node, navigator.has_schemas(cx))
+                            .into_iter()
+                            .map(|group| {
+                                group
+                                    .into_iter()
+                                    .map(|action| (action, navigator.unavailable(action, node, cx)))
+                                    .collect()
+                            })
+                            .collect();
+                    let tools = navigator
+                        .meta(cx)
+                        .map(|meta| tools(node, meta.dialect()))
+                        .unwrap_or_default();
+                    let tools_reason = navigator.unavailable(Action::Tools, node, cx);
+                    let entry = |label: &str, reason: Option<&str>| match reason {
+                        Some(reason) => SharedString::from(format!("{label} ({reason})")),
+                        None => SharedString::from(label.to_string()),
+                    };
+                    let last = groups.len().saturating_sub(1);
+                    for (index, group) in groups.into_iter().enumerate() {
                         if index > 0 {
                             menu = menu.separator();
                         }
-                        for action in group {
-                            // An entry that cannot be used says why.
-                            let reason = navigator.unavailable(action, node, cx);
-                            let label = match reason {
-                                Some(reason) => format!("{} ({reason})", action.label()),
-                                None => action.label().to_string(),
-                            };
+                        // Tools ▸ comes just before Refresh, in a group of its own.
+                        if index == last && !tools.is_empty() {
+                            let (view, id, tools) = (menu_view.clone(), id.clone(), tools.clone());
+                            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
+                                for tool in tools {
+                                    let (view, id) = (view.clone(), id.clone());
+                                    let label = format!("{}…", maintenance_dialog::label(&tool));
+                                    submenu = submenu.item(
+                                        PopupMenuItem::new(entry(&label, tools_reason))
+                                            .disabled(tools_reason.is_some())
+                                            .on_click(move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.open_tools(&id, Some(&tool), window, cx);
+                                                })
+                                            }),
+                                    );
+                                }
+                                submenu
+                            });
+                            menu = menu
+                                .item(PopupMenuItem::submenu(Action::Tools.label(), submenu))
+                                .separator();
+                        }
+                        for (action, reason) in group {
                             let (view, id) = (menu_view.clone(), id.clone());
                             menu = menu.item(
-                                PopupMenuItem::new(SharedString::from(label))
+                                PopupMenuItem::new(entry(action.label(), reason))
                                     .disabled(reason.is_some())
                                     .on_click(move |_, window, cx| {
                                         view.update(cx, |this, cx| {

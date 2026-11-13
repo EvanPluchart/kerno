@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::{App, ElementId, Hsla, Window, rgb};
-use kerno_core::Environment;
+use kerno_core::{ConnectionConfig, Environment};
 use serde::{Deserialize, Serialize};
 
 /// The theme file: surface levels, text levels, accent, semantic colours,
@@ -126,6 +126,16 @@ pub fn tag_color(key: &str, cx: &App) -> Option<Hsla> {
         .iter()
         .find(|(name, _, _)| *name == key)
         .map(|(_, light, dark_value)| rgb(if dark { *dark_value } else { *light }).into())
+}
+
+/// The colour that marks a connection wherever it is named (its sidebar
+/// row, its tabs, the status bar): its tag, else its environment's.
+pub fn connection_color(config: &ConnectionConfig, cx: &App) -> Hsla {
+    config
+        .color
+        .as_deref()
+        .and_then(|key| tag_color(key, cx))
+        .unwrap_or_else(|| environment_color(config.environment, cx))
 }
 
 /// The colour that marks an environment: quiet for local, amber for

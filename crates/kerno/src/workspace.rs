@@ -48,6 +48,7 @@ use crate::actions::{
     PreviousStatement, RunFromCursor, RunStatementInNewTab, SwitchResultsFocus, TogglePinnedResult,
     ToggleResultsPanel,
 };
+use crate::actions::{DisconnectAll, DisconnectOtherConnections, ToggleReadOnly};
 use crate::admin::tab::AdminTab;
 use crate::backup_dialog::{self, BackupDialog};
 use crate::bridge;
@@ -70,6 +71,9 @@ use crate::tabs::{
     self, Entry, Loss, StatusFacts, StatusItem, TabAction, TabKind, TabSnapshot, Target,
 };
 use crate::theme::{self, Appearance};
+use gpui_kit::StatefulInteractiveElement as _;
+use gpui_kit::WeakFocusHandle;
+use gpui_kit::component::Disableable as _;
 use kerno_core::TxState;
 use kerno_core::browse::Filter;
 use kerno_core::schema::{RelationKind, TableRef};
@@ -187,8 +191,10 @@ impl OpenTab {
             OpenTab::Query(tab) => {
                 let tab = tab.read(cx);
                 let mut losses = Vec::new();
-                if tab.tx_state() != TxState::Idle {
-                    losses.push(Loss::Transaction);
+                match tab.tx_state() {
+                    TxState::Idle => {}
+                    TxState::Open => losses.push(Loss::Transaction),
+                    TxState::Failed => losses.push(Loss::FailedTransaction),
                 }
                 if tab.file().is_some() && tab.unsaved() {
                     losses.push(Loss::Unsaved);
@@ -330,6 +336,10 @@ pub struct Workspace {
     tab_scroll: ScrollHandle,
     /// The active tab and the tab count the strip last scrolled for.
     revealed_tab: Option<(usize, usize)>,
+    /// A dialog was open at the last frame: see `keep_focus`.
+    dialog_open: bool,
+    /// What had the keyboard in the window, while no dialog was open.
+    last_focus: Option<WeakFocusHandle>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -380,6 +390,8 @@ impl Workspace {
             shown_tab: Rc::new(Cell::new(None)),
             tab_scroll: ScrollHandle::new(),
             revealed_tab: None,
+            dialog_open: false,
+            last_focus: None,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -851,18 +863,26 @@ impl Workspace {
         // One subscription per tab: they are dropped with it, by index.
         self.tab_subscriptions.push(Subscription::join(
             cx.observe(&editor, |this, _, cx| this.schedule_save(cx)),
-            cx.subscribe(&tab, |this, tab, event: &QueryTabEvent, cx| match event {
-                QueryTabEvent::SourceApplied => {
-                    let tab = tab.read(cx);
-                    if let (Some(target), Some(schema)) = (tab.target().cloned(), tab.source()) {
-                        let schema = schema.to_string();
-                        let navigator = this.sidebar.read(cx).navigator().clone();
-                        navigator.update(cx, |navigator, cx| {
-                            navigator.refresh_source(&target, &schema, cx)
-                        });
+            cx.subscribe_in(
+                &tab,
+                window,
+                |this, tab, event: &QueryTabEvent, window, cx| match event {
+                    QueryTabEvent::SwitchTarget(target) => {
+                        this.switch_target(tab.clone(), target.clone(), window, cx)
                     }
-                }
-            }),
+                    QueryTabEvent::SourceApplied => {
+                        let tab = tab.read(cx);
+                        if let (Some(target), Some(schema)) = (tab.target().cloned(), tab.source())
+                        {
+                            let schema = schema.to_string();
+                            let navigator = this.sidebar.read(cx).navigator().clone();
+                            navigator.update(cx, |navigator, cx| {
+                                navigator.refresh_source(&target, &schema, cx)
+                            });
+                        }
+                    }
+                },
+            ),
         ));
         self.tabs.push(OpenTab::Query(tab.clone()));
         self.active_tab = self.tabs.len() - 1;
@@ -1072,12 +1092,6 @@ impl Workspace {
             transaction: status
                 .as_ref()
                 .map_or(TxState::Idle, |status| status.transaction),
-            connection_transaction: connection.as_ref().is_some_and(|id| {
-                self.tabs.iter().filter_map(OpenTab::query).any(|tab| {
-                    let tab = tab.read(cx);
-                    tab.connection_id() == Some(id.as_str()) && tab.tx_state() != TxState::Idle
-                })
-            }),
             manual_commit: query.is_some_and(|tab| tab.manual_commit()),
             running: status.is_some_and(|status| status.running),
         }
@@ -1181,15 +1195,15 @@ impl Workspace {
                     self.activate_tab(self.tabs.len() - 1, window, cx);
                 }
             }
-            TabAction::Disconnect | TabAction::Reconnect => {
+            TabAction::Disconnect => {
                 if let Some(id) = connection {
-                    let reconnect = action == TabAction::Reconnect;
-                    self.connections.update(cx, |connections, cx| {
-                        connections.disconnect(&id, cx);
-                        if reconnect {
-                            connections.connect(&id, cx);
-                        }
-                    });
+                    let action = format!("Disconnect “{}”", self.connection_name(&id, cx));
+                    self.disconnect(vec![id], action, window, cx);
+                }
+            }
+            TabAction::Reconnect => {
+                if let Some(id) = connection {
+                    self.reconnect(id, window, cx);
                 }
             }
             TabAction::Administration => {
@@ -1204,8 +1218,12 @@ impl Workspace {
             }
             TabAction::UseDatabase(database) => {
                 if let Some(query) = query {
-                    query.update(cx, |query, cx| query.use_database(database, cx));
-                    self.schedule_save(cx);
+                    let target = query.read(cx).target().cloned().map(|target| Target {
+                        database: Some(database),
+                        schema: None,
+                        ..target
+                    });
+                    self.switch_target(query, target, window, cx);
                 }
             }
             TabAction::Commit | TabAction::Rollback => {
@@ -1482,8 +1500,12 @@ impl Workspace {
             .update(cx, |palette, cx| palette.set_query("", window, cx));
         let palette = self.palette.clone();
         // Commands are handled by the workspace, which the dialog is not a
-        // child of: on confirm the action is dispatched from here.
-        let target = self.focus_handle.clone();
+        // child of: on confirm the action is dispatched from what had the
+        // keyboard before (the editor, the tree), which keeps it.
+        let target = self
+            .last_focus()
+            .filter(|last| self.focus_handle.contains(last, window))
+            .unwrap_or_else(|| self.focus_handle.clone());
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
             let palette = palette.clone();
@@ -2343,6 +2365,13 @@ impl Workspace {
             SidebarEvent::OpenAdmin(id) => {
                 self.open_admin(id, window, cx);
             }
+            SidebarEvent::Disconnect { ids, action } => {
+                self.disconnect(ids.clone(), action.clone(), window, cx)
+            }
+            SidebarEvent::Reconnect(id) => self.reconnect(id.clone(), window, cx),
+            SidebarEvent::SetReadOnly(id, read_only) => {
+                self.set_read_only(id.clone(), *read_only, window, cx)
+            }
             SidebarEvent::NewEditor(id) => {
                 if matches!(
                     self.connections.read(cx).status(id),
@@ -2755,7 +2784,22 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                // The connection's tag colour, as in the sidebar (CON-47).
+                let stripe = self.connection_color(tab.connection(cx).as_deref(), cx);
                 Tab::new()
+                    .when_some(stripe, |tab, color| {
+                        tab.prefix(
+                            div()
+                                .id(("tab-stripe", index))
+                                .test_support()
+                                .flex_none()
+                                .ml_1()
+                                .w(px(3.))
+                                .h(px(14.))
+                                .rounded_full()
+                                .bg(color),
+                        )
+                    })
                     // A middle click closes the tab, as in a browser.
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -2843,7 +2887,18 @@ impl Workspace {
                 None,
             )];
         };
-        let mut items = vec![(StatusItem::Connection, connection, None)];
+        // Production is named in red whatever its tag colour.
+        let production = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.connection(cx))
+            .and_then(|id| self.connections.read(cx).get(&id).cloned())
+            .is_some_and(|saved| saved.config.environment == kerno_core::Environment::Production);
+        let mut items = vec![(
+            StatusItem::Connection,
+            connection,
+            production.then_some(theme.danger),
+        )];
         items.extend(database.map(|database| (StatusItem::Database, database, None)));
         if read_only {
             items.push((
@@ -2914,7 +2969,26 @@ impl Workspace {
         color: Hsla,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let text = div().text_color(color).child(text.into());
+        // The connection carries its tag colour, as its tabs do.
+        let stripe = (item == StatusItem::Connection)
+            .then(|| {
+                let tab = self.tabs.get(self.active_tab)?;
+                self.connection_color(tab.connection(cx).as_deref(), cx)
+            })
+            .flatten();
+        let text = h_flex()
+            .gap_1p5()
+            .children(stripe.map(|stripe| {
+                div()
+                    .id("status-connection-stripe")
+                    .test_support()
+                    .flex_none()
+                    .w(px(3.))
+                    .h(px(12.))
+                    .rounded_full()
+                    .bg(stripe)
+            }))
+            .child(div().text_color(color).child(text.into()));
         if self.menu_entries(MenuOf::Status(item), cx).is_empty() {
             return text.into_any_element();
         }
@@ -2969,6 +3043,397 @@ impl Workspace {
                     cx,
                 ))
             })
+    }
+}
+
+// Ending what sessions hold before they close; the keyboard after a dialog --
+
+/// What runs once the sessions' transactions are ended.
+type Then = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+impl Workspace {
+    /// The colour that marks a saved connection (its tag, else its
+    /// environment's); `None` without one.
+    fn connection_color(&self, id: Option<&str>, cx: &App) -> Option<Hsla> {
+        let saved = self.connections.read(cx).get(id?)?;
+        Some(theme::connection_color(&saved.config, cx))
+    }
+
+    fn connection_name(&self, id: &str, cx: &App) -> String {
+        self.connections
+            .read(cx)
+            .get(id)
+            .map(|saved| saved.config.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The connection a connection command acts on: the active tab's, else
+    /// the one selected in the sidebar.
+    fn command_connection(&self, cx: &App) -> Option<String> {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.connection(cx))
+            .or_else(|| self.sidebar.read(cx).selected().map(str::to_string))
+    }
+
+    /// Closes the connections `ids` once what their tabs hold is ended.
+    fn disconnect(
+        &mut self,
+        ids: Vec<String>,
+        action: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ids.is_empty() {
+            window.push_notification(
+                Notification::warning(SharedString::from(format!("{action}: none is open."))),
+                cx,
+            );
+            return;
+        }
+        let tabs = self.tabs_on(&ids, cx);
+        let then: Then = Box::new(move |this, _, cx| {
+            this.connections.update(cx, |connections, cx| {
+                for id in &ids {
+                    connections.disconnect(id, cx);
+                }
+            })
+        });
+        self.end_then(action, tabs, then, window, cx);
+    }
+
+    /// Closes the connection `id` and opens it again, the same way.
+    fn reconnect(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let action = format!("Reconnect “{}”", self.connection_name(&id, cx));
+        let tabs = self.tabs_on(std::slice::from_ref(&id), cx);
+        let then: Then = Box::new(move |this, _, cx| {
+            this.connections.update(cx, |connections, cx| {
+                connections.disconnect(&id, cx);
+                connections.connect(&id, cx);
+            })
+        });
+        self.end_then(action, tabs, then, window, cx);
+    }
+
+    /// Saves the read-only flag of a connection; an open one reconnects, so
+    /// what its tabs hold is ended first, the same way (CON-12).
+    fn set_read_only(
+        &mut self,
+        id: String,
+        read_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.connection_name(&id, cx);
+        let action = if read_only {
+            format!("Reconnect “{name}” read-only")
+        } else {
+            format!("Reconnect “{name}” with changes allowed")
+        };
+        let open = !matches!(
+            self.connections.read(cx).status(&id),
+            Status::Disconnected | Status::Failed { .. }
+        );
+        let tabs = if open {
+            self.tabs_on(std::slice::from_ref(&id), cx)
+        } else {
+            Vec::new()
+        };
+        let then: Then = Box::new(move |this, _, cx| {
+            this.connections.update(cx, |connections, cx| {
+                connections.set_read_only(&id, read_only, cx)
+            })
+        });
+        self.end_then(action, tabs, then, window, cx);
+    }
+
+    /// Moves a query tab to `target`, once its transaction is ended.
+    fn switch_target(
+        &mut self,
+        tab: Entity<QueryTab>,
+        target: Option<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, from) = {
+            let tab = tab.read(cx);
+            (tab.title(), tab.target().cloned())
+        };
+        let to = match (&from, &target) {
+            (Some(from), Some(to)) if from.connection == to.connection => {
+                match (&to.database, &to.schema) {
+                    (_, Some(schema)) if from.database == to.database => {
+                        format!("the schema “{schema}”")
+                    }
+                    (Some(database), _) => format!("the database “{database}”"),
+                    _ => "its connection's own database".to_string(),
+                }
+            }
+            (_, Some(to)) => format!("“{}”", self.connection_name(&to.connection, cx)),
+            (_, None) => "no connection".to_string(),
+        };
+        let action = format!("Switch “{title}” to {to}");
+        let switched = tab.clone();
+        let then: Then = Box::new(move |this, _, cx| {
+            switched.update(cx, |tab, cx| tab.set_target(target, cx));
+            this.schedule_save(cx);
+            cx.notify();
+        });
+        self.end_then(action, vec![OpenTab::Query(tab)], then, window, cx);
+    }
+
+    /// The tabs working on the connections `ids`.
+    fn tabs_on(&self, ids: &[String], cx: &App) -> Vec<OpenTab> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.connection(cx).is_some_and(|id| ids.contains(&id)))
+            .cloned()
+            .collect()
+    }
+
+    /// The one check before sessions close (disconnect, reconnect, read-only,
+    /// a tab moved): when `tabs` hold an open transaction or pending changes,
+    /// one dialog lists them and asks how to end them; Cancel changes
+    /// nothing. Without any, `then` runs now.
+    fn end_then(
+        &mut self,
+        action: String,
+        tabs: Vec<OpenTab>,
+        then: Then,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let losses: Vec<(String, Loss)> = tabs
+            .iter()
+            .flat_map(|tab| {
+                let title = tab.title(cx).to_string();
+                tab.losses(cx)
+                    .into_iter()
+                    .map(move |loss| (title.clone(), loss))
+            })
+            .collect();
+        let Some((title, text, ending)) = tabs::end_question(&action, &losses) else {
+            then(self, window, cx);
+            return;
+        };
+        let workspace = cx.entity().downgrade();
+        let then = Rc::new(RefCell::new(Some(then)));
+        // `Some(commit)` ends the transactions, `None` only discards.
+        let choose = Rc::new(
+            move |end: Option<bool>, window: &mut Window, cx: &mut App| {
+                window.close_dialog(cx);
+                if let Some(then) = then.borrow_mut().take() {
+                    let tabs = tabs.clone();
+                    let _ = workspace
+                        .update(cx, |this, cx| this.finish_then(end, tabs, then, window, cx));
+                }
+            },
+        );
+        let (title, text) = (SharedString::from(title), SharedString::from(text));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (choose, text, ending) = (choose.clone(), text.clone(), ending.clone());
+            let label = title.clone();
+            dialog
+                .title(title.clone())
+                .w(px(500.))
+                // Enter never ends a transaction.
+                .on_ok(|_, _, _| false)
+                .content(move |content, _, _| {
+                    let button = |id: &'static str, label: String, end: Option<bool>| {
+                        let choose = choose.clone();
+                        Button::new(id)
+                            .label(SharedString::from(label))
+                            .on_click(move |_, window, cx| choose(end, window, cx))
+                    };
+                    let choices: Vec<Button> = match &ending {
+                        tabs::Ending::Transactions { commit } => vec![
+                            button("end-rollback", "Roll back and continue".into(), Some(false))
+                                .outline(),
+                            button(
+                                "end-commit",
+                                match commit {
+                                    Some(why) => format!("Commit and continue ({why})"),
+                                    None => "Commit and continue".into(),
+                                },
+                                Some(true),
+                            )
+                            .primary()
+                            .disabled(commit.is_some()),
+                        ],
+                        tabs::Ending::Discard => vec![
+                            button("end-discard", "Discard and continue".into(), None).danger(),
+                        ],
+                    };
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .id("end-question")
+                                    .test_support()
+                                    .aria_label(label.clone())
+                                    .gap_1()
+                                    .text_sm()
+                                    .children(text.split('\n').enumerate().map(|(index, line)| {
+                                        let line = SharedString::from(line.to_string());
+                                        div()
+                                            .id(("end-line", index))
+                                            .test_support()
+                                            .aria_label(line.clone())
+                                            .child(line)
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("end-cancel")
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .children(choices),
+                            ),
+                    )
+                })
+        });
+    }
+
+    /// Ends the transactions of `tabs` (commits them with `Some(true)`),
+    /// waits for the server, discards the pending changes, then runs
+    /// `then`. When a COMMIT or ROLLBACK fails, nothing else is done.
+    fn finish_then(
+        &mut self,
+        end: Option<bool>,
+        tabs: Vec<OpenTab>,
+        then: Then,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let endings: Vec<Task<Result<(), String>>> = match end {
+            Some(commit) => tabs
+                .iter()
+                .filter_map(OpenTab::query)
+                .map(|tab| tab.update(cx, |tab, cx| tab.finish_transaction(commit, cx)))
+                .collect(),
+            None => Vec::new(),
+        };
+        let discarded: Vec<Entity<DataTab>> =
+            tabs.iter().filter_map(OpenTab::data).cloned().collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut failures = Vec::new();
+            for ending in endings {
+                if let Err(failure) = ending.await {
+                    failures.push(failure);
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !failures.is_empty() {
+                    let text = format!("{}. Nothing else was done.", failures.join("; "));
+                    window.push_notification(Notification::error(SharedString::from(text)), cx);
+                    return;
+                }
+                for tab in &discarded {
+                    tab.update(cx, |tab, cx| tab.discard(cx));
+                }
+                then(this, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Gives the keyboard back once a dialog, an alert or the palette has
+    /// closed. The kit gives it back to what had it when the dialog opened,
+    /// when that still exists; a menu entry, a status bar button or the
+    /// palette do not, and the window then had no focus (no global key
+    /// worked). Called on each frame: remembers what had the keyboard in
+    /// the window while no dialog was open, and gives it back to that (or
+    /// to the active tab) when a dialog closed and the focus is nowhere in
+    /// the window.
+    fn keep_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = std::mem::replace(&mut self.dialog_open, window.has_active_dialog(cx));
+        if self.dialog_open {
+            return;
+        }
+        if self.focus_handle.contains_focused(window, cx) {
+            self.last_focus = window.focused(cx).map(|focus| focus.downgrade());
+        } else if was_open {
+            let workspace = cx.entity().downgrade();
+            // Once what closing the dialog ran is done (it may have closed
+            // the tab that had the keyboard, or given it elsewhere).
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    if this.focus_handle.contains_focused(window, cx) {
+                        return;
+                    }
+                    match this
+                        .last_focus()
+                        .filter(|last| this.focus_handle.contains(last, window))
+                    {
+                        Some(last) => last.focus(window, cx),
+                        None => this.focus_active(window, cx),
+                    }
+                });
+            });
+        }
+    }
+
+    /// What had the keyboard in the window before the palette opened.
+    fn last_focus(&self) -> Option<FocusHandle> {
+        self.last_focus.as_ref().and_then(WeakFocusHandle::upgrade)
+    }
+
+    fn disconnect_all(&mut self, _: &DisconnectAll, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.sidebar.read(cx).closing(&Subject::List, cx);
+        self.disconnect(ids, "Disconnect all connections".into(), window, cx);
+    }
+
+    fn disconnect_others(
+        &mut self,
+        _: &DisconnectOtherConnections,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.command_connection(cx) else {
+            window.push_notification(
+                Notification::warning("Disconnect other connections: open a tab on a connection, or select one in the sidebar."),
+                cx,
+            );
+            return;
+        };
+        let ids = self
+            .sidebar
+            .read(cx)
+            .closing(&Subject::Connection(id.clone()), cx);
+        let action = format!(
+            "Disconnect the connections other than “{}”",
+            self.connection_name(&id, cx)
+        );
+        self.disconnect(ids, action, window, cx);
+    }
+
+    fn toggle_read_only(
+        &mut self,
+        _: &ToggleReadOnly,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.command_connection(cx) else {
+            window.push_notification(
+                Notification::warning(
+                    "Read-only: open a tab on a connection, or select one in the sidebar.",
+                ),
+                cx,
+            );
+            return;
+        };
+        let read_only = self
+            .connections
+            .read(cx)
+            .get(&id)
+            .is_some_and(|saved| saved.config.read_only);
+        self.set_read_only(id, !read_only, window, cx);
     }
 }
 
@@ -3039,6 +3504,7 @@ impl Render for Workspace {
         if let Some(tab) = self.tabs.get(self.active_tab) {
             tab.reveal(window, cx);
         }
+        self.keep_focus(window, cx);
         // The active tab is scrolled into view whenever it or the tabs
         // change (a tab opened, restored, closed or activated by key); a
         // scroll of the strip by hand is left alone until then.
@@ -3127,6 +3593,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ReconnectTabConnection, window, cx| {
                 this.perform(None, TabAction::Reconnect, window, cx)
             }))
+            .on_action(cx.listener(Self::disconnect_all))
+            .on_action(cx.listener(Self::disconnect_others))
+            .on_action(cx.listener(Self::toggle_read_only))
             .on_action(cx.listener(|this, _: &EditTabConnection, window, cx| {
                 this.perform(None, TabAction::EditConnection, window, cx)
             }))
@@ -3232,6 +3701,12 @@ impl Render for Workspace {
                 let navigator = this.sidebar.read(cx).navigator().clone();
                 navigator.update(cx, |navigator, cx| navigator.edit_selected(window, cx));
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::MaintenanceTools, window, cx| {
+                    let navigator = this.sidebar.read(cx).navigator().clone();
+                    navigator.update(cx, |navigator, cx| navigator.tools_on_selected(window, cx));
+                }),
+            )
             .on_action(cx.listener(|this, _: &RenameObject, window, cx| {
                 this.on_tree(TreeAction::Rename, window, cx)
             }))

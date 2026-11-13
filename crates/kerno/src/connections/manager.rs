@@ -577,6 +577,28 @@ impl Connections {
         Ok(())
     }
 
+    /// Makes a connection read-only, or lets it write again, and saves the
+    /// flag (never its secrets). An open connection is opened again, so
+    /// every session starts as the flag says.
+    pub fn set_read_only(&mut self, id: &str, read_only: bool, cx: &mut Context<Self>) {
+        let Some(connection) = self.saved.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        if connection.config.read_only == read_only {
+            return;
+        }
+        connection.config.read_only = read_only;
+        let changed = vec![connection.clone()];
+        self.store(changed, cx);
+        if !matches!(
+            self.status(id),
+            Status::Disconnected | Status::Failed { .. }
+        ) {
+            self.disconnect(id, cx);
+            self.connect(id, cx);
+        }
+    }
+
     /// Shows connections already changed in memory, and writes their
     /// settings (never their secrets) in the background. If that fails,
     /// the list is read back from storage.

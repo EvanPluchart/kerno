@@ -1824,9 +1824,58 @@ fn on_database(engine: Engine, database: Option<&str>, sql: &str) -> String {
                 Engine::MySql | Engine::MariaDb => kerno_mysql::MysqlDriver.connect(&params).await,
             }
             .expect("the test server");
-            let collected = kerno_core::exec::collect(session.clone(), sql.clone())
+            // A session a test left open must make the statement fail, with
+            // the server's message, not wait forever (and every later run
+            // with it, behind the exclusive test lock).
+            let (timeout, sessions) = match engine {
+                Engine::Postgres => (
+                    "SET lock_timeout = '15s'",
+                    "SELECT string_agg(concat_ws(' | ', pid, usename, datname, state, \
+                     left(query, 120)), E'\\n') FROM pg_stat_activity \
+                     WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'",
+                ),
+                Engine::MySql | Engine::MariaDb => (
+                    "SET SESSION lock_wait_timeout = 15",
+                    "SELECT GROUP_CONCAT(CONCAT_WS(' | ', ID, USER, DB, COMMAND, STATE, \
+                     LEFT(INFO, 120)) SEPARATOR '\\n') FROM information_schema.processlist \
+                     WHERE ID <> CONNECTION_ID()",
+                ),
+            };
+            kerno_core::exec::collect(session.clone(), timeout)
                 .await
-                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                .expect("the lock timeout");
+            // A database a test drops goes with whatever is still in it.
+            let sql = if engine == Engine::Postgres
+                && sql
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("DROP DATABASE")
+                && !sql.to_ascii_uppercase().contains("FORCE")
+            {
+                format!("{} WITH (FORCE)", sql.trim_end().trim_end_matches(';'))
+            } else {
+                sql
+            };
+            let collected = match kerno_core::exec::collect(session.clone(), sql.clone()).await {
+                Ok(collected) => collected,
+                Err(error) => {
+                    let open = kerno_core::exec::collect(session.clone(), sessions)
+                        .await
+                        .ok()
+                        .and_then(|listed| {
+                            listed
+                                .results
+                                .last()?
+                                .rows()
+                                .first()?
+                                .first()
+                                .cloned()
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    panic!("{sql}: {error}\nsessions on the server:\n{open}")
+                }
+            };
             session.close().await;
             collected
                 .results
@@ -2028,6 +2077,7 @@ fn dropping_renaming_and_truncating_show_the_sql_and_ask(cx: &mut TestAppContext
     // Truncate.
     assert_eq!(pg("SELECT count(*) FROM kerno_ui_nav.keep_me"), "3");
     app.act(cx, Action::Truncate, &table("keep_me"));
+    app.click(cx, "maintenance-run");
     app.click(cx, "sql-confirm");
     app.wait_until(cx, "the truncate", |_, _| {
         pg("SELECT count(*) FROM kerno_ui_nav.keep_me") == "0"
@@ -6523,11 +6573,7 @@ fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) 
 
     // The status bar's items answer a right-click, and a click.
     app.right_click(cx, "status-connection", None);
-    for label in [
-        "Disconnect (transaction open)",
-        "Reconnect (transaction open)",
-        "Edit connection…",
-    ] {
+    for label in ["Disconnect", "Reconnect", "Edit connection…"] {
         assert!(app.shows_label(cx, label), "{label}");
     }
     app.press(cx, &["escape"]);
@@ -6559,8 +6605,11 @@ fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) 
     app.click_label(cx, "What this means…");
     assert!(app.has(cx, "ok"), "the explanation is shown");
     app.click(cx, "ok");
-    // From the palette, a disconnection that would lose the transaction is refused.
+    // From the palette, a disconnection that would end the transaction
+    // asks first; Cancel keeps it.
     app.dispatch(cx, actions::DisconnectTabConnection);
+    assert!(app.has(cx, "end-question"));
+    app.click(cx, "end-cancel");
     assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
 
     // A data tab with a change waiting.
@@ -9490,11 +9539,22 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         app.dispatch(cx, actions::OpenAdmin);
         app.wait_admin(cx, Pane::Sessions);
         open.push(("before disconnecting", settle(cx, engine, ROLE, (5, 1))));
-        app.sidebar_does(
-            cx,
-            Subject::Connection(id.clone()),
-            SidebarAction::Disconnect,
-        );
+        // The open transaction is asked about first: Cancel keeps every
+        // session, the transaction still open.
+        let disconnect = |app: &Fixture, cx: &mut TestAppContext| {
+            app.sidebar_does(
+                cx,
+                Subject::Connection(id.clone()),
+                SidebarAction::Disconnect,
+            );
+            assert!(app.has(cx, "end-question"), "{engine:?}");
+        };
+        disconnect(&app, cx);
+        app.click(cx, "end-cancel");
+        open.push(("disconnect cancelled", settle(cx, engine, ROLE, (5, 1))));
+        // Rolled back, everything goes.
+        disconnect(&app, cx);
+        app.click(cx, "end-rollback");
         left.push(("disconnected", settle(cx, engine, ROLE, (0, 0))));
 
         measured.push((engine, left, open));
@@ -9509,6 +9569,23 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
             open.iter()
                 .any(|(what, held)| *what == "manual commit" && held.1 == 1),
             "{engine:?}: {open:?}"
+        );
+        // A cancelled disconnection leaves every session as it was, the
+        // transaction included.
+        let held = |name: &str| {
+            open.iter()
+                .find(|(what, _)| *what == name)
+                .map(|(_, held)| *held)
+        };
+        assert_eq!(
+            held("disconnect cancelled"),
+            held("before disconnecting"),
+            "{engine:?}: {open:?}"
+        );
+        assert_eq!(
+            held("disconnect cancelled").map(|held| held.1),
+            Some(1),
+            "{engine:?}"
         );
         let expected: Vec<_> = left
             .iter()
@@ -9646,4 +9723,1132 @@ fn the_about_text_is_one_centred_block(cx: &mut TestAppContext) {
         (centre(version) - centre(what)).abs() < px(1.),
         "{version:?} {what:?}"
     );
+}
+
+// Maintenance tools (docs/plans/PARITY-GAPS.md G12) ----------------------------
+
+impl Fixture {
+    /// Opens the maintenance tools of the tree row at `path`, on the tool
+    /// like `wanted`.
+    fn tools_dialog(
+        &self,
+        cx: &mut TestAppContext,
+        path: &[&str],
+        wanted: Option<kerno_core::maintenance::Maintenance>,
+    ) -> Option<Entity<crate::maintenance_dialog::MaintenanceDialog>> {
+        let row = self.tree_row(cx, path);
+        let navigator = cx.update(|cx| self.workspace.read(cx).navigator(cx));
+        self.step(cx, |window, cx| {
+            navigator.update(cx, |navigator, cx| {
+                let id = navigator.id_at(row, cx);
+                navigator.open_tools(&id, wanted.as_ref(), window, cx)
+            })
+        })
+    }
+
+    /// The tools of the tree row at `path`, by label.
+    fn tools_at(&self, cx: &mut TestAppContext, path: &[&str]) -> Vec<&'static str> {
+        let row = self.tree_row(cx, path);
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .tools_at(row, cx)
+        })
+    }
+
+    fn tool_state(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<crate::maintenance_dialog::MaintenanceDialog>,
+    ) -> String {
+        cx.update(|cx| dialog.read(cx).state())
+    }
+
+    /// Runs the dialog's tool through its confirmation; its state once it ended.
+    fn run_tool(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<crate::maintenance_dialog::MaintenanceDialog>,
+    ) -> String {
+        self.click(cx, "maintenance-run");
+        assert!(
+            self.has(cx, "sql-preview"),
+            "the statement is confirmed first"
+        );
+        self.click(cx, "sql-confirm");
+        self.wait_tool(cx, dialog)
+    }
+
+    /// The dialog's state once its run ended.
+    fn wait_tool(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<crate::maintenance_dialog::MaintenanceDialog>,
+    ) -> String {
+        self.wait_until(cx, "the tool to end", |app, cx| {
+            app.tool_state(cx, dialog) != "running"
+        });
+        self.tool_state(cx, dialog)
+    }
+}
+
+#[gpui_kit::test]
+fn postgres_tools_analyze_vacuum_refresh_switch_triggers_and_truncate(cx: &mut TestAppContext) {
+    use kerno_core::maintenance::{Maintenance, RefreshOptions};
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let pg = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_maint CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_maint",
+            "CREATE TABLE kerno_ui_maint.items \
+             (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, note text)",
+            "INSERT INTO kerno_ui_maint.items (note) SELECT 'n' FROM generate_series(1, 5)",
+            "CREATE MATERIALIZED VIEW kerno_ui_maint.stock AS SELECT id FROM kerno_ui_maint.items",
+            "CREATE FUNCTION kerno_ui_maint.mark() RETURNS trigger LANGUAGE plpgsql \
+             AS $$ BEGIN NEW.note := 'fired'; RETURN NEW; END $$",
+            "CREATE TRIGGER mark BEFORE INSERT ON kerno_ui_maint.items \
+             FOR EACH ROW EXECUTE FUNCTION kerno_ui_maint.mark()",
+        ],
+    );
+    let estimate = || {
+        pg("SELECT reltuples::bigint FROM pg_class WHERE oid = 'kerno_ui_maint.items'::regclass")
+    };
+    let app = connected(cx, Engine::Postgres);
+    let items = ["kerno", "kerno_ui_maint", "Tables", "items"];
+    app.open_path(cx, &items);
+
+    // ANALYZE fills the estimate of a table never analysed, and reports
+    // through notices.
+    assert_eq!(estimate(), "-1");
+    let dialog = app
+        .tools_dialog(cx, &items, Some(Maintenance::Analyze))
+        .expect("the dialog");
+    assert_eq!(
+        cx.update(|cx| dialog.read(cx).tools()),
+        ["Vacuum", "Analyze", "Truncate"]
+    );
+    let state = app.tool_state(cx, &dialog);
+    assert!(
+        state.starts_with("options: ANALYZE VERBOSE ") && state.contains("items"),
+        "{state}"
+    );
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    let (_, notices) = cx.update(|cx| dialog.read(cx).report());
+    assert!(
+        notices.iter().any(|notice| notice.contains("analyzing")),
+        "{notices:?}"
+    );
+    assert!(app.has(cx, "maintenance-outcome") && app.has(cx, "maintenance-log"));
+    assert_eq!(estimate(), "5");
+    app.click(cx, "maintenance-close");
+
+    // VACUUM with ANALYZE, its options at their defaults first; FULL keeps
+    // DISABLE_PAGE_SKIPPING off.
+    pg("DELETE FROM kerno_ui_maint.items WHERE id > 3");
+    let dialog = app.tools_dialog(cx, &items, None).expect("the dialog");
+    assert!(
+        app.tool_state(cx, &dialog)
+            .starts_with("options: VACUUM (VERBOSE) ")
+    );
+    app.click(cx, ("maintenance-option", 2usize));
+    app.click(cx, ("maintenance-option", 0usize));
+    app.click(cx, ("maintenance-option", 3usize));
+    assert!(
+        app.tool_state(cx, &dialog)
+            .starts_with("options: VACUUM (FULL, VERBOSE, ANALYZE) ")
+    );
+    app.click(cx, ("maintenance-option", 0usize));
+    assert!(
+        app.tool_state(cx, &dialog)
+            .starts_with("options: VACUUM (VERBOSE, ANALYZE) ")
+    );
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    assert_eq!(estimate(), "3");
+    app.click(cx, "maintenance-close");
+
+    // A refresh shows the rows added since; it keeps the data by default.
+    pg("INSERT INTO kerno_ui_maint.items (note) VALUES ('new')");
+    assert_eq!(pg("SELECT count(*) FROM kerno_ui_maint.stock"), "5");
+    let stock = ["kerno", "kerno_ui_maint", "Materialized views", "stock"];
+    app.open_path(cx, &stock);
+    let dialog = app
+        .tools_dialog(
+            cx,
+            &stock,
+            Some(Maintenance::RefreshMaterializedView(
+                RefreshOptions::default(),
+            )),
+        )
+        .expect("the dialog");
+    let state = app.tool_state(cx, &dialog);
+    assert!(
+        state.starts_with("options: REFRESH MATERIALIZED VIEW ") && state.ends_with(" WITH DATA"),
+        "{state}"
+    );
+    // CONCURRENTLY needs a unique index, which the view lacks: the server's
+    // error is shown, and Back offers the options again.
+    app.click(cx, ("maintenance-option", 1usize));
+    let failed = app.run_tool(cx, &dialog);
+    assert!(
+        failed.starts_with("failed: ") && failed.contains("unique index"),
+        "{failed}"
+    );
+    assert!(app.has(cx, "maintenance-outcome"));
+    app.click(cx, "maintenance-back");
+    app.click(cx, ("maintenance-option", 1usize));
+    assert!(
+        !app.tool_state(cx, &dialog).contains("CONCURRENTLY"),
+        "{}",
+        app.tool_state(cx, &dialog)
+    );
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    assert_eq!(pg("SELECT count(*) FROM kerno_ui_maint.stock"), "4");
+    app.click(cx, "maintenance-close");
+
+    // A trigger is disabled, then (shown as such in the tree) enabled again.
+    let trigger = [
+        "kerno",
+        "kerno_ui_maint",
+        "Tables",
+        "items",
+        "Triggers",
+        "mark",
+    ];
+    let state = || {
+        pg("SELECT tgenabled FROM pg_trigger WHERE tgname = 'mark' \
+            AND tgrelid = 'kerno_ui_maint.items'::regclass")
+    };
+    app.open_path(cx, &trigger);
+    assert_eq!(app.tools_at(cx, &trigger), ["Disable trigger"]);
+    let dialog = app.tools_dialog(cx, &trigger, None).expect("the dialog");
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    assert_eq!(state(), "D");
+    app.click(cx, "maintenance-close");
+    app.wait_until(cx, "the tree to show the trigger disabled", |app, cx| {
+        app.shows(cx, &trigger) && app.tools_at(cx, &trigger) == ["Enable trigger"]
+    });
+    let dialog = app.tools_dialog(cx, &trigger, None).expect("the dialog");
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    assert_eq!(state(), "O");
+    app.click(cx, "maintenance-close");
+
+    // "Truncate…" opens the same dialog, with PostgreSQL's options.
+    app.act(cx, Action::Truncate, &items);
+    assert!(app.has(cx, "maintenance-dialog") && app.has(cx, ("maintenance-option", 2usize)));
+    app.click(cx, ("maintenance-option", 1usize));
+    app.click(cx, "maintenance-run");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the truncate", |_, _| {
+        pg("SELECT count(*) FROM kerno_ui_maint.items") == "0"
+    });
+    assert_eq!(
+        pg("INSERT INTO kerno_ui_maint.items (note) VALUES ('x') RETURNING id"),
+        "1",
+        "RESTART IDENTITY starts the ids again"
+    );
+}
+
+#[gpui_kit::test]
+fn a_postgres_database_is_vacuumed_and_analysed_from_its_node(cx: &mut TestAppContext) {
+    use kerno_core::maintenance::Maintenance;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let database = "kerno_ui_maint_db";
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP DATABASE IF EXISTS kerno_ui_maint_db WITH (FORCE)"],
+        &["CREATE DATABASE kerno_ui_maint_db"],
+    );
+    on_database(
+        Engine::Postgres,
+        Some(database),
+        "CREATE TABLE t AS SELECT generate_series(1, 30) AS n",
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.wait_until(cx, "the scratch database", |app, cx| {
+        app.shows(cx, &[database])
+    });
+    assert_eq!(app.tools_at(cx, &[database]), ["Vacuum", "Analyze"]);
+    let dialog = app
+        .tools_dialog(cx, &[database], Some(Maintenance::Analyze))
+        .expect("the dialog");
+    // The whole database: the one the dialog's session is opened on.
+    assert_eq!(app.tool_state(cx, &dialog), "options: ANALYZE VERBOSE");
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    assert_eq!(
+        on_database(
+            Engine::Postgres,
+            Some(database),
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'public.t'::regclass"
+        ),
+        "30"
+    );
+    app.click(cx, "maintenance-back");
+    app.click(cx, ("maintenance-tool", 0usize));
+    assert_eq!(app.tool_state(cx, &dialog), "options: VACUUM (VERBOSE)");
+    assert_eq!(app.run_tool(cx, &dialog), "done");
+    let (_, notices) = cx.update(|cx| dialog.read(cx).report());
+    assert!(!notices.is_empty());
+    app.click(cx, "maintenance-close");
+}
+
+#[gpui_kit::test]
+fn mysql_and_mariadb_tools_show_their_status_rows(cx: &mut TestAppContext) {
+    use kerno_core::maintenance::Maintenance;
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let server = |sql: &str| on_server(engine, sql);
+        let _scratch = Scratch::new(
+            engine,
+            &["DROP DATABASE IF EXISTS kerno_ui_maint_my"],
+            &[
+                "CREATE DATABASE kerno_ui_maint_my",
+                "CREATE TABLE kerno_ui_maint_my.t (id INT PRIMARY KEY) ENGINE = InnoDB",
+                "INSERT INTO kerno_ui_maint_my.t VALUES (1), (2)",
+            ],
+        );
+        let app = connected(cx, engine);
+        let table = ["kerno_ui_maint_my", "Tables", "t"];
+        app.open_path(cx, &table);
+        assert_eq!(
+            app.tools_at(cx, &table),
+            ["Analyze", "Truncate", "Check", "Optimize", "Repair"],
+            "{engine:?}"
+        );
+        let ends_ok = |rows: &[Vec<String>], op: &str| {
+            rows.iter().all(|row| row[1] == op)
+                && rows
+                    .last()
+                    .is_some_and(|row| row[2] == "status" && row[3] == "OK")
+        };
+
+        // OPTIMIZE answers with its status rows, shown as a table.
+        let dialog = app
+            .tools_dialog(cx, &table, Some(Maintenance::Optimize))
+            .expect("the dialog");
+        assert_eq!(
+            app.tool_state(cx, &dialog),
+            "options: OPTIMIZE TABLE `kerno_ui_maint_my`.`t`"
+        );
+        assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
+        let (rows, _) = cx.update(|cx| dialog.read(cx).report());
+        assert!(ends_ok(&rows, "optimize"), "{engine:?}: {rows:?}");
+        assert!(app.has(cx, "maintenance-rows") && app.has(cx, ("maintenance-row", 0usize)));
+
+        // CHECK with one of its options.
+        app.click(cx, "maintenance-back");
+        app.click(cx, ("maintenance-tool", 2usize));
+        app.click(cx, ("maintenance-check", 2usize));
+        assert_eq!(
+            app.tool_state(cx, &dialog),
+            "options: CHECK TABLE `kerno_ui_maint_my`.`t` QUICK"
+        );
+        assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
+        let (rows, _) = cx.update(|cx| dialog.read(cx).report());
+        assert!(ends_ok(&rows, "check"), "{engine:?}: {rows:?}");
+
+        // ANALYZE ends OK; InnoDB has no REPAIR, which MySQL says in a note
+        // (MariaDB answers OK): the rows are shown as returned.
+        app.click(cx, "maintenance-back");
+        app.click(cx, ("maintenance-tool", 0usize));
+        assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
+        let (rows, _) = cx.update(|cx| dialog.read(cx).report());
+        assert!(ends_ok(&rows, "analyze"), "{engine:?}: {rows:?}");
+        app.click(cx, "maintenance-back");
+        app.click(cx, ("maintenance-tool", 4usize));
+        assert_eq!(
+            app.tool_state(cx, &dialog),
+            "options: REPAIR TABLE `kerno_ui_maint_my`.`t`"
+        );
+        assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
+        let (rows, _) = cx.update(|cx| dialog.read(cx).report());
+        assert!(
+            !rows.is_empty() && rows.iter().all(|row| row[1] == "repair"),
+            "{engine:?}: {rows:?}"
+        );
+
+        // TRUNCATE has no option on MySQL.
+        app.click(cx, "maintenance-back");
+        app.click(cx, ("maintenance-tool", 1usize));
+        assert!(!app.has(cx, ("maintenance-option", 0usize)));
+        assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
+        assert_eq!(server("SELECT COUNT(*) FROM kerno_ui_maint_my.t"), "0");
+        app.click(cx, "maintenance-close");
+    }
+}
+
+#[gpui_kit::test]
+fn the_tools_menu_and_command_open_the_dialog_and_read_only_or_production_guard_it(
+    cx: &mut TestAppContext,
+) {
+    use kerno_core::maintenance::Maintenance;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_maint_menu CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_maint_menu",
+            "CREATE TABLE kerno_ui_maint_menu.t AS SELECT generate_series(1, 3) AS n",
+        ],
+    );
+    let table = ["kerno", "kerno_ui_maint_menu", "Tables", "t"];
+    let right_click = |app: &Fixture, cx: &mut TestAppContext| {
+        let row = app.tree_row(cx, &table);
+        app.right_click(cx, ("node", row), None);
+        click_menu_entry(app, cx, "Tools");
+    };
+
+    // A real right-click: Tools ▸ lists the table's tools and opens one.
+    let app = connected(cx, Engine::Postgres);
+    app.open_path(cx, &table);
+    right_click(&app, cx);
+    for label in ["Vacuum…", "Analyze…", "Truncate…"] {
+        assert!(menu_entry(&app, cx, label).is_some(), "{label}");
+    }
+    click_menu_entry(&app, cx, "Analyze…");
+    assert!(app.has(cx, "maintenance-dialog"));
+    app.click(cx, "maintenance-close");
+    assert!(!app.has(cx, "maintenance-dialog"));
+
+    // The palette command acts on the selected node, and says why a schema
+    // has no tool.
+    let palette = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |window, cx| {
+            window.dispatch_action(Box::new(actions::MaintenanceTools), cx)
+        })
+    };
+    app.click_row(cx, &["kerno", "kerno_ui_maint_menu"], false);
+    palette(&app, cx);
+    assert!(!app.has(cx, "maintenance-dialog"));
+    app.click_row(cx, &table, false);
+    palette(&app, cx);
+    assert!(app.has(cx, "maintenance-dialog"));
+    app.click(cx, "maintenance-close");
+
+    // Read-only: every tool is disabled with the reason, and none opens.
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.open_path(cx, &table);
+    for action in [Action::Tools, Action::Truncate] {
+        assert_eq!(
+            app.why_not(cx, action, &table),
+            Some("read-only connection")
+        );
+    }
+    right_click(&app, cx);
+    assert!(menu_entry(&app, cx, "Analyze… (read-only connection)").is_some());
+    assert!(app.tools_dialog(cx, &table, None).is_none());
+    app.act(cx, Action::Truncate, &table);
+    assert!(!app.has(cx, "maintenance-dialog"));
+
+    // Production: the confirmation asks twice.
+    let mut config = testing::config(Engine::Postgres);
+    config.environment = kerno_core::config::Environment::Production;
+    let app = connected_as(cx, config);
+    app.open_path(cx, &table);
+    let dialog = app
+        .tools_dialog(cx, &table, Some(Maintenance::Analyze))
+        .expect("the dialog");
+    app.click(cx, "maintenance-run");
+    app.click(cx, "sql-confirm");
+    assert!(app.has(cx, "sql-production"));
+    assert!(app.tool_state(cx, &dialog).starts_with("options: "));
+    app.click(cx, "sql-confirm");
+    assert_eq!(app.wait_tool(cx, &dialog), "done");
+}
+
+#[gpui_kit::test]
+fn a_vacuum_waiting_for_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    vacuum_behind_a_lock(cx, "kerno_ui_maint_cancel", false);
+}
+
+#[gpui_kit::test]
+fn closing_the_dialog_stops_a_vacuum_waiting_for_a_lock(cx: &mut TestAppContext) {
+    vacuum_behind_a_lock(cx, "kerno_ui_maint_close", true);
+}
+
+/// A vacuum that waits behind another session's lock, then stopped with the
+/// Cancel button or, with `close`, by closing the dialog.
+fn vacuum_behind_a_lock(cx: &mut TestAppContext, schema: &str, close: bool) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let pg = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")],
+        &[
+            &format!("CREATE SCHEMA {schema}"),
+            &format!("CREATE TABLE {schema}.t (n int)"),
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let table = ["kerno", schema, "Tables", "t"];
+    app.open_path(cx, &table);
+    // Another session holds the table for a few seconds.
+    let lock = format!("LOCK TABLE {schema}.t IN ACCESS EXCLUSIVE MODE");
+    let locker = std::thread::spawn(move || {
+        use kerno_core::Driver as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let session = kerno_postgres::PostgresDriver
+                .connect(&testing::params(Engine::Postgres))
+                .await
+                .expect("the test server");
+            for sql in ["BEGIN", lock.as_str(), "SELECT pg_sleep(4)", "COMMIT"] {
+                kerno_core::exec::collect(session.clone(), sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            }
+            session.close().await;
+        })
+    });
+    let locks = format!(
+        "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+         WHERE c.relname = 't' AND l.mode = 'AccessExclusiveLock' \
+         AND c.relnamespace = '{schema}'::regnamespace"
+    );
+    app.wait_until(cx, "the lock", |_, _| pg(&locks) == "1");
+    let dialog = app.tools_dialog(cx, &table, None).expect("the dialog");
+    app.click(cx, "maintenance-run");
+    app.click(cx, "sql-confirm");
+    let waiting = format!(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE query LIKE 'VACUUM%{schema}%' AND wait_event_type = 'Lock'"
+    );
+    app.wait_until(cx, "the vacuum to wait for the lock", |_, _| {
+        pg(&waiting) == "1"
+    });
+    assert_eq!(app.tool_state(cx, &dialog), "running");
+    if close {
+        // Nothing but the dialog holds its view: closed, it is gone, and
+        // the statement is stopped while the lock is still held.
+        drop(dialog);
+        app.step(cx, |window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.close_dialog(cx);
+        });
+        app.wait_until(cx, "the vacuum to be stopped", |_, _| pg(&waiting) == "0");
+        assert_eq!(
+            pg(&locks),
+            "1",
+            "stopped by the cancel, not by the lock's end"
+        );
+    } else {
+        app.click(cx, "maintenance-cancel");
+        assert_eq!(app.wait_tool(cx, &dialog), "cancelled");
+        assert!(app.has(cx, "maintenance-back"));
+    }
+    locker.join().expect("the lock was held and released");
+}
+
+// Ending what sessions hold; focus after dialogs; tag colours; menus (M10
+// Part 4 follow-ups, G13 leftovers) ------------------------------------------
+
+impl Fixture {
+    /// Whether the active query tab's editor has the keyboard.
+    fn editor_has_keyboard(&self, cx: &mut TestAppContext) -> bool {
+        let tab = self.tab(cx);
+        self.step(cx, |window, cx| {
+            tab.read(cx).focus_handle(cx).contains_focused(window, cx)
+        })
+    }
+
+    /// Whether a dialog (or alert, or the palette) is open.
+    fn dialog_open(&self, cx: &mut TestAppContext) -> bool {
+        use gpui_kit::component::WindowExt as _;
+        self.step(cx, |window, cx| window.has_active_dialog(cx))
+    }
+
+    fn tx_state(&self, cx: &mut TestAppContext) -> kerno_core::TxState {
+        let tab = self.tab(cx);
+        cx.update(|cx| tab.read(cx).tx_state())
+    }
+
+    /// Types `sql` in place of the active editor's text and runs it in a
+    /// transaction of its own, which stays open.
+    fn open_transaction(&self, cx: &mut TestAppContext, sql: &str) {
+        let tab = self.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+        self.press(cx, &["secondary-a", "backspace"]);
+        self.type_text(cx, sql);
+        self.press(cx, &["secondary-enter"]);
+        self.wait_until(cx, "the open transaction", |app, cx| {
+            !app.running(cx) && app.tx_state(cx) == kerno_core::TxState::Open
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn disconnecting_ends_open_transactions_only_as_answered(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let server = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE query LIKE '%kerno_ui_end.entries values%' AND pid <> pg_backend_pid()",
+            "DROP SCHEMA IF EXISTS kerno_ui_end CASCADE",
+        ],
+        &[
+            "CREATE SCHEMA kerno_ui_end",
+            "CREATE TABLE kerno_ui_end.entries (id int PRIMARY KEY, note text)",
+            "INSERT INTO kerno_ui_end.entries VALUES (1, 'kept')",
+        ],
+    );
+    let count = || server("SELECT count(*) FROM kerno_ui_end.entries");
+    let app = connected(cx, Engine::Postgres);
+
+    // A transaction left open, and a table with a change not applied.
+    app.press(cx, &["secondary-t"]);
+    let query = app.tab(cx);
+    app.open_transaction(cx, "insert into kerno_ui_end.entries values (2, 'open')");
+    app.open_table(cx, "kerno_ui_end", "entries", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    app.type_in_cell(cx, 0, 2, "changed", "enter");
+    assert_eq!(app.pending(cx), 1);
+
+    // Disconnect from the sidebar's menu: one question lists both; Enter
+    // does not answer it, Cancel changes nothing.
+    app.right_click(cx, ("connection", 0usize), None);
+    app.click_label(cx, "Disconnect");
+    assert!(app.has(cx, "end-question"));
+    for line in [
+        "“Query 1”: a transaction is open.",
+        "“entries”: 1 pending change is discarded.",
+        "Commit and continue",
+        "Roll back and continue",
+    ] {
+        assert!(app.shows_label(cx, line), "{line}");
+    }
+    app.press(cx, &["enter"]);
+    assert!(app.has(cx, "end-question"));
+    app.click(cx, "end-cancel");
+    assert!(!app.dialog_open(cx));
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    assert_eq!(app.pending(cx), 1);
+    assert_eq!(
+        cx.update(|cx| query.read(cx).tx_state()),
+        kerno_core::TxState::Open
+    );
+    assert_eq!(count(), "1");
+
+    // Reconnect from the status bar, committing first.
+    app.right_click(cx, "status-connection", None);
+    app.click_label(cx, "Reconnect");
+    app.click(cx, "end-commit");
+    app.wait_until(cx, "the commit, then the reconnection", |app, cx| {
+        app.pending(cx) == 0 && matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    assert_eq!(count(), "2");
+    assert_eq!(
+        cx.update(|cx| query.read(cx).tx_state()),
+        kerno_core::TxState::Idle
+    );
+
+    // Disconnect all from the palette, rolling back; the tab does not say
+    // the server did it.
+    app.click(cx, ("tab-title", 0usize));
+    app.open_transaction(
+        cx,
+        "insert into kerno_ui_end.entries values (3, 'rolled back')",
+    );
+    app.dispatch(cx, actions::DisconnectAll);
+    assert!(app.shows_label(cx, "Disconnect all connections?"));
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the rollback, then the disconnection", |app, cx| {
+        app.status(cx, 0) == Status::Disconnected
+    });
+    assert_eq!(count(), "2");
+    let messages = cx.update(|cx| query.read(cx).messages());
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("rolled it back")),
+        "{messages:?}"
+    );
+    // With nothing open, Disconnect all says so.
+    app.dispatch(cx, actions::DisconnectAll);
+    assert!(!app.dialog_open(cx));
+}
+
+/// Two connections of the test server: the first in its usual auto-commit,
+/// the second named `second` and set to start in manual commit.
+fn two_connections(cx: &mut TestAppContext, second: &str) -> Fixture {
+    let storage = memory_storage();
+    let first = storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let manual = ConnectionConfig {
+        name: second.into(),
+        auto_commit: Some(false),
+        ..testing::config(Engine::Postgres)
+    };
+    let other = storage.save_connection(None, &manual).unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    for id in [&first, &other] {
+        kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
+    }
+    for row in [0usize, 1] {
+        app.step(cx, |window, cx| {
+            window.double_click(("connection", row), cx)
+        });
+    }
+    app.wait_until(cx, "both connections", |app, cx| {
+        (0..2).all(|index| matches!(app.status(cx, index), Status::Connected { .. }))
+    });
+    app
+}
+
+#[gpui_kit::test]
+fn a_tab_moved_with_a_transaction_asks_and_takes_its_new_commit_mode(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let server = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE query LIKE '%kerno_ui_move.entries values%' AND pid <> pg_backend_pid()",
+            "DROP SCHEMA IF EXISTS kerno_ui_move CASCADE",
+        ],
+        &[
+            "CREATE SCHEMA kerno_ui_move",
+            "CREATE TABLE kerno_ui_move.entries (id int PRIMARY KEY)",
+        ],
+    );
+    let app = two_connections(cx, "kerno_ui_move manual");
+    let (first, second) = cx.update(|cx| {
+        let saved = app.connections.read(cx).saved();
+        (saved[0].id.clone(), saved[1].id.clone())
+    });
+    let on = |id: &str| Target {
+        connection: id.to_string(),
+        database: None,
+        schema: None,
+    };
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.set_target(Some(on(&first)), cx)));
+    assert!(!cx.update(|cx| tab.read(cx).manual_commit()));
+    app.open_transaction(cx, "insert into kerno_ui_move.entries values (1)");
+
+    // The toolbar's connection selector asks; Cancel keeps the tab where
+    // it was, its transaction open.
+    let connection_of = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            tab.read(cx)
+                .target()
+                .map(|target| target.connection.clone())
+        })
+    };
+    app.click(cx, "tab-connection");
+    app.click_label(cx, "kerno_ui_move manual");
+    assert!(app.shows_label(cx, "Switch “Query 1” to “kerno_ui_move manual”?"));
+    app.click(cx, "end-cancel");
+    assert_eq!(connection_of(cx), Some(first.clone()));
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Open);
+
+    // Rolled back, the tab moves and starts in the manual commit of its new
+    // connection.
+    app.click(cx, "tab-connection");
+    app.click_label(cx, "kerno_ui_move manual");
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the move", |_, cx| {
+        connection_of(cx) == Some(second.clone())
+    });
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle);
+    assert!(cx.update(|cx| tab.read(cx).manual_commit()));
+    assert_eq!(server("SELECT count(*) FROM kerno_ui_move.entries"), "0");
+
+    // Without a transaction it moves at once, and takes auto-commit back.
+    let first_name = cx.update(|cx| app.connections.read(cx).saved()[0].config.name.clone());
+    app.click(cx, "tab-connection");
+    app.click_label(cx, &first_name);
+    assert!(!app.dialog_open(cx));
+    assert_eq!(connection_of(cx), Some(first));
+    assert!(!cx.update(|cx| tab.read(cx).manual_commit()));
+}
+
+#[gpui_kit::test]
+fn a_lost_connection_says_the_server_rolled_its_transaction_back(cx: &mut TestAppContext) {
+    // A role of its own: its sessions are the ones cut.
+    const ROLE: &str = "kerno_ui_lost";
+    const PASSWORD: &str = "kerno_ui_lost_pw";
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let server = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            &format!(
+                "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{ROLE}'"
+            ),
+            &format!("DROP SCHEMA IF EXISTS {ROLE} CASCADE"),
+            &format!("DROP ROLE IF EXISTS {ROLE}"),
+        ],
+        &[
+            &format!("CREATE ROLE {ROLE} LOGIN PASSWORD '{PASSWORD}'"),
+            &format!("CREATE SCHEMA {ROLE} AUTHORIZATION {ROLE}"),
+            &format!("CREATE TABLE {ROLE}.entries (id int PRIMARY KEY)"),
+            &format!("ALTER TABLE {ROLE}.entries OWNER TO {ROLE}"),
+        ],
+    );
+    let storage = memory_storage();
+    let config = ConnectionConfig {
+        user: ROLE.into(),
+        ..testing::config(Engine::Postgres)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    let password = Secrets {
+        password: Some(Secret::new(PASSWORD)),
+        ..Secrets::default()
+    };
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &password).unwrap();
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    app.open_transaction(cx, &format!("insert into {ROLE}.entries values (1)"));
+
+    // The server goes away: nothing can ask, the tab says what happened.
+    server(&format!(
+        "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{ROLE}'"
+    ));
+    app.dispatch(cx, actions::RefreshConnections);
+    app.wait_until(cx, "the tab to say so", |_, cx| {
+        cx.update(|cx| tab.read(cx).messages())
+            .iter()
+            .any(|message| message.contains("the server rolled it back"))
+    });
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle);
+    assert_eq!(server(&format!("SELECT count(*) FROM {ROLE}.entries")), "0");
+}
+
+#[gpui_kit::test]
+fn read_only_is_toggled_saved_and_reopens_the_sessions(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let session_read_only = |app: &Fixture, cx: &mut TestAppContext| {
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, "show transaction_read_only");
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the setting", |app, cx| {
+            !app.running(cx) && app.outcomes(cx) == ["1 rows"]
+        });
+        app.result(cx, 0, 1).1[0][0].clone().unwrap()
+    };
+    app.press(cx, &["secondary-t"]);
+    assert_eq!(session_read_only(&app, cx), "off");
+
+    // From the connection's menu: a checked entry, saved, every session
+    // reopened read-only.
+    app.right_click(cx, ("connection", 0usize), None);
+    app.click_label(cx, "Read-only");
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        app.first_stored().read_only && matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    assert!(app.status_bar(cx).contains(&"read-only".to_string()));
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let sidebar = cx.update(|cx| app.workspace.read(cx).sidebar());
+    let entries = cx.update(|cx| sidebar.read(cx).menu_of(&Subject::Connection(id), cx));
+    assert!(entries.contains(&crate::sidebar::Entry::Item(
+        SidebarAction::ReadOnly(true),
+        None
+    )));
+    assert_eq!(session_read_only(&app, cx), "on");
+
+    // From the palette, with a transaction open: it asks first.
+    app.open_transaction(cx, "select 1");
+    app.dispatch(cx, actions::ToggleReadOnly);
+    assert!(app.has(cx, "end-question"));
+    app.click(cx, "end-cancel");
+    assert!(app.first_stored().read_only);
+    app.dispatch(cx, actions::ToggleReadOnly);
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "changes allowed again", |app, cx| {
+        !app.first_stored().read_only && matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+    assert_eq!(session_read_only(&app, cx), "off");
+}
+
+#[gpui_kit::test]
+fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let tagged = ConnectionConfig {
+        name: "tagged".into(),
+        color: Some("blue".into()),
+        ..testing::config(Engine::Postgres)
+    };
+    let production = ConnectionConfig {
+        name: "production".into(),
+        environment: kerno_core::Environment::Production,
+        ..testing::config(Engine::Postgres)
+    };
+    let tagged_id = storage.save_connection(None, &tagged).unwrap();
+    let production_id = storage.save_connection(None, &production).unwrap();
+    let query = |title: &str, id: &str| TabSnapshot::Query {
+        title: title.into(),
+        sql: String::new(),
+        target: Some(Target {
+            connection: id.into(),
+            database: None,
+            schema: None,
+        }),
+        file: None,
+        unsaved: false,
+        source: None,
+    };
+    storage
+        .save_tabs(&[
+            query("Query 1", &tagged_id),
+            query("Query 2", &production_id),
+            TabSnapshot::Query {
+                title: "Query 3".into(),
+                sql: String::new(),
+                target: None,
+                file: None,
+                unsaved: false,
+                source: None,
+            },
+        ])
+        .unwrap();
+    let app = open(cx, storage);
+    // A stripe on each tab of a connection, none on a tab without one.
+    assert!(app.has(cx, ("tab-stripe", 0usize)));
+    assert!(app.has(cx, ("tab-stripe", 1usize)));
+    assert!(!app.has(cx, ("tab-stripe", 2usize)));
+    // Its colour is the tag's, else the environment's: production is red.
+    cx.update(|cx| {
+        assert_eq!(
+            theme::connection_color(&tagged, cx),
+            theme::tag_color("blue", cx).unwrap()
+        );
+        assert_eq!(theme::connection_color(&production, cx), cx.theme().danger);
+    });
+    // The status bar's connection item carries it too.
+    app.click(cx, ("tab-title", 0usize));
+    assert!(app.has(cx, "status-connection-stripe"));
+    app.click(cx, ("tab-title", 2usize));
+    assert!(!app.has(cx, "status-connection-stripe"));
+}
+
+#[gpui_kit::test]
+fn an_incomplete_result_says_so_and_runs_again_from_its_menu(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select generate_series(1, 5000) as kerno_ui_incomplete",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the first page", |app, cx| {
+        !app.running(cx) && app.outcomes(cx) == ["1000 rows, more"]
+    });
+    assert!(!app.has(cx, ("result-incomplete", 0usize)));
+
+    // Another statement on the session, from the toolbar's Run dropdown,
+    // keeps the first result: its paging stops.
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, "select 1 as kerno_ui_other");
+    app.click(cx, "tab-run-menu");
+    for label in [
+        "Run script from the cursor",
+        "Count rows of statement",
+        "Go to next statement",
+        "Toggle results panel",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.click_label(cx, "Run statement in new result tab");
+    app.wait_until(cx, "the second result", |app, cx| {
+        !app.running(cx) && app.outcomes(cx).len() == 2
+    });
+    assert_eq!(app.outcomes(cx), ["1000 rows, incomplete", "1 rows"]);
+    assert!(app.has(cx, ("result-incomplete", 0usize)));
+
+    // Its menu runs it again, in its place.
+    app.right_click(cx, ("result-tab", 0usize), None);
+    app.click_label(cx, "Run again");
+    app.wait_until(cx, "the run again", |app, cx| {
+        !app.running(cx) && app.outcomes(cx) == ["1 rows", "1000 rows, more"]
+    });
+    assert!(!app.has(cx, ("result-incomplete", 0usize)));
+    assert!(!app.has(cx, ("result-incomplete", 1usize)));
+
+    // The editor's menu has G4's commands too.
+    app.right_click(cx, "query-editor", Some(gpui_kit::point(px(120.), px(10.))));
+    for label in [
+        "Run statement in new result tab",
+        "Run script from the cursor",
+        "Count rows of statement",
+        "Go to previous statement",
+        "Maximize results panel",
+        "Focus results / editor",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.click_label(cx, "Count rows of statement");
+    let tab = app.tab(cx);
+    app.wait_until(cx, "the count", |_, cx| {
+        cx.update(|cx| tab.read(cx).messages())
+            .iter()
+            .any(|message| message.contains("1 row in the result"))
+    });
+}
+
+#[gpui_kit::test]
+fn the_keyboard_comes_back_after_every_dialog_and_the_palette(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    // After each: the editor has the keyboard, and a global key works.
+    let back = |app: &Fixture, cx: &mut TestAppContext, what: &str| {
+        assert!(!app.dialog_open(cx), "{what}: still open");
+        assert!(
+            app.editor_has_keyboard(cx),
+            "{what}: the editor lost the keyboard"
+        );
+        let open = app.titles(cx).len();
+        app.press(cx, &["secondary-t"]);
+        assert_eq!(app.titles(cx).len(), open + 1, "{what}: Cmd+T did nothing");
+        app.press(cx, &["secondary-w"]);
+        assert_eq!(app.titles(cx).len(), open, "{what}");
+        assert!(app.editor_has_keyboard(cx), "{what}");
+    };
+    let replace = |app: &Fixture, cx: &mut TestAppContext, sql: &str| {
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, sql);
+    };
+
+    app.press(cx, &["secondary-,"]);
+    assert!(app.dialog_open(cx));
+    app.press(cx, &["escape"]);
+    back(&app, cx, "settings");
+
+    app.dispatch(cx, actions::About);
+    app.click(cx, "ok");
+    back(&app, cx, "about");
+
+    app.press(cx, &["secondary-n"]);
+    app.click(cx, "conn-cancel");
+    back(&app, cx, "the connection dialog");
+
+    replace(&app, cx, "drop table if exists kerno_ui_focus_nothing");
+    app.press(cx, &["secondary-enter"]);
+    app.click(cx, "sql-cancel");
+    back(&app, cx, "the SQL confirmation");
+
+    replace(&app, cx, "select 1 as kerno_ui_focus");
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    app.click(cx, "result-export");
+    app.click(cx, "export-close");
+    back(&app, cx, "export");
+
+    app.dispatch(cx, actions::BackupDatabase);
+    app.click(cx, "backup-close");
+    back(&app, cx, "backup");
+
+    app.press(cx, &["secondary-k"]);
+    app.press(cx, &["escape"]);
+    back(&app, cx, "the palette");
+    // A command of the palette that opens a dialog.
+    app.press(cx, &["secondary-k"]);
+    app.type_text(cx, "Settings");
+    app.press(cx, &["enter"]);
+    assert!(app.dialog_open(cx));
+    app.press(cx, &["escape"]);
+    back(&app, cx, "settings from the palette");
+
+    // The close question and the end question, with a transaction open.
+    app.open_transaction(cx, "select 1 as kerno_ui_focus_tx");
+    app.press(cx, &["secondary-w"]);
+    app.click(cx, "cancel");
+    back(&app, cx, "the close question");
+    app.dispatch(cx, actions::DisconnectTabConnection);
+    app.click(cx, "end-cancel");
+    back(&app, cx, "the end question");
+    app.dispatch(cx, actions::RollbackTransaction);
+}
+
+#[gpui_kit::test]
+fn disconnect_others_and_a_folder_close_only_those_connections(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = two_connections(cx, "kerno_ui_others second");
+    let (first, second) = cx.update(|cx| {
+        let saved = app.connections.read(cx).saved();
+        (saved[0].id.clone(), saved[1].id.clone())
+    });
+    let open = |app: &Fixture, cx: &mut TestAppContext, index| {
+        matches!(app.status(cx, index), Status::Connected { .. })
+    };
+
+    // Disconnect others (CON-34): the second closes, the first stays.
+    app.sidebar_does(
+        cx,
+        Subject::Connection(first.clone()),
+        SidebarAction::DisconnectOthers,
+    );
+    app.wait_until(cx, "the other to close", |app, cx| {
+        app.status(cx, 1) == Status::Disconnected
+    });
+    assert!(open(&app, cx, 0));
+
+    // A folder's Disconnect (CM-12): only what the folder holds.
+    cx.update(|cx| {
+        app.connections.update(cx, |connections, cx| {
+            connections.move_connection(&second, Some("kerno_ui_folder"), cx)
+        })
+    });
+    app.sidebar_does(cx, Subject::Connection(second), SidebarAction::Connect);
+    app.wait_until(cx, "the second again", |app, cx| open(app, cx, 1));
+    app.sidebar_does(
+        cx,
+        Subject::Folder("kerno_ui_folder".into()),
+        SidebarAction::Disconnect,
+    );
+    app.wait_until(cx, "the folder's connection to close", |app, cx| {
+        app.status(cx, 1) == Status::Disconnected
+    });
+    assert!(open(&app, cx, 0));
 }

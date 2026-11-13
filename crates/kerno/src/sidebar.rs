@@ -19,7 +19,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
     Window, div, px,
 };
-use kerno_core::config::{connection_url, last_folder_name, parent_folder};
+use kerno_core::config::{connection_url, in_folder, last_folder_name, parent_folder};
 use kerno_core::storage::SavedConnection;
 
 use crate::actions::NewConnection;
@@ -54,8 +54,15 @@ pub enum SidebarAction {
     Rename,
     Delete,
     Connect,
+    /// A connection, or every connection open in a folder.
     Disconnect,
     Reconnect,
+    /// Every connection open but this one.
+    DisconnectOthers,
+    /// Every connection open.
+    DisconnectAll,
+    /// The connection's read-only flag, as it is now (a checked entry).
+    ReadOnly(bool),
     NewSqlEditor,
     Administration,
     Edit,
@@ -82,6 +89,9 @@ impl SidebarAction {
             Self::Connect => "Connect",
             Self::Disconnect => "Disconnect",
             Self::Reconnect => "Reconnect",
+            Self::DisconnectOthers => "Disconnect others",
+            Self::DisconnectAll => "Disconnect all",
+            Self::ReadOnly(_) => "Read-only",
             Self::NewSqlEditor => "New SQL editor",
             Self::Administration => "Administration",
             Self::Edit => "Edit…",
@@ -105,18 +115,23 @@ pub enum Entry {
     Separator,
 }
 
-/// The menu of `subject`. `status` is the connection's (ignored for the
-/// other subjects); `folders` are every folder; `folder` is where the
-/// connection is.
+/// The menu of `subject`. `status` and `read_only` are the connection's
+/// (ignored for the other subjects); `folders` are every folder; `folder`
+/// is where the connection is; `open` counts the connections open that a
+/// disconnection would close: all of them for the list, those in the
+/// folder, the others for a connection.
 pub fn menu(
     subject: &Subject,
     status: &Status,
     folders: &[String],
     folder: Option<&str>,
+    open: usize,
+    read_only: bool,
 ) -> Vec<Entry> {
     use Entry::{Item, Separator, Submenu};
     use SidebarAction::*;
     let enabled = |action| Item(action, None);
+    let none_open = (open == 0).then_some("none open");
     match subject {
         Subject::List => vec![
             enabled(NewConnection),
@@ -125,10 +140,14 @@ pub fn menu(
             Separator,
             enabled(Refresh),
             Item(CollapseAll, folders.is_empty().then_some("no folders")),
+            Separator,
+            Item(DisconnectAll, none_open),
         ],
         Subject::Folder(_) => vec![
             enabled(NewConnectionHere),
             enabled(NewSubfolder),
+            Separator,
+            Item(Disconnect, none_open),
             Separator,
             enabled(Rename),
             Separator,
@@ -157,6 +176,8 @@ pub fn menu(
                 ),
                 Item(Disconnect, closed.then_some("not connected")),
                 Item(Reconnect, not_connected),
+                Item(DisconnectOthers, (open == 0).then_some("no other open")),
+                enabled(ReadOnly(read_only)),
                 Separator,
                 enabled(NewSqlEditor),
                 Item(Administration, not_connected),
@@ -188,6 +209,13 @@ pub enum SidebarEvent {
     OpenAdmin(String),
     /// Ask for a connections file to import.
     ImportConnections,
+    /// Close these connections, `action` (“Disconnect “prod””) once what
+    /// their tabs hold is ended.
+    Disconnect { ids: Vec<String>, action: String },
+    /// Close this connection and open it again, the same way.
+    Reconnect(String),
+    /// Save this read-only flag on the connection, the same way.
+    SetReadOnly(String, bool),
 }
 
 /// A connection row being dragged onto a folder.
@@ -308,21 +336,49 @@ impl Sidebar {
     /// The menu of `subject` as it stands now.
     pub fn menu_of(&self, subject: &Subject, cx: &App) -> Vec<Entry> {
         let connections = self.connections.read(cx);
-        let (status, folder) = match subject {
-            Subject::Connection(id) => (
-                connections.status(id),
-                connections
-                    .get(id)
-                    .and_then(|saved| folder_of(&saved.config)),
-            ),
-            _ => (Status::Disconnected, None),
+        let (status, folder, read_only) = match subject {
+            Subject::Connection(id) => {
+                let saved = connections.get(id);
+                (
+                    connections.status(id),
+                    saved.and_then(|saved| folder_of(&saved.config)),
+                    saved.is_some_and(|saved| saved.config.read_only),
+                )
+            }
+            _ => (Status::Disconnected, None, false),
         };
         menu(
             subject,
             &status,
             &connections.folders(cx),
             folder.as_deref(),
+            self.closing(subject, cx).len(),
+            read_only,
         )
+    }
+
+    /// The open connections a Disconnect on `subject` closes: every one
+    /// for the list, those in a folder, the others for a connection.
+    pub fn closing(&self, subject: &Subject, cx: &App) -> Vec<String> {
+        let connections = self.connections.read(cx);
+        connections
+            .saved()
+            .iter()
+            .filter(|saved| {
+                !matches!(
+                    connections.status(&saved.id),
+                    Status::Disconnected | Status::Failed { .. }
+                )
+            })
+            .filter(|saved| match subject {
+                Subject::List => true,
+                Subject::Folder(path) => {
+                    folder_of(&saved.config).is_some_and(|folder| in_folder(&folder, path))
+                }
+                Subject::Connection(id) => saved.id != *id,
+            })
+            .map(|saved| saved.id.clone())
+            .collect()
     }
 
     /// Does what a menu entry says.
@@ -382,12 +438,33 @@ impl Sidebar {
                 Self::confirm_delete_folder(connections, path.clone(), window, cx)
             }
             (Subject::Connection(_), Connect) => connections.update(cx, |c, cx| c.connect(&id, cx)),
+            // What closes a session goes through the window, which asks
+            // about the transactions and pending changes it would end.
             (Subject::Connection(_), Disconnect) => {
-                connections.update(cx, |c, cx| c.disconnect(&id, cx))
+                let name = saved.map(|saved| saved.config.name).unwrap_or_default();
+                cx.emit(SidebarEvent::Disconnect {
+                    ids: vec![id],
+                    action: format!("Disconnect “{name}”"),
+                })
             }
-            (Subject::Connection(_), Reconnect) => connections.update(cx, |c, cx| {
-                c.disconnect(&id, cx);
-                c.connect(&id, cx);
+            (Subject::Connection(_), Reconnect) => cx.emit(SidebarEvent::Reconnect(id)),
+            (Subject::Connection(_), DisconnectOthers) => {
+                let name = saved.map(|saved| saved.config.name).unwrap_or_default();
+                cx.emit(SidebarEvent::Disconnect {
+                    ids: self.closing(subject, cx),
+                    action: format!("Disconnect the connections other than “{name}”"),
+                })
+            }
+            (Subject::Connection(_), ReadOnly(current)) => {
+                cx.emit(SidebarEvent::SetReadOnly(id, !current))
+            }
+            (Subject::Folder(path), Disconnect) => cx.emit(SidebarEvent::Disconnect {
+                ids: self.closing(subject, cx),
+                action: format!("Disconnect the connections in “{}”", last_folder_name(path)),
+            }),
+            (Subject::List, DisconnectAll) => cx.emit(SidebarEvent::Disconnect {
+                ids: self.closing(subject, cx),
+                action: "Disconnect all connections".into(),
             }),
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
             (Subject::Connection(_), Administration) => cx.emit(SidebarEvent::OpenAdmin(id)),
@@ -551,6 +628,7 @@ impl Sidebar {
                     let (sidebar, subject) = (sidebar.clone(), subject.clone());
                     menu.item(
                         PopupMenuItem::new(SharedString::from(label))
+                            .checked(action == SidebarAction::ReadOnly(true))
                             .disabled(reason.is_some())
                             .on_click(move |_, window, cx| {
                                 sidebar.update(cx, |this, cx| {
@@ -656,11 +734,7 @@ impl Sidebar {
         let theme = cx.theme();
         let config = &saved.config;
         let status = self.connections.read(cx).status(&saved.id);
-        let tag = config
-            .color
-            .as_deref()
-            .and_then(|key| theme::tag_color(key, cx))
-            .unwrap_or_else(|| theme::environment_color(config.environment, cx));
+        let tag = theme::connection_color(config, cx);
         let (state_label, state_color) = match &status {
             Status::Disconnected => ("", theme.muted_foreground),
             Status::Connecting => ("connecting…", theme.muted_foreground),
@@ -1004,7 +1078,7 @@ mod tests {
     fn the_empty_area_and_a_folder_offer_what_dbeaver_does() {
         let disconnected = Status::Disconnected;
         assert_eq!(
-            labels(&menu(&Subject::List, &disconnected, &[], None)),
+            labels(&menu(&Subject::List, &disconnected, &[], None, 0, false)),
             [
                 "New connection…",
                 "New folder…",
@@ -1012,23 +1086,47 @@ mod tests {
                 "—",
                 "Refresh",
                 "Collapse all (no folders)",
+                "—",
+                "Disconnect all (none open)",
             ]
         );
         let folders = ["Work".to_string()];
         assert_eq!(
-            labels(&menu(&Subject::List, &disconnected, &folders, None))[5],
+            labels(&menu(
+                &Subject::List,
+                &disconnected,
+                &folders,
+                None,
+                2,
+                false
+            ))[5],
             "Collapse all"
+        );
+        assert_eq!(
+            labels(&menu(
+                &Subject::List,
+                &disconnected,
+                &folders,
+                None,
+                2,
+                false
+            ))[7],
+            "Disconnect all"
         );
         assert_eq!(
             labels(&menu(
                 &Subject::Folder("Work".into()),
                 &disconnected,
                 &folders,
-                None
+                None,
+                0,
+                false
             )),
             [
                 "New connection here…",
                 "New subfolder…",
+                "—",
+                "Disconnect (none open)",
                 "—",
                 "Rename…",
                 "—",
@@ -1046,6 +1144,8 @@ mod tests {
             &Status::Disconnected,
             &folders,
             Some("Work"),
+            0,
+            false,
         ));
         assert_eq!(
             closed,
@@ -1053,6 +1153,8 @@ mod tests {
                 "Connect",
                 "Disconnect (not connected)",
                 "Reconnect (not connected)",
+                "Disconnect others (no other open)",
+                "Read-only",
                 "—",
                 "New SQL editor",
                 "Administration (not connected)",
@@ -1076,16 +1178,29 @@ mod tests {
             },
             &folders,
             None,
+            1,
+            true,
         ));
         assert_eq!(
             open[..3],
             ["Connect (connected)", "Disconnect", "Reconnect"]
         );
-        assert_eq!(open[5], "Administration");
-        assert_eq!(open[14], "Refresh");
-        assert!(open[10].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        assert_eq!(open[3], "Disconnect others");
+        assert_eq!(open[7], "Administration");
+        assert_eq!(open[16], "Refresh");
+        assert!(open[12].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        // The read-only entry carries the flag as it is, checked.
+        let entries = menu(&subject, &Status::Disconnected, &folders, None, 0, true);
+        assert!(entries.contains(&Entry::Item(SidebarAction::ReadOnly(true), None)));
 
-        let connecting = labels(&menu(&subject, &Status::Connecting, &folders, None));
+        let connecting = labels(&menu(
+            &subject,
+            &Status::Connecting,
+            &folders,
+            None,
+            0,
+            false,
+        ));
         assert_eq!(
             connecting[..3],
             [
@@ -1101,6 +1216,8 @@ mod tests {
             },
             &folders,
             None,
+            0,
+            false,
         ));
         assert_eq!(
             failed[..3],

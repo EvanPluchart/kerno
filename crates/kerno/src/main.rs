@@ -12,6 +12,7 @@ mod export_dialog;
 mod import_dialog;
 mod library;
 mod logging;
+mod maintenance_dialog;
 mod navigator;
 mod query;
 mod settings;
@@ -185,16 +186,49 @@ fn menus() -> Vec<Menu> {
             name: "Query".into(),
             items: vec![
                 MenuItem::action("Run Statement", RunStatement),
+                MenuItem::action(
+                    "Run Statement in New Result Tab",
+                    actions::RunStatementInNewTab,
+                ),
+                MenuItem::action("Run Script From the Cursor", actions::RunFromCursor),
                 MenuItem::action("Run All Statements", RunAll),
+                MenuItem::action("Count Rows of Statement", actions::CountStatementRows),
                 MenuItem::separator(),
                 MenuItem::action("Explain Statement", ExplainStatement),
                 MenuItem::action("Explain Analyze", ExplainAnalyze),
+                MenuItem::separator(),
+                MenuItem::action("Go to Next Statement", actions::NextStatement),
+                MenuItem::action("Go to Previous Statement", actions::PreviousStatement),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Results Panel", actions::ToggleResultsPanel),
+                MenuItem::action("Maximize Results Panel", actions::MaximizeResultsPanel),
+                MenuItem::action("Focus Results / Editor", actions::SwitchResultsFocus),
                 MenuItem::separator(),
                 MenuItem::action("Cancel Running Statement", CancelQuery),
                 MenuItem::separator(),
                 MenuItem::action("Query History", ShowHistory),
                 MenuItem::action("Saved Queries", ShowSavedQueries),
                 MenuItem::action("Save Query…", SaveQuery),
+            ],
+            disabled: false,
+        },
+        // The connection of the active tab, as DBeaver's Database menu.
+        Menu {
+            name: "Database".into(),
+            items: vec![
+                MenuItem::action("Disconnect", actions::DisconnectTabConnection),
+                MenuItem::action("Reconnect", actions::ReconnectTabConnection),
+                MenuItem::action("Disconnect Others", actions::DisconnectOtherConnections),
+                MenuItem::action("Disconnect All", actions::DisconnectAll),
+                MenuItem::separator(),
+                MenuItem::action("Read-Only Connection", actions::ToggleReadOnly),
+                MenuItem::separator(),
+                MenuItem::action("Commit Transaction", actions::CommitTransaction),
+                MenuItem::action("Roll Back Transaction", actions::RollbackTransaction),
+                MenuItem::action(
+                    "Switch Between Auto-Commit and Manual Commit",
+                    actions::ToggleCommitMode,
+                ),
             ],
             disabled: false,
         },

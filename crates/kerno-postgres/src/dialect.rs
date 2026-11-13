@@ -206,7 +206,12 @@ impl Dialect for PgDialect {
                     if o.with_data { "" } else { "NO " }
                 )
             }
-            (Maintenance::Truncate(o), ObjectRef::Relation(table, Table | PartitionedTable)) => {
+            // Foreign tables too: the server truncates them through their
+            // wrapper since PostgreSQL 14, and says so when it cannot.
+            (
+                Maintenance::Truncate(o),
+                ObjectRef::Relation(table, Table | PartitionedTable | ForeignTable),
+            ) => {
                 format!(
                     "TRUNCATE TABLE {}{}{}{}",
                     if o.only { "ONLY " } else { "" },
@@ -807,7 +812,10 @@ mod tests {
                 names(&relation(RelationKind::MaterializedView)),
                 ["vacuum", "analyze", "refresh"]
             );
-            assert_eq!(names(&relation(RelationKind::ForeignTable)), ["analyze"]);
+            assert_eq!(
+                names(&relation(RelationKind::ForeignTable)),
+                ["analyze", "truncate"]
+            );
             assert!(names(&relation(RelationKind::View)).is_empty());
             assert_eq!(
                 names(&ObjectRef::Database("kerno".into())),

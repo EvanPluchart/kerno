@@ -428,12 +428,38 @@ pub struct ConnectParams {
 /// Whether an option's name says its value is a secret. Options are stored
 /// and exported in plain text, so such an option is never accepted:
 /// secrets go through [`Secrets`] to the OS secret store.
+///
+/// A name with a secret's word in it is one (`sslpassword`, `my.api_token`,
+/// `password_prod`), unless its last part says the value describes the
+/// secret instead of holding it: `password_encryption` (a method),
+/// `token_lifetime` (a duration), `validate_password.length`. An ending
+/// that is not known keeps the name refused.
 pub fn is_secret_option(key: &str) -> bool {
+    /// What a setting about a secret, not a secret, ends with.
+    const ABOUT: [&str; 12] = [
+        "encryption",
+        "lifetime",
+        "history",
+        "interval",
+        "length",
+        "policy",
+        "count",
+        "rounds",
+        "current",
+        "timeout",
+        "attempts",
+        "time",
+    ];
     let key = key.to_ascii_lowercase();
-    key == "pwd"
-        || ["password", "passwd", "passphrase", "secret", "token"]
-            .iter()
-            .any(|word| key.contains(word))
+    let mut parts = key.rsplit(['_', '.', '-']);
+    let last = parts.next().unwrap_or_default();
+    let secret = |part: &str| {
+        part == "pwd"
+            || ["password", "passwd", "passphrase", "secret", "token"]
+                .iter()
+                .any(|word| part.contains(word))
+    };
+    secret(last) || (!ABOUT.contains(&last) && parts.any(secret))
 }
 
 /// Why a bootstrap statement is refused, if it is. It is stored and
@@ -1070,6 +1096,8 @@ mod tests {
             "ALTER ROLE app PASSWORD 'hunter2'",
             "SET my.api_token = 'hunter2'",
             "CREATE USER x IDENTIFIED BY 'hunter2'",
+            "SET my.client_secret = 'hunter2'",
+            "SET password = 'hunter2'",
         ] {
             config.init_sql.push(leaky.into());
             let error = config.validate().unwrap_err().to_string();
@@ -1172,6 +1200,8 @@ mod tests {
                 "SET TIME ZONE 'Pacific/Auckland'",
                 "SET lock_timeout = -1",
                 "SET my.setting = on",
+                // Named after a secret, holds none: the hashing method.
+                "SET password_encryption = 'scram-sha-256'",
                 "RESET statement_timeout",
             ] {
                 assert_eq!(bootstrap_refusal(allowed, engine), None, "{allowed}");
@@ -1395,8 +1425,27 @@ mod tests {
             "key_buffer_size",
             "connect_timeout",
             "sql_mode",
+            // About a secret, not one: a method, a duration, a policy.
+            "password_encryption",
+            "token_lifetime",
+            "default_password_lifetime",
+            "validate_password.length",
+            "password_reuse_interval",
         ] {
             assert!(!is_secret_option(key), "{key}");
+        }
+        for key in [
+            "my.api_token",
+            "db_pwd",
+            "private_key_passphrase",
+            "secret_key",
+            "password_hash",
+            "token_value",
+            // An ending that is not known to describe: still refused.
+            "password_prod",
+            "my.password.app",
+        ] {
+            assert!(is_secret_option(key), "{key}");
         }
 
         // A URL that carries credentials as parameters: they become the

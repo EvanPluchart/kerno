@@ -1,6 +1,7 @@
 //! What can be done to each kind of node: the content of its context menu.
 
 use kerno_core::Dialect;
+use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::table_draft::{AutoIncrement, ColumnDraft, TableChange};
 
@@ -69,6 +70,9 @@ pub enum Action {
     DropColumn,
     /// Selects the table at the other end of a foreign key in the tree.
     RevealTable,
+    /// The engine's maintenance tools (Tools ▸, see [`tools`]): never in
+    /// the lists of [`actions`], which know no dialect; the menu adds it.
+    Tools,
 }
 
 impl Action {
@@ -109,6 +113,7 @@ impl Action {
             Action::RenameColumn => "Rename column…",
             Action::DropColumn => "Drop column…",
             Action::RevealTable => "Show table in tree",
+            Action::Tools => "Tools",
         }
     }
 
@@ -134,6 +139,7 @@ impl Action {
                 | Action::DropCascade
                 | Action::RenameColumn
                 | Action::DropColumn
+                | Action::Tools
         )
     }
 }
@@ -266,6 +272,25 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         })
         .chain([vec![Refresh]])
         .collect()
+}
+
+/// The maintenance tools of a node (DBeaver's Tools ▸), at their default
+/// options: what the dialect writes for its object. A trigger is enabled
+/// when disabled (shown muted) and disabled when enabled.
+pub fn tools(node: &Node, dialect: &dyn Dialect) -> Vec<Maintenance> {
+    let NodeKind::Object(object) = &node.kind else {
+        return Vec::new();
+    };
+    let mut tools = dialect.maintenance_tools(object);
+    if matches!(object, ObjectRef::Trigger { .. }) {
+        let other = if node.muted {
+            Maintenance::DisableTrigger
+        } else {
+            Maintenance::EnableTrigger
+        };
+        tools.retain(|tool| *tool != other);
+    }
+    tools
 }
 
 /// What a double click or Enter does to a node: an entry of its menu, or
@@ -852,6 +877,7 @@ mod tests {
             DropCascade,
             RenameColumn,
             DropColumn,
+            Tools,
         ] {
             assert!(action.writes(), "{action:?}");
         }
@@ -878,6 +904,77 @@ mod tests {
             RevealTable,
         ] {
             assert!(!action.writes(), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn the_tools_menu_lists_what_the_engine_offers_for_each_object() {
+        use Maintenance::*;
+        use kerno_core::maintenance::{
+            RefreshOptions, RepairOptions, TruncateOptions, VacuumOptions,
+        };
+        let pg = kerno_postgres::PgDialect;
+        let mysql = kerno_mysql::MysqlDialect::new(kerno_core::Engine::MySql);
+        let orders = TableRef::new("shop", "orders");
+        let relation = |kind| NodeKind::Object(ObjectRef::Relation(orders.clone(), kind));
+        let of = |kind: NodeKind, dialect: &dyn Dialect| tools(&node(kind), dialect);
+        let (vacuum, truncate) = (
+            Vacuum(VacuumOptions::default()),
+            Truncate(TruncateOptions::default()),
+        );
+        for kind in [RelationKind::Table, RelationKind::PartitionedTable] {
+            assert_eq!(
+                of(relation(kind), &pg),
+                [vacuum.clone(), Analyze, truncate.clone()]
+            );
+            assert_eq!(
+                of(relation(kind), &mysql),
+                [
+                    Analyze,
+                    truncate.clone(),
+                    Check(None),
+                    Optimize,
+                    Repair(RepairOptions::default())
+                ]
+            );
+        }
+        assert_eq!(
+            of(relation(RelationKind::ForeignTable), &pg),
+            [Analyze, truncate.clone()]
+        );
+        assert_eq!(
+            of(relation(RelationKind::MaterializedView), &pg),
+            [
+                vacuum.clone(),
+                Analyze,
+                RefreshMaterializedView(RefreshOptions::default())
+            ]
+        );
+        assert!(of(relation(RelationKind::View), &pg).is_empty());
+        assert!(of(relation(RelationKind::View), &mysql).is_empty());
+        // A trigger offers the one switch that changes it.
+        let trigger = NodeKind::Object(ObjectRef::Trigger {
+            table: orders.clone(),
+            name: "orders_log".into(),
+        });
+        assert_eq!(of(trigger.clone(), &pg), [DisableTrigger]);
+        let mut disabled = node(trigger.clone());
+        disabled.muted = true;
+        assert_eq!(tools(&disabled, &pg), [EnableTrigger]);
+        assert!(of(trigger, &mysql).is_empty());
+        // A PostgreSQL database is vacuumed and analysed; MySQL's is not.
+        let database = NodeKind::Object(ObjectRef::Database("kerno".into()));
+        assert_eq!(of(database.clone(), &pg), [vacuum, Analyze]);
+        assert!(of(database, &mysql).is_empty());
+        for other in [
+            NodeKind::Object(ObjectRef::Schema("shop".into())),
+            NodeKind::Group(Group::Tables),
+            NodeKind::Column {
+                table: orders,
+                name: "id".into(),
+            },
+        ] {
+            assert!(of(other, &pg).is_empty());
         }
     }
 

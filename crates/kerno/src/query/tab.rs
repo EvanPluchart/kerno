@@ -49,8 +49,10 @@ use super::grid::{CopyFormat, Grid, GridAction, Owner};
 use super::params;
 use super::{plan_view, viewer};
 use crate::actions::{
-    ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql, ReplaceInEditor, RunAll,
-    RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment,
+    CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
+    MaximizeResultsPanel, NextStatement, PreviousStatement, ReplaceInEditor, RunAll, RunFromCursor,
+    RunStatement, RunStatementInNewTab, SaveFile, SaveFileAs, SaveQuery, ShowHistory,
+    ShowSavedQueries, SwitchResultsFocus, ToggleComment, ToggleResultsPanel,
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
@@ -323,6 +325,9 @@ pub enum QueryTabEvent {
     /// A source was applied, whether all of it ran or not: the objects of
     /// its schema may have changed.
     SourceApplied,
+    /// The user chose another connection, database or schema while a
+    /// transaction is open: the window asks how to end it, then switches.
+    SwitchTarget(Option<Target>),
 }
 
 impl EventEmitter<QueryTabEvent> for QueryTab {}
@@ -370,6 +375,7 @@ impl QueryTab {
                         .as_ref()
                         .is_some_and(|target| target.connection == *id)
                 {
+                    this.say_if_rolled_back(window, cx);
                     this.follow_connection(cx);
                     this.resume(window, cx);
                 }
@@ -665,10 +671,32 @@ impl QueryTab {
         })
     }
 
-    /// Runs on `target` from now on. What was running is stopped.
+    /// What the toolbar's selectors do: switches to `target` now, or, with
+    /// a transaction open, lets the window ask how to end it first.
+    pub fn request_target(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
+        if self.target == target {
+            return;
+        }
+        if self.tx_state() == TxState::Idle {
+            self.set_target(target, cx);
+        } else {
+            cx.emit(QueryTabEvent::SwitchTarget(target));
+        }
+    }
+
+    /// Runs on `target` from now on. What was running is stopped. On
+    /// another connection without a transaction open, the tab takes that
+    /// connection's commit mode.
     pub fn set_target(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
         if self.target == target {
             return;
+        }
+        let connection = |target: &Option<Target>| target.as_ref().map(|t| t.connection.clone());
+        if connection(&self.target) != connection(&target) && self.tx_state() == TxState::Idle {
+            self.manual_commit = target
+                .as_ref()
+                .and_then(|target| self.connections.read(cx).get(&target.connection))
+                .is_some_and(|saved| saved.config.starts_in_manual_commit());
         }
         self.stop(cx);
         self.pending = None;
@@ -683,6 +711,31 @@ impl QueryTab {
         self.catalog_load = None;
         self.complete_with(None, cx);
         self.follow_connection(cx);
+        cx.notify();
+    }
+
+    /// The connection went away with this tab's transaction open: lost, or
+    /// closed by something that could not ask (Kerno's own disconnects end
+    /// the transaction first). The server rolled it back; the tab says so.
+    fn say_if_rolled_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connected(cx) || self.tx_state() == TxState::Idle {
+            return;
+        }
+        let message = "The connection closed while this tab's transaction was open: the server \
+                       rolled it back, and nothing of it was committed.";
+        self.notices.push(Notice {
+            severity: "Warning".into(),
+            message: message.into(),
+            code: None,
+            detail: None,
+        });
+        // The messages, after the results.
+        self.active_result = self.results.len();
+        self.show_results();
+        window.push_notification(
+            Notification::warning(SharedString::from(format!("“{}”: {message}", self.title))),
+            cx,
+        );
         cx.notify();
     }
 
@@ -2041,16 +2094,6 @@ impl QueryTab {
         &self.databases
     }
 
-    /// Runs in `database` of the same connection from now on.
-    pub fn use_database(&mut self, database: String, cx: &mut Context<Self>) {
-        let target = self.target.clone().map(|target| Target {
-            database: Some(database),
-            schema: None,
-            ..target
-        });
-        self.set_target(target, cx)
-    }
-
     /// What the editor's menu depends on.
     fn editor_facts(&self, cx: &App) -> EditorFacts {
         let editor = self.editor.read(cx);
@@ -2101,29 +2144,41 @@ impl QueryTab {
 
     /// Commits or rolls back the tab's open transaction.
     pub fn end_transaction(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ending = self.finish_transaction(commit, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = ending.await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(SharedString::from(error)), cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Commits or rolls back the tab's open transaction; done at once when
+    /// none is open. The error says which statement failed.
+    pub fn finish_transaction(
+        &mut self,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
         let Some(session) = self.session.clone() else {
-            return;
+            return Task::ready(Ok(()));
         };
         if session.tx_state() == TxState::Idle {
-            return;
+            return Task::ready(Ok(()));
         }
         // A result still being paged belongs to the transaction.
         self.stop(cx);
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
         let ending = bridge::spawn(cx, exec::collect(session, sql));
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let outcome = ending.await;
-            let _ = this.update_in(cx, |_, window, cx| {
-                if let Err(error) = outcome {
-                    window.push_notification(
-                        Notification::error(SharedString::from(format!("{sql} failed: {error}"))),
-                        cx,
-                    );
-                }
-                cx.notify();
-            });
+            let _ = this.update(cx, |_, cx| cx.notify());
+            outcome
+                .map(drop)
+                .map_err(|error| format!("{sql} failed: {error}"))
         })
-        .detach();
     }
 
     /// Replaces the rows an EXPLAIN returned by its plan as a tree.
@@ -2271,7 +2326,18 @@ impl QueryTab {
         })
     }
 
-    fn result_facts(&self, id: u64) -> Option<ResultFacts> {
+    /// Whether the rows of `pane` stopped arriving before the end: it was
+    /// still being paged when another statement took the session, or it
+    /// was cancelled.
+    fn incomplete(&self, pane: &ResultPane, cx: &App) -> bool {
+        self.receiving != Some(pane.id)
+            && pane.grid().is_some_and(|grid| {
+                let grid = grid.read(cx).delegate();
+                !grid.is_complete() && !grid.has_more()
+            })
+    }
+
+    fn result_facts(&self, id: u64, cx: &App) -> Option<ResultFacts> {
         let index = self.pane_index(id)?;
         let unpinned = |panes: &[ResultPane]| panes.iter().filter(|pane| !pane.pinned).count();
         Some(ResultFacts {
@@ -2280,7 +2346,25 @@ impl QueryTab {
             right: unpinned(&self.results[index + 1..]),
             pinned_count: self.results.iter().filter(|pane| pane.pinned).count(),
             statement: !self.results[index].statement.is_empty(),
+            incomplete: self.incomplete(&self.results[index], cx),
+            writes: classify(&self.results[index].statement, self.lex_rules(cx)).writes,
         })
+    }
+
+    /// Runs the statement of an incomplete result again, in its place; the
+    /// other results stay. A statement that writes is never run again.
+    fn run_again(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.pane_index(id) else {
+            return;
+        };
+        let sql = self.results[index].statement.clone();
+        if self.running() || classify(&sql, self.lex_rules(cx)).writes {
+            return;
+        }
+        self.close_results(&[id], cx);
+        self.explain_mode = None;
+        self.keep_results = true;
+        self.execute(vec![Statement { sql, origin: None }], window, cx);
     }
 
     /// The menu of the result tab of pane `id`, built when it opens.
@@ -2291,7 +2375,7 @@ impl QueryTab {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
         move |menu, _, cx| {
-            let Some(facts) = view.read(cx).result_facts(id) else {
+            let Some(facts) = view.read(cx).result_facts(id, cx) else {
                 return menu;
             };
             let view = view.clone();
@@ -2361,6 +2445,7 @@ impl QueryTab {
             TabAction::CopyStatement => cx.write_to_clipboard(ClipboardItem::new_string(
                 self.results[index].statement.clone(),
             )),
+            TabAction::RunAgain => self.run_again(id, window, cx),
             other => tracing::warn!(?other, "not an action of a result tab"),
         }
     }
@@ -2740,7 +2825,7 @@ impl QueryTab {
                                         .disabled(!connected)
                                         .on_click(move |_, _, cx| {
                                             view.update(cx, |this, cx| {
-                                                this.set_target(
+                                                this.request_target(
                                                     Some(Target {
                                                         connection: id.clone(),
                                                         database: None,
@@ -2778,7 +2863,7 @@ impl QueryTab {
                                                             schema: None,
                                                             ..target
                                                         });
-                                                    this.set_target(target, cx)
+                                                    this.request_target(target, cx)
                                                 })
                                             }),
                                     );
@@ -2809,7 +2894,7 @@ impl QueryTab {
                                                             schema: Some(schema.clone()),
                                                             ..target
                                                         });
-                                                    this.set_target(target, cx)
+                                                    this.request_target(target, cx)
                                                 })
                                             }),
                                     );
@@ -2971,6 +3056,31 @@ impl QueryTab {
                         cx.listener(|this, _, window, cx| this.run(Scope::AtCursor, window, cx)),
                     ),
             )
+            // The other ways to run, and to move between statements and panels.
+            .child(
+                Button::new("tab-run-menu")
+                    .ghost()
+                    .small()
+                    .dropdown_caret(true)
+                    .tooltip("More ways to run")
+                    .dropdown_menu({
+                        let view = view.clone();
+                        move |menu, _, cx| {
+                            let entries = tabs::run_menu(view.read(cx).editor_facts(cx));
+                            let view = view.clone();
+                            tabs::fill_menu(
+                                menu,
+                                entries,
+                                Rc::new(move |action, window, cx| {
+                                    let view = view.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        run_editor_action(&view, action, window, cx)
+                                    });
+                                }),
+                            )
+                        }
+                    }),
+            )
     }
 
     fn render_pane(&self, pane: &ResultPane, cx: &mut Context<Self>) -> AnyElement {
@@ -3129,11 +3239,12 @@ impl QueryTab {
     }
 
     fn render_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (border, muted, mono) = {
+        let (border, muted, warning, mono) = {
             let theme = cx.theme();
             (
                 theme.border,
                 theme.muted_foreground,
+                theme.warning,
                 theme.mono_font_family.clone(),
             )
         };
@@ -3155,6 +3266,7 @@ impl QueryTab {
             .children(self.results.iter().enumerate().map(|(index, pane)| {
                 let id = pane.id;
                 let statement = SharedString::from(pane.statement.clone());
+                let incomplete = self.incomplete(pane, cx);
                 Tab::new()
                     .when(pane.pinned, |tab| {
                         tab.prefix(Icon::new(Glyph::Bookmark).xsmall())
@@ -3180,6 +3292,27 @@ impl QueryTab {
                             .context_menu(self.result_menu(id, cx))
                             .child(SharedString::from(self.result_label(index))),
                     )
+                    // Not every row is there: says so, and how to get them.
+                    .when(incomplete, |tab| {
+                        tab.suffix(
+                            div()
+                                .id(("result-incomplete", index))
+                                .test_support()
+                                .pl_1()
+                                .text_xs()
+                                .text_color(warning)
+                                .child("incomplete")
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(
+                                        "Not every row arrived: another statement ran on this \
+                                         tab's session while this result was waiting to be \
+                                         paged, or it was cancelled. Choose “Run again” in its \
+                                         menu for the whole result.",
+                                    )
+                                    .build(window, cx)
+                                }),
+                        )
+                    })
             }))
             .children(messages.then(|| {
                 Tab::new().label(SharedString::from(format!(
@@ -3344,10 +3477,18 @@ fn run_editor_action(
             return;
         }
         TabAction::RunStatement => Box::new(RunStatement),
+        TabAction::RunInNewTab => Box::new(RunStatementInNewTab),
+        TabAction::RunFromCursor => Box::new(RunFromCursor),
         TabAction::RunScript => Box::new(RunAll),
         TabAction::Explain => Box::new(ExplainStatement),
         TabAction::ExplainAnalyze => Box::new(ExplainAnalyze),
+        TabAction::CountRows => Box::new(CountStatementRows),
         TabAction::Format => Box::new(FormatSql),
+        TabAction::NextStatement => Box::new(NextStatement),
+        TabAction::PreviousStatement => Box::new(PreviousStatement),
+        TabAction::ToggleResults => Box::new(ToggleResultsPanel),
+        TabAction::MaximizeResults => Box::new(MaximizeResultsPanel),
+        TabAction::SwitchFocus => Box::new(SwitchResultsFocus),
         // The editor's own actions, as its built-in menu does.
         TabAction::Undo => Box::new(input::Undo),
         TabAction::Redo => Box::new(input::Redo),
