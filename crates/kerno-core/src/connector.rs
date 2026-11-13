@@ -136,6 +136,14 @@ impl Connector {
             .map(|sql| sql.trim())
             .enumerate();
         for (index, sql) in statements.filter(|(_, sql)| !sql.is_empty()) {
+            // Checked where it runs too: a store edited by hand, or written
+            // by an older version, does not go through the form.
+            if let Some(reason) = crate::config::bootstrap_refusal(sql, self.config.engine) {
+                return Err(Error::Config(format!(
+                    "bootstrap statement {} {reason}",
+                    index + 1
+                )));
+            }
             tracing::debug!(statement = index + 1, sql, "bootstrap statement");
             if let Err(error) = exec::collect(session.clone(), sql).await {
                 if !self.config.ignore_init_errors {
@@ -146,6 +154,15 @@ impl Connector {
                 }
                 tracing::warn!(statement = index + 1, %error, "bootstrap statement failed; ignored");
             }
+        }
+        // Whatever ran above, a read-only connection ends its setup read-only
+        // (bootstrap statements are also refused when they name that state).
+        if self.config.read_only {
+            exec::collect(session.clone(), session.dialect().read_only_session_sql())
+                .await
+                .map_err(|error| {
+                    Error::Connect(format!("the session could not be made read-only: {error}"))
+                })?;
         }
         Ok(())
     }

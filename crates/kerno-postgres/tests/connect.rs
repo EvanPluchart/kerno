@@ -531,6 +531,31 @@ async fn connector_runs_the_bootstrap_on_every_session() {
         "after_error"
     );
 
+    // A statement that is not a plain session setting never runs, even when
+    // the settings did not come through the form.
+    for refused in [
+        "SELECT pg_catalog.set_config('application_name', 'ran', false)",
+        "SET default_transaction_read_only = off",
+    ] {
+        config.init_sql = vec![refused.into()];
+        // Refused when the connection is opened, before anything is sent.
+        let error = config.validate().expect_err("the bootstrap is refused");
+        assert!(
+            error.to_string().contains("bootstrap statement 1"),
+            "{refused}: {error}"
+        );
+    }
+    // A read-only connection is read-only after its bootstrap.
+    config.read_only = true;
+    config.init_sql = vec!["SET application_name = 'kerno_ro'".into()];
+    let session = open(config.clone()).await.session(None).await.unwrap();
+    assert_eq!(
+        scalar(&session, "SHOW default_transaction_read_only").await,
+        "on"
+    );
+    assert_eq!(scalar(&session, "SHOW application_name").await, "kerno_ro");
+    config.read_only = false;
+
     // A default schema that does not exist is not an error on PostgreSQL
     // (`search_path` accepts it), and a quote in its name cannot escape.
     config.init_sql.clear();

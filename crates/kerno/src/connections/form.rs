@@ -771,7 +771,9 @@ mod tests {
         form.init_sql = "SET a = 1; DELETE FROM t".into();
         let errors = form.build().unwrap_err();
         assert!(
-            errors[0].message.contains("Statement 2 would change data"),
+            errors[0]
+                .message
+                .contains("Statement 2 is not a SET or RESET"),
             "{}",
             errors[0].message
         );

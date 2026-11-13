@@ -439,11 +439,23 @@ pub fn is_secret_option(key: &str) -> bool {
 /// Why a bootstrap statement is refused, if it is. It is stored and
 /// exported in plain text, so it may not name a secret (`ALTER ROLE …
 /// PASSWORD`, `SET my.api_token = …`, MySQL's `IDENTIFIED BY`). It runs at
-/// every connect without being shown, so it may only set session state:
-/// no write, no DDL, no transaction control (a read-only connection
-/// refuses writes, and a production one confirms them).
+/// every connect without being shown — also when the connection came from
+/// an imported file — so it may only set session state: one `SET` or
+/// `RESET` of a session setting, with plain values. Anything that could run
+/// code (`SELECT`, `CALL`, `DO`, a function call in a value), write, touch
+/// the transaction, change who the session runs as, reach beyond the
+/// session (`GLOBAL`, `PERSIST`) or lift the read-only state of a
+/// connection is refused.
 pub fn bootstrap_refusal(sql: &str, engine: Engine) -> Option<&'static str> {
-    use crate::sql::{LexRules, StatementKind, classify};
+    use crate::sql::{LexRules, TokenKind, lex};
+    const NOT_A_SETTING: &str =
+        "is not a SET or RESET of a session setting: bootstrap statements only set up the session";
+    const BEYOND_THE_SESSION: &str =
+        "would reach beyond the session (GLOBAL, PERSIST) or change who it runs as";
+    const READ_ONLY: &str =
+        "would change the transaction or its read-only state, which the connection decides";
+    const RUNS_CODE: &str = "holds a function call or a query: bootstrap values are plain literals";
+
     let secret = sql
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
         .any(|word| is_secret_option(word) || word.eq_ignore_ascii_case("identified"));
@@ -456,10 +468,88 @@ pub fn bootstrap_refusal(sql: &str, engine: Engine) -> Option<&'static str> {
         Engine::Postgres => LexRules::POSTGRES,
         Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
     };
-    let class = classify(sql, rules);
-    (class.writes || matches!(class.kind, StatementKind::Transaction(_))).then_some(
-        "would change data, the schema or the transaction: bootstrap statements only set up the session",
-    )
+    let tokens: Vec<_> = lex(sql, rules)
+        .into_iter()
+        .filter(|token| !token.kind.is_trivia())
+        .collect();
+    let text = |index: usize| tokens.get(index).map(|token| &sql[token.range.clone()]);
+    let word = |index: usize, expected: &str| {
+        tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::Word)
+            && text(index).is_some_and(|found| found.eq_ignore_ascii_case(expected))
+    };
+    // Nothing to run (a blank line of the form).
+    if tokens.is_empty() {
+        return None;
+    }
+    if !(word(0, "set") || word(0, "reset")) {
+        return Some(NOT_A_SETTING);
+    }
+    // One statement: nothing after a semicolon.
+    if let Some(end) = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::Semicolon)
+        && end + 1 < tokens.len()
+    {
+        return Some(NOT_A_SETTING);
+    }
+    for (index, token) in tokens.iter().enumerate() {
+        let found = &sql[token.range.clone()];
+        match token.kind {
+            // A call, a subquery, a user variable assigned from one.
+            TokenKind::Punct if found == "(" || found == ")" => return Some(RUNS_CODE),
+            TokenKind::Word | TokenKind::QuotedIdent => {
+                let name = found
+                    .trim_matches(|c| c == '"' || c == '`')
+                    .to_ascii_lowercase();
+                let name = name.trim_start_matches("@@");
+                if matches!(
+                    name,
+                    "select" | "call" | "do" | "execute" | "table" | "values"
+                ) {
+                    return Some(RUNS_CODE);
+                }
+                if matches!(name, "global" | "persist" | "persist_only")
+                    || name.starts_with("global.")
+                    || name.starts_with("persist.")
+                    || name.starts_with("persist_only.")
+                    || matches!(
+                        name,
+                        "role"
+                            | "session_authorization"
+                            | "authorization"
+                            | "session_replication_role"
+                            | "sql_log_bin"
+                            | "password"
+                    )
+                {
+                    return Some(BEYOND_THE_SESSION);
+                }
+                let setting = name.rsplit('.').next().unwrap_or(name);
+                if matches!(
+                    setting,
+                    "transaction"
+                        | "characteristics"
+                        | "constraints"
+                        | "default_transaction_read_only"
+                        | "transaction_read_only"
+                        | "tx_read_only"
+                        | "read_only"
+                        | "super_read_only"
+                        | "autocommit"
+                ) {
+                    return Some(READ_ONLY);
+                }
+                // `RESET ALL` would also reset what the connection set up.
+                if index == 1 && word(0, "reset") && name == "all" {
+                    return Some(READ_ONLY);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The file written by "export connections": settings only, no secrets.
@@ -893,20 +983,63 @@ mod tests {
             );
             config.init_sql.pop();
         }
-        // Statements that would write or touch the transaction, on any connection.
-        for writing in [
-            "INSERT INTO audit VALUES (1)",
-            "DROP TABLE t",
-            "BEGIN",
-            "SET GLOBAL max_connections = 10",
+        // Only a SET or RESET of a session setting, with plain values.
+        for (refused, why) in [
+            ("INSERT INTO audit VALUES (1)", "is not a SET or RESET"),
+            ("DROP TABLE t", "is not a SET or RESET"),
+            ("BEGIN", "is not a SET or RESET"),
+            ("SELECT audit.note_login()", "is not a SET or RESET"),
+            ("CALL sp_on_login()", "is not a SET or RESET"),
+            ("DO $$ BEGIN PERFORM 1; END $$", "is not a SET or RESET"),
+            ("SET a = 1; DROP TABLE t", "is not a SET or RESET"),
+            ("SET GLOBAL max_connections = 10", "beyond the session"),
+            ("SET @@global.max_connections = 10", "beyond the session"),
+            ("SET PERSIST max_connections = 10", "beyond the session"),
+            ("SET ROLE admin", "beyond the session"),
+            ("SET SESSION AUTHORIZATION postgres", "beyond the session"),
+            (
+                "SET session_replication_role = replica",
+                "beyond the session",
+            ),
+            ("SET default_transaction_read_only = off", "read-only state"),
+            ("SET transaction_read_only = off", "read-only state"),
+            (
+                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+                "read-only state",
+            ),
+            ("SET SESSION TRANSACTION READ WRITE", "read-only state"),
+            ("SET @@session.tx_read_only = 0", "read-only state"),
+            ("SET autocommit = 0", "read-only state"),
+            ("RESET ALL", "read-only state"),
+            ("RESET default_transaction_read_only", "read-only state"),
+            ("SET @x = (SELECT f())", "function call or a query"),
+            (
+                "SET sql_mode = CONCAT(@@sql_mode, ',ANSI')",
+                "function call or a query",
+            ),
         ] {
-            config.init_sql.push(writing.into());
+            config.init_sql.push(refused.into());
             let error = config.validate().unwrap_err().to_string();
             assert!(
-                error.contains("bootstrap statement 3 would change data"),
-                "{writing}: {error}"
+                error.contains("bootstrap statement 3") && error.contains(why),
+                "{refused}: {error}"
             );
             config.init_sql.pop();
+        }
+        // What bootstrap statements are for.
+        for engine in [Engine::Postgres, Engine::MySql] {
+            for allowed in [
+                "SET search_path TO shop, public",
+                "SET time_zone = '+05:30'",
+                "set statement_timeout = 30000;",
+                "SET SESSION sql_mode = 'ANSI_QUOTES,STRICT_ALL_TABLES'",
+                "SET default_transaction_isolation = 'repeatable read'",
+                "SET NAMES utf8mb4",
+                "RESET statement_timeout",
+                "SET application_name TO \"nightly report\"",
+            ] {
+                assert_eq!(bootstrap_refusal(allowed, engine), None, "{allowed}");
+            }
         }
         let file = r#"{"kerno_connections": 1, "connections": [{"name":"x","engine":"postgres","host":"h","port":5432,"user":"u","init_sql":["SET a = 1","ALTER USER u PASSWORD 'hunter2'"]}]}"#;
         let error = import_connections(file).unwrap_err().to_string();

@@ -68,6 +68,13 @@ pub trait Dialect: Send + Sync {
         Err(Error::Unsupported("reading query plans".into()))
     }
 
+    /// The statement that makes every later transaction of a session
+    /// read-only. A read-only connection runs it again after its bootstrap
+    /// statements, so nothing run at connect can leave the session writable.
+    fn read_only_session_sql(&self) -> &'static str {
+        "SET SESSION TRANSACTION READ ONLY"
+    }
+
     /// `expr` as text, for matching a pattern against a column of any
     /// type. The default is the standard cast to a character string of no
     /// given length.

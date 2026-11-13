@@ -89,6 +89,10 @@ impl Dialect for PgDialect {
         }
     }
 
+    fn read_only_session_sql(&self) -> &'static str {
+        "SET default_transaction_read_only = on"
+    }
+
     /// `CHAR` without a length is one character here.
     fn cast_to_text(&self, expr: &str) -> String {
         format!("CAST({expr} AS text)")

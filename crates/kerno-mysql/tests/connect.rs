@@ -667,7 +667,25 @@ async fn connector_runs_the_bootstrap_on_every_session() {
 
         config.ignore_init_errors = true;
         config.init_sql.push("SET @kerno_boot = 'after'".into());
-        let session = open(config).await.session(None).await.unwrap();
+        let session = open(config.clone()).await.session(None).await.unwrap();
         assert_eq!(scalar(&session, "SELECT @kerno_boot").await, "after");
+
+        // A statement that is not a plain session setting never runs.
+        config.init_sql = vec!["SET SESSION TRANSACTION READ WRITE".into()];
+        // Refused when the connection is opened, before anything is sent.
+        let error = config.validate().expect_err("the bootstrap is refused");
+        assert!(
+            error.to_string().contains("bootstrap statement 1"),
+            "{engine:?}: {error}"
+        );
+        // A read-only connection is read-only after its bootstrap.
+        config.read_only = true;
+        config.init_sql = vec!["SET @kerno_boot = 'ro'".into()];
+        let session = open(config).await.session(None).await.unwrap();
+        assert_eq!(
+            scalar(&session, "SELECT @@transaction_read_only").await,
+            "1",
+            "{engine:?}"
+        );
     }
 }

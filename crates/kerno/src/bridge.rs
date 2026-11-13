@@ -18,6 +18,11 @@ impl Global for Tokio {}
 
 /// Starts the runtime. Call once, before anything is spawned.
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
+    // Once per process run: starting it again would drop the first runtime
+    // and cancel whatever was still running on it (tests open the app twice).
+    if cx.has_global::<Tokio>() {
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)
         .thread_name("kerno-io")
