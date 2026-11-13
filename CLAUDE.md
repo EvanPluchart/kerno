@@ -162,6 +162,32 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
      out, wrong password, TLS failure) with the next step, then the server's raw message below. Example: host
      not found → "Host “studio” was not found. Check the host name; for a server on this computer, use
      localhost."
+  6. Environments are the user's, as DBeaver's connection types (`DBPConnectionType`, Apache-2.0, port with
+     attribution): Settings → Environments lists them; the three built-ins (local, staging, production) can be
+     edited but not deleted; the user adds their own. Each has a name, a colour (light and dark), and its
+     rules: auto-commit by default, confirm every SQL execution, confirm data edits, read-only by default,
+     close idle transactions. Existing connections keep their environment by id.
+  7. A non-local environment is visible everywhere while it is active, as in DBeaver: the window's chrome for
+     that connection (its tabs, the editor and grid frame, the status bar) takes the environment's colour,
+     strong for production, softer for staging, none for local. Readable in both themes (WCAG AA).
+  8. A connection with no default database opens on the database the server gives (often `postgres`, which
+     is empty) and the owner thought his data was gone. The Database field lists the server's databases once
+     the fields allow a test (a dropdown, still free text); the navigator shows the default database first and
+     marked, and the others under it unexpanded.
+  9. The macOS keychain asked the owner's login password on every connect. Read each secret at most once per
+     app run (keep it in memory for the session, never on disk); `scripts/bundle-macos.sh` signs with a stable
+     identity when one is configured (`KERNO_SIGN_IDENTITY`), ad hoc otherwise, and the README says that ad-hoc
+     builds make the keychain ask again after each rebuild ("Always allow" stops it for that build).
+  10. Backup, restore and the other tool dialogs are redone as DBeaver's (its `tasks` wizards for PostgreSQL
+      and MySQL): objects picked from a checkbox tree (schemas, tables) instead of a text field, the engine's
+      real options grouped (format, compression, encoding, clean/create, if exists, no owner, no privileges,
+      jobs for directory format; for MySQL single transaction, routines, events, triggers, extended inserts),
+      the output file chosen up front with a native save dialog, then a progress view with the tool's log,
+      elapsed time, cancel, and "Show in Finder" at the end. Local clients, as DBeaver's "Local client":
+      Settings → Local clients lists every detected install per engine (Homebrew `libpq`/`postgresql@N`,
+      Postgres.app versions, EDB installers, `mysql-client`, `mariadb`, PATH) with its version, lets the user
+      add one by folder and pick the default per engine; a connection can override it (Advanced tab); the
+      dialog warns before running when the client is older than the server (pg_dump refuses a newer server).
 
 ## 4. v1 features (all required, priority order)
 
