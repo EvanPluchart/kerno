@@ -9,6 +9,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{engines, exec_ok, run, scalar};
+use kerno_core::config::Engine;
 use kerno_core::schema::{ColumnInfo, TableRef};
 use kerno_core::sql::{CellValue, RowChange, apply_edits, edit_statements};
 use kerno_core::{Session, TxState, TypeKind};
@@ -601,5 +602,175 @@ async fn backslashes_and_quotes_survive_any_backslash_mode() {
             &format!("DROP DATABASE {}", dialect.quote_ident(&database)),
         )
         .await;
+    }
+}
+
+/// What the result of `sql` is, editable or why not, as a query tab decides
+/// it: from the statement, the origins of its columns, the table.
+async fn verdict(
+    session: &Arc<dyn Session>,
+    sql: &str,
+) -> Result<Vec<Option<String>>, kerno_core::editable::ReadOnly> {
+    use kerno_core::editable;
+    let collected = run(session, sql).await.unwrap();
+    let columns = collected.results[0].columns.clone();
+    let source = editable::check(sql, session.dialect().lex_rules(), &columns)?;
+    let (editable, _) = editable::lookup(session, &columns, &source).await?;
+    Ok(editable.columns)
+}
+
+#[tokio::test]
+async fn results_say_which_table_columns_they_show() {
+    use kerno_core::ColumnOrigin;
+    use kerno_core::editable::ReadOnly;
+    use kerno_core::schema::RelationKind;
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let origins = |sql: &'static str| {
+            let session = session.clone();
+            async move {
+                run(&session, sql).await.unwrap().results[0]
+                    .columns
+                    .iter()
+                    .map(|column| column.origin.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let column = |table: &str, name: &str| {
+            Some(ColumnOrigin::Named {
+                schema: "kerno".into(),
+                table: table.into(),
+                column: name.into(),
+            })
+        };
+        // Plain columns and aliases keep their table column; an expression
+        // has none.
+        assert_eq!(
+            origins("SELECT id, full_name AS n, id + 1 AS e FROM customers").await,
+            [
+                column("customers", "id"),
+                column("customers", "full_name"),
+                None
+            ],
+            "{engine:?}"
+        );
+        // A view's columns are the view's.
+        assert_eq!(
+            origins("SELECT id FROM active_customers").await,
+            [column("active_customers", "id")],
+            "{engine:?}"
+        );
+        // MySQL names the table through a derived table; MariaDB names the
+        // derived table, so a query tab keeps the origins of the first run.
+        let derived = origins("SELECT * FROM (SELECT id FROM customers) kerno_q").await;
+        let through = if engine == Engine::MariaDb {
+            "kerno_q"
+        } else {
+            "customers"
+        };
+        assert_eq!(derived, [column(through, "id")], "{engine:?}");
+
+        assert_eq!(
+            verdict(
+                &session,
+                "SELECT id, full_name AS n, 1 AS e FROM customers WHERE id < 5"
+            )
+            .await,
+            Ok(vec![Some("id".into()), Some("full_name".into()), None]),
+            "{engine:?}"
+        );
+        let all = verdict(&session, "SELECT * FROM customers").await.unwrap();
+        assert!(all.iter().all(Option::is_some), "{engine:?}");
+        for (sql, why) in [
+            (
+                "SELECT c.id, o.id FROM customers c JOIN orders o ON o.customer_id = c.id",
+                ReadOnly::SeveralTables,
+            ),
+            (
+                "SELECT c.id, d.full_name FROM customers c JOIN customers d ON d.id = c.id",
+                ReadOnly::Shape("joins tables"),
+            ),
+            ("SELECT 1 + 1", ReadOnly::NoTableColumn),
+            (
+                "SELECT full_name FROM customers",
+                ReadOnly::KeyMissing {
+                    column: "id".into(),
+                    table: TableRef::new("kerno", "customers"),
+                },
+            ),
+            (
+                "SELECT * FROM active_customers",
+                ReadOnly::View(
+                    TableRef::new("kerno", "active_customers"),
+                    RelationKind::View,
+                ),
+            ),
+        ] {
+            assert_eq!(verdict(&session, sql).await, Err(why), "{engine:?}: {sql}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn edits_join_an_open_transaction_without_ending_it() {
+    use kerno_core::sql::apply_edits_in_transaction;
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let database = common::fresh_database(&session, "edit_in_transaction").await;
+        exec_ok(
+            &session,
+            &format!("CREATE TABLE {database}.t (id INT PRIMARY KEY, name TEXT)"),
+        )
+        .await;
+        exec_ok(
+            &session,
+            &format!("INSERT INTO {database}.t VALUES (1, 'one'), (2, 'two')"),
+        )
+        .await;
+        let table = TableRef::new(database.clone(), "t");
+        let structure = session.table_structure(&table).await.unwrap();
+        let generate = |changes: &[RowChange]| {
+            edit_statements(session.dialect(), &table, &structure.columns, changes).unwrap()
+        };
+        let rename = |id: &str, name: &str| RowChange::Update {
+            key: vec![("id".into(), CellValue::Text(id.into()))],
+            set: vec![("name".into(), CellValue::Text(name.into()))],
+        };
+        let names = || {
+            let session = session.clone();
+            let sql = format!("SELECT GROUP_CONCAT(name ORDER BY id) FROM {database}.t");
+            async move { scalar(&session, &sql).await }
+        };
+
+        let statements = generate(&[rename("1", "uno")]);
+        assert!(
+            apply_edits_in_transaction(&session, &statements)
+                .await
+                .is_err()
+        );
+
+        exec_ok(&session, "START TRANSACTION").await;
+        exec_ok(
+            &session,
+            &format!("INSERT INTO {database}.t VALUES (3, 'three')"),
+        )
+        .await;
+        apply_edits_in_transaction(&session, &statements)
+            .await
+            .unwrap_or_else(|f| panic!("{engine:?}: {f}"));
+        assert_eq!(session.tx_state(), TxState::Open, "{engine:?}");
+        assert_eq!(names().await, "uno,two,three", "{engine:?}");
+
+        let failing = generate(&[rename("2", "dos"), rename("404", "none")]);
+        let failure = apply_edits_in_transaction(&session, &failing)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.statement, Some(1), "{engine:?}");
+        assert_eq!(session.tx_state(), TxState::Open, "{engine:?}");
+        assert_eq!(names().await, "uno,two,three", "{engine:?}");
+
+        exec_ok(&session, "ROLLBACK").await;
+        assert_eq!(names().await, "one,two", "{engine:?}");
+        exec_ok(&session, &format!("DROP DATABASE {database}")).await;
     }
 }

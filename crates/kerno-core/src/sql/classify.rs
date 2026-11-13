@@ -104,18 +104,7 @@ const QUERY_WORDS: &[&str] = &[
 /// If it holds several anyway, it writes or destroys as soon as one of
 /// them does.
 pub fn classify(statement: &str, rules: LexRules) -> StatementClass {
-    let mut tokens = Vec::new();
-    collect(statement, rules, &mut tokens);
-    let mut depth = 0usize;
-    for token in &mut tokens {
-        if token.kind == TokenKind::Punct && token.text == ")" {
-            depth = depth.saturating_sub(1);
-        }
-        token.depth = depth;
-        if token.kind == TokenKind::Punct && token.text == "(" {
-            depth += 1;
-        }
-    }
+    let tokens = nested_tokens(statement, rules);
     let mut parts = tokens
         .split(|token| token.kind == TokenKind::Semicolon)
         .filter(|part| !part.is_empty());
@@ -132,6 +121,143 @@ pub fn classify(statement: &str, rules: LexRules) -> StatementClass {
         }
     }
     class
+}
+
+/// The meaningful tokens of `statement`, each with the number of
+/// parentheses around it (a parenthesis counts as outside itself).
+fn nested_tokens(statement: &str, rules: LexRules) -> Vec<Tok<'_>> {
+    let mut tokens = Vec::new();
+    collect(statement, rules, &mut tokens);
+    let mut depth = 0usize;
+    for token in &mut tokens {
+        if token.kind == TokenKind::Punct && token.text == ")" {
+            depth = depth.saturating_sub(1);
+        }
+        token.depth = depth;
+        if token.kind == TokenKind::Punct && token.text == "(" {
+            depth += 1;
+        }
+    }
+    tokens
+}
+
+/// What [`single_table_select`] says of a statement that is no `SELECT`
+/// at all, or several statements.
+pub const NOT_A_SELECT: &str = "is not a single SELECT";
+
+/// Functions that return several rows for one: in the select list they
+/// repeat the row of the table they are called on (PostgreSQL).
+const SET_RETURNING: &[&str] = &[
+    "UNNEST",
+    "GENERATE_SERIES",
+    "GENERATE_SUBSCRIPTS",
+    "JSON_ARRAY_ELEMENTS",
+    "JSON_ARRAY_ELEMENTS_TEXT",
+    "JSONB_ARRAY_ELEMENTS",
+    "JSONB_ARRAY_ELEMENTS_TEXT",
+    "JSON_EACH",
+    "JSON_EACH_TEXT",
+    "JSONB_EACH",
+    "JSONB_EACH_TEXT",
+    "JSON_OBJECT_KEYS",
+    "JSONB_OBJECT_KEYS",
+    "JSONB_PATH_QUERY",
+    "REGEXP_MATCHES",
+    "REGEXP_SPLIT_TO_TABLE",
+    "STRING_TO_TABLE",
+];
+
+/// Why the rows of `statement` may not be the rows of one table as they
+/// are stored, each shown once, read from its text: [`NOT_A_SELECT`], or
+/// what the statement does that prevents it ("joins tables", "uses
+/// DISTINCT"…), to follow "the statement". `None` for a plain `SELECT`
+/// from one table, whatever its aliases, `WHERE`, `ORDER BY` or `LIMIT`.
+///
+/// The rules are DBeaver's single-source query (`SQLQuery`,
+/// `isPotentiallySingleSourceSelect`: no join, no grouping, no `INTO`, a
+/// table as the `FROM` item), read on tokens instead of a parse tree, plus
+/// what repeats or merges rows: `DISTINCT`, set operations, `WITH`, and a
+/// set-returning function in the select list. The columns a result shows
+/// are told by the server ([`crate::result::ColumnOrigin`]); this covers
+/// what origins cannot see, such as a table joined to itself.
+pub fn single_table_select(statement: &str, rules: LexRules) -> Option<&'static str> {
+    let tokens = nested_tokens(statement, rules);
+    let mut parts = tokens
+        .split(|token| token.kind == TokenKind::Semicolon)
+        .filter(|part| !part.is_empty());
+    let (Some(tokens), None) = (parts.next(), parts.next()) else {
+        return Some(NOT_A_SELECT);
+    };
+    let class = classify_tokens(tokens, rules);
+    if class.kind != StatementKind::Select || class.writes {
+        return Some(NOT_A_SELECT);
+    }
+    let first = &tokens[0];
+    if first.is("WITH") {
+        return Some("uses WITH");
+    }
+    if first.is("TABLE") {
+        return None;
+    }
+    if !first.is("SELECT") {
+        // `VALUES …`, or `(SELECT …) UNION (SELECT …)`.
+        return Some(NOT_A_SELECT);
+    }
+    let top = |token: &Tok| token.depth == first.depth;
+    // Where the FROM item ends: a clause, or what the engine adds to a
+    // table (sampling, index hints, partitions) and opens a parenthesis on.
+    const AFTER_FROM: &[&str] = &[
+        "WHERE",
+        "GROUP",
+        "HAVING",
+        "WINDOW",
+        "ORDER",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "FOR",
+        "LOCK",
+        "TABLESAMPLE",
+        "USE",
+        "FORCE",
+        "IGNORE",
+        "PARTITION",
+    ];
+    let mut in_select = true;
+    let mut in_from = false;
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        let next_opens = tokens
+            .get(index + 1)
+            .is_some_and(|next| is_punct(next, "("));
+        if in_select && token.is_any(SET_RETURNING) && next_opens {
+            return Some("repeats rows with a set-returning function");
+        }
+        if !top(token) {
+            continue;
+        }
+        if token.is("DISTINCT") {
+            return Some("uses DISTINCT");
+        }
+        if token.is_any(&["GROUP", "HAVING"]) {
+            return Some("groups rows");
+        }
+        if token.is_any(&["UNION", "INTERSECT", "EXCEPT", "MINUS"]) {
+            return Some("combines several results");
+        }
+        if token.is_any(&["JOIN", "STRAIGHT_JOIN"]) {
+            return Some("joins tables");
+        }
+        if token.is("FROM") {
+            (in_select, in_from) = (false, true);
+        } else if in_from && token.is_any(AFTER_FROM) {
+            in_from = false;
+        } else if in_from && is_punct(token, ",") {
+            return Some("joins tables");
+        } else if in_from && is_punct(token, "(") {
+            return Some("reads from a subquery or a function");
+        }
+    }
+    None
 }
 
 /// Appends the meaningful tokens of `source` to `out`. MySQL runs what is
@@ -946,6 +1072,96 @@ mod tests {
         assert_eq!(
             classify("/*!50001 DROP VIEW v */", LexRules::POSTGRES),
             other(false)
+        );
+    }
+
+    #[test]
+    fn single_table_selects_are_told_from_the_rest() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("select id, name from shop.customers where id < 5", None),
+            (
+                "SELECT c.id AS customer, c.name n FROM shop.customers c",
+                None,
+            ),
+            ("select * from t order by id desc limit 10 offset 5", None),
+            (
+                "select *, id * 2 from t where x in (select y from a, b)",
+                None,
+            ),
+            (
+                "select id, (select count(*) from o where o.c = t.id) from t",
+                None,
+            ),
+            ("select id from t for update", None),
+            ("select id from t tablesample system (10)", None),
+            ("select id, row_number() over (order by id) from t", None),
+            ("select 1", None),
+            ("table shop.customers", None),
+            ("  -- a comment\n select id from t;", None),
+            ("select id from t; select id from u", Some(NOT_A_SELECT)),
+            ("insert into t values (1) returning id", Some(NOT_A_SELECT)),
+            ("select id into other from t", Some(NOT_A_SELECT)),
+            ("values (1), (2)", Some(NOT_A_SELECT)),
+            (
+                "(select id from t) union (select id from u)",
+                Some(NOT_A_SELECT),
+            ),
+            ("explain select id from t", Some(NOT_A_SELECT)),
+            (
+                "with x as (select id from t) select * from x",
+                Some("uses WITH"),
+            ),
+            ("select distinct id from t", Some("uses DISTINCT")),
+            ("select distinct on (id) id from t", Some("uses DISTINCT")),
+            (
+                "select id, count(*) from t group by id",
+                Some("groups rows"),
+            ),
+            (
+                "select id from t union all select id from u",
+                Some("combines several results"),
+            ),
+            (
+                "select a.id from t a join t b on b.id = a.id",
+                Some("joins tables"),
+            ),
+            (
+                "select t.id from t left outer join u on u.t = t.id",
+                Some("joins tables"),
+            ),
+            (
+                "select t.id from t, u where u.t = t.id",
+                Some("joins tables"),
+            ),
+            (
+                "select id from (select id from t) s",
+                Some("reads from a subquery or a function"),
+            ),
+            (
+                "select * from generate_series(1, 3)",
+                Some("reads from a subquery or a function"),
+            ),
+            (
+                "select id, unnest(tags) from t",
+                Some("repeats rows with a set-returning function"),
+            ),
+        ];
+        for rules in [LexRules::POSTGRES, LexRules::MYSQL] {
+            for (sql, expected) in cases {
+                assert_eq!(single_table_select(sql, rules), *expected, "{sql}");
+            }
+        }
+        // MySQL's index hints and partitions name the table, they join nothing.
+        assert_eq!(
+            single_table_select(
+                "select id from t use index (primary) where id > 1",
+                LexRules::MYSQL
+            ),
+            None
+        );
+        assert_eq!(
+            single_table_select("select id from t straight_join u", LexRules::MYSQL),
+            Some("joins tables")
         );
     }
 }

@@ -485,6 +485,27 @@ WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}",
     /// From `information_schema.SCHEMATA` and the sizes of its tables. A
     /// database has no owner on these engines; MariaDB keeps a comment,
     /// MySQL has none.
+    /// The table the server named, with its columns: a view answers `v`,
+    /// a table `r`, as PostgreSQL's `relkind` letters them.
+    fn origin_sql(&self, source: &kerno_core::editable::Source) -> Option<String> {
+        let kerno_core::editable::Source::Named(table) = source else {
+            return None;
+        };
+        Some(format!(
+            "\
+SELECT t.TABLE_SCHEMA, t.TABLE_NAME,
+       CASE WHEN t.TABLE_TYPE = 'BASE TABLE' THEN 'r' ELSE 'v' END,
+       c.ORDINAL_POSITION, c.COLUMN_NAME
+FROM information_schema.TABLES t
+JOIN information_schema.COLUMNS c
+  ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
+WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}
+ORDER BY c.ORDINAL_POSITION",
+            self.quote_string(&table.schema),
+            self.quote_string(&table.name)
+        ))
+    }
+
     fn database_properties_sql(&self, database: &str) -> Option<String> {
         let name = self.quote_string(database);
         let comment = if self.engine == Engine::MariaDb {

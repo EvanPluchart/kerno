@@ -143,6 +143,12 @@ is still being typed (an unterminated string or comment fails the whole script),
 uses a small tolerant lexer in `kerno-core` (`sql::lex`, `sql::split`) that never fails. `sqlparser` stays in
 the stack for what needs a real parse of a complete statement (classification, completion context).
 
+Update, 2026-11-13: nothing ended up needing that parse. Classification, completion context, formatting,
+the derived-table wrapping of a result's filter and the single-table rule for editable results are all
+written on the same lexer, for the same reason (they must work on text that is not finished, in two
+dialects). `sqlparser` had become a dependency no source file used, so it was removed from the manifests.
+`CLAUDE.md` §2 still names it as the planned tool; this entry is the record of the difference.
+
 ## D-011 — PostgreSQL introspection choices
 
 - Reads `pg_catalog`, not `information_schema` (which hides objects the role has no privilege on and omits

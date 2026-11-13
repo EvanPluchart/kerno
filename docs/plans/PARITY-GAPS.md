@@ -879,3 +879,65 @@ Left:
 - Navigate ▸ holds the two go-to entries only; DBeaver's also lists the row moves and the foreign
   keys, which Kerno keeps at the top level of the menu and on keys.
 - The scroll test drives the table's list, not a wheel event.
+
+## G8 — delivered on 2026-11-13, and what it left (one `opus` agent; core: `result.rs`
+(`Column::origin`, `ResultStore::renamed`), `editable.rs` (new), `sql/classify.rs`
+(`single_table_select`), `sql/edits.rs` (`apply_edits_in_transaction`), `dialect.rs` (`origin_sql`);
+drivers: `session.rs`, `dialect.rs`, `tests/edits.rs`; app: `query/edit.rs` (new), `query/grid.rs`,
+`query/tab.rs`, `data/tab.rs`, `workspace.rs`, `ui_tests.rs`; `sqlparser` removed from the manifests)
+
+Done (RES-51):
+- Origins from the server, not from the SQL: PostgreSQL's row description (table OID, attribute
+  number, from the statement's existing describe), MySQL / MariaDB's schema, original table and
+  column. One catalog query per result names the table and its kind (`Dialect::origin_sql`), then the
+  table's structure; run off the UI thread on the connection's own session when it is in the result's
+  database, else on a session opened and closed for it; never on the tab's.
+- Editable when the statement is a plain SELECT (`single_table_select`: no JOIN or comma in FROM, no
+  DISTINCT, GROUP BY / HAVING, set operation, WITH, subquery or function as the FROM item, known
+  set-returning function in the select list; DBeaver's `SQLQuery.isPotentiallySingleSourceSelect`),
+  the columns from a table are one table's, that table is a table (not a view), and the result holds
+  its key as `DataTab` decides it (`row_identity`). Aliases are written under the table's names; an
+  expression, a column shown twice and a generated column are read-only cells.
+- Read-only results say why in the footer, one sentence (`editable::ReadOnly`): read-only
+  connection, not a single SELECT, joins tables / uses DISTINCT / groups rows / combines several
+  results / uses WITH / reads from a subquery or a function / repeats rows with a set-returning
+  function, no column comes from a table, columns of several tables, a view or materialized view,
+  no primary or unique key, the key column `x` of `s.t` is not in the result, the table not found or
+  not read. Generate SQL ▸ is disabled with the short form; enabled on editable results.
+- The edit layer is the data tab's, shared (`query/edit.rs`, and `Grid::pending_sql`,
+  `rows_sql`, `generated_columns`, `EditTarget`): typing, Delete / Set NULL / default, paste, add /
+  duplicate / delete / revert rows, copy from row, undo, Esc, the value panel and record view, the
+  row commands of the workspace, Review SQL and `sql_confirm` (production asks twice).
+- Apply: in auto-commit, one transaction of its own (`apply_edits`); in manual commit or with a
+  transaction open, inside it under a savepoint, nothing committed, the statements in the transaction
+  log; a failed apply takes back only what it did and keeps the pending changes. Then the result is
+  read again with its filter and order. While a result is paged in an open transaction, Apply asks to
+  fetch all rows first (stopping the paged statement would cancel it, which ends a PostgreSQL
+  transaction). Changes are applied only on the connection and database their rows were read on: a
+  tab switched elsewhere refuses until it is switched back (or the changes discarded).
+- Filtered and ordered results stay editable: MariaDB names the derived table, so the origins of the
+  statement's first run are kept in `Requery`.
+- Tests: `editable::tests::*`, `classify::tests::single_table_selects_are_told_from_the_rest`,
+  `grid::tests::a_result_of_one_table_edits_as_table_data_and_a_read_only_one_says_why`, drivers'
+  `results_say_which_table_columns_they_show`, `edits_join_an_open_transaction_without_ending_it`;
+  UI `a_select_result_of_one_table_is_edited_reviewed_and_applied` (all three engines),
+  `a_result_that_is_no_rows_of_one_table_says_why_it_is_read_only`,
+  `a_manual_commit_tab_applies_result_edits_inside_its_transaction`,
+  `a_result_filtered_or_ordered_by_the_server_stays_editable`,
+  `result_changes_stay_where_their_rows_were_read`.
+
+Differs from DBeaver:
+- A table without a key stays read-only (DBeaver offers to use all columns); a join to another table,
+  even with only one table's columns, is read-only (DBeaver may edit it as a multi-source result).
+- An editable result is ordered by the server on a header click, even when every row is here:
+  pending changes are kept by row as fetched.
+- While a result holds pending changes, the tab runs nothing else and its results are not closed:
+  apply or discard first (DBeaver asks to save).
+
+Left:
+- New rows wait until every row is fetched ("Fetch all rows first").
+- A tab on another database than the connection's own session opens a session per editable-looking
+  result for the lookup (PostgreSQL); a cache per table would save it.
+- No FK navigation from result rows (DBeaver's references panel on a result).
+- A table created in the tab's own uncommitted transaction is not seen by the lookup session: its
+  result says the table was not found.

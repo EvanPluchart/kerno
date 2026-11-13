@@ -37,12 +37,16 @@ use kerno_core::browse::{
     one_of_sql, select_from,
 };
 use kerno_core::config::Environment;
-use kerno_core::schema::{RelationKind, TableRef};
+use kerno_core::editable::{self, Editable, ReadOnly, Source as EditSource};
+use kerno_core::schema::{RelationKind, TableRef, TableStructure};
+use kerno_core::sql::{
+    CellValue, RowChange, RowSql, StatementClass, StatementKind, TxCommand, apply_edits,
+    apply_edits_in_transaction, classify,
+};
 use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_sql,
     split_statements, statement_at, toggle_block_comment,
 };
-use kerno_core::sql::{StatementClass, StatementKind, TxCommand, classify};
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
     Dialect, Error, ExecEvent, Notice, Plan, ResultStore, RowLimit, Session, TxState, exec,
@@ -51,10 +55,11 @@ use kerno_core::{
 use super::comment;
 use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::distinct;
-use super::grid::{CopyFormat, Grid, GridAction, Owner};
+use super::edit;
+use super::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner};
 use super::params;
+use super::plan_view;
 use super::tx_log::{self, TxLogEntry};
-use super::{plan_view, viewer};
 use crate::actions::{
     self, CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
     MaximizeResultsPanel, NextStatement, PreviousStatement, ReplaceInEditor, RunAll, RunFromCursor,
@@ -208,8 +213,18 @@ pub struct ResultPane {
     pub requery: Option<Requery>,
     /// Rows of the whole result, once counted.
     pub total: Option<u64>,
+    /// Whether its rows take changes as rows of one table (RES-51): `None`
+    /// while that is being found out, and for rows that are no result.
+    editable: Option<Result<(), ReadOnly>>,
+    /// Why the last apply of its changes changed nothing.
+    apply_error: Option<String>,
+    /// The connection and database it was read on: its changes are
+    /// applied there or nowhere.
+    place: Option<(String, Option<String>)>,
     /// The grid's selection and double click; dropped with the pane.
     _grid_events: Option<Subscription>,
+    /// Finds out whether its rows take changes; dropped with the pane.
+    _lookup: Option<Task<()>>,
 }
 
 /// What the result of a SELECT is read again with: its own statement,
@@ -228,6 +243,10 @@ pub struct Requery {
     /// The server ignored the statement's own `ORDER BY` (MySQL and
     /// MariaDB in a derived table without a `LIMIT`).
     pub order_dropped: bool,
+    /// The table columns the result of the statement itself showed:
+    /// read again inside a derived table, MariaDB names the derived table
+    /// instead.
+    pub origins: Option<Arc<[Option<kerno_core::ColumnOrigin>]>>,
 }
 
 /// A count or a list of values read for the result on screen.
@@ -265,6 +284,10 @@ pub struct TabStatus {
     /// Rows with changes waiting to be applied (a table's data).
     pub pending: usize,
 }
+
+/// Why the changes of a result are not applied after the tab moved.
+const MOVED_AWAY: &str = "The tab now runs on another connection or database than these rows were \
+                          read on: discard their changes, or switch back.";
 
 /// A statement on one line, cut short: enough to tell which one it is.
 fn one_line(statement: &str) -> String {
@@ -387,6 +410,9 @@ pub enum QueryTabEvent {
     /// The user chose another connection, database or schema while a
     /// transaction is open: the window asks how to end it, then switches.
     SwitchTarget(Option<Target>),
+    /// Open a query tab holding `sql`, on this tab's connection, database
+    /// and schema (statements written from rows of a result).
+    OpenQuery { title: String, sql: String },
 }
 
 impl EventEmitter<QueryTabEvent> for QueryTab {}
@@ -662,7 +688,7 @@ impl QueryTab {
                 .map(|grid| grid.read(cx).delegate().row_count()),
             elapsed: pane.and_then(|pane| pane.elapsed),
             notices: self.notices.len(),
-            pending: 0,
+            pending: self.pending_count(cx),
         }
     }
 
@@ -1667,6 +1693,9 @@ impl QueryTab {
     /// Runs `statements` one after the other, stopping at the first that
     /// fails.
     fn execute(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.free_to_run(window, cx) {
+            return;
+        }
         let rules = self.lex_rules(cx);
         let connections = self.connections.read(cx);
         let saved = self
@@ -1748,6 +1777,20 @@ impl QueryTab {
         });
     }
 
+    /// Whether a run may replace the results. With changes waiting in one
+    /// it may not: they are about the rows on screen (as a table's page
+    /// keeps its rows while changes wait).
+    fn free_to_run(&self, window: &mut Window, cx: &mut App) -> bool {
+        if self.pending_count(cx) == 0 {
+            return true;
+        }
+        window.push_notification(
+            Notification::warning("Apply or discard the pending changes of the result first."),
+            cx,
+        );
+        false
+    }
+
     /// Shows why a statement was not run on a read-only connection.
     fn refuse_read_only(&mut self, statement: &str, connection: &str, cx: &mut Context<Self>) {
         self.refuse(
@@ -1814,7 +1857,11 @@ impl QueryTab {
             pinned: false,
             requery: self.requery.clone(),
             total: None,
+            editable: None,
+            apply_error: None,
+            place: self.place(),
             _grid_events: None,
+            _lookup: None,
         });
         id
     }
@@ -1839,6 +1886,9 @@ impl QueryTab {
     /// sent as it is written. Whatever came of it, the window is told.
     pub fn apply_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.source.is_none() || matches!(self.activity, Activity::Running { .. }) {
+            return;
+        }
+        if !self.free_to_run(window, cx) {
             return;
         }
         if self.connect_first(Request::ApplySource, cx) {
@@ -2590,12 +2640,21 @@ impl QueryTab {
         let sql = statement.to_string();
         let mut grid = grid.with_owner(Owner {
             act: Rc::new(move |action, row, column, window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    if action == GridAction::Export {
+                let _ = view.update(cx, |this, cx| match action {
+                    GridAction::Export => {
                         this.export_statement(sql.clone(), window, cx);
-                    } else {
-                        this.result_action(id, action, row, column, window, cx);
                     }
+                    GridAction::Paste
+                    | GridAction::EditCell
+                    | GridAction::SetNull
+                    | GridAction::SetDefault
+                    | GridAction::CopyFromRow(_)
+                    | GridAction::DuplicateRow
+                    | GridAction::DeleteRow
+                    | GridAction::RevertRow
+                    | GridAction::AddRow
+                    | GridAction::Generate(_) => this.edit_result(action, row, column, window, cx),
+                    action => this.result_action(id, action, row, column, window, cx),
                 });
             }),
             related: None,
@@ -2637,7 +2696,20 @@ impl QueryTab {
                 // The grid numbers its rows itself.
                 .row_header(false)
         });
-        // A double click on a cell shows its whole value.
+        // Whether the rows take changes: what the statement and the
+        // columns say at once, then what the table says.
+        let verdict = self
+            .explain_mode
+            .is_none()
+            .then(|| self.edit_check(statement, requery.as_ref(), &table, cx));
+        let requery = requery.map(|requery| Requery {
+            origins: requery.origins.clone().or_else(|| {
+                let columns = table.read(cx).delegate().store().columns().clone();
+                Some(columns.iter().map(|column| column.origin.clone()).collect())
+            }),
+            ..requery
+        });
+        // A double click on a cell types in it, or shows its whole value.
         let events = cx.subscribe_in(
             &table,
             window,
@@ -2656,20 +2728,638 @@ impl QueryTab {
                     });
                 }
                 if let TableEvent::DoubleClickedCell(row, column) = event {
-                    let grid = table.read(cx).delegate();
-                    if let Some((column, value)) = grid.value_at(*row, *column) {
-                        let (column, value) = (column.clone(), value.map(<[u8]>::to_vec));
-                        viewer::open(&column, value.as_deref(), window, cx);
-                    }
+                    edit::double_click(table, *row, *column, window, cx);
                 }
             },
         );
-        let id = self.push_pane(statement.to_string(), Outcome::Rows(table), None, None);
+        let id = self.push_pane(
+            statement.to_string(),
+            Outcome::Rows(table.clone()),
+            None,
+            None,
+        );
         if let Some(pane) = self.pane_mut(id) {
             pane._grid_events = Some(events);
             pane.requery = requery;
         }
+        match verdict {
+            Some(Ok((columns, source))) => self.look_up_table(id, columns, source, window, cx),
+            Some(Err(why)) => self.decided(id, Err(why), cx),
+            None => {}
+        }
         id
+    }
+
+    // Editing a result (RES-51) ---------------------------------------------
+
+    /// What is known at once of whether the rows of a result take changes
+    /// (see [`editable::check`]): the connection takes writes, the
+    /// statement is a plain SELECT, the columns from a table are one
+    /// table's. With the columns as their origins say (those of the
+    /// statement's first run when it is read again).
+    fn edit_check(
+        &self,
+        statement: &str,
+        requery: Option<&Requery>,
+        table: &Entity<TableState<Grid>>,
+        cx: &App,
+    ) -> Result<(Arc<[kerno_core::Column]>, EditSource), ReadOnly> {
+        let saved = self
+            .target
+            .as_ref()
+            .and_then(|target| self.connections.read(cx).get(&target.connection));
+        if let Some(saved) = saved.filter(|saved| saved.config.read_only) {
+            return Err(ReadOnly::Connection(saved.config.name.clone()));
+        }
+        let mut columns = table.read(cx).delegate().store().columns().clone();
+        if let Some(origins) = requery
+            .and_then(|requery| requery.origins.as_ref())
+            .filter(|origins| origins.len() == columns.len())
+        {
+            columns = columns
+                .iter()
+                .zip(origins.iter())
+                .map(|(column, origin)| column.clone().with_origin(origin.clone()))
+                .collect();
+        }
+        let statement = requery.map_or(statement, |requery| requery.statement.as_str());
+        let source = editable::check(statement, self.lex_rules(cx), &columns)?;
+        Ok((columns, source))
+    }
+
+    /// Finds out from the table whether the rows of pane `id` take
+    /// changes: one small catalog query and the table's structure, off the
+    /// UI thread, on the connection's own session when it is in the
+    /// result's database, else on a session opened for it (OIDs belong to
+    /// a database). Never on the tab's: a result being paged holds it, and
+    /// its transaction is the user's.
+    fn look_up_table(
+        &mut self,
+        id: u64,
+        columns: Arc<[kerno_core::Column]>,
+        source: EditSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(target), Some(grid)) = (self.target.clone(), self.pane_grid(id)) else {
+            return;
+        };
+        let database = grid.read(cx).delegate().session().database();
+        let connections = self.connections.read(cx);
+        let meta = connections
+            .meta_session(&target.connection)
+            .filter(|meta| !meta.dialect().has_schemas() || meta.database() == database);
+        let opening = match &meta {
+            Some(_) => None,
+            None => Some(connections.open_session(&target.connection, database, cx)),
+        };
+        // One piece of work on the runtime, which goes on when the pane is
+        // gone: a session opened for the lookup is always closed by it.
+        let looking = bridge::spawn(cx, async move {
+            let (session, close) = match (meta, opening) {
+                (Some(meta), _) => (meta, false),
+                (None, Some(opening)) => match opening.await {
+                    Ok(session) => (session, true),
+                    Err(error) => return Err(ReadOnly::Unread(error.to_string())),
+                },
+                (None, None) => return Err(ReadOnly::Unread("no session".into())),
+            };
+            let decided = editable::lookup(&session, &columns, &source).await;
+            if close {
+                session.close().await;
+            }
+            decided
+        });
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let decided = looking.await;
+            let _ = this.update(cx, |this, cx| this.decided(id, decided, cx));
+        });
+        if let Some(pane) = self.pane_mut(id) {
+            pane._lookup = Some(task);
+        }
+    }
+
+    /// Makes the rows of pane `id` editable as rows of their table, or says
+    /// why they stay read-only.
+    fn decided(
+        &mut self,
+        id: u64,
+        decided: Result<(Editable, TableStructure), ReadOnly>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(grid) = self.pane_grid(id) else {
+            return;
+        };
+        let (verdict, target) = match decided {
+            Ok((editable, structure)) => (
+                Ok(()),
+                Ok(EditTarget {
+                    table: editable.table,
+                    structure: Arc::new(structure),
+                    identity: editable.identity,
+                    names: editable.columns,
+                }),
+            ),
+            Err(why) => {
+                let short = why.short();
+                (Err(why), Err(short))
+            }
+        };
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().set_edit_target(target);
+            table.refresh(cx);
+            cx.notify();
+        });
+        if let Some(pane) = self.pane_mut(id) {
+            pane.editable = Some(verdict);
+        }
+        cx.notify();
+    }
+
+    /// How many rows of the results have changes waiting.
+    pub fn pending_count(&self, cx: &App) -> usize {
+        self.results
+            .iter()
+            .filter_map(ResultPane::grid)
+            .map(|grid| grid.read(cx).delegate().pending().map_or(0, |p| p.count()))
+            .sum()
+    }
+
+    /// Why the rows of the result on screen take no change, in one
+    /// sentence; `None` while that is being found out or when they do. For
+    /// tests.
+    #[cfg(test)]
+    pub fn result_read_only(&self) -> Option<String> {
+        match self.results.get(self.active_result)?.editable.as_ref()? {
+            Ok(()) => None,
+            Err(why) => Some(why.to_string()),
+        }
+    }
+
+    /// The connection and database the tab runs on.
+    fn place(&self) -> Option<(String, Option<String>)> {
+        let target = self.target.as_ref()?;
+        Some((target.connection.clone(), target.database.clone()))
+    }
+
+    /// Whether the tab runs elsewhere than the rows of pane `id` were read
+    /// on: its changes are not applied there.
+    fn moved_away(&self, id: u64) -> bool {
+        self.results
+            .iter()
+            .find(|pane| pane.id == id)
+            .is_some_and(|pane| pane.place != self.place())
+    }
+
+    /// Whether the rows of the result on screen take changes, and why not
+    /// when they do not.
+    fn result_edits(&self) -> edit::Allowed {
+        let pane = self.results.get(self.active_result);
+        if pane.is_some_and(|pane| self.moved_away(pane.id)) {
+            return Err(Some(MOVED_AWAY.into()));
+        }
+        match pane.map(|pane| &pane.editable) {
+            Some(Some(Ok(()))) => Ok(()),
+            Some(Some(Err(why))) => Err(Some(SharedString::from(why.to_string()))),
+            Some(None) => Err(Some(
+                "Wait a moment: the table of the result is being read.".into(),
+            )),
+            None => Err(None),
+        }
+    }
+
+    /// The grid of the result on screen, when its rows take changes; says
+    /// why not when they do not.
+    fn editing_grid(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<(u64, Entity<TableState<Grid>>)> {
+        let pane = self.results.get(self.active_result)?;
+        let grid = pane.grid()?;
+        match self.result_edits() {
+            Ok(()) => Some((pane.id, grid)),
+            Err(why) => {
+                if let Some(why) = why {
+                    window.push_notification(Notification::warning(why), cx);
+                }
+                None
+            }
+        }
+    }
+
+    /// Runs a change of the edit layer on the result on screen, when its
+    /// rows take changes, and redraws.
+    fn on_result_rows(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&Entity<TableState<Grid>>, &mut App),
+    ) {
+        let Some((id, grid)) = self.editing_grid(window, cx) else {
+            return;
+        };
+        act(&grid, cx);
+        if let Some(pane) = self.pane_mut(id) {
+            pane.apply_error = None;
+        }
+        // Auto-refresh would read the rows again over the changes.
+        if self.auto_refresh.is_some() && self.pending_count(cx) > 0 {
+            self.stop_auto_refresh(Some("changes are pending"), cx);
+        }
+        cx.notify();
+    }
+
+    /// New rows go after the last row: every row must be here first.
+    fn rows_all_here(&self, window: &mut Window, cx: &mut App) -> bool {
+        let more = self
+            .active_grid()
+            .is_some_and(|grid| grid.read(cx).delegate().has_more());
+        if more {
+            window.push_notification(
+                Notification::warning(
+                    "Fetch all rows first: new rows go after the last row of the result.",
+                ),
+                cx,
+            );
+        }
+        !more
+    }
+
+    /// Adds an empty row at the end of the result on screen.
+    pub fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rows_all_here(window, cx) {
+            self.on_result_rows(window, cx, edit::add_row);
+        }
+    }
+
+    /// Adds copies of the selected rows (or of `row`) at the end.
+    pub fn duplicate_rows(
+        &mut self,
+        row: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rows_all_here(window, cx) {
+            self.on_result_rows(window, cx, |grid, cx| edit::duplicate_rows(grid, row, cx));
+        }
+    }
+
+    /// Marks the selected rows (or `row`) for deletion.
+    pub fn delete_rows(&mut self, row: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_result_rows(window, cx, |grid, cx| edit::delete_rows(grid, row, cx));
+    }
+
+    /// Gives every selected cell `value` (`NULL` or the column's default).
+    pub fn set_selected(&mut self, value: CellValue, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_result_rows(window, cx, |grid, cx| {
+            edit::set_cells(grid, value, false, cx)
+        });
+    }
+
+    /// Gives the selected cells the values of the row above or below.
+    pub fn copy_from_row(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_result_rows(window, cx, |grid, cx| edit::copy_from_row(grid, above, cx));
+    }
+
+    /// Drops the pending values of the selected cells (Esc). Returns
+    /// whether there was one.
+    pub fn revert_cells(&mut self, cx: &mut Context<Self>) -> bool {
+        self.active_grid()
+            .filter(|grid| grid.read(cx).delegate().pending().is_some())
+            .is_some_and(|grid| edit::revert_cells(&grid, cx))
+    }
+
+    /// Takes the last change back (Cmd+Z). Returns whether there was one.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        self.active_grid()
+            .filter(|grid| grid.read(cx).delegate().pending().is_some())
+            .is_some_and(|grid| edit::undo(&grid, cx))
+    }
+
+    /// Forgets every pending change of the result on screen.
+    pub fn discard(&mut self, cx: &mut Context<Self>) {
+        if let Some(grid) = self.active_grid() {
+            edit::discard(&grid, cx);
+        }
+        if let Some(pane) = self.results.get_mut(self.active_result) {
+            pane.apply_error = None;
+        }
+        cx.notify();
+    }
+
+    /// Forgets the pending changes of every result: the session they were
+    /// to be applied on is ending.
+    pub fn discard_results(&mut self, cx: &mut Context<Self>) {
+        for grid in self.results.iter().filter_map(ResultPane::grid) {
+            if grid
+                .read(cx)
+                .delegate()
+                .pending()
+                .is_some_and(|p| !p.is_empty())
+            {
+                edit::discard(&grid, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Runs an entry of a grid menu that changes the rows of pane `id`.
+    fn edit_result(
+        &mut self,
+        action: GridAction,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            GridAction::Paste => {
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    self.on_result_rows(window, cx, |grid, cx| edit::paste(grid, &text, cx));
+                }
+            }
+            GridAction::EditCell => {
+                if let Some(grid) = self.active_grid() {
+                    edit::edit_cell(&grid, row, column, window, cx);
+                }
+            }
+            // Cells of NOT NULL columns are left alone, as with Delete.
+            GridAction::SetNull => self.on_result_rows(window, cx, |grid, cx| {
+                edit::set_cells(grid, CellValue::Null, true, cx)
+            }),
+            GridAction::SetDefault => self.set_selected(CellValue::Default, window, cx),
+            GridAction::CopyFromRow(above) => self.copy_from_row(above, window, cx),
+            GridAction::DuplicateRow => self.duplicate_rows(Some(row), window, cx),
+            GridAction::DeleteRow => self.delete_rows(Some(row), window, cx),
+            GridAction::RevertRow => {
+                self.on_result_rows(window, cx, |grid, cx| edit::revert_row(grid, row, cx))
+            }
+            GridAction::AddRow => self.add_row(window, cx),
+            GridAction::Generate(kind) => self.generate_from_result(kind, row, window, cx),
+            _ => {}
+        }
+    }
+
+    /// Writes `kind` statements for the selected rows (or `row`) of the
+    /// result on screen into a new query tab: nothing runs.
+    fn generate_from_result(
+        &mut self,
+        kind: RowSql,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, grid)) = self.editing_grid(window, cx) else {
+            return;
+        };
+        let shown = edit::selection(&grid, cx).map_or_else(|| vec![row], |(rows, _)| rows);
+        let grid = grid.read(cx).delegate();
+        let rows: Vec<usize> = shown
+            .into_iter()
+            .map(|row| grid.source_row(row))
+            .filter(|&row| row < grid.row_count())
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let title = grid
+            .table()
+            .map(|table| table.name.clone())
+            .unwrap_or_default();
+        match grid.rows_sql(kind, &rows) {
+            Ok(sql) => cx.emit(QueryTabEvent::OpenQuery { title, sql }),
+            Err(error) => window.push_notification(
+                Notification::error(SharedString::from(format!(
+                    "The {} could not be written: {error}",
+                    kind.label()
+                ))),
+                cx,
+            ),
+        }
+    }
+
+    /// Shows the statements of the pending changes of the result on screen
+    /// and, once confirmed, applies them.
+    pub fn review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, grid)) = self.editing_grid(window, cx) else {
+            return;
+        };
+        // What is being typed counts.
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().commit_edit(cx);
+            cx.notify();
+        });
+        let (changes, statements) = match grid.read(cx).delegate().pending_sql() {
+            Ok(written) => written,
+            Err(error) => {
+                if let Some(pane) = self.pane_mut(id) {
+                    pane.apply_error = Some(error.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if statements.is_empty() {
+            return;
+        }
+        let saved = self
+            .target
+            .as_ref()
+            .and_then(|target| self.connections.read(cx).get(&target.connection));
+        let environment = saved.map_or(Environment::Local, |saved| saved.config.environment);
+        let connection = saved
+            .map(|saved| saved.config.name.clone())
+            .unwrap_or_default();
+        let count = grid.read(cx).delegate().pending().map_or(0, |p| p.count());
+        let table = grid
+            .read(cx)
+            .delegate()
+            .table()
+            .map(|table| table.name.clone())
+            .unwrap_or_default();
+        let in_transaction = self.manual_commit || self.tx_state() != TxState::Idle;
+        let view = cx.entity();
+        let run = statements.clone();
+        sql_confirm::open(
+            Confirmation {
+                title: format!(
+                    "Apply {count} {} to {table}",
+                    if count == 1 { "change" } else { "changes" }
+                ),
+                explanation: if in_transaction {
+                    "These statements join the transaction open in this tab, all of them or none:                      nothing is committed until you commit it."
+                } else {
+                    "These statements run in one transaction: all of them take effect, or none                      does."
+                }
+                .into(),
+                statement: ConfirmStatement::Fixed(
+                    statements
+                        .iter()
+                        .map(|statement| format!("{statement};"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                action: "Apply",
+                destructive: changes
+                    .iter()
+                    .any(|change| matches!(change, RowChange::Delete { .. })),
+                connection,
+                environment,
+            },
+            window,
+            cx,
+            move |_, window, cx| {
+                view.update(cx, |this, cx| this.apply(id, run.clone(), window, cx));
+            },
+        );
+    }
+
+    /// Runs the reviewed statements of pane `id` on the tab's session, all
+    /// of them or none: in a transaction of their own in auto-commit, in
+    /// the tab's transaction (under a savepoint, nothing committed) in
+    /// manual commit or while one is open. The rows are then read again.
+    fn apply(
+        &mut self,
+        id: u64,
+        statements: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running() || self.side.is_some() {
+            window.push_notification(
+                Notification::warning("Wait for the running statement to end."),
+                cx,
+            );
+            return;
+        }
+        // Never on another server or database than the rows were read on.
+        if self.moved_away(id) {
+            window.push_notification(Notification::warning(MOVED_AWAY), cx);
+            return;
+        }
+        let manual = self.manual_commit;
+        if self.receiving.is_some() {
+            // The statement being paged holds the session; stopping it
+            // cancels it, which would end a transaction on PostgreSQL.
+            if manual || self.tx_state() != TxState::Idle {
+                window.push_notification(
+                    Notification::warning(
+                        "Fetch all rows of the result first: its statement holds the session \
+                         of this tab's open transaction.",
+                    ),
+                    cx,
+                );
+                return;
+            }
+            self.stop(cx);
+        }
+        let opening = self.session(cx);
+        let rules = self.lex_rules(cx);
+        let started = Instant::now();
+        let started_at_ms = kerno_core::storage::now_ms();
+        self.cancel_requested = false;
+        self.activity = Activity::Running {
+            index: 0,
+            total: 1,
+            since: started,
+        };
+        self.run = Some(cx.spawn_in(window, async move |this, cx| {
+            let applied = match opening.await {
+                Err(error) => Err(error.to_string()),
+                Ok(session) => {
+                    let applying = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let began = manual && session.tx_state() == TxState::Idle;
+                            if began {
+                                let begin = if session.dialect().has_schemas() {
+                                    "BEGIN"
+                                } else {
+                                    "START TRANSACTION"
+                                };
+                                exec::collect(session.clone(), begin)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            let ran = if session.tx_state() == TxState::Idle {
+                                apply_edits(&session, &statements).await
+                            } else {
+                                apply_edits_in_transaction(&session, &statements).await
+                            };
+                            ran.map(|()| (statements, began))
+                                .map_err(|failure| failure.to_string())
+                        })
+                    });
+                    let Ok(applying) = applying else {
+                        return;
+                    };
+                    applying.await
+                }
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.run = None;
+                this.activity = Activity::Idle;
+                let Some(pane) = this.pane_mut(id) else {
+                    return;
+                };
+                match applied {
+                    Ok((statements, began)) => {
+                        let count = pane.grid().map_or(0, |grid| {
+                            grid.read(cx).delegate().pending().map_or(0, |p| p.count())
+                        });
+                        pane.apply_error = None;
+                        if let Some(grid) = pane.grid() {
+                            edit::discard(&grid, cx);
+                        }
+                        let requery = pane.requery.clone().unwrap_or_default();
+                        // The statements join the transaction's log, which a
+                        // transaction begun here starts empty.
+                        if began {
+                            this.tx_log.clear();
+                        }
+                        if this.tx_state() != TxState::Idle {
+                            let elapsed = started.elapsed();
+                            for statement in &statements {
+                                this.tx_log.push(TxLogEntry::new(
+                                    statement,
+                                    rules,
+                                    started_at_ms,
+                                    elapsed,
+                                    Some(1),
+                                    HistoryStatus::Ok,
+                                    None,
+                                ));
+                            }
+                        }
+                        window.push_notification(
+                            Notification::success(SharedString::from(format!(
+                                "{count} {} applied.",
+                                if count == 1 { "change" } else { "changes" }
+                            ))),
+                            cx,
+                        );
+                        // What the server now holds, read as before.
+                        this.read_again(id, requery.filter, requery.sort, window, cx);
+                    }
+                    // Nothing was written; the changes are still there.
+                    Err(failure) => {
+                        pane.apply_error = Some(format!(
+                            "Nothing was changed: {failure}. The pending changes are kept."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Why the last apply of the result on screen changed nothing; for
+    /// tests.
+    #[cfg(test)]
+    pub fn result_apply_error(&self) -> Option<String> {
+        self.results.get(self.active_result)?.apply_error.clone()
     }
 
     /// Copies the selection of the result on screen (`None`: its column
@@ -2881,6 +3571,18 @@ impl QueryTab {
         let Some(index) = self.pane_index(id) else {
             return;
         };
+        // Closing a result with changes waiting would lose them.
+        let closes = matches!(
+            action,
+            TabAction::Close
+                | TabAction::CloseOthers
+                | TabAction::CloseToLeft
+                | TabAction::CloseToRight
+                | TabAction::CloseAll
+        );
+        if closes && !self.free_to_run(window, cx) {
+            return;
+        }
         // The bulk closes leave pinned results alone.
         let unpinned = |panes: &[ResultPane]| -> Vec<u64> {
             panes
@@ -3209,6 +3911,9 @@ impl QueryTab {
                 Notification::warning("Wait for the running statement to end."),
                 cx,
             );
+            return;
+        }
+        if !self.free_to_run(window, cx) {
             return;
         }
         let (Some(requery), Some(meta)) = (
@@ -3811,6 +4516,10 @@ impl QueryTab {
             self.stop_auto_refresh(Some("another result is on screen"), cx);
             return false;
         }
+        if self.pending_count(cx) > 0 {
+            self.stop_auto_refresh(Some("changes are pending"), cx);
+            return false;
+        }
         // Never two runs at once: the next tick tries again.
         if !self.running() && self.side.is_none() && self.pending.is_none() {
             let (id, requery) = (pane.id, pane.requery.clone().unwrap_or_default());
@@ -3887,8 +4596,7 @@ impl QueryTab {
         window.defer(cx, move |window, cx| focus.focus(window, cx));
     }
 
-    /// Whether the results area has the keyboard; for tests.
-    #[cfg(test)]
+    /// Whether the results area has the keyboard.
     pub fn results_focused(&self, window: &Window, cx: &App) -> bool {
         self.results_focus.contains_focused(window, cx)
     }
@@ -4487,6 +5195,130 @@ impl QueryTab {
             }))
     }
 
+    /// What a result whose rows take changes adds above them: the table
+    /// they are written to, the row commands, and the pending changes with
+    /// Discard, Review SQL and Apply (as a table's data toolbar).
+    fn render_edit_bar(
+        &self,
+        pane: &ResultPane,
+        grid: &Entity<TableState<Grid>>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, warning, danger, border) = (
+            theme.muted_foreground,
+            theme.warning,
+            theme.danger,
+            theme.border,
+        );
+        let state = grid.read(cx);
+        let delegate = state.delegate();
+        let pending = delegate.pending().map_or(0, |pending| pending.count());
+        let table = delegate
+            .table()
+            .map(|table| format!("{}.{}", table.schema, table.name))
+            .unwrap_or_default();
+        let selected = delegate.selected(state.selection()).is_some();
+        let busy = self.running();
+        let action = |id: &'static str, label: &'static str, tip: &'static str| {
+            Button::new(id).ghost().xsmall().label(label).tooltip(tip)
+        };
+        v_flex()
+            .flex_none()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .id("result-edit-bar")
+                    .test_support()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .px_1()
+                            .text_color(muted)
+                            .child(SharedString::from(format!("Rows of {table}"))),
+                    )
+                    .child(
+                        action("result-add-row", "Add row", "Add an empty row")
+                            .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
+                    )
+                    .child(
+                        action(
+                            "result-delete",
+                            "Delete",
+                            "Mark the selected rows for deletion",
+                        )
+                        .disabled(!selected)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.delete_rows(None, window, cx)),
+                        ),
+                    )
+                    .child(
+                        action(
+                            "result-set-null",
+                            "Set NULL",
+                            "Set the selected cells to NULL",
+                        )
+                        .disabled(!selected)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_selected(CellValue::Null, window, cx)
+                        })),
+                    )
+                    .child(div().flex_1())
+                    .when(pending > 0, |bar| {
+                        bar.child(
+                            div()
+                                .id("result-pending")
+                                .test_support()
+                                .px_1()
+                                .text_color(warning)
+                                .child(SharedString::from(format!(
+                                    "{pending} pending {}",
+                                    if pending == 1 { "change" } else { "changes" }
+                                ))),
+                        )
+                        .child(
+                            action("result-discard", "Discard", "Forget the pending changes")
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.discard(cx))),
+                        )
+                        .child(
+                            action(
+                                "result-review",
+                                "Review SQL",
+                                "Show the statements of the pending changes",
+                            )
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
+                        )
+                        .child(
+                            Button::new("result-apply")
+                                .primary()
+                                .xsmall()
+                                .label("Apply")
+                                .tooltip("Review the SQL, then apply it")
+                                .disabled(busy)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.review(window, cx)),
+                                ),
+                        )
+                    }),
+            )
+            .children(pane.apply_error.clone().map(|error| {
+                div()
+                    .id("result-apply-error")
+                    .test_support()
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .text_color(danger)
+                    .child(SharedString::from(error))
+            }))
+    }
+
     fn render_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (border, muted, warning, mono) = {
             let theme = cx.theme();
@@ -4523,9 +5355,11 @@ impl QueryTab {
                     // A middle click closes the result, as in a browser.
                     .on_mouse_down(
                         MouseButton::Middle,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.close_results(&[id], cx)
+                            if this.free_to_run(window, cx) {
+                                this.close_results(&[id], cx)
+                            }
                         }),
                     )
                     .child(
@@ -4645,11 +5479,20 @@ impl QueryTab {
         let exportable = self.exportable(pane, cx);
         let filter_bar = requery
             .as_ref()
-            .map(|requery| self.render_result_filter(requery, cx));
+            .map(|requery| self.render_result_filter(requery, cx).into_any_element());
+        let edit_bar = grid
+            .as_ref()
+            .filter(|_| matches!(pane.editable, Some(Ok(()))))
+            .map(|grid| self.render_edit_bar(pane, grid, cx).into_any_element());
+        let read_only = match &pane.editable {
+            Some(Err(why)) => Some(SharedString::from(why.to_string())),
+            _ => None,
+        };
         v_flex()
             .size_full()
             .child(tabs)
             .children(filter_bar)
+            .children(edit_bar)
             .child(div().flex_1().min_h_0().child(self.render_pane(pane, cx)))
             .child(
                 h_flex()
@@ -4751,6 +5594,16 @@ impl QueryTab {
                                 })),
                         )
                     })
+                    // Why its rows take no change.
+                    .children(read_only.map(|why| {
+                        div()
+                            .id("result-read-only")
+                            .test_support()
+                            .min_w_0()
+                            .truncate()
+                            .child(why.clone())
+                            .tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))
+                    }))
                     // Which statement this is the result of.
                     .child(
                         div()
@@ -4934,23 +5787,37 @@ impl Render for QueryTab {
             .test_support()
             .track_focus(&self.results_focus)
             .size_full()
-            // With the grid focused: copy what is selected, select everything.
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            // With the grid focused: copy what is selected, select everything;
+            // in rows that take changes, the keys of a table's data.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
-                if !keystroke.modifiers.secondary(cx) || keystroke.modifiers.shift {
-                    return;
-                }
+                let secondary = keystroke.modifiers.secondary(cx) && !keystroke.modifiers.shift;
                 match keystroke.key.as_str() {
-                    "c" => {
+                    "c" if secondary => {
                         if this.copy_selection(Some(CopyFormat::Tsv), cx) {
                             cx.stop_propagation();
                         }
                     }
-                    "a" => {
+                    "a" if secondary => {
                         this.select_all_rows(cx);
                         cx.stop_propagation();
                     }
-                    _ => {}
+                    _ => {
+                        let Some(grid) = this.active_grid() else {
+                            return;
+                        };
+                        let edits = this.result_edits();
+                        if edits.is_err() || !grid.read(cx).focus_handle(cx).is_focused(window) {
+                            return;
+                        }
+                        if edit::on_key(&grid, keystroke, edits, window, cx) {
+                            if let Some(pane) = this.results.get_mut(this.active_result) {
+                                pane.apply_error = None;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }
                 }
             }))
             .child(self.render_results(cx));

@@ -344,3 +344,196 @@ async fn a_failed_apply_changes_nothing() {
 
     exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
 }
+
+/// What the result of `sql` is, editable or why not, as a query tab decides
+/// it: from the statement, the origins of its columns, the table.
+async fn verdict(
+    session: &Arc<dyn Session>,
+    sql: &str,
+) -> Result<Vec<Option<String>>, kerno_core::editable::ReadOnly> {
+    use kerno_core::editable;
+    let collected = run(session, sql).await.unwrap();
+    let columns = collected.results[0].columns.clone();
+    let source = editable::check(sql, session.dialect().lex_rules(), &columns)?;
+    let (editable, _) = editable::lookup(session, &columns, &source).await?;
+    Ok(editable.columns)
+}
+
+#[tokio::test]
+async fn results_say_which_table_columns_they_show() {
+    use kerno_core::ColumnOrigin;
+    use kerno_core::editable::ReadOnly;
+    use kerno_core::schema::RelationKind;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let oid: u32 = scalar(&session, "SELECT 'shop.customers'::regclass::oid")
+        .await
+        .parse()
+        .unwrap();
+    let origins = |sql: &'static str| {
+        let session = session.clone();
+        async move {
+            run(&session, sql).await.unwrap().results[0]
+                .columns
+                .iter()
+                .map(|column| column.origin.clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    let column = |number| {
+        Some(ColumnOrigin::Oid {
+            table: oid,
+            column: number,
+        })
+    };
+    // Plain columns and aliases keep their table column; an expression
+    // has none.
+    assert_eq!(
+        origins("SELECT id, full_name AS n, id + 1 AS e FROM shop.customers").await,
+        [column(1), column(3), None]
+    );
+    // Through a derived table, as a filtered result is read again.
+    assert_eq!(
+        origins("SELECT * FROM (SELECT id, full_name FROM shop.customers) kerno_q").await,
+        [column(1), column(3)]
+    );
+    // A view's columns are the view's.
+    let view: u32 = scalar(&session, "SELECT 'shop.order_totals'::regclass::oid")
+        .await
+        .parse()
+        .unwrap();
+    assert!(
+        origins("SELECT * FROM shop.order_totals").await.iter().all(
+            |origin| matches!(origin, Some(ColumnOrigin::Oid { table, .. }) if *table == view)
+        )
+    );
+
+    // Editable: one table, its key in the result, aliases written back
+    // under the table's names.
+    assert_eq!(
+        verdict(
+            &session,
+            "SELECT id, full_name AS n, id + 1 AS e FROM shop.customers WHERE id < 5"
+        )
+        .await,
+        Ok(vec![Some("id".into()), Some("full_name".into()), None])
+    );
+    let all = verdict(&session, "SELECT * FROM shop.customers")
+        .await
+        .unwrap();
+    assert!(all.iter().all(Option::is_some) && all[0].as_deref() == Some("id"));
+    // Read-only, and why.
+    let customers = TableRef::new("shop", "customers");
+    for (sql, why) in [
+        (
+            "SELECT c.id, o.id FROM shop.customers c JOIN shop.orders o ON o.customer_id = c.id",
+            ReadOnly::SeveralTables,
+        ),
+        (
+            "SELECT c.id, c.full_name FROM shop.customers c JOIN shop.customers d ON d.id = c.id",
+            ReadOnly::Shape("joins tables"),
+        ),
+        ("SELECT 1 + 1", ReadOnly::NoTableColumn),
+        (
+            "SELECT full_name FROM shop.customers",
+            ReadOnly::KeyMissing {
+                column: "id".into(),
+                table: customers.clone(),
+            },
+        ),
+        (
+            "SELECT * FROM shop.order_totals",
+            ReadOnly::View(TableRef::new("shop", "order_totals"), RelationKind::View),
+        ),
+        (
+            "SELECT * FROM shop.product_sales",
+            ReadOnly::View(
+                TableRef::new("shop", "product_sales"),
+                RelationKind::MaterializedView,
+            ),
+        ),
+    ] {
+        assert_eq!(verdict(&session, sql).await, Err(why), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn edits_join_an_open_transaction_without_ending_it() {
+    use kerno_core::sql::apply_edits_in_transaction;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("edit_in_transaction");
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(
+        &session,
+        &format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, name text)"),
+    )
+    .await;
+    exec_ok(
+        &session,
+        &format!("INSERT INTO {schema}.t VALUES (1, 'one'), (2, 'two')"),
+    )
+    .await;
+    let table = TableRef::new(schema.clone(), "t");
+    let structure = session.table_structure(&table).await.unwrap();
+    let generate = |changes: &[RowChange]| {
+        edit_statements(session.dialect(), &table, &structure.columns, changes).unwrap()
+    };
+    let rename = |id: &str, name: &str| RowChange::Update {
+        key: vec![("id".into(), CellValue::Text(id.into()))],
+        set: vec![("name".into(), CellValue::Text(name.into()))],
+    };
+    let names = || {
+        let session = session.clone();
+        let sql = format!("SELECT string_agg(name, ',' ORDER BY id) FROM {schema}.t");
+        async move { scalar(&session, &sql).await }
+    };
+
+    // Refused outside a transaction.
+    let statements = generate(&[rename("1", "uno")]);
+    assert!(
+        apply_edits_in_transaction(&session, &statements)
+            .await
+            .is_err()
+    );
+
+    exec_ok(&session, "BEGIN").await;
+    exec_ok(
+        &session,
+        &format!("INSERT INTO {schema}.t VALUES (3, 'three')"),
+    )
+    .await;
+    apply_edits_in_transaction(&session, &statements)
+        .await
+        .unwrap();
+    assert_eq!(session.tx_state(), TxState::Open);
+    assert_eq!(names().await, "uno,two,three");
+
+    // A failed apply takes back its own statements only.
+    let failing = generate(&[rename("2", "dos"), rename("404", "none")]);
+    let failure = apply_edits_in_transaction(&session, &failing)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.statement, Some(1));
+    assert_eq!(session.tx_state(), TxState::Open);
+    assert_eq!(names().await, "uno,two,three");
+
+    // The user's rollback undoes the applied edits with the rest.
+    exec_ok(&session, "ROLLBACK").await;
+    assert_eq!(names().await, "one,two");
+
+    // A failed transaction is refused: it must be rolled back first.
+    exec_ok(&session, "BEGIN").await;
+    assert!(run(&session, "SELECT 1 / 0").await.is_err());
+    assert_eq!(session.tx_state(), TxState::Failed);
+    assert!(
+        apply_edits_in_transaction(&session, &statements)
+            .await
+            .is_err()
+    );
+    exec_ok(&session, "ROLLBACK").await;
+    exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
+}

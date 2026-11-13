@@ -207,6 +207,10 @@ impl OpenTab {
                 if tab.file().is_some() && tab.unsaved() {
                     losses.push(Loss::Unsaved);
                 }
+                match tab.pending_count(cx) {
+                    0 => {}
+                    count => losses.push(Loss::Pending(count)),
+                }
                 losses
             }
             OpenTab::Data(tab) => match tab.read(cx).pending_count(cx) {
@@ -283,7 +287,7 @@ impl OpenTab {
         let marked = match self {
             OpenTab::Query(tab) => {
                 let tab = tab.read(cx);
-                tab.file().is_some() && tab.unsaved()
+                tab.file().is_some() && tab.unsaved() || tab.pending_count(cx) > 0
             }
             OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
             OpenTab::Structure(_) | OpenTab::Admin(_) => false,
@@ -923,6 +927,10 @@ impl Workspace {
                 |this, tab, event: &QueryTabEvent, window, cx| match event {
                     QueryTabEvent::SwitchTarget(target) => {
                         this.switch_target(tab.clone(), target.clone(), window, cx)
+                    }
+                    QueryTabEvent::OpenQuery { title, sql } => {
+                        let target = tab.read(cx).target().cloned();
+                        this.open_query(title.clone(), sql, target, window, cx);
                     }
                     QueryTabEvent::SourceApplied => {
                         let tab = tab.read(cx);
@@ -1829,6 +1837,15 @@ impl Workspace {
             tab.update(cx, |tab, cx| tab.review(window, cx));
             return;
         }
+        // The same for the changes of a result, while the results have the
+        // keyboard; the editor's text is saved otherwise.
+        if let Some(tab) = self.active_query_tab().cloned()
+            && tab.read(cx).results_focused(window, cx)
+            && tab.read(cx).pending_count(cx) > 0
+        {
+            tab.update(cx, |tab, cx| tab.review(window, cx));
+            return;
+        }
         let file = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf));
@@ -2245,40 +2262,84 @@ impl Workspace {
         self.on_data_tab(window, cx, |tab, window, cx| tab.refresh(window, cx));
     }
 
+    /// Runs a command on the rows on screen: a table's data, or the result
+    /// of the active query tab (which says why when its rows take no
+    /// change).
+    fn on_rows(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        data: impl FnOnce(&mut DataTab, &mut Window, &mut Context<DataTab>),
+        query: impl FnOnce(&mut QueryTab, &mut Window, &mut Context<QueryTab>),
+    ) {
+        if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| data(tab, window, cx));
+        } else if let Some(tab) = self.active_query_tab().cloned() {
+            tab.update(cx, |tab, cx| query(tab, window, cx));
+        }
+    }
+
     fn add_row(&mut self, _: &AddRow, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| tab.add_row(window, cx));
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.add_row(window, cx),
+            |tab, window, cx| tab.add_row(window, cx),
+        );
     }
 
     fn duplicate_rows(&mut self, _: &DuplicateRows, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.duplicate_rows(None, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.duplicate_rows(None, window, cx),
+            |tab, window, cx| tab.duplicate_rows(None, window, cx),
+        );
     }
 
     fn delete_rows(&mut self, _: &DeleteRows, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.delete_rows(None, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.delete_rows(None, window, cx),
+            |tab, window, cx| tab.delete_rows(None, window, cx),
+        );
     }
 
     fn set_null(&mut self, _: &SetNull, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.set_selected(CellValue::Null, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.set_selected(CellValue::Null, window, cx),
+            |tab, window, cx| tab.set_selected(CellValue::Null, window, cx),
+        );
     }
 
     fn set_default(&mut self, _: &SetDefault, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.set_selected(CellValue::Default, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.set_selected(CellValue::Default, window, cx),
+            |tab, window, cx| tab.set_selected(CellValue::Default, window, cx),
+        );
     }
 
     fn apply_changes(&mut self, _: &ApplyChanges, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, window, cx| tab.review(window, cx));
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.review(window, cx),
+            |tab, window, cx| tab.review(window, cx),
+        );
     }
 
     fn discard_changes(&mut self, _: &DiscardChanges, window: &mut Window, cx: &mut Context<Self>) {
-        self.on_data_tab(window, cx, |tab, _, cx| tab.discard(cx));
+        self.on_rows(
+            window,
+            cx,
+            |tab, _, cx| tab.discard(cx),
+            |tab, _, cx| tab.discard(cx),
+        );
     }
 
     fn copy_from_row_above(
@@ -2287,9 +2348,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.copy_from_row(true, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.copy_from_row(true, window, cx),
+            |tab, window, cx| tab.copy_from_row(true, window, cx),
+        );
     }
 
     fn copy_from_row_below(
@@ -2298,18 +2362,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.on_data_tab(window, cx, |tab, window, cx| {
-            tab.copy_from_row(false, window, cx)
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, window, cx| tab.copy_from_row(false, window, cx),
+            |tab, window, cx| tab.copy_from_row(false, window, cx),
+        );
     }
 
     /// Esc: with nothing to revert, the key goes on (the grid then clears
     /// its selection).
     fn revert_cells(&mut self, _: &actions::RevertCells, _: &mut Window, cx: &mut Context<Self>) {
-        let reverted = self
-            .active_data_tab()
-            .cloned()
-            .is_some_and(|tab| tab.update(cx, |tab, cx| tab.revert_cells(cx)));
+        let reverted = if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.revert_cells(cx))
+        } else {
+            self.active_query_tab()
+                .cloned()
+                .is_some_and(|tab| tab.update(cx, |tab, cx| tab.revert_cells(cx)))
+        };
         if !reverted {
             cx.propagate();
         }
@@ -2321,9 +2391,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.on_data_tab(window, cx, |tab, _, cx| {
-            tab.undo(cx);
-        });
+        self.on_rows(
+            window,
+            cx,
+            |tab, _, cx| {
+                tab.undo(cx);
+            },
+            |tab, _, cx| {
+                tab.undo(cx);
+            },
+        );
     }
 
     /// Cmd+Shift+C, in a table's data and in a query result.
@@ -3421,6 +3498,8 @@ impl Workspace {
         };
         let discarded: Vec<Entity<DataTab>> =
             tabs.iter().filter_map(OpenTab::data).cloned().collect();
+        let queries: Vec<Entity<QueryTab>> =
+            tabs.iter().filter_map(OpenTab::query).cloned().collect();
         cx.spawn_in(window, async move |this, cx| {
             let mut failures = Vec::new();
             for ending in endings {
@@ -3436,6 +3515,9 @@ impl Workspace {
                 }
                 for tab in &discarded {
                     tab.update(cx, |tab, cx| tab.discard(cx));
+                }
+                for tab in &queries {
+                    tab.update(cx, |tab, cx| tab.discard_results(cx));
                 }
                 then(this, window, cx);
             });

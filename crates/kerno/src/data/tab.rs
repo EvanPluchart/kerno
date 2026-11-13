@@ -26,9 +26,9 @@ use kerno_core::browse::{
 };
 use kerno_core::config::Environment;
 use kerno_core::exec::CollectedResult;
-use kerno_core::pending::{Pending, neighbour};
-use kerno_core::schema::{ColumnGeneration, RelationKind, TableRef, TableStructure};
-use kerno_core::sql::{CellValue, RowChange, RowSql, apply_edits, edit_statements, rows_sql};
+use kerno_core::pending::Pending;
+use kerno_core::schema::{RelationKind, TableRef, TableStructure};
+use kerno_core::sql::{CellValue, RowChange, RowSql, apply_edits};
 use kerno_core::{Error, ResultStore, Session, TxState, exec};
 
 use crate::actions::CloseTab;
@@ -37,10 +37,10 @@ use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::query::distinct;
-use crate::query::grid::{ColumnEdit, CopyFormat, Grid, GridAction, Owner, SortOnServer};
+use crate::query::edit;
+use crate::query::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
-use crate::query::viewer;
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
@@ -751,32 +751,19 @@ impl DataTab {
             Some((column, *descending))
         });
         // A computed column takes no value, nor does an identity the server
-        // always generates.
-        let columns = match self.read_only(cx) {
+        // always generates (`ColumnEdit::of`).
+        let target = match self.read_only(cx) {
             Some(reason) => Err(reason),
-            None => Ok(store
-                .columns()
-                .iter()
-                .map(|column| {
-                    let info = structure
-                        .columns
-                        .iter()
-                        .find(|info| info.name == column.name);
-                    ColumnEdit {
-                        writable: info.is_some_and(|info| {
-                            !matches!(
-                                info.generation,
-                                Some(
-                                    ColumnGeneration::Stored(_)
-                                        | ColumnGeneration::Virtual(_)
-                                        | ColumnGeneration::IdentityAlways
-                                )
-                            )
-                        }),
-                        nullable: info.is_some_and(|info| info.nullable),
-                    }
-                })
-                .collect()),
+            None => Ok(EditTarget {
+                table: self.table.clone(),
+                structure: structure.clone(),
+                identity: structure.row_identity().unwrap_or_default(),
+                names: store
+                    .columns()
+                    .iter()
+                    .map(|column| Some(column.name.clone()))
+                    .collect(),
+            }),
         };
         let view = cx.weak_entity();
         let sort_on_server: Rc<SortOnServer> = Rc::new({
@@ -807,7 +794,7 @@ impl DataTab {
             session,
             self.table.clone(),
             sort,
-            columns,
+            target,
             sort_on_server,
         )
         .with_owner(owner);
@@ -825,7 +812,7 @@ impl DataTab {
             cx.subscribe_in(
                 &table,
                 window,
-                |this, table, event: &TableEvent, window, cx| {
+                |_, table, event: &TableEvent, window, cx| {
                     if matches!(
                         event,
                         TableEvent::SelectCell(..)
@@ -840,16 +827,8 @@ impl DataTab {
                     }
                     // A double click types in the cell, or shows the whole
                     // value of one that cannot be typed in.
-                    // A boolean that takes a value is toggled by the click on
-                    // it already selected, not by a double click.
                     if let TableEvent::DoubleClickedCell(row, column) = event {
-                        let grid = table.read(cx).delegate();
-                        let toggled = grid.value_at(*row, *column).is_some_and(|(column, _)| {
-                            column.kind == kerno_core::TypeKind::Boolean
-                        }) && grid.editable(*row, *column).is_ok();
-                        if !toggled {
-                            this.edit_cell(*row, *column, window, cx);
-                        }
+                        edit::double_click(table, *row, *column, window, cx);
                     }
                 },
             ),
@@ -1269,48 +1248,25 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(table) = self.grid.clone() else {
-            return;
-        };
-        let editing = table.update(cx, |table, cx| {
-            let grid = table.delegate_mut();
-            grid.begin_edit(row, column, window, cx)
-        });
-        if !editing {
-            let grid = table.read(cx).delegate();
-            if let Some((column, value)) = grid.value_at(row, column) {
-                let (column, value) = (column.clone(), value.map(<[u8]>::to_vec));
-                viewer::open(&column, value.as_deref(), window, cx);
-            }
+        if let Some(table) = self.grid.clone() {
+            edit::edit_cell(&table, row, column, window, cx);
         }
     }
 
     /// The rows and columns of the result that are selected.
     fn selection(&self, cx: &App) -> Option<(Vec<usize>, Vec<usize>)> {
-        let table = self.grid.as_ref()?.read(cx);
-        let selected = table.delegate().selected(table.selection())?;
-        Some((selected.rows.collect(), selected.columns))
+        edit::selection(self.grid.as_ref()?, cx)
     }
 
-    /// Changes the pending changes, as one step that undo takes back, and
-    /// redraws.
-    fn change(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Pending, &ResultStore)) {
-        self.edit(cx, |pending, store| {
-            pending.step(|pending| change(pending, store))
-        });
-    }
-
-    /// Changes the pending changes and redraws. What is being typed is kept
-    /// first: a key that changes rows may come while a cell is open.
-    fn edit(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Pending, &ResultStore)) {
-        if let Some(table) = &self.grid {
-            table.update(cx, |table, cx| {
-                let grid = table.delegate_mut();
-                grid.commit_edit(cx);
-                grid.edit(edit);
-                table.refresh(cx);
-                cx.notify();
-            });
+    /// Runs a change of the shared edit layer on the grid, when there is
+    /// one, and redraws: the last apply's error goes.
+    fn on_rows(
+        &mut self,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&Entity<TableState<Grid>>, &mut App),
+    ) {
+        if let Some(table) = self.grid.clone() {
+            act(&table, cx);
         }
         self.apply_error = None;
         cx.notify();
@@ -1319,100 +1275,47 @@ impl DataTab {
     /// Takes the last change back (Cmd+Z). Returns whether there was one.
     pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
         let mut undone = false;
-        self.edit(cx, |pending, _| undone = pending.undo());
+        self.on_rows(cx, |table, cx| undone = edit::undo(table, cx));
         undone
     }
 
     /// Drops the pending values of the selected cells (Esc). Returns
     /// whether there was one, so that Esc otherwise clears the selection.
     pub fn revert_cells(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((rows, columns)) = self.selection(cx) else {
-            return false;
-        };
         let mut reverted = false;
-        self.change(cx, |pending, store| {
-            for &row in &rows {
-                for &column in &columns {
-                    reverted |= pending.revert_cell(store.row_count(), row, column);
-                }
-            }
-        });
+        self.on_rows(cx, |table, cx| reverted = edit::revert_cells(table, cx));
         reverted
     }
 
     /// Gives the selected cells the values of the row above (`above`) or
-    /// below, as DBeaver's Ctrl+D and Ctrl+Alt+D do: a block of rows takes
-    /// its first (last) row's. Columns the server fills are left alone, and
-    /// so is the key of a row that exists.
+    /// below (see [`edit::copy_from_row`]).
     pub fn copy_from_row(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit(window, cx) {
-            return;
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| edit::copy_from_row(table, above, cx));
         }
-        let Some(table) = self.grid.clone() else {
-            return;
-        };
-        let generated = self.generated_columns(cx);
-        let keys: Vec<String> = self
-            .structure
-            .as_ref()
-            .and_then(|structure| structure.row_identity())
-            .unwrap_or_default();
-        let copy = {
-            let table = table.read(cx);
-            let grid = table.delegate();
-            let fetched = grid.row_count();
-            let columns = grid.store().columns();
-            table
-                .delegate()
-                .selected(table.selection())
-                .and_then(|selected| {
-                    let from = neighbour(&selected.rows, above, grid.total_rows())?;
-                    let cells: Vec<(usize, usize)> = selected
-                        .rows
-                        .clone()
-                        .filter(|&row| row != from)
-                        .flat_map(|row| selected.columns.iter().map(move |&column| (row, column)))
-                        .filter(|&(row, column)| {
-                            grid.takes_value(row, column)
-                                && !generated.contains(&column)
-                                && (row >= fetched || !keys.contains(&columns[column].name))
-                        })
-                        .collect();
-                    Some((from, cells))
-                })
-        };
-        if let Some((from, cells)) = copy {
-            self.change(cx, |pending, store| pending.copy_cells(store, from, cells));
+    }
+
+    /// Whether the rows take changes, and why not when they do not.
+    fn edits(&self, cx: &App) -> edit::Allowed {
+        if self.pending(cx).is_some() {
+            return Ok(());
         }
+        Err(self.read_only_reason(cx).map(SharedString::from))
     }
 
     /// Whether the rows take changes; says why not when they do not.
     fn can_edit(&self, window: &mut Window, cx: &mut App) -> bool {
-        if self.pending(cx).is_some() {
-            return true;
+        let edits = self.edits(cx);
+        if let Err(Some(why)) = &edits {
+            window.push_notification(Notification::warning(why.clone()), cx);
         }
-        if let Some(reason) = self.read_only_reason(cx) {
-            window.push_notification(Notification::warning(SharedString::from(reason)), cx);
-        }
-        false
+        edits.is_ok()
     }
 
     /// Adds an empty row at the end and shows it.
     pub fn add_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit(window, cx) {
-            return;
-        }
-        let mut added = None;
-        self.change(cx, |pending, store| added = Some(pending.add_row(store)));
-        self.show_row(added, cx);
-    }
-
-    fn show_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
-        if let (Some(row), Some(table)) = (row, &self.grid) {
-            table.update(cx, |table, cx| {
-                table.set_selected_row(row, cx);
-                table.scroll_to_row(row, cx);
-            });
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, edit::add_row);
         }
     }
 
@@ -1423,139 +1326,48 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_edit(window, cx) {
-            return;
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| edit::duplicate_rows(table, row, cx));
         }
-        let Some(rows) = row
-            .map(|row| vec![row])
-            .or_else(|| Some(self.selection(cx)?.0))
-        else {
-            return;
-        };
-        // Keys the server generates are left to it: a copy would collide.
-        let generated = self.generated_columns(cx);
-        let mut last = None;
-        self.change(cx, |pending, store| {
-            for row in rows {
-                last = pending.duplicate(store, row, &generated).or(last);
-            }
-        });
-        self.show_row(last, cx);
-    }
-
-    /// The columns of the result whose values the server makes: computed
-    /// columns, identities, auto-increments.
-    fn generated_columns(&self, cx: &App) -> Vec<usize> {
-        let (Some(table), Some(structure)) = (&self.grid, &self.structure) else {
-            return Vec::new();
-        };
-        table
-            .read(cx)
-            .delegate()
-            .store()
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| {
-                structure
-                    .columns
-                    .iter()
-                    .any(|info| info.name == column.name && info.generation.is_some())
-            })
-            .map(|(index, _)| index)
-            .collect()
     }
 
     /// Marks the selected rows (or `row`) for deletion.
     pub fn delete_rows(&mut self, row: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit(window, cx) {
-            return;
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| edit::delete_rows(table, row, cx));
         }
-        let Some(rows) = row
-            .map(|row| vec![row])
-            .or_else(|| Some(self.selection(cx)?.0))
-        else {
-            return;
-        };
-        self.change(cx, |pending, store| pending.delete(store.row_count(), rows));
     }
 
     /// Takes a row back to what was fetched.
     pub fn revert_row(&mut self, row: usize, cx: &mut Context<Self>) {
-        self.change(cx, |pending, _| pending.revert(row));
+        self.on_rows(cx, |table, cx| edit::revert_row(table, row, cx));
     }
 
     /// Gives every selected cell `value` (`NULL` or the column's default).
     pub fn set_selected(&mut self, value: CellValue, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_cells(value, false, window, cx);
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| edit::set_cells(table, value, false, cx));
+        }
     }
 
     /// Sets the selected cells that take NULL to NULL (Delete, Backspace).
     pub fn clear_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_cells(CellValue::Null, true, window, cx);
-    }
-
-    /// Gives the selected cells `value`; with `nullable_only`, not those
-    /// of a NOT NULL column.
-    fn set_cells(
-        &mut self,
-        value: CellValue,
-        nullable_only: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.can_edit(window, cx) {
-            return;
+        if self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| {
+                edit::set_cells(table, CellValue::Null, true, cx)
+            });
         }
-        let Some((rows, columns)) = self.selection(cx) else {
-            return;
-        };
-        let Some(table) = self.grid.clone() else {
-            return;
-        };
-        // Cells that take no value are left alone.
-        let cells: Vec<(usize, usize)> = {
-            let table = table.read(cx);
-            let grid = table.delegate();
-            rows.iter()
-                .flat_map(|&row| columns.iter().map(move |&column| (row, column)))
-                .filter(|&(row, column)| {
-                    grid.takes_value(row, column) && (!nullable_only || grid.nullable(column))
-                })
-                .collect()
-        };
-        self.change(cx, |pending, store| {
-            for (row, column) in cells {
-                pending.set(store, row, column, value.clone());
-            }
-        });
     }
 
     /// Puts the text of the clipboard in the selected cells: one value in
-    /// each, or a block of tab-separated cells from the first one. Each
-    /// pasted cell is a pending change, as a typed one is.
+    /// each, or a block of tab-separated cells from the first one.
     pub fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if text.is_empty() || !self.can_edit(window, cx) {
-            return;
+        if !text.is_empty() && self.can_edit(window, cx) {
+            self.on_rows(cx, |table, cx| edit::paste(table, &text, cx));
         }
-        let Some(table) = self.grid.clone() else {
-            return;
-        };
-        let cells = {
-            let table = table.read(cx);
-            let Some(selected) = table.delegate().selected(table.selection()) else {
-                return;
-            };
-            table.delegate().pasted(&selected, &text)
-        };
-        self.change(cx, |pending, store| {
-            for (row, column, value) in cells {
-                pending.set(store, row, column, value);
-            }
-        });
     }
 
     /// A condition on the column of a cell of the grid, with the cell's
@@ -1682,9 +1494,7 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(table), Some(structure), Some(session)) =
-            (&self.grid, &self.structure, &self.session)
-        else {
+        let Some(table) = &self.grid else {
             return;
         };
         let shown = self
@@ -1699,16 +1509,7 @@ impl DataTab {
         if rows.is_empty() {
             return;
         }
-        let identity = structure.row_identity().unwrap_or_default();
-        let written = rows_sql(
-            kind,
-            session.dialect(),
-            &self.table,
-            &structure.columns,
-            &identity,
-            grid.store(),
-            &rows,
-        );
+        let written = grid.rows_sql(kind, &rows);
         match written {
             Ok(sql) => cx.emit(DataTabEvent::OpenQuery {
                 title: self.table.name.clone(),
@@ -1764,25 +1565,15 @@ impl DataTab {
 
     /// Forgets every pending change.
     pub fn discard(&mut self, cx: &mut Context<Self>) {
-        self.change(cx, |pending, _| pending.clear());
+        self.on_rows(cx, edit::discard);
     }
 
     /// The statements the pending changes become; for the review and tests.
     pub fn pending_sql(&self, cx: &App) -> kerno_core::Result<(Vec<RowChange>, Vec<String>)> {
-        let (Some(table), Some(structure), Some(session)) =
-            (&self.grid, &self.structure, &self.session)
-        else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let grid = table.read(cx).delegate();
-        let Some(pending) = grid.pending() else {
-            return Ok((Vec::new(), Vec::new()));
-        };
-        let identity = structure.row_identity().unwrap_or_default();
-        let changes = pending.changes(grid.store(), &identity)?;
-        let statements =
-            edit_statements(session.dialect(), &self.table, &structure.columns, &changes)?;
-        Ok((changes, statements))
+        match &self.grid {
+            Some(table) => table.read(cx).delegate().pending_sql(),
+            None => Ok((Vec::new(), Vec::new())),
+        }
     }
 
     /// Shows the statements of the pending changes and, once confirmed,
@@ -2726,36 +2517,13 @@ impl Render for DataTab {
                         });
                         cx.stop_propagation();
                     }
-                    "v" if secondary => {
-                        this.paste(window, cx);
-                        cx.stop_propagation();
-                    }
-                    "delete" | "backspace" if !keystroke.modifiers.modified() => {
-                        this.clear_selected(window, cx);
-                        cx.stop_propagation();
-                    }
-                    "enter" | "f2" => {
-                        if let Some((row, column)) = table.read(cx).selected_cell() {
-                            this.edit_cell(row, column, window, cx);
+                    _ => {
+                        let edits = this.edits(cx);
+                        if edit::on_key(&table, keystroke, edits, window, cx) {
+                            this.apply_error = None;
                             cx.stop_propagation();
                         }
                     }
-                    // Space toggles a boolean, as a click on DBeaver's
-                    // checkbox does.
-                    "space" if !keystroke.modifiers.modified() => {
-                        let boolean = table.read(cx).selected_cell().and_then(|(row, column)| {
-                            let grid = table.read(cx).delegate();
-                            let (described, _) = grid.value_at(row, column)?;
-                            (described.kind == kerno_core::TypeKind::Boolean
-                                && grid.editable(row, column).is_ok())
-                            .then_some((row, column))
-                        });
-                        if let Some((row, column)) = boolean {
-                            this.edit_cell(row, column, window, cx);
-                            cx.stop_propagation();
-                        }
-                    }
-                    _ => {}
                 }
             }))
             .child(self.render_toolbar(cx))

@@ -18,7 +18,9 @@ use kerno_core::schema::{
     TableStructure,
 };
 use kerno_core::sql::{Catalog, TokenKind, lex};
-use kerno_core::{AdminView, Column, Engine, Error, Result, Session, TxState, TypeKind};
+use kerno_core::{
+    AdminView, Column, ColumnOrigin, Engine, Error, Result, Session, TxState, TypeKind,
+};
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 
@@ -127,7 +129,15 @@ impl PgSession {
                     statement
                         .columns()
                         .iter()
-                        .map(|column| types::describe(column.type_()))
+                        .map(|column| {
+                            let (name, kind) = types::describe(column.type_());
+                            // The table column it shows, when it shows one.
+                            let origin = column
+                                .table_oid()
+                                .zip(column.column_id())
+                                .map(|(table, column)| ColumnOrigin::Oid { table, column });
+                            (name, kind, origin)
+                        })
                         .collect::<Vec<_>>(),
                 );
             }
@@ -159,7 +169,8 @@ impl PgSession {
                             .iter()
                             .enumerate()
                             .map(|(index, name)| match &types {
-                                Some(types) => Column::new(name.name(), &types[index].0, types[index].1),
+                                Some(types) => Column::new(name.name(), &types[index].0, types[index].1)
+                                    .with_origin(types[index].2.clone()),
                                 None => Column::new(name.name(), "", TypeKind::Other),
                             })
                             .collect();

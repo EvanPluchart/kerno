@@ -9303,7 +9303,9 @@ fn settle(
     role: &str,
     expected: (usize, usize),
 ) -> (usize, usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Long enough for a close queued behind other tests' work on the shared
+    // runtime; the wait ends as soon as the count is the expected one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         cx.run_until_parked();
         let held = held_by(engine, role);
@@ -11708,12 +11710,16 @@ fn a_row_menu_generates_sql_and_a_query_result_says_why_it_cannot(cx: &mut TestA
         app.active_query(cx).1,
         "UPDATE \"kerno_ui_g7_menu\".\"t\" SET \"name\" = 'seven' WHERE \"id\" = 7;\n"
     );
-    // A query result's rows are no table's: each entry says so.
+    // A read-only query result's rows are no table's: each entry says why
+    // (G8: a result of one table with its key generates as table data).
     app.run_in_new_tab(cx, "select 1 as one", "secondary-enter");
     app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["1 rows"]);
     app.right_click(cx, "table-cell-0:1", None);
     click_menu_entry(&app, cx, "Generate SQL");
-    for label in ["SELECT by key (query result)", "INSERT (query result)"] {
+    for label in [
+        "SELECT by key (no column of a table)",
+        "INSERT (no column of a table)",
+    ] {
         assert!(menu_entry(&app, cx, label).is_some(), "{label}");
     }
 }
@@ -14238,4 +14244,414 @@ fn auto_refresh_reads_again_until_a_change_or_another_tab(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(cx.update(|cx| tab.read(cx).auto_refresh()), None);
     assert!(app.has(cx, "result-auto-refresh-stopped"));
+}
+
+// G8 (RES-51): the result of a query edited as rows of its table ---------------
+
+impl Fixture {
+    /// The grid of result `index` of the active query tab.
+    fn result_grid(&self, cx: &mut TestAppContext, index: usize) -> Entity<TableState<Grid>> {
+        let tab = self.tab(cx);
+        cx.update(|cx| tab.read(cx).grid_of(index)).expect("a grid")
+    }
+
+    /// Waits until the active tab's first result is decided: editable, or
+    /// read-only with the reason it says.
+    fn result_verdict(&self, cx: &mut TestAppContext) -> Option<String> {
+        self.wait_until(cx, "the result's table", |app, cx| {
+            let tab = app.tab(cx);
+            cx.update(|cx| {
+                let tab = tab.read(cx);
+                tab.result_read_only().is_some()
+                    || tab
+                        .grid_of(0)
+                        .is_some_and(|grid| grid.read(cx).delegate().pending().is_some())
+            })
+        });
+        let tab = self.tab(cx);
+        cx.update(|cx| tab.read(cx).result_read_only())
+    }
+
+    /// Rows of the first result with changes waiting.
+    fn result_pending(&self, cx: &mut TestAppContext) -> usize {
+        let tab = self.tab(cx);
+        cx.update(|cx| tab.read(cx).pending_count(cx))
+    }
+
+    /// What the first result draws; nothing while it is read again.
+    fn result_rows(&self, cx: &mut TestAppContext) -> Vec<Vec<String>> {
+        let tab = self.tab(cx);
+        cx.update(|cx| {
+            let grid = tab.read(cx).grid_of(0);
+            grid.map_or_else(Vec::new, |grid| grid.read(cx).delegate().shown())
+        })
+    }
+
+    /// Types `text` in a cell of the first result, in place of what it
+    /// holds, and presses Enter.
+    fn type_in_result(&self, cx: &mut TestAppContext, row: usize, column: usize, text: &str) {
+        let grid = self.result_grid(cx, 0);
+        self.step(cx, |window, cx| {
+            crate::query::edit::edit_cell(&grid, row, column, window, cx)
+        });
+        self.press(cx, &["secondary-a", "backspace"]);
+        self.type_text(cx, text);
+        self.press(cx, &["enter"]);
+    }
+}
+
+/// A scratch table `t` (id, name, qty) of four rows in `schema`.
+fn g8_table(engine: Engine, schema: &str) -> Scratch {
+    let (drop_schema, create_schema) = scratch_schema(engine, schema);
+    Scratch::new(
+        engine,
+        &[&drop_schema],
+        &[
+            &create_schema,
+            &format!("CREATE TABLE {schema}.t (id INT PRIMARY KEY, name VARCHAR(50), qty INT)"),
+            &format!(
+                "INSERT INTO {schema}.t VALUES (1, 'one', 1), (2, 'two', 2), (3, 'three', 3), \
+                 (9, 'nine', 9)"
+            ),
+        ],
+    )
+}
+
+/// The rows of `schema.t` on the server, `id|name|qty` by id.
+fn g8_rows(engine: Engine, schema: &str) -> String {
+    let concat = match engine {
+        Engine::Postgres => format!(
+            "SELECT string_agg(id || '|' || coalesce(name, 'NULL') || '|' || \
+             coalesce(qty::text, 'NULL'), ',' ORDER BY id) FROM {schema}.t"
+        ),
+        Engine::MySql | Engine::MariaDb => format!(
+            "SELECT GROUP_CONCAT(CONCAT(id, '|', COALESCE(name, 'NULL'), '|', \
+             COALESCE(qty, 'NULL')) ORDER BY id SEPARATOR ',') FROM {schema}.t"
+        ),
+    };
+    on_server(engine, &concat)
+}
+
+#[gpui_kit::test]
+fn a_select_result_of_one_table_is_edited_reviewed_and_applied(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_g8_edit";
+        let _scratch = g8_table(engine, schema);
+        let app = connected(cx, engine);
+        // An alias is written back under the table's name; an expression
+        // is shown, not written.
+        app.run_in_new_tab(
+            cx,
+            &format!(
+                "select id, name as n, qty * 2 as twice from {schema}.t where id < 5 order by id"
+            ),
+            "secondary-enter",
+        );
+        app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["3 rows"]);
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        assert!(app.has(cx, "result-edit-bar") && !app.has(cx, "result-read-only"));
+        let grid = app.result_grid(cx, 0);
+        let (expression, key) = cx.update(|cx| {
+            let grid = grid.read(cx).delegate();
+            (grid.editable(0, 3), grid.editable(0, 1))
+        });
+        assert!(expression.is_err() && key.is_ok(), "{engine:?}");
+
+        // A typed value, a NULL set with Delete, a deleted row, a new row.
+        app.type_in_result(cx, 0, 2, "uno");
+        select_cell(&app, cx, &grid, (1, 2));
+        app.press(cx, &["delete"]);
+        app.step(cx, |_, cx| {
+            grid.update(cx, |table, cx| table.set_selected_row(2, cx))
+        });
+        app.click(cx, "result-delete");
+        app.click(cx, "result-add-row");
+        app.type_in_result(cx, 3, 1, "4");
+        app.type_in_result(cx, 3, 2, "four");
+        assert_eq!(app.result_pending(cx), 4, "{engine:?}");
+        assert!(app.has(cx, "result-pending"));
+        // Nothing is written yet; another run would drop the changes, so it
+        // waits for them.
+        assert_eq!(
+            g8_rows(engine, schema),
+            "1|one|1,2|two|2,3|three|3,9|nine|9"
+        );
+        app.press(cx, &["secondary-enter"]);
+        assert_eq!(app.result_pending(cx), 4, "{engine:?}");
+
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied changes", |app, cx| {
+            app.result_pending(cx) == 0
+                && app.outcomes(cx) == ["3 rows"]
+                && app
+                    .result_rows(cx)
+                    .first()
+                    .is_some_and(|row| row[1] == "uno")
+        });
+        // One transaction of its own (auto-commit): the server has it.
+        assert_eq!(
+            g8_rows(engine, schema),
+            "1|uno|1,2|NULL|2,4|four|NULL,9|nine|9",
+            "{engine:?}"
+        );
+        // The rows on screen are what the server now holds.
+        assert_eq!(
+            app.result_rows(cx),
+            [["1", "uno", "2"], ["2", "NULL", "4"], ["4", "four", "NULL"]],
+            "{engine:?}"
+        );
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+
+        // An apply that fails changes nothing and keeps the changes: the
+        // row was deleted elsewhere since it was read.
+        app.type_in_result(cx, 0, 2, "first");
+        app.type_in_result(cx, 1, 2, "second");
+        on_server(engine, &format!("DELETE FROM {schema}.t WHERE id = 2"));
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the failed apply", |app, cx| {
+            let tab = app.tab(cx);
+            cx.update(|cx| tab.read(cx).result_apply_error()).is_some()
+        });
+        assert_eq!(app.result_pending(cx), 2, "{engine:?}");
+        assert!(app.has(cx, "result-apply-error"));
+        assert_eq!(g8_rows(engine, schema), "1|uno|1,4|four|NULL,9|nine|9");
+        app.click(cx, "result-discard");
+        assert_eq!(app.result_pending(cx), 0);
+    }
+}
+
+#[gpui_kit::test]
+fn a_result_that_is_no_rows_of_one_table_says_why_it_is_read_only(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_g8_read_only";
+        let _scratch = g8_table(engine, schema);
+        on_server(
+            engine,
+            &format!("CREATE TABLE {schema}.u (id INT PRIMARY KEY, t_id INT)"),
+        );
+        on_server(engine, &format!("INSERT INTO {schema}.u VALUES (10, 1)"));
+        let app = connected(cx, engine);
+        for (sql, why) in [
+            (
+                format!("select t.id, u.id from {schema}.t t join {schema}.u u on u.t_id = t.id"),
+                "Read-only result: its columns come from several tables.".to_string(),
+            ),
+            (
+                format!("select name from {schema}.t"),
+                format!(
+                    "Read-only result: the key column `id` of `{schema}.t` is not in the result."
+                ),
+            ),
+            (
+                format!("select distinct id, name from {schema}.t"),
+                "Read-only result: the statement uses DISTINCT.".to_string(),
+            ),
+        ] {
+            app.run_in_new_tab(cx, &sql, "secondary-enter");
+            assert_eq!(app.result_verdict(cx), Some(why), "{engine:?}: {sql}");
+            assert!(app.has(cx, "result-read-only") && !app.has(cx, "result-edit-bar"));
+            // Its keys change nothing.
+            let grid = app.result_grid(cx, 0);
+            select_cell(&app, cx, &grid, (0, 1));
+            app.press(cx, &["delete"]);
+            assert_eq!(app.result_pending(cx), 0, "{engine:?}: {sql}");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_manual_commit_tab_applies_result_edits_inside_its_transaction(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_g8_manual";
+        let _scratch = g8_table(engine, schema);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+        app.type_text(cx, &format!("select id, name from {schema}.t order by id"));
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["4 rows"]);
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        app.type_in_result(cx, 0, 2, "uno");
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied changes", |app, cx| {
+            app.result_pending(cx) == 0
+                && app.outcomes(cx) == ["4 rows"]
+                && app
+                    .result_rows(cx)
+                    .first()
+                    .is_some_and(|row| row[1] == "uno")
+        });
+        // Inside the tab's transaction: nothing is committed, and the log
+        // of the transaction holds the statement.
+        assert_eq!(
+            cx.update(|cx| tab.read(cx).tx_state()),
+            kerno_core::TxState::Open
+        );
+        assert_eq!(
+            g8_rows(engine, schema),
+            "1|one|1,2|two|2,3|three|3,9|nine|9"
+        );
+        let logged = cx.update(|cx| {
+            tab.read(cx)
+                .transaction_log()
+                .iter()
+                .any(|entry| entry.sql.starts_with("UPDATE"))
+        });
+        assert!(logged, "{engine:?}");
+        // Rolling the transaction back undoes the edit.
+        app.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| tab.end_transaction(false, window, cx))
+        });
+        app.wait_until(cx, "the rollback", |_, cx| {
+            cx.update(|cx| tab.read(cx).tx_state()) == kerno_core::TxState::Idle
+        });
+        assert_eq!(
+            g8_rows(engine, schema),
+            "1|one|1,2|two|2,3|three|3,9|nine|9"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_result_filtered_or_ordered_by_the_server_stays_editable(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_g8_filtered";
+        let _scratch = g8_table(engine, schema);
+        let app = connected(cx, engine);
+        app.run_in_new_tab(
+            cx,
+            &format!("select id, name from {schema}.t"),
+            "secondary-enter",
+        );
+        app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["4 rows"]);
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        // Read again in a derived table, which MariaDB names instead of the
+        // table: the origins of the first run are kept.
+        let tab = app.tab(cx);
+        app.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| tab.filter_result("id > 1", window, cx))
+        });
+        app.wait_until(cx, "the filtered rows", |app, cx| {
+            app.outcomes(cx) == ["3 rows"]
+        });
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        // A header orders an editable result on the server, never here: the
+        // changes are kept by row as the server sent them.
+        let grid = app.result_grid(cx, 0);
+        app.step(cx, |window, cx| {
+            Grid::perform(
+                &grid,
+                crate::query::grid::GridAction::Order(Some(true)),
+                window,
+                cx,
+            )
+        });
+        app.wait_until(cx, "the rows by id descending", |app, cx| {
+            app.result_rows(cx).first().is_some_and(|row| row[0] == "9")
+        });
+        let (requery, _) = cx.update(|cx| tab.read(cx).result_requery());
+        assert_eq!(
+            requery.and_then(|requery| requery.sort),
+            Some(("id".to_string(), true)),
+            "{engine:?}"
+        );
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        app.type_in_result(cx, 0, 2, "last");
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied change", |app, cx| {
+            app.result_pending(cx) == 0
+        });
+        app.wait_until(cx, "the rows read again", |app, cx| {
+            app.result_rows(cx)
+                .first()
+                .is_some_and(|row| row[1] == "last")
+        });
+        assert_eq!(
+            g8_rows(engine, schema),
+            "1|one|1,2|two|2,3|three|3,9|last|9",
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn result_changes_stay_where_their_rows_were_read(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let engine = Engine::Postgres;
+    let schema = "kerno_ui_g8_place";
+    let _scratch = g8_table(engine, schema);
+    let app = connected(cx, engine);
+    app.run_in_new_tab(
+        cx,
+        &format!("select id, name from {schema}.t order by id"),
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["4 rows"]);
+    assert_eq!(app.result_verdict(cx), None);
+    app.type_in_result(cx, 0, 2, "uno");
+    // Keys with a modifier keep their own meaning on a selected cell:
+    // Shift+Enter opens the value panel, Cmd+Enter (a run) waits for the
+    // changes; neither types in the cell.
+    let grid = app.result_grid(cx, 0);
+    select_cell(&app, cx, &grid, (1, 2));
+    app.press(cx, &["shift-enter"]);
+    assert!(app.has(cx, "value-editor"));
+    app.click(cx, "value-cancel");
+    select_cell(&app, cx, &grid, (1, 2));
+    app.press(cx, &["secondary-enter"]);
+    assert_eq!(cx.update(|cx| grid.read(cx).delegate().editing()), None);
+    assert_eq!(app.result_pending(cx), 1);
+    // The tab moved to another database: its changes are not applied
+    // there, nor here.
+    let tab = app.tab(cx);
+    let target = cx
+        .update(|cx| tab.read(cx).target().cloned())
+        .expect("a target");
+    let other = Target {
+        database: Some("kerno_other".into()),
+        schema: None,
+        ..target.clone()
+    };
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.request_target(Some(other), cx)));
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| tab.review(window, cx))
+    });
+    assert!(!app.has(cx, "sql-confirm"));
+    assert_eq!(app.result_pending(cx), 1);
+    // Back where they were read, they apply.
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.request_target(Some(target), cx)));
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| tab.review(window, cx))
+    });
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the applied change", |app, cx| {
+        app.result_pending(cx) == 0
+            && app
+                .result_rows(cx)
+                .first()
+                .is_some_and(|row| row[1] == "uno")
+    });
+    assert_eq!(
+        g8_rows(engine, schema),
+        "1|uno|1,2|two|2,3|three|3,9|nine|9"
+    );
 }

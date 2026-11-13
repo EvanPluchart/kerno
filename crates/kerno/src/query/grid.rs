@@ -28,9 +28,9 @@ use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
 use kerno_core::format::{CellStyle, display};
 use kerno_core::pending::Pending;
-use kerno_core::schema::{TableRef, TableStructure};
+use kerno_core::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
 use kerno_core::sort::sorted_rows;
-use kerno_core::sql::{CellValue, RowSql};
+use kerno_core::sql::{CellValue, RowChange, RowSql, edit_statements, rows_sql};
 use kerno_core::{Dialect, ResultStore, RowBatch, RowDemand, Session, TypeKind};
 
 /// Cells longer than this are cut in the grid; the value viewer shows all.
@@ -146,6 +146,39 @@ pub struct ColumnEdit {
     /// Its cells take a value (a computed column does not).
     pub writable: bool,
     pub nullable: bool,
+}
+
+impl ColumnEdit {
+    /// What a column showing the table column `name` takes: nothing when
+    /// it shows none, or one the server computes (a generated column, an
+    /// identity it always makes).
+    pub fn of(structure: &TableStructure, name: Option<&str>) -> Self {
+        let info = name.and_then(|name| structure.columns.iter().find(|info| info.name == name));
+        Self {
+            writable: info.is_some_and(|info| {
+                !matches!(
+                    info.generation,
+                    Some(
+                        ColumnGeneration::Stored(_)
+                            | ColumnGeneration::Virtual(_)
+                            | ColumnGeneration::IdentityAlways
+                    )
+                )
+            }),
+            nullable: info.is_some_and(|info| info.nullable),
+        }
+    }
+}
+
+/// The table the rows of a grid are written to.
+pub struct EditTarget {
+    pub table: TableRef,
+    pub structure: Arc<TableStructure>,
+    /// The columns that address a row.
+    pub identity: Vec<String>,
+    /// The table column each column of the result shows: `None` for one
+    /// written nowhere (an expression, a column shown a second time).
+    pub names: Vec<Option<String>>,
 }
 
 /// An entry of the menus of a cell or a column header.
@@ -322,6 +355,8 @@ fn item(action: GridAction, why_not: Option<&'static str>) -> Entry {
 pub struct CellFacts {
     /// A table's data, not a query result.
     pub data: bool,
+    /// The rows of a query result that take changes, as a table's data.
+    pub editable: bool,
     /// Why the rows take no change: read-only connection, view, no key.
     pub read_only: Option<&'static str>,
     pub kind: TypeKind,
@@ -407,7 +442,8 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
         .map(|format| enabled(A::CopyAs(format)))
         .collect();
     let mut entries = vec![enabled(A::Copy), Entry::Submenu("Copy as", copy_as)];
-    if facts.data {
+    let edits = facts.data || facts.editable;
+    if edits {
         let paste = read_only
             .or((!facts.clipboard).then_some("clipboard empty"))
             .or(this_cell(deleted.or(computed).or(binary)));
@@ -458,7 +494,7 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
         );
     }
     entries.extend([Entry::Separator, enabled(A::ViewValue)]);
-    if facts.data {
+    if edits {
         let revert = match facts.row {
             Mark::Fetched => Some("no change"),
             Mark::New => Some("new row: delete it"),
@@ -569,7 +605,7 @@ pub fn row_menu(facts: &CellFacts) -> Vec<Entry> {
         enabled(A::Copy),
         Entry::Submenu("Copy as", copy_as),
     ];
-    if facts.data {
+    if facts.data || facts.editable {
         let read_only = facts.read_only;
         let deleted = (facts.row == Mark::Deleted).then_some("row deleted");
         let revert = match facts.row {
@@ -583,6 +619,10 @@ pub fn row_menu(facts: &CellFacts) -> Vec<Entry> {
             item(A::DuplicateRow, read_only),
             item(A::DeleteRow, read_only.or(deleted)),
             item(A::RevertRow, read_only.or(revert)),
+        ]);
+    }
+    if facts.data {
+        entries.extend([
             Entry::Separator,
             item(
                 A::ClearFilters,
@@ -604,11 +644,12 @@ pub fn row_menu(facts: &CellFacts) -> Vec<Entry> {
 }
 
 /// "Generate SQL ▸" for the selected rows of a table (DBeaver's
-/// `SQLGeneratorContributor` on result rows). A query result's rows are no
-/// table's in v1: every entry says so. Rows added and not applied yet are
-/// skipped; on their own, nothing is written.
+/// `SQLGeneratorContributor` on result rows), or of a result that is one
+/// table's rows; a read-only result says why. Rows added and not applied
+/// yet are skipped; on their own, nothing is written.
 fn generate_menu(facts: &CellFacts) -> Entry {
-    let result = (!facts.data).then_some("query result");
+    let result =
+        (!facts.data && !facts.editable).then(|| facts.read_only.unwrap_or("query result"));
     let new = (!facts.many && facts.row == Mark::New).then_some("new row");
     let no_key = facts.keyless.then_some("no key");
     Entry::Submenu(
@@ -773,13 +814,55 @@ struct Editing {
     _subscription: Subscription,
 }
 
-/// What a table's data view adds to a result: changes waiting to be
-/// applied, and the cell being typed in.
+/// What a table's data view, or an editable result, adds to the rows:
+/// where changes go, changes waiting to be applied, and the cell being
+/// typed in.
 pub struct Edits {
     pub pending: Pending,
     /// What each column of the result takes.
     columns: Vec<ColumnEdit>,
+    structure: Arc<TableStructure>,
+    identity: Vec<String>,
+    /// The result's columns under the names of the table columns they
+    /// show (empty: none), when some differ from the result's labels.
+    renamed: Option<Arc<[kerno_core::Column]>>,
     editing: Option<Editing>,
+}
+
+impl Edits {
+    fn new(columns: &[kerno_core::Column], target: EditTarget) -> Self {
+        let EditTarget {
+            structure,
+            identity,
+            names,
+            ..
+        } = target;
+        let differs = columns
+            .iter()
+            .zip(&names)
+            .any(|(column, name)| name.as_deref() != Some(column.name.as_str()));
+        let renamed = differs.then(|| {
+            columns
+                .iter()
+                .zip(&names)
+                .map(|(column, name)| kerno_core::Column {
+                    name: name.clone().unwrap_or_default(),
+                    ..column.clone()
+                })
+                .collect()
+        });
+        Self {
+            pending: Pending::default(),
+            columns: names
+                .iter()
+                .map(|name| ColumnEdit::of(&structure, name.as_deref()))
+                .collect(),
+            structure,
+            identity,
+            renamed,
+            editing: None,
+        }
+    }
 }
 
 /// How a cell differs from what was fetched.
@@ -925,15 +1008,15 @@ impl Grid {
     }
 
     /// One page of `table`, fetched in full and sorted by the server as
-    /// `sort` says. With `columns` (what each column takes), cells can be
-    /// edited and the changes wait in [`Edits::pending`]; otherwise the
-    /// rows are read-only for the reason given.
+    /// `sort` says. With a target, cells can be edited and the changes wait
+    /// in [`Edits::pending`]; otherwise the rows are read-only for the
+    /// reason given.
     pub fn page(
         store: ResultStore,
         session: Arc<dyn Session>,
         table: TableRef,
         sort: Option<(usize, bool)>,
-        columns: Result<Vec<ColumnEdit>, &'static str>,
+        target: Result<EditTarget, &'static str>,
         sort_on_server: Rc<SortOnServer>,
     ) -> Self {
         let layout = (0..store.columns().len()).collect();
@@ -952,12 +1035,10 @@ impl Grid {
             anchor: TableSelection::None,
             session,
             table: Some(table),
-            read_only: columns.as_ref().err().copied(),
-            edits: columns.ok().map(|columns| Edits {
-                pending: Pending::default(),
-                columns,
-                editing: None,
-            }),
+            read_only: target.as_ref().err().copied(),
+            edits: target
+                .ok()
+                .map(|target| Edits::new(store.columns(), target)),
             sort_on_server: Some(sort_on_server),
             reorder: None,
             server_sorted: false,
@@ -973,6 +1054,112 @@ impl Grid {
 
     pub fn store(&self) -> &ResultStore {
         &self.store
+    }
+
+    /// Makes the rows of a result editable, as rows of `target`'s table,
+    /// or says in a few words why they are not. A result put in order here
+    /// goes back to the server's order: pending changes are kept by row as
+    /// fetched, and an editable result is ordered by the server.
+    pub fn set_edit_target(&mut self, target: Result<EditTarget, &'static str>) {
+        match target {
+            Ok(target) => {
+                if self.order.is_some() || self.sorting.is_some() {
+                    self.order = None;
+                    self.sorting = None;
+                    self.sort = self.sort.filter(|_| self.server_sorted);
+                }
+                self.table = Some(target.table.clone());
+                self.read_only = None;
+                self.edits = Some(Edits::new(self.store.columns(), target));
+            }
+            Err(why) => {
+                self.read_only = Some(why);
+                self.edits = None;
+            }
+        }
+        self.generation += 1;
+    }
+
+    /// The rows as rows of the table they are written to: the result's
+    /// columns under the names of the table's columns.
+    fn edit_store(&self) -> ResultStore {
+        match self.edits.as_ref().and_then(|edits| edits.renamed.clone()) {
+            Some(columns) => self.store.renamed(columns),
+            None => self.store.clone(),
+        }
+    }
+
+    /// The table column a column of the result shows, when it is written
+    /// to one.
+    pub fn table_column(&self, source: usize) -> Option<&ColumnInfo> {
+        let edits = self.edits.as_ref()?;
+        let name = match &edits.renamed {
+            Some(columns) => &columns.get(source)?.name,
+            None => &self.store.columns().get(source)?.name,
+        };
+        edits
+            .structure
+            .columns
+            .iter()
+            .find(|info| &info.name == name)
+    }
+
+    /// Whether a column of the result shows a column of the key.
+    pub fn is_key(&self, source: usize) -> bool {
+        self.table_column(source).is_some_and(|info| {
+            self.edits
+                .as_ref()
+                .is_some_and(|edits| edits.identity.contains(&info.name))
+        })
+    }
+
+    /// The columns of the result whose values the server makes, or that
+    /// show no column of the table: a copied row leaves them out.
+    pub fn generated_columns(&self) -> Vec<usize> {
+        (0..self.store.columns().len())
+            .filter(|&source| {
+                self.table_column(source)
+                    .is_none_or(|info| info.generation.is_some())
+            })
+            .collect()
+    }
+
+    /// The statements the pending changes become, and the changes.
+    pub fn pending_sql(&self) -> kerno_core::Result<(Vec<RowChange>, Vec<String>)> {
+        let (Some(edits), Some(table)) = (&self.edits, &self.table) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let changes = edits.pending.changes(&self.edit_store(), &edits.identity)?;
+        let statements = edit_statements(
+            self.session.dialect(),
+            table,
+            &edits.structure.columns,
+            &changes,
+        )?;
+        Ok((changes, statements))
+    }
+
+    /// `kind` statements for the fetched rows `rows` of the result (rows of
+    /// the store), with their values as literals.
+    pub fn rows_sql(&self, kind: RowSql, rows: &[usize]) -> kerno_core::Result<String> {
+        let (Some(table), Some(structure)) = (&self.table, self.structure()) else {
+            return Err(kerno_core::Error::Config(
+                "these rows are no table's".into(),
+            ));
+        };
+        let identity = match &self.edits {
+            Some(edits) => edits.identity.clone(),
+            None => structure.row_identity().unwrap_or_default(),
+        };
+        rows_sql(
+            kind,
+            self.session.dialect(),
+            table,
+            &structure.columns,
+            &identity,
+            &self.edit_store(),
+            rows,
+        )
     }
 
     /// The pending changes of a data view.
@@ -1190,9 +1377,7 @@ impl Grid {
     /// The values a cell of an enum column is chosen from, NULL (`None`)
     /// last when the column takes it; `None` for other columns.
     pub fn choices(&self, source: usize) -> Option<Vec<Option<String>>> {
-        let name = &self.store.columns().get(source)?.name;
-        let structure = self.owner.as_ref()?.structure.as_ref()?;
-        let info = structure.columns.iter().find(|info| &info.name == name)?;
+        let info = self.table_column(source)?;
         if info.enum_values.is_empty() {
             return None;
         }
@@ -1429,6 +1614,9 @@ impl Grid {
 
     /// The table the rows are from, when they are one table's.
     pub(super) fn structure(&self) -> Option<&Arc<TableStructure>> {
+        if let Some(edits) = &self.edits {
+            return Some(&edits.structure);
+        }
         self.owner.as_ref()?.structure.as_ref()
     }
 
@@ -1449,6 +1637,11 @@ impl Grid {
     /// The table the rows are from.
     pub(super) fn table(&self) -> Option<&TableRef> {
         self.table.as_ref()
+    }
+
+    /// The session the rows came from.
+    pub(super) fn session(&self) -> &Arc<dyn Session> {
+        &self.session
     }
 
     /// Shows a cell's whole value. With `edit`, a cell that takes typed
@@ -1863,6 +2056,7 @@ impl Grid {
         let owner = self.owner.as_ref();
         CellFacts {
             data: self.sort_on_server.is_some(),
+            editable: self.sort_on_server.is_none() && self.edits.is_some(),
             read_only: self.read_only,
             kind: self.store.columns()[source].kind,
             null: self.cell(row, source).is_none(),
@@ -2319,8 +2513,12 @@ impl TableDelegate for Grid {
         }
         // Not every row is here, or the server's order is taken back: the
         // server reads the result again.
+        // An editable result too: pending changes are kept by row as
+        // fetched, which an order made here would mix up.
         if let Some(ask) = self.reorder.clone()
-            && (!self.complete || (self.server_sorted && matches!(sort, ColumnSort::Default)))
+            && (!self.complete
+                || self.edits.is_some()
+                || (self.server_sorted && matches!(sort, ColumnSort::Default)))
         {
             let sort = match sort {
                 ColumnSort::Ascending => Some((source, false)),
@@ -2728,6 +2926,7 @@ mod tests {
     fn result_cell() -> CellFacts {
         CellFacts {
             data: false,
+            editable: false,
             read_only: None,
             kind: TypeKind::Text,
             null: false,
@@ -3035,6 +3234,52 @@ mod tests {
         }));
         assert!(select.contains(&"Filter on this column…".to_string()));
         assert!(select.contains(&"Distinct values…".to_string()));
+    }
+
+    #[test]
+    fn a_result_of_one_table_edits_as_table_data_and_a_read_only_one_says_why() {
+        let select = HeaderFacts {
+            filters: true,
+            ..column()
+        };
+        let editable = CellFacts {
+            editable: true,
+            column: select,
+            ..result_cell()
+        };
+        let all = flat(&cell_menu(&editable));
+        for entry in [
+            "Paste",
+            "Edit cell",
+            "Set NULL",
+            "Set default",
+            "Duplicate row",
+            "Delete row",
+            "Revert row (no change)",
+            "SELECT by key",
+            "UPDATE",
+        ] {
+            assert!(all.contains(&entry.to_string()), "{entry}: {all:?}");
+        }
+        // A table's page only: refreshed and its filter cleared from here.
+        assert!(!all.contains(&"Refresh".to_string()), "{all:?}");
+        let rows = flat(&row_menu(&editable));
+        for entry in ["Add row", "Duplicate row", "Delete row"] {
+            assert!(rows.contains(&entry.to_string()), "{entry}: {rows:?}");
+        }
+        assert!(!rows.contains(&"Clear filters (no filter)".to_string()));
+        // A read-only result keeps no edit entry; Generate SQL says why.
+        let read_only = CellFacts {
+            read_only: Some("joins tables"),
+            column: select,
+            ..result_cell()
+        };
+        let all = flat(&cell_menu(&read_only));
+        assert!(!all.contains(&"Edit cell".to_string()), "{all:?}");
+        assert!(
+            all.contains(&"UPDATE (joins tables)".to_string()),
+            "{all:?}"
+        );
     }
 
     #[test]

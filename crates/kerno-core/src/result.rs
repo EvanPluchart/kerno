@@ -64,16 +64,41 @@ pub struct Column {
     pub type_name: String,
     /// Family of the type.
     pub kind: TypeKind,
+    /// The table column the server says this column shows, when it shows
+    /// one: an expression or a literal has none.
+    pub origin: Option<ColumnOrigin>,
+}
+
+/// Where a column of a result comes from, as the server describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ColumnOrigin {
+    /// PostgreSQL's row description: the table's OID and the column's
+    /// attribute number, named by a catalog lookup in the same database.
+    Oid { table: u32, column: i16 },
+    /// MySQL and MariaDB: the database, the table and the column under
+    /// their own names, whatever aliases the statement gave them.
+    Named {
+        schema: String,
+        table: String,
+        column: String,
+    },
 }
 
 impl Column {
-    /// A column with the given name, type name and kind.
+    /// A column with the given name, type name and kind, of no known table.
     pub fn new(name: impl Into<String>, type_name: impl Into<String>, kind: TypeKind) -> Self {
         Self {
             name: name.into(),
             type_name: type_name.into(),
             kind,
+            origin: None,
         }
+    }
+
+    /// The same column, showing a table column.
+    pub fn with_origin(mut self, origin: Option<ColumnOrigin>) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
@@ -288,6 +313,17 @@ impl ResultStore {
         self.starts.push(self.rows);
         self.rows += batch.row_count();
         self.batches.push(Arc::new(batch));
+    }
+
+    /// The same rows under other columns (as many): a result's rows as
+    /// rows of the table its columns show, named as the table names them.
+    /// Cheap, as a clone is.
+    pub fn renamed(&self, columns: Arc<[Column]>) -> Self {
+        debug_assert_eq!(columns.len(), self.columns.len());
+        Self {
+            columns,
+            ..self.clone()
+        }
     }
 
     /// Number of rows fetched so far.

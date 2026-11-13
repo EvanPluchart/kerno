@@ -426,6 +426,23 @@ WHERE d.datname = {}",
         ))
     }
 
+    /// The relation of an OID from the row description, with its columns
+    /// (dropped ones left out).
+    fn origin_sql(&self, source: &kerno_core::editable::Source) -> Option<String> {
+        let kerno_core::editable::Source::Oid(oid) = source else {
+            return None;
+        };
+        Some(format!(
+            "\
+SELECT n.nspname, c.relname, c.relkind::text, a.attnum, a.attname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE c.oid = {oid}
+ORDER BY a.attnum"
+        ))
+    }
+
     /// From `pg_namespace`, with what the schema holds.
     fn schema_properties_sql(&self, schema: &str) -> Option<String> {
         Some(format!(

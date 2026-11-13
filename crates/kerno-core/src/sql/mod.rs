@@ -12,12 +12,16 @@ pub mod params;
 pub mod split;
 pub mod text;
 
-pub use classify::{StatementClass, StatementKind, TxCommand, classify};
+pub use classify::{
+    NOT_A_SELECT, StatementClass, StatementKind, TxCommand, classify, single_table_select,
+};
 pub use complete::{
     Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema, Completion,
     CompletionItem, CompletionKind, complete,
 };
-pub use edits::{ApplyFailure, CellValue, RowChange, apply_edits, edit_statements};
+pub use edits::{
+    ApplyFailure, CellValue, RowChange, apply_edits, apply_edits_in_transaction, edit_statements,
+};
 pub use format::format_sql;
 pub use generate::{
     RowSql, call_routine, delete_template, insert_template, rows_sql, select_template,

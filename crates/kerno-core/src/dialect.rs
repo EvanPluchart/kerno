@@ -233,6 +233,16 @@ pub trait Dialect: Send + Sync {
         None
     }
 
+    /// The query that names the table a result's columns come from (see
+    /// [`crate::editable::resolve`]): one row per column of the table, with
+    /// its schema, its name, its kind as PostgreSQL's `relkind` letters it
+    /// (`r`, `p`, `f`, `v`, `m`), the column's number and the column's
+    /// name; no row when the table is not found. `None` when the engine
+    /// does not describe where columns come from.
+    fn origin_sql(&self, _source: &crate::editable::Source) -> Option<String> {
+        None
+    }
+
     /// The script that replaces `object` by the definition in `ddl`: what
     /// [`crate::Session::ddl`] printed for it, edited by the user. The
     /// script is run one statement at a time, as the editor splits it.

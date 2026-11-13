@@ -19,7 +19,9 @@ use kerno_core::schema::{
 };
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{Catalog, LexRules, TokenKind, lex};
-use kerno_core::{AdminView, Column, Engine, Error, Notice, Result, Session, TxState, TypeKind};
+use kerno_core::{
+    AdminView, Column, ColumnOrigin, Engine, Error, Notice, Result, Session, TxState, TypeKind,
+};
 use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, QueryResult, Row, TextProtocol, Value};
@@ -306,7 +308,15 @@ impl MysqlSession {
                 } else {
                     0
                 });
-                described.push(Column::new(column.name_str(), type_name, kind));
+                // The table column it shows, under its own names; an
+                // expression has no table.
+                let table = column.org_table_str();
+                let origin = (!table.is_empty()).then(|| ColumnOrigin::Named {
+                    schema: column.schema_str().into_owned(),
+                    table: table.into_owned(),
+                    column: column.org_name_str().into_owned(),
+                });
+                described.push(Column::new(column.name_str(), type_name, kind).with_origin(origin));
             }
             sink.columns(described).await?;
 

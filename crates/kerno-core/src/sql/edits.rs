@@ -201,8 +201,83 @@ pub async fn apply_edits(
     exec::collect(session.clone(), "START TRANSACTION")
         .await
         .map_err(whole)?;
+    match run_each(session, statements).await {
+        None => exec::collect(session.clone(), "COMMIT")
+            .await
+            .map(|_| ())
+            .map_err(whole),
+        Some(failure) => {
+            if let Err(error) = exec::collect(session.clone(), "ROLLBACK").await {
+                tracing::warn!(%error, "rollback after a failed apply did not succeed");
+            }
+            Err(failure)
+        }
+    }
+}
 
-    let mut failure = None;
+/// The savepoint an apply inside an open transaction takes back to.
+const SAVEPOINT: &str = "kerno_apply";
+
+/// Runs edit statements inside the transaction open on `session`, as
+/// [`apply_edits`] checks them: they all take effect or none does, through
+/// a savepoint, and nothing is committed: the transaction stays open, its
+/// earlier work untouched either way.
+///
+/// The session must be in an open transaction that has not failed. Must
+/// be called from within the Tokio runtime.
+pub async fn apply_edits_in_transaction(
+    session: &Arc<dyn Session>,
+    statements: &[String],
+) -> std::result::Result<(), ApplyFailure> {
+    let whole = |error: Error| ApplyFailure {
+        statement: None,
+        error,
+    };
+    match session.tx_state() {
+        TxState::Open => {}
+        TxState::Idle => {
+            return Err(whole(Error::Config(
+                "no transaction is open in this session".into(),
+            )));
+        }
+        TxState::Failed => {
+            return Err(whole(Error::Config(
+                "the transaction failed; roll it back first".into(),
+            )));
+        }
+    }
+    if statements.is_empty() {
+        return Ok(());
+    }
+    exec::collect(session.clone(), format!("SAVEPOINT {SAVEPOINT}"))
+        .await
+        .map_err(whole)?;
+    let failure = run_each(session, statements).await;
+    let end = match failure {
+        None => format!("RELEASE SAVEPOINT {SAVEPOINT}"),
+        Some(_) => format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"),
+    };
+    let ended = exec::collect(session.clone(), end).await;
+    match (failure, ended) {
+        (Some(failure), Err(error)) => {
+            tracing::warn!(%error, "rollback to the savepoint after a failed apply did not succeed");
+            Err(failure)
+        }
+        (Some(failure), Ok(_)) => {
+            // Back where it was: the savepoint is let go too.
+            let release = format!("RELEASE SAVEPOINT {SAVEPOINT}");
+            if let Err(error) = exec::collect(session.clone(), release).await {
+                tracing::warn!(%error, "the savepoint of a failed apply was not released");
+            }
+            Err(failure)
+        }
+        (None, ended) => ended.map(|_| ()).map_err(whole),
+    }
+}
+
+/// Runs `statements` one by one, each of which must change exactly one
+/// row; stops at the first that does not, and says which.
+async fn run_each(session: &Arc<dyn Session>, statements: &[String]) -> Option<ApplyFailure> {
     for (index, sql) in statements.iter().enumerate() {
         let error = match exec::collect(session.clone(), sql.as_str()).await {
             Ok(collected) => {
@@ -223,25 +298,12 @@ pub async fn apply_edits(
             }
             Err(error) => error,
         };
-        failure = Some(ApplyFailure {
+        return Some(ApplyFailure {
             statement: Some(index),
             error,
         });
-        break;
     }
-
-    match failure {
-        None => exec::collect(session.clone(), "COMMIT")
-            .await
-            .map(|_| ())
-            .map_err(whole),
-        Some(failure) => {
-            if let Err(error) = exec::collect(session.clone(), "ROLLBACK").await {
-                tracing::warn!(%error, "rollback after a failed apply did not succeed");
-            }
-            Err(failure)
-        }
-    }
+    None
 }
 
 #[cfg(test)]

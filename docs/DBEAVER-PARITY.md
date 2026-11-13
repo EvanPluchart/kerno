@@ -307,7 +307,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-48 | Advanced Paste (Ctrl+Shift+V) | Paste with options, including as new rows | core `core.edit.paste.special`; ui.editors.data `ResultSetPasteSettings` | PG, My | **roadmap**: Paste into cells comes with M6 Part 1; inserting new rows from a spreadsheet is less common |
 | RES-49 | Inline edit (Enter, double click) | Edits the cell in place (double click default `INLINE_EDITOR`) | ui.editors.data `row.edit.inline`, pref `RESULT_SET_DOUBLE_CLICK` | PG, My | **done**: Double click, Enter or F2 on table data; `cells_are_edited_reviewed_and_applied_in_one_transaction` |
 | RES-50 | Edit cell in a value editor (Shift+Enter) | Dialog editor for long text, JSON, binary | ui.editors.data `core.resultset.row.edit` | PG, My | **done**: the value panel edits text and JSON and sets NULL, as a pending change. `the_value_panel_edits_a_json_cell_and_apply_writes_it` |
-| RES-51 | Edit results of a query | A single-table SELECT with a key is editable in the SQL editor | ui.editors.data `ResultSetViewer` (single-source model) | PG, My | **gap**: G8 |
+| RES-51 | Edit results of a query | A single-table SELECT with a key is editable in the SQL editor | ui.editors.data `ResultSetViewer` (single-source model) | PG, My | **done**: a result whose rows are rows of one table and that holds its key is edited like table data; otherwise the footer says why (a join, no key, a view…). `a_select_result_of_one_table_is_edited_reviewed_and_applied`, `a_result_that_is_no_rows_of_one_table_says_why_it_is_read_only`, `a_manual_commit_tab_applies_result_edits_inside_its_transaction` |
 | RES-52 | Add row, duplicate row, delete row | Row editing commands | ui.editors.data `row.add`, `row.copy`, `row.delete` | PG, My | **done**: `add_row`, `duplicate_rows`, `delete_rows`; `cells_are_edited_reviewed_and_applied_in_one_transaction` |
 | RES-53 | Row editing keys (Alt+Insert, Ctrl+Alt+Insert, Alt+Delete) | Shortcuts to add, duplicate, delete rows | ui.editors.data key bindings | PG, My | **done**: Alt+Insert, Alt+Delete, Ctrl+Alt+Insert and Mac alternatives; `data_keys_edit_rows_and_apply` |
 | RES-54 | Add / duplicate row before | Inserts above the current row | ui.editors.data `row.add.before`, `row.copy.before` | PG, My | **roadmap**: Row position in an unsorted table is not meaningful to the server |
@@ -625,10 +625,10 @@ Counts per status and per area (recounted from the rows above on 2026-11-13, HEA
 | Connections | 36 | 0 | 0 | 0 | 15 | 51 |
 | Navigator | 41 | 0 | 0 | 0 | 18 | 59 |
 | SQL editor | 38 | 0 | 0 | 0 | 16 | 54 |
-| Results and data editing | 56 | 0 | 0 | 1 | 15 | 72 |
+| Results and data editing | 57 | 0 | 0 | 0 | 15 | 72 |
 | Object editors (structure) | 15 | 0 | 0 | 0 | 6 | 21 |
 | Tools and administration | 13 | 0 | 0 | 0 | 15 | 28 |
 | Context menus | 122 | 0 | 0 | 0 | 11 | 133 |
-| **All** | **321** | **0** | **0** | **1** | **96** | **418** |
+| **All** | **322** | **0** | **0** | **0** | **96** | **418** |
 
 Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.

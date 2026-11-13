@@ -28,7 +28,6 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry", "env-filter"] }
 tracing-appender = "0.2"
-sqlparser = "0.64"
 
 # App storage and platform directories.
 rusqlite = { version = "0.42", features = ["bundled"] }
