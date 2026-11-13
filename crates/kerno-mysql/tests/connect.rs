@@ -651,7 +651,7 @@ async fn connector_runs_the_bootstrap_on_every_session() {
             );
         }
 
-        config.init_sql = vec!["SET @@kerno_nope = 1".into()];
+        config.init_sql = vec!["SET kerno_nope = 1".into()];
         let error = open(config.clone())
             .await
             .session(None)
@@ -660,7 +660,7 @@ async fn connector_runs_the_bootstrap_on_every_session() {
             .expect("the bootstrap fails");
         let message = error.to_string();
         assert!(
-            message.contains("bootstrap statement 1 failed: SET @@kerno_nope = 1")
+            message.contains("bootstrap statement 1 failed: SET kerno_nope = 1")
                 && message.contains("kerno_nope"),
             "{engine:?}: {message}"
         );
