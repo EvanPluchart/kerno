@@ -66,11 +66,13 @@ fn check(name: &str, port: u16) -> bool {
 /// Whether the test container of `engine` is up. Prints a `SKIPPED` line
 /// when it is not.
 pub fn available(engine: Engine) -> bool {
+    exclusive_run();
     check(service_name(engine), port(engine))
 }
 
 /// Whether the SSH bastion is up. Prints a `SKIPPED` line when it is not.
 pub fn ssh_available() -> bool {
+    exclusive_run();
     check("kerno-ssh", SSH_PORT)
 }
 
@@ -164,4 +166,27 @@ pub async fn trusted_host_keys(known_hosts: PathBuf) -> HostKeyStore {
         learn_into: Some(known_hosts),
         trusted_fingerprint,
     }
+}
+
+/// Makes this test process the only one talking to the test servers: a
+/// second process (another `cargo test` started beside this one) waits here
+/// until the first has exited. Tests name their scratch objects after
+/// themselves, so two runs of the same test would otherwise trip over each
+/// other. Called by every test that connects; the lock is taken once and
+/// held for the life of the process.
+pub fn exclusive_run() {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Option<std::fs::File>> = OnceLock::new();
+    LOCK.get_or_init(|| {
+        let path = std::env::temp_dir().join("kerno-test-servers.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .ok()?;
+        // Without the lock the tests still run; they only lose the guarantee.
+        file.lock().ok()?;
+        Some(file)
+    });
 }

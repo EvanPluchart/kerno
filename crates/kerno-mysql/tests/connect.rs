@@ -615,3 +615,59 @@ async fn connector_opens_sessions_per_database() {
     .err();
     assert!(matches!(error, Some(Error::Config(_))), "{error:?}");
 }
+
+#[tokio::test]
+async fn connector_runs_the_bootstrap_on_every_session() {
+    for engine in engines() {
+        let open = |config: kerno_core::ConnectionConfig| async move {
+            Connector::open(
+                Arc::new(MysqlDriver),
+                config,
+                testing::secrets(),
+                &HostKeyStore::default(),
+            )
+            .await
+            .unwrap()
+        };
+        let mut config = testing::config(engine);
+        // No schemas on MySQL: the default database is the database field.
+        config.default_schema = Some("kerno_other".into());
+        config.init_sql = vec![
+            "SET time_zone = '+05:30'".into(),
+            "SET @kerno_boot = 'yes'".into(),
+        ];
+        let connector = open(config.clone()).await;
+        for database in [None, Some("kerno_other")] {
+            let session = connector.session(database).await.unwrap();
+            assert_eq!(
+                scalar(&session, "SELECT @@session.time_zone").await,
+                "+05:30",
+                "{engine:?}"
+            );
+            assert_eq!(scalar(&session, "SELECT @kerno_boot").await, "yes");
+            assert_eq!(
+                scalar(&session, "SELECT DATABASE()").await,
+                database.unwrap_or("kerno")
+            );
+        }
+
+        config.init_sql = vec!["SET @@kerno_nope = 1".into()];
+        let error = open(config.clone())
+            .await
+            .session(None)
+            .await
+            .err()
+            .expect("the bootstrap fails");
+        let message = error.to_string();
+        assert!(
+            message.contains("bootstrap statement 1 failed: SET @@kerno_nope = 1")
+                && message.contains("kerno_nope"),
+            "{engine:?}: {message}"
+        );
+
+        config.ignore_init_errors = true;
+        config.init_sql.push("SET @kerno_boot = 'after'".into());
+        let session = open(config).await.session(None).await.unwrap();
+        assert_eq!(scalar(&session, "SELECT @kerno_boot").await, "after");
+    }
+}

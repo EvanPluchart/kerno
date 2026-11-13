@@ -463,3 +463,81 @@ async fn connector_opens_sessions_per_database() {
     assert!(matches!(error, Some(Error::Config(_))), "{error:?}");
     assert_eq!(PostgresDriver.engines(), &[ENGINE]);
 }
+
+#[tokio::test]
+async fn connector_runs_the_bootstrap_on_every_session() {
+    if !testing::available(ENGINE) {
+        return;
+    }
+    let open = |config: kerno_core::ConnectionConfig| async move {
+        Connector::open(
+            Arc::new(PostgresDriver),
+            config,
+            testing::secrets(),
+            &HostKeyStore::default(),
+        )
+        .await
+        .unwrap()
+    };
+    // Values the server would not have by itself.
+    let mut config = testing::config(ENGINE);
+    config.default_schema = Some("shop".into());
+    config.init_sql = vec![
+        "SET TIME ZONE 'Pacific/Auckland'".into(),
+        "  ".into(),
+        "SET application_name = 'kerno_bootstrap'".into(),
+    ];
+    let connector = open(config.clone()).await;
+    for database in [None, Some("kerno_other")] {
+        let session = connector.session(database).await.unwrap();
+        assert_eq!(scalar(&session, "SHOW TimeZone").await, "Pacific/Auckland");
+        assert_eq!(
+            scalar(&session, "SHOW application_name").await,
+            "kerno_bootstrap"
+        );
+        if database.is_none() {
+            assert_eq!(
+                scalar(&session, "SELECT current_schema()::text").await,
+                "shop"
+            );
+        }
+    }
+
+    // A failing statement fails the session, naming it and the server's reason.
+    config.init_sql = vec!["SET TIME ZONE 'UTC'".into(), "SET kerno_no_such = 1".into()];
+    let connector = open(config.clone()).await;
+    let error = connector
+        .session(None)
+        .await
+        .err()
+        .expect("the bootstrap fails");
+    let message = error.to_string();
+    assert!(
+        message.contains("bootstrap statement 2 failed: SET kerno_no_such = 1")
+            && message.contains("kerno_no_such"),
+        "{message}"
+    );
+    assert!(!message.contains(testing::DB_PASSWORD), "{message}");
+
+    // Unless the connection ignores bootstrap errors: the next one still runs.
+    config.ignore_init_errors = true;
+    config
+        .init_sql
+        .push("SET application_name = 'after_error'".into());
+    let connector = open(config.clone()).await;
+    let session = connector.session(None).await.unwrap();
+    assert_eq!(
+        scalar(&session, "SHOW application_name").await,
+        "after_error"
+    );
+
+    // A default schema that does not exist is not an error on PostgreSQL
+    // (`search_path` accepts it), and a quote in its name cannot escape.
+    config.init_sql.clear();
+    config.default_schema = Some("no\"pe".into());
+    let session = open(config).await.session(None).await.unwrap();
+    assert_eq!(
+        scalar(&session, "SHOW search_path").await,
+        "\"no\"\"pe\", public"
+    );
+}

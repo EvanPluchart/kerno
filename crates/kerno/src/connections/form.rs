@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use kerno_core::config::{
     ConnectionConfig, Engine, Environment, Secret, Secrets, SshAuth, SshConfig, TlsConfig, TlsMode,
-    is_secret_option, parse_connection_url,
+    bootstrap_refusal, is_secret_option, parse_connection_url,
 };
+use kerno_core::sql::{LexRules, split_statements};
 
 /// A field of the dialog, to attach an error to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +19,7 @@ pub enum Field {
     Port,
     User,
     Options,
+    InitSql,
     CaFile,
     CertFile,
     KeyFile,
@@ -95,7 +97,21 @@ pub struct ConnectionForm {
     pub ssh_key_passphrase: String,
     pub ssh_agent_socket: String,
     pub ssh_keepalive: String,
+    /// The commit mode new tabs start in; `None` follows the environment.
+    pub auto_commit: Option<bool>,
+    /// PostgreSQL only.
+    pub default_schema: String,
+    /// Bootstrap statements, separated by `;`.
+    pub init_sql: String,
+    pub ignore_init_errors: bool,
 }
+
+/// The commit modes the dialog offers, with their labels.
+pub const COMMIT_MODES: [(Option<bool>, &str); 3] = [
+    (None, "From the environment (production: manual)"),
+    (Some(true), "Auto-commit"),
+    (Some(false), "Manual commit"),
+];
 
 impl ConnectionForm {
     /// An empty form for a new connection to `engine`.
@@ -160,6 +176,15 @@ impl ConnectionForm {
             ssh_key_passphrase: secret(&secrets.ssh_key_passphrase),
             ssh_agent_socket,
             ssh_keepalive: ssh.map_or(30, |ssh| ssh.keepalive_secs).to_string(),
+            auto_commit: config.auto_commit,
+            default_schema: config.default_schema.clone().unwrap_or_default(),
+            init_sql: config
+                .init_sql
+                .iter()
+                .map(|sql| format!("{sql};"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ignore_init_errors: config.ignore_init_errors,
         }
     }
 
@@ -286,6 +311,22 @@ impl ConnectionForm {
             }
         }
 
+        let rules = match self.engine {
+            Engine::Postgres => LexRules::POSTGRES,
+            Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
+        };
+        let mut init_sql = Vec::new();
+        for statement in split_statements(&self.init_sql, rules) {
+            let sql = statement.text(&self.init_sql).to_string();
+            if let Some(reason) = bootstrap_refusal(&sql, self.engine) {
+                errors.push(error(
+                    Field::InitSql,
+                    format!("Statement {} {reason}", init_sql.len() + 1),
+                ));
+            }
+            init_sql.push(sql);
+        }
+
         let tls = TlsConfig {
             mode: self.tls_mode,
             ca_file: file(&self.ca_file, Field::CaFile, "CA certificate", &mut errors),
@@ -389,6 +430,13 @@ impl ConnectionForm {
             group: kerno_core::config::folder_path(&self.group),
             save_password: self.save_password,
             options,
+            auto_commit: self.auto_commit,
+            // MySQL and MariaDB have no schemas: the database is the default.
+            default_schema: (self.engine == Engine::Postgres)
+                .then(|| non_empty(&self.default_schema))
+                .flatten(),
+            init_sql,
+            ignore_init_errors: self.ignore_init_errors,
         };
         // Secrets are kept exactly as typed (a password may start or end
         // with a space), and only the ones the chosen methods use.
@@ -650,6 +698,13 @@ mod tests {
         config.save_password = false;
         config.options.insert("a".into(), "1".into());
         config.options.insert("b".into(), "two words".into());
+        config.auto_commit = Some(false);
+        config.init_sql = vec![
+            "SET time_zone = '+00:00'".into(),
+            "SET @note = 'a;b'".into(),
+            "SET sql_mode = 'ANSI_QUOTES'".into(),
+        ];
+        config.ignore_init_errors = true;
         config.tls = TlsConfig {
             mode: TlsMode::VerifyCa,
             ca_file: Some(file("ca.pem")),
@@ -672,6 +727,54 @@ mod tests {
         };
         let form = ConnectionForm::from_saved(&config, &secrets);
         assert_eq!(form.build().unwrap(), (config, secrets));
+    }
+
+    #[test]
+    fn bootstrap_statements_are_split_and_checked() {
+        let mut form = ConnectionForm::new(Engine::Postgres);
+        assert_eq!(form.auto_commit, None);
+        form.init_sql =
+            "SET TIME ZONE 'UTC';\n\n-- a comment\nSET application_name = 'a;b'\n".into();
+        form.default_schema = " shop ".into();
+        let (config, _) = form.build().unwrap();
+        assert_eq!(
+            config.init_sql,
+            ["SET TIME ZONE 'UTC'", "SET application_name = 'a;b'"]
+        );
+        assert_eq!(config.default_schema.as_deref(), Some("shop"));
+        assert_eq!(
+            ConnectionForm::from_saved(&config, &Secrets::default())
+                .build()
+                .unwrap()
+                .0,
+            config
+        );
+
+        // No default schema on MySQL: the database field is the default.
+        form.set_engine(Engine::MySql);
+        assert_eq!(form.build().unwrap().0.default_schema, None);
+
+        form.init_sql = "SET a = 1; ALTER USER u IDENTIFIED BY 'hunter2'".into();
+        let errors = form.build().unwrap_err();
+        assert_eq!(fields(&errors), [Field::InitSql]);
+        assert!(
+            errors[0].message.contains("Statement 2"),
+            "{}",
+            errors[0].message
+        );
+        assert!(
+            !errors[0].message.contains("hunter2"),
+            "{}",
+            errors[0].message
+        );
+
+        form.init_sql = "SET a = 1; DELETE FROM t".into();
+        let errors = form.build().unwrap_err();
+        assert!(
+            errors[0].message.contains("Statement 2 would change data"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]

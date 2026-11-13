@@ -257,6 +257,23 @@ pub struct ConnectionConfig {
     /// Extra driver options (`application_name`, `connect_timeout`, ...).
     #[serde(default)]
     pub options: BTreeMap<String, String>,
+    /// The commit mode query tabs start in: `Some(true)` auto-commit,
+    /// `Some(false)` manual, `None` from the environment (production starts
+    /// in manual commit, as DBeaver's connection types do).
+    #[serde(default)]
+    pub auto_commit: Option<bool>,
+    /// PostgreSQL: schema made current in every session (`search_path`).
+    /// MySQL and MariaDB use [`ConnectionConfig::database`] instead.
+    #[serde(default)]
+    pub default_schema: Option<String>,
+    /// Statements run, in order, right after each session opens (DBeaver's
+    /// "bootstrap queries"). Stored and exported in plain text.
+    #[serde(default)]
+    pub init_sql: Vec<String>,
+    /// A failing [`ConnectionConfig::init_sql`] statement is logged and
+    /// skipped instead of failing the connection.
+    #[serde(default)]
+    pub ignore_init_errors: bool,
 }
 
 fn default_true() -> bool {
@@ -281,7 +298,17 @@ impl ConnectionConfig {
             group: None,
             save_password: true,
             options: BTreeMap::new(),
+            auto_commit: None,
+            default_schema: None,
+            init_sql: Vec::new(),
+            ignore_init_errors: false,
         }
+    }
+
+    /// Whether query tabs of this connection start in manual commit.
+    pub fn starts_in_manual_commit(&self) -> bool {
+        self.auto_commit
+            .map_or(self.environment == Environment::Production, |auto| !auto)
     }
 
     /// Checks the settings are complete enough to try a connection.
@@ -306,6 +333,14 @@ impl ConnectionConfig {
                 "option \"{key}\" looks like a secret; options are stored and exported in plain text, \
                  so use the password fields instead"
             )));
+        }
+        for (index, sql) in self.init_sql.iter().enumerate() {
+            if let Some(reason) = bootstrap_refusal(sql, self.engine) {
+                return Err(Error::Config(format!(
+                    "bootstrap statement {} {reason}",
+                    index + 1
+                )));
+            }
         }
         if let Some(ssh) = &self.ssh {
             if ssh.host.trim().is_empty() {
@@ -399,6 +434,32 @@ pub fn is_secret_option(key: &str) -> bool {
         || ["password", "passwd", "passphrase", "secret", "token"]
             .iter()
             .any(|word| key.contains(word))
+}
+
+/// Why a bootstrap statement is refused, if it is. It is stored and
+/// exported in plain text, so it may not name a secret (`ALTER ROLE …
+/// PASSWORD`, `SET my.api_token = …`, MySQL's `IDENTIFIED BY`). It runs at
+/// every connect without being shown, so it may only set session state:
+/// no write, no DDL, no transaction control (a read-only connection
+/// refuses writes, and a production one confirms them).
+pub fn bootstrap_refusal(sql: &str, engine: Engine) -> Option<&'static str> {
+    use crate::sql::{LexRules, StatementKind, classify};
+    let secret = sql
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .any(|word| is_secret_option(word) || word.eq_ignore_ascii_case("identified"));
+    if secret {
+        return Some(
+            "looks like it holds a secret: bootstrap statements are stored and exported in plain text",
+        );
+    }
+    let rules = match engine {
+        Engine::Postgres => LexRules::POSTGRES,
+        Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
+    };
+    let class = classify(sql, rules);
+    (class.writes || matches!(class.kind, StatementKind::Transaction(_))).then_some(
+        "would change data, the schema or the transaction: bootstrap statements only set up the session",
+    )
 }
 
 /// The file written by "export connections": settings only, no secrets.
@@ -780,6 +841,79 @@ mod tests {
         assert_eq!(config.tls.mode, TlsMode::Prefer);
         assert!(config.save_password);
         assert!(config.ssh.is_none());
+        // Stores and exports written before the connection settings of G13.
+        assert_eq!(config.auto_commit, None);
+        assert_eq!(config.default_schema, None);
+        assert!(config.init_sql.is_empty() && !config.ignore_init_errors);
+        assert!(!config.starts_in_manual_commit());
+    }
+
+    #[test]
+    fn the_commit_mode_follows_the_environment_unless_chosen() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        for (environment, manual) in [
+            (Environment::Local, false),
+            (Environment::Staging, false),
+            (Environment::Production, true),
+        ] {
+            config.environment = environment;
+            config.auto_commit = None;
+            assert_eq!(config.starts_in_manual_commit(), manual, "{environment:?}");
+            config.auto_commit = Some(true);
+            assert!(!config.starts_in_manual_commit(), "{environment:?}");
+            config.auto_commit = Some(false);
+            assert!(config.starts_in_manual_commit(), "{environment:?}");
+        }
+    }
+
+    #[test]
+    fn a_bootstrap_statement_with_a_secret_is_refused_without_echoing_it() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Boot".into();
+        config.init_sql = vec![
+            "SET search_path TO shop, public".into(),
+            "SET time_zone = '+00:00'".into(),
+        ];
+        config.validate().unwrap();
+        for leaky in [
+            "ALTER ROLE app PASSWORD 'hunter2'",
+            "SET my.api_token = 'hunter2'",
+            "CREATE USER x IDENTIFIED BY 'hunter2'",
+        ] {
+            config.init_sql.push(leaky.into());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("bootstrap statement 3"), "{error}");
+            assert!(!error.contains("hunter2"), "{error}");
+            let error = export_connections(std::slice::from_ref(&config))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Boot") && !error.contains("hunter2"),
+                "{error}"
+            );
+            config.init_sql.pop();
+        }
+        // Statements that would write or touch the transaction, on any connection.
+        for writing in [
+            "INSERT INTO audit VALUES (1)",
+            "DROP TABLE t",
+            "BEGIN",
+            "SET GLOBAL max_connections = 10",
+        ] {
+            config.init_sql.push(writing.into());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("bootstrap statement 3 would change data"),
+                "{writing}: {error}"
+            );
+            config.init_sql.pop();
+        }
+        let file = r#"{"kerno_connections": 1, "connections": [{"name":"x","engine":"postgres","host":"h","port":5432,"user":"u","init_sql":["SET a = 1","ALTER USER u PASSWORD 'hunter2'"]}]}"#;
+        let error = import_connections(file).unwrap_err().to_string();
+        assert!(
+            error.contains("bootstrap statement 2") && !error.contains("hunter2"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -837,10 +971,25 @@ mod tests {
             auth: SshAuth::Agent { socket: None },
             keepalive_secs: 30,
         });
+        first.auto_commit = Some(true);
+        first.default_schema = Some("shop".into());
+        first.init_sql = vec!["SET TIME ZONE 'UTC'".into(), "SET work_mem = '64MB'".into()];
+        first.ignore_init_errors = true;
         let mut second = ConnectionConfig::new(Engine::MySql);
         second.name = "Billing".into();
         let exported = export_connections(&[first.clone(), second.clone()]).unwrap();
         assert!(exported.contains("\"kerno_connections\": 1"), "{exported}");
+        for key in [
+            "auto_commit",
+            "default_schema",
+            "init_sql",
+            "ignore_init_errors",
+        ] {
+            assert!(
+                exported.contains(&format!("\"{key}\"")),
+                "{key}: {exported}"
+            );
+        }
         assert_eq!(import_connections(&exported).unwrap(), [first, second]);
         assert_eq!(
             import_connections(&export_connections(&[]).unwrap()).unwrap(),

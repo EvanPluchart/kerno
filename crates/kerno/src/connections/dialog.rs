@@ -23,7 +23,7 @@ use kerno_core::config::{Engine, Environment, Secrets, TlsMode};
 use kerno_core::ssh::SshError;
 use kerno_core::storage::SavedConnection;
 
-use super::form::{ConnectionForm, Field, FieldError, SshAuthKind};
+use super::form::{COMMIT_MODES, ConnectionForm, Field, FieldError, SshAuthKind};
 use super::manager::{Connections, TestReport};
 use crate::engine_logo::engine_logo;
 use crate::state::AppState;
@@ -72,6 +72,8 @@ struct Inputs {
     password: Entity<InputState>,
     database: Entity<InputState>,
     options: Entity<TextareaState>,
+    default_schema: Entity<InputState>,
+    init_sql: Entity<TextareaState>,
     ca_file: Entity<InputState>,
     cert_file: Entity<InputState>,
     key_file: Entity<InputState>,
@@ -184,6 +186,7 @@ impl ConnectionDialog {
         let ssh_key_file = text(&form.ssh_key_file, "~/.ssh/id_ed25519");
         let ssh_agent_socket = text(&form.ssh_agent_socket, "SSH_AUTH_SOCK when empty");
         let ssh_keepalive = text(&form.ssh_keepalive, "30");
+        let default_schema = text(&form.default_schema, "public");
         let mut secret = |value: &str| {
             let value = value.to_string();
             cx.new(|cx| {
@@ -201,6 +204,13 @@ impl ConnectionDialog {
                 .auto_grow(4, 10)
                 .placeholder("application_name=kerno")
                 .default_value(options_text)
+        });
+        let init_text = form.init_sql.clone();
+        let init_sql = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 8)
+                .placeholder("SET TIME ZONE 'UTC';")
+                .default_value(init_text)
         });
 
         // Enter in the URL field fills the form from it.
@@ -226,6 +236,8 @@ impl ConnectionDialog {
                 password,
                 database,
                 options,
+                default_schema,
+                init_sql,
                 ca_file,
                 cert_file,
                 key_file,
@@ -260,6 +272,8 @@ impl ConnectionDialog {
             password: value(&i.password),
             database: value(&i.database),
             options: i.options.read(cx).value().to_string(),
+            default_schema: value(&i.default_schema),
+            init_sql: i.init_sql.read(cx).value().to_string(),
             ca_file: value(&i.ca_file),
             cert_file: value(&i.cert_file),
             key_file: value(&i.key_file),
@@ -905,8 +919,50 @@ impl ConnectionDialog {
     }
 
     fn render_advanced(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let commit_mode = COMMIT_MODES
+            .iter()
+            .position(|(mode, _)| *mode == self.form.auto_commit);
         v_flex()
             .gap_3()
+            .child(
+                self.field(
+                    "New query tabs start in",
+                    None,
+                    RadioGroup::horizontal("conn-commit-mode")
+                        .children(COMMIT_MODES.map(|(_, label)| label))
+                        .selected_index(commit_mode)
+                        .on_click(cx.listener(|this, index: &usize, _, cx| {
+                            if let Some((mode, _)) = COMMIT_MODES.get(*index) {
+                                this.form.auto_commit = *mode;
+                                cx.notify();
+                            }
+                        })),
+                    cx,
+                ),
+            )
+            .when(self.form.engine == Engine::Postgres, |this| {
+                this.child(self.field(
+                    "Default schema (search_path of every session)",
+                    None,
+                    Input::new(&self.inputs.default_schema).id("conn-default-schema"),
+                    cx,
+                ))
+            })
+            .child(self.field(
+                "Bootstrap statements, run in every new session (separate them with ;)",
+                Some(Field::InitSql),
+                Textarea::new(&self.inputs.init_sql),
+                cx,
+            ))
+            .child(
+                Checkbox::new("conn-ignore-init-errors")
+                    .label("Ignore errors in bootstrap statements (they are only logged)")
+                    .checked(self.form.ignore_init_errors)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.form.ignore_init_errors = *checked;
+                        cx.notify();
+                    })),
+            )
             .child(self.field(
                 "Driver options, one key=value per line",
                 Some(Field::Options),
@@ -1004,7 +1060,7 @@ fn section_of(field: Field) -> Section {
         | Field::SshKeyFile
         | Field::SshAgentSocket
         | Field::SshKeepalive => Section::Ssh,
-        Field::Options => Section::Advanced,
+        Field::Options | Field::InitSql => Section::Advanced,
     }
 }
 

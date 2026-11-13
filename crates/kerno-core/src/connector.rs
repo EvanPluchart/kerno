@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::config::{ConnectParams, ConnectionConfig, Secrets};
 use crate::driver::{Driver, Session};
 use crate::error::{Error, Result};
+use crate::exec;
 use crate::ssh::{Tunnel, TunnelRequest};
 
 /// Where SSH host keys are looked up and recorded.
@@ -96,7 +97,57 @@ impl Connector {
             read_only: self.config.read_only,
             options: self.config.options.clone(),
         };
-        self.driver.connect(&params).await
+        let session = self.driver.connect(&params).await?;
+        if let Err(error) = self.bootstrap(&session).await {
+            session.close().await;
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    /// Makes the default schema current, then runs the bootstrap
+    /// statements, on a session that just opened. A failing statement fails
+    /// the session, naming it, unless the connection ignores such errors.
+    async fn bootstrap(&self, session: &Arc<dyn Session>) -> Result<()> {
+        let schema = self
+            .config
+            .default_schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|schema| !schema.is_empty() && session.dialect().has_schemas())
+            .map(|schema| {
+                format!(
+                    "SET search_path TO {}, public",
+                    session.dialect().quote_ident(schema)
+                )
+            });
+        // The default schema is a setting the user chose, never ignored.
+        if let Some(sql) = schema {
+            exec::collect(session.clone(), sql.as_str())
+                .await
+                .map_err(|error| {
+                    Error::Connect(format!("the default schema could not be set: {error}"))
+                })?;
+        }
+        let statements = self
+            .config
+            .init_sql
+            .iter()
+            .map(|sql| sql.trim())
+            .enumerate();
+        for (index, sql) in statements.filter(|(_, sql)| !sql.is_empty()) {
+            tracing::debug!(statement = index + 1, sql, "bootstrap statement");
+            if let Err(error) = exec::collect(session.clone(), sql).await {
+                if !self.config.ignore_init_errors {
+                    return Err(Error::Connect(format!(
+                        "bootstrap statement {} failed: {sql}: {error}",
+                        index + 1
+                    )));
+                }
+                tracing::warn!(statement = index + 1, %error, "bootstrap statement failed; ignored");
+            }
+        }
+        Ok(())
     }
 
     /// The connection's settings.
