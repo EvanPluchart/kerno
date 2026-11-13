@@ -88,6 +88,11 @@ pub fn apply(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) 
     }
 }
 
+/// Night, the brand's dark surface (`assets/brand/BRAND.md`): the reversed
+/// lockup is drawn on it, as its file is. The other brand colours (Lime,
+/// Ink, Olive, Lime wash) live in the theme file.
+pub const NIGHT: u32 = 0x0E1116;
+
 /// A colour tag a connection can carry: `(key, light mode, dark mode)`.
 /// Keys are what is stored in the connection's settings.
 pub const TAG_COLORS: [(&str, u32, u32); 8] = [
@@ -215,6 +220,17 @@ mod tests {
             ("accent.foreground", "accent.background"),
             ("primary.foreground", "primary.background"),
             ("primary.foreground", "primary.hover.background"),
+            ("primary.foreground", "primary.active.background"),
+            // A primary button's label on the button itself (Ink on Lime).
+            ("button.primary.foreground", "button.primary.background"),
+            (
+                "button.primary.foreground",
+                "button.primary.hover.background",
+            ),
+            (
+                "button.primary.foreground",
+                "button.primary.active.background",
+            ),
             ("secondary.foreground", "secondary.background"),
             ("danger.foreground", "danger.background"),
             ("success.foreground", "success.background"),
@@ -225,6 +241,10 @@ mod tests {
             ("sidebar.accent.foreground", "sidebar.accent.background"),
             ("sidebar.primary.foreground", "sidebar.primary.background"),
             ("muted.foreground", "sidebar.background"),
+            // The selected connection of the sidebar.
+            ("foreground", "sidebar.accent.background"),
+            ("muted.foreground", "sidebar.accent.background"),
+            ("muted.foreground", "popover.background"),
             ("tab.foreground", "tab_bar.background"),
             ("tab.active.foreground", "tab.active.background"),
             ("muted.foreground", "title_bar.background"),
@@ -247,7 +267,14 @@ mod tests {
             ("warning.background", "background"),
             ("info.background", "background"),
             ("link", "background"),
+            ("link", "muted.background"),
+            ("link", "sidebar.background"),
+            ("link", "popover.background"),
+            ("link", "status_bar.background"),
+            ("link", "table.active.background"),
+            // The accent as text (an outline primary button's label).
             ("primary.background", "background"),
+            ("primary.background", "popover.background"),
             ("danger.background", "sidebar.background"),
             ("danger.background", "status_bar.background"),
             ("warning.background", "status_bar.background"),
@@ -286,9 +313,44 @@ mod tests {
                         ));
                     }
                 }
-                let ratio = contrast(&theme.colors["ring"], surface_hex);
-                if ratio < 3.0 {
-                    failures.push(format!("{}: ring on {surface} is {ratio:.2}:1", theme.name));
+            }
+            // Focus rings, input borders, the selected-row marker and the
+            // drag marker, on every surface they are drawn on.
+            let indicators = [
+                (
+                    "ring",
+                    &[
+                        "background",
+                        "sidebar.background",
+                        "tab_bar.background",
+                        "muted.background",
+                        "popover.background",
+                        "status_bar.background",
+                    ][..],
+                ),
+                (
+                    "input.border",
+                    &["background", "sidebar.background", "popover.background"],
+                ),
+                (
+                    "list.active.border",
+                    &["background", "list.active.background"],
+                ),
+                (
+                    "table.active.border",
+                    &["background", "table.active.background"],
+                ),
+                ("drag.border", &["background", "sidebar.background"]),
+            ];
+            for (indicator, surfaces) in indicators {
+                for surface in surfaces {
+                    let ratio = contrast(&theme.colors[indicator], &theme.colors[*surface]);
+                    if ratio < 3.0 {
+                        failures.push(format!(
+                            "{}: {indicator} on {surface} is {ratio:.2}:1",
+                            theme.name
+                        ));
+                    }
                 }
             }
         }
@@ -331,6 +393,96 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "below 4.5:1:\n{}", failures.join("\n"));
+    }
+
+    /// The brand (`assets/brand/BRAND.md`) is where its rules put it: Lime
+    /// buttons with Ink labels in both themes; on light surfaces Olive for
+    /// text, links and rings (Lime is 1.3:1 on white) and Lime wash for the
+    /// selected row; on dark surfaces Lime for all of it.
+    #[test]
+    fn the_brand_colours_sit_where_brand_md_puts_them() {
+        const LIME: &str = "#C8F03C";
+        const INK: &str = "#111111";
+        const OLIVE: &str = "#4D6B00";
+        const LIME_WASH: &str = "#F1F8D6";
+        // The ratios BRAND.md lists.
+        assert!(contrast(INK, LIME) >= 14.3, "ink on lime");
+        assert!(contrast(OLIVE, "#FFFFFF") >= 6.1, "olive on white");
+        assert!(
+            contrast(LIME, "#FFFFFF") < 3.0,
+            "lime cannot carry text on white"
+        );
+        assert!(
+            contrast(LIME, &format!("#{NIGHT:06X}")) >= 4.5,
+            "lime on night"
+        );
+
+        let themes = themes();
+        let (light, dark) = (&themes[0].colors, &themes[1].colors);
+        for colors in [light, dark] {
+            assert_eq!(colors["button.primary.background"], LIME);
+            assert_eq!(colors["button.primary.foreground"], INK);
+        }
+        for key in [
+            "ring",
+            "link",
+            "caret",
+            "primary.background",
+            "list.active.border",
+        ] {
+            assert_eq!(light[key], OLIVE, "light {key}");
+            assert_eq!(dark[key], LIME, "dark {key}");
+        }
+        assert_eq!(dark["primary.foreground"], INK);
+        assert_eq!(light["list.active.background"], LIME_WASH);
+        assert_eq!(light["table.active.background"], LIME_WASH);
+        // Lime never carries text or a ring on a light surface.
+        for (key, hex) in light {
+            if key.starts_with("button.primary") {
+                continue;
+            }
+            assert_ne!(hex.to_uppercase(), LIME, "light {key} is lime");
+        }
+        for (kind, hex) in themes[0].syntax() {
+            assert_ne!(hex.to_uppercase(), LIME, "light syntax {kind} is lime");
+        }
+    }
+
+    /// Hue of `#RRGGBB` in degrees.
+    fn hue(hex: &str) -> f64 {
+        let hex = hex.trim_start_matches('#');
+        let [r, g, b] = [0, 2, 4]
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap() as f64 / 255.0);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let delta = max - min;
+        let hue = if delta == 0.0 {
+            0.0
+        } else if max == r {
+            ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / delta + 2.0
+        } else {
+            (r - g) / delta + 4.0
+        };
+        hue * 60.0
+    }
+
+    /// "Success" stays semantic: its green is far enough in hue from the
+    /// lime accent (connected dot next to a selected connection, new rows
+    /// next to the selected row) not to read as the same colour.
+    #[test]
+    fn success_cannot_be_mistaken_for_the_accent() {
+        for theme in themes() {
+            let success = hue(&theme.colors["success.background"]);
+            for accent in ["primary.background", "button.primary.background"] {
+                let distance = (success - hue(&theme.colors[accent])).abs();
+                assert!(
+                    distance.min(360.0 - distance) >= 60.0,
+                    "{}: success and {accent} are {distance:.0} degrees apart",
+                    theme.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -26,6 +26,8 @@ RUN rustup toolchain install
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY crates crates
+# The app embeds the brand files and the engine logos at compile time.
+COPY assets assets
 COPY tests tests
 RUN nice -n 10 cargo build --release -j 3
 RUN nice -n 10 cargo test -p kerno-core --lib -j 3 -- --test-threads=3

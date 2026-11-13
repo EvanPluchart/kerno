@@ -44,8 +44,8 @@ gpui_kit::assets::icon_assets!(
     ]
 );
 
-/// Kerno's assets: the engine logos and the schema tree's glyphs, then
-/// everything the UI kit bundles.
+/// Kerno's assets: the engine logos, Kerno's brand files and the schema
+/// tree's glyphs, then everything the UI kit bundles.
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -54,7 +54,11 @@ impl AssetSource for Assets {
             POSTGRESQL => Some(include_bytes!("../assets/engines/postgresql.svg")),
             MYSQL => Some(include_bytes!("../assets/engines/mysql.svg")),
             MARIADB => Some(include_bytes!("../assets/engines/mariadb.svg")),
-            _ => None,
+            // Kerno's own mark and lockups, under `brand/`.
+            _ => crate::brand::FILES
+                .iter()
+                .find(|(file, _)| *file == path)
+                .map(|(_, bytes)| *bytes),
         };
         if let Some(bytes) = own {
             return Ok(Some(Cow::Borrowed(bytes)));
@@ -66,7 +70,13 @@ impl AssetSource for Assets {
     }
 
     fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
-        gpui_kit::assets::Assets.list(path)
+        let mut found: Vec<SharedString> = crate::brand::FILES
+            .iter()
+            .filter(|(file, _)| file.starts_with(path))
+            .map(|(file, _)| SharedString::from(*file))
+            .collect();
+        found.extend(gpui_kit::assets::Assets.list(path)?);
+        Ok(found)
     }
 }
 

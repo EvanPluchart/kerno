@@ -600,3 +600,28 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   remote). The scripts are to be run again with the icon at the end (plans/M10.md Part 8). An AppImage and an
   amd64 build from this Mac are on the roadmap. The image `kerno-linux-build` (5.6 GB) is removed at the end
   of the goal.
+
+## D-032 — Brand colours in the theme
+
+- The accent moves from teal to the brand (`assets/brand/BRAND.md`). The UI kit paints `primary` in more
+  places than buttons (checkbox and radio fills, the tab marker, outline-primary labels, the selected engine
+  card, the plan bars), so the two themes split it: the kit's own `button.primary.*` slots carry the button
+  (Lime `#C8F03C` with Ink `#111111`, 14.4:1, in both themes), and `primary.*` is the accent that reads on
+  the theme's surfaces: Olive `#4D6B00` with white text in light (6.1:1 on white), Lime with Ink in dark.
+- Light: rings, caret, links, keywords and the selected-row marker are Olive (5.3:1 or more on every light
+  surface); selected rows and soft accent backgrounds are Lime wash `#F1F8D6`; the sidebar's selected
+  connection is a deeper wash `#E5F2BC` because the wash disappears on the grey sidebar (1.02:1); the editor
+  and grid selection is lime at 70 % over white (`#D8F477`); hover rows are neutral grey `#F3F5F7`, so hover
+  and selection differ in hue. Dark: lime at 5 % (hover), 8 % (accent), 12 % (selected row, sidebar
+  selection) and 28 % (editor selection) over the surfaces, written as opaque hex so the contrast tests
+  measure what is drawn; rings, links, keywords Lime (12.1:1 or more). Dark surfaces kept: the bars at
+  `#0E1012` are already next to Night `#0E1116`.
+- Input borders were 1.5:1; they now pass 3:1 (`#878F9B` light, `#646D78` dark), as the plan asks.
+- Semantic colours unchanged: success, warning, danger, info, the connection tag colours (the `teal` tag key
+  stays: it is stored in users' connections and is not the accent) and the pending-change tints. Success
+  green sits about 75 degrees of hue from lime and olive; a test keeps it 60 or more.
+- The brand files are embedded byte for byte under `brand/` and drawn with `img()` at their own colours:
+  the lockup (reversed on dark, on a Night panel that continues its own background) in the About window at
+  240 px, the mark (olive on light, lime on dark) in the empty tab area in an 80 px square that holds its
+  clear space. The Linux window icon (`WindowOptions::icon`, X11 only) needs the `image` crate: left to the
+  packaging part, the `.desktop` entry and hicolor icons cover it.

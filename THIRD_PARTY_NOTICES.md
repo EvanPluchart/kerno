@@ -15,6 +15,9 @@ The licence texts ship next to the font files.
 
 Copyright 2016 The Inter Project Authors. Copyright 2020 The JetBrains Mono Project Authors.
 
+Kerno's wordmark (`assets/brand/kerno-wordmark.svg` and the horizontal lockups) is Inter SemiBold converted
+to outlines, under the same licence.
+
 SHA-256 of the release archives the files were taken from:
 
 - `Inter-4.1.zip`: `9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e`
