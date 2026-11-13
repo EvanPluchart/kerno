@@ -810,3 +810,26 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   release; signing is the real answer and stays the owner's (it needs their identity).
 - No GitHub Actions: the checks run locally (`scripts/check.sh`); a release is built locally
   (`scripts/release.sh`), and publishing it stays the owner's.
+
+## D-046 — Tool wizards and local clients: what was decided while building them
+
+- **Defaults.** PostgreSQL backups default to the custom format, as DBeaver. `mysqldump` defaults to
+  `--single-transaction` with `--routines` and `--hex-blob` on (DBeaver leaves them off): a consistent
+  dump that restores routines and binary data is the safer default. DBeaver's `--debug-info` log level is
+  not offered: current `mysql` clients refuse it.
+- **Three steps, not four**: objects, settings (with the output folder and the file name pattern), progress,
+  as the owner's follow-up describes. An existing file is replaced only after a confirmation.
+- **Extra arguments** must be written `--name=value`. Anything that sets the server, the port, the user,
+  the database, TLS, option files, plugins or a password is refused, abbreviations and MySQL's stacked
+  prefixes included, and so is anything that undoes a protection of the restore (`--set`, `--command`,
+  `--output`, `--local-infile`, `--binary-mode`, `--sandbox`, `--pager`…). The list errs on the strict
+  side: an abbreviation of a refused option refuses longer options sharing it.
+- **Another user for the tool**: the name is kept with the settings, the password is used for that run
+  only and never saved (so never in a task).
+- **A local client folder runs only if Kerno detected it or the user added it**, and it never travels with
+  an export: an imported file must not choose which binaries run (found by the security review while the
+  work was in progress; the first plan said to export it). A stored folder that is neither is ignored, the
+  wizard says so and uses the default.
+- **A PostgreSQL client older than the server blocks Start** with the reason (`pg_dump` would refuse);
+  another MySQL / MariaDB version only warns.
+- The old `tool_paths` setting is turned into added folders once.
