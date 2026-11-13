@@ -135,6 +135,45 @@ nice -n 10 cargo build --release -p kerno
 - Menus are tested through the function that fills them (see `Navigator::perform`, `DataTab::related`), plus
   one real right-click test (`a_right_click_on_a_cell_opens_the_menu_of_its_row`).
 
+## Reliability of the suite
+
+`KERNO_REQUIRE_CONTAINERS=1 nice -n 10 cargo test --workspace -- --test-threads=3` must pass every time, on a
+busy machine too. Three tests of one binary run at once against the same four servers, and one test process at a
+time holds the servers (`testing::exclusive_run`). A new test follows these rules:
+
+- **Own objects only.** Create what you assert on under a name no other test uses (`kerno_ui_<test>` /
+  `kerno_test_<test>`, through `Scratch` or `common::scratch_schema`); grep the name before you pick it. Never
+  assert on a server-wide fact another test can change while you run: the first row of a sizes list, the list
+  or count of sessions, roles, databases, schemas or locks, the processlist. Filter it to your own objects first
+  (your schema, role, user, a marker in the statement text), or to the fixture with the scratch prefixes left
+  out (see `fixture_rows` in the drivers' `tests/introspect.rs`). Count sessions under a login role of the test's
+  own (`every_owner_of_a_session_closes_it_when_it_goes_away`), never all of `kerno`'s.
+- **Wait for the state, not for time.** Anything that goes through the network, storage or the runtime is
+  awaited with `app.wait_until(cx, "what", |app, cx| condition)` (it gives up after 30 s and prints what the
+  window shows). The condition must name the end state itself (the outcome text, the row count, the status),
+  not something that is also true before the action took effect, such as `!running` alone. No `sleep` instead
+  of a condition, no retry around a whole test, no longer deadline without knowing what takes that long.
+- **Cancel what is on the server.** `running` is true as soon as the tab starts a run, before the statement
+  reaches the server; a cancel request that arrives before it is ignored there. A test that cancels waits for
+  `running_on_server(engine, marker)` first (a unique alias or comment in the statement).
+- **A 30 s timeout is a state that never came, not slowness.** Read the message (`situation()`: tabs, results,
+  activity, status bar) and look for a refused action (a run that silently did not start because another was
+  running) or a real race in the app before touching the test.
+- **The server to yourself.** No test changes a server-wide setting. A test that terminates sessions, kills
+  queries or holds locks does it only on sessions and objects it opened itself (a `Sleeper`, its own role, its
+  own table). No test needs the whole server today, so there is no lock for it. If one ever does (a global
+  setting, a restart), add one `static` mutex in `ui_tests.rs` (and one in the driver's `tests/common`) that
+  every such test takes, so they never overlap each other while the rest of the suite keeps running beside
+  them. Do not lower `--test-threads`.
+- **Cleanup that cannot be skipped.** Declare the `Scratch` before the app (it is dropped after it), drop at
+  the start what an earlier run may have left, and end every transaction the test opens. `Scratch` does not
+  panic a second time when the test already failed (that would abort the whole run): it prints the cleanup
+  that did not run, which happens when the failed test's app still holds a transaction on those objects (the
+  drop gives up after the 15 s lock timeout); the next run of that test drops them first.
+- **Measure flakiness, do not guess.** Before calling the suite reliable, run the `kerno` binary 20 times in a
+  row, 5 of them beside a CPU-heavy job (`nice -n 10 cargo build --release -p kerno`), and check that no
+  `kerno_ui_*` / `kerno_test_*` schema, database, role or user is left on the servers afterwards.
+
 ## Real-app checks and captures (main session or a `sonnet` agent)
 
 `scripts/capture.sh` and `scripts/window-id.swift` capture the window (`screencapture -l <id>`). The app runs

@@ -199,6 +199,75 @@ async fn abandoning_a_statement_that_produces_nothing_cancels_it() {
 }
 
 #[tokio::test]
+async fn the_cancel_of_an_abandoned_result_never_stops_the_next_statement() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    // The server has sent the whole small result and is idle when the
+    // consumer lets it go: the cancel request sent then must be over before
+    // the next statement starts, or it lands on that one (as a late cancel
+    // does in libpq's PQcancel without its wait).
+    for round in 0..60 {
+        let mut execution = exec::run(
+            session.clone(),
+            "SELECT g FROM generate_series(1, 5000) g".into(),
+            RowLimit::Rows(1_000),
+        );
+        assert!(matches!(
+            next_event(&mut execution).await,
+            Some(ExecEvent::Columns(_))
+        ));
+        let (seen, complete) = read_rows(&mut execution, 1_000).await;
+        assert_eq!((seen, complete), (1_000, false));
+        drop(execution);
+        let next = run(&session, "SELECT pg_sleep(0.05), 'next'").await;
+        assert!(next.is_ok(), "round {round}: {next:?}");
+    }
+}
+
+/// How `execution` ends.
+async fn ending(execution: &mut exec::Execution) -> kerno_core::Result<()> {
+    loop {
+        match next_event(execution).await {
+            Some(ExecEvent::Finished(result)) => return result,
+            Some(_) => {}
+            None => panic!("the execution ended without a result"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_stops_the_statement_waiting_for_its_turn_too() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    // A holds the session; B waits behind it when the cancel comes (as a
+    // statement waits behind a result being let go): B is not sent, rather
+    // than run in full after a cancel the idle server would ignore.
+    let mut first = exec::run(session.clone(), "SELECT pg_sleep(1)".into(), RowLimit::All);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut second = exec::run(session.clone(), "SELECT pg_sleep(30)".into(), RowLimit::All);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = Instant::now();
+    session.cancel().await.unwrap();
+    let first = ending(&mut first).await.unwrap_err();
+    assert_eq!(first.db().and_then(|db| db.code.as_deref()), Some("57014"));
+    assert!(matches!(ending(&mut second).await, Err(Error::Cancelled)));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // A cancel of an idle session leaves the next statement alone.
+    session.cancel().await.unwrap();
+    assert_eq!(
+        scalar(&session, "SELECT pg_sleep(0.2)::text || 'next'").await,
+        "next"
+    );
+}
+
+#[tokio::test]
 async fn every_type_arrives_in_its_text_form() {
     let Some(session) = common::session().await else {
         return;

@@ -108,11 +108,13 @@ SELECT n.nspname AS schema,
        CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows,
        pg_catalog.pg_table_size(c.oid) AS table_bytes,
        pg_catalog.pg_indexes_size(c.oid) AS index_bytes,
-       pg_catalog.pg_total_relation_size(c.oid) AS total_bytes,
-       pg_catalog.pg_size_pretty(pg_catalog.pg_total_relation_size(c.oid)) AS total
+       s.total_bytes,
+       pg_catalog.pg_size_pretty(s.total_bytes) AS total
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'm') AND {USER_SCHEMAS}
+CROSS JOIN LATERAL (SELECT pg_catalog.pg_total_relation_size(c.oid) AS total_bytes) s
+-- A table dropped while the list is read has no size (NULL): it is gone.
+WHERE c.relkind IN ('r', 'm') AND {USER_SCHEMAS} AND s.total_bytes IS NOT NULL
 ORDER BY 6 DESC, 1, 2"
         ),
         AdminView::Settings => "\

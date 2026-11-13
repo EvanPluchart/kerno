@@ -163,6 +163,22 @@ async fn tls_modes_without_verification() {
             .await
             .unwrap();
         assert_eq!(scalar(&session, SSL_IN_USE).await, expected, "{mode:?}");
+        // The cancel request takes the same route, and is acted on.
+        let mut execution = exec::run(session.clone(), "SELECT pg_sleep(30)".into(), RowLimit::All);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        session.cancel().await.expect("the cancel request");
+        let error = loop {
+            match common::next_event(&mut execution).await {
+                Some(ExecEvent::Finished(result)) => break result.unwrap_err(),
+                Some(_) => {}
+                None => panic!("the execution ended without a result"),
+            }
+        };
+        assert_eq!(
+            error.db().and_then(|db| db.code.as_deref()),
+            Some("57014"),
+            "{mode:?}: {error:?}"
+        );
     }
 }
 

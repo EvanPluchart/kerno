@@ -689,3 +689,19 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   rows or notices belong together; and a session opened on the object's database serves a database node
   other than the tab's. The session is closed when the statement ends, and closing the dialog cancels it.
 
+
+## D-039 — A cancel is over when the server has acted on it, and covers a statement not yet sent
+
+- PostgreSQL cancels through a second connection, and the server signals the session's backend from
+  another process. tokio-postgres returns once the request is written, so the cancel of a result being let
+  go could land on the session's next statement and stop that one (seen as tests that timed out one run in
+  ten). The cancel now waits for the server to close the cancel connection, as libpq's `PQcancel` and
+  pgJDBC do, at most 10 s. Cost: one more round trip on each cancel, and the session is held meanwhile.
+- On both engines `Session::cancel` also stops a statement asked for and not yet sent (waiting for its turn
+  on the session, or being described): the server, idle at that moment, would ignore the request and the
+  statement would then run in full. Still ignored, as the protocols give no way to tell: a cancel that
+  reaches the server in the instant between the statement being written and being read.
+- The PostgreSQL table-sizes list leaves out a table with no size: it was dropped while the list was read,
+  and `NULL` sorts first in a descending order.
+- Tests assert only on objects of their own (`docs/plans/README.md`, "Reliability of the suite"); a failed
+  test's cleanup reports what it could not drop instead of panicking a second time, which aborted the run.

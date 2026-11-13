@@ -1,7 +1,9 @@
 //! Opening a PostgreSQL connection: TLS configuration, direct or tunnelled
 //! transport, and cancel requests over the same transport.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use kerno_core::config::{ConnectParams, TlsConfig, TlsMode};
@@ -15,6 +17,7 @@ use rustls::{
 };
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::tls::MakeTlsConnect;
@@ -35,26 +38,142 @@ pub(crate) struct CancelRoute {
 }
 
 impl CancelRoute {
+    /// Sends a cancel request and returns once the server has acted on it.
+    ///
+    /// The server signals the session's backend from another process: a
+    /// request that is merely sent can land after the session's next
+    /// statement has started, and stop that one instead. So, as libpq's
+    /// `PQcancel` and pgJDBC do, wait for the server to close the cancel
+    /// connection, which it does once the signal is sent.
     pub(crate) async fn cancel(&self) -> Result<()> {
-        let outcome = match &self.tunnel {
-            None => self.token.cancel_query(self.tls.clone()).await,
-            Some(tunnel) => {
-                let stream = tunnel.open_stream(&self.host, self.port).await?;
-                let connect = tls_connect_for(&self.tls, &self.host)?;
-                self.token.cancel_query_raw(stream, connect).await
+        let text = |error: &dyn std::fmt::Display| error.to_string();
+        let sending = async {
+            match &self.tunnel {
+                // A Unix socket directory, as tokio-postgres reads the host.
+                None if self.host.starts_with('/') => {
+                    let path = format!("{}/.s.PGSQL.{}", self.host, self.port);
+                    let stream = tokio::net::UnixStream::connect(path)
+                        .await
+                        .map_err(|error| text(&error))?;
+                    let connect = tls_connect_for::<UntilClosed<tokio::net::UnixStream>>(
+                        &self.tls, &self.host,
+                    )
+                    .map_err(|e| text(&e))?;
+                    self.token
+                        .cancel_query_raw(UntilClosed::new(stream), connect)
+                        .await
+                        .map_err(|error| text(&error))
+                }
+                None => {
+                    let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
+                        .await
+                        .map_err(|error| text(&error))?;
+                    let connect = tls_connect_for::<UntilClosed<tokio::net::TcpStream>>(
+                        &self.tls, &self.host,
+                    )
+                    .map_err(|e| text(&e))?;
+                    self.token
+                        .cancel_query_raw(UntilClosed::new(stream), connect)
+                        .await
+                        .map_err(|error| text(&error))
+                }
+                Some(tunnel) => {
+                    let stream = tunnel
+                        .open_stream(&self.host, self.port)
+                        .await
+                        .map_err(|error| text(&error))?;
+                    let connect =
+                        tls_connect_for::<UntilClosed<TunnelStream>>(&self.tls, &self.host)
+                            .map_err(|e| text(&e))?;
+                    self.token
+                        .cancel_query_raw(UntilClosed::new(stream), connect)
+                        .await
+                        .map_err(|error| text(&error))
+                }
             }
         };
-        outcome
-            .map_err(|error| Error::Connect(format!("could not send the cancel request: {error}")))
+        match tokio::time::timeout(CANCEL_TIMEOUT, sending).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::Connect(format!(
+                "could not send the cancel request: {error}"
+            ))),
+            Err(_) => Err(Error::Connect(
+                "the server did not answer the cancel request".into(),
+            )),
+        }
     }
 }
 
-fn tls_connect_for(
+/// How long a cancel request may take, sent and acted on.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The transport of a cancel request: shutting it down also waits for the
+/// server to close its end (see [`CancelRoute::cancel`]).
+struct UntilClosed<S> {
+    stream: S,
+    /// The write side is shut: a stream is not asked to do it twice.
+    shut: bool,
+}
+
+impl<S> UntilClosed<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            shut: false,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for UntilClosed<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for UntilClosed<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if !self.shut {
+            std::task::ready!(Pin::new(&mut self.stream).poll_shutdown(cx))?;
+            self.shut = true;
+        }
+        // The server sends nothing back: read until it closes.
+        let mut scratch = [0u8; 64];
+        loop {
+            let mut buf = ReadBuf::new(&mut scratch);
+            std::task::ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buf))?;
+            if buf.filled().is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
+fn tls_connect_for<S>(
     tls: &MakeRustlsConnect,
     host: &str,
-) -> Result<<MakeRustlsConnect as MakeTlsConnect<TunnelStream>>::TlsConnect> {
+) -> Result<<MakeRustlsConnect as MakeTlsConnect<S>>::TlsConnect>
+where
+    MakeRustlsConnect: MakeTlsConnect<S>,
+    <MakeRustlsConnect as MakeTlsConnect<S>>::Error: std::fmt::Display,
+{
     let mut make = tls.clone();
-    <MakeRustlsConnect as MakeTlsConnect<TunnelStream>>::make_tls_connect(&mut make, host)
+    <MakeRustlsConnect as MakeTlsConnect<S>>::make_tls_connect(&mut make, host)
         .map_err(|error| Error::Tls(error.to_string()))
 }
 
@@ -129,7 +248,7 @@ pub(crate) async fn open(
         }
         Some(tunnel) => {
             let stream = tunnel.open_stream(&params.host, params.port).await?;
-            let connect = tls_connect_for(&tls, &params.host)?;
+            let connect = tls_connect_for::<TunnelStream>(&tls, &params.host)?;
             let (client, connection) =
                 tokio::time::timeout(timeout, config.connect_raw(stream, connect))
                     .await

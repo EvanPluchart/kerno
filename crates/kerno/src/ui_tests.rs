@@ -173,12 +173,28 @@ impl Fixture {
             if done(self, cx) {
                 return;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {what}; {}", self.situation(cx));
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// What the window shows, for the message of a wait that timed out:
+    /// the tabs, the active query tab's results, the status bar.
+    fn situation(&self, cx: &mut TestAppContext) -> String {
+        let tabs = self.titles(cx);
+        let status = self.status_bar(cx);
+        let query = cx.update(|cx| {
+            let tab = self.workspace.read(cx).active_query_tab()?.read(cx);
+            Some(format!(
+                "results {:?}, {:?}, messages {:?}",
+                tab.outcomes(cx),
+                tab.activity(),
+                tab.messages()
+            ))
+        });
+        format!("tabs {tabs:?}, status bar {status:?}, query tab: {query:?}")
     }
 
     fn status(&self, cx: &mut TestAppContext, index: usize) -> Status {
@@ -1889,6 +1905,23 @@ fn on_database(engine: Engine, database: Option<&str>, sql: &str) -> String {
     .expect("the statement ran")
 }
 
+/// Whether a statement whose text holds `marker` is running on the server,
+/// in a session other than the one asking. A cancel sent before that is
+/// ignored by the server: tests that cancel wait for it.
+fn running_on_server(engine: Engine, marker: &str) -> bool {
+    let sql = match engine {
+        Engine::Postgres => format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' \
+             AND query LIKE '%{marker}%' AND pid <> pg_backend_pid()"
+        ),
+        Engine::MySql | Engine::MariaDb => format!(
+            "SELECT count(*) FROM information_schema.processlist WHERE COMMAND = 'Query' \
+             AND INFO LIKE '%{marker}%' AND ID <> CONNECTION_ID()"
+        ),
+    };
+    on_server(engine, &sql) != "0"
+}
+
 /// Objects of one test, on a test server, removed when the test ends
 /// whether it passed or not.
 struct Scratch {
@@ -1914,7 +1947,20 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         for sql in &self.cleanup {
             // Runs on its own thread: a failed test must still clean up.
-            on_server(self.engine, sql);
+            if !std::thread::panicking() {
+                on_server(self.engine, sql);
+                continue;
+            }
+            // A second panic would abort the whole run, and leave every
+            // other running test's objects behind too: say why and go on
+            // (the next run of this test drops what is left first).
+            let (engine, owned) = (self.engine, sql.clone());
+            if std::thread::spawn(move || on_server(engine, &owned))
+                .join()
+                .is_err()
+            {
+                eprintln!("cleanup of a failed test did not run: {sql}");
+            }
         }
     }
 }
@@ -2663,14 +2709,17 @@ fn a_large_result_arrives_a_page_at_a_time(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_running_statement_is_cancelled_and_the_window_stays_usable(cx: &mut TestAppContext) {
     for (engine, slow) in [
-        (Engine::Postgres, "select pg_sleep(60)"),
+        (
+            Engine::Postgres,
+            "select pg_sleep(60) as kerno_ui_cancel_run",
+        ),
         (
             Engine::MySql,
-            "select count(*) from kerno.orders where sleep(0.05) = 0",
+            "select count(*) as kerno_ui_cancel_run from kerno.orders where sleep(0.05) = 0",
         ),
         (
             Engine::MariaDb,
-            "select count(*) from kerno.orders where sleep(0.05) = 0",
+            "select count(*) as kerno_ui_cancel_run from kerno.orders where sleep(0.05) = 0",
         ),
     ] {
         if !testing::available(engine) {
@@ -2678,7 +2727,9 @@ fn a_running_statement_is_cancelled_and_the_window_stays_usable(cx: &mut TestApp
         }
         let app = connected(cx, engine);
         app.run_in_new_tab(cx, slow, "secondary-enter");
-        app.wait_until(cx, "the statement to start", |app, cx| app.running(cx));
+        app.wait_until(cx, "the statement to start", |app, cx| {
+            app.running(cx) && running_on_server(engine, "kerno_ui_cancel_run")
+        });
         assert!(app.has(cx, "tab-cancel"), "{engine:?}");
 
         // While it runs the window answers: another tab opens, the tree is there.
@@ -4622,14 +4673,14 @@ fn rows_that_cannot_be_addressed_are_read_only_and_say_why(cx: &mut TestAppConte
     }
     let _scratch = Scratch::new(
         Engine::Postgres,
-        &["DROP SCHEMA IF EXISTS kerno_ui_keys CASCADE"],
+        &["DROP SCHEMA IF EXISTS kerno_ui_keyless CASCADE"],
         &[
-            "CREATE SCHEMA kerno_ui_keys",
-            "CREATE TABLE kerno_ui_keys.keyless (name text, body text)",
-            "INSERT INTO kerno_ui_keys.keyless VALUES ('a', repeat('long ', 100))",
-            "CREATE TABLE kerno_ui_keys.keyed (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
-            "INSERT INTO kerno_ui_keys.keyed VALUES (1)",
-            "CREATE VIEW kerno_ui_keys.names AS SELECT name FROM kerno_ui_keys.keyless",
+            "CREATE SCHEMA kerno_ui_keyless",
+            "CREATE TABLE kerno_ui_keyless.keyless (name text, body text)",
+            "INSERT INTO kerno_ui_keyless.keyless VALUES ('a', repeat('long ', 100))",
+            "CREATE TABLE kerno_ui_keyless.keyed (id int PRIMARY KEY, doubled int GENERATED ALWAYS AS (id * 2) STORED)",
+            "INSERT INTO kerno_ui_keyless.keyed VALUES (1)",
+            "CREATE VIEW kerno_ui_keyless.names AS SELECT name FROM kerno_ui_keyless.keyless",
         ],
     );
     let reason = |app: &Fixture, cx: &mut TestAppContext| {
@@ -4638,7 +4689,7 @@ fn rows_that_cannot_be_addressed_are_read_only_and_say_why(cx: &mut TestAppConte
     };
     let app = connected(cx, Engine::Postgres);
     // No key: a row cannot be told from another.
-    app.open_table(cx, "kerno_ui_keys", "keyless", RelationKind::Table);
+    app.open_table(cx, "kerno_ui_keyless", "keyless", RelationKind::Table);
     app.wait_for_rows(cx, "Rows 1–1 of 1");
     assert!(reason(&app, cx).unwrap().contains("no primary key"));
     assert!(app.has(cx, "data-read-only") && !app.has(cx, "data-add-row"));
@@ -4649,11 +4700,11 @@ fn rows_that_cannot_be_addressed_are_read_only_and_say_why(cx: &mut TestAppConte
     app.on_data(cx, |tab, window, cx| tab.add_row(window, cx));
     assert_eq!(app.pending(cx), 0);
     // A view.
-    app.open_table(cx, "kerno_ui_keys", "names", RelationKind::View);
+    app.open_table(cx, "kerno_ui_keyless", "names", RelationKind::View);
     app.wait_for_rows(cx, "Rows 1–1 of 1");
     assert!(reason(&app, cx).unwrap().contains("view"));
     // A table with a key takes changes, except in its computed column.
-    app.open_table(cx, "kerno_ui_keys", "keyed", RelationKind::Table);
+    app.open_table(cx, "kerno_ui_keyless", "keyed", RelationKind::Table);
     app.wait_for_rows(cx, "Rows 1–1 of 1");
     assert_eq!(reason(&app, cx), None);
     assert!(app.has(cx, "data-add-row"));
@@ -4666,7 +4717,7 @@ fn rows_that_cannot_be_addressed_are_read_only_and_say_why(cx: &mut TestAppConte
     let mut config = testing::config(Engine::Postgres);
     config.read_only = true;
     let app = connected_as(cx, config);
-    app.open_table(cx, "kerno_ui_keys", "keyed", RelationKind::Table);
+    app.open_table(cx, "kerno_ui_keyless", "keyed", RelationKind::Table);
     app.wait_for_rows(cx, "Rows 1–1 of 1");
     assert!(reason(&app, cx).unwrap().contains("read-only connection"));
     assert!(!app.has(cx, "data-add-row"));
@@ -4746,8 +4797,9 @@ fn a_slow_page_is_cancelled_and_the_tab_stays_usable(cx: &mut TestAppContext) {
         tab.set_filter(slow, window, cx)
     });
     // Let the statement reach the server before stopping it.
-    std::thread::sleep(Duration::from_millis(300));
-    cx.run_until_parked();
+    app.wait_until(cx, "the slow page on the server", |_, _| {
+        running_on_server(Engine::Postgres, "pg_sleep(30) IS NOT NULL")
+    });
     assert_eq!(app.data_state(cx), "loading");
     assert!(app.status_bar(cx).contains(&"running…".to_string()));
     app.press(cx, &["secondary-."]);
@@ -7521,8 +7573,14 @@ fn roles_and_their_grants_sizes_and_settings_are_listed(cx: &mut TestAppContext)
             .iter()
             .position(|header| header == "Total size")
             .unwrap();
-        assert_eq!(tables[0][1], "big_table", "{engine:?}");
-        assert!(tables[0][total].ends_with(" MB"), "{:?}", tables[0]);
+        // Other tests' scratch tables come and go meanwhile; the fixture's
+        // biggest table comes before the rest of the fixture.
+        let fixture: Vec<_> = tables
+            .iter()
+            .filter(|row| !row[0].starts_with("kerno_ui_") && !row[0].starts_with("kerno_test_"))
+            .collect();
+        assert_eq!(fixture[0][1], "big_table", "{engine:?}: {tables:?}");
+        assert!(fixture[0][total].ends_with(" MB"), "{:?}", fixture[0]);
 
         // Settings, filtered.
         app.on_admin(cx, |tab, window, cx| tab.select(SETTINGS, window, cx));
@@ -9109,9 +9167,11 @@ fn result_tabs_close_pin_and_rename(cx: &mut TestAppContext) {
 
     // Cancel stops what runs and leaves the kept results alone; the
     // result that was waiting to be paged stops there.
-    app.retype(cx, "select pg_sleep(60)");
+    app.retype(cx, "select pg_sleep(60) as kerno_ui_result_tabs");
     app.press(cx, &["secondary-\\"]);
-    app.wait_until(cx, "the statement to start", |app, cx| app.running(cx));
+    app.wait_until(cx, "the statement to start", |app, cx| {
+        app.running(cx) && running_on_server(Engine::Postgres, "kerno_ui_result_tabs")
+    });
     app.press(cx, &["secondary-."]);
     app.wait_until(cx, "the cancellation", |app, cx| !app.running(cx));
     assert_eq!(
@@ -9295,7 +9355,26 @@ fn held_by(engine: Engine, role: &str) -> (usize, usize) {
     (sessions.parse().unwrap(), idle.parse().unwrap())
 }
 
-/// Lets the app and the server work for up to five seconds, until `role`
+/// The sessions of `role` and what each last ran, for the message of a
+/// count that never became the expected one.
+fn session_history(engine: Engine, role: &str) -> String {
+    let sql = match engine {
+        Engine::Postgres => format!(
+            "SELECT string_agg(concat_ws(' | ', pid, state, backend_start, left(query, 200)), \
+             E'\\n') FROM pg_stat_activity WHERE usename = '{role}'"
+        ),
+        Engine::MySql | Engine::MariaDb => format!(
+            "SELECT json_pretty(json_arrayagg(concat_ws(' | ', t.processlist_id, \
+             t.processlist_command, t.processlist_time, h.event_id, left(h.sql_text, 200)))) \
+             FROM performance_schema.threads t \
+             LEFT JOIN performance_schema.events_statements_history h USING (thread_id) \
+             WHERE t.processlist_user = '{role}'"
+        ),
+    };
+    on_server(engine, &sql)
+}
+
+/// Lets the app and the server work for up to twenty seconds, until `role`
 /// holds `expected`; gives what it holds then.
 fn settle(
     cx: &mut TestAppContext,
@@ -9309,7 +9388,14 @@ fn settle(
     loop {
         cx.run_until_parked();
         let held = held_by(engine, role);
-        if held == expected || std::time::Instant::now() > deadline {
+        if held == expected {
+            return held;
+        }
+        if std::time::Instant::now() > deadline {
+            eprintln!(
+                "{engine:?}: {role} holds {held:?}, not {expected:?}:\n{}",
+                session_history(engine, role)
+            );
             return held;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -13526,37 +13612,37 @@ fn f4_on_a_database_or_a_schema_shows_its_properties(cx: &mut TestAppContext) {
         let pg = engine == Engine::Postgres;
         let (cleanup, setup): (&str, Vec<&str>) = if pg {
             (
-                "DROP SCHEMA IF EXISTS kerno_ui_props CASCADE",
+                "DROP SCHEMA IF EXISTS kerno_ui_f4_props CASCADE",
                 vec![
-                    "CREATE SCHEMA kerno_ui_props",
-                    "CREATE TABLE kerno_ui_props.items (id int PRIMARY KEY)",
-                    "COMMENT ON SCHEMA kerno_ui_props IS 'kerno props'",
+                    "CREATE SCHEMA kerno_ui_f4_props",
+                    "CREATE TABLE kerno_ui_f4_props.items (id int PRIMARY KEY)",
+                    "COMMENT ON SCHEMA kerno_ui_f4_props IS 'kerno props'",
                 ],
             )
         } else if engine == Engine::MariaDb {
             (
-                "DROP DATABASE IF EXISTS kerno_ui_props",
+                "DROP DATABASE IF EXISTS kerno_ui_f4_props",
                 vec![
-                    "CREATE DATABASE kerno_ui_props CHARACTER SET latin1 COLLATE latin1_bin \
+                    "CREATE DATABASE kerno_ui_f4_props CHARACTER SET latin1 COLLATE latin1_bin \
                      COMMENT 'kerno props'",
-                    "CREATE TABLE kerno_ui_props.items (id INT PRIMARY KEY)",
+                    "CREATE TABLE kerno_ui_f4_props.items (id INT PRIMARY KEY)",
                 ],
             )
         } else {
             (
-                "DROP DATABASE IF EXISTS kerno_ui_props",
+                "DROP DATABASE IF EXISTS kerno_ui_f4_props",
                 vec![
-                    "CREATE DATABASE kerno_ui_props CHARACTER SET latin1 COLLATE latin1_bin",
-                    "CREATE TABLE kerno_ui_props.items (id INT PRIMARY KEY)",
+                    "CREATE DATABASE kerno_ui_f4_props CHARACTER SET latin1 COLLATE latin1_bin",
+                    "CREATE TABLE kerno_ui_f4_props.items (id INT PRIMARY KEY)",
                 ],
             )
         };
         let _scratch = Scratch::new(engine, &[cleanup], &setup);
         let app = connected(cx, engine);
         let node: Vec<&str> = if pg {
-            vec!["kerno", "kerno_ui_props"]
+            vec!["kerno", "kerno_ui_f4_props"]
         } else {
-            vec!["kerno_ui_props"]
+            vec!["kerno_ui_f4_props"]
         };
         app.wait_until(cx, "the scratch node", |app, cx| app.shows(cx, &node));
         app.click_row(cx, &node, false);

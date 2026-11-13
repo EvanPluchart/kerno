@@ -6,7 +6,7 @@
 //! That protocol does not report column types, so statements that return
 //! rows are described first (`Parse`/`Describe`) to learn them.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -40,6 +40,12 @@ pub struct PgSession {
     link: Mutex<Link>,
     cancel: CancelRoute,
     tx_state: AtomicU8,
+    /// How many times [`Session::cancel`] was called. A cancel that comes
+    /// after a statement was asked for and before it is sent (while it waits
+    /// for its turn on the session, or is being described) is for that
+    /// statement: it is not sent at all (the server, idle then, would
+    /// ignore the cancel request).
+    cancels: AtomicU64,
     server: ServerInfo,
     database: String,
     dialect: PgDialect,
@@ -82,6 +88,7 @@ impl PgSession {
             }),
             cancel,
             tx_state: AtomicU8::new(TX_IDLE),
+            cancels: AtomicU64::new(0),
             server,
             database,
             dialect: PgDialect,
@@ -107,8 +114,18 @@ impl PgSession {
     }
 
     /// Runs one statement, writing to the sink. Returns `Err(Cancelled)`
-    /// when the sink reported that the consumer left.
-    async fn run(&self, link: &mut Link, sql: &str, sink: &mut ExecSink) -> Result<()> {
+    /// when the sink reported that the consumer left, or when the session
+    /// was cancelled since `cancels` was read (the count of cancels when
+    /// the statement was asked for): `sent` then stays false, the
+    /// statement never reached the server.
+    async fn run(
+        &self,
+        link: &mut Link,
+        sql: &str,
+        sink: &mut ExecSink,
+        cancels: u64,
+        sent: &mut bool,
+    ) -> Result<()> {
         let Link { client, events } = link;
         let client = client.as_ref().ok_or_else(closed)?;
 
@@ -143,6 +160,13 @@ impl PgSession {
             }
         }
 
+        // A cancel that came while this statement waited for the session
+        // (behind a result being let go, say) or was described would find
+        // the server idle and be lost: the statement is not sent.
+        if self.cancels.load(Ordering::Acquire) != cancels {
+            return Err(Error::Cancelled);
+        }
+        *sent = true;
         let stream = client
             .simple_query_raw(sql)
             .await
@@ -384,10 +408,16 @@ impl Session for PgSession {
     }
 
     async fn execute(&self, sql: &str, sink: &mut ExecSink) -> Result<()> {
+        let cancels = self.cancels.load(Ordering::Acquire);
         let mut link = self.link.lock().await;
         let effect = tx_effect(sql);
-        let outcome = self.run(&mut link, sql, sink).await;
+        let mut sent = false;
+        let outcome = self.run(&mut link, sql, sink, cancels, &mut sent).await;
         if matches!(outcome, Err(Error::Cancelled)) {
+            // Cancelled before it was sent: nothing to stop.
+            if !sent {
+                return outcome;
+            }
             // The consumer left. The statement's remaining output is
             // discarded by the connection, in order, before the next
             // statement's answer is read.
@@ -410,6 +440,8 @@ impl Session for PgSession {
     }
 
     async fn cancel(&self) -> Result<()> {
+        // First: a statement about to be sent sees it.
+        self.cancels.fetch_add(1, Ordering::AcqRel);
         self.cancel.cancel().await
     }
 

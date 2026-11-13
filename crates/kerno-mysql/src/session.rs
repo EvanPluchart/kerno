@@ -6,7 +6,7 @@
 //! differently). Cancelling goes through a second, short-lived connection
 //! that sends `KILL QUERY`, the only way the protocol offers.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -82,6 +82,11 @@ pub struct MysqlSession {
     database: std::sync::Mutex<Option<String>>,
     /// The server's "in a transaction" status flag after the last statement.
     in_transaction: AtomicBool,
+    /// How many times [`Session::cancel`] was called. A cancel that comes
+    /// while a statement waits for its turn on the session is for that
+    /// statement: it is not sent at all (`KILL QUERY` would find the
+    /// connection idle, or busy with what is being let go).
+    cancels: AtomicU64,
 }
 
 /// Why a statement stopped before its results were all delivered.
@@ -151,6 +156,7 @@ impl MysqlSession {
             dialect: MysqlDialect::new(engine),
             database: std::sync::Mutex::new(None),
             in_transaction: AtomicBool::new(false),
+            cancels: AtomicU64::new(0),
         };
 
         // The literals below must be written for the mode the session is in.
@@ -539,13 +545,19 @@ impl Session for MysqlSession {
     }
 
     async fn execute(&self, sql: &str, sink: &mut ExecSink) -> Result<()> {
+        let cancels = self.cancels.load(Ordering::Acquire);
         let mut link = self.link.lock().await;
+        if self.cancels.load(Ordering::Acquire) != cancels {
+            return Err(Error::Cancelled);
+        }
         let outcome = self.execute_on(link.begin()?, sql, sink).await;
         link.end();
         outcome
     }
 
     async fn cancel(&self) -> Result<()> {
+        // First: a statement waiting for the session sees it.
+        self.cancels.fetch_add(1, Ordering::AcqRel);
         self.kill_query().await
     }
 

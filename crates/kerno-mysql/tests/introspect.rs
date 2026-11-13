@@ -15,6 +15,18 @@ use kerno_core::schema::{
 use kerno_core::sql::{LexRules, split_statements};
 use kerno_core::{AdminView, Error, Session, TypeKind};
 
+/// The rows of a list whose first column is not another test's scratch
+/// database or schema.
+fn fixture_rows(rows: &[Vec<Option<String>>]) -> Vec<&Vec<Option<String>>> {
+    rows.iter()
+        .filter(|row| {
+            row[0].as_deref().is_some_and(|name| {
+                !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_")
+            })
+        })
+        .collect()
+}
+
 fn names<T>(items: &[T], name: impl Fn(&T) -> &str) -> Vec<&str> {
     items.iter().map(name).collect()
 }
@@ -1448,6 +1460,8 @@ async fn administrative_views() {
             columns,
             ["database", "encoding", "collation", "tables", "size_bytes"]
         );
+        // Other tests' scratch databases come and go meanwhile.
+        let databases = fixture_rows(&databases);
         assert_eq!(
             databases[0][0].as_deref(),
             Some("kerno_analytics"),
@@ -1463,6 +1477,7 @@ async fn administrative_views() {
 
         let (columns, tables) = view(AdminView::TableSizes).await;
         assert_eq!(&columns[..2], ["database", "table"]);
+        let tables = fixture_rows(&tables);
         assert_eq!(
             (tables[0][0].as_deref(), tables[0][1].as_deref()),
             (Some("kerno_analytics"), Some("big_table")),

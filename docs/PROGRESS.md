@@ -297,6 +297,11 @@ Found and fixed on the way:
 - A MySQL column edit lost `ON UPDATE CURRENT_TIMESTAMP`, `INVISIBLE`, and a PostgreSQL identity turned off
   and on became `BY DEFAULT`; a foreign key on its own table did not follow a column rename. All carried
   or fixed, with tests on the servers (D-027).
+- Reliability of the suite (D-039): the PostgreSQL cancel waits for the server to act (the cancel of a
+  dropped result stopped the next statement), a cancel covers a statement not yet sent on both engines, the
+  sizes list leaves out a table being dropped, tests assert on their own objects only and wait for the
+  statement to be on the server before cancelling. `docs/plans/README.md` has the rules. Measured: the app
+  suite 20 of 20 before review, then 12 of 12, and the workspace 8 of 9, after it.
 
 Still open:
 
@@ -376,8 +381,11 @@ Committed since `f982e77` (HEAD `409c4fc`). One line per commit or group:
 
 Still open:
 
-- The reliability of the test suite (in progress): timing-dependent tests and tests that depend on what
-  others leave on the servers; the full run with the containers up must pass repeatedly.
+- One test still fails about once in forty full runs:
+  `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user, both idle in
+  a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test
+  now prints those sessions and their last statements when the count never settles, so the next failure
+  names its cause.
 - A third list of visual defects (`plans/M10.md` Part 4).
 - The clean performance measurement on an idle machine and `docs/BENCH.md` (GOAL criterion 5).
 - The final screenshots in `docs/screenshots/final/` (criterion 7).

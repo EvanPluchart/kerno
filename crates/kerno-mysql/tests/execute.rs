@@ -131,6 +131,61 @@ async fn abandoning_a_suspended_result_stops_the_server() {
 }
 
 #[tokio::test]
+async fn the_kill_of_an_abandoned_result_never_stops_the_next_statement() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        // The whole small result is on its way when the consumer lets it
+        // go: the statement is over on the server when the kill arrives.
+        for round in 0..30 {
+            let mut execution = exec::run(
+                session.clone(),
+                "SELECT id FROM kerno.orders".into(),
+                RowLimit::Rows(1_000),
+            );
+            let (seen, complete) = read_rows(&mut execution, 1_000).await;
+            assert_eq!((seen, complete), (1_000, false));
+            drop(execution);
+            let next = run(&session, "SELECT SLEEP(0.05), 'next'").await;
+            assert!(next.is_ok(), "{engine:?} round {round}: {next:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_stops_the_statement_waiting_for_its_turn_too() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        // A holds the session; B waits behind it when the cancel comes: B
+        // is not sent, rather than run in full after the kill.
+        let mut first = exec::run(session.clone(), "SELECT SLEEP(1)".into(), RowLimit::All);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut second = exec::run(session.clone(), "SELECT SLEEP(30)".into(), RowLimit::All);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        session.cancel().await.unwrap();
+        // SLEEP ends early and quietly when killed.
+        let _ = finish(&mut first).await;
+        assert!(
+            matches!(finish(&mut second).await, Err(Error::Cancelled)),
+            "{engine:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{engine:?}: {:?}",
+            started.elapsed()
+        );
+
+        // A cancel of an idle session leaves the next statement alone.
+        session.cancel().await.unwrap();
+        assert_eq!(
+            scalar(&session, "SELECT CONCAT(SLEEP(0.2), 'next')").await,
+            "0next",
+            "{engine:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn fetch_all_delivers_every_row_in_order() {
     for engine in engines() {
         let session = common::session(engine).await;

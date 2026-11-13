@@ -10,6 +10,18 @@ use kerno_core::schema::{
 };
 use kerno_core::{AdminView, Error, TypeKind};
 
+/// The rows of a list whose first column is not another test's scratch
+/// database or schema.
+fn fixture_rows(rows: &[Vec<Option<String>>]) -> Vec<&Vec<Option<String>>> {
+    rows.iter()
+        .filter(|row| {
+            row[0].as_deref().is_some_and(|name| {
+                !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_")
+            })
+        })
+        .collect()
+}
+
 fn names<T>(items: &[T], name: impl Fn(&T) -> &str) -> Vec<&str> {
     items.iter().map(name).collect()
 }
@@ -1050,16 +1062,23 @@ async fn administrative_views() {
         columns,
         ["database", "owner", "encoding", "size_bytes", "size"]
     );
-    assert_eq!(databases[0][0].as_deref(), Some("kerno"), "largest first");
+    // Other tests' scratch databases come and go meanwhile.
+    assert_eq!(
+        fixture_rows(&databases)[0][0].as_deref(),
+        Some("kerno"),
+        "largest first"
+    );
 
     let (columns, tables) = view(AdminView::TableSizes).await;
     assert_eq!(&columns[..2], ["schema", "table"]);
+    // Other tests' scratch tables come and go meanwhile.
+    let fixture = fixture_rows(&tables);
     assert_eq!(
-        (tables[0][0].as_deref(), tables[0][1].as_deref()),
+        (fixture[0][0].as_deref(), fixture[0][1].as_deref()),
         (Some("analytics"), Some("big_table")),
         "largest first"
     );
-    assert_eq!(tables[0][2].as_deref(), Some("1000000"));
+    assert_eq!(fixture[0][2].as_deref(), Some("1000000"));
 
     let (columns, settings) = view(AdminView::Settings).await;
     assert_eq!(&columns[..2], ["name", "value"]);
@@ -1071,6 +1090,48 @@ async fn administrative_views() {
     assert_eq!(ssl[1].as_deref(), Some("on"));
 
     let _ = rows(&session, "SELECT 1").await;
+}
+
+#[tokio::test]
+async fn a_table_dropped_while_the_sizes_are_read_is_not_listed() {
+    let Some(reader) = common::session().await else {
+        return;
+    };
+    let other = common::session().await.unwrap();
+    let schema = common::scratch_schema("sizes_gone");
+    exec_ok(&other, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&other, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(
+        &other,
+        &format!("CREATE TABLE {schema}.t AS SELECT generate_series(1, 10) AS n"),
+    )
+    .await;
+    // The reader's snapshot still has the table when it is dropped: its
+    // size can no longer be read, as when a drop commits during the list.
+    exec_ok(&reader, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
+    assert_eq!(
+        scalar(
+            &reader,
+            &format!("SELECT count(*) FROM pg_class WHERE relnamespace = '{schema}'::regnamespace")
+        )
+        .await,
+        "1"
+    );
+    exec_ok(&other, &format!("DROP TABLE {schema}.t")).await;
+    let sizes = reader.admin_query(AdminView::TableSizes).unwrap();
+    let listed = run(&reader, &sizes).await;
+    exec_ok(&reader, "ROLLBACK").await;
+    exec_ok(&other, &format!("DROP SCHEMA {schema} CASCADE")).await;
+
+    let tables = listed.unwrap().results.remove(0).rows();
+    assert!(
+        tables
+            .iter()
+            .all(|row| row[0].as_deref() != Some(schema.as_str())),
+        "{tables:?}"
+    );
+    // Largest first: nothing without a size above the rest.
+    assert!(tables.iter().all(|row| row[5].is_some()), "{tables:?}");
 }
 
 #[tokio::test]
