@@ -1692,6 +1692,13 @@ impl Grid {
         !self.complete && self.demand.is_some() && self.store.row_count() as u64 >= self.requested
     }
 
+    /// Whether a click on a header has the server read the result again
+    /// in that order, rather than sorting the rows held here.
+    pub fn sorts_on_server(&self) -> bool {
+        self.sort_on_server.is_some()
+            || (self.reorder.is_some() && (!self.complete || self.edits.is_some()))
+    }
+
     /// Whether every row of the result is here.
     pub fn is_complete(&self) -> bool {
         self.complete

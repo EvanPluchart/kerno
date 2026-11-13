@@ -2,7 +2,9 @@
 # Measures Kerno against the performance targets of CLAUDE.md §5 with the
 # app's bench mode (crates/kerno/src/bench.rs) and prints one table.
 #
-#   scripts/bench.sh [runs]        (default 5 runs of each measure)
+#   scripts/bench.sh [runs] [startup-runs]
+#                                  (default 5 runs of each measure, 30 of the
+#                                  startup: it is short and varies the most)
 #
 # Needs the kerno-postgres and kerno-mysql containers (scripts/test-env.sh up)
 # and an idle machine: it refuses to measure while the 1-minute load average
@@ -15,6 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 runs="${1:-5}"
+startup_runs="${2:-30}"
 max_load=4
 bin="$PWD/target/release/kerno"
 
@@ -98,7 +101,7 @@ fresh() {
 }
 
 measure() {
-  local label="$1" mode="$2" connection="$3" sql="$4" password="$5"
+  local label="$1" mode="$2" connection="$3" sql="$4" password="$5" runs="${6:-$runs}"
   for i in $(seq 1 "$runs"); do
     wait_for_quiet
     echo "$label $i/$runs (load $(load1))" >&2
@@ -115,13 +118,17 @@ measure() {
   done
 }
 
-measure startup startup "" "" ""
+measure startup startup "" "" "" "$startup_runs"
 measure postgres first_rows postgres "SELECT * FROM analytics.big_table" "$pg_password"
 measure mysql first_rows mysql "SELECT * FROM kerno_analytics.big_table" "$my_password"
 measure scroll scroll postgres "SELECT * FROM analytics.big_table" "$pg_password"
+# A result of one table is edited like table data and ordered by the server;
+# the sort done here is timed on a result that is not one table's.
+measure sort first_rows postgres \
+  "SELECT * FROM analytics.big_table UNION ALL SELECT * FROM analytics.big_table WHERE false" "$pg_password"
 
 echo
-echo "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(date '+%Y-%m-%d %H:%M'), commit $(git rev-parse --short HEAD), load $(load1), $runs runs, median (min-max)"
+echo "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(date '+%Y-%m-%d %H:%M'), commit $(git rev-parse --short HEAD), load $(load1), $runs runs ($startup_runs of the startup), median (min-max)"
 python3 -I - "$raw" <<'PY'
 import json, statistics, sys
 from collections import defaultdict

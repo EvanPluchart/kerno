@@ -410,6 +410,13 @@ async fn run(
             // `analytics.big_table`), as a click on its header does; grid
             // column 0 numbers the rows.
             const SORTED: usize = 4;
+            // A result edited like table data is ordered by the server:
+            // there is no sort here to time.
+            if cx.update(|_, cx| grid.read(cx).delegate().sorts_on_server())? {
+                report(json!({"bench": "sort", "rows": rows, "on_server": true}));
+                cx.update(|_, cx| cx.quit())?;
+                return Ok(());
+            }
             let sorting = Instant::now();
             let column = cx.update(|window, cx| {
                 grid.update(cx, |table, cx| {
