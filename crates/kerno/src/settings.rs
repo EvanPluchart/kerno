@@ -1,6 +1,7 @@
 //! User settings, stored as one value in Kerno's storage.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use kerno_core::storage::Storage;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,10 @@ pub struct Settings {
     /// Ask before closing a tab that holds pending changes, unsaved text or
     /// a changed table form. An open transaction always asks.
     pub confirm_close_tab: bool,
+    /// The client tool binaries chosen by the user for backup and restore,
+    /// by tool name (`pg_dump`, `psql`, `pg_restore`, `mysqldump`, `mysql`);
+    /// the others are looked for where they are usually installed.
+    pub tool_paths: BTreeMap<String, PathBuf>,
 }
 
 impl Default for Settings {
@@ -71,6 +76,7 @@ impl Default for Settings {
             connection_folders: BTreeSet::new(),
             collapsed_folders: BTreeSet::new(),
             confirm_close_tab: true,
+            tool_paths: BTreeMap::new(),
         }
     }
 }
@@ -112,6 +118,7 @@ mod tests {
             connection_folders: ["Work".to_string(), "Work/Clients".to_string()].into(),
             collapsed_folders: ["Work/Clients".to_string()].into(),
             confirm_close_tab: false,
+            tool_paths: [("pg_dump".to_string(), PathBuf::from("/opt/pg/bin/pg_dump"))].into(),
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

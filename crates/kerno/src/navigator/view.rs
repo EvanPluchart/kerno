@@ -85,6 +85,8 @@ pub enum NavigatorEvent {
     },
     /// Make `target` (a database and schema) the active query tab's.
     SetDefault { target: Target },
+    /// Back up the database of `target`, or restore a file into it.
+    BackupRestore { target: Target, restore: bool },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -360,6 +362,22 @@ impl Navigator {
         }
     }
 
+    /// Reads `database` of `connection` again, when the tree shows it: what
+    /// a restore changed.
+    pub fn refresh_database(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
+        if self.connection.as_deref() != Some(connection) {
+            return;
+        }
+        let id = self.tree.items().into_iter().find_map(|item| {
+            let node = self.tree.node(&item.id)?;
+            (node.kind == NodeKind::Object(ObjectRef::Database(database.to_string())))
+                .then(|| item.id.clone())
+        });
+        if let Some(id) = id {
+            self.refresh(&id, cx);
+        }
+    }
+
     /// The session that answers for `database`, opened if it is not yet.
     fn session_for(
         &mut self,
@@ -591,6 +609,16 @@ impl Navigator {
                         target,
                         schema,
                         table,
+                    });
+                }
+            }
+            Action::Backup | Action::Restore => {
+                if self.unavailable(action, &node, cx).is_none()
+                    && let Some(target) = self.target_of(&node, false)
+                {
+                    cx.emit(NavigatorEvent::BackupRestore {
+                        target,
+                        restore: action == Action::Restore,
                     });
                 }
             }

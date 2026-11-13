@@ -52,6 +52,10 @@ pub enum Action {
     RenameEnumValue,
     Export,
     ImportCsv,
+    /// Writes a backup of a database with the engine's dump tool.
+    Backup,
+    /// Restores a backup file into a database with the engine's client tool.
+    Restore,
     Refresh,
     /// PostgreSQL `DROP … CASCADE`: also drops what depends on the object.
     DropCascade,
@@ -92,6 +96,8 @@ impl Action {
             Action::RenameEnumValue => "Rename value…",
             Action::Export => "Export…",
             Action::ImportCsv => "Import CSV…",
+            Action::Backup => "Back up…",
+            Action::Restore => "Restore…",
             Action::Refresh => "Refresh",
             Action::DropCascade => "Drop with cascade…",
             Action::CreateFunction => "Create function…",
@@ -124,6 +130,7 @@ impl Action {
                 | Action::AddEnumValue
                 | Action::RenameEnumValue
                 | Action::ImportCsv
+                | Action::Restore
                 | Action::DropCascade
                 | Action::RenameColumn
                 | Action::DropColumn
@@ -146,6 +153,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Object(ObjectRef::Database(_)) if has_schemas => {
             vec![
                 vec![NewQueryHere, CreateSchema, CreateDatabase],
+                vec![Backup, Restore],
                 vec![CopyName, CopyQualifiedName],
                 vec![Drop],
             ]
@@ -159,7 +167,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateDatabase,
             ],
-            vec![ImportCsv],
+            vec![ImportCsv, Backup, Restore],
             vec![ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
@@ -504,6 +512,11 @@ mod tests {
         assert!(view.contains(&Export) && !view.contains(&ImportCsv));
         assert!(schema.contains(&ImportCsv) && mysql_database.contains(&ImportCsv));
         assert!(!pg_database.contains(&ImportCsv));
+        // A database is what the client tools back up and restore.
+        for database in [&pg_database, &mysql_database] {
+            assert!(database.contains(&Backup) && database.contains(&Restore));
+        }
+        assert!(!schema.contains(&Backup) && !table.contains(&Restore));
         assert_eq!(
             flat(
                 NodeKind::Column {
@@ -835,6 +848,7 @@ mod tests {
             AddEnumValue,
             RenameEnumValue,
             ImportCsv,
+            Restore,
             DropCascade,
             RenameColumn,
             DropColumn,
@@ -853,6 +867,7 @@ mod tests {
             SetDefault,
             CreateView,
             Export,
+            Backup,
             Refresh,
             CreateFunction,
             CreateProcedure,

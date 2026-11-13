@@ -29,20 +29,22 @@ use gpui_kit::{
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, AddRow, ApplyChanges, CancelQuery, CloseAllTabs, CloseOtherTabs, CloseTab,
-    CloseTabsToTheRight, CollapseConnectionFolders, CollapseSchemaTree, CommitTransaction,
-    CopyObjectName, CopyQualifiedName, CopyTabFilePath, DeleteRows, DiscardChanges,
-    DisconnectTabConnection, DropObject, DuplicateRows, DuplicateTab, EditConnection, EditObject,
-    EditTabConnection, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData,
-    FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection, NewConnectionFolder,
-    NewQueryOnObject, NewQueryTab, NextTab, OpenAdmin, OpenCommandPalette, OpenConnection,
-    OpenSettings, OpenSqlFile, PreviousTab, ReconnectTabConnection, RefreshConnections,
-    RefreshData, RefreshObject, RefreshSchemaTree, RenameObject, RenameTab, ReopenClosedTab,
-    ReplaceInEditor, RevealTabFile, RollbackTransaction, RunAll, RunStatement, SaveFile,
-    SaveFileAs, SaveQuery, SetDefault, SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries,
-    ToggleComment, ToggleCommitMode, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, AddRow, ApplyChanges, BackupDatabase, CancelQuery, CloseAllTabs, CloseOtherTabs,
+    CloseTab, CloseTabsToTheRight, CollapseConnectionFolders, CollapseSchemaTree,
+    CommitTransaction, CopyObjectName, CopyQualifiedName, CopyTabFilePath, DeleteRows,
+    DiscardChanges, DisconnectTabConnection, DropObject, DuplicateRows, DuplicateTab,
+    EditConnection, EditObject, EditTabConnection, ExplainAnalyze, ExplainStatement,
+    ExportConnections, ExportData, FindInEditor, FormatSql, ImportConnections, ImportCsv,
+    NewConnection, NewConnectionFolder, NewQueryOnObject, NewQueryTab, NextTab, OpenAdmin,
+    OpenCommandPalette, OpenConnection, OpenSettings, OpenSqlFile, PreviousTab,
+    ReconnectTabConnection, RefreshConnections, RefreshData, RefreshObject, RefreshSchemaTree,
+    RenameObject, RenameTab, ReopenClosedTab, ReplaceInEditor, RestoreDatabase, RevealTabFile,
+    RollbackTransaction, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, SetDefault,
+    SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries, ToggleComment, ToggleCommitMode,
+    ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::admin::tab::AdminTab;
+use crate::backup_dialog::{self, BackupDialog};
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{
@@ -189,6 +191,17 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Admin(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
+        }
+    }
+
+    /// Where the tab works: connection, database and schema.
+    fn target(&self, cx: &App) -> Option<Target> {
+        match self {
+            OpenTab::Query(tab) => tab.read(cx).target().cloned(),
+            OpenTab::Data(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::Structure(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::Admin(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::TableEditor(tab) => Some(tab.read(cx).target().clone()),
         }
     }
 
@@ -1364,11 +1377,8 @@ impl Workspace {
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_alert_dialog(cx, |alert, _, _| {
-            alert.title("Kerno").description(format!(
-                "Version {}\n\nA fast, native database client.\nLicensed under MIT or Apache-2.0, at your option.",
-                env!("CARGO_PKG_VERSION")
-            ))
+        window.open_alert_dialog(cx, |alert, _, cx| {
+            alert.width(px(440.)).child(crate::brand::about(cx))
         });
     }
 
@@ -1485,6 +1495,9 @@ impl Workspace {
                 table,
             } => {
                 self.import_csv_into(target.clone(), schema.clone(), table.clone(), window, cx);
+            }
+            NavigatorEvent::BackupRestore { target, restore } => {
+                self.backup_restore(target.clone(), *restore, window, cx);
             }
             NavigatorEvent::SetDefault { target } => {
                 let tab = self.active_query_tab().filter(|tab| {
@@ -1963,6 +1976,65 @@ impl Workspace {
                 tab.update(cx, |tab, cx| tab.refresh(window, cx));
             }
         }
+    }
+
+    // Backup and restore ---------------------------------------------------
+
+    /// The palette's "Back Up Database…" / "Restore Database…": the database
+    /// of the active tab, else the default one of the connection the tree
+    /// shows.
+    fn backup_restore_command(
+        &mut self,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.target(cx))
+            .or_else(|| self.default_target(cx));
+        match target {
+            Some(target) => {
+                self.backup_restore(target, restore, window, cx);
+            }
+            None => window.push_notification(
+                Notification::warning(
+                    "Connect first: right-click a database in the tree and choose “Back up…” \
+                     or “Restore…”.",
+                ),
+                cx,
+            ),
+        }
+    }
+
+    /// Opens the backup of the database of `target`, or the restore of a
+    /// file into it. A restore refreshes that database in the tree.
+    pub fn backup_restore(
+        &mut self,
+        target: Target,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BackupDialog>> {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        let mode = if restore {
+            backup_dialog::Mode::Restore
+        } else {
+            backup_dialog::Mode::Backup
+        };
+        backup_dialog::open(
+            self.connections.clone(),
+            target,
+            mode,
+            window,
+            cx,
+            move |connection, database, _, cx| {
+                navigator.update(cx, |navigator, cx| {
+                    navigator.refresh_database(connection, database, cx)
+                })
+            },
+        )
     }
 
     fn refresh_data(&mut self, _: &RefreshData, window: &mut Window, cx: &mut Context<Self>) {
@@ -2533,6 +2605,8 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .gap_3()
+                // The mark, with its clear space (drawn about 52 px tall).
+                .child(crate::brand::mark(px(80.), cx))
                 .child(
                     v_flex()
                         .items_center()
@@ -2913,6 +2987,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::refresh_data))
             .on_action(cx.listener(Self::export_data))
             .on_action(cx.listener(Self::import_csv))
+            .on_action(cx.listener(|this, _: &BackupDatabase, window, cx| {
+                this.backup_restore_command(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RestoreDatabase, window, cx| {
+                this.backup_restore_command(true, window, cx)
+            }))
             .on_action(cx.listener(Self::add_row))
             .on_action(cx.listener(Self::duplicate_rows))
             .on_action(cx.listener(Self::delete_rows))

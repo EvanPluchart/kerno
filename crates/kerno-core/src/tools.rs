@@ -146,12 +146,33 @@ pub fn find(tool: Tool) -> Option<PathBuf> {
 /// `fallbacks`. In each directory every name of the tool is tried before the
 /// next directory.
 pub fn find_in(tool: Tool, path_var: Option<&OsStr>, fallbacks: &[PathBuf]) -> Option<PathBuf> {
+    find_all_in(tool, path_var, fallbacks).into_iter().next()
+}
+
+/// Every installed binary of `tool`, in the order [`find`] looks: several
+/// versions can be installed side by side (`/opt/homebrew/bin/pg_dump` 14
+/// and `/opt/homebrew/opt/libpq/bin/pg_dump` 18), and the first one may be
+/// too old for the server. Blocking (it reads the file system).
+pub fn find_all(tool: Tool) -> Vec<PathBuf> {
+    let fallbacks: Vec<PathBuf> = FALLBACK_DIRS.iter().map(PathBuf::from).collect();
+    find_all_in(tool, std::env::var_os("PATH").as_deref(), &fallbacks)
+}
+
+/// [`find_all`] with the search path given, as [`find_in`]. A binary
+/// reached twice (a directory listed twice, a link to another match) is
+/// kept once, where it is first found.
+pub fn find_all_in(tool: Tool, path_var: Option<&OsStr>, fallbacks: &[PathBuf]) -> Vec<PathBuf> {
     let from_path = path_var.into_iter().flat_map(std::env::split_paths);
+    let mut seen = std::collections::HashSet::new();
     from_path
         .chain(fallbacks.iter().cloned())
         .filter(|dir| !dir.as_os_str().is_empty())
         .flat_map(|dir| tool.names().iter().map(move |name| dir.join(name)))
-        .find(|candidate| is_executable(candidate))
+        .filter(|candidate| is_executable(candidate))
+        .filter(|candidate| {
+            seen.insert(std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone()))
+        })
+        .collect()
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -825,11 +846,8 @@ fn emit(read: std::io::Result<usize>, line: &mut Vec<u8>, on_line: &impl Fn(Stri
 /// the file can switch to), where any gap is a command run unasked.
 pub fn check_script(check: &ScriptCheck, cancel: &AtomicBool) -> Result<()> {
     let path = &check.path;
-    let file = std::fs::File::open(path)
-        .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?;
     let psql = check.tool == Tool::Psql;
-    let glued = psql && !check.version.as_ref().is_some_and(psql_needs_a_space);
-    let Some(found) = scan(psql, glued, file, path, cancel)? else {
+    let Some(found) = find_client_command(check, cancel)? else {
         return Ok(());
     };
     Err(Error::Config(format!(
@@ -843,6 +861,18 @@ pub fn check_script(check: &ScriptCheck, cancel: &AtomicBool) -> Result<()> {
     )))
 }
 
+/// The first client command of the script [`check_script`] refuses, with
+/// its line, or `None` when it has none: for the restore dialog, which
+/// names it next to the opt-in. Blocking, like [`check_script`].
+pub fn find_client_command(check: &ScriptCheck, cancel: &AtomicBool) -> Result<Option<Finding>> {
+    let path = &check.path;
+    let file = std::fs::File::open(path)
+        .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?;
+    let psql = check.tool == Tool::Psql;
+    let glued = psql && !check.version.as_ref().is_some_and(psql_needs_a_space);
+    scan(psql, glued, file, path, cancel)
+}
+
 /// Whether this psql reads `\ofile` as the unknown command `ofile`, not as
 /// `\o file`: from 8.4 on (commit 6f093f3825, "One-letter backslash
 /// commands now need a space before the first argument", in the 8.4
@@ -854,13 +884,13 @@ fn psql_needs_a_space(version: &ToolVersion) -> bool {
     version.text.contains("(PostgreSQL)") && version.number >= (8, 4, 0)
 }
 
-/// A client command found by [`scan`].
-#[derive(Debug, PartialEq, Eq)]
-struct Finding {
+/// A client command found in a script, see [`find_client_command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
     /// 1-based line number.
-    line: u64,
+    pub line: u64,
     /// The command as written (`\!`, `system`…).
-    command: String,
+    pub command: String,
 }
 
 /// How much of the file [`scan`] reads at a time: all it holds of it.
@@ -1945,6 +1975,19 @@ mod tests {
             "{text}"
         );
         assert!(!started.exists() && !pwned.exists());
+        // What the dialog shows next to the opt-in.
+        let check = ScriptCheck {
+            tool: Tool::Psql,
+            path: script.clone(),
+            version: None,
+        };
+        assert_eq!(
+            find_client_command(&check, &AtomicBool::new(false)).unwrap(),
+            Some(Finding {
+                line: 2,
+                command: "\\!".into()
+            })
+        );
 
         // A clean script: the tool starts.
         std::fs::write(&script, "SELECT 1;\n").unwrap();
@@ -1958,6 +2001,10 @@ mod tests {
             .await
             .unwrap();
         assert!(status.success() && started.exists());
+        assert_eq!(
+            find_client_command(&check, &AtomicBool::new(false)).unwrap(),
+            None
+        );
 
         let check = |path: &Path| ScriptCheck {
             tool: Tool::Psql,
@@ -2192,6 +2239,47 @@ mod tests {
             Some(mysql)
         );
         assert_eq!(find_in(Tool::Psql, Some(&path_var), &fallbacks), None);
+    }
+
+    #[test]
+    fn find_all_lists_every_install_in_search_order_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (first, second, fallback) = (
+            root.path().join("a"),
+            root.path().join("b"),
+            root.path().join("c"),
+        );
+        for dir in [&first, &second, &fallback] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        // The same directory twice, as $PATH and as a fallback.
+        let path_var = std::env::join_paths([&first, &second, &first]).unwrap();
+        let fallbacks = [fallback.clone(), second.clone()];
+        assert_eq!(
+            find_all_in(Tool::PgDump, Some(&path_var), &fallbacks),
+            Vec::<PathBuf>::new()
+        );
+
+        let old = fake_tool(&first, "pg_dump", 0o755);
+        let newer = fake_tool(&fallback, "pg_dump", 0o755);
+        // A link to a binary already listed is not listed again.
+        std::os::unix::fs::symlink(&old, second.join("pg_dump")).unwrap();
+        assert_eq!(
+            find_all_in(Tool::PgDump, Some(&path_var), &fallbacks),
+            vec![old.clone(), newer.clone()]
+        );
+        // `find_in` is the first of them.
+        assert_eq!(
+            find_in(Tool::PgDump, Some(&path_var), &fallbacks),
+            Some(old)
+        );
+        // Both names of a MySQL tool, each directory in turn.
+        let maria = fake_tool(&first, "mariadb", 0o755);
+        let mysql = fake_tool(&fallback, "mysql", 0o755);
+        assert_eq!(
+            find_all_in(Tool::Mysql, Some(&path_var), &fallbacks),
+            vec![maria, mysql]
+        );
     }
 
     /// `/bin/sh -c script`, so the test never executes a file it just wrote.

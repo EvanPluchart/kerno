@@ -146,6 +146,10 @@ gpui_kit::actions!(
         /// Opens the administration of the active tab's connection, or of
         /// the one selected in the sidebar.
         OpenAdmin,
+        /// Writes a backup of a database with the engine's dump tool.
+        BackupDatabase,
+        /// Restores a backup file into a database with the engine's client tool.
+        RestoreDatabase,
         /// Activates the next tab.
         NextTab,
         /// Activates the previous tab.
@@ -781,6 +785,22 @@ pub const COMMANDS: &[Command] = &[
             "variables"
         ],
         OpenAdmin
+    ),
+    command!(
+        "backup_database",
+        "Back Up Database…",
+        "Server",
+        [],
+        ["backup", "dump", "pg_dump", "mysqldump", "save database"],
+        BackupDatabase
+    ),
+    command!(
+        "restore_database",
+        "Restore Database…",
+        "Server",
+        [],
+        ["restore", "load dump", "pg_restore", "psql", "mysql"],
+        RestoreDatabase
     ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(

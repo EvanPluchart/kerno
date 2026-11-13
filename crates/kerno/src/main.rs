@@ -2,6 +2,8 @@
 
 mod actions;
 mod admin;
+mod backup_dialog;
+mod brand;
 mod bridge;
 mod connections;
 mod data;
@@ -30,11 +32,12 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    About, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData,
-    FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection, NewQueryTab,
-    OpenCommandPalette, OpenSettings, OpenSqlFile, Quit, ReplaceInEditor, RunAll, RunStatement,
-    SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar,
-    UseDarkTheme, UseLightTheme, UseSystemTheme,
+    About, BackupDatabase, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement,
+    ExportConnections, ExportData, FindInEditor, FormatSql, ImportConnections, ImportCsv,
+    NewConnection, NewQueryTab, OpenCommandPalette, OpenSettings, OpenSqlFile, Quit,
+    ReplaceInEditor, RestoreDatabase, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery,
+    ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme,
+    UseSystemTheme,
 };
 use crate::connections::manager::{Connections, Drivers};
 use crate::state::{AppState, Startup};
@@ -157,6 +160,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Export…", ExportData),
                 MenuItem::action("Import CSV…", ImportCsv),
+                MenuItem::action("Back Up Database…", BackupDatabase),
+                MenuItem::action("Restore Database…", RestoreDatabase),
                 MenuItem::separator(),
                 MenuItem::action("Import Connections…", ImportConnections),
                 MenuItem::action("Export Connections…", ExportConnections),
