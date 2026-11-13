@@ -62,7 +62,9 @@ servers.
   notice in `THIRD_PARTY_NOTICES.md`; follow each vendor's usage guidelines (no recolouring beyond what
   they allow, clear space, no distortion). Never use an engine logo as part of Kerno's own branding. Keep a
   monochrome variant only where the vendor provides one, for small sizes and dark backgrounds.
-- Nothing leaves the machine: no telemetry, no analytics, no update pings, no crash upload.
+- Nothing leaves the machine: no telemetry, no analytics, no crash upload. One exception, the owner's
+  (2026-11-13): the update check of §3 item 12, one request to GitHub's releases page, which sends nothing
+  else and can be turned off.
 
 ### Machine hygiene (the owner's Mac froze once — strict)
 
@@ -206,6 +208,20 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
       - Save as task: a named task with all its settings, listed in a Tasks view (run again, edit, duplicate,
         delete, last run status and log). No scheduler (DBeaver Community has none).
       Kerno's look, not DBeaver's: same steps and options, drawn with Kerno's components and theme.
+  11. A main toolbar under the title bar, as DBeaver's, for the quick actions: New connection (with the
+      engine list), Connect, Disconnect, Reconnect, New SQL editor (with recent scripts), Commit, Rollback,
+      transaction mode (Auto / Manual, with isolation level), transaction log, read-only toggle, the active
+      connection picker and the active database / schema picker (`public@studio`), Open dashboard, Tools,
+      search. Each greys out when it does not apply; each has a tooltip with its shortcut; the toolbar's
+      right-click lets the user hide items, as DBeaver's customisation.
+  12. Updates as in the owner's other apps Recto and Vigie (github.com/EvanPluchart/recto and /vigie, MIT,
+      same owner: their code may be reused as is; clone them into `~/VM/refs/`; read Recto's
+      `docs/decisions/0006*` and `crates/*/src/update`). Kerno asks
+      `https://github.com/EvanPluchart/kerno/releases/latest` at launch and every 6 hours without following
+      the redirect, offers only a strictly newer `X.Y.Z`, stays silent offline, can be turned off (Settings
+      and `KERNO_NO_UPDATE_CHECK`), and installs the way Recto and Vigie do on macOS and Linux (checksum from
+      the release's `SHA256SUMS`, never run unverified; otherwise opens the release page). The repository is
+      not created and nothing is published by you: that stays the owner's (§8).
 
 ## 4. v1 features (all required, priority order)
 
@@ -310,8 +326,10 @@ each. Not in v1.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean, `cargo deny check`
   clean.
 - Linux: the workspace builds in a Linux container (Docker, Debian/Ubuntu image with GPUI's system deps,
-  `nice`, `-j 3`). Add `.github/workflows/ci.yml` for macOS + Linux (fmt, clippy, tests with service
-  containers, build). Do not create a remote or push.
+  `nice`, `-j 3`). No GitHub Actions at all (owner, 2026-11-13: Actions minutes cost money): delete
+  `.github/workflows/`; `scripts/check.sh` runs fmt, clippy, deny and the tests with the containers locally,
+  and `scripts/release.sh` builds the macOS and Linux artifacts with a `SHA256SUMS` file and prints the
+  `gh release create` command for the owner, never runs it. Do not create a remote or push.
 - Packaging scripts: `scripts/bundle-macos.sh` (`.app` + `.dmg`, ad-hoc signed) and
   `scripts/bundle-linux.sh` (tarball + `.desktop` file; AppImage if straightforward).
 
@@ -336,7 +354,7 @@ each. Not in v1.
 
 - Milestones, one commit (or more) per milestone, conventional messages:
   0. Environment check, pinned GPUI + gpui-component hello window, workspace, licences, docker-compose,
-     fixtures, CI file.
+     fixtures, local check script.
   1. Driver trait, PostgreSQL and MySQL drivers with tests.
   2. App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge.
   3. Connections (A).

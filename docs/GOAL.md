@@ -28,7 +28,7 @@ The goal is reached only when ALL of these are true and verified by you:
    editor with results, EXPLAIN plan, table data with pending edits, structure editor, import/export,
    admin, command palette, settings, empty and error states) in light and dark; you looked at each one and
    fixed what was wrong.
-8. The workspace builds in a Linux container; `.github/workflows/ci.yml` exists; `scripts/bundle-macos.sh`
+8. The workspace builds in a Linux container; no GitHub Actions workflow; `scripts/check.sh` and `scripts/release.sh` exist and run; `scripts/bundle-macos.sh`
    produces a launchable `Kerno.app` with the icon; `scripts/bundle-linux.sh` produces a tarball.
 9. README (what Kerno is, screenshots, install, build from source on macOS and Linux, run the test
    containers, keyboard shortcuts, roadmap link, licence); `CONTRIBUTING.md`; `docs/ROADMAP.md`;
