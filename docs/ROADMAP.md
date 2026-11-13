@@ -172,3 +172,12 @@ The owner can pull any row back by naming its ID.
 | CM-51 | Generate SQL ▸ MERGE, INSERT ON CONFLICT, UPDATE FROM, DELETE USING | PG, My | See NAV-51, NAV-52 |
 | CM-74 | New Index / Constraint from selection | PG, My | See NAV-43 |
 | CM-112 | View / Format ▸, Hints, Logical structure | PG, My | See RES-32, RES-33, RES-71 |
+
+## Packaging
+
+- **AppImage for Linux.** `scripts/bundle-linux.sh` produces a tarball (binary, `.desktop` file, icons,
+  licences). An AppImage needs `appimagetool` and a desktop-integration step that the build image does not
+  carry; it comes with the first public release.
+- **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
+  (arm64 here); amd64 is built by CI's `ubuntu-24.04` runner. Cross-building locally would run under
+  emulation.

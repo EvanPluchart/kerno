@@ -1,0 +1,32 @@
+# Builds the Kerno workspace on Linux (Ubuntu 24.04, the CI runner's image)
+# and runs the kerno-core unit tests; no database containers are reachable
+# here. The image also serves scripts/bundle-linux.sh from macOS.
+#
+#   nice -n 10 docker build -f Dockerfile.linux-build -t kerno-linux-build .
+#
+# The architecture is the Docker host's: arm64 on Apple Silicon, amd64 on
+# an x86_64 machine or runner.
+FROM ubuntu:24.04
+
+COPY scripts/install-linux-deps.sh /tmp/install-linux-deps.sh
+RUN /tmp/install-linux-deps.sh && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none
+
+WORKDIR /src
+# The toolchain pinned by the repository, in its own layer so source
+# changes do not reinstall it.
+COPY rust-toolchain.toml .
+RUN rustup toolchain install
+
+# The build depends on the Rust sources only: a change to scripts, docs or
+# icons reuses it. Everything else comes last, for scripts/bundle-linux.sh.
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY crates crates
+COPY tests tests
+RUN nice -n 10 cargo build --release -j 3
+RUN nice -n 10 cargo test -p kerno-core --lib -j 3 -- --test-threads=3
+COPY . .

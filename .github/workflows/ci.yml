@@ -42,8 +42,9 @@ jobs:
         run: xvfb-run -a cargo test --workspace -- --test-threads=3
         env:
           KERNO_REQUIRE_CONTAINERS: "1"
-      - name: Build
-        run: cargo build --release
+      # The release build, packaged as a tarball (scripts/bundle-linux.sh).
+      - name: Build and package
+        run: scripts/bundle-linux.sh
       - name: Stop the test containers
         if: always()
         run: scripts/test-env.sh down
@@ -60,5 +61,9 @@ jobs:
       # themselves as skipped and the unit and UI tests run.
       - name: Test
         run: cargo test --workspace -- --test-threads=3
-      - name: Build
-        run: cargo build --release
+      # The release build, packaged as an ad-hoc signed Kerno.app and .dmg;
+      # the launch check needs a desktop session and is skipped.
+      - name: Build and package
+        run: scripts/bundle-macos.sh
+        env:
+          KERNO_SKIP_LAUNCH_CHECK: "1"
