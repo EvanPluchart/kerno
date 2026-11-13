@@ -171,7 +171,7 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
      that connection (its tabs, the editor and grid frame, the status bar) takes the environment's colour,
      strong for production, softer for staging, none for local. Readable in both themes (WCAG AA).
   8. A connection with no default database opens on the database the server gives (often `postgres`, which
-     is empty) and the owner thought his data was gone. The Database field lists the server's databases once
+     is empty) and the owner thought their data was gone. The Database field lists the server's databases once
      the fields allow a test (a dropdown, still free text); the navigator shows the default database first and
      marked, and the others under it unexpanded.
   9. The macOS keychain asked the owner's login password on every connect. Read each secret at most once per
