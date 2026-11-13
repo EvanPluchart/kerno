@@ -67,6 +67,8 @@ pub enum SidebarAction {
     ReadOnly(bool),
     NewSqlEditor,
     Administration,
+    /// Administration on its Locks sub-tab (DBeaver's Lock Manager).
+    LockManager,
     Edit,
     Duplicate,
     /// Into this folder; the top level when `None`.
@@ -97,6 +99,7 @@ impl SidebarAction {
             Self::ReadOnly(_) => "Read-only",
             Self::NewSqlEditor => "New SQL editor",
             Self::Administration => "Administration",
+            Self::LockManager => "Lock Manager",
             Self::Edit => "Edit…",
             Self::Duplicate => "Duplicate",
             Self::MoveTo(Some(folder)) => return folder.clone(),
@@ -190,6 +193,7 @@ pub fn menu(
                 Separator,
                 enabled(NewSqlEditor),
                 Item(Administration, not_connected),
+                Item(LockManager, not_connected),
                 Separator,
                 enabled(Edit),
                 enabled(Duplicate),
@@ -216,6 +220,8 @@ pub enum SidebarEvent {
     NewEditor(String),
     /// Open the administration of this connection.
     OpenAdmin(String),
+    /// Open it on its Locks sub-tab.
+    OpenLocks(String),
     /// Ask for a connections file to import.
     ImportConnections,
     /// Close these connections, `action` (“Disconnect “prod””) once what
@@ -511,6 +517,7 @@ impl Sidebar {
             }),
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
             (Subject::Connection(_), Administration) => cx.emit(SidebarEvent::OpenAdmin(id)),
+            (Subject::Connection(_), LockManager) => cx.emit(SidebarEvent::OpenLocks(id)),
             (Subject::Connection(_), Edit) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), Duplicate) => {
                 connections.update(cx, |c, cx| c.duplicate(&id, cx))
@@ -1221,6 +1228,7 @@ mod tests {
                 "—",
                 "New SQL editor",
                 "Administration (not connected)",
+                "Lock Manager (not connected)",
                 "—",
                 "Edit…",
                 "Duplicate",
@@ -1251,8 +1259,9 @@ mod tests {
         );
         assert_eq!(open[3], "Disconnect others");
         assert_eq!(open[7], "Administration");
-        assert_eq!(open[16], "Refresh");
-        assert!(open[12].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        assert_eq!(open[8], "Lock Manager");
+        assert_eq!(open[17], "Refresh");
+        assert!(open[13].starts_with("Move to folder ▸ [No folder (already there), Work,"));
         // The read-only entry carries the flag as it is, checked.
         let entries = menu(
             &subject,

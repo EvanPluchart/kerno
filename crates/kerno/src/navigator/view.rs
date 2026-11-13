@@ -112,6 +112,8 @@ pub enum NavigatorEvent {
     },
     /// Make `target` (a database and schema) the active query tab's.
     SetDefault { target: Target },
+    /// Tell the user something went otherwise than asked.
+    Warn(String),
     /// Back up the database of `target` (only `tables` when there are
     /// some), or restore a file into it.
     BackupRestore {
@@ -550,12 +552,21 @@ impl Navigator {
                 self.revealing = None;
                 self.sync(cx);
                 let id = SharedString::from(path.last().cloned().unwrap_or_default());
-                self.tree_state.update(cx, |state, cx| {
-                    if let Some(index) = state.index_of(&id) {
-                        state.set_selected_index(Some(index), cx);
-                        state.scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
-                    }
+                let shown = self.tree_state.update(cx, |state, cx| {
+                    let index = state.index_of(&id)?;
+                    state.set_selected_index(Some(index), cx);
+                    state.scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
+                    Some(())
                 });
+                // Loaded but hidden by an object filter: say so, and leave
+                // the filter as the user set it.
+                if shown.is_none() && self.tree.node(&id).is_some() {
+                    cx.emit(NavigatorEvent::Warn(format!(
+                        "{} is hidden by an object filter of the schema tree: turn the \
+                         filter off (Filter ▸ Turn on or off) to see it there.",
+                        revealing.table.name
+                    )));
+                }
                 return;
             }
             Reveal::Missing => self.revealing = None,
@@ -590,6 +601,14 @@ impl Navigator {
         };
         match action {
             Action::Refresh => self.refresh(id, cx),
+            Action::Properties
+                if matches!(
+                    node.kind,
+                    NodeKind::Object(ObjectRef::Database(_) | ObjectRef::Schema(_))
+                ) =>
+            {
+                self.show_properties(&node, window, cx)
+            }
             Action::OpenData | Action::OpenStructure | Action::Properties => {
                 // A column opens its table; a foreign key the table at its
                 // other end.
@@ -1262,6 +1281,57 @@ impl Navigator {
                 Err(error) => window.push_notification(
                     Notification::error(SharedString::from(format!(
                         "The call of {name} could not be written: {error}"
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Shows what the catalogs say of a database or a schema: owner,
+    /// encoding, collation, size, comment (DBeaver's object editor, F4).
+    fn show_properties(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+        let NodeKind::Object(object) = &node.kind else {
+            return;
+        };
+        let object = object.clone();
+        let title = format!("{} · properties", node.label);
+        let session = self.session_for(&node.database, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let read = match session.await {
+                Err(error) => Err(error),
+                Ok(session) => {
+                    let reading = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let d = session.dialect();
+                            let sql = match &object {
+                                ObjectRef::Database(name) => d.database_properties_sql(name),
+                                ObjectRef::Schema(name) => d.schema_properties_sql(name),
+                                _ => None,
+                            }
+                            .ok_or_else(|| {
+                                kerno_core::Error::Unsupported("properties of this object".into())
+                            })?;
+                            exec::collect(session, sql).await
+                        })
+                    });
+                    match reading {
+                        Ok(reading) => reading.await,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let _ = cx.update(|window, cx| match read {
+                Ok(collected) => crate::structure::tab::open_properties(
+                    title,
+                    crate::structure::tab::properties_of(collected),
+                    window,
+                    cx,
+                ),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "The properties could not be read: {error}"
                     ))),
                     cx,
                 ),

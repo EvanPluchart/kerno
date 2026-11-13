@@ -177,6 +177,18 @@ gpui_kit::actions!(
         /// Opens the administration of the active tab's connection, or of
         /// the one selected in the sidebar.
         OpenAdmin,
+        /// The same administration, on its Locks sub-tab.
+        OpenLockManager,
+        /// Runs "Read data in SQL console" on the selected tree node.
+        ReadObjectInConsole,
+        /// Writes the call of the selected routine into a query tab.
+        GenerateRoutineCall,
+        /// Runs the selected routine, asking for its parameters.
+        ExecuteRoutine,
+        /// Opens the form of the selected table on a new column.
+        AddColumnToObject,
+        /// Backs up the selected database, or the selected table alone.
+        BackupObject,
         /// Writes a backup of a database with the engine's dump tool.
         BackupDatabase,
         /// Restores a backup file into a database with the engine's client tool.
@@ -294,6 +306,15 @@ gpui_kit::actions!(
         ShowAggregatePanel,
         /// Lists the columns of the result with their types and keys.
         ShowColumnsPanel,
+        /// Lists the values of the selected column with their counts, to
+        /// filter on some.
+        FilterDistinctValues,
+        /// Shows every row of the table or result on screen again.
+        ClearFilters,
+        /// Counts every row of the table or result on screen.
+        CalculateRowCount,
+        /// Reads the rows on screen again every few seconds, or stops.
+        ToggleAutoRefresh,
     ]
 );
 
@@ -492,11 +513,14 @@ pub const COMMANDS: &[Command] = &[
         CopyQualifiedName,
         "Navigator"
     ),
+    // DBeaver's Ctrl+] makes a script file and Ctrl+Alt+Enter a console
+    // (`core.sql.editor.console`); a query tab is a console until saved, so
+    // both keys open one bound to the node's database and schema.
     command!(
         "new_query_on_object",
         "New Query on Selected Object",
         "Navigator",
-        ["secondary-]"],
+        ["secondary-]", "secondary-alt-enter"],
         ["sql", "console", "script"],
         NewQueryOnObject,
         "Navigator"
@@ -797,6 +821,40 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-r"],
         ["reload", "read again"],
         RefreshData
+    ),
+    // DBeaver's key (`core.resultset.filterMenu.distinct`), in a grid.
+    command!(
+        "filter_distinct_values",
+        "Filter by Distinct Values…",
+        "Data",
+        ["ctrl-f11"],
+        ["distinct", "values", "checklist", "in", "filter"],
+        FilterDistinctValues,
+        "DataTable"
+    ),
+    command!(
+        "clear_filters",
+        "Clear Filters",
+        "Data",
+        [],
+        ["reset", "filter", "every row", "where"],
+        ClearFilters
+    ),
+    command!(
+        "calculate_row_count",
+        "Calculate Total Row Count",
+        "Data",
+        [],
+        ["count", "how many", "rows", "total", "count exactly"],
+        CalculateRowCount
+    ),
+    command!(
+        "toggle_auto_refresh",
+        "Toggle Auto-Refresh",
+        "Data",
+        [],
+        ["refresh", "every", "seconds", "timer", "reload"],
+        ToggleAutoRefresh
     ),
     // The keys of the grids, DBeaver's defaults (`ui.editors.data`
     // plugin.xml, context `ui.context.resultset.focused`; Ctrl is Ctrl on
@@ -1411,6 +1469,21 @@ pub const COMMANDS: &[Command] = &[
         ],
         OpenAdmin
     ),
+    // DBeaver's Lock Manager (`postgresql.lock.manager`).
+    command!(
+        "lock_manager",
+        "Lock Manager",
+        "Server",
+        [],
+        [
+            "locks",
+            "blocking",
+            "waiting",
+            "deadlock",
+            "blocked sessions"
+        ],
+        OpenLockManager
+    ),
     command!(
         "backup_database",
         "Back Up Database…",
@@ -1445,6 +1518,55 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["statements", "pending", "transaction monitor", "commit"],
         ShowTransactionLog
+    ),
+    // The entries of the tree's menus, on its selected node. "Edit column…"
+    // is F4 on a column (`edit_object`).
+    command!(
+        "read_object_in_console",
+        "Read Data in SQL Console",
+        "Navigator",
+        [],
+        ["select", "rows", "table", "console"],
+        ReadObjectInConsole
+    ),
+    command!(
+        "generate_routine_call",
+        "Generate CALL for Selected Routine",
+        "Navigator",
+        [],
+        ["function", "procedure", "call", "sql"],
+        GenerateRoutineCall
+    ),
+    command!(
+        "execute_routine",
+        "Execute Selected Routine…",
+        "Navigator",
+        [],
+        ["function", "procedure", "call", "run"],
+        ExecuteRoutine
+    ),
+    command!(
+        "add_column_to_object",
+        "Add Column to Selected Table…",
+        "Navigator",
+        [],
+        ["alter", "new column", "table form"],
+        AddColumnToObject
+    ),
+    command!(
+        "backup_object",
+        "Back Up Selected Object…",
+        "Navigator",
+        [],
+        [
+            "backup",
+            "dump",
+            "pg_dump",
+            "mysqldump",
+            "table",
+            "database"
+        ],
+        BackupObject
     ),
     // DBeaver's Filter ▸ of the navigator (`core.object.filter.*`).
     command!(

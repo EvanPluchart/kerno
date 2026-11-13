@@ -32,6 +32,10 @@ use gpui_kit::{
     Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     Task, TestSupportExt as _, Window, div, px,
 };
+use kerno_core::browse::{
+    Filter, Operator, Query, Source as QuerySource, and_where, count_from, described, distinct_sql,
+    one_of_sql, select_from,
+};
 use kerno_core::config::Environment;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::{
@@ -46,6 +50,7 @@ use kerno_core::{
 
 use super::comment;
 use super::completion::{self, SharedCatalog, SqlCompletion};
+use super::distinct;
 use super::grid::{CopyFormat, Grid, GridAction, Owner};
 use super::params;
 use super::tx_log::{self, TxLogEntry};
@@ -58,6 +63,7 @@ use crate::actions::{
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
+use crate::data::tab::{AutoRefresh, auto_refresh_button, history_button};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
@@ -198,8 +204,38 @@ pub struct ResultPane {
     name: Option<String>,
     /// Kept by the next runs until unpinned or closed.
     pinned: bool,
+    /// How the result of a SELECT is read again on the server.
+    pub requery: Option<Requery>,
+    /// Rows of the whole result, once counted.
+    pub total: Option<u64>,
     /// The grid's selection and double click; dropped with the pane.
     _grid_events: Option<Subscription>,
+}
+
+/// What the result of a SELECT is read again with: its own statement,
+/// filtered and ordered by the server, as DBeaver's filter panel over an
+/// editor's result (`ResultSetFilterPanel`, `getWrappedFilterQuery`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Requery {
+    /// The statement as it ran, its parameters written in.
+    pub statement: String,
+    /// The body of the `WHERE`, as typed.
+    pub filter: String,
+    /// The column the server orders on, and whether descending.
+    pub sort: Option<(String, bool)>,
+    /// Auto-refresh reads this result again.
+    pub auto: bool,
+    /// The server ignored the statement's own `ORDER BY` (MySQL and
+    /// MariaDB in a derived table without a `LIMIT`).
+    pub order_dropped: bool,
+}
+
+/// A count or a list of values read for the result on screen.
+struct SideWork {
+    /// The session it runs on once open: the tab's, or one of its own
+    /// while the tab's holds a result being paged.
+    session: Option<Arc<dyn Session>>,
+    _task: Task<()>,
 }
 
 impl ResultPane {
@@ -322,6 +358,23 @@ pub struct QueryTab {
     source: Option<String>,
     /// The settings the editor follows: soft wrap, line numbers, tab size.
     editor_options: (bool, bool, u8),
+    /// What the run being prepared reads again, and the run in progress.
+    next_requery: Option<Requery>,
+    requery: Option<Requery>,
+    /// The filter of the result on screen, and the pane it shows.
+    result_filter: Entity<InputState>,
+    result_filter_for: Option<u64>,
+    /// The statement and filter the field was last given: a result read
+    /// again with the same ones (auto-refresh) leaves what is typed alone.
+    result_filter_shown: Option<(String, String)>,
+    /// The filters applied to results before, by statement.
+    result_history: HashMap<String, Vec<String>>,
+    /// A count or a list of values being read.
+    side: Option<SideWork>,
+    /// Reads the result marked `auto` again every so often (RES-25).
+    auto_refresh: Option<AutoRefresh>,
+    /// Why auto-refresh stopped by itself, until it is started again.
+    auto_refresh_stopped: Option<&'static str>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -399,6 +452,20 @@ impl QueryTab {
             .as_ref()
             .and_then(|target| connections.read(cx).get(&target.connection))
             .is_some_and(|saved| saved.config.starts_in_manual_commit());
+        let result_filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(
+                "Filter the result on the server: a SQL condition, for example total > 100",
+            )
+        });
+        let filtering = cx.subscribe_in(
+            &result_filter,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.apply_result_filter(window, cx);
+                }
+            },
+        );
         let mut tab = Self {
             title: title.into(),
             editor,
@@ -433,7 +500,16 @@ impl QueryTab {
             catalog_load: None,
             source: None,
             editor_options,
-            _subscriptions: vec![subscription, edits, settings],
+            next_requery: None,
+            requery: None,
+            result_filter,
+            result_filter_for: None,
+            result_filter_shown: None,
+            result_history: HashMap::new(),
+            side: None,
+            auto_refresh: None,
+            auto_refresh_stopped: None,
+            _subscriptions: vec![subscription, edits, settings, filtering],
         };
         tab.follow_connection(cx);
         tab
@@ -1335,6 +1411,14 @@ impl QueryTab {
     /// Asks the server to cancel the running statement. It ends with the
     /// server's cancellation error and keeps the rows that arrived.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        // A count or a list of values: its statement is cancelled, and it
+        // says so when it ends.
+        if let Some(side) = &self.side {
+            if let Some(session) = side.session.clone() {
+                bridge::spawn(cx, async move { session.cancel().await }).detach();
+            }
+            return;
+        }
         // A run waiting for its connection is simply forgotten.
         if self.pending.take().is_some() {
             cx.notify();
@@ -1686,6 +1770,7 @@ impl QueryTab {
     /// Shows why a run did not happen, as its result.
     fn refuse(&mut self, statement: String, failure: Failure, cx: &mut Context<Self>) {
         self.stop(cx);
+        self.requery = None;
         self.show_results();
         self.clear_results();
         self.notices.clear();
@@ -1727,6 +1812,8 @@ impl QueryTab {
             elapsed,
             name: None,
             pinned: false,
+            requery: self.requery.clone(),
+            total: None,
             _grid_events: None,
         });
         id
@@ -1842,6 +1929,7 @@ impl QueryTab {
     ) {
         self.stop(cx);
         self.generation += 1;
+        self.requery = self.next_requery.take();
         self.clear_results();
         self.notices.clear();
         // The first result of this run is shown; the editor and the
@@ -2166,7 +2254,10 @@ impl QueryTab {
             failure,
             row_count,
         } = ended;
-        if let Some(target) = &self.target {
+        // Auto-refresh reads the same statement again and again: the
+        // history and the transaction's log keep the first run only.
+        let auto = self.requery.as_ref().is_some_and(|requery| requery.auto);
+        if let Some(target) = self.target.as_ref().filter(|_| !auto) {
             let entry = HistoryEntry {
                 id: 0,
                 connection_id: target.connection.clone(),
@@ -2188,7 +2279,7 @@ impl QueryTab {
         }
         // In manual commit the statement joins the transaction's log; one
         // that ended the transaction (COMMIT typed, MySQL's DDL) empties it.
-        if self.manual_commit {
+        if self.manual_commit && !auto {
             if self.tx_state() == TxState::Idle {
                 self.tx_log.clear();
             } else {
@@ -2479,26 +2570,62 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> u64 {
+        // The pane this grid goes in: `push_pane` gives it this id.
+        let id = self.next_pane;
+        let class = classify(statement, self.lex_rules(cx));
+        // A SELECT's result can be read again on the server, filtered and
+        // ordered: a re-run keeps what it was read with.
+        // A plan's rows are no result to read again.
+        let requery = self.requery.clone().or_else(|| {
+            (class.kind == StatementKind::Select && !class.writes && self.explain_mode.is_none())
+                .then(|| Requery {
+                    statement: statement.to_string(),
+                    ..Requery::default()
+                })
+        });
         // The menu of a cell exports the result of its own statement (it
-        // says when that statement writes, and does not run it).
+        // says when that statement writes, and does not run it), and
+        // filters it.
         let view = cx.weak_entity();
         let sql = statement.to_string();
-        let grid = grid.with_owner(Owner {
-            act: Rc::new(move |action, _, _, window, cx| {
-                if action == GridAction::Export {
-                    let _ = view.update(cx, |this, cx| {
-                        this.export_statement(sql.clone(), window, cx)
-                    });
-                }
+        let mut grid = grid.with_owner(Owner {
+            act: Rc::new(move |action, row, column, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if action == GridAction::Export {
+                        this.export_statement(sql.clone(), window, cx);
+                    } else {
+                        this.result_action(id, action, row, column, window, cx);
+                    }
+                });
             }),
             related: None,
-            export: classify(statement, self.lex_rules(cx))
-                .writes
-                .then_some("the statement writes"),
-            filtered: false,
+            export: class.writes.then_some("the statement writes"),
+            filtered: requery
+                .as_ref()
+                .is_some_and(|requery| !requery.filter.trim().is_empty()),
             keyless: false,
             structure: None,
         });
+        if let Some(requery) = &requery {
+            let sorted = requery.sort.as_ref().and_then(|(name, descending)| {
+                let column = grid
+                    .store()
+                    .columns()
+                    .iter()
+                    .position(|column| column.name == *name)?;
+                Some((column, *descending))
+            });
+            let view = cx.weak_entity();
+            grid = grid.with_server_order(
+                Rc::new(move |sort, window, cx| {
+                    let _ = view.update(cx, |this, cx| this.reorder(id, sort, window, cx));
+                }),
+                sorted,
+            );
+            if !requery.filter.trim().is_empty() && !requery.auto {
+                self.remember_result_filter(&requery.statement, &requery.filter, cx);
+            }
+        }
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
                 .col_resizable(true)
@@ -2540,6 +2667,7 @@ impl QueryTab {
         let id = self.push_pane(statement.to_string(), Outcome::Rows(table), None, None);
         if let Some(pane) = self.pane_mut(id) {
             pane._grid_events = Some(events);
+            pane.requery = requery;
         }
         id
     }
@@ -2934,12 +3062,23 @@ impl QueryTab {
         let Some(statement) = self.statements(Scope::AtCursor, cx).into_iter().next() else {
             return;
         };
-        let refusal = if classify(&statement.sql, rules).kind != StatementKind::Select {
-            Some("only a SELECT returns rows to count")
-        } else if !find_params(&statement.sql, rules).is_empty() {
-            Some("the statement has parameters")
+        let Some(meta) = self.meta(cx) else {
+            return;
+        };
+        // DBeaver's `SQLQueryTransformerCount`: the statement as a derived
+        // table, on lines of its own.
+        let counting = Query::new(meta.dialect(), &statement.sql, &[]).and_then(|query| {
+            count_from(
+                meta.dialect(),
+                QuerySource::Query(&query),
+                &[],
+                &Filter::default(),
+            )
+        });
+        let refusal = if !find_params(&statement.sql, rules).is_empty() {
+            Some("the statement has parameters".to_string())
         } else {
-            None
+            counting.as_ref().err().map(ToString::to_string)
         };
         if let Some(reason) = refusal {
             window.push_notification(
@@ -2952,7 +3091,9 @@ impl QueryTab {
         }
         // A result waiting to be paged holds the session.
         self.stop(cx);
-        let sql = format!("SELECT COUNT(*) FROM ({}) kerno_count", statement.sql);
+        let Ok(sql) = counting else {
+            return;
+        };
         let session = self.session(cx);
         self.cancel_requested = false;
         self.activity = Activity::Running {
@@ -3005,6 +3146,677 @@ impl QueryTab {
             });
         }));
         cx.notify();
+    }
+
+    // A SELECT's result read again on the server -----------------------------
+
+    /// The dialect of the tab's connection, while it is open.
+    fn meta(&self, cx: &App) -> Option<Arc<dyn Session>> {
+        let target = self.target.as_ref()?;
+        self.connections.read(cx).meta_session(&target.connection)
+    }
+
+    /// The statement that reads `statement` again with `filter` (the body
+    /// of a `WHERE`) and `sort`, as a derived table; the statement itself
+    /// when neither is given. With it, whether the server ignores the
+    /// statement's own order.
+    fn requery_sql(
+        dialect: &dyn Dialect,
+        statement: &str,
+        columns: &[kerno_core::Column],
+        filter: &str,
+        sort: Option<&(String, bool)>,
+    ) -> kerno_core::Result<(String, bool)> {
+        if filter.trim().is_empty() && sort.is_none() {
+            return Ok((statement.to_string(), false));
+        }
+        let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+        let query = Query::new(dialect, statement, &names)?;
+        let dropped = sort.is_none() && query.drops_own_order(dialect);
+        let sql = select_from(
+            dialect,
+            QuerySource::Query(&query),
+            &described(columns),
+            &Filter {
+                conditions: Vec::new(),
+                raw: filter.to_string(),
+            },
+            sort.map(|(column, descending)| (column.as_str(), *descending)),
+        )?;
+        Ok((sql, dropped))
+    }
+
+    /// The columns of the rows of pane `id`; none when it holds no rows.
+    fn pane_columns(&self, id: u64, cx: &App) -> Vec<kerno_core::Column> {
+        self.pane_grid(id).map_or_else(Vec::new, |grid| {
+            grid.read(cx).delegate().store().columns().to_vec()
+        })
+    }
+
+    /// Runs the statement of pane `id` again on the server with `filter`
+    /// and `sort`, in the pane's place (DBeaver's filter panel and server
+    /// ordering of an editor's result). What cannot be read again says why.
+    pub fn read_again(
+        &mut self,
+        id: u64,
+        filter: String,
+        sort: Option<(String, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running() || self.side.is_some() {
+            window.push_notification(
+                Notification::warning("Wait for the running statement to end."),
+                cx,
+            );
+            return;
+        }
+        let (Some(requery), Some(meta)) = (
+            self.pane_index(id)
+                .and_then(|index| self.results[index].requery.clone()),
+            self.meta(cx),
+        ) else {
+            return;
+        };
+        let columns = self.pane_columns(id, cx);
+        let sql = Self::requery_sql(
+            meta.dialect(),
+            &requery.statement,
+            &columns,
+            &filter,
+            sort.as_ref(),
+        );
+        let (sql, order_dropped) = match sql {
+            Ok(sql) => sql,
+            Err(error) => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(format!(
+                        "The result cannot be filtered or ordered on the server: {error}."
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        };
+        self.next_requery = Some(Requery {
+            filter,
+            sort,
+            order_dropped,
+            ..requery
+        });
+        self.close_results(&[id], cx);
+        self.explain_mode = None;
+        self.keep_results = true;
+        self.execute(vec![Statement { sql, origin: None }], window, cx);
+    }
+
+    /// The order a header asked of a result not wholly fetched: a column
+    /// of its rows and whether descending, or none.
+    fn reorder(
+        &mut self,
+        id: u64,
+        sort: Option<(usize, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requery) = self
+            .pane_index(id)
+            .and_then(|index| self.results[index].requery.clone())
+        else {
+            return;
+        };
+        let columns = self.pane_columns(id, cx);
+        let sort = sort
+            .and_then(|(column, descending)| Some((columns.get(column)?.name.clone(), descending)));
+        self.read_again(id, requery.filter, sort, window, cx);
+    }
+
+    /// Reads the result on screen again with the filter typed above it.
+    pub fn apply_result_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.results.get(self.active_result) else {
+            return;
+        };
+        let (Some(requery), true) = (
+            pane.requery.clone(),
+            self.result_filter_for == Some(pane.id),
+        ) else {
+            return;
+        };
+        let filter = self.result_filter.read(cx).value().trim().to_string();
+        self.read_again(pane.id, filter, requery.sort, window, cx);
+    }
+
+    /// Puts `filter` in the filter field of pane `id`, to be finished and
+    /// applied there.
+    fn prefill_result_filter(
+        &mut self,
+        id: u64,
+        filter: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.result_filter_for != Some(id) {
+            return;
+        }
+        self.result_filter.update(cx, |input, cx| {
+            input.set_value(filter, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// The SQL of a condition on the cell at `row` and `column` of pane
+    /// `id`'s grid, its value as a literal.
+    fn cell_condition(
+        &self,
+        id: u64,
+        row: usize,
+        column: usize,
+        operator: Operator,
+        cx: &App,
+    ) -> Option<String> {
+        let grid = self.pane_grid(id)?;
+        let grid = grid.read(cx).delegate();
+        let condition = crate::data::tab::condition_at(grid, row, column, operator)?;
+        let filter = Filter {
+            conditions: vec![condition],
+            raw: String::new(),
+        };
+        let meta = self.meta(cx)?;
+        filter
+            .where_sql(meta.dialect(), &described(grid.store().columns()))
+            .ok()
+            .flatten()
+    }
+
+    /// Runs an entry of a grid menu that filters the result of pane `id`.
+    fn result_action(
+        &mut self,
+        id: u64,
+        action: GridAction,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(requery) = self
+            .pane_index(id)
+            .and_then(|index| self.results[index].requery.clone())
+        else {
+            return;
+        };
+        let filtered = |condition: &str| and_where(&requery.filter, condition);
+        match action {
+            GridAction::FilterByValue | GridAction::ExcludeValue => {
+                let operator = if action == GridAction::FilterByValue {
+                    Operator::Equals
+                } else {
+                    Operator::NotEquals
+                };
+                if let Some(condition) = self.cell_condition(id, row, column, operator, cx) {
+                    self.read_again(id, filtered(&condition), requery.sort, window, cx);
+                }
+            }
+            GridAction::FilterWith(operator) => {
+                if let Some(condition) = self.cell_condition(id, row, column, operator, cx) {
+                    self.prefill_result_filter(id, filtered(&condition), window, cx);
+                }
+            }
+            GridAction::FilterColumn => {
+                let name = self.pane_grid(id).and_then(|grid| {
+                    let grid = grid.read(cx).delegate();
+                    let source = grid.source_column(column)?;
+                    Some(grid.store().columns()[source].name.clone())
+                });
+                if let (Some(name), Some(meta)) = (name, self.meta(cx)) {
+                    let condition = format!("{} = ", meta.dialect().quote_ident(&name));
+                    self.prefill_result_filter(id, filtered(&condition), window, cx);
+                }
+            }
+            GridAction::DistinctValues => self.distinct_result_values(id, column, window, cx),
+            GridAction::ClearFilters => {
+                self.read_again(id, String::new(), requery.sort, window, cx)
+            }
+            _ => {}
+        }
+    }
+
+    /// What the filter history of the results of `statement` is stored
+    /// under: the connection and the statement on one line.
+    fn result_history_key(&self, statement: &str) -> Option<String> {
+        let target = self.target.as_ref()?;
+        Some(format!(
+            "query:{}/{}/{}",
+            target.connection,
+            target.database.as_deref().unwrap_or_default(),
+            statement.split_whitespace().collect::<Vec<_>>().join(" ")
+        ))
+    }
+
+    /// Puts a filter applied to a result of `statement` first in its
+    /// history.
+    fn remember_result_filter(&mut self, statement: &str, filter: &str, cx: &mut Context<Self>) {
+        let Some(key) = self.result_history_key(statement) else {
+            return;
+        };
+        let (storage, rules) = (AppState::get(cx).storage.clone(), self.lex_rules(cx));
+        let (stored_key, kept) = (key.clone(), filter.to_string());
+        let saving =
+            bridge::spawn_blocking(cx, move || storage.add_filter(&stored_key, &kept, rules));
+        let filter = filter.to_string();
+        cx.spawn(async move |this, cx| {
+            if !matches!(saving.await, Ok(true)) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                let history = this.result_history.entry(key).or_default();
+                history.retain(|known| *known != filter);
+                history.insert(0, filter);
+                history.truncate(kerno_core::storage::FILTERS_KEPT);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Reads the filter history of the results of `statement`, once.
+    fn load_result_history(&mut self, statement: &str, cx: &mut Context<Self>) {
+        let Some(key) = self.result_history_key(statement) else {
+            return;
+        };
+        if self.result_history.contains_key(&key) {
+            return;
+        }
+        self.result_history.insert(key.clone(), Vec::new());
+        let storage = AppState::get(cx).storage.clone();
+        let stored_key = key.clone();
+        let reading = bridge::spawn_blocking(cx, move || storage.filters(&stored_key));
+        cx.spawn(async move |this, cx| {
+            let Ok(history) = reading.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.result_history.insert(key, history);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The filters applied before to results of the statement on screen.
+    pub fn result_filter_history(&self) -> Vec<String> {
+        self.results
+            .get(self.active_result)
+            .and_then(|pane| pane.requery.as_ref())
+            .and_then(|requery| self.result_history_key(&requery.statement))
+            .and_then(|key| self.result_history.get(&key).cloned())
+            .unwrap_or_default()
+    }
+
+    /// A session for a count or a list of values while the tab's holds a
+    /// result being paged: the tab's connection, database and schema.
+    fn own_session(&self, cx: &App) -> Task<kerno_core::Result<Arc<dyn Session>>> {
+        let Some(target) = self.target.clone() else {
+            return Task::ready(Err(Error::Config(
+                "choose a connection for this tab first".into(),
+            )));
+        };
+        let opening =
+            self.connections
+                .read(cx)
+                .open_session(&target.connection, target.database.clone(), cx);
+        cx.spawn(async move |cx| {
+            let session = opening.await?;
+            // As the tab's own session (`session`): its schema first.
+            if session.dialect().has_schemas()
+                && let Some(schema) = &target.schema
+            {
+                let sql = format!(
+                    "SET search_path TO {}, public",
+                    session.dialect().quote_ident(schema)
+                );
+                cx.update(|cx| bridge::spawn(cx, exec::collect(session.clone(), sql)))
+                    .await?;
+            }
+            Ok(session)
+        })
+    }
+
+    /// Runs `sql`, a read statement about the result on screen, without
+    /// losing it: on the tab's session when it is free, as a run of the tab
+    /// (Cancel and the next run stop it); on a session of its own while the
+    /// tab's holds the result being paged. A transaction open on the tab's
+    /// session would not be seen from another one: then nothing runs, and
+    /// the notice says why.
+    fn side_query(
+        &mut self,
+        sql: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(
+            &mut Self,
+            kerno_core::Result<exec::Collected>,
+            &mut Window,
+            &mut Context<Self>,
+        ) + 'static,
+    ) {
+        if self.running() || self.side.is_some() {
+            window.push_notification(
+                Notification::warning("Wait for the running statement to end."),
+                cx,
+            );
+            return;
+        }
+        let paged = self.receiving.is_some();
+        if paged && self.tx_state() != TxState::Idle {
+            window.push_notification(
+                Notification::warning(
+                    "A transaction is open in this tab while its result is still being read: \
+                     another session would not see its changes. Fetch all rows, or end the \
+                     transaction, then try again.",
+                ),
+                cx,
+            );
+            return;
+        }
+        let opening = if paged {
+            self.own_session(cx)
+        } else {
+            self.session(cx)
+        };
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let ran = match opening.await {
+                Ok(session) => {
+                    let _ = this.update(cx, |this, _| {
+                        if let Some(side) = &mut this.side {
+                            side.session = Some(session.clone());
+                        }
+                    });
+                    let running = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let ran = exec::collect(session.clone(), sql).await;
+                            if paged {
+                                let _ = session.close().await;
+                            }
+                            ran
+                        })
+                    });
+                    match running {
+                        Ok(running) => running.await,
+                        Err(_) => return,
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if paged {
+                    this.side = None;
+                } else {
+                    this.run = None;
+                    this.activity = Activity::Idle;
+                }
+                done(this, ran, window, cx);
+                cx.notify();
+            });
+        });
+        if paged {
+            self.side = Some(SideWork {
+                session: None,
+                _task: task,
+            });
+        } else {
+            self.cancel_requested = false;
+            self.activity = Activity::Running {
+                index: 0,
+                total: 1,
+                since: Instant::now(),
+            };
+            self.run = Some(task);
+        }
+        cx.notify();
+    }
+
+    /// Types `filter` above the result on screen and applies it; for tests.
+    #[cfg(test)]
+    pub fn filter_result(&mut self, filter: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.type_result_filter(filter, window, cx);
+        self.apply_result_filter(window, cx);
+    }
+
+    /// Types `filter` above the result on screen; for tests.
+    #[cfg(test)]
+    pub fn type_result_filter(
+        &mut self,
+        filter: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_filter.update(cx, |input, cx| {
+            input.set_value(filter.to_string(), window, cx)
+        });
+    }
+
+    /// What the filter field above the result holds; for tests.
+    #[cfg(test)]
+    pub fn typed_result_filter(&self, cx: &App) -> String {
+        self.result_filter.read(cx).value().to_string()
+    }
+
+    /// How the result on screen is read again, and its count; for tests.
+    #[cfg(test)]
+    pub fn result_requery(&self) -> (Option<Requery>, Option<u64>) {
+        self.results
+            .get(self.active_result)
+            .map_or((None, None), |pane| (pane.requery.clone(), pane.total))
+    }
+
+    /// Counts the rows of the result on screen, its filter applied
+    /// (DBeaver's "Calculate total row count", `core.resultset.count`); the
+    /// footer shows the number.
+    pub fn count_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.results.get(self.active_result) else {
+            return;
+        };
+        let (id, Some(requery), Some(meta)) = (pane.id, pane.requery.clone(), self.meta(cx)) else {
+            return;
+        };
+        let columns = self.pane_columns(id, cx);
+        let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+        let counting = Query::new(meta.dialect(), &requery.statement, &names).and_then(|query| {
+            count_from(
+                meta.dialect(),
+                QuerySource::Query(&query),
+                &described(&columns),
+                &Filter {
+                    conditions: Vec::new(),
+                    raw: requery.filter.clone(),
+                },
+            )
+        });
+        let counting = match counting {
+            Ok(counting) => counting,
+            Err(error) => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(format!(
+                        "The rows of the result cannot be counted: {error}."
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        };
+        self.side_query(
+            counting,
+            window,
+            cx,
+            move |this, counted, window, cx| match counted {
+                Ok(counted) => {
+                    let total = crate::data::tab::first_count(Ok(counted));
+                    if let Some(pane) = this.pane_mut(id) {
+                        pane.total = total;
+                    }
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "The rows could not be counted: {error}"
+                    ))),
+                    cx,
+                ),
+            },
+        );
+    }
+
+    /// Lists the distinct values of a column of pane `id`'s result, its
+    /// filter applied, to filter on some (DBeaver's "Filter by distinct
+    /// values").
+    fn distinct_result_values(
+        &mut self,
+        id: u64,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(requery), Some(meta), Some(grid)) = (
+            self.pane_index(id)
+                .and_then(|index| self.results[index].requery.clone()),
+            self.meta(cx),
+            self.pane_grid(id),
+        ) else {
+            return;
+        };
+        let Some(source) = grid.read(cx).delegate().source_column(column) else {
+            return;
+        };
+        let columns = self.pane_columns(id, cx);
+        let infos = described(&columns);
+        let name = columns[source].name.clone();
+        let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+        let listing = Query::new(meta.dialect(), &requery.statement, &names).and_then(|query| {
+            distinct_sql(
+                meta.dialect(),
+                QuerySource::Query(&query),
+                &infos,
+                &Filter {
+                    conditions: Vec::new(),
+                    raw: requery.filter.clone(),
+                },
+                &name,
+                distinct::LIMIT,
+            )
+        });
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(format!(
+                        "The values of {name} cannot be listed: {error}."
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        };
+        let info = infos[source].clone();
+        self.side_query(listing, window, cx, move |_, listed, window, cx| {
+            let values = match listed {
+                Ok(listed) => distinct::values(&listed),
+                Err(error) => {
+                    window.push_notification(
+                        Notification::error(SharedString::from(format!(
+                            "The values of {name} could not be read: {error}"
+                        ))),
+                        cx,
+                    );
+                    return;
+                }
+            };
+            let view = cx.weak_entity();
+            distinct::open(&name, values, window, cx, move |picked, window, cx| {
+                let Some(condition) = one_of_sql(meta.dialect(), &info, &picked) else {
+                    return;
+                };
+                let _ = view.update(cx, |this, cx| {
+                    let filter = and_where(&requery.filter, &condition);
+                    this.read_again(id, filter, requery.sort.clone(), window, cx)
+                });
+            });
+        });
+    }
+
+    /// Reads the result on screen again every `every`, or stops (`None`).
+    pub fn set_auto_refresh(
+        &mut self,
+        every: Option<Duration>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for pane in &mut self.results {
+            if let Some(requery) = &mut pane.requery {
+                requery.auto = false;
+            }
+        }
+        self.auto_refresh = None;
+        self.auto_refresh_stopped = None;
+        if let Some(every) = every
+            && let Some(Some(requery)) = self
+                .results
+                .get_mut(self.active_result)
+                .map(|pane| pane.requery.as_mut())
+        {
+            requery.auto = true;
+            self.auto_refresh = Some(AutoRefresh::start(every, window, cx, Self::auto_tick));
+        }
+        cx.notify();
+    }
+
+    /// The interval of auto-refresh, while on.
+    pub fn auto_refresh(&self) -> Option<Duration> {
+        self.auto_refresh.as_ref().map(|auto| auto.every)
+    }
+
+    /// Stops auto-refresh; `why` it stopped by itself, shown in the footer.
+    pub fn stop_auto_refresh(&mut self, why: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.auto_refresh.take().is_some() {
+            self.auto_refresh_stopped = why;
+            cx.notify();
+        }
+    }
+
+    /// Another tab is on screen: auto-refresh stops.
+    pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.stop_auto_refresh(Some("the tab was hidden"), cx);
+    }
+
+    /// One tick of auto-refresh: whether it goes on.
+    fn auto_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(pane) = self
+            .results
+            .iter()
+            .find(|pane| pane.requery.as_ref().is_some_and(|requery| requery.auto))
+        else {
+            // Another run replaced it, or the run that read it again is
+            // still on its way.
+            if self.running() {
+                return true;
+            }
+            self.stop_auto_refresh(Some("the result was replaced"), cx);
+            return false;
+        };
+        if matches!(pane.outcome, Outcome::Failed(_) | Outcome::Cancelled) {
+            self.stop_auto_refresh(Some("the statement failed"), cx);
+            return false;
+        }
+        // Reading it again would bring it on screen in place of another.
+        if self.results.get(self.active_result).map(|shown| shown.id) != Some(pane.id) {
+            self.stop_auto_refresh(Some("another result is on screen"), cx);
+            return false;
+        }
+        // Never two runs at once: the next tick tries again.
+        if !self.running() && self.side.is_none() && self.pending.is_none() {
+            let (id, requery) = (pane.id, pane.requery.clone().unwrap_or_default());
+            self.read_again(id, requery.filter, requery.sort, window, cx);
+        }
+        true
     }
 
     // Panels ------------------------------------------------------------------
@@ -3544,6 +4356,95 @@ impl QueryTab {
         }
     }
 
+    /// The filter of a SELECT's result, read again by the server
+    /// (DBeaver's `ResultSetFilterPanel` over an editor's result).
+    fn render_result_filter(&self, requery: &Requery, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let refined = !requery.filter.trim().is_empty() || requery.sort.is_some();
+        let statement = SharedString::from(requery.statement.clone());
+        h_flex()
+            .id("result-filter-bar")
+            .test_support()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("WHERE"),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.result_filter)
+                        .small()
+                        .id("result-filter")
+                        .font_family(theme.mono_font_family.clone()),
+                ),
+            )
+            .child(history_button(
+                "result-filter-history",
+                &self.result_filter_history(),
+                cx.entity(),
+                |this, filter, window, cx| {
+                    if let Some(pane) = this.results.get(this.active_result) {
+                        let (id, sort) = (
+                            pane.id,
+                            pane.requery
+                                .as_ref()
+                                .and_then(|requery| requery.sort.clone()),
+                        );
+                        this.read_again(id, filter, sort, window, cx);
+                    }
+                },
+            ))
+            .child(
+                Button::new("result-filter-apply")
+                    .outline()
+                    .small()
+                    .label("Filter")
+                    .tooltip("Run the statement again, keeping the rows of this condition (Enter)")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.apply_result_filter(window, cx)),
+                    ),
+            )
+            .when(refined, |bar| {
+                bar.child(
+                    Button::new("result-filter-clear")
+                        .ghost()
+                        .small()
+                        .label("Clear")
+                        .tooltip("Run the statement as it is written")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(pane) = this.results.get(this.active_result) {
+                                this.read_again(pane.id, String::new(), None, window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id("result-filter-origin")
+                        .test_support()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if requery.order_dropped {
+                            "read again by the server, which ignored the statement's ORDER BY: \
+                             order by a column header"
+                        } else {
+                            "read again by the server"
+                        })
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(statement.clone()).build(window, cx)
+                        }),
+                )
+            })
+    }
+
     /// What the server said on the side during the last run.
     fn render_messages(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
@@ -3704,31 +4605,51 @@ impl QueryTab {
                 );
         };
         // What the footer says about the result on screen.
-        let (summary, has_more) = match &pane.outcome {
+        let (summary, has_more, complete, order) = match &pane.outcome {
             Outcome::Rows(grid) => {
                 let grid = grid.read(cx).delegate();
                 let rows = grid.row_count();
                 let more = grid.has_more();
-                let text = if grid.is_complete() {
-                    format!("{rows} row{}", if rows == 1 { "" } else { "s" })
-                } else if more {
-                    format!("first {rows} rows; more on the server")
-                } else {
-                    format!("{rows} rows so far")
+                let text = match pane.total {
+                    _ if grid.is_complete() => {
+                        format!("{rows} row{}", if rows == 1 { "" } else { "s" })
+                    }
+                    Some(total) => format!(
+                        "first {} of {} rows",
+                        plan_view::number(rows as f64),
+                        plan_view::number(total as f64)
+                    ),
+                    None if more => format!("first {rows} rows; more on the server"),
+                    None => format!("{rows} rows so far"),
                 };
-                (text, more)
+                // Which order the rows are in, as DBeaver's smart ordering
+                // chose it.
+                let order = grid.ordered_by_server().map(|server| {
+                    if server {
+                        "ordered by the server"
+                    } else {
+                        "ordered here (every row is fetched)"
+                    }
+                });
+                (text, more, grid.is_complete(), order)
             }
-            _ => (String::new(), false),
+            _ => (String::new(), false, true, None),
         };
+        let requery = pane.requery.clone();
+        let auto_here = requery.as_ref().is_some_and(|requery| requery.auto);
         let elapsed = pane.elapsed.map(duration_text);
         let grid = match &pane.outcome {
             Outcome::Rows(grid) => Some(grid.clone()),
             _ => None,
         };
         let exportable = self.exportable(pane, cx);
+        let filter_bar = requery
+            .as_ref()
+            .map(|requery| self.render_result_filter(requery, cx));
         v_flex()
             .size_full()
             .child(tabs)
+            .children(filter_bar)
             .child(div().flex_1().min_h_0().child(self.render_pane(pane, cx)))
             .child(
                 h_flex()
@@ -3743,6 +4664,53 @@ impl QueryTab {
                     .text_xs()
                     .text_color(muted)
                     .child(SharedString::from(summary))
+                    .children(
+                        order.map(|order| div().id("result-order").test_support().child(order)),
+                    )
+                    .when(
+                        requery.is_some()
+                            && grid.is_some()
+                            && !complete
+                            && pane.total.is_none()
+                            && self.side.is_none(),
+                        |this| {
+                            this.child(
+                                Button::new("result-count")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Count")
+                                    .tooltip("Count every row of the result on the server")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.count_result(window, cx)
+                                    })),
+                            )
+                        },
+                    )
+                    .when(self.side.is_some(), |this| {
+                        this.child("reading…").child(
+                            Button::new("result-side-cancel")
+                                .ghost()
+                                .xsmall()
+                                .label("Cancel")
+                                .tooltip("Stop the statement")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                        )
+                    })
+                    .when(requery.is_some(), |this| {
+                        this.child(auto_refresh_button(
+                            "result-auto-refresh",
+                            self.auto_refresh().filter(|_| auto_here),
+                            cx.entity(),
+                            |this, every, window, cx| this.set_auto_refresh(every, window, cx),
+                        ))
+                    })
+                    .children(self.auto_refresh_stopped.map(|why| {
+                        div()
+                            .id("result-auto-refresh-stopped")
+                            .test_support()
+                            .text_color(warning)
+                            .child(SharedString::from(format!("Auto-refresh stopped: {why}.")))
+                    }))
                     .children(grid.clone().map(|table| {
                         Button::new("result-record")
                             .ghost()
@@ -3906,6 +4874,23 @@ impl Focusable for QueryTab {
 
 impl Render for QueryTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The filter field shows the filter of the result on screen.
+        let filterable = self
+            .results
+            .get(self.active_result)
+            .and_then(|pane| Some((pane.id, pane.requery.clone()?)));
+        if let Some((id, requery)) = filterable
+            && self.result_filter_for != Some(id)
+        {
+            self.result_filter_for = Some(id);
+            let shown = (requery.statement.clone(), requery.filter.clone());
+            if self.result_filter_shown.as_ref() != Some(&shown) {
+                self.result_filter
+                    .update(cx, |input, cx| input.set_value(requery.filter, window, cx));
+                self.load_result_history(&requery.statement, cx);
+                self.result_filter_shown = Some(shown);
+            }
+        }
         let shows_results = !self.results.is_empty()
             || !self.notices.is_empty()
             || self.run.is_some()

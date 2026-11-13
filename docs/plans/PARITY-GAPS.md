@@ -772,3 +772,110 @@ Left:
 - The Properties page is read-only but for a table's comment; a view's comment is not set from it.
 - The transaction log is also emptied when a new transaction begins (after a lost connection or a
   rollback on close); that path has no test.
+
+## G5 — delivered on 2026-11-13, and what it left (one `opus` agent; core: `browse.rs`, `storage.rs`
+(migration 2, `filter_history`); app: `query/tab.rs`, `query/grid.rs`, `query/distinct.rs` (new),
+`data/tab.rs`, `actions.rs`, `main.rs`, `workspace.rs`, `ui_tests.rs`)
+
+Done:
+- RES-04, RES-09: the result of one SELECT (not one that writes, locks rows or holds several statements)
+  has a filter bar (`WHERE`, Filter, History, Clear); a filter, a header sort while not every row is
+  here (DBeaver's smart ordering: `ResultSetViewer.toggleSortOrder`), Filter by / Exclude value and
+  Filter ▸ re-run `SELECT * FROM (\n<statement>\n) kerno_q WHERE … ORDER BY …`
+  (`browse::Query`, `select_from`), which keeps paging. A fully fetched result sorts here; the footer
+  says which ("ordered by the server" / "ordered here"). Duplicate column names are refused on MySQL and
+  MariaDB (error 1060) and when named on PostgreSQL, with the reason. Test
+  `a_select_result_is_filtered_ordered_and_counted_on_the_server` (all three engines: comment and `;`,
+  CTE with ORDER BY and LIMIT, server order on the 1M-row table, duplicate names refused); units
+  `browse::tests::*`, `grid::tests::a_select_result_filters_on_the_server_but_never_edits`.
+- RES-23: "Count" in a result's footer and "Count exactly" on table data (palette "Calculate Total Row
+  Count"); a result being paged is counted on a session of its own (its schema set first), so it keeps
+  its pages; with a transaction open there it is refused with the reason. Count Rows of Statement now
+  uses the same derived table. Same test, and `a_large_table_shows_its_estimate_and_counts_on_demand`.
+- RES-11, CM-106: "Distinct values…" (Ctrl+F11 in a grid, as DBeaver) in Filter ▸ (with Clear filters)
+  and in the header menu, on table data and SELECT results: the 200 most frequent values with their counts, searchable, picked values
+  added as `col IN (…)` / `IS NULL` with literals (`browse::one_of_sql`). Test
+  `distinct_values_of_a_result_and_of_a_table_become_a_filter` (PG, MySQL).
+- RES-06: the last 20 filters per table (`data:` key) and per statement (`query:` key) in the app storage
+  (migration 2), never one the history's redaction would mask; a History dropdown on both bars. Tests
+  `the_filters_applied_to_a_table_are_offered_again`, `storage::tests::filters_are_kept_per_key_latest_first_without_secrets`.
+- RES-25: Auto-refresh ▸ 1, 5, 10, 15, 30, 60 s on the data toolbar and a result's footer (and "Toggle
+  Auto-Refresh", 10 s); ticks never overlap a read; stops on a pending change, a failure, the tab hidden,
+  the result replaced or another result tab on screen, and says why in the footer; what is typed in the
+  filter stays, and only the first run goes to the history. Test
+  `auto_refresh_reads_again_until_a_change_or_another_tab`.
+
+Differs from DBeaver:
+- The result filter is one SQL text (DBeaver's panel too); menu filters are added to it as SQL. DBeaver
+  first tries to patch the statement's own WHERE (JSQLParser); Kerno always wraps it.
+- MySQL and MariaDB ignore the statement's own ORDER BY without LIMIT inside a derived table: the bar says
+  so ("ignored the statement's ORDER BY: order by a column header").
+- The distinct list is searched among the 200 values read, not on the server; it uses the current filter
+  but for the column's own conditions (table data).
+- Auto-refresh stops when the tab is hidden (DBeaver keeps it on in the background).
+
+Left:
+- A re-run result moves to the end of the result tabs (it stays active).
+- DBeaver also lists "Calculate total row count" under Navigate ▸ while more rows remain; that submenu
+  was being added to `grid.rs` by another part during G5, so the entry waits for it (the footer and the
+  palette have it).
+- Auto-refresh does not pause while a dialog is open (the plan asked for it); it skips a tick while a
+  read runs.
+- Distinct values on a JSON column of PostgreSQL fail on the server (`json` has no equality): the header
+  menu does not know the column's type; the cell menu disables it.
+- The filter history of results is keyed by the statement text; a statement differing by more than
+  whitespace has its own.
+
+## G18 and the leftovers of G10–G17 and M10 Part 4 — delivered on 2026-11-13, and what they left (one
+`opus` agent; core: `ssh.rs`, `dialect.rs`; drivers: `dialect.rs`, `tests/introspect.rs`; app:
+`navigator/actions.rs`, `navigator/view.rs`, `structure/tab.rs`, `sidebar.rs`, `admin/tab.rs`,
+`actions.rs`, `main.rs`, `workspace.rs`, `data/tab.rs`, `query/grid.rs`, `ui_tests.rs`)
+
+- G18, the six "done, untested" rows, now tested; all worked as listed. CON-24
+  `ssh::tests::ssh_keepalive_is_passed_to_the_client` (the client config is built by `client_config`;
+  0 turns keep-alive off). SQL-03 `the_tab_toolbar_changes_its_connection_database_and_schema`
+  (PostgreSQL schema and database, then MySQL and one of its databases; each run checked). SQL-42
+  `the_editor_closes_brackets_and_quotes` (the kit pairs on single typed characters, before
+  whitespace or a closer, and steps over a typed closer). SQL-46
+  `the_editor_adds_a_cursor_above_and_below` (Cmd+Alt+Up / Down). RES-21
+  `scrolling_to_the_end_of_a_result_fetches_the_next_page` (the table's list scrolled to its last row;
+  no wheel event). RES-40 `a_dragged_column_keeps_its_new_place` (a real header drag, then a sort).
+- CM-33: Properties (F4 and a menu entry) on a database and a schema opens a dialog of what the
+  catalogs say, read through the dialect (`database_properties_sql`, `schema_properties_sql`) as a
+  table's Properties are, drawn with the same lines (`structure::tab::open_properties`). PostgreSQL
+  database: owner, encoding, collation, character type, tablespace, connection limit, template,
+  connections allowed, size, OID, comment; schema: owner, tables, views, size, OID, comment. MySQL /
+  MariaDB database: character set, collation, tables, views, data and index size, and MariaDB's
+  comment (MySQL keeps none, neither has an owner). Show DDL stays in the menu. Tests
+  `f4_on_a_database_or_a_schema_shows_its_properties`, drivers' `properties_describe_databases_and_schemas`
+  / `properties_describe_databases`.
+- NAV-48: DBeaver's Ctrl+] (`core.sql.editor.create`, `SQLEditorHandlerOpenEditor`) creates a script
+  file in the project's Scripts folder; Ctrl+Alt+Enter in the navigator (`core.sql.editor.console`,
+  `SQLEditorHandlerOpenConsole`) opens a console: an editor without a file, bound to the selected
+  object's connection and schema. A Kerno query tab has no file until saved, so both are the same
+  thing here: Cmd+Alt+Enter is a second key of "New Query on Selected Object" beside Cmd+]. Test
+  `cmd_alt_enter_opens_a_console_on_the_selected_node`. The row can close.
+- Session question: a table form's draft is not a transaction and is not asked about; it survives a
+  disconnect and a reconnect untouched (`a_table_form_draft_survives_a_disconnect_and_reconnect`).
+  MySQL case of the read-only toggle and of its question: `read_only_and_its_question_on_mysql`.
+- Link with editor on a table an object filter hides: a warning says so and names the filter's
+  toggle; the filter is left alone (`link_with_editor_says_when_a_filter_hides_the_table`).
+- Palette commands on the selected tree node: Read Data in SQL Console, Generate CALL, Execute
+  Selected Routine…, Add Column to Selected Table…, Back Up Selected Object… (Database ▸ Schema
+  Tree); Edit column is F4's `edit_object`, the Filter ▸ entries had theirs
+  (`tree_entries_have_palette_commands_on_the_selected_node`).
+- Lock Manager in a connection's sidebar menu and as a command in the Database menu: Administration
+  on its Locks sub-tab (`the_lock_manager_opens_from_the_connection_menu_and_the_palette`).
+- After Apply in table data the new page's grid takes the keyboard, unless the user moved to
+  something else while it was read (`the_grid_has_the_keyboard_after_apply`; it fails without the fix).
+- Go to row… / Go to column… in a cell's Navigate ▸ submenu, after the order, as DBeaver's
+  `fillNavigateMenu` (`go_to_row_and_column_are_in_the_navigate_menu_of_a_cell`).
+- The transaction log of a new transaction after a lost connection holds only its own statements
+  (`a_new_transaction_after_a_lost_connection_starts_an_empty_log`).
+
+Left:
+- The database and schema properties are read-only (no comment edit from the dialog, unlike a
+  table's); a schema's properties on MySQL are its database's.
+- Navigate ▸ holds the two go-to entries only; DBeaver's also lists the row moves and the foreign
+  keys, which Kerno keeps at the top level of the menu and on keys.
+- The scroll test drives the table's list, not a wheel event.

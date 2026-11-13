@@ -402,6 +402,48 @@ WHERE n.nspname = {} AND c.relname = {}",
             self.quote_string(&table.name)
         ))
     }
+
+    /// From `pg_database`; the size needs the CONNECT privilege.
+    fn database_properties_sql(&self, database: &str) -> Option<String> {
+        Some(format!(
+            "\
+SELECT pg_catalog.pg_get_userbyid(d.datdba) AS \"Owner\",
+       pg_catalog.pg_encoding_to_char(d.encoding) AS \"Encoding\",
+       d.datcollate AS \"Collation\",
+       d.datctype AS \"Character type\",
+       t.spcname AS \"Tablespace\",
+       CASE WHEN d.datconnlimit < 0 THEN 'no limit' ELSE d.datconnlimit::text END AS \"Connection limit\",
+       d.datistemplate AS \"Template\",
+       d.datallowconn AS \"Allows connections\",
+       CASE WHEN pg_catalog.has_database_privilege(d.oid, 'CONNECT')
+            THEN pg_catalog.pg_database_size(d.oid) END AS \"Total size\",
+       d.oid AS \"OID\",
+       pg_catalog.shobj_description(d.oid, 'pg_database') AS \"Comment\"
+FROM pg_catalog.pg_database d
+LEFT JOIN pg_catalog.pg_tablespace t ON t.oid = d.dattablespace
+WHERE d.datname = {}",
+            self.quote_string(database)
+        ))
+    }
+
+    /// From `pg_namespace`, with what the schema holds.
+    fn schema_properties_sql(&self, schema: &str) -> Option<String> {
+        Some(format!(
+            "\
+SELECT pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\",
+       (SELECT count(*) FROM pg_catalog.pg_class c
+        WHERE c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'f')) AS \"Tables\",
+       (SELECT count(*) FROM pg_catalog.pg_class c
+        WHERE c.relnamespace = n.oid AND c.relkind IN ('v', 'm')) AS \"Views\",
+       (SELECT COALESCE(sum(pg_catalog.pg_total_relation_size(c.oid)), 0) FROM pg_catalog.pg_class c
+        WHERE c.relnamespace = n.oid AND c.relkind IN ('r', 'p', 'm')) AS \"Total size\",
+       n.oid AS \"OID\",
+       pg_catalog.obj_description(n.oid, 'pg_namespace') AS \"Comment\"
+FROM pg_catalog.pg_namespace n
+WHERE n.nspname = {}",
+            self.quote_string(schema)
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +672,10 @@ mod tests {
             .properties_sql(&TableRef::new("sh'op", "orders"), RelationKind::Table)
             .unwrap();
         assert!(properties.contains("n.nspname = 'sh''op' AND c.relname = 'orders'"));
+        let database = d.database_properties_sql("it's").unwrap();
+        assert!(database.contains("WHERE d.datname = 'it''s'"), "{database}");
+        let schema = d.schema_properties_sql("sh'op").unwrap();
+        assert!(schema.contains("WHERE n.nspname = 'sh''op'"), "{schema}");
     }
 
     #[test]

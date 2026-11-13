@@ -1020,20 +1020,16 @@ mod tests {
         assert!(storage.add_filter("t", " id > 1 ", rules).unwrap());
         assert!(storage.add_filter("t", "status = 'paid'", rules).unwrap());
         assert!(storage.add_filter("other", "id = 2", rules).unwrap());
-        assert_eq!(
-            storage.filters("t").unwrap(),
-            ["status = 'paid'", "id > 1"]
-        );
+        assert_eq!(storage.filters("t").unwrap(), ["status = 'paid'", "id > 1"]);
         // Applied again, it comes first and is not listed twice.
         std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(storage.add_filter("t", "id > 1", rules).unwrap());
-        assert_eq!(
-            storage.filters("t").unwrap(),
-            ["id > 1", "status = 'paid'"]
-        );
+        assert_eq!(storage.filters("t").unwrap(), ["id > 1", "status = 'paid'"]);
         // Only the latest are kept.
         for n in 0..FILTERS_KEPT {
-            storage.add_filter("t", &format!("id = {n}"), rules).unwrap();
+            storage
+                .add_filter("t", &format!("id = {n}"), rules)
+                .unwrap();
         }
         let kept = storage.filters("t").unwrap();
         assert_eq!(kept.len(), FILTERS_KEPT);
@@ -1050,7 +1046,13 @@ mod tests {
                 .add_filter("q:select password 'hunter2'", "id = 1", rules)
                 .unwrap()
         );
-        assert_eq!(storage.filters("q:select password 'hunter2'").unwrap().len(), 0);
+        assert_eq!(
+            storage
+                .filters("q:select password 'hunter2'")
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(storage.filters("other").unwrap(), ["id = 2"]);
     }
 

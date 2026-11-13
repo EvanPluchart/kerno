@@ -165,6 +165,15 @@ impl OpenTab {
         }
     }
 
+    /// Another tab is on screen: auto-refresh stops.
+    fn hide(&self, cx: &mut App) {
+        match self {
+            OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.hide(cx)),
+            OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.hide(cx)),
+            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::TableEditor(_) => {}
+        }
+    }
+
     fn entity_id(&self) -> EntityId {
         match self {
             OpenTab::Query(tab) => tab.entity_id(),
@@ -777,19 +786,30 @@ impl Workspace {
     /// The palette's "Server Administration": of the active tab's
     /// connection, else of the one selected in the sidebar.
     fn open_admin_command(&mut self, _: &OpenAdmin, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_admin_here(window, cx);
+    }
+
+    /// The administration of the active tab's connection, else of the one
+    /// selected in the sidebar; says so when there is none.
+    fn open_admin_here(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<AdminTab>> {
         let connection = self
             .tabs
             .get(self.active_tab)
             .and_then(|tab| tab.connection(cx))
             .or_else(|| self.sidebar.read(cx).selected().map(str::to_string));
         match connection {
-            Some(connection) => {
-                self.open_admin(&connection, window, cx);
+            Some(connection) => Some(self.open_admin(&connection, window, cx)),
+            None => {
+                window.push_notification(
+                    Notification::warning("Server Administration: select a connection first."),
+                    cx,
+                );
+                None
             }
-            None => window.push_notification(
-                Notification::warning("Server Administration: select a connection first."),
-                cx,
-            ),
         }
     }
 
@@ -1640,6 +1660,8 @@ impl Workspace {
                 let tab = self.open_structure(target.clone(), table.clone(), *kind, window, cx);
                 tab.update(cx, |tab, cx| tab.select(PROPERTIES_SECTION, cx));
             }
+            NavigatorEvent::Warn(text) => window
+                .push_notification(Notification::warning(SharedString::from(text.clone())), cx),
             NavigatorEvent::CreateTable { target, schema } => {
                 self.open_table_editor(target.clone(), schema.clone(), None, window, cx);
             }
@@ -2417,6 +2439,12 @@ impl Workspace {
             }
             SidebarEvent::OpenAdmin(id) => {
                 self.open_admin(id, window, cx);
+            }
+            SidebarEvent::OpenLocks(id) => {
+                let tab = self.open_admin(id, window, cx);
+                tab.update(cx, |tab, cx| {
+                    tab.select(crate::admin::tab::LOCKS, window, cx)
+                });
             }
             SidebarEvent::Disconnect { ids, action } => {
                 self.disconnect(ids.clone(), action.clone(), window, cx)
@@ -3643,6 +3671,41 @@ impl Workspace {
                 this.on_grid(GridAction::Panel(Panel::Columns), window, cx)
             }),
         )
+        // Filters, counts and auto-refresh of a table's rows or a result.
+        .on_action(
+            cx.listener(|this, _: &actions::FilterDistinctValues, window, cx| {
+                this.on_grid(GridAction::DistinctValues, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::ClearFilters, window, cx| {
+            this.on_grid(GridAction::ClearFilters, window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::CalculateRowCount, window, cx| {
+                if let Some(tab) = this.active_data_tab().cloned() {
+                    tab.update(cx, |tab, cx| tab.count_exactly(window, cx));
+                } else if let Some(tab) = this.active_query_tab().cloned() {
+                    tab.update(cx, |tab, cx| tab.count_result(window, cx));
+                }
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::ToggleAutoRefresh, window, cx| {
+                let every = |on: Option<std::time::Duration>| {
+                    on.is_none()
+                        .then_some(crate::data::tab::AUTO_REFRESH_DEFAULT)
+                };
+                if let Some(tab) = this.active_data_tab().cloned() {
+                    tab.update(cx, |tab, cx| {
+                        tab.set_auto_refresh(every(tab.auto_refresh()), window, cx)
+                    });
+                } else if let Some(tab) = this.active_query_tab().cloned() {
+                    tab.update(cx, |tab, cx| {
+                        tab.set_auto_refresh(every(tab.auto_refresh()), window, cx)
+                    });
+                }
+            }),
+        )
         .on_action(
             cx.listener(|this, _: &actions::OpenTableAtCursor, window, cx| {
                 this.open_at_cursor(false, window, cx)
@@ -3903,8 +3966,16 @@ impl Render for Workspace {
         *self.tab_target.borrow_mut() = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).target().cloned());
-        self.shown_tab
-            .set(self.tabs.get(self.active_tab).map(OpenTab::entity_id));
+        let shown = self.tabs.get(self.active_tab).map(OpenTab::entity_id);
+        // The tabs no longer shown stop refreshing on their own.
+        if self.shown_tab.get() != shown {
+            for tab in &self.tabs {
+                if Some(tab.entity_id()) != shown {
+                    tab.hide(cx);
+                }
+            }
+        }
+        self.shown_tab.set(shown);
         let sidebar_visible = AppState::get(cx).settings.sidebar_visible;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
@@ -4139,6 +4210,40 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SetDefaultSchema, window, cx| {
                 this.on_tree(TreeAction::SetDefault, window, cx)
             }))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ReadObjectInConsole, window, cx| {
+                    this.on_tree(TreeAction::ReadInConsole, window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::GenerateRoutineCall, window, cx| {
+                    this.on_tree(TreeAction::GenerateCall, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ExecuteRoutine, window, cx| {
+                    this.on_tree(TreeAction::ExecuteRoutine, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::AddColumnToObject, window, cx| {
+                    this.on_tree(TreeAction::AddColumn, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::BackupObject, window, cx| {
+                    this.on_tree(TreeAction::Backup, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::OpenLockManager, window, cx| {
+                    if let Some(tab) = this.open_admin_here(window, cx) {
+                        tab.update(cx, |tab, cx| {
+                            tab.select(crate::admin::tab::LOCKS, window, cx)
+                        });
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &EditConnection, window, cx| {
                 this.sidebar
                     .update(cx, |sidebar, cx| sidebar.edit_selected(window, cx))

@@ -164,6 +164,8 @@ pub enum GridAction {
     FilterWith(Operator),
     /// Adds an empty condition on the column to the filter bar.
     FilterColumn,
+    /// Lists the column's values with their counts, to filter on some.
+    DistinctValues,
     ClearFilters,
     /// Ascending (`Some(false)`), descending, or the server's own order.
     Order(Option<bool>),
@@ -204,6 +206,10 @@ pub enum GridAction {
     /// Larger text (`1`), smaller (`-1`), the usual size (`0`).
     Zoom(i8),
     Panel(Panel),
+    /// Asks for a row number and selects that row.
+    GoToRow,
+    /// Lists the columns to select one.
+    GoToColumn,
 }
 
 /// Where "First / Previous / Next / Last row" moves the selection.
@@ -251,6 +257,7 @@ impl GridAction {
             Self::ExcludeValue => "Exclude this value",
             Self::FilterWith(operator) => return format!("{} this value…", operator.label()),
             Self::FilterColumn => "Filter on this column…",
+            Self::DistinctValues => "Distinct values…",
             Self::ClearFilters => "Clear filters",
             Self::Order(Some(false)) => "Ascending",
             Self::Order(Some(true)) => "Descending",
@@ -285,6 +292,8 @@ impl GridAction {
             Self::Zoom(0) => "Usual text size",
             Self::Panel(Panel::Aggregate) => "Aggregate",
             Self::Panel(Panel::Columns) => "Columns",
+            Self::GoToRow => "Go to row…",
+            Self::GoToColumn => "Go to column…",
         }
         .to_string()
     }
@@ -349,6 +358,9 @@ pub struct HeaderFacts {
     pub pinned: bool,
     pub hidden: usize,
     pub filtered: bool,
+    /// The server filters the rows: a table's data, or the result of a
+    /// SELECT that it reads again with the filter.
+    pub filters: bool,
 }
 
 /// "Order by this column ▸", the current order ticked.
@@ -399,6 +411,9 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
         let paste = read_only
             .or((!facts.clipboard).then_some("clipboard empty"))
             .or(this_cell(deleted.or(computed).or(binary)));
+        entries.push(item(A::Paste, paste));
+    }
+    if facts.data || facts.column.filters {
         let operators = [
             Operator::Greater,
             Operator::GreaterOrEqual,
@@ -410,25 +425,28 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
             Operator::In,
         ];
         let with_value = no_filter.or(facts.null.then_some("NULL value"));
-        entries.extend([
-            item(A::Paste, paste),
+        // DBeaver's Filter ▸ (`fillFiltersMenu`): the operators on this
+        // value, the column's distinct values, and clearing.
+        let mut filter: Vec<Entry> = operators
+            .into_iter()
+            .map(|operator| item(A::FilterWith(operator), with_value))
+            .collect();
+        filter.extend([
             Entry::Separator,
-            item(A::FilterByValue, no_filter),
-            item(A::ExcludeValue, no_filter),
-            Entry::Submenu(
-                "Filter",
-                operators
-                    .into_iter()
-                    .map(|operator| item(A::FilterWith(operator), with_value))
-                    .collect(),
-            ),
+            item(A::DistinctValues, no_filter),
             item(
                 A::ClearFilters,
                 (!facts.column.filtered).then_some("no filter"),
             ),
         ]);
+        entries.extend([
+            Entry::Separator,
+            item(A::FilterByValue, no_filter),
+            item(A::ExcludeValue, no_filter),
+            Entry::Submenu("Filter", filter),
+        ]);
     }
-    entries.extend([Entry::Separator, order_menu(&facts.column)]);
+    entries.extend([Entry::Separator, order_menu(&facts.column), navigate_menu()]);
     if !facts.related.is_empty() {
         entries.push(Entry::Separator);
         entries.extend(
@@ -508,6 +526,18 @@ fn layout_menu(facts: &CellFacts) -> Entry {
             enabled(A::Zoom(1)),
             enabled(A::Zoom(-1)),
             enabled(A::Zoom(0)),
+        ],
+    )
+}
+
+/// "Navigate ▸" (DBeaver's `fillNavigateMenu`, after the order): go to a
+/// row or a column; the foreign keys have their own entries.
+fn navigate_menu() -> Entry {
+    Entry::Submenu(
+        "Navigate",
+        vec![
+            enabled(GridAction::GoToRow),
+            enabled(GridAction::GoToColumn),
         ],
     )
 }
@@ -601,8 +631,8 @@ pub fn header_menu(facts: &HeaderFacts) -> Vec<Entry> {
         Entry::Separator,
         order_menu(facts),
     ];
-    if facts.data {
-        entries.push(enabled(A::FilterColumn));
+    if facts.data || facts.filters {
+        entries.extend([enabled(A::FilterColumn), enabled(A::DistinctValues)]);
     }
     entries.extend([
         Entry::Separator,
@@ -803,6 +833,12 @@ pub struct Grid {
     read_only: Option<&'static str>,
     /// Sorting is the server's work (a page of a table), not the grid's.
     sort_on_server: Option<Rc<SortOnServer>>,
+    /// Reads a result again in another order (a SELECT's): asked when not
+    /// every row is here, as DBeaver's "smart" ordering
+    /// (`ResultSetViewer.toggleSortOrder`); the rows here are sorted here.
+    reorder: Option<Rc<SortOnServer>>,
+    /// The rows came from the server in the order `sort` says.
+    server_sorted: bool,
     owner: Option<Owner>,
     /// One row as a list of its columns instead of the grid.
     pub record: bool,
@@ -845,6 +881,8 @@ impl Grid {
             edits: None,
             read_only: None,
             sort_on_server: None,
+            reorder: None,
+            server_sorted: false,
             owner: None,
             record: false,
             stats: None,
@@ -858,6 +896,32 @@ impl Grid {
     pub fn with_owner(mut self, owner: Owner) -> Self {
         self.owner = Some(owner);
         self
+    }
+
+    /// The rows of a SELECT that the server can read again filtered and in
+    /// another order: `reorder` asks for an order while not every row is
+    /// here; `sort` is the order the server gave these rows.
+    pub fn with_server_order(
+        mut self,
+        reorder: Rc<SortOnServer>,
+        sort: Option<(usize, bool)>,
+    ) -> Self {
+        self.reorder = Some(reorder);
+        self.server_sorted = sort.is_some();
+        self.sort = sort;
+        self
+    }
+
+    /// Who put the rows in their order: the server (`true`) or the grid;
+    /// `None` when they are in no chosen order.
+    pub fn ordered_by_server(&self) -> Option<bool> {
+        self.sort.map(|_| self.server_sorted)
+    }
+
+    /// Whether the rows can be put in another order now: once they stopped
+    /// arriving, or by the server while it holds more.
+    fn sortable(&self) -> bool {
+        !self.loading() || (self.reorder.is_some() && self.has_more())
     }
 
     /// One page of `table`, fetched in full and sorted by the server as
@@ -895,6 +959,8 @@ impl Grid {
                 editing: None,
             }),
             sort_on_server: Some(sort_on_server),
+            reorder: None,
+            server_sorted: false,
             owner: None,
             record: false,
             stats: None,
@@ -1764,10 +1830,11 @@ impl Grid {
                 .sort
                 .filter(|(sorted, _)| Some(*sorted) == source)
                 .map(|(_, descending)| descending),
-            loading: self.loading(),
+            loading: !self.sortable(),
             pinned: self.is_pinned(column),
             hidden: self.hidden_count(),
             filtered: self.owner.as_ref().is_some_and(|owner| owner.filtered),
+            filters: self.sort_on_server.is_some() || self.reorder.is_some(),
         }
     }
 
@@ -2059,6 +2126,8 @@ impl Grid {
                 crate::settings_view::zoom_grid((step != 0).then_some(f32::from(step)), window, cx)
             }
             GridAction::Panel(panel) => super::grid_view::open_panel(table, panel, window, cx),
+            GridAction::GoToRow => super::grid_view::go_to_row(table, window, cx),
+            GridAction::GoToColumn => super::grid_view::go_to_column(table, window, cx),
             GridAction::Order(order) => table.update(cx, |table, cx| {
                 let sort = match order {
                     Some(false) => ColumnSort::Ascending,
@@ -2211,7 +2280,7 @@ impl TableDelegate for Grid {
             shown = shown.fixed_left();
         }
         // What is still arriving cannot be put in order yet.
-        if !self.loading() {
+        if self.sortable() {
             shown = match self.sort {
                 Some((sorted, descending)) if sorted == source => {
                     if descending {
@@ -2248,6 +2317,20 @@ impl TableDelegate for Grid {
             window.defer(cx, move |window, cx| ask(sort, window, cx));
             return;
         }
+        // Not every row is here, or the server's order is taken back: the
+        // server reads the result again.
+        if let Some(ask) = self.reorder.clone()
+            && (!self.complete || (self.server_sorted && matches!(sort, ColumnSort::Default)))
+        {
+            let sort = match sort {
+                ColumnSort::Ascending => Some((source, false)),
+                ColumnSort::Descending => Some((source, true)),
+                ColumnSort::Default => None,
+            };
+            window.defer(cx, move |window, cx| ask(sort, window, cx));
+            return;
+        }
+        self.server_sorted = false;
         let descending = match sort {
             ColumnSort::Ascending => false,
             ColumnSort::Descending => true,
@@ -2637,6 +2720,7 @@ mod tests {
             pinned: false,
             hidden: 0,
             filtered: false,
+            filters: false,
         }
     }
 
@@ -2667,6 +2751,7 @@ mod tests {
             data: true,
             column: HeaderFacts {
                 data: true,
+                filters: true,
                 ..column()
             },
             ..result_cell()
@@ -2675,6 +2760,7 @@ mod tests {
 
     const COPY_AS: &str = "Copy as ▸ With column names | CSV | JSON | Markdown | SQL INSERT";
     const ORDER: &str = "Order by this column ▸ Ascending | Descending | Clear order (not ordered)";
+    const NAVIGATE: &str = "Navigate ▸ Go to row… | Go to column…";
     const COLUMN: &str = "Column ▸ Copy column name | Pin column | Hide column | \
                           Show all columns (none hidden)";
     const GENERATE: &str = "Generate SQL ▸ SELECT by key | SELECT … IN | INSERT | UPDATE | DELETE";
@@ -2691,6 +2777,7 @@ mod tests {
                 COPY_AS,
                 "—",
                 ORDER,
+                NAVIGATE,
                 "—",
                 "View value",
                 "—",
@@ -2749,7 +2836,8 @@ mod tests {
         };
         let filter = "Filter ▸ > this value… | >= this value… | < this value… | \
                       <= this value… | contains this value… | LIKE this value… | \
-                      NOT LIKE this value… | IN this value…";
+                      NOT LIKE this value… | IN this value… | — | Distinct values… | \
+                      Clear filters (no filter)";
         assert_eq!(
             labels(&cell_menu(&facts)),
             [
@@ -2760,9 +2848,9 @@ mod tests {
                 "Filter by this value",
                 "Exclude this value",
                 filter,
-                "Clear filters (no filter)",
                 "—",
                 ORDER,
+                NAVIGATE,
                 "—",
                 "Go to customers (customer_id = 7)",
                 "—",
@@ -2929,6 +3017,7 @@ mod tests {
                 "—",
                 "Order by this column ▸ ✓ Ascending | Descending | Clear order",
                 "Filter on this column…",
+                "Distinct values…",
                 "—",
                 "Pin column",
                 "Hide column",
@@ -2938,8 +3027,48 @@ mod tests {
                 "Fit all widths",
             ]
         );
-        // A result has no filter.
+        // A result the server cannot read again has no filter; a SELECT's has.
         assert!(!labels(&header_menu(&column())).contains(&"Filter on this column…".to_string()));
+        let select = labels(&header_menu(&HeaderFacts {
+            filters: true,
+            ..column()
+        }));
+        assert!(select.contains(&"Filter on this column…".to_string()));
+        assert!(select.contains(&"Distinct values…".to_string()));
+    }
+
+    #[test]
+    fn a_select_result_filters_on_the_server_but_never_edits() {
+        let facts = CellFacts {
+            column: HeaderFacts {
+                filters: true,
+                ..column()
+            },
+            ..result_cell()
+        };
+        let menu = labels(&cell_menu(&facts));
+        assert!(
+            menu.contains(&"Filter by this value".to_string()),
+            "{menu:?}"
+        );
+        assert!(menu.contains(&"Exclude this value".to_string()));
+        let all = flat(&cell_menu(&facts));
+        for entry in [
+            "Distinct values…",
+            "Clear filters (no filter)",
+            "> this value…",
+        ] {
+            assert!(all.contains(&entry.to_string()), "{entry}: {all:?}");
+        }
+        for entry in ["Paste", "Edit cell", "Set NULL", "Refresh"] {
+            assert!(!all.contains(&entry.to_string()), "{entry}: {all:?}");
+        }
+        // A JSON column has no distinct values to list.
+        let json = flat(&cell_menu(&CellFacts {
+            kind: TypeKind::Json,
+            ..facts
+        }));
+        assert!(json.contains(&"Distinct values… (JSON value)".to_string()));
     }
 
     #[test]

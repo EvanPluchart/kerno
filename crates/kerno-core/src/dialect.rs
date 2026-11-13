@@ -222,6 +222,17 @@ pub trait Dialect: Send + Sync {
         None
     }
 
+    /// The query that describes a database for its Properties page, shaped
+    /// as [`Dialect::properties_sql`]'s; `None` when the engine has none.
+    fn database_properties_sql(&self, _database: &str) -> Option<String> {
+        None
+    }
+
+    /// The same for a schema; `None` on engines without schemas.
+    fn schema_properties_sql(&self, _schema: &str) -> Option<String> {
+        None
+    }
+
     /// The script that replaces `object` by the definition in `ddl`: what
     /// [`crate::Session::ddl`] printed for it, edited by the user. The
     /// script is run one statement at a time, as the editor splits it.

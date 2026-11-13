@@ -1230,6 +1230,47 @@ async fn properties_describe_tables_and_views() {
 }
 
 #[tokio::test]
+async fn properties_describe_databases_and_schemas() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let d = session.dialect();
+    let describe = |sql: String| {
+        let session = session.clone();
+        async move {
+            let collected = run(&session, &sql).await.unwrap();
+            let result = collected.results.into_iter().next().unwrap();
+            let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+            (columns, result.rows())
+        }
+    };
+    let (columns, rows) = describe(d.database_properties_sql("kerno").unwrap()).await;
+    let row = &rows[0];
+    assert_eq!(property(&columns, row, "Owner").as_deref(), Some("kerno"));
+    assert_eq!(property(&columns, row, "Encoding").as_deref(), Some("UTF8"));
+    assert_eq!(property(&columns, row, "Template").as_deref(), Some("f"));
+    assert!(property(&columns, row, "Collation").is_some());
+    let size: u64 = property(&columns, row, "Total size")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(size > 0);
+
+    let (columns, rows) = describe(d.schema_properties_sql("shop").unwrap()).await;
+    let row = &rows[0];
+    assert_eq!(property(&columns, row, "Owner").as_deref(), Some("kerno"));
+    assert_eq!(
+        property(&columns, row, "Comment").as_deref(),
+        Some("Orders, customers and the product catalogue")
+    );
+    let tables: u64 = property(&columns, row, "Tables").unwrap().parse().unwrap();
+    assert!(tables > 0);
+    // Nothing is found for a schema that does not exist.
+    let (_, rows) = describe(d.schema_properties_sql("no_such").unwrap()).await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
 async fn a_database_is_created_with_the_options_the_server_lists() {
     let Some(session) = common::session().await else {
         return;

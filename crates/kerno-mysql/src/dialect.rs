@@ -482,6 +482,33 @@ WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}",
         ))
     }
 
+    /// From `information_schema.SCHEMATA` and the sizes of its tables. A
+    /// database has no owner on these engines; MariaDB keeps a comment,
+    /// MySQL has none.
+    fn database_properties_sql(&self, database: &str) -> Option<String> {
+        let name = self.quote_string(database);
+        let comment = if self.engine == Engine::MariaDb {
+            ",\n       NULLIF(s.SCHEMA_COMMENT, '') AS `Comment`"
+        } else {
+            ""
+        };
+        Some(format!(
+            "\
+SELECT s.DEFAULT_CHARACTER_SET_NAME AS `Character set`,
+       s.DEFAULT_COLLATION_NAME AS `Collation`,
+       (SELECT COUNT(*) FROM information_schema.TABLES t
+        WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME AND t.TABLE_TYPE = 'BASE TABLE') AS `Tables`,
+       (SELECT COUNT(*) FROM information_schema.TABLES t
+        WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME AND t.TABLE_TYPE = 'VIEW') AS `Views`,
+       (SELECT COALESCE(SUM(t.DATA_LENGTH), 0) FROM information_schema.TABLES t
+        WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME) AS `Data size`,
+       (SELECT COALESCE(SUM(t.INDEX_LENGTH), 0) FROM information_schema.TABLES t
+        WHERE t.TABLE_SCHEMA = s.SCHEMA_NAME) AS `Index size`{comment}
+FROM information_schema.SCHEMATA s
+WHERE s.SCHEMA_NAME = {name}"
+        ))
+    }
+
     /// Databases hold tables directly on these engines.
     fn create_schema_sql(&self, _name: &str) -> Result<String> {
         Err(unsupported(
@@ -1136,6 +1163,16 @@ mod tests {
                 properties.contains("t.TABLE_SCHEMA = 'shop' AND t.TABLE_NAME = 'order items'"),
                 "{properties}"
             );
+            let database = d.database_properties_sql("it's").unwrap();
+            assert!(
+                database.contains("WHERE s.SCHEMA_NAME = 'it''s'"),
+                "{database}"
+            );
+            assert_eq!(
+                database.contains("SCHEMA_COMMENT"),
+                d.engine == Engine::MariaDb
+            );
+            assert_eq!(d.schema_properties_sql("shop"), None);
         }
     }
 

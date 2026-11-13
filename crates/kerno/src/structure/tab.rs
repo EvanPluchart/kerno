@@ -90,7 +90,7 @@ pub const COLUMNS_SECTION: usize = 1;
 pub const DDL_SECTION: usize = 6;
 
 /// A property and its value (`None`: the server does not know).
-type Properties = Vec<(String, Option<String>)>;
+pub(crate) type Properties = Vec<(String, Option<String>)>;
 
 /// Where the tab is with the structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -866,7 +866,6 @@ impl StructureTab {
 
     /// The properties, one per line, and the comment's "Edit…" on a table.
     fn render_properties(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
         let properties = match &self.properties {
             None => {
                 return self.render_notice(
@@ -924,27 +923,8 @@ impl StructureTab {
             .gap_1()
             .children(properties.iter().enumerate().map(|(index, (name, value))| {
                 let comment = name == "Comment";
-                h_flex()
+                property_line(name, value.as_deref(), cx)
                     .id(("structure-property", index))
-                    .gap_3()
-                    .items_start()
-                    .text_sm()
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(160.))
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(name.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(value.is_none(), |this| {
-                                this.text_color(theme.muted_foreground)
-                            })
-                            .child(SharedString::from(property_text(name, value.as_deref()))),
-                    )
                     .when(comment && editable, |this| {
                         this.child(
                             Button::new("structure-edit-comment")
@@ -1085,8 +1065,68 @@ impl ListGrid {
     }
 }
 
+/// One property on its line: its name, then its value for people.
+fn property_line(name: &str, value: Option<&str>, cx: &App) -> gpui_kit::Div {
+    let theme = cx.theme();
+    h_flex()
+        .gap_3()
+        .items_start()
+        .text_sm()
+        .child(
+            div()
+                .flex_none()
+                .w(px(160.))
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(name.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .when(value.is_none(), |this| {
+                    this.text_color(theme.muted_foreground)
+                })
+                .child(SharedString::from(property_text(name, value))),
+        )
+}
+
+/// Shows the properties of a database or a schema (DBeaver's object
+/// editor, F4), read with [`properties_of`]: one line each, as the
+/// Properties sub-tab of a table shows them.
+pub(crate) fn open_properties(
+    title: String,
+    properties: Properties,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let body = if properties.is_empty() {
+            div()
+                .id("object-properties-missing")
+                .test_support()
+                .text_sm()
+                .child("Not found: it may have been renamed or dropped. Refresh the tree.")
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("object-properties")
+                .test_support()
+                .gap_1()
+                .children(properties.iter().enumerate().map(|(index, (name, value))| {
+                    let label = format!("{name}: {}", property_text(name, value.as_deref()));
+                    property_line(name, value.as_deref(), cx)
+                        .id(("object-property", index))
+                        .test_support()
+                        .aria_label(SharedString::from(label))
+                }))
+                .into_any_element()
+        };
+        dialog.title(title.clone()).w(px(520.)).child(body)
+    });
+}
+
 /// The properties in the one row of a properties query: its columns.
-fn properties_of(collected: exec::Collected) -> Properties {
+pub(crate) fn properties_of(collected: exec::Collected) -> Properties {
     let Some(result) = collected.results.into_iter().next() else {
         return Vec::new();
     };

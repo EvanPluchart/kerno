@@ -179,7 +179,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![
                 vec![NewQueryHere, CreateSchema, CreateDatabase],
                 vec![Backup, Restore],
-                vec![CopyName, CopyQualifiedName],
+                vec![Properties, CopyName, CopyQualifiedName],
                 vec![Drop],
             ]
         }
@@ -193,7 +193,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateDatabase,
             ],
             vec![ImportCsv, Backup, Restore],
-            vec![ShowDdl, CopyName, CopyQualifiedName],
+            vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
         NodeKind::Object(ObjectRef::Schema(_)) => vec![
@@ -205,7 +205,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateSchema,
             ],
             vec![ImportCsv],
-            vec![ShowDdl, CopyName, CopyQualifiedName],
+            vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
@@ -871,18 +871,19 @@ mod tests {
             Some(EditSource)
         );
         assert_eq!(edit(routine(RoutineKind::Aggregate), true), Some(ShowDdl));
+        // A database and a schema show their properties (CM-33).
         let schema = NodeKind::Object(ObjectRef::Schema("shop".into()));
-        assert_eq!(edit(schema, true), Some(ShowDdl));
+        assert_eq!(edit(schema, true), Some(Properties));
         let database = NodeKind::Object(ObjectRef::Database("kerno".into()));
-        assert_eq!(edit(database.clone(), false), Some(ShowDdl));
+        assert_eq!(edit(database.clone(), false), Some(Properties));
         // A column is edited in the form of its table (CM-72).
         let column = NodeKind::Column {
             table: orders,
             name: "id".into(),
         };
         assert_eq!(edit(column, true), Some(EditColumn));
-        // Nothing to edit on a PostgreSQL database or a folder.
-        assert_eq!(edit(database, true), None);
+        assert_eq!(edit(database, true), Some(Properties));
+        // Nothing to edit on a folder.
         assert_eq!(edit(NodeKind::Group(Group::Tables), true), None);
     }
 

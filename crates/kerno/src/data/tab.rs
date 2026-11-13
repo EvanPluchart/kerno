@@ -12,8 +12,8 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -21,7 +21,9 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
-use kerno_core::browse::{Condition, Filter, Operator, Page, count_sql, page_sql};
+use kerno_core::browse::{
+    Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql,
+};
 use kerno_core::config::Environment;
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::{Pending, neighbour};
@@ -34,6 +36,7 @@ use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
+use crate::query::distinct;
 use crate::query::grid::{ColumnEdit, CopyFormat, Grid, GridAction, Owner, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
@@ -87,6 +90,78 @@ enum State {
         message: String,
         gone: bool,
     },
+}
+
+/// How many rows the filter keeps in the whole table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Total {
+    Exact(u64),
+    /// The planner's estimate of an unfiltered table too large to count
+    /// after each page; "Count exactly" counts it.
+    About(u64),
+}
+
+/// An unfiltered table whose estimate is above this is not counted after
+/// each page: the estimate is shown instead (M6 Part 2).
+const COUNT_ESTIMATE_ABOVE: u64 = 1_000_000;
+
+/// The intervals auto-refresh offers, in seconds (DBeaver's
+/// `AutoRefreshControl.AUTO_REFRESH_DEFAULTS`).
+pub const AUTO_REFRESH_SECONDS: [u64; 6] = [1, 5, 10, 15, 30, 60];
+
+/// What the toggle command starts auto-refresh with.
+pub const AUTO_REFRESH_DEFAULT: Duration = Duration::from_secs(10);
+
+/// Reads the rows again every `every` while on.
+pub struct AutoRefresh {
+    pub every: Duration,
+    _timer: Task<()>,
+}
+
+impl AutoRefresh {
+    /// Calls `tick` every `every`, on the entity, until it returns false or
+    /// the entity is gone. Ticks are counted from the last one: a refresh
+    /// still running when the next tick comes is not started again.
+    pub fn start<T: 'static>(
+        every: Duration,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        tick: fn(&mut T, &mut Window, &mut Context<T>) -> bool,
+    ) -> Self {
+        let timer = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(every).await;
+                let going = this.update_in(cx, tick);
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        Self {
+            every,
+            _timer: timer,
+        }
+    }
+
+    /// "every 5 s".
+    pub fn label(every: Duration) -> String {
+        format!("every {} s", every.as_secs())
+    }
+}
+
+/// The first cell of a one-value result, as a count: `None` for NULL, a
+/// negative number (PostgreSQL's estimate of a table never analysed) or
+/// a failure.
+pub fn first_count(collected: kerno_core::Result<exec::Collected>) -> Option<u64> {
+    let collected = collected.ok()?;
+    let result = collected.results.first()?;
+    result
+        .batches
+        .first()?
+        .text(0, 0)?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// Whether the server says the table itself does not exist: PostgreSQL's
@@ -149,15 +224,28 @@ pub struct DataTab {
     page: u64,
     page_size: u64,
     grid: Option<Entity<TableState<Grid>>>,
-    /// Rows the filter keeps in the whole table, once counted.
-    total: Option<u64>,
+    /// Rows the filter keeps in the whole table, once counted or estimated.
+    total: Option<Total>,
     counting: bool,
+    /// An unfiltered table estimated above this is not counted after each
+    /// page.
+    estimate_above: u64,
+    /// The filters applied here before, the latest first (RES-06).
+    history: Vec<String>,
+    /// The filter last put in the history.
+    remembered: Option<Filter>,
+    /// Reads the page again every so often (RES-25).
+    auto_refresh: Option<AutoRefresh>,
+    /// Why auto-refresh stopped by itself, until it is started again.
+    auto_refresh_stopped: Option<&'static str>,
     elapsed: Option<Duration>,
     state: State,
     /// The load in flight; the next one waits for it.
     load: Option<Task<()>>,
     generation: u64,
     applying: bool,
+    /// The page read after an apply takes the keyboard, as the grid had it.
+    refocus_grid: bool,
     /// Why the last apply changed nothing.
     apply_error: Option<String>,
     grid_subscriptions: Vec<Subscription>,
@@ -225,11 +313,17 @@ impl DataTab {
             grid: None,
             total: None,
             counting: false,
+            estimate_above: COUNT_ESTIMATE_ABOVE,
+            history: Vec::new(),
+            remembered: None,
+            auto_refresh: None,
+            auto_refresh_stopped: None,
             elapsed: None,
             state: State::Waiting,
             load: None,
             generation: 0,
             applying: false,
+            refocus_grid: false,
             apply_error: None,
             grid_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
@@ -237,8 +331,87 @@ impl DataTab {
         for condition in filter.conditions {
             tab.push_filter_row(condition, window, cx);
         }
+        tab.load_history(cx);
         tab.reload(window, cx);
         tab
+    }
+
+    /// What the filter history of this table is stored under.
+    fn history_key(&self) -> String {
+        format!(
+            "data:{}/{}/{}.{}",
+            self.target.connection,
+            self.target.database.as_deref().unwrap_or_default(),
+            self.table.schema,
+            self.table.name
+        )
+    }
+
+    /// Reads the filters applied to this table before.
+    fn load_history(&mut self, cx: &mut Context<Self>) {
+        let (storage, key) = (AppState::get(cx).storage.clone(), self.history_key());
+        let reading = bridge::spawn_blocking(cx, move || storage.filters(&key));
+        cx.spawn(async move |this, cx| {
+            let Ok(history) = reading.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.history = history;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Puts the filter of the rows on screen first in the history, written
+    /// as SQL with its values as literals.
+    fn remember_filter(&mut self, session: &Arc<dyn Session>, cx: &mut Context<Self>) {
+        let (Some(structure), false) = (&self.structure, self.applied.is_empty()) else {
+            return;
+        };
+        if self.remembered.as_ref() == Some(&self.applied) {
+            return;
+        }
+        // The conditions as SQL, and what was typed as it was typed.
+        let conditions = Filter {
+            conditions: self.applied.conditions.clone(),
+            raw: String::new(),
+        };
+        let Ok(conditions) = conditions.where_sql(session.dialect(), &structure.columns) else {
+            return;
+        };
+        let raw = self.applied.raw.trim();
+        let text = match conditions {
+            Some(conditions) if raw.is_empty() => conditions,
+            Some(conditions) => kerno_core::browse::and_where(raw, &conditions),
+            None => raw.to_string(),
+        };
+        self.remembered = Some(self.applied.clone());
+        let (storage, key, rules) = (
+            AppState::get(cx).storage.clone(),
+            self.history_key(),
+            session.dialect().lex_rules(),
+        );
+        let kept = text.clone();
+        let saving = bridge::spawn_blocking(cx, move || storage.add_filter(&key, &kept, rules));
+        cx.spawn(async move |this, cx| {
+            if !matches!(saving.await, Ok(true)) {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.history.retain(|known| *known != text);
+                this.history.insert(0, text);
+                this.history.truncate(kerno_core::storage::FILTERS_KEPT);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The filters offered by the history; for tests.
+    #[cfg(test)]
+    pub fn history(&self) -> &[String] {
+        &self.history
     }
 
     pub fn title(&self) -> SharedString {
@@ -386,6 +559,11 @@ impl DataTab {
         cx.notify();
     }
 
+    /// Another tab is on screen: auto-refresh stops.
+    pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.stop_auto_refresh(Some("the tab was hidden"), cx);
+    }
+
     /// The tab is on screen: a deferred tab reads its rows now.
     pub fn reveal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.hidden) {
@@ -408,6 +586,7 @@ impl DataTab {
         let previous = self.load.take();
         let opening = self.session(cx);
         let table = self.table.clone();
+        let estimate_above = self.estimate_above;
         let known = self.structure.clone();
         let filter = self.applied.clone();
         let sort = self.sort.clone();
@@ -433,6 +612,16 @@ impl DataTab {
                             Some(structure) => structure,
                             None => Arc::new(session.table_structure(&table).await?),
                         };
+                        // The planner's estimate of an unfiltered table: above
+                        // the threshold it stands for the count, read with
+                        // the page instead of a count after it.
+                        let about = if filter.is_empty() {
+                            let estimate = session.dialect().estimated_rows_sql(&table);
+                            first_count(exec::collect(session.clone(), estimate).await)
+                                .filter(|about| *about > estimate_above)
+                        } else {
+                            None
+                        };
                         let identity = structure.row_identity().unwrap_or_default();
                         let sql = page_sql(
                             session.dialect(),
@@ -453,14 +642,14 @@ impl DataTab {
                             .unwrap_or_default();
                         let counting =
                             count_sql(session.dialect(), &structure.columns, &table, &filter)?;
-                        Ok::<_, Error>((structure, result, counting))
+                        Ok::<_, Error>((structure, result, counting, about))
                     })
                 })
             };
             let Ok(reading) = reading else {
                 return;
             };
-            let (structure, result, counting) = match reading.await {
+            let (structure, result, counting, about) = match reading.await {
                 Ok(read) => read,
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| this.failed(generation, &error, cx));
@@ -476,22 +665,25 @@ impl DataTab {
             let shown = this.update_in(cx, |this, window, cx| {
                 this.generation == generation && {
                     this.show(loaded, elapsed, window, cx);
+                    if let Some(about) = about {
+                        this.total = Some(Total::About(about));
+                        this.counting = false;
+                    }
                     true
                 }
             });
-            if !matches!(shown, Ok(true)) {
+            if !matches!(shown, Ok(true)) || about.is_some() {
                 return;
             }
             // The page shows at once; how many rows there are in all follows.
-            let Ok(counted) =
-                cx.update(|_, cx| bridge::spawn(cx, exec::collect(session, counting)))
-            else {
+            let Ok(counted) = cx.update(|_, cx| {
+                bridge::spawn(cx, async move {
+                    first_count(exec::collect(session, counting).await).map(Total::Exact)
+                })
+            }) else {
                 return;
             };
-            let total = counted.await.ok().and_then(|collected| {
-                let result = collected.results.first()?;
-                result.batches.first()?.text(0, 0)?.parse::<u64>().ok()
-            });
+            let total = counted.await;
             let _ = this.update(cx, |this, cx| {
                 if this.generation == generation {
                     this.total = total;
@@ -507,10 +699,12 @@ impl DataTab {
         if self.generation != generation {
             return;
         }
+        self.refocus_grid = false;
         if error.is_disconnect() {
             self.close_session(cx);
         }
         self.counting = false;
+        self.stop_auto_refresh(Some("the rows could not be read"), cx);
         let gone = table_gone(error);
         self.state = State::Failed {
             message: error.to_string(),
@@ -543,6 +737,7 @@ impl DataTab {
         self.total = None;
         self.counting = true;
         self.state = State::Ready;
+        self.remember_filter(&session, cx);
 
         let mut store = ResultStore::new(result.columns.clone());
         for batch in result.batches {
@@ -658,9 +853,25 @@ impl DataTab {
                     }
                 },
             ),
-            // Pending changes show in the toolbar.
-            cx.observe(&table, |_, _, cx| cx.notify()),
+            // Pending changes show in the toolbar, and stop auto-refresh: a
+            // refresh would drop them.
+            cx.observe(&table, |this, _, cx| {
+                if this.auto_refresh.is_some() && this.pending_count(cx) > 0 {
+                    this.stop_auto_refresh(Some("changes are pending"), cx);
+                }
+                cx.notify()
+            }),
         ];
+        if std::mem::take(&mut self.refocus_grid) {
+            // Only while the keyboard is still on this tab, not after the
+            // user moved on during the reload.
+            let old = self.grid.as_ref().map(|grid| grid.focus_handle(cx));
+            let focused = window.focused(cx);
+            if focused.is_none() || focused == old || self.focus_handle.contains_focused(window, cx)
+            {
+                table.focus_handle(cx).focus(window, cx);
+            }
+        }
         self.grid = Some(table);
         cx.notify();
     }
@@ -729,10 +940,219 @@ impl DataTab {
     fn has_next(&self, cx: &App) -> bool {
         let shown = self.page * self.page_size + self.fetched(cx);
         match self.total {
-            Some(total) => shown < total,
-            // Not counted yet: a full page may have a next one.
-            None => self.fetched(cx) == self.page_size,
+            Some(Total::Exact(total)) => shown < total,
+            // Not counted: a full page may have a next one.
+            Some(Total::About(_)) | None => self.fetched(cx) == self.page_size,
         }
+    }
+
+    /// How many rows the filter keeps, as counted or estimated; for tests.
+    #[cfg(test)]
+    pub fn total(&self) -> Option<Total> {
+        self.total
+    }
+
+    /// Estimates above `rows` are shown as such; for tests.
+    #[cfg(test)]
+    pub fn set_estimate_above(&mut self, rows: u64) {
+        self.estimate_above = rows;
+    }
+
+    /// Counts the rows the filter keeps (DBeaver's "Calculate total row
+    /// count", `core.resultset.count`), after what the session is doing;
+    /// Cancel stops it.
+    pub fn count_exactly(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(session), Some(structure)) = (self.session.clone(), self.structure.clone())
+        else {
+            return;
+        };
+        if self.counting || self.state != State::Ready {
+            return;
+        }
+        let Ok(counting) = count_sql(
+            session.dialect(),
+            &structure.columns,
+            &self.table,
+            &self.applied,
+        ) else {
+            return;
+        };
+        self.counting = true;
+        let generation = self.generation;
+        let previous = self.load.take();
+        self.load = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let Ok(counted) =
+                cx.update(|_, cx| bridge::spawn(cx, exec::collect(session, counting)))
+            else {
+                return;
+            };
+            let total = first_count(counted.await);
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.counting = false;
+                    // A cancelled count leaves the estimate.
+                    if let Some(total) = total {
+                        this.total = Some(Total::Exact(total));
+                    }
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Lists the distinct values of the grid's `column` among the rows the
+    /// filter keeps, but for the column's own conditions, with their counts
+    /// (DBeaver's "Filter by distinct values"); the values picked are added
+    /// to the filter.
+    pub fn distinct_values(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(session), Some(structure), Some(table)) = (
+            self.session.clone(),
+            self.structure.clone(),
+            self.grid.clone(),
+        ) else {
+            return;
+        };
+        let Some(name) = ({
+            let grid = table.read(cx).delegate();
+            grid.source_column(column)
+                .map(|source| grid.store().columns()[source].name.clone())
+        }) else {
+            return;
+        };
+        let Some(info) = structure
+            .columns
+            .iter()
+            .find(|info| info.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let mut filter = self.applied.clone();
+        filter
+            .conditions
+            .retain(|condition| condition.column != name);
+        let listing = distinct_sql(
+            session.dialect(),
+            kerno_core::browse::Source::Table(&self.table),
+            &structure.columns,
+            &filter,
+            &name,
+            distinct::LIMIT,
+        );
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(error.to_string())),
+                    cx,
+                );
+                return;
+            }
+        };
+        let previous = self.load.take();
+        let generation = self.generation;
+        self.counting = true;
+        self.load = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let dialect_of = session.clone();
+            let Ok(listed) = cx.update(|_, cx| bridge::spawn(cx, exec::collect(session, listing)))
+            else {
+                return;
+            };
+            let listed = listed.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.counting = false;
+                cx.notify();
+                let values = match listed {
+                    Ok(listed) => distinct::values(&listed),
+                    Err(error) => {
+                        window.push_notification(
+                            Notification::error(SharedString::from(format!(
+                                "The values of {name} could not be read: {error}"
+                            ))),
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                let view = cx.weak_entity();
+                distinct::open(&name, values, window, cx, move |picked, window, cx| {
+                    let Some(condition) = one_of_sql(dialect_of.dialect(), &info, &picked) else {
+                        return;
+                    };
+                    let _ = view.update(cx, |this, cx| {
+                        this.add_raw_condition(&condition, window, cx)
+                    });
+                });
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Adds `condition` (SQL) to the raw `WHERE` of the filter bar and reads
+    /// the rows the filter keeps.
+    fn add_raw_condition(&mut self, condition: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.free_to_move(window, cx) {
+            return;
+        }
+        let raw = kerno_core::browse::and_where(&self.raw_filter.read(cx).value(), condition);
+        self.raw_filter
+            .update(cx, |input, cx| input.set_value(raw, window, cx));
+        self.apply_filter(window, cx);
+    }
+
+    // Auto-refresh ----------------------------------------------------------
+
+    /// Reads the page again every `every`, or stops (`None`).
+    pub fn set_auto_refresh(
+        &mut self,
+        every: Option<Duration>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.auto_refresh_stopped = None;
+        self.auto_refresh =
+            every.map(|every| AutoRefresh::start(every, window, cx, Self::auto_tick));
+        cx.notify();
+    }
+
+    /// The interval of auto-refresh, while on.
+    pub fn auto_refresh(&self) -> Option<Duration> {
+        self.auto_refresh.as_ref().map(|auto| auto.every)
+    }
+
+    /// Stops auto-refresh; `why` it stopped by itself, shown in the footer.
+    pub fn stop_auto_refresh(&mut self, why: Option<&'static str>, cx: &mut Context<Self>) {
+        if self.auto_refresh.take().is_some() {
+            self.auto_refresh_stopped = why;
+            cx.notify();
+        }
+    }
+
+    /// One tick of auto-refresh: whether it goes on.
+    fn auto_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.pending_count(cx) > 0 {
+            self.stop_auto_refresh(Some("changes are pending"), cx);
+            return false;
+        }
+        if self.hidden || self.read_failed() || !self.connected(cx) {
+            self.stop_auto_refresh(Some("the rows are not shown"), cx);
+            return false;
+        }
+        // Never two reads at once: the next tick tries again.
+        if !(self.state == State::Loading || self.counting || self.applying) {
+            self.reload(window, cx);
+        }
+        true
     }
 
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1148,21 +1568,12 @@ impl DataTab {
         operator: Operator,
         cx: &App,
     ) -> Option<Condition> {
-        let grid = self.grid.as_ref()?.read(cx).delegate();
-        let (described, value) = grid.value_at(row, column)?;
-        let operator = match (value, operator) {
-            (None, Operator::Equals) => Operator::IsNull,
-            (None, Operator::NotEquals) => Operator::IsNotNull,
-            (None, _) => return None,
-            (Some(_), operator) => operator,
-        };
-        Some(Condition {
-            column: described.name.clone(),
+        condition_at(
+            self.grid.as_ref()?.read(cx).delegate(),
+            row,
+            column,
             operator,
-            value: value.map_or(String::new(), |bytes| {
-                String::from_utf8_lossy(bytes).into_owned()
-            }),
-        })
+        )
     }
 
     /// Adds a condition to the filter bar and reads the rows it keeps
@@ -1230,6 +1641,7 @@ impl DataTab {
                 }
             }
             GridAction::ClearFilters => self.set_filter(Filter::default(), window, cx),
+            GridAction::DistinctValues => self.distinct_values(column, window, cx),
             GridAction::Follow(index, _) => {
                 let related = match (&self.grid, &self.structure) {
                     (Some(table), Some(structure)) => {
@@ -1462,6 +1874,7 @@ impl DataTab {
                             cx,
                         );
                         // The grid is read again, without the changes.
+                        this.refocus_grid = true;
                         this.load = None;
                         this.reload(window, cx);
                     }
@@ -1534,7 +1947,12 @@ impl DataTab {
             )
         };
         match self.total {
-            Some(total) if fetched > 0 => format!("{range} of {}", number(total as f64)),
+            Some(Total::Exact(total)) if fetched > 0 => {
+                format!("{range} of {}", number(total as f64))
+            }
+            Some(Total::About(total)) if fetched > 0 => {
+                format!("{range} of about {}", number(total as f64))
+            }
             _ => range,
         }
     }
@@ -1580,6 +1998,16 @@ impl DataTab {
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
             )
+            // Pending changes stop auto-refresh: no use for it then, and
+            // the toolbar keeps its room for them.
+            .when(pending == 0, |bar| {
+                bar.child(auto_refresh_button(
+                    "data-auto-refresh",
+                    self.auto_refresh(),
+                    cx.entity(),
+                    |this, every, window, cx| this.set_auto_refresh(every, window, cx),
+                ))
+            })
             .when(editable, |bar| {
                 bar.child(
                     action("data-add-row", "Add row", "Add an empty row")
@@ -1825,6 +2253,21 @@ impl DataTab {
                                 .font_family(theme.mono_font_family.clone()),
                         ),
                     )
+                    .child(history_button(
+                        "filter-history",
+                        &self.history,
+                        view.clone(),
+                        |this, filter, window, cx| {
+                            this.set_filter(
+                                Filter {
+                                    conditions: Vec::new(),
+                                    raw: filter,
+                                },
+                                window,
+                                cx,
+                            )
+                        },
+                    ))
                     .child(
                         Button::new("filter-apply")
                             .outline()
@@ -1870,6 +2313,35 @@ impl DataTab {
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(SharedString::from(range))
+            .when(
+                matches!(self.total, Some(Total::About(_))) && !self.counting && !loading,
+                |bar| {
+                    bar.child(
+                        Button::new("data-count")
+                            .ghost()
+                            .xsmall()
+                            .label("Count exactly")
+                            .tooltip("Count the rows of the table (the number shown is the server's estimate)")
+                            .on_click(cx.listener(|this, _, window, cx| this.count_exactly(window, cx))),
+                    )
+                },
+            )
+            .children(self.auto_refresh().map(|every| {
+                div()
+                    .id("data-auto-refresh-on")
+                    .test_support()
+                    .child(SharedString::from(format!(
+                        "Auto-refresh {}",
+                        AutoRefresh::label(every)
+                    )))
+            }))
+            .children(self.auto_refresh_stopped.map(|why| {
+                div()
+                    .id("data-auto-refresh-stopped")
+                    .test_support()
+                    .text_color(cx.theme().warning)
+                    .child(SharedString::from(format!("Auto-refresh stopped: {why}.")))
+            }))
             .when(self.counting && !loading, |bar| bar.child("counting…"))
             .when(loading && self.grid.is_some(), |bar| bar.child("loading…"))
             .when(self.applying, |bar| bar.child("applying…"))
@@ -2053,6 +2525,30 @@ impl DataTab {
     }
 }
 
+/// A condition on the column of a cell of `grid`, with the cell's value:
+/// `operator`, or for a NULL cell `IS NULL` (`=`) and `IS NOT NULL` (`<>`).
+pub fn condition_at(
+    grid: &Grid,
+    row: usize,
+    column: usize,
+    operator: Operator,
+) -> Option<Condition> {
+    let (described, value) = grid.value_at(row, column)?;
+    let operator = match (value, operator) {
+        (None, Operator::Equals) => Operator::IsNull,
+        (None, Operator::NotEquals) => Operator::IsNotNull,
+        (None, _) => return None,
+        (Some(_), operator) => operator,
+    };
+    Some(Condition {
+        column: described.name.clone(),
+        operator,
+        value: value.map_or(String::new(), |bytes| {
+            String::from_utf8_lossy(bytes).into_owned()
+        }),
+    })
+}
+
 /// The other end of a foreign key of a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Related {
@@ -2107,6 +2603,87 @@ pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Relat
         })
     });
     references.chain(referenced_by).collect()
+}
+
+/// What a view does with an interval of auto-refresh (`None`: stop).
+type SetAutoRefresh<T> = fn(&mut T, Option<Duration>, &mut Window, &mut Context<T>);
+
+/// The auto-refresh dropdown (DBeaver's `AutoRefreshControl`): the
+/// intervals, the current one ticked, and Stop; it says when it is on.
+pub fn auto_refresh_button<T: 'static>(
+    id: &'static str,
+    on: Option<Duration>,
+    view: Entity<T>,
+    set: SetAutoRefresh<T>,
+) -> impl IntoElement {
+    let label = match on {
+        Some(every) => format!("Every {} s", every.as_secs()),
+        None => "Auto-refresh".into(),
+    };
+    Button::new(id)
+        .ghost()
+        .small()
+        .label(SharedString::from(label))
+        .selected(on.is_some())
+        .tooltip("Read the rows again every few seconds")
+        .dropdown_caret(true)
+        .dropdown_menu(move |mut menu, _, _| {
+            for seconds in AUTO_REFRESH_SECONDS {
+                let (every, view) = (Duration::from_secs(seconds), view.clone());
+                menu = menu.item(
+                    PopupMenuItem::new(SharedString::from(format!("Every {seconds} s")))
+                        .checked(on == Some(every))
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| set(this, Some(every), window, cx))
+                        }),
+                );
+            }
+            let view = view.clone();
+            menu.separator()
+                .item(PopupMenuItem::new("Stop").disabled(on.is_none()).on_click(
+                    move |_, window, cx| view.update(cx, |this, cx| set(this, None, window, cx)),
+                ))
+        })
+}
+
+/// The filters applied before, to apply one again (DBeaver's history of
+/// the filter panel).
+pub fn history_button<T: 'static>(
+    id: &'static str,
+    history: &[String],
+    view: Entity<T>,
+    pick: fn(&mut T, String, &mut Window, &mut Context<T>),
+) -> impl IntoElement {
+    let history = history.to_vec();
+    Button::new(id)
+        .ghost()
+        .small()
+        .label("History")
+        .tooltip("The filters applied here before")
+        .disabled(history.is_empty())
+        .dropdown_caret(true)
+        .dropdown_menu(move |mut menu, _, _| {
+            for filter in &history {
+                let (view, filter) = (view.clone(), filter.clone());
+                let label: String = one_line_filter(&filter);
+                menu = menu.item(PopupMenuItem::new(SharedString::from(label)).on_click(
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| pick(this, filter.clone(), window, cx))
+                    },
+                ));
+            }
+            menu
+        })
+}
+
+/// A filter on one line, cut short for a menu.
+fn one_line_filter(filter: &str) -> String {
+    let line = filter.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > 80 {
+        line.chars().take(79).collect::<String>() + "…"
+    } else {
+        line
+    }
 }
 
 impl Focusable for DataTab {

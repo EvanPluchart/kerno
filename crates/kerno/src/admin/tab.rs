@@ -890,6 +890,12 @@ impl AdminTab {
         self.view(pane).grid.clone()
     }
 
+    /// The sub-tab on screen; for tests.
+    #[cfg(test)]
+    pub fn section(&self) -> usize {
+        self.section
+    }
+
     /// The id of the session selected; for tests.
     #[cfg(test)]
     pub fn selected_id(&self, cx: &App) -> Option<String> {

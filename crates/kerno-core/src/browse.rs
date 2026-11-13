@@ -310,6 +310,8 @@ pub struct Query {
     text: String,
     /// The names more than one column of the result carries.
     duplicates: Vec<String>,
+    /// It ends with its own `ORDER BY` and no `LIMIT`.
+    own_order: bool,
 }
 
 impl Query {
@@ -327,14 +329,19 @@ impl Query {
         };
         let class = classify(text, rules);
         if class.kind != StatementKind::Select {
-            return refuse("only the result of a SELECT can be read again this way");
+            return refuse(
+                "only the result of one SELECT can be filtered, ordered or counted on the server",
+            );
         }
         if class.writes {
             return refuse("the statement writes (INTO, or a CTE that changes rows)");
         }
-        if locks_rows(text, rules) {
+        let words = top_words(text, rules);
+        if locks_rows(&words) {
             return refuse("the statement locks rows (FOR UPDATE, FOR SHARE, LOCK IN SHARE MODE)");
         }
+        let own_order = words.windows(2).any(|pair| pair == ["ORDER", "BY"])
+            && !words.iter().any(|word| word == "LIMIT" || word == "FETCH");
         let mut duplicates: Vec<String> = Vec::new();
         for (index, name) in columns.iter().enumerate() {
             if columns[..index].contains(name) && !duplicates.contains(name) {
@@ -355,7 +362,15 @@ impl Query {
         Ok(Self {
             text: text.to_string(),
             duplicates,
+            own_order,
         })
+    }
+
+    /// Whether the server ignores the statement's own `ORDER BY` once it
+    /// is a derived table: MySQL and MariaDB do without a `LIMIT`, so a
+    /// filtered result comes back in no given order.
+    pub fn drops_own_order(&self, dialect: &dyn Dialect) -> bool {
+        self.own_order && dialect.engine() != Engine::Postgres
     }
 
     /// The statement, without its `;`.
@@ -378,7 +393,17 @@ impl Query {
 
 /// Whether a `SELECT` ends with a locking clause: reading it again would
 /// lock the rows again, inside a filter's or a count's statement.
-fn locks_rows(statement: &str, rules: crate::sql::LexRules) -> bool {
+fn locks_rows(words: &[String]) -> bool {
+    words.windows(2).any(|pair| {
+        pair[0] == "FOR" && matches!(pair[1].as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
+    }) || words
+        .windows(4)
+        .any(|four| four == ["LOCK", "IN", "SHARE", "MODE"])
+}
+
+/// The words of a statement outside parentheses, in upper case; anything
+/// else outside them is an empty word, so that only neighbours pair up.
+fn top_words(statement: &str, rules: crate::sql::LexRules) -> Vec<String> {
     let mut depth = 0usize;
     let mut words: Vec<String> = Vec::new();
     for token in lex(statement, rules) {
@@ -392,11 +417,7 @@ fn locks_rows(statement: &str, rules: crate::sql::LexRules) -> bool {
             _ => {}
         }
     }
-    words.windows(2).any(|pair| {
-        pair[0] == "FOR" && matches!(pair[1].as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
-    }) || words
-        .windows(4)
-        .any(|four| four == ["LOCK", "IN", "SHARE", "MODE"])
+    words
 }
 
 /// What `FROM` reads for `source`.
@@ -439,10 +460,7 @@ pub fn select_from(
     filter: &Filter,
     sort: Option<(&str, bool)>,
 ) -> Result<String> {
-    let mut sql = format!(
-        "SELECT * {}",
-        from_where(dialect, source, columns, filter)?
-    );
+    let mut sql = format!("SELECT * {}", from_where(dialect, source, columns, filter)?);
     if let Some((column, descending)) = sort {
         if let Source::Query(query) = source {
             query.check(column)?;
@@ -507,10 +525,24 @@ pub fn one_of_sql(
         .map(|value| dialect.literal(&CellValue::Text(value.clone()), column))
         .collect();
     let in_list = (!literals.is_empty()).then(|| format!("{ident} IN ({})", literals.join(", ")));
-    let null = values.iter().any(Option::is_none).then(|| format!("{ident} IS NULL"));
+    let null = values
+        .iter()
+        .any(Option::is_none)
+        .then(|| format!("{ident} IS NULL"));
     match (in_list, null) {
         (Some(in_list), Some(null)) => Some(format!("({in_list} OR {null})")),
         (one, other) => one.or(other),
+    }
+}
+
+/// The body of a `WHERE` that keeps what `existing` keeps and `condition`
+/// too.
+pub fn and_where(existing: &str, condition: &str) -> String {
+    let existing = existing.trim();
+    if existing.is_empty() {
+        condition.to_string()
+    } else {
+        format!("({existing}) AND {condition}")
     }
 }
 
@@ -810,7 +842,10 @@ mod tests {
             let q = |ident: &str| dialect.quote_ident(ident);
             // The `;` goes, and the comment after the last word with it; one
             // inside stays on its line.
-            let shipped = query(dialect, "select * -- all of them\nfrom shop.orders -- end\n;");
+            let shipped = query(
+                dialect,
+                "select * -- all of them\nfrom shop.orders -- end\n;",
+            );
             assert_eq!(shipped.text(), "select * -- all of them\nfrom shop.orders");
             let columns = columns_named(&["id", "status"]);
             assert_eq!(
@@ -843,6 +878,18 @@ mod tests {
                 .unwrap(),
                 "SELECT * FROM (\nSELECT id FROM t ORDER BY id LIMIT 5\n) kerno_q"
             );
+            // MySQL and MariaDB drop an ORDER BY without LIMIT in a derived
+            // table; PostgreSQL keeps it.
+            let sorted = query(dialect, "select id from t order by id desc");
+            assert_eq!(
+                sorted.drops_own_order(dialect),
+                dialect.engine() != Engine::Postgres
+            );
+            assert!(!ordered.drops_own_order(dialect));
+            assert!(
+                !query(dialect, "select id from (select id from t order by id) s")
+                    .drops_own_order(dialect)
+            );
             // A CTE, a UNION in parentheses, VALUES: the server reads them.
             for statement in [
                 "WITH s AS (SELECT 1 AS id) SELECT * FROM s",
@@ -853,13 +900,7 @@ mod tests {
             }
             // Counted through the same derived table.
             assert_eq!(
-                count_from(
-                    dialect,
-                    Source::Query(&shipped),
-                    &columns,
-                    &status_is("x")
-                )
-                .unwrap(),
+                count_from(dialect, Source::Query(&shipped), &columns, &status_is("x")).unwrap(),
                 format!(
                     "SELECT count(*) FROM (\nselect * -- all of them\nfrom shop.orders\n) \
                      kerno_q\nWHERE {} = 'x'",
@@ -875,9 +916,9 @@ mod tests {
             let no = |statement: &str| refused(dialect, statement, &["id"]);
             assert!(no("").contains("no statement"));
             assert!(no("select 1; select 2").contains("several statements"));
-            assert!(no("update t set a = 1").contains("only the result of a SELECT"));
-            assert!(no("show tables").contains("only the result of a SELECT"));
-            assert!(no("explain select 1").contains("only the result of a SELECT"));
+            assert!(no("update t set a = 1").contains("only the result of one SELECT"));
+            assert!(no("show tables").contains("only the result of one SELECT"));
+            assert!(no("explain select 1").contains("only the result of one SELECT"));
             assert!(no("select * into t2 from t").contains("writes"));
             assert!(no("select * from t for update").contains("locks rows"));
             assert!(no("SELECT * FROM t FOR NO KEY UPDATE").contains("locks rows"));
@@ -912,7 +953,16 @@ mod tests {
         let both = Query::new(&PG, statement, &names(&["id", "id", "status"])).unwrap();
         let columns = columns_named(&["id", "id", "status"]);
         let source = Source::Query(&both);
-        assert!(select_from(&PG, source, &columns, &status_is("x"), Some(("status", false))).is_ok());
+        assert!(
+            select_from(
+                &PG,
+                source,
+                &columns,
+                &status_is("x"),
+                Some(("status", false))
+            )
+            .is_ok()
+        );
         let ambiguous = |result: Result<String>| result.unwrap_err().to_string();
         let on_id = Filter {
             conditions: vec![Condition::equals("id", "1")],
@@ -947,10 +997,7 @@ mod tests {
     }
 
     fn columns_named(names: &[&str]) -> Vec<ColumnInfo> {
-        names
-            .iter()
-            .map(|name| col(name, TypeKind::Text))
-            .collect()
+        names.iter().map(|name| col(name, TypeKind::Text)).collect()
     }
 
     #[test]
@@ -1007,6 +1054,12 @@ mod tests {
             "(\"id\" IN (7) OR \"id\" IS NULL)"
         );
         assert_eq!(one_of(&number, &[None]).unwrap(), "\"id\" IS NULL");
+        // Added to what is typed, which keeps its own precedence.
+        assert_eq!(and_where("  ", "a = 1"), "a = 1");
+        assert_eq!(
+            and_where("a = 1 OR b = 2", "c = 3"),
+            "(a = 1 OR b = 2) AND c = 3"
+        );
     }
 
     #[test]

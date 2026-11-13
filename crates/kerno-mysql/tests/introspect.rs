@@ -1672,6 +1672,33 @@ async fn properties_describe_tables_and_views() {
 }
 
 #[tokio::test]
+async fn properties_describe_databases() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let d = session.dialect();
+        let (columns, rows) = table(&session, &d.database_properties_sql("kerno").unwrap()).await;
+        assert_eq!(rows.len(), 1, "{engine:?}");
+        let row = &rows[0];
+        assert!(property(&columns, row, "Character set").is_some());
+        assert!(property(&columns, row, "Collation").is_some());
+        let tables: u64 = property(&columns, row, "Tables").unwrap().parse().unwrap();
+        assert!(tables > 0, "{engine:?}");
+        let size: u64 = property(&columns, row, "Data size")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(size > 0, "{engine:?}");
+        // MariaDB keeps a comment on a database; MySQL has none to show.
+        assert_eq!(
+            columns.iter().any(|column| column == "Comment"),
+            engine == Engine::MariaDb
+        );
+        let (_, rows) = table(&session, &d.database_properties_sql("no_such").unwrap()).await;
+        assert!(rows.is_empty(), "{engine:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_database_is_created_with_a_character_set_and_collation() {
     for engine in engines() {
         let session = common::session(engine).await;
