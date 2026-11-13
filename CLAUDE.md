@@ -147,6 +147,21 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
   while text accents, links and focus rings use Olive `#4D6B00` and selected rows use Lime wash `#F1F8D6`.
   Keep WCAG AA (BRAND.md lists the ratios). Show the horizontal lockup in the About window and the README
   header, and the mark in the empty state of the main window.
+- Owner's test of 2026-11-13 (afternoon), all required before the final screenshots:
+  1. No vertical bars at the left of connection rows or tabs: they read as generated filler. A connection
+     with no colour shows no marker; a colour tag is a small dot beside the engine logo (sidebar, tabs, status
+     bar). Production keeps a distinct warning (its tinted tab or status bar), not a bar.
+  2. One tree, as DBeaver's Database Navigator: folders and connections are the roots, expanding a connection
+     connects it and shows its databases, schemas and objects under it. No separate "not connected" panel
+     taking half the sidebar. Every empty area of the sidebar answers a right-click.
+  3. Folders have a colour (the connection palette) and an icon: a few built-in glyphs or a custom image the
+     user picks (PNG, JPEG or SVG, copied into the app data directory, drawn at 16 px), e.g. a project's logo.
+     Set them in the New folder dialog and in the folder's "Edit folder…" menu entry.
+  4. The app icon also shows when the bare binary runs (Dock and app switcher), not only inside `Kerno.app`.
+  5. Connection errors say what happened in plain words first (host not found, connection refused, timed
+     out, wrong password, TLS failure) with the next step, then the server's raw message below. Example: host
+     not found → "Host “studio” was not found. Check the host name; for a server on this computer, use
+     localhost."
 
 ## 4. v1 features (all required, priority order)
 
