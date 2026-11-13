@@ -1,8 +1,10 @@
 # Features
 
 Every v1 item of CLAUDE.md §4, with its status, the tests that cover it and the screenshot that shows it.
-Status: `done` (works end to end against the test servers, tested, captured), `partial` (what is missing is
-said), `todo` (milestone given). Test names are functions; the file is given once per group.
+Status: `done` (in the committed code and covered by a test), `done, untested` (it exists, no test covers it),
+`partial: <what is missing>`, `todo: <plan file and part>` (not built yet). Test names are functions; the file is
+given once per group. Screenshot: files of `docs/screenshots/`; `to capture` where the plan has captures not yet
+taken (milestones 7 and 8); `—` where there is none. Committed code only (HEAD `712b7cf`), 2026-11-13.
 
 Engines: PG = PostgreSQL 17, My = MySQL 8.4, Ma = MariaDB 11.
 
@@ -21,8 +23,12 @@ Tests: `crates/kerno/src/ui_tests.rs` (UI), `crates/kerno/src/connections/manage
 | A5 Test connection (version, latency) | done | `test_connection_reports_version_and_latency`, `a_connection_is_filled_from_a_url_tested_saved_and_opened` | `m3-dialog-general-light.png` |
 | A5 Connect / disconnect | done | `connects_queries_and_disconnects`, `a_failed_connection_says_why` | `m3-sidebar-connected-*.png`, `m3-connection-failed-light.png` |
 | A5 Auto-reconnect on a dropped connection | done | `a_lost_connection_is_re_established` | — (no visible state) |
-| A5 Read-only flag | partial: the server session is read-only (`read_only_sessions_refuse_writes`, PG, My, Ma); the client-side block arrives with the editor (milestone 5) | `read_only_sessions_refuse_writes` | `m3-dialog-general-*.png` |
-| A5 Duplicate, edit, delete | done | `duplicate_import_and_delete`, `deleting_a_connection_asks_first`, `saving_stores_settings_and_secrets_separately` | `m3-sidebar-menu-light.png` |
+| A5 Read-only flag | done: the server session is read-only and the client refuses writes | `read_only_sessions_refuse_writes` (PG, My, Ma), `statements_that_destroy_or_write_are_guarded`, `production_asks_twice_and_read_only_refuses`, `a_read_only_connection_cannot_apply`, `a_read_only_connection_cannot_import` | `m3-dialog-general-*.png`, `m4-navigator-menu-readonly-light.png` |
+| A5 Duplicate, edit, rename, delete (sidebar menu) | done | `duplicate_import_and_delete`, `deleting_a_connection_asks_first`, `saving_stores_settings_and_secrets_separately`, `the_sidebar_answers_a_right_click_on_each_part`, `folders_are_made_renamed_and_removed_with_what_they_hold` (rename) | `m3-sidebar-menu-light.png` |
+| A1 Folders: nested paths kept in `group`, empty folders remembered, create / rename / delete (content moves up after a confirmation), collapse, folder picker in the dialog | done | `folders_are_made_renamed_and_removed_with_what_they_hold`, `a_folder_is_made_renamed_filled_by_drag_and_deleted`, `folder_paths_are_tidied_checked_and_moved`, `the_folder_is_stored_as_a_tidy_path`, `connections_are_exported_without_secrets_and_imported_back` (folders travel with the export) | — |
+| A1 Drag a connection onto a folder or to the top level | done | `a_folder_is_made_renamed_filled_by_drag_and_deleted` | — |
+| A5 Sidebar menus: empty area, folder, connection (Reconnect, New SQL editor, Move to folder, Copy name / URL without the password / host) | done | `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does`, `a_connection_disables_what_does_not_apply_to_its_status`, `the_copied_connection_url_has_no_password`, `the_connection_url_has_no_password_and_reads_back`, `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection` | `m3-sidebar-menu-light.png` |
+| A5 A double click or Enter on a connection connects it and never disconnects; F4 edits it | done | `a_double_click_on_a_connection_connects_and_never_disconnects` | — |
 | A5 Import / export as JSON without secrets | done | `connections_are_exported_without_secrets_and_imported_back`, `connections_export_and_import_without_secrets`, `import_rejects_what_is_not_a_valid_connections_file` | — (file dialog) |
 
 Engine logos (CLAUDE.md §1): engine picker and sidebar connections show the vendors' logos
@@ -44,23 +50,159 @@ and `actions.rs` (tree and menus), `crates/kerno-core/src/sql/generate.rs` and t
 | B2 Filter box | done | `the_filter_narrows_the_tree_and_clearing_it_restores_it`, `the_filter_keeps_what_matches_and_the_way_to_it` | `m4-navigator-filter-light.png` |
 | B2 Refresh node | done | `refresh_reloads_the_nearest_node_that_owns_its_children`, `dropping_renaming_and_truncating_show_the_sql_and_ask` (the tree is refreshed after each) | — |
 | B2 Row-count and size hints, icons per object kind | done | `databases_then_schemas_then_folders_of_objects`, `counts_and_sizes_are_compact` | `m4-navigator-tree-*.png` |
-| B3 New query here, copy name, generate SELECT / INSERT / UPDATE / DELETE, show DDL | done (the tab is bound to the connection in milestone 5) | `statements_and_ddl_open_in_a_tab_and_run_nothing`, `generate.rs` tests | `m4-navigator-menu-light.png` |
+| B3 New query here, copy name, generate SELECT / INSERT / UPDATE / DELETE, show DDL | done | `statements_and_ddl_open_in_a_tab_and_run_nothing`, `generate.rs` tests | `m4-navigator-menu-light.png` |
 | B3 Rename, truncate, drop, with SQL preview and confirmation | done | `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` (MySQL, MariaDB), `tests/generate.rs` (PG, My, Ma) | `m4-confirm-drop-*.png`, `m4-confirm-rename-light.png`, `m4-confirm-production-light.png`, `m4-navigator-menu-readonly-light.png` |
 | B3 Create schema / database | done | `dropping_renaming_and_truncating_show_the_sql_and_ask` (schema), `tests/generate.rs` (database) | — |
-| B3 Create table / view | partial: opens a statement to complete in a query tab; the form editor is milestone 7 | `statements_and_ddl_open_in_a_tab_and_run_nothing` | — |
-| B3 Open data, open structure | todo: with the table data view (milestone 6) and the structure view (milestone 7) | | |
+| B3 Create table (opens the form editor) | done | `a_table_is_created_from_the_form` | to capture |
+| B3 Create view | partial: opens a statement to complete in a query tab | `statements_and_ddl_open_in_a_tab_and_run_nothing` | — |
+| B3 Open data, open structure | done | `a_double_click_or_enter_opens_what_the_row_is_for`, `a_table_is_read_in_pages_sorted_and_filtered_by_the_server`, `the_structure_of_a_table_is_shown_in_tabs`, `navigator_keys_run_the_actions_of_the_selected_node` | `m6-data-pending-light.png`, to capture (structure) |
+| B3 Edit source, install extension, create enum, Export…, Import CSV… (entries on the nodes they apply to) | done | `editing_a_source_applies_it_once_its_sql_is_confirmed`, `extensions_are_installed_and_dropped_from_the_tree`, `enums_are_created_and_their_values_added_and_renamed`, `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog`, `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it` | to capture |
+| B3 Set as default for the active tab; copy the qualified name; New query on any node | done | `set_as_default_points_the_active_tab_at_the_schema`, `navigator_keys_run_the_actions_of_the_selected_node` | — |
+| B3 Empty area below the tree: Refresh, Collapse all, New query here | done | `a_right_click_below_the_schema_tree_opens_its_menu` | — |
+| B1 Clicks (§4.B item 1): a click selects; the chevron, Right and Left expand and collapse; a double click or Enter runs the default action (table, view: data, structure or expand by the `table_double_click` setting; routines: source; other objects: DDL; folders: toggle) | done | `a_click_selects_a_row_and_the_chevron_or_the_arrows_open_it`, `a_double_click_or_enter_opens_what_the_row_is_for`, `a_double_click_opens_what_the_node_is_for`, `f4_opens_the_editor_of_what_the_node_is` | — |
+| B Keys, as DBeaver: F4 edit, F2 rename, Delete / Backspace drop (with the SQL confirmation), F5 refresh, Cmd+C copy name, Cmd+Shift+C qualified name, Cmd+] new query, Cmd+Shift+A set as default; each a named command in the palette and the keymap file | done | `navigator_keys_run_the_actions_of_the_selected_node`, `command_ids_are_unique_and_shortcuts_valid`, `a_shortcut_is_unique_within_its_context`, `shortcuts_need_a_real_key` | — |
 
-## C. SQL editor — todo (milestone 5)
+## C. SQL editor
 
-## D. Results grid — todo (milestone 5)
+Tests: `crates/kerno/src/ui_tests.rs` (UI, against the three servers), `crates/kerno-core/src/sql/{split,params,classify,complete,format,lex}.rs`
+(statements), `crates/kerno-core/src/plan.rs` and `crates/kerno/src/query/plan_view.rs` (EXPLAIN),
+`crates/kerno/src/query/comment.rs`, `crates/kerno/src/library.rs`, `crates/kerno-core/src/storage.rs` (history),
+`crates/kerno-{postgres,mysql}/tests/{execute,explain,introspect}.rs` (what the servers do).
+Status words: `done` (in the committed code and a test covers it), `done, untested`, `partial: <what is missing>`,
+`todo: <plan file and part>`. Screenshots of milestone 5 beyond the two below are not taken yet.
 
-## E. Table data view — todo (milestone 6)
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| C1 Several tabs per connection, each bound to a connection, database and schema | done | `tabs_open_switch_and_close_from_the_keyboard`, `tabs_close_with_their_button_and_open_from_the_empty_state`, `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection`, `set_as_default_points_the_active_tab_at_the_schema`, `a_tab_without_an_open_connection_says_what_to_do` | — |
+| C1 Toolbar selectors (connection, database, schema) of a tab | done, untested: no test clicks the dropdowns; the target they set is covered by the row above | | — |
+| C1 Tabs and unsaved text restored after a restart | done | `unsaved_text_and_tabs_come_back_after_a_restart`, `the_active_tab_is_active_again_after_a_restart`, `snapshots_are_tagged_by_kind` | — |
+| C1 Open and save `.sql` files (name, unsaved mark, a file open once) | done | `sql_files_are_opened_saved_and_marked_when_changed` | — |
+| C1 Closing a tab that holds an open transaction, pending edits or an unsaved file asks first | todo: plans/M5.md Part 4 (also plans/CTX.md Part 2) | | — |
+| C2 Highlighting | done, untested: the kit's editor with the SQL language | | — |
+| C2 Schema-aware completion: keywords, functions, schemas, tables, columns, aliases, joins on foreign keys | done | `completion_proposes_tables_columns_and_joins`, `typing_in_the_editor_opens_completion_and_enter_accepts_it`, `the_catalog_follows_ddl`; core: `after_from_come_relations_of_the_search_path_then_schemas`, `after_an_alias_and_a_dot_come_its_columns`, `join_proposes_joins_along_foreign_keys_first`, `on_proposes_the_foreign_key_condition`, `functions_are_built_in_or_from_the_catalog`, `names_are_quoted_only_when_they_need_it`, `a_large_catalog_and_a_long_statement_stay_fast`; drivers: `completion_catalog_lists_the_user_schemas` (PG), `completion_catalog_lists_the_user_databases` (My, Ma) | — |
+| C2 Completion on demand (Ctrl+Space); catalog read through the tab's session in manual commit; MySQL `USE` refreshes the search path | todo: plans/M5.md (left over from Part 2) | | — |
+| C2 Bracket matching | done, untested: the kit's editor | | — |
+| C2 Comment toggle (Cmd+/) | done | `the_comment_shortcut_toggles_the_lines_of_the_selection`, `lines_are_commented_out_and_back_in`, `a_selection_is_widened_to_whole_lines` | — |
+| C2 Find and replace | done | `the_editor_searches_and_replaces` | — |
+| C2 Multi-cursor | done, untested: the kit's editor (Cmd+Alt+Up / Down) | | — |
+| C2 Format SQL (selection or whole text, one undo step, never changes a token) | done | `format_sql_rewrites_the_selection_or_everything_as_one_undo_step`; core: `formatting_preserves_every_token`, `formatting_is_idempotent`, `representative_statements_come_back_exactly_so`, `output_is_tidy`, `random_token_soup_keeps_the_properties` | — |
+| C3 Run the statement at the cursor, or the whole script (one result per statement, stops at the first failure) | done | `statements_run_and_their_rows_fill_the_grid`; core: `statement_at_cursor`, `splits_on_semicolons_and_drops_empty_statements`, `mysql_delimiter_command`, `a_long_script_splits_in_linear_time` | — |
+| C3 Run the selection | done, untested | | — |
+| C3 Rows arrive a page at a time; fetch more, fetch all | done | `a_large_result_arrives_a_page_at_a_time`; core: `delivers_exactly_the_rows_asked_for_then_waits`, `first_rows_arrive_before_a_large_result_is_done`; drivers: `rows_stream_only_as_far_as_asked` (PG, My, Ma), `fetch_all_delivers_every_row_in_order` | — |
+| C3 Cancel a running statement | done | `a_running_statement_is_cancelled_and_the_window_stays_usable`; drivers: `a_running_statement_can_be_cancelled` (PG, My, Ma), `cancelling_a_sleep_ends_it_at_once`, `another_sessions_statement_can_be_cancelled` | — |
+| C3 Timing and rows affected | done | `statements_run_and_their_rows_fill_the_grid`; drivers: `commands_report_their_row_counts` | — |
+| C3 Server notices and warnings panel; error position underlined with detail and hint | done | `messages_errors_and_history_of_a_run`; drivers: `notices_and_warnings_are_delivered` (PG), `warnings_are_delivered_as_notices` (My, Ma), `server_errors_carry_code_position_detail_and_hint` (PG), `server_errors_carry_code_and_position` (My, Ma) | — |
+| C3 Write guards (CLAUDE.md §1): read-only refuses writes, destructive statements confirmed, production twice | done | `statements_that_destroy_or_write_are_guarded`; core: `statements_are_classified`, `the_table_covers_enough`, `executable_comments_are_mysql_only` | — |
+| C4 Query parameters (`:name`, `$1`, `?`) asked for before the run | done | `parameters_are_asked_for_before_a_statement_runs`; core: `finds_named_and_numbered_parameters_once_each`, `question_marks_are_separate_parameters_on_mysql_only`, `things_that_look_like_parameters_but_are_not`, `binds_every_occurrence_and_leaves_the_rest`, `values_become_literals` | — |
+| C5 EXPLAIN and EXPLAIN ANALYZE as a plan tree (cost, rows, time, slowest step) and the raw output | done | `plans_are_shown_as_a_tree_on_every_engine`; core: `slowest_is_the_largest_exclusive_time`, `exclusive_time_takes_the_children_out`, `the_outline_shows_one_node_per_line`; app: `rows_are_the_nodes_top_down_with_their_depth_and_path`, `measurement_details_are_left_to_the_raw_output`, `numbers_and_times_are_short_and_grouped`; drivers: `plans_are_read_with_and_without_analyze` (PG, My, Ma), `the_scan_of_the_big_table_is_the_slowest_step` | `m5-explain-analyze-light.png` |
+| C6 Transaction mode per tab: auto-commit or manual, visible state, Commit and Rollback | done | `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended`; drivers: `transaction_state_follows_the_server` (PG, My, Ma), `abandoning_a_result_inside_a_transaction_keeps_the_transaction` (PG) | — |
+| C7 Query history: searchable, per connection, duration and status | done | `history_and_saved_queries_are_searched_and_reopened`, `messages_errors_and_history_of_a_run`; core: `history_is_newest_first_filtered_and_searchable`, `history_never_stores_a_password`, `passwords_in_statements_are_redacted`; app: `times_are_told_in_the_largest_unit_that_fits`, `a_statement_is_shown_on_one_line` | `m5-history-light.png` |
+| C7 Saved queries: named, foldered | done | `history_and_saved_queries_are_searched_and_reopened`; core: `saved_queries_are_created_updated_sorted_and_deleted` | `m5-history-light.png` |
 
-## F. Structure — todo (milestone 7)
+## D. Results grid
 
-## G. Import, export, backup — todo (milestone 8)
+Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno-core/src/{format,sort,export,result}.rs`, the drivers'
+`tests/execute.rs` (`every_type_arrives_in_its_text_form`).
 
-## H. Administration — todo (milestone 8)
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| D1 Virtualized, streamed, compact storage | partial: rows are laid out only when visible and arrive in pages; smooth scrolling of 1,000,000 rows × 20 columns is measured in milestone 9 (todo: plans/M9.md) | `a_large_result_arrives_a_page_at_a_time`, `cells_round_trip_across_many_rows`, `store_addresses_rows_across_batches`, `a_clone_is_a_snapshot_that_shares_the_rows` | — |
+| D1 Client-side sort (numbers as numbers, NULLs last; large results on a background thread) | done | `the_grid_sorts_copies_and_rearranges_what_it_shows`; core: `numbers_compare_by_value`, `nulls_are_greater_than_everything`, `rows_are_sorted_with_ties_in_fetch_order_and_nulls_last`, `two_hundred_thousand_mixed_rows_sort_correctly`, `one_million_mixed_rows_sort_correctly` | — |
+| D1 Hide and pin columns, show all | done | `the_grid_sorts_copies_and_rearranges_what_it_shows` | — |
+| D1 Column resize and reorder | done, untested | | — |
+| D1 Row numbers | done, untested | | — |
+| D1 Selection: cells, ranges (shift-click), the whole result | partial: a cell, a range and Cmd+A are tested; selecting a row or a column by its header (the kit's) is not | `the_grid_sorts_copies_and_rearranges_what_it_shows` | — |
+| D2 NULL distinct from the empty string | done | `null_is_not_an_empty_string`, `null_is_distinct_from_empty`, `statements_run_and_their_rows_fill_the_grid` | — |
+| D2 Numbers right-aligned; colour per kind | partial: the kind that picks alignment and colour is tested; the drawn alignment is not asserted | `style_follows_the_kind_of_the_column` | — |
+| D2 Booleans, long text truncated, binary as a hex preview | done | `booleans_are_spelled_out`, `text_is_cut_at_a_number_of_characters`, `a_huge_cell_is_cut_without_reading_all_of_it`, `binary_is_a_hex_preview`, `a_double_click_on_a_cell_shows_its_whole_value` | — |
+| D2 Dates and times with zone, UUID, JSON, arrays: shown as the server writes them | done | `every_type_arrives_in_its_text_form` (PG, My, Ma), `numbers_are_shown_as_the_server_printed_them`, `json_numbers_and_strings_are_kept_as_written` | — |
+| D2 Value viewer: text, indented JSON, hex dump | done | `a_double_click_on_a_cell_shows_its_whole_value`; core: `json_is_indented_by_two_spaces`, `hex_dump_has_rows_of_sixteen_bytes`, `deeply_nested_json_does_not_overflow` | — |
+| D3 Copy as TSV, CSV, JSON, Markdown, SQL INSERT; copy column names | done | `the_grid_sorts_copies_and_rearranges_what_it_shows`; core: `sample_as_csv`, `sample_as_tsv`, `sample_as_json_array`, `sample_as_markdown`, `sample_as_sql_insert`, `delimited_fields_are_quoted_only_when_they_must_be` | — |
+| D3 The row menu opens from any cell and offers the copy formats | done | `a_right_click_on_a_cell_opens_the_menu_of_its_row` | `m6-row-menu-dark.png` |
+| D3 Export the full result | done | `a_query_result_is_exported_by_running_its_statement_again`, `the_million_row_table_exports_line_by_line` (PG, My, Ma) | — |
+
+## E. Table data view
+
+Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno-core/src/{browse,pending}.rs`, `crates/kerno-core/src/sql/edits.rs`,
+`crates/kerno-core/src/schema.rs`, `crates/kerno-{postgres,mysql}/tests/edits.rs`.
+
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| E1 Pages of data, server-side sort from a header click, filter bar (column, operator, value) with a raw `WHERE`, row count | done | `a_table_is_read_in_pages_sorted_and_filtered_by_the_server`; core: `conditions_are_written_with_literals`, `patterns_match_the_text_of_any_column`, `conditions_and_the_raw_text_must_all_hold`, `what_cannot_be_a_filter_is_refused`, `a_page_is_sorted_down_to_the_row_identity` | `m6-filter-light.png` |
+| E1 Refresh; cancel a slow page | done | `cells_are_edited_reviewed_and_applied_in_one_transaction` (refresh), `a_slow_page_is_cancelled_and_the_tab_stays_usable` (PG) | — |
+| E1 Counting a very large table: "about N rows" and a "Count exactly" button | partial: the estimate statement exists in the core (`Dialect::estimated_rows_sql`); the tab still counts exactly (todo: plans/M6.md Part 2) | `the_row_estimate_of_the_big_table_is_close_to_its_count` (PG), `the_row_estimate_of_the_big_table_is_of_its_order` (My, Ma) | — |
+| E1 Opened from the tree (double click, Enter, Open data); restored after a restart | done | `a_double_click_or_enter_opens_what_the_row_is_for`, `a_table_opened_from_the_tree_comes_back_after_a_restart` | — |
+| E2 Inline edit of cells; add, duplicate, delete rows; Set NULL, Set default; pending changes highlighted and counted | done | `cells_are_edited_reviewed_and_applied_in_one_transaction`; core: `an_edit_back_to_the_fetched_value_is_no_edit`, `rows_are_added_copied_taken_away_and_reverted` | `m6-data-pending-light.png`, `m6-data-pending-dark.png` |
+| E2 Review SQL; Apply in one transaction or Discard; a failed apply rolls back and keeps the pending edits | done | `cells_are_edited_reviewed_and_applied_in_one_transaction`; core: `update_sets_cells_of_the_row_addressed_by_its_key`, `delete_addresses_one_row`, `changes_keep_their_order_and_empty_updates_vanish`, `changes_address_rows_by_the_key_they_were_read_with`; drivers: `a_failed_apply_changes_nothing` (PG, My, Ma), `every_type_survives_a_write_from_its_text_form` (PG), `every_type_round_trips_through_edit_statements` (My, Ma) | `m6-review-sql-light.png` |
+| E2 A primary or unique key is required, else read-only with the reason | done | `rows_that_cannot_be_addressed_are_read_only_and_say_why` (PG); core: `row_identity_prefers_the_primary_key_in_key_order`, `no_key_means_no_row_identity`, `without_a_key_only_new_rows_can_be_written`, `a_row_without_identity_is_never_updated_or_deleted` | — |
+| E2 Enum and boolean cells edited from a list; paste into cells; Delete sets NULL; Cmd+Z takes a change back | todo: plans/M6.md Part 1 | | — |
+| E3 Follow a foreign key to the referenced row; list the rows that reference the current one | done | `foreign_keys_lead_to_the_referenced_row_and_back` | `m6-row-menu-dark.png` |
+
+## F. Structure
+
+Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno-core/src/table_draft.rs`, `crates/kerno-core/src/dialect.rs`,
+`crates/kerno-{postgres,mysql}/tests/{alter,generate,introspect}.rs`. Captures of milestone 7 are not taken yet.
+
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| F1 Structure tab of a table: columns, indexes, constraints, foreign keys both ways, triggers, DDL | done | `the_structure_of_a_table_is_shown_in_tabs`, `a_view_shows_its_columns_and_ddl`, `the_structure_tab_comes_back_after_a_restart`; drivers: `structure_of_a_table`, `table_ddl_recreates_the_same_structure` | to capture |
+| F2 Create a table through a form with a live DDL preview, applied after confirmation | done | `a_table_is_created_from_the_form`, `the_form_refuses_what_is_invalid`; core: `a_new_draft_has_an_auto_increment_primary_key`, `validation_names_every_problem`, `create_table_writes_keys_inline_then_indexes_and_comments`; drivers: `a_table_created_from_a_draft_reads_back_as_the_draft` (PG, My, Ma) | to capture |
+| F2 Alter a table through the form (add, drop, rename, modify columns; indexes; foreign keys; comments) with the statements previewed | partial: column order cannot be edited; renaming the table from the form with the structure tab following and the per-engine wording of the confirmation have no test (plans/M7.md Part 1c, item 4) | `a_table_is_altered_from_the_form_with_a_preview`; core: `every_kind_of_change_in_the_order_it_must_run`, `an_unchanged_draft_gives_no_change`, `renaming_a_key_column_keeps_the_keys_and_indexes`, `primary_keys_are_dropped_and_added_as_needed`, `a_foreign_key_with_another_action_is_dropped_and_added`, `alter_table_writes_one_statement_per_action_in_order`, `altering_a_column_writes_only_what_differs`; drivers: `a_table_edited_from_its_structure_becomes_the_draft` (PG, My, Ma) | to capture |
+| F2 An edit does not lose what the form does not show: ON UPDATE, INVISIBLE, identity kind, a self-referencing key | done | core: `a_change_of_on_update_alters_the_column`, `an_invisible_column_stays_invisible`, `an_identity_keeps_its_kind`, `a_key_on_its_own_table_follows_a_rename_of_what_it_references`; drivers: `a_comment_only_edit_keeps_on_update_current_timestamp`, `an_invisible_column_stays_invisible_after_an_edit` (My, Ma), `an_identity_generated_always_stays_always` (PG), `a_key_on_its_own_table_follows_a_rename_of_what_it_references` (PG, My, Ma) | — |
+| F2 Apply asks twice on production, refuses on a read-only connection, rolls back a failed alter on PostgreSQL | done | `production_asks_twice_before_a_table_is_altered`, `a_read_only_connection_cannot_apply`, `a_failed_alter_changes_nothing_on_postgresql`, `a_table_form_is_not_restored_after_a_restart` | — |
+| F3 View, function and procedure source: view and edit, applied with confirmation | done | `editing_a_source_applies_it_once_its_sql_is_confirmed`, `a_materialized_view_whose_new_source_fails_is_kept`; drivers: `edited_sources_replace_views_and_routines` (PG, My, Ma); core: `sources_extensions_and_enums_are_engine_specific` | to capture |
+| F4 Create and drop a database and a schema | done | `dropping_renaming_and_truncating_show_the_sql_and_ask` (schema); drivers: `rename_truncate_drop_and_create_do_what_they_say` (database, PG, My, Ma) | — |
+| F4 PostgreSQL extensions: install from the available list, drop | done | `extensions_are_installed_and_dropped_from_the_tree`; driver: `an_extension_is_installed_and_dropped` (PG) | to capture |
+| F4 PostgreSQL enums: create, add a value, rename a value, drop | done | `enums_are_created_and_their_values_added_and_renamed`; driver: `enums_are_created_extended_and_renamed` (PG) | to capture |
+
+## G. Import, export, backup
+
+Tests: `crates/kerno/src/ui_tests.rs`, `crates/kerno/src/import_dialog.rs`, `crates/kerno-core/src/{export,export_file,import,tools}.rs`,
+`crates/kerno-{postgres,mysql}/tests/{transfer,tools}.rs`. Captures of milestone 8 are not taken yet.
+
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| G1 Export a table or a result to CSV / TSV, JSON array, NDJSON, SQL INSERT, Markdown, streamed to a file with progress | done | `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog`, `a_query_result_is_exported_by_running_its_statement_again`; core: `every_encoding_writes_its_mark_and_its_characters`, `the_temporary_file_sits_next_to_the_target`; drivers: `json_markdown_and_insert_files_hold_every_row` (PG, My, Ma), `the_million_row_table_exports_line_by_line` (PG, My, Ma) | to capture |
+| G1 Options: delimiter, header, NULL text, encoding | done | `delimited_files_round_trip_through_an_import` (PG, My, Ma), `options_reach_the_file` (PG), `a_character_split_between_writes_is_encoded_once_whole` | to capture |
+| G1 Cancel; a failure removes the partial file | done | `a_slow_export_is_cancelled_and_leaves_no_file`; drivers: `cancel_stops_the_statement_and_removes_the_file`, `failures_remove_the_file_and_say_why` (PG, My, Ma) | to capture |
+| G2 Import CSV into an existing table or a new one: preview, guessed delimiter, encoding and types, mapping | done | `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one`; app: `the_delimiter_and_the_encoding_are_guessed`, `a_table_is_named_after_its_file`; core: `kinds_are_guessed_from_every_value`, `preview_reads_the_header_and_the_first_rows`, `a_new_table_is_created_with_nullable_columns_only`; drivers: `a_mapping_skips_and_reorders_columns` (PG, My, Ma) | to capture |
+| G2 Parsing: quotes, line breaks, delimiters, encodings, NULL rule | done | core: `quotes_doubled_quotes_and_line_breaks`, `other_delimiters`, `encodings_and_byte_order_marks`, `null_text_unquoted_is_null_quoted_is_a_value`, `an_unclosed_quote_and_bad_utf8_name_their_line`; app: `the_confirmation_writes_null_where_the_reader_reads_null` | — |
+| G2 Batches in one transaction; an error rolls everything back and names the line; read-only refused | done | `a_failed_import_says_which_line_and_keeps_nothing`, `a_read_only_connection_cannot_import`; drivers: `a_bad_record_rolls_everything_back_and_names_its_line`, `a_hundred_thousand_rows_go_into_a_new_table` (PG, My, Ma) | to capture |
+| G2 Cancel an import from the dialog; the double confirmation on production; the MySQL "created first" sentence | partial: the core cancel is tested (`cancel_rolls_the_import_back`, PG, My, Ma); the dialog's cancel, the production confirmation and that sentence have no UI test (plans/M8.md, left over from Parts 1 and 2) | `cancel_rolls_the_import_back` | to capture |
+| G3 Backup and restore through the installed client tools: find the binaries and their version, command lines without the secret, streamed output, cancel | partial: the core (`tools.rs`) is done; the dialog (detected binary, chosen path, the command shown, log pane, missing-tool message) is todo: plans/M8.md Part 3 (app half) | `find_searches_the_path_then_the_fallbacks`, `versions_are_read_from_each_tool`, `pg_dump_command_lines`, `pg_restore_command_lines`, `mysql_command_lines`, `no_password_means_no_password_variable`, `run_streams_lines_and_reports_the_exit_status`, `cancel_kills_the_child`, `run_reports_a_tool_that_cannot_start`; drivers: `pg_dump_then_psql_and_pg_restore_copy_a_database`, `pg_dump_through_the_ssh_tunnel_with_verify_full`, `an_older_pg_dump_fails_with_its_reason` (PG), `mysqldump_then_mysql_copy_a_database` (My, Ma) | to capture |
+| G3 A restored SQL file cannot run commands on this computer unasked | done (core; the dialog's opt-in checkbox is todo: plans/M8.md Part 3) | `a_restore_uses_the_client_sandbox_or_a_check_unless_allowed`, `the_sandbox_option_follows_the_client_version`, `psql_commands_that_reach_the_computer_are_found_with_their_line`, `mysql_commands_that_reach_the_computer_are_found_with_their_line`, `what_pg_dump_writes_is_not_flagged`, `what_mysqldump_writes_is_not_flagged`, `a_refused_script_runs_nothing`, `a_200_mb_script_is_scanned_in_constant_memory`; drivers: `a_plain_file_with_client_commands_runs_nothing` (PG), `a_file_with_client_commands_runs_nothing` (My, Ma), `a_genuine_plain_dump_passes_the_check_and_restores` (PG), `a_genuine_dump_passes_the_check_and_restores_both_ways` (My, Ma) | — |
+
+## H. Administration
+
+Only the data layer exists: the six views of `Session::admin_query` and the two session calls. The tab that shows
+them is milestone 8 Part 4 (`plans/M8.md`).
+
+| Item | Status | Tests | Screenshot |
+| ---- | ------ | ----- | ---------- |
+| H1 Sessions / processes view: refresh, cancel query, terminate session | todo: plans/M8.md Part 4 (the query and the cancel / terminate calls exist) | `administrative_views` (PG, My, Ma), `the_session_list_reads_the_table_the_server_has`, `another_sessions_statement_can_be_cancelled`, `a_session_killed_by_the_server_reports_it` | to capture |
+| H2 Users and roles with their grants (read view) | todo: plans/M8.md Part 4 (the queries exist) | `administrative_views` (PG, My, Ma), `every_view_has_a_query_on_both_engines` | to capture |
+| H2 Database and table sizes | todo: plans/M8.md Part 4 (the queries exist) | `administrative_views` (PG, My, Ma) | to capture |
+| H2 Server version and settings | todo: plans/M8.md Part 4 for the settings view; the version is already read at connect | `reports_the_server_and_database` (PG, My, Ma), `test_connection_reports_version_and_latency` | to capture |
+
+## Context menus (CLAUDE.md §3)
+
+Every surface listed in §3 should answer a right-click. Entry lists are built by pure functions and unit-tested;
+a real right-click test is named where one exists.
+
+| Surface | Answers a right-click today | Test | Screenshot |
+| ------- | --------------------------- | ---- | ---------- |
+| Sidebar: empty area and header (New connection, New folder, Import connections, Refresh, Collapse all) | yes | `the_sidebar_answers_a_right_click_on_each_part`; list: `the_empty_area_and_a_folder_offer_what_dbeaver_does` | — |
+| Sidebar: folder (New connection here, New subfolder, Rename, Delete) | yes | `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` | — |
+| Sidebar: connection (Connect, Disconnect, Reconnect, New SQL editor, Edit, Duplicate, Rename, Move to folder, Delete, Refresh, Copy) | yes; entries that do not apply are disabled with the reason | `the_sidebar_answers_a_right_click_on_each_part`; list: `a_connection_disables_what_does_not_apply_to_its_status`; `the_copied_connection_url_has_no_password`, `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection` | `m3-sidebar-menu-light.png` |
+| Navigator: below the tree (Refresh, Collapse all, New query here) | yes | `a_right_click_below_the_schema_tree_opens_its_menu` | — |
+| Navigator: object rows (per kind of node) | yes; the entry lists are tested, no test right-clicks a row (plans/CTX.md acceptance) | `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` | `m4-navigator-menu-light.png`, `m4-navigator-menu-readonly-light.png` |
+| Results grid and table data: cell (row menu: owner extras, copy formats) | yes | `a_right_click_on_a_cell_opens_the_menu_of_its_row` | `m6-row-menu-dark.png` |
+| Results grid and table data: column header (Copy name, Pin, Hide, Show all) | yes, untested | | — |
+| Grid: cell-aware entries (Order by, Filter by this value, Exclude, Set NULL, Edit cell, Paste, Export…) and the extended header menu | no | | todo: plans/CTX.md Part 3 |
+| Tabs bar: a tab (Close, Close others, Close to the right, Close all, Rename) and the empty area | no | | todo: plans/CTX.md Part 2 |
+| SQL editor (Run statement, Run script, Explain, Format, Cut, Copy, Paste, Comment, Save) | no | | todo: plans/CTX.md Part 2 |
+| Status bar items (connection, database, transaction, read-only, rows, pending changes) | no | | todo: plans/CTX.md Part 2 |
+| Drag and drop of connections between folders | yes | `a_folder_is_made_renamed_filled_by_drag_and_deleted` | — |
 
 ## I. App
 

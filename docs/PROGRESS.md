@@ -262,3 +262,50 @@ Not done in this milestone, on purpose: the Linux container build (milestone 10)
 - Tests: app 91, core 212, drivers green with the containers required; clippy and fmt clean.
 - Owner request: Fable budget nearly spent. Plans written in `docs/plans/` (README, M5–M10); from here the
   main session plans, reviews and commits, and subagents implement.
+
+## 2026-11-13 — Milestones 5 to 8 largely built; context menus and DBeaver parity begun
+
+Committed since `356bf42` (HEAD `712b7cf`, 28 commits; the plans are in `docs/plans/`):
+
+- Milestone 5: completion catalog (one driver call per session) and schema-aware completion and Format SQL in
+  the editor; `split_statements` made linear (20,000 statements: 16 s, now 22 ms); lexer fixes.
+- Milestone 6: the table data view (done earlier) plus the decisions written down (D-026).
+- Milestone 7: table drafts and DDL per engine, the structure tab, the table form with a live DDL preview,
+  view / function / procedure source editing, PostgreSQL extensions and enums.
+- Milestone 8: streamed export and CSV import (core and dialogs, three engines); backup and restore through
+  the installed client tools (core only) with a safety layer for restored SQL files.
+- Owner feedback of 2026-11-13: a double click or Enter opens a table's data; connection folders, drag and
+  drop and the sidebar menus; DBeaver's keys on the tree and the connection list; the DBeaver parity
+  inventory (418 rows) with its gaps as plan parts.
+- Packaging: macOS `.app` and `.dmg`, Linux tarball, the workspace built in an Ubuntu 24.04 container
+  (D-031). `cargo deny check` clean with no ignored advisory (russh without its `rsa` feature).
+- Tests: 280 `kerno-core` tests pass in the Linux container (plans/M10.md). The last full run on the Mac with
+  the servers, 2026-11-12, was app 91, core 212, drivers green; no later total was recorded, so none is
+  claimed here. Docs: FEATURES sections A to H are filled in from the committed code and test names; parity
+  summary recounted: 169 done, 9 done untested, 45 planned, 99 gap, 96 roadmap.
+
+Found and fixed on the way:
+
+- The kit's table opens no row menu from a cell in cell-selection mode: the menu is attached per cell
+  (D-026), which also repaired the copy menu of results.
+- Security review of the restore commit: `psql --file` and `mysql < file` run the client commands a file
+  holds (shell, files, reconnecting elsewhere with the password). Restores now use the client's sandbox
+  where its version has one and a scan of the file elsewhere; hostile files are tested not to run; a psql
+  before 8.4 reads glued forms such as `\!cmd`, now refused too (D-029).
+- Flaky tests made deterministic: they no longer depend on how many progress reports arrive nor on scratch
+  databases created by tests running beside them. Settings changes are saved in the order they were made.
+- A MySQL column edit lost `ON UPDATE CURRENT_TIMESTAMP`, `INVISIBLE`, and a PostgreSQL identity turned off
+  and on became `BY DEFAULT`; a foreign key on its own table did not follow a column rename. All carried
+  or fixed, with tests on the servers (D-027).
+
+Still open:
+
+- Milestone 5: tab-close confirmations (`plans/M5.md` Part 4), Ctrl+Space and catalog leftovers.
+- Milestone 6: editing comfort (`plans/M6.md` Part 1: lists for enum and boolean cells, paste, Delete,
+  Cmd+Z), counting very large tables (Part 2; the estimate statement exists).
+- Milestone 7: two tests of `plans/M7.md` Part 1c item 4; captures. Milestone 8: the backup and restore
+  dialog (Part 3, app half), the administration tab (Part 4), three UI tests left over from the dialogs;
+  captures.
+- Context menus on the tabs bar, the editor, the status bar and the extended grid menus
+  (`plans/CTX.md` Parts 2 and 3); `plans/PARITY-GAPS.md` G2 to G18; milestone 9 (performance, BENCH) and 10
+  (polish, icon, README, final captures, Docker image `kerno-linux-build` to remove).

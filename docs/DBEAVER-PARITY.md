@@ -87,7 +87,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-07 | Connection type defaults: auto-commit | Production starts in manual commit, Development and Test in auto-commit | model `DBPConnectionType` (PROD autocommit=false) | PG, My | **gap**: G13 |
 | CON-08 | Connection type defaults: confirm execution and data changes | Production asks before running SQL and before saving edits; Test asks before saving edits | model `DBPConnectionType` (confirmExecute, confirmDataChange) | PG, My | **done**: Production asks twice before any write, edits always previewed (CLAUDE.md §1); `production_asks_twice_and_read_only_refuses`, `statements_that_destroy_or_write_are_guarded` |
 | CON-09 | Edit connection types | User-defined types with their own colours and defaults | ui.editors.connection `PrefPageConnectionTypes` | PG, My | **roadmap**: Kerno has three fixed environments plus free colour tags (CLAUDE.md §4.A1); custom types add little |
-| CON-10 | Connection folder | Folder chosen in the General page; nested folders in the navigator | ui.editors.connection `ConnectionPageGeneral`; core `core.new.folder` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (folders, folder picker) |
+| CON-10 | Connection folder | Folder chosen in the General page; nested folders in the navigator | ui.editors.connection `ConnectionPageGeneral`; core `core.new.folder` | PG, My | **done**: Folders are paths in the connection's group, with a folder picker in the dialog; `a_folder_is_made_renamed_filled_by_drag_and_deleted`, `folders_are_made_renamed_and_removed_with_what_they_hold`, `the_folder_is_stored_as_a_tidy_path` |
 | CON-11 | Read-only connection | Blocks writes in the client and opens read-only sessions | ui.editors.connection `dialog_connection_wizard_final_checkbox_connection_readonly` | PG, My | **done**: `read_only` flag; `read_only_sessions_refuse_writes`, `production_asks_twice_and_read_only_refuses` |
 | CON-12 | Read-only toggle command | Flips read-only on the selected connection without opening the dialog | core `core.connection.readonly` (Database menu) | PG, My | **gap**: G13 |
 | CON-13 | Default auto-commit per connection | Initialization page: start sessions in auto-commit or manual mode | ui.editors.connection `ConnectionPageInitialization` | PG, My | **gap**: G13 |
@@ -109,14 +109,14 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-29 | SOCKS proxy and network profiles | Proxy handler and reusable network settings | ui.editors.connection `SocksProxyConfiguratorUI`, `PrefPageNetworkProfiles` | PG, My | **roadmap**: Not in CLAUDE.md §4.A; enterprise networks only |
 | CON-30 | Test connection | Connects once and reports server version and timing | ui.editors.connection `ConnectionTestDialog` | PG, My | **done**: `test_connection_reports_version_and_latency` |
 | CON-31 | Connect / Disconnect | Opens or closes the connection | core `core.connect`, `core.disconnect` | PG, My | **done**: `connects_queries_and_disconnects`, `a_failed_connection_says_why` |
-| CON-32 | Invalidate / Reconnect | Drops and re-opens the connection | core `core.invalidate` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Reconnect) |
+| CON-32 | Invalidate / Reconnect | Drops and re-opens the connection | core `core.invalidate` | PG, My | **done**: Reconnect in the connection menu; `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection` |
 | CON-33 | Disconnect All | Closes every open connection | core `core.disconnectAll` | PG, My | **gap**: G13 |
 | CON-34 | Disconnect Others | Closes every connection but the selected one | core `core.disconnectOther` | PG, My | **gap**: G13 |
 | CON-35 | Auto-reconnect | Re-opens a connection lost under a running session | model (connection recovery) | PG, My | **done**: `a_lost_connection_is_re_established` |
 | CON-36 | Edit connection | Opens the connection pages for an existing connection | ui.navigator `core.object.open` on a connection (F4) | PG, My | **done**: Sidebar "Edit…"; `a_saved_connection_round_trips_through_the_form` |
 | CON-37 | Duplicate (copy / paste) connection | Copies a connection under a new name | core `org.eclipse.ui.edit.copy` / `paste` on connections | PG, My | **done**: `duplicate_import_and_delete` |
 | CON-38 | Delete connection | Removes the saved connection after asking | core `org.eclipse.ui.edit.delete` | PG, My | **done**: `deleting_a_connection_asks_first` |
-| CON-39 | Rename connection | F2 on the connection | core `org.eclipse.ui.edit.rename` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Rename) |
+| CON-39 | Rename connection | F2 on the connection | core `org.eclipse.ui.edit.rename` | PG, My | **done**: Rename… in the connection menu; `the_sidebar_answers_a_right_click_on_each_part`, `folders_are_made_renamed_and_removed_with_what_they_hold`; F2 is not bound in the connection list |
 | CON-40 | Import / export connections | Moves connection definitions between installs | core `org.eclipse.ui.file.import` / `export` (project import) | PG, My | **done**: JSON without secrets; `connections_are_exported_without_secrets_and_imported_back` |
 | CON-41 | Transaction mode menu | Auto-commit, manual commit, smart commit and isolation level for the active session | core `DataSourceTransactionModeContributor` | PG, My | **done**: Per-tab auto / manual mode; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
 | CON-42 | Smart commit mode | Switches to manual mode when a modifying statement runs, back to auto after commit | ui.editors.connection `action_menu_transaction_smart_auto_commit` | PG, My | **roadmap**: Off by default in DBeaver; manual mode per tab covers the need |
@@ -153,23 +153,23 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-17 | Filter by object type | Filter applies to connections, containers or tables | ui.navigator `navigator.filter.object.type` | PG, My | **roadmap**: The filter keeps matches and their path; type scoping is rarely used |
 | NAV-18 | Show connected only | Hides disconnected connections | ui.navigator `navigator.filter.connected` | PG, My | **roadmap**: Small list of connections in a client; folders (CTX Part 1) organise them |
 | NAV-19 | Object filters: hide, show only selected, configure, toggle, clear | Persistent include / exclude masks per connection | core `core.object.filter.add.exclude` / `.include` / `.config` / `.toggle` / `.clear` | PG, My | **gap**: G11 |
-| NAV-20 | Collapse All | Folds the whole tree | core `org.eclipse.ui.navigate.collapseAll` (navigator view menu) | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Collapse all) |
+| NAV-20 | Collapse All | Folds the whole tree | core `org.eclipse.ui.navigate.collapseAll` (navigator view menu) | PG, My | **done**: Collapse all in the tree's menu and as a command; `a_right_click_below_the_schema_tree_opens_its_menu` |
 | NAV-21 | Link with editor | Selects in the tree the object of the active editor | ui.navigator `core.navigator.linkeditor` (Ctrl+Shift+,) | PG, My | **gap**: G10 |
 | NAV-22 | Statistics hints (row count, size) | Size and row estimates beside objects | ui.navigator pref `NAVIGATOR_SHOW_STATISTICS_INFO` (true) | PG, My | **done**: `counts_and_sizes_are_compact`, `databases_then_schemas_then_folders_of_objects` |
 | NAV-23 | Object descriptions in the tree | Comments shown beside names | ui.navigator pref `NAVIGATOR_SHOW_OBJECTS_DESCRIPTION` (false) | PG, My | **roadmap**: Off by default in DBeaver |
 | NAV-24 | Show system objects | Lists system schemas and tables | ui.editors.connection `dialog_connection_wizard_final_checkbox_show_system_objects` | PG, My | **roadmap**: System catalogs are reachable from the editor; the tree hides them by design |
 | NAV-25 | Double click on an object | Opens the object editor (default `EDIT`, last used page) | ui.navigator `NavigatorHandlerObjectOpen`, pref `NAVIGATOR_OBJECT_DOUBLE_CLICK` | PG, My | **done**: Owner's rule: tables open their data, per setting (CLAUDE.md §4.B1); `a_double_click_or_enter_opens_what_the_row_is_for`, `a_double_click_opens_what_the_node_is_for` |
-| NAV-26 | Double click on a connection | Connects if needed and expands it (default `EXPAND`) | ui.navigator pref `NAVIGATOR_CONNECTION_DOUBLE_CLICK` | PG, My | **gap**: G1 (Kerno disconnects a connected connection on double click) |
+| NAV-26 | Double click on a connection | Connects if needed and expands it (default `EXPAND`) | ui.navigator pref `NAVIGATOR_CONNECTION_DOUBLE_CLICK` | PG, My | **done**: `a_double_click_on_a_connection_connects_and_never_disconnects` |
 | NAV-27 | Enter on a node | Same as double click | ui.navigator `NavigatorHandlerObjectOpen` | PG, My | **done**: `a_double_click_or_enter_opens_what_the_row_is_for` |
 | NAV-28 | Arrows expand / collapse, click selects | Tree keyboard navigation | ui.navigator `DatabaseNavigatorTree` | PG, My | **done**: `a_click_selects_a_row_and_the_chevron_or_the_arrows_open_it` |
-| NAV-29 | F4 Edit object | Opens the object editor; on a connection, the connection dialog | ui.navigator `core.object.open` (F4) | PG, My | **gap**: G1 |
-| NAV-30 | F2 Rename | Renames the selected object | core `org.eclipse.ui.edit.rename` | PG, My | **gap**: G1 (menu entry exists, no key) |
-| NAV-31 | Delete key | Drops the selected object after the SQL preview | core `org.eclipse.ui.edit.delete` | PG, My | **gap**: G1 (menu entry exists, no key) |
-| NAV-32 | Copy (Ctrl+C) | Copies the names of the selected objects | core `org.eclipse.ui.edit.copy` | PG, My | **gap**: G1 (menu entry exists, no key) |
-| NAV-33 | Copy Advanced Info (Ctrl+Shift+C) | Copies fully qualified names | core `core.edit.copy.special` ("Copy Advanced Info") | PG, My | **gap**: G1 |
+| NAV-29 | F4 Edit object | Opens the object editor; on a connection, the connection dialog | ui.navigator `core.object.open` (F4) | PG, My | **done**: F4 opens structure, source or DDL by node kind, and edits a connection; `navigator_keys_run_the_actions_of_the_selected_node`, `f4_opens_the_editor_of_what_the_node_is`, `a_double_click_on_a_connection_connects_and_never_disconnects` |
+| NAV-30 | F2 Rename | Renames the selected object | core `org.eclipse.ui.edit.rename` | PG, My | **done**: F2 asks for the new name; `navigator_keys_run_the_actions_of_the_selected_node` |
+| NAV-31 | Delete key | Drops the selected object after the SQL preview | core `org.eclipse.ui.edit.delete` | PG, My | **done**: Delete and Backspace open the drop confirmation; `navigator_keys_run_the_actions_of_the_selected_node` |
+| NAV-32 | Copy (Ctrl+C) | Copies the names of the selected objects | core `org.eclipse.ui.edit.copy` | PG, My | **done**: Cmd+C copies the name; `navigator_keys_run_the_actions_of_the_selected_node` |
+| NAV-33 | Copy Advanced Info (Ctrl+Shift+C) | Copies fully qualified names | core `core.edit.copy.special` ("Copy Advanced Info") | PG, My | **done**: Cmd+Shift+C copies the qualified name, quoted only where needed; `navigator_keys_run_the_actions_of_the_selected_node`, `a_qualified_name_is_quoted_only_where_it_has_to_be` |
 | NAV-34 | Multiple selection | Several objects selected for drop, export, generate | ui.navigator tree (SWT multi-select) | PG, My | **roadmap**: Single selection covers daily use; multi-object actions multiply confirmation flows |
 | NAV-35 | Drag an object into the SQL editor | Drops the object name at the cursor | ui.navigator `NavigatorUtils` drag source | PG, My | **roadmap**: Completion inserts names; drag between GPUI views needs a custom drop target in the editor |
-| NAV-36 | Set as default (Ctrl+Shift+A) | Makes a schema or database the active one of the connection | ui.navigator `core.navigator.set.default` | PG, My | **gap**: G1 |
+| NAV-36 | Set as default (Ctrl+Shift+A) | Makes a schema or database the active one of the connection | ui.navigator `core.navigator.set.default` | PG, My | **done**: Cmd+Shift+A points the active query tab at the schema; `set_as_default_points_the_active_tab_at_the_schema`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | NAV-37 | Open Database Object (Ctrl+Shift+D) | Search dialog over all objects of the connections | core `core.object.goto` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (Quick open Cmd+P; relations only) |
 | NAV-38 | Bookmarks | Bookmark a node and jump back to it | core `core.navigator.bookmark.add` / `.navigate` | PG, My | **roadmap**: Workspace / project feature (Eclipse resources) |
 | NAV-39 | Browse from here | New navigator view rooted at a node | ui.navigator `core.navigator.open.browser` | PG, My | **roadmap**: Eclipse view plumbing |
@@ -181,7 +181,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-45 | View Data | Opens the data of a table or view | ui.editors.data `ui.editors.data.forSelection` | PG, My | **done**: Open data; `a_table_opened_from_the_tree_comes_back_after_a_restart`, `a_table_is_read_in_pages_sorted_and_filtered_by_the_server` |
 | NAV-46 | Read data in SQL console | Opens a console with a SELECT of the table and runs it | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **gap**: G7 |
 | NAV-47 | SQL Editor ▸ Open / Recent / New script / Open console | Script or console bound to the selected node; keys F3 / Ctrl+[, Ctrl+], Ctrl+Alt+Enter | ui.editors.sql `core.sql.editor.open`, `.recent`, `.create`, `.console` | PG, My | **done**: New query here; `statements_and_ddl_open_in_a_tab_and_run_nothing`, `a_query_result_is_exported_by_running_its_statement_again` |
-| NAV-48 | Keys for a new SQL editor on the selected node | Ctrl+] / Ctrl+Alt+Enter open an editor bound to the node | ui.editors.sql key bindings of `core.sql.editor.create` / `.console` | PG, My | **gap**: G1 |
+| NAV-48 | Keys for a new SQL editor on the selected node | Ctrl+] / Ctrl+Alt+Enter open an editor bound to the node | ui.editors.sql key bindings of `core.sql.editor.create` / `.console` | PG, My | **gap**: G1 (Cmd+] opens a query tab on the selected node, `navigator_keys_run_the_actions_of_the_selected_node`; the console bound to the node, Ctrl+Alt+Enter in DBeaver, is not built) |
 | NAV-49 | Generate SQL ▸ SELECT, INSERT, UPDATE, DELETE | Statement templates for a table | ui.editors.sql `sqlGenerator` tableSelect / tableInsert / tableUpdate / tableDelete | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing`, driver `tests/generate.rs` |
 | NAV-50 | Generate SQL ▸ DDL | The object's DDL in an editor | ui.editors.sql `sqlGenerator` tableDDL | PG, My | **done**: Show DDL; `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | NAV-51 | Generate SQL ▸ MERGE, JOIN, INNER JOIN | Merge statement; join of two selected tables | ui.editors.sql `sqlGenerator` tableMerge / tableJoin / tableInnerJoin | PG, My | **roadmap**: JOIN needs multi-selection (NAV-34); completion proposes joins on foreign keys already |
@@ -360,8 +360,8 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 
 | ID | Feature (as DBeaver names it) | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| TOOL-01 | Backup (pg_dump) / Dump database (mysqldump) | Dumps a database with the client tool | ext.postgresql.ui `tools.backup.db`; ext.mysql.ui `tools.exportDatabase` | PG, My | **planned**: `docs/plans/M8.md` Part 3 (dialog; core done) |
-| TOOL-02 | Restore | Restores a dump with pg_restore / psql / mysql | ext.postgresql.ui `tools.restore.db`; ext.mysql.ui `tools.importDatabase` | PG, My | **planned**: `docs/plans/M8.md` Part 3 and Part 3b |
+| TOOL-01 | Backup (pg_dump) / Dump database (mysqldump) | Dumps a database with the client tool | ext.postgresql.ui `tools.backup.db`; ext.mysql.ui `tools.exportDatabase` | PG, My | **planned**: `docs/plans/M8.md` Part 3 (dialog; the core is done and tested: `pg_dump_command_lines`, `mysql_command_lines`, `run_streams_lines_and_reports_the_exit_status`, `pg_dump_then_psql_and_pg_restore_copy_a_database`, `mysqldump_then_mysql_copy_a_database`) |
+| TOOL-02 | Restore | Restores a dump with pg_restore / psql / mysql | ext.postgresql.ui `tools.restore.db`; ext.mysql.ui `tools.importDatabase` | PG, My | **planned**: `docs/plans/M8.md` Part 3 (dialog and its opt-in checkbox; the core and its safety check are done and tested: `a_restore_uses_the_client_sandbox_or_a_check_unless_allowed`, `a_refused_script_runs_nothing`, `a_genuine_plain_dump_passes_the_check_and_restores`) |
 | TOOL-03 | Global backup (pg_dumpall) | Dumps roles and all databases | ext.postgresql.ui `tools.backup.all.db` | PG | **roadmap**: Server-wide dumps are a DBA task outside a client's daily use |
 | TOOL-04 | Execute script with the local client | Runs a file with psql / mysql | ext.postgresql.ui `tools.execute.script`; ext.mysql.ui `tools.executeScript` | PG, My | **roadmap**: Restore covers SQL files (M8 Part 3) |
 | TOOL-05 | Analyze (PostgreSQL) | ANALYZE of tables or a database | ext.postgresql.ui `tools.analyze` (`PostgreToolBaseVacuum`) | PG | **gap**: G12 |
@@ -397,63 +397,63 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-01 | New Connection | Opens the new-connection dialog | core menu `core.databaseNavigator` → `core.new.connection` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
+| CM-01 | New Connection | Opens the new-connection dialog | core menu `core.databaseNavigator` → `core.new.connection` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part` |
 | CM-02 | Driver Manager | JDBC drivers | core `core.driver.manager` | PG, My | **roadmap**: No JDBC drivers (CON-50) |
 | CM-03 | Active Project ▸ | Project switcher | core `NavigatorActiveProjectContributor` | PG, My | **roadmap**: Eclipse projects (NAV-40) |
-| CM-04 | New Folder | Creates a connection folder | core `core.new.folder` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-05 | Import connections | Kerno's own entry, no DBeaver equivalent in this menu | — (CLAUDE.md §3) | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-06 | Collapse All | Folds the tree | core `org.eclipse.ui.navigate.collapseAll` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
+| CM-04 | New Folder | Creates a connection folder | core `core.new.folder` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
+| CM-05 | Import connections | Kerno's own entry, no DBeaver equivalent in this menu | — (CLAUDE.md §3) | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `connections_are_exported_without_secrets_and_imported_back` |
+| CM-06 | Collapse All | Folds the tree | core `org.eclipse.ui.navigate.collapseAll` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does` |
 | CM-07 | Link with editor | Selects the active editor's object | ui.navigator `core.navigator.linkeditor` | PG, My | **gap**: G10 |
-| CM-08 | Refresh | Reloads the list | core `core.project.refresh` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-09 | Paste | Pastes copied connections | core `org.eclipse.ui.edit.paste` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Duplicate covers it) |
+| CM-08 | Refresh | Reloads the list | core `core.project.refresh` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does` |
+| CM-09 | Paste | Pastes copied connections | core `org.eclipse.ui.edit.paste` | PG, My | **gap**: no plan part; Duplicate (CM-24) covers it and the empty-area menu has no Paste |
 
 ### Folder
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-10 | Create ▸ Connection | New connection in this folder | ui.navigator `core.object.create` on a folder | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (New connection here) |
-| CM-11 | New Folder | Sub-folder | core `core.new.folder` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
+| CM-10 | Create ▸ Connection | New connection in this folder | ui.navigator `core.object.create` on a folder | PG, My | **done**: New connection here opens the dialog with the folder preset; `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
+| CM-11 | New Folder | Sub-folder | core `core.new.folder` | PG, My | **done**: New subfolder; `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does` |
 | CM-12 | Disconnect | Closes every connection of the folder | core `org.jkiss.dbeaver.folder.disconnect` | PG, My | **gap**: G13 |
-| CM-13 | Rename (F2) | Renames the folder | core `org.eclipse.ui.edit.rename` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-14 | Delete | Removes the folder | core `org.eclipse.ui.edit.delete` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-15 | Refresh | Re-reads the folder | core `org.eclipse.ui.file.refresh` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Refresh of the list) |
+| CM-13 | Rename (F2) | Renames the folder | core `org.eclipse.ui.edit.rename` | PG, My | **done**: Rename…; `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
+| CM-14 | Delete | Removes the folder | core `org.eclipse.ui.edit.delete` | PG, My | **done**: Delete… asks, the content moves up; `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
+| CM-15 | Refresh | Re-reads the folder | core `org.eclipse.ui.file.refresh` | PG, My | **gap**: no plan part holds it; the folder menu has no Refresh (the list's Refresh is CM-08) |
 
 ### Connection
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-16 | Edit Connection (F4) | Connection dialog | ui.navigator `core.object.open` | PG, My | **done, untested** (gap of kind test, G18): Sidebar "Edit…" (`sidebar.rs`); no test opens the menu (G18); F4: G1 |
+| CM-16 | Edit Connection (F4) | Connection dialog | ui.navigator `core.object.open` | PG, My | **done**: Edit… in the connection menu and F4; `the_sidebar_answers_a_right_click_on_each_part`, `a_double_click_on_a_connection_connects_and_never_disconnects` |
 | CM-17 | Create ▸ (database, schema) | New child object | ui.navigator `core.object.create` | PG, My | **roadmap**: Create database / schema exist on the navigator's database and schema nodes (`dropping_renaming_and_truncating_show_the_sql_and_ask`); the sidebar connection menu need not repeat them |
-| CM-18 | SQL Editor ▸ (open script, recent, new script, console) | Editor bound to the connection | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (New SQL editor) |
+| CM-18 | SQL Editor ▸ (open script, recent, new script, console) | Editor bound to the connection | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New SQL editor connects first when needed; `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection`, `the_sidebar_answers_a_right_click_on_each_part`; no recent-scripts list or console |
 | CM-19 | Connection view ▸ | Tree presets | core `ConnectionViewSettingsContributor` | PG, My | **roadmap**: See NAV-59 |
 | CM-20 | Filter ▸ | Object filters | core `navigator.filter` menu | PG, My | **gap**: G11 |
 | CM-21 | Compare / Migrate ▸ | Schema compare | cmp.simple.ui | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | CM-22 | Tools ▸ (session manager, lock manager, backup all) | Connection-level tools | ext.postgresql.ui / ext.mysql.ui `connectionEditor` contributions, `tools.backup.all.db` | PG, My | **planned**: `docs/plans/M8.md` Part 4 ("Administration" on the connection menu); lock manager G16 |
-| CM-23 | Copy | Copies the connection | core `org.eclipse.ui.edit.copy` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 (Copy ▸ name, URL, host) |
-| CM-24 | Paste | Pastes a copied connection | core `org.eclipse.ui.edit.paste` | PG, My | **done, untested** (gap of kind test, G18): Duplicate (`sidebar.rs`); action tested by `duplicate_import_and_delete`, menu not (G18) |
-| CM-25 | Delete | Deletes after asking | core `org.eclipse.ui.edit.delete` | PG, My | **done, untested** (gap of kind test, G18): Sidebar "Delete…"; action tested by `deleting_a_connection_asks_first`, menu not (G18) |
-| CM-26 | Rename (F2) | Renames the connection | core `org.eclipse.ui.edit.rename` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-27 | Refresh (F5) | Re-reads the connection's tree | core `org.eclipse.ui.file.refresh` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-28 | Connect | Opens the connection | core `core.connect` | PG, My | **done, untested** (gap of kind test, G18): Sidebar "Connect"; action tested by `connects_queries_and_disconnects`, menu not (G18) |
-| CM-29 | Invalidate / Reconnect | Re-opens the connection | core `core.invalidate` | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
-| CM-30 | Disconnect | Closes the connection | core `core.disconnect` | PG, My | **done, untested** (gap of kind test, G18): Sidebar "Disconnect"; menu not tested (G18) |
+| CM-23 | Copy | Copies the connection | core `org.eclipse.ui.edit.copy` | PG, My | **done**: Copy ▸ Name, Connection URL without the password, Host; `the_copied_connection_url_has_no_password`, `the_connection_url_has_no_password_and_reads_back` |
+| CM-24 | Paste | Pastes a copied connection | core `org.eclipse.ui.edit.paste` | PG, My | **done**: Duplicate; `duplicate_import_and_delete`, `the_sidebar_answers_a_right_click_on_each_part` |
+| CM-25 | Delete | Deletes after asking | core `org.eclipse.ui.edit.delete` | PG, My | **done**: Delete…; `deleting_a_connection_asks_first`, `the_sidebar_answers_a_right_click_on_each_part` |
+| CM-26 | Rename (F2) | Renames the connection | core `org.eclipse.ui.edit.rename` | PG, My | **done**: Rename…; `the_sidebar_answers_a_right_click_on_each_part`, `folders_are_made_renamed_and_removed_with_what_they_hold`; F2 is not bound in the connection list |
+| CM-27 | Refresh (F5) | Re-reads the connection's tree | core `org.eclipse.ui.file.refresh` | PG, My | **done**: Refresh (disabled while not connected); `a_connection_disables_what_does_not_apply_to_its_status`, `the_sidebar_answers_a_right_click_on_each_part`; F5 is not bound in the connection list |
+| CM-28 | Connect | Opens the connection | core `core.connect` | PG, My | **done**: Connect; `connects_queries_and_disconnects`, `a_connection_disables_what_does_not_apply_to_its_status`, `the_sidebar_answers_a_right_click_on_each_part` |
+| CM-29 | Invalidate / Reconnect | Re-opens the connection | core `core.invalidate` | PG, My | **done**: Reconnect; `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection`, `a_connection_disables_what_does_not_apply_to_its_status` |
+| CM-30 | Disconnect | Closes the connection | core `core.disconnect` | PG, My | **done**: Disconnect; `a_connection_disables_what_does_not_apply_to_its_status`, `the_sidebar_answers_a_right_click_on_each_part` |
 | CM-31 | Security ▸ Change user password | Changes the login's password | ui.editors.connection `connection.changeCurrentPassword` | PG, My | **roadmap**: See CON-48 |
-| CM-32 | Move to folder (drag and drop) | Moves a connection between folders | ui.navigator drag and drop | PG, My | **planned**: `docs/plans/CTX.md` Part 1 |
+| CM-32 | Move to folder (drag and drop) | Moves a connection between folders | ui.navigator drag and drop | PG, My | **done**: Move to folder ▸ and drag and drop; `a_folder_is_made_renamed_filled_by_drag_and_deleted`, `a_connection_disables_what_does_not_apply_to_its_status` |
 
 ### Database / schema
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-33 | Edit (F4) | Database or schema properties | ui.navigator `core.object.open` | PG, My | **gap**: G1 (F4); properties page G17 |
+| CM-33 | Edit (F4) | Database or schema properties | ui.navigator `core.object.open` | PG, My | **gap**: G17 (properties page; F4 opens the DDL, `navigator_keys_run_the_actions_of_the_selected_node`) |
 | CM-34 | Create ▸ (schema, table, view, function, sequence, …) | New child object | ui.navigator `core.object.create` | PG, My | **done**: Create schema / database / table / view; `dropping_renaming_and_truncating_show_the_sql_and_ask`, `a_table_is_created_from_the_form`; other kinds: G10 |
-| CM-35 | SQL Editor ▸ | Editor bound to the database or schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New query here on schemas and MySQL databases; `statements_and_ddl_open_in_a_tab_and_run_nothing`; on a PostgreSQL database node: G1 |
-| CM-36 | Set as default (Ctrl+Shift+A) | Makes it the active database / schema | ui.navigator `core.navigator.set.default` | PG, My | **gap**: G1 |
+| CM-35 | SQL Editor ▸ | Editor bound to the database or schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New query here on schemas, MySQL databases and PostgreSQL databases; `statements_and_ddl_open_in_a_tab_and_run_nothing`, `navigator_keys_run_the_actions_of_the_selected_node` |
+| CM-36 | Set as default (Ctrl+Shift+A) | Makes it the active database / schema | ui.navigator `core.navigator.set.default` | PG, My | **done**: Set as default for this tab, Cmd+Shift+A; `set_as_default_points_the_active_tab_at_the_schema` |
 | CM-37 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **gap**: G11 |
 | CM-38 | Generate SQL ▸ DDL | DDL of the schema / database | ui.editors.sql `sqlGenerator` | PG, My | **done**: Show DDL (schemas, MySQL databases); `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | CM-39 | Tools ▸ Backup, Restore | Dump and restore | ext.postgresql.ui / ext.mysql.ui tools | PG, My | **planned**: `docs/plans/M8.md` Part 3 |
 | CM-40 | Tools ▸ Analyze, Vacuum | Database maintenance | ext.postgresql.ui `tools.analyze`, `tools.vacuum` | PG | **gap**: G12 |
 | CM-41 | Export Data / Import Data | Data transfer on the container | data.transfer.ui | PG, My | **done**: Import CSV… on schema / MySQL database (new table); `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one` |
-| CM-42 | Copy, Copy Advanced Info | Copies names | core `edit.copy`, `core.edit.copy.special` | PG, My | **done**: Copy name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`; qualified copy G1 |
+| CM-42 | Copy, Copy Advanced Info | Copies names | core `edit.copy`, `core.edit.copy.special` | PG, My | **done**: Copy name, Copy qualified name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | CM-43 | Delete | Drops after preview | core `edit.delete` | PG, My | **done**: Drop…; `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | CM-44 | Rename | Renames | core `edit.rename` | PG | **done**: Rename… (schemas); `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | CM-45 | Refresh | Re-reads | core `file.refresh` | PG, My | **done**: `refresh_reloads_the_nearest_node_that_owns_its_children` |
@@ -462,14 +462,14 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-46 | Edit Table (F4) | Object editor | ui.navigator `core.object.open` | PG, My | **done**: Open structure; `the_structure_of_a_table_is_shown_in_tabs`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it`; F4: G1 |
+| CM-46 | Edit Table (F4) | Object editor | ui.navigator `core.object.open` | PG, My | **done**: Open structure, F4; `the_structure_of_a_table_is_shown_in_tabs`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | CM-47 | View Diagram | ER diagram | ui.editors.erd | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | CM-48 | View Data | Data editor | ui.editors.data `forSelection` | PG, My | **done**: Open data; `a_table_opened_from_the_tree_comes_back_after_a_restart` |
 | CM-49 | Create ▸ (column, index, constraint, foreign key, trigger) | New child objects | ui.navigator `core.object.create` | PG, My | **done**: Through the table form (Edit table…); `a_table_is_altered_from_the_form_with_a_preview`; triggers: G10 |
 | CM-50 | Generate SQL ▸ SELECT / INSERT / UPDATE / DELETE / DDL | Templates | ui.editors.sql `sqlGenerator` | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | CM-51 | Generate SQL ▸ MERGE, INSERT ON CONFLICT, UPDATE FROM, DELETE USING | Further templates | ui.editors.sql / ext.postgresql `sqlGenerator` | PG, My | **roadmap**: See NAV-51, NAV-52 |
 | CM-52 | Read data in SQL console | SELECT run in a console | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **gap**: G7 |
-| CM-53 | SQL Editor ▸ | Editor bound to the table's schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **gap**: G1 (New query here exists on schemas, not tables) |
+| CM-53 | SQL Editor ▸ | Editor bound to the table's schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New query here, Cmd+]; `navigator_keys_run_the_actions_of_the_selected_node`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 | CM-54 | Export Data | Export wizard | data.transfer.ui `core.export.data` | PG, My | **done**: Export…; `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog` |
 | CM-55 | Import Data | Import wizard | data.transfer.ui `core.import.data` | PG, My | **done**: Import CSV…; `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one` |
 | CM-56 | Tools ▸ Analyze, Vacuum, Truncate (options), Enable / Disable triggers (PG) | Table maintenance | ext.postgresql.ui tools | PG | **gap**: G12 (plain Truncate is done) |
@@ -477,7 +477,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-58 | Tools ▸ Backup (selected tables) | Dump of one table | ext.postgresql.ui `tools.backup.db` | PG, My | **planned**: `docs/plans/M8.md` Part 3 (selected tables option) |
 | CM-59 | Compare / Migrate ▸ | Compare | cmp.simple.ui | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | CM-60 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **gap**: G11 |
-| CM-61 | Copy, Copy Advanced Info | Names | core `edit.copy`, `core.edit.copy.special` | PG, My | **done**: Copy name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`; qualified copy G1 |
+| CM-61 | Copy, Copy Advanced Info | Names | core `edit.copy`, `core.edit.copy.special` | PG, My | **done**: Copy name, Copy qualified name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | CM-62 | Delete | Drop with preview | core `edit.delete` | PG, My | **done**: Drop…; `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | CM-63 | Rename | Rename with preview | core `edit.rename` | PG, My | **done**: Rename…; `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | CM-64 | Refresh | Re-reads | core `file.refresh` | PG, My | **done**: `refresh_reloads_the_nearest_node_that_owns_its_children` |
@@ -486,7 +486,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-65 | Edit View (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source / Open structure; `editing_a_source_applies_it_once_its_sql_is_confirmed`; F4: G1 |
+| CM-65 | Edit View (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source / Open structure, F4; `editing_a_source_applies_it_once_its_sql_is_confirmed`, `f4_opens_the_editor_of_what_the_node_is` |
 | CM-66 | View Data | Data editor | ui.editors.data `forSelection` | PG, My | **done**: Open data; `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 | CM-67 | Generate SQL ▸ SELECT, DDL | Templates | ui.editors.sql `sqlGenerator` | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | CM-68 | Read data in SQL console | SELECT run in a console | ui.editors.sql `forSelection` | PG, My | **gap**: G7 |
@@ -510,7 +510,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-79 | Edit (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source (double click opens it); `editing_a_source_applies_it_once_its_sql_is_confirmed`, `a_double_click_opens_what_the_node_is_for`; F4: G1 |
+| CM-79 | Edit (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source (double click and F4 open it); `editing_a_source_applies_it_once_its_sql_is_confirmed`, `a_double_click_opens_what_the_node_is_for`, `f4_opens_the_editor_of_what_the_node_is` |
 | CM-80 | Execute stored procedure | Console with a call statement | ui.editors.sql `core.procedure.execute` | PG, My | **gap**: G7 |
 | CM-81 | Generate SQL ▸ CALL, DDL | Call template; definition | ui.editors.sql `sqlGenerator` procedureCall, tableDDL | PG, My | **gap**: G7 (DDL is done: Show DDL) |
 | CM-82 | Copy, Delete, Rename, Refresh | Standard entries | core `edit.*`, `file.refresh` | PG, My | **done**: `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
@@ -618,15 +618,17 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 ## Summary
 
-Counts per status and per area (recounted from the rows above). "Gap" rows are ordered in `docs/plans/PARITY-GAPS.md` (G1 to G17), "done, untested" rows in its Part G18. The 67 rows once proposed for the roadmap were accepted on 2026-11-13 and are counted under roadmap.
+Counts per status and per area (recounted from the rows above on 2026-11-13, HEAD `712b7cf`: the keys and default actions of the tree and the connection list, the connection folders and the sidebar menus moved to done; the first count, from HEAD `cee8bd2`, was 136 done, 14 done untested, 66 planned, 106 gap, 96 roadmap). "Gap" rows are ordered in `docs/plans/PARITY-GAPS.md` (G1 to G17), "done, untested" rows in its Part G18. The 67 rows once proposed for the roadmap were accepted on 2026-11-13 and are counted under roadmap.
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
-| Connections | 22 | 1 | 4 | 9 | 15 | 51 |
-| Navigator | 17 | 0 | 6 | 18 | 18 | 59 |
+| Connections | 25 | 1 | 1 | 9 | 15 | 51 |
+| Navigator | 25 | 0 | 5 | 11 | 18 | 59 |
 | SQL editor | 20 | 3 | 3 | 12 | 16 | 54 |
 | Results and data editing | 26 | 2 | 8 | 21 | 15 | 72 |
 | Object editors (structure) | 11 | 0 | 2 | 2 | 6 | 21 |
 | Tools and administration | 1 | 0 | 4 | 8 | 15 | 28 |
-| Context menus | 39 | 8 | 39 | 36 | 11 | 133 |
-| **All** | **136** | **14** | **66** | **106** | **96** | **418** |
+| Context menus | 61 | 3 | 22 | 36 | 11 | 133 |
+| **All** | **169** | **9** | **45** | **99** | **96** | **418** |
+
+Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.

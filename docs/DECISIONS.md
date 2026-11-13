@@ -473,3 +473,130 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   on a reading of CLAUDE.md and are confirmed: specialised PostgreSQL folders (not in the §4.B tree),
   "search in web" (§1: nothing leaves the machine), editing roles and users (§4.H2 asks for a read
   view), replication tools (outside §4). The owner can pull any row back by naming its ID.
+
+## D-025 — Query tabs, second part
+
+- Statements are classified from their first tokens (`sql/classify.rs`) before they run. A read-only
+  connection refuses what writes, `EXPLAIN ANALYZE` of a write included (it runs the write); what destroys
+  (DROP, TRUNCATE, `ALTER … DROP`, DELETE or UPDATE without WHERE) is shown and confirmed; on a production
+  connection every write is confirmed twice. The "confirmations" setting turns off the destructive question
+  only, never the production one. Executable comments (`/*! … */`) count only on MySQL and MariaDB.
+- EXPLAIN goes through `Dialect::explain` and `Dialect::parse_plan`, so each engine writes and reads its own
+  form; the tree shows cost, rows, own and total time, and the slowest step; the raw output is a click away.
+  The history records the statement the user wrote, not the `EXPLAIN` it was wrapped in.
+- History and saved queries share one dialog (Cmd+Y): history per connection and searchable, saved queries
+  with a name and a folder, a click reopens either in a tab on its connection. Passwords in statements are
+  redacted before storage.
+- `.sql` files: a tab is named after its file and marked only when its text differs (cursor moves do not
+  count); a file already open is shown, not opened twice; file tabs come back after a restart.
+- A PostgreSQL result abandoned inside an open transaction is left to finish: a cancel request would abort
+  the whole block. Outside a transaction, abandoning cancels.
+- The completion catalog is one `Session::completion_catalog` call per tab (four queries on each engine,
+  not one structure query per table), loaded when the connection opens and again after a DDL statement. The
+  completion code lives in the core and runs on the statement under the cursor only.
+- The formatter never changes a token: the output is compared with the input after layout and the original
+  is returned if they differ; `DELIMITER` sections and routine bodies are left as written. Checked on a
+  corpus and on random token soup.
+- `split_statements` is a single pass over the tokens (20,000 statements took 16 s, 22 ms now).
+
+## D-026 — Table data view
+
+- One grid delegate (`Grid`) serves results and table data; table data adds an optional edit layer. The row
+  menu is attached to each cell, because the kit's table opens none from a cell in cell-selection mode.
+- Sort and filter run on the server. `ORDER BY` always ends with the row identity (primary key, else a
+  NOT NULL unique index), so pages never overlap. Values are written as literals by the dialect
+  (`browse.rs`); a raw `WHERE` that holds `;` is refused.
+- Pending changes (edits, deletions, new rows) live in the page and block moving to another page, a refresh
+  or a new filter until applied or discarded.
+- Apply order is deletes, updates, inserts, in one transaction; every statement must change exactly one row,
+  otherwise everything rolls back and the pending changes stay. Rows are addressed by the values they were
+  read with, so a row changed by someone else since is not written over.
+- Statements on a tab's session run one after the other; a new load waits for the previous one, and only the
+  user cancels. Views and tables without a key are read-only, and the tab says why.
+- Counting a very large table: `Dialect::estimated_rows_sql` exists in the core; the tab still counts
+  exactly (plans/M6.md Part 2).
+
+## D-027 — Structure
+
+- The form edits a `TableDraft`; `changes()` is a pure function of the stored structure and the draft that
+  returns the ordered differences (drops of keys and indexes, then columns, then primary key, indexes and
+  foreign keys, the table rename last). Each dialect turns them into statements; the preview is those
+  statements.
+- PostgreSQL writes one `ALTER TABLE` per change and applies them in one transaction. MySQL and MariaDB send
+  at most two statements, the foreign-key drops and then one combined `ALTER TABLE` (the server refuses a
+  key or auto-increment change alone); `CHANGE COLUMN` when a column is renamed and modified. MySQL DDL
+  commits at once, so the confirmation says a failure leaves earlier statements applied.
+- What the form does not show must not be lost by an edit: `ColumnInfo::on_update`, `INVISIBLE` and the
+  identity kind (ALWAYS or BY DEFAULT) are carried by the draft and written back; a foreign key on its own
+  table follows a rename of the column it references. Column order of an existing table cannot be edited.
+- Editing a view, function or procedure opens its definition as a replace script in a query tab
+  ("source mode"); Apply source shows the whole script and asks. PostgreSQL replaces in place (a materialized
+  view by drop and create inside one transaction), MariaDB uses `CREATE OR REPLACE`, MySQL drops then
+  creates a routine.
+- PostgreSQL extensions come from `pg_available_extensions` and are installed from a searchable list; enums
+  are created, extended and renamed from the Types folder. Both are PostgreSQL-only and absent on MySQL.
+
+## D-028 — Export and import
+
+- Export streams on a session of its own, so the tab stays usable. Rows go through a bounded channel to a
+  writer thread (`export_file.rs`); the file is written beside its name and renamed when whole, and cancel or
+  failure removes it. Measured in a debug build: about 78,000 rows/s with 18 MB resident for 1,000,000 rows.
+  Encodings: UTF-8 with or without BOM, UTF-16LE, Latin-1 (characters outside it become `?`).
+- A result is exported by running its statement again; a statement that writes is never re-run, so its
+  Export button is absent.
+- Import uses a CSV reader of our own (quotes, line breaks, CRLF, any delimiter, encodings), no new
+  dependency. One transaction with a savepoint per batch; a bad record rolls everything back and names its
+  line. On MySQL and MariaDB `CREATE TABLE` commits at once: a new table is created before the transaction
+  and dropped if the import does not complete, and the confirmation says so.
+- NULL rule: an unquoted field equal to the NULL text is NULL; a quoted one is always a value, so `""` stays
+  the empty string. The preview and the confirmation follow the same rule as the import.
+
+## D-029 — Backup tools and the restore safety rule
+
+- Backup and restore run the engines' own client tools as child processes (`tools.rs`). The password goes
+  only in the child's environment (`PGPASSWORD`, `MYSQL_PWD`); what is shown names the variable, and
+  inherited `PG*` and `MYSQL*` variables are removed. Through an SSH tunnel the tool connects to a one-use
+  local port. MySQL dumps are written with hex blobs.
+- A restored SQL file is a script: `psql` and `mysql` run the client commands it holds (shell, files,
+  reconnecting elsewhere). Clients that have a sandbox get it: MySQL `--commands=OFF` from 8.0.43, 8.4.6 and
+  9.4; MariaDB `--sandbox --binary-mode` from 10.6.18 and the series listed in the module doc; every MySQL
+  restore gets `--local-infile=0`. `psql` has no such option, so the file is scanned first, in constant
+  memory and on purpose ignoring SQL quoting, and refused with its line and command unless
+  `allow_client_commands` is set. The `pg_restore` custom format holds no script and is unchanged.
+- The scan is version-aware for psql: before 8.4 a glued form like `\!cmd` runs, so it is refused whenever
+  the version is unknown or older; for a psql known to be 8.4 or later, only exact command names are
+  refused, which keeps regular expressions (`\s+`) in genuine dumps from false alarms.
+- `\connect` in a dump (`pg_dump --create`) is refused by design: the password is in the child's environment
+  and would go to whatever server the file names. A dump with carriage returns in its data needs the opt-in
+  on a client without a sandbox (the scan cannot tell a `\r` command from a carriage return in a string). The dialog is not built yet (plans/M8.md Part 3).
+
+## D-030 — Navigator and sidebar interactions, as DBeaver
+
+- A click selects. The chevron, Right and Left expand and collapse. A double click or Enter runs the default
+  action: table, view and materialized view open data (or structure or expand, by the `table_double_click`
+  setting), routines open their source, other objects their DDL, folders toggle. On a connection a double
+  click or Enter connects it when closed and shows its tree; it never disconnects.
+- Keys are default bindings of named commands, bound per view through a key context ("Navigator",
+  "ConnectionList"): F4, F2, Delete / Backspace, F5, Cmd+C, Cmd+Shift+C, Cmd+], Cmd+Shift+A. Each is in the
+  palette and open to the keymap file, and unique within its context.
+- Connection folders are paths joined by `/` in the connection's `group`, so existing stores, export and
+  import carry them. Empty folders and the collapsed state are settings (`connection_folders`,
+  `collapsed_folders`). Deleting a folder moves what it holds up one level after a confirmation.
+- Sidebar menus are built by a pure function of the subject, the connection status and the folders; entries
+  that do not apply are disabled with the reason in the label. Connections are dragged onto a folder or to
+  the top level.
+- Settings changes are written by one saver, in the order they were made; the last value wins, also on quit.
+
+## D-031 — Packaging
+
+- `scripts/bundle-macos.sh`: release build, `Kerno.app` ad-hoc signed and verified, a launch check on a
+  scratch data directory, then a `.dmg` with `hdiutil`. `scripts/bundle-linux.sh`: a tarball with the binary,
+  desktop entry, icons and licences; from macOS it runs in the image of `Dockerfile.linux-build`
+  (Ubuntu 24.04), which builds the workspace and runs the core tests. CI builds through the same scripts.
+- Verified on 2026-11-13: the `.app` signs, launches and quits; the `.dmg` verifies; the workspace builds and
+  280 `kerno-core` tests pass in the container; the tarball is written; the Linux binary maps its window under
+  Xvfb.
+- Not verified: Linux rendering beyond the mapped window, Wayland, amd64, the edited CI file (never run, no
+  remote). The scripts are to be run again with the icon at the end (plans/M10.md Part 8). An AppImage and an
+  amd64 build from this Mac are on the roadmap. The image `kerno-linux-build` (5.6 GB) is removed at the end
+  of the goal.

@@ -566,3 +566,12 @@ These rows were accepted for `docs/ROADMAP.md` with the reasons below and are no
 | CM-51 | Generate SQL ▸ MERGE, INSERT ON CONFLICT, UPDATE FROM, DELETE USING | PG, My | See NAV-51, NAV-52 |
 | CM-74 | New Index / Constraint from selection | PG, My | See NAV-43 |
 | CM-112 | View / Format ▸, Hints, Logical structure | PG, My | See RES-32, RES-33, RES-71 |
+
+## Added after the first documentation pass (2026-11-13)
+
+- **CM-15 — Refresh on a connection folder** (gap, small): add "Refresh" to the folder menu of
+  `sidebar::menu` (reloads the saved list, as the empty-area entry does); extend
+  `the_empty_area_and_a_folder_offer_what_dbeaver_does`. Do it with CTX Part 3 or G18.
+- **CM-09 — Paste in the sidebar's empty area**: decided for the roadmap. DBeaver pastes a copied
+  connection; Kerno's "Duplicate" on the connection does the same in one step. Mark the row `roadmap` with
+  that reason at the next update of `docs/DBEAVER-PARITY.md` and list it in `docs/ROADMAP.md`.

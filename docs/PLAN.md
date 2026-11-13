@@ -10,12 +10,13 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |
 | 4  | Schema navigator (§4 B)                                                    | done   |
-| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: `plans/M5.md`) |
-| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md`) |
-| 7  | Structure (§4 F)                                                           | todo   |
-| 8  | Import, export, backup, administration (§4 G, H)                           | todo   |
+| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: `plans/M5.md` Part 4 tab-close confirmations, Ctrl+Space and catalog leftovers of Part 2, captures; Parts 1, 2, 3 and the docs are done) |
+| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md` Part 1 editing comfort, Part 2 counting large tables; the table view, editing and the docs are done) |
+| 7  | Structure (§4 F)                                                           | doing (left: two tests of `plans/M7.md` Part 1c item 4, captures `m7-*`; Parts 1 to 4 are done) |
+| 8  | Import, export, backup, administration (§4 G, H)                           | doing (left: `plans/M8.md` Part 3 backup / restore dialog, Part 4 administration tab, UI tests left over from Parts 1 and 2, captures; export, import and the backup core are done) |
 | 9  | Performance pass, `docs/BENCH.md`                                          | todo   |
-| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | todo |
+| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | doing (packaging and the Linux container build done, `plans/M10.md` Part 6; the rest todo) |
+| —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | doing: done are CTX Parts 0 and 1 (clicks, folders, drag and drop, sidebar menus) and PARITY-GAPS G1 (keys of the tree and the connection list); left are CTX Parts 2 and 3 (tabs bar, editor, status bar, grid menus), PARITY-GAPS G2 to G18, and 99 gap rows in `DBEAVER-PARITY.md` |
 
 ## Implementation plans (owner request of 2026-11-12, CLAUDE.md §7 "Model budget")
 
@@ -27,9 +28,8 @@ main session stops, the work continues from these files.
 ## Owner feedback of 2026-11-13 (spec commit `6100e4f`)
 
 After testing a release build: (1) a double click or Enter on a table opens its data, as DBeaver; the
-chevron and the arrow keys expand; a setting chooses data / structure / expand — `plans/CTX.md` Part 0, in
-progress; (2) context menus on every surface (sidebar, folders, connections, tab bar, editor, grids, status
-bar), connection folders and drag and drop — `plans/CTX.md` Parts 1 to 3; (3) DBeaver Community is the
+chevron and the arrow keys expand; a setting chooses data / structure / expand — `plans/CTX.md` Part 0, done; (2) context menus on every surface (sidebar, folders, connections, tab bar, editor, grids, status
+bar), connection folders and drag and drop — `plans/CTX.md` Parts 1 (done) to 3 (Parts 2 and 3 left); (3) DBeaver Community is the
 primary reference: `docs/DBEAVER-PARITY.md` is built from its source and its gaps become plan parts —
 `plans/PARITY.md`. GOAL criterion 2 requires both.
 
