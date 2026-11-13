@@ -129,6 +129,8 @@ pub enum GridAction {
     EditCell,
     SetNull,
     SetDefault,
+    /// Copies the values of the row above (`true`) or below the selection.
+    CopyFromRow(bool),
     DuplicateRow,
     DeleteRow,
     RevertRow,
@@ -167,6 +169,8 @@ impl GridAction {
             Self::EditCell => "Edit cell",
             Self::SetNull => "Set NULL",
             Self::SetDefault => "Set default",
+            Self::CopyFromRow(true) => "Copy from row above",
+            Self::CopyFromRow(false) => "Copy from row below",
             Self::DuplicateRow => "Duplicate row",
             Self::DeleteRow => "Delete row",
             Self::RevertRow => "Revert row",
@@ -343,6 +347,8 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
                 takes_value.or(this_cell((!facts.nullable).then_some("NOT NULL"))),
             ),
             item(A::SetDefault, takes_value),
+            item(A::CopyFromRow(true), takes_value),
+            item(A::CopyFromRow(false), takes_value),
             Entry::Separator,
             item(A::DuplicateRow, read_only),
             item(A::DeleteRow, read_only.or(deleted)),
@@ -784,9 +790,10 @@ impl Grid {
         let typed = editing.input.read(cx).value().to_string();
         let kind = self.store.columns()[editing.column].kind;
         if let Some(value) = typed_value(&typed, &editing.initial, kind) {
+            let store = &self.store;
             edits
                 .pending
-                .set(&self.store, editing.row, editing.column, value);
+                .step(|pending| pending.set(store, editing.row, editing.column, value));
         }
     }
 
@@ -914,6 +921,13 @@ impl Grid {
     }
 
     // Selection ---------------------------------------------------------------
+
+    /// The cell being typed in (row, column of the result); for tests.
+    #[cfg(test)]
+    pub fn editing(&self) -> Option<(usize, usize)> {
+        let editing = self.edits.as_ref()?.editing.as_ref()?;
+        Some((editing.row, editing.column))
+    }
 
     /// What the grid draws in its cells, row by row (column 0, the row
     /// numbers, left out); for tests.
@@ -1938,6 +1952,8 @@ mod tests {
                 "Edit cell",
                 "Set NULL",
                 "Set default",
+                "Copy from row above",
+                "Copy from row below",
                 "—",
                 "Duplicate row",
                 "Delete row",
@@ -1965,6 +1981,7 @@ mod tests {
             "Edit cell (view)",
             "Set NULL (view)",
             "Set default (view)",
+            "Copy from row above (view)",
             "Duplicate row (view)",
             "Delete row (view)",
             "Revert row (view)",
@@ -2059,6 +2076,7 @@ mod tests {
             "Set NULL (row deleted)",
             "Paste (row deleted)",
             "Delete row (row deleted)",
+            "Copy from row above (row deleted)",
             "Revert row",
         ] {
             assert!(deleted.contains(&entry.to_string()), "{entry}: {deleted:?}");

@@ -1,6 +1,7 @@
 //! Kerno: a fast, native database client.
 
 mod actions;
+mod admin;
 mod bridge;
 mod connections;
 mod data;

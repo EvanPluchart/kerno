@@ -77,6 +77,16 @@ gpui_kit::actions!(
         ApplyChanges,
         /// Forgets the pending changes.
         DiscardChanges,
+        /// Gives the selected cells the values of the row above.
+        CopyFromRowAbove,
+        /// Gives the selected cells the values of the row below.
+        CopyFromRowBelow,
+        /// Drops the pending values of the selected cells.
+        RevertCells,
+        /// Takes the last pending change back.
+        UndoChange,
+        /// Copies the selected cells with their column names.
+        CopyWithColumnNames,
         /// Writes the rows of the table or result on screen to a file.
         ExportData,
         /// Imports a CSV file into a table.
@@ -133,6 +143,9 @@ gpui_kit::actions!(
         ReconnectTabConnection,
         /// Opens the dialog of the connection of the active tab.
         EditTabConnection,
+        /// Opens the administration of the active tab's connection, or of
+        /// the one selected in the sidebar.
+        OpenAdmin,
         /// Activates the next tab.
         NextTab,
         /// Activates the previous tab.
@@ -446,29 +459,37 @@ pub const COMMANDS: &[Command] = &[
         ["reload", "read again"],
         RefreshData
     ),
+    // The keys of the grids, DBeaver's defaults (`ui.editors.data`
+    // plugin.xml, context `ui.context.resultset.focused`; Ctrl is Ctrl on
+    // macOS too), plus keys Mac keyboards have. They work while a grid has
+    // the focus (`DataTable`, the table's own context), never in the editor.
+    // `cmd-` where Linux's Ctrl would take another command's key.
     command!(
         "add_row",
         "Add Row",
         "Data",
-        [],
+        ["alt-insert", "secondary-shift-n"],
         ["insert", "new row"],
-        AddRow
+        AddRow,
+        "DataTable"
     ),
     command!(
         "duplicate_rows",
         "Duplicate Selected Rows",
         "Data",
-        [],
+        ["ctrl-alt-insert", "cmd-d"],
         ["copy row", "clone"],
-        DuplicateRows
+        DuplicateRows,
+        "DataTable"
     ),
     command!(
         "delete_rows",
         "Delete Selected Rows",
         "Data",
-        [],
+        ["alt-delete", "cmd-backspace"],
         ["remove row"],
-        DeleteRows
+        DeleteRows,
+        "DataTable"
     ),
     command!(
         "set_null",
@@ -482,9 +503,55 @@ pub const COMMANDS: &[Command] = &[
         "set_default",
         "Set Selected Cells to Default",
         "Data",
-        [],
+        ["ctrl-backspace"],
         ["default value"],
-        SetDefault
+        SetDefault,
+        "DataTable"
+    ),
+    command!(
+        "copy_from_row_above",
+        "Copy Values From the Row Above",
+        "Data",
+        ["ctrl-d"],
+        ["fill down", "repeat"],
+        CopyFromRowAbove,
+        "DataTable"
+    ),
+    command!(
+        "copy_from_row_below",
+        "Copy Values From the Row Below",
+        "Data",
+        ["ctrl-alt-d"],
+        ["fill up", "repeat"],
+        CopyFromRowBelow,
+        "DataTable"
+    ),
+    command!(
+        "revert_cells",
+        "Revert Selected Cells",
+        "Data",
+        ["escape"],
+        ["reset", "undo edit"],
+        RevertCells,
+        "DataTable"
+    ),
+    command!(
+        "undo_change",
+        "Undo Last Pending Change",
+        "Data",
+        ["secondary-z"],
+        ["revert", "take back"],
+        UndoChange,
+        "DataTable"
+    ),
+    command!(
+        "copy_with_column_names",
+        "Copy Selection With Column Names",
+        "Data",
+        ["secondary-shift-c"],
+        ["header", "clipboard", "advanced copy"],
+        CopyWithColumnNames,
+        "DataTable"
     ),
     command!(
         "apply_changes",
@@ -695,6 +762,25 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["settings", "properties"],
         EditTabConnection
+    ),
+    command!(
+        "open_admin",
+        "Server Administration",
+        "Server",
+        [],
+        [
+            "sessions",
+            "processes",
+            "kill",
+            "terminate",
+            "roles",
+            "users",
+            "grants",
+            "sizes",
+            "settings",
+            "variables"
+        ],
+        OpenAdmin
     ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(
@@ -1024,6 +1110,30 @@ mod tests {
                 .any(|p| p.contains("\"f4\" is bound to both")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn the_grid_keys_differ_on_both_systems() {
+        // `secondary-` and `cmd-` resolve per system: two strings can be one
+        // keystroke (Ctrl+D on Linux), which the check above cannot see.
+        let (bindings, _) = effective_bindings("");
+        for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
+            let mut seen = BTreeMap::new();
+            for (key, id) in &bindings {
+                if context_of(id) != Some("DataTable") {
+                    continue;
+                }
+                let stroke = Keystroke::parse_with_os(key, os).unwrap().unparse(os);
+                if let Some(other) = seen.insert(stroke.clone(), *id) {
+                    panic!("{os:?}: {stroke} is bound to both {other} and {id}");
+                }
+            }
+        }
+        assert_eq!(
+            keys_of(&bindings, "add_row"),
+            ["alt-insert", "secondary-shift-n"]
+        );
+        assert_eq!(keys_of(&bindings, "revert_cells"), ["escape"]);
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub enum TabSnapshot {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         materialized: bool,
     },
+    /// The administration of a server.
+    Admin {
+        /// The connection, and the database its tables are listed from.
+        target: Target,
+    },
 }
 
 /// An entry of the menus of the tabs, the editor and the status bar.
@@ -112,6 +117,7 @@ pub enum TabAction {
     // The status bar.
     Disconnect,
     Reconnect,
+    Administration,
     EditConnection,
     UseDatabase(String),
     Commit,
@@ -161,6 +167,7 @@ impl TabAction {
             Self::SaveQuery => "Save as query…",
             Self::Disconnect => "Disconnect",
             Self::Reconnect => "Reconnect",
+            Self::Administration => "Administration",
             Self::EditConnection => "Edit connection…",
             Self::UseDatabase(database) => return database.clone(),
             Self::Commit => "Commit transaction",
@@ -382,6 +389,7 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
             Item(TabAction::Disconnect, keeps_connection),
             Item(TabAction::Reconnect, keeps_connection),
             Separator,
+            Item(TabAction::Administration, not_connected),
             enabled(TabAction::EditConnection),
         ],
         StatusItem::Database if facts.query => facts
@@ -663,7 +671,13 @@ mod tests {
         let menu = |item, facts: &StatusFacts| labels(&status_menu(item, "12 rows", facts));
         assert_eq!(
             menu(StatusItem::Connection, &facts),
-            ["Disconnect", "Reconnect", "—", "Edit connection…"]
+            [
+                "Disconnect",
+                "Reconnect",
+                "—",
+                "Administration",
+                "Edit connection…"
+            ]
         );
         assert_eq!(
             menu(StatusItem::Database, &facts),
@@ -741,6 +755,11 @@ mod tests {
             ..facts
         };
         assert!(menu(StatusItem::Database, &data).is_empty());
+        // A server is administered while it is connected.
+        assert_eq!(
+            menu(StatusItem::Connection, &StatusFacts::default())[3],
+            "Administration (not connected)"
+        );
     }
 
     #[test]
@@ -884,6 +903,20 @@ mod tests {
             serde_json::from_str::<TabSnapshot>(&json).unwrap(),
             structure
         );
+        // A server's administration, the same way.
+        let admin = TabSnapshot::Admin {
+            target: Target {
+                connection: "c1".into(),
+                database: Some("kerno".into()),
+                schema: None,
+            },
+        };
+        let json = serde_json::to_string(&admin).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"admin","target":{"connection":"c1","database":"kerno"}}"#
+        );
+        assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), admin);
         // A kind this version does not know is rejected, and the storage
         // layer then skips that tab instead of failing to start.
         assert!(serde_json::from_str::<TabSnapshot>(r#"{"kind":"from_the_future"}"#).is_err());

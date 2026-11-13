@@ -57,6 +57,7 @@ pub enum SidebarAction {
     Disconnect,
     Reconnect,
     NewSqlEditor,
+    Administration,
     Edit,
     Duplicate,
     /// Into this folder; the top level when `None`.
@@ -82,6 +83,7 @@ impl SidebarAction {
             Self::Disconnect => "Disconnect",
             Self::Reconnect => "Reconnect",
             Self::NewSqlEditor => "New SQL editor",
+            Self::Administration => "Administration",
             Self::Edit => "Edit…",
             Self::Duplicate => "Duplicate",
             Self::MoveTo(Some(folder)) => return folder.clone(),
@@ -157,6 +159,7 @@ pub fn menu(
                 Item(Reconnect, not_connected),
                 Separator,
                 enabled(NewSqlEditor),
+                Item(Administration, not_connected),
                 Separator,
                 enabled(Edit),
                 enabled(Duplicate),
@@ -181,6 +184,8 @@ pub fn menu(
 pub enum SidebarEvent {
     /// Open a query tab on this connection, which is open.
     NewEditor(String),
+    /// Open the administration of this connection.
+    OpenAdmin(String),
     /// Ask for a connections file to import.
     ImportConnections,
 }
@@ -279,6 +284,11 @@ impl Sidebar {
                 connections.connect(&id, cx)
             }
         });
+    }
+
+    /// The connection selected in the list.
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
     }
 
     /// What Enter does to the selected connection.
@@ -380,6 +390,7 @@ impl Sidebar {
                 c.connect(&id, cx);
             }),
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
+            (Subject::Connection(_), Administration) => cx.emit(SidebarEvent::OpenAdmin(id)),
             (Subject::Connection(_), Edit) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), Duplicate) => {
                 connections.update(cx, |c, cx| c.duplicate(&id, cx))
@@ -1044,6 +1055,7 @@ mod tests {
                 "Reconnect (not connected)",
                 "—",
                 "New SQL editor",
+                "Administration (not connected)",
                 "—",
                 "Edit…",
                 "Duplicate",
@@ -1069,8 +1081,9 @@ mod tests {
             open[..3],
             ["Connect (connected)", "Disconnect", "Reconnect"]
         );
-        assert_eq!(open[13], "Refresh");
-        assert!(open[9].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        assert_eq!(open[5], "Administration");
+        assert_eq!(open[14], "Refresh");
+        assert!(open[10].starts_with("Move to folder ▸ [No folder (already there), Work,"));
 
         let connecting = labels(&menu(&subject, &Status::Connecting, &folders, None));
         assert_eq!(

@@ -35,13 +35,14 @@ use crate::actions::{
     DisconnectTabConnection, DropObject, DuplicateRows, DuplicateTab, EditConnection, EditObject,
     EditTabConnection, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData,
     FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection, NewConnectionFolder,
-    NewQueryOnObject, NewQueryTab, NextTab, OpenCommandPalette, OpenConnection, OpenSettings,
-    OpenSqlFile, PreviousTab, ReconnectTabConnection, RefreshConnections, RefreshData,
-    RefreshObject, RefreshSchemaTree, RenameObject, RenameTab, ReopenClosedTab, ReplaceInEditor,
-    RevealTabFile, RollbackTransaction, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery,
-    SetDefault, SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries, ToggleComment,
-    ToggleCommitMode, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    NewQueryOnObject, NewQueryTab, NextTab, OpenAdmin, OpenCommandPalette, OpenConnection,
+    OpenSettings, OpenSqlFile, PreviousTab, ReconnectTabConnection, RefreshConnections,
+    RefreshData, RefreshObject, RefreshSchemaTree, RenameObject, RenameTab, ReopenClosedTab,
+    ReplaceInEditor, RevealTabFile, RollbackTransaction, RunAll, RunStatement, SaveFile,
+    SaveFileAs, SaveQuery, SetDefault, SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries,
+    ToggleComment, ToggleCommitMode, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
+use crate::admin::tab::AdminTab;
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{
@@ -91,6 +92,7 @@ enum OpenTab {
     Query(Entity<QueryTab>),
     Data(Entity<DataTab>),
     Structure(Entity<StructureTab>),
+    Admin(Entity<AdminTab>),
     /// Not restored after a restart: an unsaved draft is not worth keeping.
     TableEditor(Entity<TableEditor>),
 }
@@ -117,6 +119,13 @@ impl OpenTab {
         }
     }
 
+    fn admin(&self) -> Option<&Entity<AdminTab>> {
+        match self {
+            OpenTab::Admin(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     fn table_editor(&self) -> Option<&Entity<TableEditor>> {
         match self {
             OpenTab::TableEditor(tab) => Some(tab),
@@ -129,6 +138,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.entity_id(),
             OpenTab::Data(tab) => tab.entity_id(),
             OpenTab::Structure(tab) => tab.entity_id(),
+            OpenTab::Admin(tab) => tab.entity_id(),
             OpenTab::TableEditor(tab) => tab.entity_id(),
         }
     }
@@ -160,7 +170,7 @@ impl OpenTab {
                 0 => Vec::new(),
                 count => vec![Loss::Pending(count)],
             },
-            OpenTab::Structure(_) => Vec::new(),
+            OpenTab::Structure(_) | OpenTab::Admin(_) => Vec::new(),
             OpenTab::TableEditor(tab) => {
                 if tab.read(cx).dirty(cx) {
                     vec![Loss::Form]
@@ -177,6 +187,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.read(cx).connection_id().map(str::to_string),
             OpenTab::Data(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Structure(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::Admin(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
         }
     }
@@ -186,6 +197,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.focus_handle(cx),
             OpenTab::Data(tab) => tab.focus_handle(cx),
             OpenTab::Structure(tab) => tab.focus_handle(cx),
+            OpenTab::Admin(tab) => tab.focus_handle(cx),
             OpenTab::TableEditor(tab) => tab.focus_handle(cx),
         }
     }
@@ -196,6 +208,7 @@ impl OpenTab {
             OpenTab::Query(tab) => Some(tab.read(cx).snapshot(cx)),
             OpenTab::Data(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Structure(tab) => Some(tab.read(cx).snapshot()),
+            OpenTab::Admin(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::TableEditor(_) => None,
         }
     }
@@ -205,6 +218,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.read(cx).title(),
             OpenTab::Data(tab) => tab.read(cx).title(),
             OpenTab::Structure(tab) => tab.read(cx).title(),
+            OpenTab::Admin(tab) => tab.read(cx).title(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).title(),
         }
     }
@@ -218,7 +232,7 @@ impl OpenTab {
                 tab.file().is_some() && tab.unsaved()
             }
             OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
-            OpenTab::Structure(_) => false,
+            OpenTab::Structure(_) | OpenTab::Admin(_) => false,
             OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
         };
         let title = self.title(cx);
@@ -234,6 +248,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.read(cx).status(cx),
             OpenTab::Data(tab) => tab.read(cx).status(cx),
             OpenTab::Structure(tab) => tab.read(cx).status(cx),
+            OpenTab::Admin(tab) => tab.read(cx).status(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).status(cx),
         }
     }
@@ -243,6 +258,7 @@ impl OpenTab {
             OpenTab::Query(tab) => tab.clone().into(),
             OpenTab::Data(tab) => tab.clone().into(),
             OpenTab::Structure(tab) => tab.clone().into(),
+            OpenTab::Admin(tab) => tab.clone().into(),
             OpenTab::TableEditor(tab) => tab.clone().into(),
         }
     }
@@ -267,6 +283,9 @@ pub struct Workspace {
     /// Where the active query tab runs, written on each frame for the
     /// schema tree's "Set as default for this tab".
     tab_target: Rc<RefCell<Option<Target>>>,
+    /// The active tab, written on each frame: an administration tab
+    /// refreshes on its own only while it is the one shown.
+    shown_tab: Rc<Cell<Option<EntityId>>>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -314,6 +333,7 @@ impl Workspace {
             pending_save: None,
             pending_editor: None,
             tab_target,
+            shown_tab: Rc::new(Cell::new(None)),
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -389,6 +409,9 @@ impl Workspace {
                 };
                 self.push_structure_tab(target, TableRef::new(schema, table), kind, window, cx);
             }
+            TabSnapshot::Admin { target } => {
+                self.push_admin_tab(target, window, cx);
+            }
         }
     }
 
@@ -430,6 +453,12 @@ impl Workspace {
     #[cfg(test)]
     pub fn active_structure_tab(&self) -> Option<&Entity<StructureTab>> {
         self.tabs.get(self.active_tab)?.structure()
+    }
+
+    /// The active tab, when it administers a server.
+    #[cfg(test)]
+    pub fn active_admin_tab(&self) -> Option<&Entity<AdminTab>> {
+        self.tabs.get(self.active_tab)?.admin()
     }
 
     /// The active tab, when it is a table form.
@@ -565,6 +594,65 @@ impl Workspace {
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
         tab
+    }
+
+    /// Opens the administration of a server in a tab of its own.
+    fn push_admin_tab(
+        &mut self,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AdminTab> {
+        let (connections, shown) = (self.connections.clone(), self.shown_tab.clone());
+        let tab = cx.new(|cx| AdminTab::new(target, connections, shown, window, cx));
+        // One subscription per tab: `close_tab_at` removes them by index. The
+        // tab's title follows the connection's name.
+        self.tab_subscriptions
+            .push(cx.observe(&tab, |_, _, cx| cx.notify()));
+        self.tabs.push(OpenTab::Admin(tab.clone()));
+        self.active_tab = self.tabs.len() - 1;
+        tab
+    }
+
+    /// Shows the administration of a connection's server: in the tab that
+    /// already shows it, else in a new one.
+    pub fn open_admin(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AdminTab> {
+        let open = self.tabs.iter().position(|tab| {
+            tab.admin()
+                .is_some_and(|tab| tab.read(cx).target().connection == connection)
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index].admin().expect("an admin tab").clone();
+        }
+        let tab = self.push_admin_tab(connection_target(connection), window, cx);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.schedule_save(cx);
+        tab
+    }
+
+    /// The palette's "Server Administration": of the active tab's
+    /// connection, else of the one selected in the sidebar.
+    fn open_admin_command(&mut self, _: &OpenAdmin, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.connection(cx))
+            .or_else(|| self.sidebar.read(cx).selected().map(str::to_string));
+        match connection {
+            Some(connection) => {
+                self.open_admin(&connection, window, cx);
+            }
+            None => window.push_notification(
+                Notification::warning("Server Administration: select a connection first."),
+                cx,
+            ),
+        }
     }
 
     /// Opens the form of `table`, or of a new table in `schema` when `None`:
@@ -999,6 +1087,11 @@ impl Workspace {
                             connections.connect(&id, cx);
                         }
                     });
+                }
+            }
+            TabAction::Administration => {
+                if let Some(id) = connection {
+                    self.open_admin(&id, window, cx);
                 }
             }
             TabAction::EditConnection => {
@@ -1525,6 +1618,12 @@ impl Workspace {
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        // A table's data saves its pending changes, as DBeaver's Ctrl+S
+        // does, through the review: nothing is written unseen.
+        if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.review(window, cx));
+            return;
+        }
         let file = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf));
@@ -1906,6 +2005,66 @@ impl Workspace {
         self.on_data_tab(window, cx, |tab, _, cx| tab.discard(cx));
     }
 
+    fn copy_from_row_above(
+        &mut self,
+        _: &actions::CopyFromRowAbove,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.copy_from_row(true, window, cx)
+        });
+    }
+
+    fn copy_from_row_below(
+        &mut self,
+        _: &actions::CopyFromRowBelow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_data_tab(window, cx, |tab, window, cx| {
+            tab.copy_from_row(false, window, cx)
+        });
+    }
+
+    /// Esc: with nothing to revert, the key goes on (the grid then clears
+    /// its selection).
+    fn revert_cells(&mut self, _: &actions::RevertCells, _: &mut Window, cx: &mut Context<Self>) {
+        let reverted = self
+            .active_data_tab()
+            .cloned()
+            .is_some_and(|tab| tab.update(cx, |tab, cx| tab.revert_cells(cx)));
+        if !reverted {
+            cx.propagate();
+        }
+    }
+
+    fn undo_change(
+        &mut self,
+        _: &actions::UndoChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_data_tab(window, cx, |tab, _, cx| {
+            tab.undo(cx);
+        });
+    }
+
+    /// Cmd+Shift+C, in a table's data and in a query result.
+    fn copy_with_column_names(
+        &mut self,
+        _: &actions::CopyWithColumnNames,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let format = crate::query::grid::CopyFormat::TsvWithHeader;
+        if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.copy_selection(format, cx));
+        } else if let Some(tab) = self.active_query_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.copy_selection(Some(format), cx));
+        }
+    }
+
     fn find_in_editor(&mut self, _: &FindInEditor, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_query_tab() {
             tab.update(cx, |tab, cx| tab.find(false, window, cx));
@@ -2001,6 +2160,9 @@ impl Workspace {
         match event {
             SidebarEvent::ImportConnections => {
                 self.import_connections(&ImportConnections, window, cx)
+            }
+            SidebarEvent::OpenAdmin(id) => {
+                self.open_admin(id, window, cx);
             }
             SidebarEvent::NewEditor(id) => {
                 if matches!(
@@ -2651,6 +2813,8 @@ impl Render for Workspace {
         *self.tab_target.borrow_mut() = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).target().cloned());
+        self.shown_tab
+            .set(self.tabs.get(self.active_tab).map(OpenTab::entity_id));
         let sidebar_visible = AppState::get(cx).settings.sidebar_visible;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
@@ -2723,6 +2887,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &EditTabConnection, window, cx| {
                 this.perform(None, TabAction::EditConnection, window, cx)
             }))
+            .on_action(cx.listener(Self::open_admin_command))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::toggle_sidebar))
@@ -2755,6 +2920,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::set_default))
             .on_action(cx.listener(Self::apply_changes))
             .on_action(cx.listener(Self::discard_changes))
+            .on_action(cx.listener(Self::copy_from_row_above))
+            .on_action(cx.listener(Self::copy_from_row_below))
+            .on_action(cx.listener(Self::revert_cells))
+            .on_action(cx.listener(Self::undo_change))
+            .on_action(cx.listener(Self::copy_with_column_names))
             .on_action(cx.listener(Self::replace_in_editor))
             .on_action(cx.listener(Self::explain_statement))
             .on_action(cx.listener(Self::explain_analyze))

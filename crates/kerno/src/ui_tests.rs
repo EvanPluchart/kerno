@@ -3447,6 +3447,224 @@ fn pasting_fills_cells_from_the_clipboard_and_delete_empties_them(cx: &mut TestA
     app.click(cx, "data-discard");
 }
 
+#[gpui_kit::test]
+fn data_keys_edit_rows_and_apply(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_data_keys");
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                &scratch_table(
+                    engine,
+                    "kerno_ui_data_keys.items",
+                    "name VARCHAR(20) NOT NULL, qty INT, note VARCHAR(20) DEFAULT 'n/a'",
+                ),
+                "INSERT INTO kerno_ui_data_keys.items (name, qty, note) \
+                 VALUES ('a', 1, 'x'), ('b', 2, 'y'), ('c', 3, 'z')",
+            ],
+        );
+        let app = connected(cx, engine);
+        app.open_table(cx, "kerno_ui_data_keys", "items", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–3 of 3");
+        let grid = app.data_grid(cx);
+        // Selects a cell (or a row) and gives the grid the keys. Columns:
+        // the row number, id, name, qty, note.
+        let select = |app: &Fixture, cx: &mut TestAppContext, row: usize, column: Option<usize>| {
+            app.step(cx, |window, cx| {
+                grid.update(cx, |table, cx| {
+                    table.delegate_mut().clear_selection();
+                    match column {
+                        Some(column) => table.set_selected_cell(row, column, cx),
+                        None => table.set_selected_row(row, cx),
+                    }
+                });
+                grid.read(cx).focus_handle(cx).focus(window, cx);
+            });
+        };
+        let statements = |app: &Fixture, cx: &mut TestAppContext| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).pending_sql(cx)).unwrap().1
+        };
+        let verbs = |statements: &[String]| -> Vec<String> {
+            statements
+                .iter()
+                .map(|statement| statement.split(' ').next().unwrap().to_string())
+                .collect()
+        };
+        let row = |cells: [&str; 4]| cells.map(str::to_string).to_vec();
+
+        // Ctrl+Alt+D: the selected cell takes the value of the row below.
+        select(&app, cx, 0, Some(3));
+        app.press(cx, &["ctrl-alt-d"]);
+        assert_eq!(
+            app.data_rows(cx)[0],
+            row(["1", "a", "2", "x"]),
+            "{engine:?}"
+        );
+        // Esc takes it back; with nothing to take back, Esc clears the
+        // selection, as it did before; Cmd+Z undoes the revert.
+        app.press(cx, &["escape"]);
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[0][2].as_str()),
+            (0, "1")
+        );
+        assert!(cx.update(|cx| grid.read(cx).selected_cell()).is_some());
+        app.press(cx, &["escape"]);
+        assert!(cx.update(|cx| grid.read(cx).selected_cell()).is_none());
+        app.press(cx, &["secondary-z"]);
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[0][2].as_str()),
+            (1, "2")
+        );
+
+        // Alt+Insert adds a row; Ctrl+D fills it from the row above, its
+        // generated key left to the server; Esc on one cell takes it back
+        // to its default.
+        select(&app, cx, 2, None);
+        app.press(cx, &["alt-insert"]);
+        assert_eq!(app.pending(cx), 2);
+        assert_eq!(cx.update(|cx| grid.read(cx).selected_row()), Some(3));
+        app.press(cx, &["ctrl-d"]);
+        assert_eq!(app.data_rows(cx)[3][1..], ["c", "3", "z"]);
+        select(&app, cx, 3, Some(4));
+        app.press(cx, &["escape"]);
+        assert_eq!(app.data_rows(cx)[3][1..], ["c", "3", "NULL"]);
+        // The menu entry does what the key does.
+        app.on_data(cx, |tab, window, cx| {
+            tab.perform(
+                crate::query::grid::GridAction::CopyFromRow(true),
+                3,
+                4,
+                window,
+                cx,
+            )
+        });
+        assert_eq!(app.data_rows(cx)[3][1..], ["c", "3", "z"]);
+        app.press(cx, &["escape"]);
+        assert_eq!(app.data_rows(cx)[3][1..], ["c", "3", "NULL"]);
+
+        // Alt+Delete marks a row deleted.
+        select(&app, cx, 1, None);
+        app.press(cx, &["alt-delete"]);
+        assert_eq!(app.pending(cx), 3);
+
+        // A typed value is one step of undo too.
+        app.type_in_cell(cx, 2, 2, "cc", "enter");
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[2][1].as_str()),
+            (4, "cc")
+        );
+        app.press(cx, &["secondary-z"]);
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[2][1].as_str()),
+            (3, "c")
+        );
+        // With a cell open, Esc only closes it (the cell's pending value
+        // stays), and Cmd+Z undoes typing, not a change.
+        app.type_in_cell(cx, 0, 3, "5", "escape");
+        assert_eq!(
+            (app.pending(cx), app.data_rows(cx)[0][2].as_str()),
+            (3, "2")
+        );
+        app.on_data(cx, |tab, window, cx| tab.edit_cell(2, 2, window, cx));
+        app.type_text(cx, "zz");
+        app.press(cx, &["secondary-z"]);
+        let editing = |cx: &mut TestAppContext| cx.update(|cx| grid.read(cx).delegate().editing());
+        assert_eq!(editing(cx), Some((2, 1)));
+        app.press(cx, &["escape"]);
+        assert_eq!(editing(cx), None);
+        assert_eq!(app.pending(cx), 3);
+        assert_eq!(app.data_rows(cx)[2][1], "c");
+
+        // Cmd+S opens the review of the three statements; cancel keeps them.
+        let written = statements(&app, cx);
+        assert_eq!(
+            verbs(&written),
+            ["DELETE", "UPDATE", "INSERT"],
+            "{engine:?}"
+        );
+        if engine == Engine::Postgres {
+            assert_eq!(
+                written[2],
+                "INSERT INTO \"kerno_ui_data_keys\".\"items\" (\"name\", \"qty\") VALUES ('c', 3)"
+            );
+        }
+        select(&app, cx, 0, Some(2));
+        app.press(cx, &["secondary-s"]);
+        // The review is built from these statements (`DataTab::review`).
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        app.click(cx, "sql-cancel");
+        assert_eq!(app.pending(cx), 3);
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_data_keys.items"),
+            "3"
+        );
+
+        // The Mac keys: Cmd+Shift+N adds, Cmd+Backspace deletes, Cmd+D and
+        // Ctrl+Alt+Insert duplicate; Ctrl+Backspace sets the default.
+        select(&app, cx, 2, None);
+        app.press(cx, &["secondary-shift-n"]);
+        assert_eq!(app.pending(cx), 4);
+        app.press(cx, &["cmd-backspace"]);
+        assert_eq!(app.pending(cx), 3);
+        select(&app, cx, 2, None);
+        app.press(cx, &["cmd-d"]);
+        select(&app, cx, 2, None);
+        app.press(cx, &["ctrl-alt-insert"]);
+        assert_eq!(app.pending(cx), 5);
+        select(&app, cx, 2, Some(4));
+        app.press(cx, &["ctrl-backspace"]);
+        assert!(
+            statements(&app, cx)
+                .iter()
+                .any(|statement| statement.starts_with("UPDATE")
+                    && statement.contains("= DEFAULT")),
+            "{:?}",
+            statements(&app, cx)
+        );
+
+        // Cmd+Shift+C copies with the column names.
+        select(&app, cx, 0, Some(2));
+        app.step(cx, |_, cx| {
+            grid.update(cx, |table, _| table.delegate_mut().extend_to(1, 3))
+        });
+        app.press(cx, &["secondary-shift-c"]);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            copied.as_deref().and_then(|text| text.lines().next()),
+            Some("name\tqty")
+        );
+
+        // Nothing pending: Cmd+S opens nothing.
+        app.click(cx, "data-discard");
+        select(&app, cx, 0, Some(2));
+        app.press(cx, &["secondary-s"]);
+        assert!(!app.has(cx, "sql-preview"));
+    }
+
+    // Cmd+Shift+C in a query result too.
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(cx, "select 1 as one, 2 as two", "secondary-enter");
+    app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    app.step(cx, |window, cx| {
+        grid.update(cx, |table, cx| table.set_selected_cell(0, 1, cx));
+        grid.read(cx).focus_handle(cx).focus(window, cx);
+    });
+    app.press(cx, &["secondary-shift-c"]);
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("one\n1\n"));
+}
+
 // Plans and guards ----------------------------------------------------------------
 
 #[gpui_kit::test]
@@ -6845,4 +7063,629 @@ fn a_drop_with_cascade_also_drops_what_depends_on_the_table(cx: &mut TestAppCont
         (count("tables", "t"), count("views", "v")),
         ("0".into(), "0".into())
     );
+}
+
+// Server administration (docs/plans/M8.md Part 4) -----------------------------------
+
+use crate::admin::tab::{AdminTab, Pane, ROLES, SETTINGS, SIZES};
+
+/// A session of the test's own on a test server, busy with a slow
+/// statement marked `marker`; terminated when dropped if still running.
+struct Sleeper {
+    engine: Engine,
+    id: String,
+    done: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+impl Sleeper {
+    fn start(engine: Engine, marker: &str) -> Self {
+        use kerno_core::Driver as _;
+        let (own_id, sql) = match engine {
+            Engine::Postgres => (
+                "SELECT pg_backend_pid()",
+                format!("SELECT '{marker}', pg_sleep(60)"),
+            ),
+            // Interrupted, SLEEP() fails the query it is part of (alone in
+            // it, it would return 1 instead).
+            Engine::MySql | Engine::MariaDb => (
+                "SELECT CONNECTION_ID()",
+                format!("SELECT '{marker}', COUNT(*) FROM kerno.orders WHERE SLEEP(0.02) = 0"),
+            ),
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let done = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let params = testing::params(engine);
+                let session = match engine {
+                    Engine::Postgres => kerno_postgres::PostgresDriver.connect(&params).await,
+                    Engine::MySql | Engine::MariaDb => {
+                        kerno_mysql::MysqlDriver.connect(&params).await
+                    }
+                }
+                .expect("the test server");
+                let id = kerno_core::exec::collect(session.clone(), own_id)
+                    .await
+                    .unwrap()
+                    .results[0]
+                    .rows()[0][0]
+                    .clone()
+                    .unwrap();
+                sender.send(id).unwrap();
+                let outcome = kerno_core::exec::collect(session.clone(), sql)
+                    .await
+                    .map(drop)
+                    .map_err(|error| error.to_string());
+                session.close().await;
+                outcome
+            })
+        });
+        let id = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the sleeper's session");
+        Self {
+            engine,
+            id,
+            done: Some(done),
+        }
+    }
+
+    /// How its statement ended, once it has.
+    fn outcome(&mut self) -> Option<Result<(), String>> {
+        if !self.done.as_ref()?.is_finished() {
+            return None;
+        }
+        self.done
+            .take()
+            .map(|done| done.join().expect("the sleeper"))
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        if self.done.as_ref().is_some_and(|done| !done.is_finished()) {
+            // This test's own session, and no other.
+            let sql = match self.engine {
+                Engine::Postgres => format!("SELECT pg_terminate_backend({})", self.id),
+                Engine::MySql | Engine::MariaDb => format!("KILL CONNECTION {}", self.id),
+            };
+            let engine = self.engine;
+            // A failure here must not abort a test that is already failing.
+            let _ = std::thread::spawn(move || on_server(engine, &sql)).join();
+        }
+    }
+}
+
+impl Fixture {
+    /// The active tab, which administers a server.
+    fn admin(&self, cx: &mut TestAppContext) -> Entity<AdminTab> {
+        cx.update(|cx| {
+            self.workspace
+                .read(cx)
+                .active_admin_tab()
+                .expect("an administration tab")
+                .clone()
+        })
+    }
+
+    /// Does something to the active administration tab.
+    fn on_admin(
+        &self,
+        cx: &mut TestAppContext,
+        act: impl FnOnce(&mut AdminTab, &mut gpui_kit::Window, &mut gpui_kit::Context<AdminTab>),
+    ) {
+        let tab = self.admin(cx);
+        self.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| act(tab, window, cx))
+        });
+    }
+
+    /// Waits for a list of the administration tab to be read.
+    fn wait_admin(&self, cx: &mut TestAppContext, pane: Pane) {
+        let tab = self.admin(cx);
+        self.wait_until(cx, "the list", |_, cx| {
+            let state = cx.update(|cx| tab.read(cx).state(pane));
+            assert!(!state.starts_with("failed"), "{pane:?}: {state}");
+            state == "ready"
+        });
+    }
+
+    /// The headers and rows a list of the administration tab shows.
+    fn admin_shown(&self, cx: &mut TestAppContext, pane: Pane) -> (Vec<String>, Vec<Vec<String>>) {
+        let tab = self.admin(cx);
+        cx.update(|cx| tab.read(cx).shown(pane, cx))
+    }
+
+    /// Reads the sub-tab on screen again until its rows of `pane` satisfy
+    /// `done`; gives them.
+    fn admin_rows_until(
+        &self,
+        cx: &mut TestAppContext,
+        pane: Pane,
+        what: &str,
+        done: impl Fn(&[Vec<String>]) -> bool,
+    ) -> Vec<Vec<String>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            self.wait_admin(cx, pane);
+            let (_, rows) = self.admin_shown(cx, pane);
+            if done(&rows) {
+                return rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {rows:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            self.on_admin(cx, |tab, window, cx| tab.refresh(window, cx));
+        }
+    }
+
+    /// Types `text` in the filter box of the sub-tab, in place of what it
+    /// holds.
+    fn admin_filter(&self, cx: &mut TestAppContext, text: &str) {
+        self.click(cx, "admin-filter");
+        self.press(cx, &["secondary-a", "backspace"]);
+        self.type_text(cx, text);
+    }
+
+    /// Why the selected session cannot be signalled, when it cannot.
+    fn admin_why_not(&self, cx: &mut TestAppContext) -> Option<&'static str> {
+        let tab = self.admin(cx);
+        cx.update(|cx| tab.read(cx).why_not_signal(cx))
+    }
+
+    fn admin_asked(&self, cx: &mut TestAppContext) -> Option<String> {
+        let tab = self.admin(cx);
+        cx.update(|cx| tab.read(cx).asked().map(str::to_string))
+    }
+
+    fn admin_message(&self, cx: &mut TestAppContext) -> Option<(bool, String)> {
+        let tab = self.admin(cx);
+        cx.update(|cx| tab.read(cx).message().cloned())
+    }
+}
+
+/// Waits for a sleeper's statement to end; gives how.
+fn sleeper_ended(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    sleeper: &mut Sleeper,
+) -> Result<(), String> {
+    let mut ended = None;
+    app.wait_until(cx, "the end of the slow statement", |_, _| {
+        ended = sleeper.outcome();
+        ended.is_some()
+    });
+    ended.unwrap()
+}
+
+#[gpui_kit::test]
+fn the_sessions_list_cancels_and_terminates_what_the_test_opened(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+        // From the connection's menu in the sidebar.
+        app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+        assert_eq!(
+            app.titles(cx),
+            [format!("test {} · administration", engine.label())]
+        );
+        app.wait_admin(cx, Pane::Sessions);
+        assert!(app.has(cx, "admin-version"), "{engine:?}");
+
+        // The tab's own session is marked, and nothing is offered on it.
+        let (headers, rows) = app.admin_shown(cx, Pane::Sessions);
+        assert!(headers.contains(&"Query".to_string()), "{headers:?}");
+        assert!(
+            !headers.contains(&"This session".to_string()),
+            "{headers:?}"
+        );
+        let own = rows
+            .iter()
+            .position(|row| row[0].ends_with(" · this tab"))
+            .unwrap_or_else(|| panic!("{engine:?}: no own session in {rows:?}"));
+        app.click(cx, ("admin-sessions-cell", own << 12));
+        assert_eq!(app.admin_why_not(cx), Some("this tab's session"));
+
+        let mut cancelled = Sleeper::start(engine, "kerno_ui_admin_cancel");
+        let mut terminated = Sleeper::start(engine, "kerno_ui_admin_terminate");
+
+        // Cancel query, from the toolbar, on the row selected.
+        app.admin_filter(cx, "kerno_ui_admin_cancel");
+        app.admin_rows_until(cx, Pane::Sessions, "the session to cancel", |rows| {
+            rows.len() == 1 && rows[0][0] == cancelled.id
+        });
+        app.click(cx, ("admin-sessions-cell", 0usize));
+        assert_eq!(app.admin_why_not(cx), None);
+        app.click(cx, "admin-cancel");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        let expected = match engine {
+            Engine::Postgres => format!("SELECT pg_catalog.pg_cancel_backend({})", cancelled.id),
+            Engine::MySql | Engine::MariaDb => format!("KILL QUERY {}", cancelled.id),
+        };
+        assert_eq!(app.admin_asked(cx), Some(expected));
+        app.click(cx, "sql-confirm");
+        let error = sleeper_ended(&app, cx, &mut cancelled).unwrap_err();
+        let lower = error.to_lowercase();
+        assert!(
+            lower.contains("cancel") || lower.contains("interrupted"),
+            "{engine:?}: {error}"
+        );
+        app.wait_until(cx, "the outcome", |app, cx| {
+            app.admin_message(cx)
+                == Some((
+                    false,
+                    format!("Cancelled the statement of session {}.", cancelled.id),
+                ))
+        });
+
+        // Terminate session, from the menu of its row, opened with a real
+        // right-click.
+        app.admin_filter(cx, "kerno_ui_admin_terminate");
+        app.admin_rows_until(cx, Pane::Sessions, "the session to terminate", |rows| {
+            rows.len() == 1 && rows[0][0] == terminated.id
+        });
+        app.right_click(cx, ("admin-sessions-cell", 0usize), None);
+        assert!(menu_entry(&app, cx, "Copy").is_some(), "{engine:?}");
+        assert!(menu_entry(&app, cx, "Cancel query").is_some(), "{engine:?}");
+        click_menu_entry(&app, cx, "Terminate session");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        let expected = match engine {
+            Engine::Postgres => {
+                format!("SELECT pg_catalog.pg_terminate_backend({})", terminated.id)
+            }
+            Engine::MySql | Engine::MariaDb => format!("KILL CONNECTION {}", terminated.id),
+        };
+        assert_eq!(app.admin_asked(cx), Some(expected));
+        app.click(cx, "sql-confirm");
+        assert!(
+            sleeper_ended(&app, cx, &mut terminated).is_err(),
+            "{engine:?}"
+        );
+        app.wait_until(cx, "the outcome", |app, cx| {
+            app.admin_message(cx) == Some((false, format!("Terminated session {}.", terminated.id)))
+        });
+        // Gone from the server, gone from the list.
+        app.admin_rows_until(cx, Pane::Sessions, "the session to go", |rows| {
+            rows.is_empty()
+        });
+        assert!(app.has(cx, ("admin-empty", Pane::Sessions as usize)));
+    }
+}
+
+#[gpui_kit::test]
+fn roles_and_their_grants_sizes_and_settings_are_listed(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        // From the palette, on the connection selected in the sidebar.
+        app.dispatch(cx, actions::OpenAdmin);
+        app.wait_admin(cx, Pane::Sessions);
+
+        // Roles; the grants of the one selected below them.
+        app.on_admin(cx, |tab, window, cx| tab.select(ROLES, window, cx));
+        app.wait_admin(cx, Pane::Roles);
+        app.wait_admin(cx, Pane::Grants);
+        let (_, roles) = app.admin_shown(cx, Pane::Roles);
+        assert!(roles.iter().any(|role| role[0] == "kerno"), "{roles:?}");
+        assert!(app.has(cx, ("admin-empty", Pane::Grants as usize)));
+        let readonly = roles
+            .iter()
+            .position(|role| role[0] == "kerno_readonly")
+            .unwrap();
+        app.click(cx, ("admin-roles-cell", readonly << 12));
+        let (headers, grants) = app.admin_shown(cx, Pane::Grants);
+        let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
+        let grantee = match engine {
+            Engine::Postgres => "kerno_readonly",
+            Engine::MySql | Engine::MariaDb => "'kerno_readonly'@'%'",
+        };
+        assert!(grants.iter().all(|grant| grant[0] == grantee), "{grants:?}");
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant[column("Object")] == "audit_log"
+                    && grant[column("Privileges")] == "INSERT, SELECT"),
+            "{engine:?}: {grants:?}"
+        );
+
+        // Sizes, for people, largest first.
+        app.on_admin(cx, |tab, window, cx| tab.select(SIZES, window, cx));
+        app.wait_admin(cx, Pane::Databases);
+        app.wait_admin(cx, Pane::Tables);
+        let (headers, databases) = app.admin_shown(cx, Pane::Databases);
+        let size = headers.iter().position(|header| header == "Size").unwrap();
+        let kerno = databases.iter().find(|row| row[0] == "kerno").unwrap();
+        assert!(
+            ["B", "kB", "MB", "GB"]
+                .iter()
+                .any(|unit| kerno[size].ends_with(&format!(" {unit}"))),
+            "{kerno:?}"
+        );
+        let (headers, tables) = app.admin_shown(cx, Pane::Tables);
+        let total = headers
+            .iter()
+            .position(|header| header == "Total size")
+            .unwrap();
+        assert_eq!(tables[0][1], "big_table", "{engine:?}");
+        assert!(tables[0][total].ends_with(" MB"), "{:?}", tables[0]);
+
+        // Settings, filtered.
+        app.on_admin(cx, |tab, window, cx| tab.select(SETTINGS, window, cx));
+        app.wait_admin(cx, Pane::Settings);
+        app.admin_filter(cx, "max_connections");
+        let (_, settings) = app.admin_shown(cx, Pane::Settings);
+        assert!(
+            settings.iter().all(|row| row
+                .iter()
+                .any(|cell| cell.to_lowercase().contains("max_connections"))),
+            "{settings:?}"
+        );
+        let row = settings
+            .iter()
+            .position(|row| row[0] == "max_connections")
+            .unwrap();
+        // Cmd+C copies the selected cell.
+        app.click(cx, ("admin-settings-cell", (row << 12) | 1));
+        app.press(cx, &["secondary-c"]);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some(settings[row][1].as_str()));
+        assert_eq!(settings[row][1], "100", "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn the_sessions_refresh_on_their_own_only_while_shown(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+    app.wait_admin(cx, Pane::Sessions);
+    let (_, rows) = app.admin_shown(cx, Pane::Sessions);
+    let own = rows
+        .iter()
+        .position(|row| row[0].ends_with(" · this tab"))
+        .unwrap();
+    app.click(cx, ("admin-sessions-cell", own << 12));
+    let tab = app.admin(cx);
+    let reads = |cx: &mut TestAppContext| cx.update(|cx| tab.read(cx).reads());
+    let before = reads(cx);
+    app.on_admin(cx, |tab, window, cx| {
+        tab.set_auto_refresh(Some(Duration::from_secs(5)), window, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(5));
+    app.wait_until(cx, "an automatic read", |_, cx| reads(cx) == before + 1);
+    app.wait_admin(cx, Pane::Sessions);
+    // The selection stays on the same session.
+    assert_eq!(app.admin_why_not(cx), Some("this tab's session"));
+
+    // Behind another tab, nothing is read.
+    app.press(cx, &["secondary-t"]);
+    for _ in 0..3 {
+        cx.executor().advance_clock(Duration::from_secs(5));
+        app.step(cx, |_, _| ());
+    }
+    assert_eq!(reads(cx), before + 1);
+
+    // Back in front, it goes on; turned off, it stops.
+    app.press(cx, &["ctrl-shift-tab"]);
+    cx.executor().advance_clock(Duration::from_secs(5));
+    app.wait_until(cx, "the next read", |_, cx| reads(cx) == before + 2);
+    app.wait_admin(cx, Pane::Sessions);
+    app.on_admin(cx, |tab, window, cx| tab.set_auto_refresh(None, window, cx));
+    cx.executor().advance_clock(Duration::from_secs(30));
+    app.step(cx, |_, _| ());
+    assert_eq!(reads(cx), before + 2);
+}
+
+#[gpui_kit::test]
+async fn the_admin_tab_opens_from_the_status_bar_and_comes_back_after_a_restart(
+    cx: &mut TestAppContext,
+) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.right_click(cx, "status-connection", None);
+    click_menu_entry(&app, cx, "Administration");
+    assert_eq!(
+        app.titles(cx),
+        ["Query 1", "test PostgreSQL · administration"]
+    );
+    app.wait_admin(cx, Pane::Sessions);
+    let stored = app
+        .wait_for_stored_tabs(cx, |tabs| {
+            tabs.iter()
+                .any(|tab| matches!(tab, TabSnapshot::Admin { .. }))
+        })
+        .await;
+    assert!(
+        matches!(&stored[1], TabSnapshot::Admin { target } if target.database.is_none()),
+        "{stored:?}"
+    );
+
+    // The next launch shows the tab; its lists are read once connected.
+    let restarted = open(cx, app.storage.clone());
+    assert_eq!(
+        restarted.titles(cx),
+        ["Query 1", "test PostgreSQL · administration"]
+    );
+    assert!(restarted.has(cx, ("admin-waiting", 0usize)));
+}
+
+/// Opens the app on a test server as `user`.
+fn connected_as_user(
+    cx: &mut TestAppContext,
+    engine: Engine,
+    user: &str,
+    password: &str,
+) -> Fixture {
+    let storage = memory_storage();
+    let config = ConnectionConfig {
+        user: user.into(),
+        ..testing::config(engine)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    let password = Secrets {
+        password: Some(Secret::new(password)),
+        ..Secrets::default()
+    };
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &password).unwrap();
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        assert!(
+            !matches!(app.status(cx, 0), Status::Failed { .. }),
+            "{:?}",
+            app.status(cx, 0)
+        );
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    app
+}
+
+#[gpui_kit::test]
+fn an_account_without_the_privileges_sees_what_the_server_refused(cx: &mut TestAppContext) {
+    // An account that sees every session (PROCESS) but may signal only its
+    // own, and cannot read the accounts (the mysql database).
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let account = "'kerno_ui_admin_watcher'@'%'";
+        // Declared first, dropped last: after the app's sessions.
+        let _scratch = Scratch::new(
+            engine,
+            &[&format!("DROP USER IF EXISTS {account}")],
+            &[
+                &format!("CREATE USER {account} IDENTIFIED BY 'kerno_ui_watch_pw'"),
+                &format!("GRANT PROCESS ON *.* TO {account}"),
+                &format!("GRANT SELECT ON kerno.* TO {account}"),
+            ],
+        );
+        let app = connected_as_user(cx, engine, "kerno_ui_admin_watcher", "kerno_ui_watch_pw");
+        app.dispatch(cx, actions::OpenAdmin);
+        app.wait_admin(cx, Pane::Sessions);
+
+        let sleeper = Sleeper::start(engine, "kerno_ui_admin_refused");
+        app.admin_filter(cx, "kerno_ui_admin_refused");
+        app.admin_rows_until(cx, Pane::Sessions, "the other session", |rows| {
+            rows.len() == 1 && rows[0][0] == sleeper.id
+        });
+        app.click(cx, ("admin-sessions-cell", 0usize));
+        app.click(cx, "admin-cancel");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the refusal", |app, cx| app.admin_message(cx).is_some());
+        let (failed, text) = app.admin_message(cx).unwrap();
+        assert!(failed, "{engine:?}: {text}");
+        assert!(text.contains("not owner of thread"), "{engine:?}: {text}");
+
+        // A list it may not read says what the server said.
+        app.on_admin(cx, |tab, window, cx| tab.select(ROLES, window, cx));
+        let tab = app.admin(cx);
+        app.wait_until(cx, "the refusal", |_, cx| {
+            cx.update(|cx| tab.read(cx).state(Pane::Roles))
+                .starts_with("failed")
+        });
+        let state = cx.update(|cx| tab.read(cx).state(Pane::Roles));
+        assert!(state.contains("denied"), "{engine:?}: {state}");
+        assert!(app.has(cx, ("admin-error", Pane::Roles as usize)));
+    }
+}
+
+#[gpui_kit::test]
+fn the_selected_session_stays_selected_through_a_refresh_and_a_sort(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.dispatch(cx, actions::OpenAdmin);
+    app.wait_admin(cx, Pane::Sessions);
+    let sleepers: Vec<Sleeper> = (0..3)
+        .map(|_| Sleeper::start(Engine::Postgres, "kerno_ui_admin_moves"))
+        .collect();
+    app.admin_filter(cx, "kerno_ui_admin_moves");
+    let rows = app.admin_rows_until(cx, Pane::Sessions, "the three sessions", |rows| {
+        rows.len() == 3
+    });
+    // The middle one; the one above it goes.
+    app.click(cx, ("admin-sessions-cell", 1usize << 12));
+    let tab = app.admin(cx);
+    let selected = |cx: &mut TestAppContext| cx.update(|cx| tab.read(cx).selected_id(cx));
+    let kept = rows[1][0].clone();
+    assert_eq!(selected(cx), Some(kept.clone()));
+    let grid = cx.update(|cx| tab.read(cx).grid(Pane::Sessions));
+    let offset = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            grid.read(cx)
+                .vertical_scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+        })
+    };
+    let before = offset(cx);
+    assert!(sleepers.iter().any(|sleeper| sleeper.id == rows[0][0]));
+    on_server(
+        Engine::Postgres,
+        &format!("SELECT pg_terminate_backend({})", rows[0][0]),
+    );
+    let rows = app.admin_rows_until(cx, Pane::Sessions, "two sessions", |rows| rows.len() == 2);
+    assert_eq!(rows[0][0], kept, "{rows:?}");
+    assert_eq!(selected(cx), Some(kept.clone()));
+    assert_eq!(offset(cx), before);
+
+    // A sort on the client moves the row; the selection goes with it.
+    for sort in [ColumnSort::Ascending, ColumnSort::Descending] {
+        app.step(cx, |window, cx| {
+            grid.update(cx, |table, cx| {
+                table.delegate_mut().perform_sort(0, sort, window, cx)
+            })
+        });
+        assert_eq!(selected(cx), Some(kept.clone()), "{sort:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_read_only_connection_sends_no_signal(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected_as(
+        cx,
+        ConnectionConfig {
+            read_only: true,
+            ..testing::config(Engine::Postgres)
+        },
+    );
+    app.dispatch(cx, actions::OpenAdmin);
+    app.wait_admin(cx, Pane::Sessions);
+    let (_, rows) = app.admin_shown(cx, Pane::Sessions);
+    // Another session: the one the schema tree reads on.
+    let other = rows
+        .iter()
+        .position(|row| !row[0].ends_with(" · this tab"))
+        .unwrap();
+    app.click(cx, ("admin-sessions-cell", other << 12));
+    assert_eq!(app.admin_why_not(cx), Some("read-only connection"));
+    app.right_click(cx, ("admin-sessions-cell", other << 12), None);
+    assert!(menu_entry(&app, cx, "Terminate session (read-only connection)").is_some());
+    assert!(menu_entry(&app, cx, "Cancel query (read-only connection)").is_some());
+    app.press(cx, &["escape"]);
 }

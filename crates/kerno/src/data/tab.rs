@@ -24,7 +24,7 @@ use gpui_kit::{
 use kerno_core::browse::{Condition, Filter, Operator, Page, count_sql, page_sql};
 use kerno_core::config::Environment;
 use kerno_core::exec::CollectedResult;
-use kerno_core::pending::Pending;
+use kerno_core::pending::{Pending, neighbour};
 use kerno_core::schema::{ColumnGeneration, RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{CellValue, RowChange, apply_edits, edit_statements};
 use kerno_core::{Error, ResultStore, Session, TxState, exec};
@@ -773,17 +773,98 @@ impl DataTab {
         Some((selected.rows.collect(), selected.columns))
     }
 
-    /// Changes the pending changes and redraws.
+    /// Changes the pending changes, as one step that undo takes back, and
+    /// redraws.
     fn change(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Pending, &ResultStore)) {
+        self.edit(cx, |pending, store| {
+            pending.step(|pending| change(pending, store))
+        });
+    }
+
+    /// Changes the pending changes and redraws. What is being typed is kept
+    /// first: a key that changes rows may come while a cell is open.
+    fn edit(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Pending, &ResultStore)) {
         if let Some(table) = &self.grid {
             table.update(cx, |table, cx| {
-                table.delegate_mut().edit(change);
+                let grid = table.delegate_mut();
+                grid.commit_edit(cx);
+                grid.edit(edit);
                 table.refresh(cx);
                 cx.notify();
             });
         }
         self.apply_error = None;
         cx.notify();
+    }
+
+    /// Takes the last change back (Cmd+Z). Returns whether there was one.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut undone = false;
+        self.edit(cx, |pending, _| undone = pending.undo());
+        undone
+    }
+
+    /// Drops the pending values of the selected cells (Esc). Returns
+    /// whether there was one, so that Esc otherwise clears the selection.
+    pub fn revert_cells(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((rows, columns)) = self.selection(cx) else {
+            return false;
+        };
+        let mut reverted = false;
+        self.change(cx, |pending, store| {
+            for &row in &rows {
+                for &column in &columns {
+                    reverted |= pending.revert_cell(store.row_count(), row, column);
+                }
+            }
+        });
+        reverted
+    }
+
+    /// Gives the selected cells the values of the row above (`above`) or
+    /// below, as DBeaver's Ctrl+D and Ctrl+Alt+D do: a block of rows takes
+    /// its first (last) row's. Columns the server fills are left alone, and
+    /// so is the key of a row that exists.
+    pub fn copy_from_row(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit(window, cx) {
+            return;
+        }
+        let Some(table) = self.grid.clone() else {
+            return;
+        };
+        let generated = self.generated_columns(cx);
+        let keys: Vec<String> = self
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.row_identity())
+            .unwrap_or_default();
+        let copy = {
+            let table = table.read(cx);
+            let grid = table.delegate();
+            let fetched = grid.row_count();
+            let columns = grid.store().columns();
+            table
+                .delegate()
+                .selected(table.selection())
+                .and_then(|selected| {
+                    let from = neighbour(&selected.rows, above, grid.total_rows())?;
+                    let cells: Vec<(usize, usize)> = selected
+                        .rows
+                        .clone()
+                        .filter(|&row| row != from)
+                        .flat_map(|row| selected.columns.iter().map(move |&column| (row, column)))
+                        .filter(|&(row, column)| {
+                            grid.takes_value(row, column)
+                                && !generated.contains(&column)
+                                && (row >= fetched || !keys.contains(&columns[column].name))
+                        })
+                        .collect();
+                    Some((from, cells))
+                })
+        };
+        if let Some((from, cells)) = copy {
+            self.change(cx, |pending, store| pending.copy_cells(store, from, cells));
+        }
     }
 
     /// Whether the rows take changes; says why not when they do not.
@@ -833,24 +914,7 @@ impl DataTab {
             return;
         };
         // Keys the server generates are left to it: a copy would collide.
-        let generated: Vec<usize> = match (&self.grid, &self.structure) {
-            (Some(table), Some(structure)) => table
-                .read(cx)
-                .delegate()
-                .store()
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| {
-                    structure
-                        .columns
-                        .iter()
-                        .any(|info| info.name == column.name && info.generation.is_some())
-                })
-                .map(|(index, _)| index)
-                .collect(),
-            _ => Vec::new(),
-        };
+        let generated = self.generated_columns(cx);
         let mut last = None;
         self.change(cx, |pending, store| {
             for row in rows {
@@ -858,6 +922,29 @@ impl DataTab {
             }
         });
         self.show_row(last, cx);
+    }
+
+    /// The columns of the result whose values the server makes: computed
+    /// columns, identities, auto-increments.
+    fn generated_columns(&self, cx: &App) -> Vec<usize> {
+        let (Some(table), Some(structure)) = (&self.grid, &self.structure) else {
+            return Vec::new();
+        };
+        table
+            .read(cx)
+            .delegate()
+            .store()
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                structure
+                    .columns
+                    .iter()
+                    .any(|info| info.name == column.name && info.generation.is_some())
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Marks the selected rows (or `row`) for deletion.
@@ -1059,6 +1146,7 @@ impl DataTab {
             // Cells of NOT NULL columns are left alone, as with Delete.
             GridAction::SetNull => self.clear_selected(window, cx),
             GridAction::SetDefault => self.set_selected(CellValue::Default, window, cx),
+            GridAction::CopyFromRow(above) => self.copy_from_row(above, window, cx),
             GridAction::DuplicateRow => self.duplicate_rows(Some(row), window, cx),
             GridAction::DeleteRow => self.delete_rows(Some(row), window, cx),
             GridAction::RevertRow => self.revert_row(row, cx),
@@ -1259,12 +1347,11 @@ impl DataTab {
         }
     }
 
-    /// Copies the selection. Returns whether there was something to copy.
-    fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Copies the selection in `format`. Returns whether there was
+    /// something to copy.
+    pub fn copy_selection(&mut self, format: CopyFormat, cx: &mut Context<Self>) -> bool {
         self.grid.as_ref().is_some_and(|table| {
-            table.update(cx, |table, cx| {
-                Grid::copy(table, Some(CopyFormat::Tsv), None, cx)
-            })
+            table.update(cx, |table, cx| Grid::copy(table, Some(format), None, cx))
         })
     }
 
@@ -1857,7 +1944,7 @@ impl Render for DataTab {
                 let secondary = keystroke.modifiers.secondary(cx) && !keystroke.modifiers.shift;
                 match keystroke.key.as_str() {
                     "c" if secondary => {
-                        if this.copy_selection(cx) {
+                        if this.copy_selection(CopyFormat::Tsv, cx) {
                             cx.stop_propagation();
                         }
                     }
