@@ -56,7 +56,21 @@ Tests that need a container return early with a message when it is down. Set `KE
 other database: Kerno's tests connect only to the `kerno-*` containers.
 
 Write the test first for core logic (SQL generation, parsing, type conversion, statement splitting). UI flows
-use GPUI's test contexts (`crates/kerno/src/ui_tests.rs`).
+use GPUI's test contexts: `crates/kerno/src/ui_tests.rs` holds the shared helpers and `ui_tests/*.rs` the tests,
+one file per area (sidebar tree, menus, environments, toolbar, tool wizards, tasks, updates, and so on).
+
+The suite has to pass every time, on a busy machine too. The rules are in
+[docs/plans/README.md](docs/plans/README.md), "Reliability of the suite". The short version:
+
+- Create the objects a test asserts on under names of its own (`kerno_ui_<test>`, `kerno_test_<test>`) through
+  `Scratch` or `common::scratch_schema`, and assert only on those, never on a server-wide list or count another
+  test can change.
+- Wait for a state, not for time: `app.wait_until(cx, "what", |app, cx| condition)` with a condition that names the
+  end state. No `sleep`, no retry around a whole test.
+- A test that cancels waits until the statement is running on the server first.
+- Three tests run at once against the same servers; no test changes a server-wide setting, and a test that
+  terminates sessions or holds locks does it only on its own.
+- Tests never build the real update runner and never reach the network.
 
 ## Lint
 
@@ -74,8 +88,8 @@ cargo deny check
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). In short:
 
-- `crates/kerno-core`: driver traits, value and result model, config, SSH, secrets, storage, SQL helpers. No
-  GPUI.
+- `crates/kerno-core`: driver traits, value and result model, config, SSH, secrets, storage, SQL helpers,
+  environments, client tools, update rules. No GPUI.
 - `crates/kerno-postgres`, `crates/kerno-mysql`: the drivers, each with `tests/` against its containers.
 - `crates/kerno`: the app. Database, file, SSH and secret-store work goes through `bridge.rs`; the UI thread
   never waits on I/O.
@@ -109,8 +123,19 @@ Kerno is MIT OR Apache-2.0 and must stay clean (CLAUDE.md §1).
   logs or in crash output.
 - Destructive actions show the SQL they will run and ask for confirmation; read-only connections refuse
   writes; production connections ask twice.
-- Nothing leaves the machine: no telemetry, no analytics, no update pings, no crash upload. A change that
-  adds a network call other than to a database the user configured will not be accepted.
+- Nothing leaves the machine: no telemetry, no analytics, no crash upload. The only request Kerno makes that is
+  not to a database the user configured is the update check (one `curl` to the repository's `releases/latest`,
+  D-048, with an off switch); a change that adds any other network call will not be accepted.
+- A client tool folder runs only if Kerno detected it or the user added it; it never travels with an export
+  (D-046). Extra arguments to a tool cannot set the server, user, TLS, option files or a password.
+- `unsafe` is denied workspace-wide; the only exception is the Dock icon call in `app_icon.rs` (D-042).
+
+## Releases
+
+There is no hosted CI and no GitHub Actions workflow: `scripts/check.sh` is the check. A release is built locally
+with `scripts/release.sh [version]` (clean tree, version equal to `Cargo.toml`, macOS `.dmg` and Linux tarball,
+`dist/SHA256SUMS`); it prints the `gh release create` command, and publishing is the owner's. Never add a remote,
+push, tag or publish from a change.
 
 ## Commits
 

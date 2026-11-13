@@ -7,13 +7,14 @@
 
 Kerno is a native, open-source database client for macOS and Linux, written in Rust with GPUI. All database,
 file, SSH and secret-store work runs off the UI thread, results stream in pages and are drawn virtually, and
-every running query can be cancelled. Nothing leaves the machine: no telemetry, no analytics, no crash
-upload. One request is made on its own: at launch and every 6 hours, Kerno asks
-`https://github.com/EvanPluchart/kerno/releases/latest` which version is the newest (through the system's
-`curl`, the redirect not followed, a `Kerno/<version>` user agent, no cookie, no identifier, nothing else
-sent). Turn it off in Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for
-Updates… asks only when you click it. An update is installed only after its SHA-256 matches the release's
-`SHA256SUMS`.
+every running query can be cancelled. There is no telemetry, no analytics and no crash upload. The one request
+Kerno makes on its own is the update check: at launch and every 6 hours it sends a `HEAD` request to
+`https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with the redirect not
+followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and reads the version in the
+redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Turn it off in
+Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
+click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
+[architecture notes](docs/ARCHITECTURE.md#the-update-check) give the details.
 
 Version 1 connects to PostgreSQL, MySQL and MariaDB. Its feature set and interactions follow DBeaver
 Community; its look follows the calm, dense style of modern editors. Licensed under MIT OR Apache-2.0.
@@ -32,10 +33,17 @@ Community; its look follows the calm, dense style of modern editors. Licensed un
 
 The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs/FEATURES.md). In short:
 
-- Connections with SSL/TLS modes, SSH tunnels and a read-only flag; passwords live in the OS secret store.
-  Each connection is in an environment (local, staging, production or one of your own) whose colour tints
-  the window around it and whose rules apply: commit mode, confirmations, read-only default, idle
-  transactions rolled back.
+- Connections with SSL/TLS modes, SSH tunnels and a read-only flag; passwords live in the OS secret store and
+  are read from it once per run. A connection that fails says what happened in plain words first (host not
+  found, connection refused, timed out, wrong password, TLS failure) with the next step, and shows the server's
+  own message below.
+- One tree in the sidebar, as DBeaver's Database Navigator: folders and connections are the roots, and opening a
+  connection connects it and shows its databases (the default one first), schemas and objects under it. Folders
+  have a colour and an icon (a built-in glyph or a PNG, JPEG or SVG you pick); connections move between folders
+  by drag and drop. Every surface answers a right-click.
+- Environments as DBeaver's connection types: local, staging and production, which can be edited, and your own.
+  Each has a colour that tints the window's chrome while its connection is active, and rules: auto-commit by
+  default, confirm every execution, read-only by default, idle transactions rolled back.
 - A main toolbar under the title bar, as DBeaver's: new connection (by engine), connect, reconnect,
   disconnect, new SQL editor (with the recent scripts), commit, rollback, the transaction mode with the
   isolation level, the transaction log, read-only, the active connection and `schema@connection`, the
@@ -45,8 +53,13 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
   plan tree, per-tab transactions, query history and saved queries.
 - A table data view with inline editing, SQL review and one-transaction apply; structure views and a form
   editor for tables.
-- CSV and other exports, CSV import, backup and restore through the installed client tools, and an
-  administration view (sessions, roles, sizes, settings).
+- CSV and other exports, CSV import, and a Tools submenu on databases, schemas and tables: backup, global
+  backup, restore and execute script as step wizards on the installed client tools (`pg_dump`, `pg_dumpall`,
+  `pg_restore`, `psql`, `mysqldump`, `mysql`), analyze, vacuum, optimize, check and repair, foreign data
+  wrappers, the session and lock managers. A wizard's settings can be saved as a named task and run again from the
+  Tasks view (there is no scheduler). Settings ▸ Local clients lists every client install it finds, with its
+  version, and lets you add a folder and choose the default per engine; a connection can use its own.
+- An administration view (sessions, roles, sizes, settings).
 
 Measurements: [docs/BENCH.md](docs/BENCH.md).
 
@@ -58,7 +71,8 @@ There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.
 On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
 (`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). Kerno reads each saved password from
 the keychain once per run. An ad-hoc signature changes with every build, so the keychain asks for your login
-password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it.
+password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it, and an update installed by Kerno
+keeps the signature of its release: an ad-hoc one makes the keychain ask again once.
 
 On Linux, unpack the tarball into a prefix:
 
@@ -140,32 +154,49 @@ reachable from the command palette.
 | Cmd+Enter | Run statement |
 | Cmd+Shift+Enter | Run all statements |
 | Cmd+\ | Run statement in a new result tab |
-| Cmd+Alt+Enter or Alt+P | Run the script from the cursor |
-| Cmd+Alt+] / Cmd+Alt+[ (or Alt+Down / Alt+Up) | Go to the next / previous statement |
+| Cmd+Alt+Enter or Alt+P | Run the script from the cursor (editor) |
+| Cmd+Alt+] / Cmd+Alt+[ (or Alt+Down / Alt+Up) | Go to the next / previous statement (editor) |
 | Cmd+. | Cancel the running statement |
 | Ctrl+Alt+N / Ctrl++ | Fetch more rows / fetch all rows |
+| Ctrl+Shift+P | Pin or unpin the result tab |
+| Ctrl+Shift+\ (written Ctrl+\|) | Close the result tab |
+| Cmd+Alt+R or Alt+Shift+T | Show or hide the results panel |
+| Ctrl+Shift+T | Maximize the results panel |
+| Cmd+Alt+T or Alt+T | Move the focus between results and editor |
 | Ctrl+4 / Ctrl+8 | Commit / roll back the transaction |
 | Ctrl+Alt+A | Switch between auto-commit and manual commit |
 | Cmd+E / Cmd+Shift+E | Explain / explain analyze |
 | Cmd+Y | Query history |
 | Cmd+/ | Toggle line comment |
-| Cmd+Shift+I | Format SQL |
 | Cmd+Shift+/ | Toggle block comment |
+| Cmd+Shift+I | Format SQL |
 | Cmd+Shift+X / Cmd+Shift+Y | Upper case / lower case |
+| Ctrl+Alt+Shift+W | Toggle soft wrap |
 | Ctrl+Space or Cmd+I | Show completions |
-| F4 | Edit the selected object, connection, or open the table at the cursor |
+| F4 / Shift+F4 | Open the rows / the structure of the table at the cursor (editor) |
+| F4 | Edit the selected object, connection or folder (sidebar) |
 | F2 / F5 | Rename / refresh the selected object |
+| Backspace or Delete | Drop the selected object / delete the selected connection (sidebar) |
+| Enter | Open the selected connection (sidebar) |
 | Cmd+C / Cmd+Shift+C | Copy object name / qualified name (navigator) |
 | Cmd+] or Cmd+Alt+Enter | New query on the selected object (navigator) |
+| Cmd+Shift+A | Set the selected schema as the default of this tab (navigator) |
 | Cmd+Shift+, | Link the schema tree with the editor |
 | Cmd+R | Refresh rows (data view) |
-| Alt+Insert | Add row (data view) |
-| Cmd+Z | Undo last pending change (data view) |
-| Shift+Enter | View the value of the selected cell |
-| Tab | Toggle record view (data and result grids) |
+| Alt+Insert or Cmd+Shift+N | Add row (grid) |
+| Ctrl+Alt+Insert or Cmd+D | Duplicate the selected rows (grid) |
+| Alt+Delete or Cmd+Backspace | Delete the selected rows (grid) |
+| Ctrl+Backspace | Set the selected cells to their default (grid) |
+| Ctrl+D / Ctrl+Alt+D | Copy the values of the row above / below (grid) |
+| Escape | Revert the selected cells (grid) |
+| Cmd+Z | Undo the last pending change (grid) |
+| Cmd+Shift+C | Copy the selection with column names (grid) |
+| Shift+Enter | View or edit the value of the selected cell |
+| Tab | Toggle record view (grids) |
+| Ctrl+Alt+Left / Right | Previous / next row (Add Shift for the first / last row) |
 | Ctrl+G / Ctrl+Shift+G | Go to row / go to column |
 | Ctrl+F11 | Filter by distinct values of the column |
-| Cmd+= / Cmd+- / Cmd+0 | Grid text larger / smaller / usual |
+| Cmd+= / Cmd+- / Cmd+0 (or Alt+0 / Alt+9) | Grid text larger / smaller / usual |
 | Cmd+Q | Quit |
 
 These are the defaults in `crates/kerno/src/actions.rs`; the full list is the command palette, and the

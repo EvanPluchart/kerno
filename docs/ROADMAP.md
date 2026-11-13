@@ -122,11 +122,11 @@ The owner can pull any row back by naming its ID.
 
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
-| CON-09 | Edit connection types | PG, My | Kerno has three fixed environments plus free colour tags (CLAUDE.md §4.A1); custom types add little |
-| CON-14 | Default isolation level | PG, My | Rarely changed; a `SET TRANSACTION` in bootstrap queries (G13) covers it |
+| CON-09 | Edit connection types | PG, My | Kerno has three fixed environments plus free colour tags (CLAUDE.md §4.A1); custom types add little Update: done since (D-044), environments are the user's: Settings ▸ Environments. |
+| CON-14 | Default isolation level | PG, My | Rarely changed; a `SET TRANSACTION` in bootstrap queries (G13) covers it Update: the toolbar's transaction mode sets the isolation level of a session (D-050); a default applied at connect is still not offered. |
 | CON-18 | Keep-alive (database) | PG, My | Off by default in DBeaver; Kerno re-establishes a dropped connection (`a_lost_connection_is_re_established`) |
 | CON-19 | Close idle connection after N seconds | PG, My | Resource saving, not a daily need; needs an idle timer per connection |
-| CON-20 | Auto-close idle transactions | PG, My | Safety net for manual mode; Kerno already asks before closing a tab with an open transaction (M5 Part 4) |
+| CON-20 | Auto-close idle transactions | PG, My | Safety net for manual mode; Kerno already asks before closing a tab with an open transaction (M5 Part 4) Update: done since (D-044), an environment's "close idle transactions" rule. |
 | CON-26 | SSH: jump servers | PG, My | Beyond CLAUDE.md §4.A4 (one tunnel); bastion chains are uncommon |
 | CON-27 | SSH: local / remote host and port overrides, connect timeout | PG, My | Automatic local port is enough for a client; rare settings |
 | CON-28 | SSH: share tunnel between connections | PG, My | Optimisation only |
@@ -203,8 +203,8 @@ The owner can pull any row back by naming its ID.
 
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
-| TOOL-03 | Global backup (pg_dumpall) | PG | Server-wide dumps are a DBA task outside a client's daily use |
-| TOOL-04 | Execute script with the local client | PG, My | Restore covers SQL files (M8 Part 3) |
+| TOOL-03 | Global backup (pg_dumpall) | PG | Server-wide dumps are a DBA task outside a client's daily use Update: done since (D-046), the global backup wizard. |
+| TOOL-04 | Execute script with the local client | PG, My | Restore covers SQL files (M8 Part 3) Update: done since (D-046), the execute-script wizard. |
 | TOOL-15 | Session details: query text and plan | PG, My | M8 Part 4 shows the query column; the plan of another session is rarely needed |
 | TOOL-17 | MySQL status, engines, charsets, collations, plugins | My | Available through SHOW statements in the editor |
 | TOOL-27 | SQL terminal presentation | PG, My | Alternative presentation of results; outside CLAUDE.md §4 |
