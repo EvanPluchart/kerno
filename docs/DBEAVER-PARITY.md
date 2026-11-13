@@ -618,7 +618,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 ## Summary
 
-Counts per status and per area (recounted from the rows above on 2026-11-13, HEAD `f982e77` plus the maintenance tools of the working tree: G1, G2, G4, G10, G12, G13, CTX Parts 2 and 3 and M8 moved to done; the count from HEAD `712b7cf` was 169 done, 9 done untested, 45 planned, 99 gap, 96 roadmap; the first, from HEAD `cee8bd2`, 136, 14, 66, 106, 96). "Gap" rows are ordered in `docs/plans/PARITY-GAPS.md` (G1 to G17), "done, untested" rows in its Part G18. The 67 rows once proposed for the roadmap were accepted on 2026-11-13 and are counted under roadmap.
+Counts per status and per area, recounted from the rows above at HEAD `409c4fc` on 2026-11-13: 322 done, 96 roadmap, no row left as done untested, planned or gap (the counts at earlier commits were 169 done at `712b7cf`, 136 at `cee8bd2`). The 96 roadmap rows (the 67 accepted on 2026-11-13 included) are each in `docs/ROADMAP.md` with their reason, and `docs/plans/PARITY-GAPS.md` holds the work orders that closed the gaps.
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
@@ -631,4 +631,4 @@ Counts per status and per area (recounted from the rows above on 2026-11-13, HEA
 | Context menus | 122 | 0 | 0 | 0 | 11 | 133 |
 | **All** | **322** | **0** | **0** | **0** | **96** | **418** |
 
-Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.
+CM-09 (Paste of a copied connection), CM-15 (Refresh on a folder), NAV-48 and CM-33, once gaps, are done: each row names its test.

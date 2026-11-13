@@ -344,3 +344,43 @@ Committed since `fc0ade2` (HEAD `f982e77`, 22 commits). One line per commit or g
 No full test run was made while writing this entry; test names in the docs were checked to exist by
 searching the code, not by running them.
 
+## 2026-11-13 (later) — Settings, keymap, grid, results, parity closed
+
+Committed since `f982e77` (HEAD `409c4fc`). One line per commit or group:
+
+- `6596d9d`: parity, features, decisions and progress brought up to `fc0ade2`-`f982e77` (D-033 to D-036).
+- `2388fd5`: maintenance tools dialog (G12 app half); one question before a session ends (disconnect,
+  reconnect, disconnect others / all, read-only toggle, moving a tab); tabs and the status bar carry the
+  connection's colour; the keyboard returns after dialogs and the palette.
+- `89cdd60`: settings view (appearance, fonts, editor, grid, confirmations, tool paths), the keymap file,
+  Open Table (Cmd+P), a palette command and a menu entry for every action, new keys (commit, roll back,
+  fetch more / all, completion on demand, grid text size); the secrets test over the data directory and the
+  log (D-037); bench mode `KERNO_BENCH` and `scripts/bench.sh` (M9 Part 1); README, CONTRIBUTING,
+  ARCHITECTURE and ROADMAP rewritten from the code.
+- `2b0f3bf`: Generate SQL from rows, CALL / Execute on routines, block comment, case change, copy statement,
+  Link with editor, editor submenus (G7, G15, G10 leftovers); engine logos drawn at their size and result
+  batches without slack: 1M rows x 20 columns hold 340 MB (M9 Part 2).
+- `1844bb2`: record view, selection figures, value panel editing, Go to Row / Column, row-number menu,
+  Aggregate and Columns panels (G3, G6, G9); transaction log, lock manager, hide idle sessions, properties,
+  Create database options, object filters, back up one table (G11, G14, G16, G17, CM-58).
+- `e13ec36`: filter, order and count a query result on the server, estimated and exact counts, distinct
+  values, filter history, auto-refresh (G5, M6 Part 2); properties on F4, console on the selected node, Lock
+  Manager from the connection menu; tests for what had none (G18).
+- `409c4fc`: result columns carry their origin; a result of one table is edited like table data through
+  the shared module `query/edit.rs` (G8); `sqlparser` removed (D-010). `DBEAVER-PARITY.md` has no gap left:
+  322 rows done, 96 on the roadmap (418).
+- Docs of this pass: `FEATURES.md` walks CLAUDE.md §4 item by item with tests and screenshots, and lists
+  what has no test or no screenshot; `ROADMAP.md` checked against the 96 roadmap rows (all present, each
+  with its reason); `ARCHITECTURE.md` describes origins, editable results, the command table, settings and
+  bench mode; the README shortcut table follows `actions.rs`.
+
+Still open:
+
+- The reliability of the test suite (in progress): timing-dependent tests and tests that depend on what
+  others leave on the servers; the full run with the containers up must pass repeatedly.
+- A third list of visual defects (`plans/M10.md` Part 4).
+- The clean performance measurement on an idle machine and `docs/BENCH.md` (GOAL criterion 5).
+- The final screenshots in `docs/screenshots/final/` (criterion 7).
+- The final verification of every criterion of `docs/GOAL.md`.
+- Tests and captures `FEATURES.md` marks missing: M7 Part 1c item 4, the import dialog's cancel and
+  production confirmation, selecting a column by its header, running a selection, resizing a column.

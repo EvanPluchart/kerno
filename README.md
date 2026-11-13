@@ -91,7 +91,8 @@ Details in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Keyboard shortcuts
 
-`Cmd` on macOS is `Ctrl` on Linux. Every action is also reachable from the command palette.
+`Cmd` on macOS is `Ctrl` on Linux; `Ctrl` written alone is the Control key on both systems. Every action is also
+reachable from the command palette.
 
 | Shortcut | Action |
 | -------- | ------ |
@@ -109,19 +110,31 @@ Details in [CONTRIBUTING.md](CONTRIBUTING.md).
 | Cmd+Enter | Run statement |
 | Cmd+Shift+Enter | Run all statements |
 | Cmd+\ | Run statement in a new result tab |
+| Cmd+Alt+Enter or Alt+P | Run the script from the cursor |
+| Cmd+Alt+] / Cmd+Alt+[ (or Alt+Down / Alt+Up) | Go to the next / previous statement |
 | Cmd+. | Cancel the running statement |
+| Ctrl+Alt+N / Ctrl++ | Fetch more rows / fetch all rows |
+| Ctrl+4 / Ctrl+8 | Commit / roll back the transaction |
+| Ctrl+Alt+A | Switch between auto-commit and manual commit |
 | Cmd+E / Cmd+Shift+E | Explain / explain analyze |
 | Cmd+Y | Query history |
 | Cmd+/ | Toggle line comment |
 | Cmd+Shift+I | Format SQL |
+| Cmd+Shift+/ | Toggle block comment |
+| Cmd+Shift+X / Cmd+Shift+Y | Upper case / lower case |
 | Ctrl+Space or Cmd+I | Show completions |
 | F4 | Edit the selected object, connection, or open the table at the cursor |
 | F2 / F5 | Rename / refresh the selected object |
 | Cmd+C / Cmd+Shift+C | Copy object name / qualified name (navigator) |
+| Cmd+] or Cmd+Alt+Enter | New query on the selected object (navigator) |
+| Cmd+Shift+, | Link the schema tree with the editor |
 | Cmd+R | Refresh rows (data view) |
 | Alt+Insert | Add row (data view) |
 | Cmd+Z | Undo last pending change (data view) |
 | Shift+Enter | View the value of the selected cell |
+| Tab | Toggle record view (data and result grids) |
+| Ctrl+G / Ctrl+Shift+G | Go to row / go to column |
+| Ctrl+F11 | Filter by distinct values of the column |
 | Cmd+= / Cmd+- / Cmd+0 | Grid text larger / smaller / usual |
 | Cmd+Q | Quit |
 

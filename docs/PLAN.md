@@ -10,13 +10,13 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |
 | 4  | Schema navigator (§4 B)                                                    | done   |
-| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | doing (left: Ctrl+Space and catalog leftovers of Part 2, captures; Parts 1, 2, 3, 4 (tab-close confirmations, `5864bc9`) and the docs are done) |
-| 6  | Table data view and editing (§4 E)                                         | doing (left: `plans/M6.md` Part 1 lists for boolean and enum cells, Part 2 counting large tables; the table view, editing, paste, Delete, Cmd+Z and the docs are done) |
-| 7  | Structure (§4 F)                                                           | doing (left: two tests of `plans/M7.md` Part 1c item 4, captures `m7-*`; Parts 1 to 4 are done) |
-| 8  | Import, export, backup, administration (§4 G, H)                           | doing (left: UI tests left over from Parts 1 and 2, the selected-tables option of backup, captures; export, import, backup and restore with their dialog (`514c0ba`) and the administration tab (`d4be8c4`) are done) |
-| 9  | Performance pass, `docs/BENCH.md`                                          | todo   |
-| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | doing (packaging and the Linux container build done, `plans/M10.md` Part 6; the brand colours, lockup and mark done, Part 5, `9b3e1ae`; the rest todo) |
-| —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | doing: done are CTX Parts 0 to 3 and PARITY-GAPS G1, G2, G4, G10, G13 (but CON-12, CON-33, CON-34, CON-47, CM-12) and the G12 core half; the G12 app half is in the working tree; left are G3, G5 to G9, G11, G14 to G18, and 61 gap rows in `DBEAVER-PARITY.md` |
+| 5  | SQL editor, results grid, history, saved queries (§4 C, D)                 | done (Part 4 tab-close confirmations `5864bc9`, Ctrl+Space and catalog refresh `89cdd60`, `2b0f3bf`; the final captures come with milestone 10) |
+| 6  | Table data view and editing (§4 E)                                         | done (lists for boolean and enum cells, paste, Delete, Cmd+Z, estimated and exact counts `e13ec36`, editing a query result `409c4fc`) |
+| 7  | Structure (§4 F)                                                           | doing (left: the tests of `plans/M7.md` Part 1c item 4: renaming a table from the form with the structure tab following, and the per-engine wording of the confirmation; column order cannot be edited) |
+| 8  | Import, export, backup, administration (§4 G, H)                           | doing (left: UI tests for the import dialog's cancel, its production confirmation and the MySQL "created first" sentence; the backup dialog has no tables list, one table is backed up from its tree node; export, import, backup and restore, the administration tab, maintenance tools, locks and idle sessions are done) |
+| 9  | Performance pass, `docs/BENCH.md`                                          | doing (bench mode and its script `89cdd60`, engine logos drawn at their size, no slack in result batches `2b0f3bf`; left: the clean measurement on an idle machine and `docs/BENCH.md`) |
+| 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | doing (done: packaging and the Linux container build, the brand colours, lockup and mark, the settings view, the keymap file, shortcuts in the README; left: a third list of visual defects in `plans/M10.md` Part 4, the final screenshots in `docs/screenshots/final/`) |
+| —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | done: CTX Parts 0 to 3 and PARITY-GAPS G1 to G17 are delivered; `DBEAVER-PARITY.md` has 322 rows done and 96 on the roadmap, none left as a gap; the debt of tests (G18) is closed except the rows `FEATURES.md` still marks "no test" |
 
 ## Implementation plans (owner request of 2026-11-12, CLAUDE.md §7 "Model budget")
 
@@ -50,6 +50,13 @@ For every feature of §4, in this order:
 5. Add the row to `docs/FEATURES.md` (status, covering test, screenshot).
 
 ## Open points
+
+- The reliability of the test suite is being worked on (in progress): some tests depend on timing or on what
+  other tests leave on the servers; the full run with the containers up has to pass repeatedly before the goal
+  is verified (GOAL criterion 1).
+- Still open for the goal: the third list of visual defects (`plans/M10.md` Part 4), a clean performance
+  measurement on an idle machine with `docs/BENCH.md` (criterion 5), the final screenshots in
+  `docs/screenshots/final/` (criterion 7), and the final verification of every criterion of `docs/GOAL.md`.
 
 - `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not
   on `$PATH`); the backup tools find them in their fallback directories. Nothing to ask the owner.

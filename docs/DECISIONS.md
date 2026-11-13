@@ -135,13 +135,13 @@ in Kerno's file only. Changed key: always refused, with the file and line of the
   0 rows; the driver cannot tell the two apart. The app never sends empty statements (the splitter drops
   them).
 
-## D-010 — Statement splitting with Kerno's own lexer; `sqlparser` for analysis
+## D-010 — Statement splitting and analysis with Kerno's own lexer; no `sqlparser`
 
 The spec names `sqlparser` for statement splitting and statement-at-cursor. Its tokenizer rejects text that
 is still being typed (an unterminated string or comment fails the whole script), knows nothing of the
 `mysql` client's `DELIMITER` command, and reports line/column rather than byte offsets. Splitting therefore
-uses a small tolerant lexer in `kerno-core` (`sql::lex`, `sql::split`) that never fails. `sqlparser` stays in
-the stack for what needs a real parse of a complete statement (classification, completion context).
+uses a small tolerant lexer in `kerno-core` (`sql::lex`, `sql::split`) that never fails. `sqlparser` was first kept for what needed a real parse of a complete statement
+(classification, completion context).
 
 Update, 2026-11-13: nothing ended up needing that parse. Classification, completion context, formatting,
 the derived-table wrapping of a result's filter and the single-table rule for editable results are all

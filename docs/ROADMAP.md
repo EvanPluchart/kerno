@@ -169,7 +169,7 @@ The owner can pull any row back by naming its ID.
 | SQL-44 | Foldings | PG, My | Depends on the kit's editor |
 | SQL-49 | Advanced copy in the editor | PG, My | Plain copy is enough for code |
 | SQL-51 | Set connection from navigator, auto-sync | PG, My | Off by default; "New query here" binds a tab to a node |
-| SQL-53 | Disable SQL syntax parser | PG, My | Kerno parses only the statement at the cursor (M9 checks large scripts), so there is nothing to turn off |
+| SQL-53 | Disable SQL syntax parser | PG, My | Kerno splits and reads only what a run needs on its own tolerant lexer (`a_long_script_splits_in_linear_time`), so there is nothing to turn off |
 
 #### Results and data editing
 
@@ -184,7 +184,7 @@ The owner can pull any row back by naming its ID.
 | RES-33 | Row colours by value, colorize data types | PG, My | Visual nicety |
 | RES-39 | Hide columns with no data | PG, My | Rare |
 | RES-42 | Advanced Copy (Ctrl+Shift+C) | PG, My | Copy with column names and Copy as CSV / TSV cover the usual options; the shortcut is in G2 |
-| RES-48 | Advanced Paste (Ctrl+Shift+V) | PG, My | Paste into cells comes with M6 Part 1; inserting new rows from a spreadsheet is less common |
+| RES-48 | Advanced Paste (Ctrl+Shift+V) | PG, My | Paste into cells is done (`pasting_fills_cells_from_the_clipboard_and_delete_empties_them`); inserting new rows from a spreadsheet is less common |
 | RES-54 | Add / duplicate row before | PG, My | Row position in an unsorted table is not meaningful to the server |
 | RES-71 | Virtual keys and logical structure | PG, My | Keyless tables stay read-only with the reason (CLAUDE.md §4.E2) |
 | RES-72 | Generate UUID | PG, My | `gen_random_uuid()` / `uuid()` as a default covers it |

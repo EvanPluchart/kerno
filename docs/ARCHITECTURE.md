@@ -5,7 +5,7 @@ drivers and the core; the drivers depend on the core; the core depends on neithe
 
 | Crate | Role |
 | ----- | ---- |
-| `crates/kerno-core` | Engine-neutral core, no UI dependency: the `Driver`, `Session` and `Dialect` traits, the value and result model, connection settings, SSH tunnel, secrets, app storage, SQL helpers (splitting, parameters, classification, completion, formatting), export and import, pending-edit SQL, table drafts and their DDL. |
+| `crates/kerno-core` | Engine-neutral core, no UI dependency: the `Driver`, `Session` and `Dialect` traits, the value and result model, connection settings, SSH tunnel, secrets, app storage, SQL helpers (splitting, parameters, classification, completion, formatting; all on Kerno's own tolerant lexer, no SQL parser crate, D-010), table browsing and its filter (`browse.rs`), export and import, pending-edit SQL, table drafts and their DDL, the rule that decides whether a query result can be edited (`editable.rs`) and the figures of a selection of cells (`aggregate.rs`). |
 | `crates/kerno-postgres` | `PostgresDriver` on `tokio-postgres` with rustls. |
 | `crates/kerno-mysql` | `MysqlDriver` on `mysql_async`; one driver for MySQL and MariaDB. |
 | `crates/kerno` | The app binary (GPUI through the `gpui-kit` facade, D-001 in [DECISIONS.md](DECISIONS.md)): windows, views, actions, keymap, theme. |
@@ -68,7 +68,22 @@ the empty string. Rows are packed into `RowBatch` arenas, one byte buffer plus o
 allocation per cell; `ResultStore` strings batches together and addresses rows globally. Each `Column` has a
 name, the server's type name and a `TypeKind` (integer, float, decimal, boolean, text, binary, date, time,
 date-time with and without zone, interval, uuid, json, array, enum, bit, other), which decides alignment,
-sort order and literal quoting.
+sort order and literal quoting. A column also carries its `origin` (`Option<ColumnOrigin>`): the table column the
+server says it shows, as PostgreSQL's table OID and attribute number, or as the database, table and column
+names MySQL and MariaDB send, whatever aliases the statement gave. An expression has none.
+
+### Editing a query result
+
+`kerno-core/src/editable.rs` decides, once per result, whether it can be edited as rows of one table, and says why
+when it cannot: `check` looks at the statement (one `SELECT` of one source) and the column origins, with no round
+trip; `resolve` reads the answer of `Dialect::origin_sql`, which names the table and its kind (a table, not a
+view); `decide` takes the table's structure and requires its row identity (the key the table data view uses) among
+the result's columns. The app side is `crates/kerno/src/query/edit.rs`, shared by the table data tab and the
+query tab: typing, NULL and default, paste, rows added, copied, deleted and reverted, undo, each tab applying the
+pending changes on its own session through the same pending-edit SQL (`sql/edits.rs`) in one transaction. In a
+manual-commit tab the apply joins the open transaction under a savepoint and commits nothing; a result is
+edited only on the connection and database its rows were read on. `browse.rs` also re-runs a `SELECT` as a
+derived table to filter, order and count it on the server (a statement that cannot be wrapped says why).
 
 ## The async bridge
 
@@ -95,6 +110,23 @@ connection: its `Connector` (with the SSH tunnel, if any), a navigator "meta" se
   another. The tab that opened a session owns it and closes it when it goes away; disconnecting closes every
   session the connection handed out. A 30-second keep-alive checks open connections, and a lost one is
   re-established.
+
+## Settings, keymap and the command table
+
+`crates/kerno/src/actions.rs` holds `COMMANDS`, one table of every command: id, palette label and group, default
+shortcuts (`secondary` is Cmd on macOS and Ctrl elsewhere) and the key context they work in. The palette, the
+menu bar, the key bindings and the keymap override file are all derived from it, so no command exists without a
+palette entry, and tests check that every action is a command, ids are unique and every command is in a menu.
+`keymap.json` in the config directory rebinds or unbinds a command by id; a bad file is reported at start and the
+defaults stay. `settings.rs` stores the user's settings as one value in `kerno.db` and `settings_view.rs` is the
+settings tab (appearance, fonts, editor, grid, confirmations, tool paths); each choice applies at once.
+
+## Bench mode
+
+`crates/kerno/src/bench.rs`, behind `KERNO_BENCH=seed|startup|first_rows|scroll`: measures startup, the first rows
+of a large result, fetching and sorting it, and scrolling the grid, prints one JSON line per measure and quits. It
+refuses to run without `KERNO_DATA_DIR` and `KERNO_SECRET_STORE=memory`, so it never touches real data or the
+keychain; without the variable every hook costs one atomic load. `scripts/bench.sh` runs each mode five times.
 
 ## Secrets
 
