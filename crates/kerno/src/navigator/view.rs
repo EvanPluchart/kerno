@@ -37,8 +37,9 @@ use kerno_core::table_draft::TableChange;
 use kerno_core::{Session, exec};
 
 use super::actions::{
-    Action, FilterAction, Template, actions, create_template, default_action, edit_action,
-    filter_actions, qualified_name, tools,
+    Action, FilterAction, Template, ToolEntry, ToolGroups, actions, create_template,
+    default_action, edit_action, filter_actions, qualified_name, same_tool, tool_entries, tools,
+    tools_now,
 };
 use super::filter_dialog;
 use super::model::{
@@ -118,11 +119,13 @@ pub enum NavigatorEvent {
     SetDefault { target: Target },
     /// Tell the user something went otherwise than asked.
     Warn(String),
-    /// Back up the database of `target` (only `tables` when there are
-    /// some), or restore a file into it.
-    BackupRestore {
+    /// Open a Tools ▸ entry (not a maintenance tool: the navigator opens
+    /// those) on `target`: a wizard on the database, with only `tables`
+    /// (a table's backup) or the schema of `target` ticked, the
+    /// administration, the foreign data wrappers, the tasks.
+    Tool {
         target: Target,
-        restore: bool,
+        entry: ToolEntry,
         tables: Vec<TableRef>,
     },
 }
@@ -887,18 +890,12 @@ impl Navigator {
                 }
             }
             Action::Backup | Action::Restore => {
-                if self.unavailable(connection, action, &node, cx).is_none() {
-                    let target = Self::target_of(connection, &node, false);
-                    let tables = match &node.kind {
-                        NodeKind::Object(ObjectRef::Relation(table, _)) => vec![table.clone()],
-                        _ => Vec::new(),
-                    };
-                    cx.emit(NavigatorEvent::BackupRestore {
-                        target,
-                        restore: action == Action::Restore,
-                        tables,
-                    });
-                }
+                let entry = if action == Action::Backup {
+                    ToolEntry::Backup
+                } else {
+                    ToolEntry::Restore
+                };
+                self.perform_tool(entry, id, window, cx);
             }
             Action::CreateTable => {
                 if self.unavailable(connection, action, &node, cx).is_none()
@@ -1313,6 +1310,95 @@ impl Navigator {
                 }
             },
         ))
+    }
+
+    /// Tools ▸ of `node` for its kind (see [`tool_entries`]).
+    fn tool_entries_of(&self, connection: &str, node: &Node, cx: &App) -> ToolGroups {
+        let offered = self
+            .meta(connection, cx)
+            .map(|meta| tools(node, meta.dialect()))
+            .unwrap_or_default();
+        tool_entries(Some(node), self.has_schemas(connection, cx), &offered)
+    }
+
+    /// Tools ▸ of `node` as its menu shows it: each entry with why it
+    /// cannot be used now, if it cannot.
+    pub fn tool_menu(&self, connection: &str, node: &Node, cx: &App) -> ToolGroups {
+        let read_only = self
+            .connections
+            .read(cx)
+            .get(connection)
+            .is_some_and(|saved| saved.config.read_only);
+        // The entries that were in the plain menu keep its rules.
+        let moved = |entry: &ToolEntry| match entry {
+            ToolEntry::Backup => Some(Action::Backup),
+            ToolEntry::Restore => Some(Action::Restore),
+            ToolEntry::Maintain(Maintenance::Truncate(_)) => Some(Action::Truncate),
+            _ => None,
+        };
+        tools_now(self.tool_entries_of(connection, node, cx), true, read_only)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(entry, reason)| {
+                        let reason = reason.or_else(|| {
+                            moved(&entry)
+                                .and_then(|action| self.unavailable(connection, action, node, cx))
+                        });
+                        (entry, reason)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Does what a Tools ▸ entry says for the node `id`, or says why it
+    /// cannot. Maintenance tools open here; the rest opens in the window.
+    pub fn perform_tool(
+        &mut self,
+        entry: ToolEntry,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((connection, node)) = self.object(id) else {
+            return;
+        };
+        let listed = self
+            .tool_menu(&connection, &node, cx)
+            .concat()
+            .into_iter()
+            .find(|(listed, _)| same_tool(listed, &entry));
+        match listed {
+            None => return,
+            Some((_, Some(reason))) => {
+                let text = format!("{}: {reason}.", entry.label().trim_end_matches('…'));
+                window.push_notification(Notification::warning(SharedString::from(text)), cx);
+                return;
+            }
+            Some(_) => {}
+        }
+        if let ToolEntry::Maintain(tool) = &entry {
+            self.open_tools(id, Some(tool), window, cx);
+            return;
+        }
+        // A table's backup is of that table; a schema's starts with it
+        // ticked.
+        let tables = match (&entry, &node.kind) {
+            (
+                ToolEntry::Backup | ToolEntry::NewTask,
+                NodeKind::Object(ObjectRef::Relation(table, _)),
+            ) => vec![table.clone()],
+            _ => Vec::new(),
+        };
+        let in_schema = matches!(node.kind, NodeKind::Object(ObjectRef::Schema(_)));
+        let target = Self::target_of(&connection, &node, in_schema);
+        cx.emit(NavigatorEvent::Tool {
+            target,
+            entry,
+            tables,
+        });
     }
 
     /// What "Maintenance Tools…" does: the tools of the selected node.
@@ -2316,9 +2402,26 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !actions(node, self.has_schemas(connection, cx))
-            .concat()
-            .contains(&action)
+        // Backup, Restore and Truncate are under Tools ▸; their keys work
+        // where the entry applies.
+        let tool = match action {
+            Action::Backup => Some(ToolEntry::Backup),
+            Action::Restore => Some(ToolEntry::Restore),
+            Action::Truncate => Some(ToolEntry::Maintain(Maintenance::Truncate(
+                Default::default(),
+            ))),
+            _ => None,
+        };
+        let in_tools = tool.is_some_and(|tool| {
+            self.tool_entries_of(connection, node, cx)
+                .concat()
+                .iter()
+                .any(|(entry, reason)| same_tool(entry, &tool) && reason.is_none())
+        });
+        if !in_tools
+            && !actions(node, self.has_schemas(connection, cx))
+                .concat()
+                .contains(&action)
         {
             return;
         }
@@ -2494,6 +2597,28 @@ impl Navigator {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Tools ▸ of the node on a row, as the menu shows it (a group per
+    /// line, a disabled entry with its reason); for tests.
+    #[cfg(test)]
+    pub fn tool_menu_at(&self, row: usize, cx: &App) -> Vec<String> {
+        let Some((connection, node)) = self.object(&self.id_at(row, cx)) else {
+            return Vec::new();
+        };
+        self.tool_menu(&connection, &node, cx)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(entry, reason)| match reason {
+                        Some(reason) => format!("{} ({reason})", entry.label()),
+                        None => entry.label(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .collect()
     }
 
     /// The row reached by these labels from the current connection's
@@ -3111,11 +3236,7 @@ fn object_menu(
                     .collect()
             })
             .collect();
-    let tools = navigator
-        .meta(&connection, cx)
-        .map(|meta| tools(&node, meta.dialect()))
-        .unwrap_or_default();
-    let tools_reason = navigator.unavailable(&connection, Action::Tools, &node, cx);
+    let tools = navigator.tool_menu(&connection, &node, cx);
     let filters: Vec<(FilterAction, Option<&'static str>)> = filter_actions(&node)
         .into_iter()
         .map(|action| {
@@ -3139,18 +3260,23 @@ fn object_menu(
         if index == last && !tools.is_empty() {
             let (view, id, tools) = (view.clone(), id.clone(), tools.clone());
             let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
-                for tool in tools {
-                    let (view, id) = (view.clone(), id.clone());
-                    let label = format!("{}…", maintenance_dialog::label(&tool));
-                    submenu = submenu.item(
-                        PopupMenuItem::new(entry(&label, tools_reason))
-                            .disabled(tools_reason.is_some())
-                            .on_click(move |_, window, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.open_tools(&id, Some(&tool), window, cx);
-                                })
-                            }),
-                    );
+                for (index, group) in tools.into_iter().enumerate() {
+                    if index > 0 {
+                        submenu = submenu.separator();
+                    }
+                    for (tool, reason) in group {
+                        let (view, id) = (view.clone(), id.clone());
+                        submenu = submenu.item(
+                            PopupMenuItem::new(entry(&tool.label(), reason))
+                                .disabled(reason.is_some())
+                                .on_click(move |_, window, cx| {
+                                    let tool = tool.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.perform_tool(tool, &id, window, cx)
+                                    })
+                                }),
+                        );
+                    }
                 }
                 submenu
             });

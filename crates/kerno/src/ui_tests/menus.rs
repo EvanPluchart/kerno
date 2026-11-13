@@ -97,7 +97,6 @@ fn each_kind_of_navigator_node_answers_a_right_click_with_its_menu(cx: &mut Test
                 ShowDdl,
                 CopyName,
                 Rename,
-                Truncate,
                 Drop,
                 Export,
             ],
@@ -131,6 +130,14 @@ fn each_kind_of_navigator_node_answers_a_right_click_with_its_menu(cx: &mut Test
         app.press(cx, &["escape"]);
         assert!(menu_entry(&app, cx, "Copy name").is_none(), "{path:?}");
     }
+
+    // Truncate is under the table's Tools ▸, as in DBeaver's tool groups.
+    let node = app.tree_row(cx, &table);
+    app.right_click(cx, ("node", node), None);
+    click_menu_entry(&app, cx, "Tools");
+    assert!(menu_entry(&app, cx, "Truncate…").is_some());
+    app.press(cx, &["escape"]);
+    app.press(cx, &["escape"]);
 
     // An entry runs from the menu: the table's SELECT, in a new tab.
     let node = app.tree_row(cx, &table);

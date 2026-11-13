@@ -106,6 +106,11 @@ pub struct Settings {
     /// The environments connections can be in: the three built-ins, edited
     /// or not, then the user's own.
     pub environments: Vec<EnvironmentDef>,
+    /// Ask GitHub for a newer release at launch and every 6 hours
+    /// (CLAUDE.md §3 item 12); "Check for updates…" asks anyway.
+    pub check_updates: bool,
+    /// The release "Skip this version" chose: not offered by the checks.
+    pub skipped_update: Option<String>,
 }
 
 /// The sizes the settings allow, in points.
@@ -143,6 +148,8 @@ impl Default for Settings {
             selection_stats: true,
             hide_idle_sessions: false,
             environments: environment::builtin_environments(),
+            check_updates: true,
+            skipped_update: None,
         }
     }
 }
@@ -264,6 +271,8 @@ mod tests {
                 });
                 environments
             },
+            check_updates: false,
+            skipped_update: Some("0.2.0".into()),
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

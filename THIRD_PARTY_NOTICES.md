@@ -60,6 +60,29 @@ Trademark notices:
 - GPUI, by Zed Industries (Apache-2.0), consumed as the `gpui-pre` snapshot crates.
 - GPUI Kit / gpui-component, by Longbridge (Apache-2.0).
 
+## Recto and Vigie
+
+The update check and install (`crates/kerno-core/src/update.rs`, `crates/kerno/src/update.rs`,
+`crates/kerno/src/workspace/updates.rs`) reuse code and rules of two applications by the same author,
+both under the MIT licence:
+
+- **Recto** (https://github.com/EvanPluchart/recto), Copyright (c) 2026 Evan Pluchart: `Version`, `newer`,
+  `checksum_for` and `release_page` (`crates/recto-core/src/update.rs`), the timing and the update button
+  (`crates/recto-app/src/update/mod.rs`, `crates/recto-app/src/viewer/update.rs`).
+- **Vigie** (https://github.com/EvanPluchart/vigie), Copyright (c) 2026 Evan Pluchart: the "Check for updates"
+  setting and the manual check (`crates/vigie-app/src/update.rs`).
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions: The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR
+ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ## Reference implementations
 
 Kerno was written with two open-source database clients as references for behaviour. No code, icon,

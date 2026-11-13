@@ -6,6 +6,7 @@
 use std::rc::Rc;
 
 use gpui_kit::InteractiveElement as _;
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
@@ -276,7 +277,11 @@ impl Render for ConfirmView {
                     .font_family(theme.mono_font_family.clone())
                     .text_sm()
                     .map(|this| match &statement {
-                        Ok(sql) => this.child(SharedString::from(sql.clone())),
+                        Ok(sql) => this.child(
+                            div()
+                                .child(SharedString::from(sql.clone()))
+                                .test_text(sql.clone()),
+                        ),
                         Err(reason) => this
                             .text_color(theme.muted_foreground)
                             .child(SharedString::from(reason.clone())),

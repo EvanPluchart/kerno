@@ -7,8 +7,13 @@
 
 Kerno is a native, open-source database client for macOS and Linux, written in Rust with GPUI. All database,
 file, SSH and secret-store work runs off the UI thread, results stream in pages and are drawn virtually, and
-every running query can be cancelled. Nothing leaves the machine: no telemetry, no analytics, no update
-pings, no crash upload.
+every running query can be cancelled. Nothing leaves the machine: no telemetry, no analytics, no crash
+upload. One request is made on its own: at launch and every 6 hours, Kerno asks
+`https://github.com/EvanPluchart/kerno/releases/latest` which version is the newest (through the system's
+`curl`, the redirect not followed, a `Kerno/<version>` user agent, no cookie, no identifier, nothing else
+sent). Turn it off in Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for
+Updates… asks only when you click it. An update is installed only after its SHA-256 matches the release's
+`SHA256SUMS`.
 
 Version 1 connects to PostgreSQL, MySQL and MariaDB. Its feature set and interactions follow DBeaver
 Community; its look follows the calm, dense style of modern editors. Licensed under MIT OR Apache-2.0.
@@ -82,6 +87,18 @@ nice -n 10 cargo build --release -p kerno
 
 From macOS, `scripts/bundle-linux.sh` builds the Linux package inside Docker (`Dockerfile.linux-build`).
 `.cargo/config.toml` caps cargo at 3 jobs.
+
+## Checks and releases
+
+There is no hosted CI: the checks run locally. `scripts/check.sh` runs `cargo fmt --check`, clippy with
+`-D warnings`, `cargo deny check` and the workspace tests (starting the `kerno-*` containers if they are not
+running, and stopping them again if it started them), one summary line per step, stopping at the first
+failure. `scripts/check.sh --no-tests` skips the tests. It refuses to start when the machine is busy.
+
+A release is built locally with `scripts/release.sh [version]`: it checks the tree is clean and the version
+matches `Cargo.toml`, builds the macOS `.dmg` (on macOS) and the Linux tarball, and writes `dist/SHA256SUMS`.
+It then prints the `gh release create` command; the owner runs it. The script itself makes no network
+request, creates no tag and pushes nothing.
 
 ## Test databases
 

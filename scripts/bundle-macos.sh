@@ -8,7 +8,7 @@
 # "Always allow" across builds.
 # Then launches the bundle once on a scratch data directory and an
 # in-memory secret store, waits for its window and quits it.
-# KERNO_SKIP_LAUNCH_CHECK=1 skips that check (CI, no display).
+# KERNO_SKIP_LAUNCH_CHECK=1 skips that check (no display).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

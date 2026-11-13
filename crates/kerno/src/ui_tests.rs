@@ -45,7 +45,10 @@ mod environments;
 mod folders;
 mod menus;
 mod sidebar_tree;
+mod tasks;
 mod tool_wizards;
+mod tools_menu;
+mod updates;
 
 struct Fixture {
     window: WindowHandle<Root>,
@@ -7497,7 +7500,11 @@ fn the_sessions_list_cancels_and_terminates_what_the_test_opened(cx: &mut TestAp
         let app = connected(cx, engine);
         let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
         // From the connection's menu in the sidebar.
-        app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+        app.sidebar_does(
+            cx,
+            Subject::Connection(id),
+            SidebarAction::Tool(crate::navigator::actions::ToolEntry::Dashboard),
+        );
         assert_eq!(
             app.titles(cx),
             [format!("test {} · administration", engine.label())]
@@ -7681,7 +7688,11 @@ fn the_sessions_refresh_on_their_own_only_while_shown(cx: &mut TestAppContext) {
     }
     let app = connected(cx, Engine::Postgres);
     let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
-    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+    app.sidebar_does(
+        cx,
+        Subject::Connection(id),
+        SidebarAction::Tool(crate::navigator::actions::ToolEntry::Dashboard),
+    );
     app.wait_admin(cx, Pane::Sessions);
     let (_, rows) = app.admin_shown(cx, Pane::Sessions);
     let own = rows
@@ -12247,7 +12258,11 @@ fn the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker(cx: &mut TestA
         let _scratch = Scratch::new(engine, &[cleanup], &setup);
         let app = connected(cx, engine);
         let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
-        app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+        app.sidebar_does(
+            cx,
+            Subject::Connection(id),
+            SidebarAction::Tool(crate::navigator::actions::ToolEntry::Dashboard),
+        );
         app.wait_admin(cx, Pane::Sessions);
 
         // TOOL-13: idle (PostgreSQL) or sleeping sessions are left out, and
@@ -13411,7 +13426,7 @@ fn the_lock_manager_opens_from_the_connection_menu_and_the_palette(cx: &mut Test
     app.sidebar_does(
         cx,
         Subject::Connection(id.clone()),
-        SidebarAction::LockManager,
+        SidebarAction::Tool(crate::navigator::actions::ToolEntry::LockManager),
     );
     assert_eq!(section(&app, cx), crate::admin::tab::LOCKS);
     app.on_admin(cx, |tab, window, cx| {

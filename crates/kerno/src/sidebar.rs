@@ -25,6 +25,7 @@ use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{Connections, Status, folder_of};
 use crate::folder_dialog::{self, Target};
+use crate::navigator::actions::{ToolEntry, ToolGroups};
 use crate::navigator::view::Navigator;
 use crate::state::AppState;
 
@@ -68,9 +69,9 @@ pub enum SidebarAction {
     /// The connection's read-only flag, as it is now (a checked entry).
     ReadOnly(bool),
     NewSqlEditor,
-    Administration,
-    /// Administration on its Locks sub-tab (DBeaver's Lock Manager).
-    LockManager,
+    /// An entry of the connection's Tools ▸ (the administration, its locks
+    /// and sessions, the tool wizards, the tasks).
+    Tool(ToolEntry),
     Edit,
     Duplicate,
     /// Into this folder; the top level when `None`.
@@ -102,8 +103,7 @@ impl SidebarAction {
             Self::DisconnectAll => "Disconnect all",
             Self::ReadOnly(_) => "Read-only",
             Self::NewSqlEditor => "New SQL editor",
-            Self::Administration => "Administration",
-            Self::LockManager => "Lock Manager",
+            Self::Tool(entry) => return entry.label(),
             Self::Edit => "Edit…",
             Self::Duplicate => "Duplicate",
             Self::MoveTo(Some(folder)) => return folder.clone(),
@@ -131,7 +131,8 @@ pub enum Entry {
 /// `folders` are every folder; `folder` is where the connection is; `open`
 /// counts the connections open that a disconnection would close: all of
 /// them for the list, those in the folder, the others for a connection;
-/// `copied` says a connection was copied, for Paste.
+/// `copied` says a connection was copied, for Paste. A connection's Tools ▸
+/// is left empty here: [`with_tools`] fills it.
 pub fn menu(
     subject: &Subject,
     status: &Status,
@@ -199,8 +200,7 @@ pub fn menu(
                 enabled(ReadOnly(checked)),
                 Separator,
                 enabled(NewSqlEditor),
-                Item(Administration, not_connected),
-                Item(LockManager, not_connected),
+                Submenu(TOOLS, Vec::new()),
                 Separator,
                 enabled(Edit),
                 enabled(Duplicate),
@@ -220,15 +220,39 @@ pub fn menu(
     }
 }
 
+/// The label of a connection's Tools ▸.
+pub const TOOLS: &str = "Tools";
+
+/// `entries` with the connection's Tools ▸ filled with `tools`
+/// ([`crate::navigator::actions::tool_entries`]), groups apart.
+pub fn with_tools(entries: Vec<Entry>, tools: ToolGroups) -> Vec<Entry> {
+    let items: Vec<Entry> = tools
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, group)| {
+            (index > 0).then_some(Entry::Separator).into_iter().chain(
+                group
+                    .into_iter()
+                    .map(|(entry, reason)| Entry::Item(SidebarAction::Tool(entry), reason)),
+            )
+        })
+        .collect();
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::Submenu(TOOLS, _) => Entry::Submenu(TOOLS, items.clone()),
+            entry => entry,
+        })
+        .collect()
+}
+
 /// What the rest of the window does for the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarEvent {
     /// Open a query tab on this connection, which is open.
     NewEditor(String),
-    /// Open the administration of this connection.
-    OpenAdmin(String),
-    /// Open it on its Locks sub-tab.
-    OpenLocks(String),
+    /// Open a Tools ▸ entry on this connection's default database.
+    Tool(String, ToolEntry),
     /// Ask for a connections file to import.
     ImportConnections,
     /// Close these connections, `action` (“Disconnect “prod””) once what
@@ -340,7 +364,7 @@ impl Sidebar {
             ),
             Subject::Folder(_) => (Status::Disconnected, None, false),
         };
-        menu(
+        let entries = menu(
             subject,
             &status,
             &connections.folders(cx),
@@ -348,6 +372,18 @@ impl Sidebar {
             self.closing(subject, cx).len(),
             checked,
             self.copied_connection(cx).is_some(),
+        );
+        let Subject::Connection(id) = subject else {
+            return entries;
+        };
+        let postgres = connections
+            .get(id)
+            .is_some_and(|saved| saved.config.engine == kerno_core::Engine::Postgres);
+        let connected = matches!(status, Status::Connected { .. });
+        let tools = crate::navigator::actions::tool_entries(None, postgres, &[]);
+        with_tools(
+            entries,
+            crate::navigator::actions::tools_now(tools, connected, checked),
         )
     }
 
@@ -503,8 +539,7 @@ impl Sidebar {
                 action: "Disconnect all connections".into(),
             }),
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
-            (Subject::Connection(_), Administration) => cx.emit(SidebarEvent::OpenAdmin(id)),
-            (Subject::Connection(_), LockManager) => cx.emit(SidebarEvent::OpenLocks(id)),
+            (Subject::Connection(_), Tool(entry)) => cx.emit(SidebarEvent::Tool(id, entry)),
             (Subject::Connection(_), Edit) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), Duplicate) => {
                 connections.update(cx, |c, cx| c.duplicate(&id, cx))
@@ -970,8 +1005,7 @@ mod tests {
                 "Read-only",
                 "—",
                 "New SQL editor",
-                "Administration (not connected)",
-                "Lock Manager (not connected)",
+                "Tools ▸ []",
                 "—",
                 "Edit…",
                 "Duplicate",
@@ -1001,10 +1035,11 @@ mod tests {
             ["Connect (connected)", "Disconnect", "Reconnect"]
         );
         assert_eq!(open[3], "Disconnect others");
-        assert_eq!(open[7], "Administration");
-        assert_eq!(open[8], "Lock Manager");
-        assert_eq!(open[17], "Refresh");
-        assert!(open[13].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        // Administration and Lock Manager moved under Tools ▸, filled by
+        // `with_tools` (see `a_connection_s_tools_say_what_its_state_allows`).
+        assert_eq!(open[7], "Tools ▸ []");
+        assert_eq!(open[16], "Refresh");
+        assert!(open[12].starts_with("Move to folder ▸ [No folder (already there), Work,"));
         // The read-only entry carries the flag as it is, checked.
         let entries = menu(
             &subject,
@@ -1052,6 +1087,49 @@ mod tests {
                 "Disconnect (not connected)",
                 "Reconnect (not connected)"
             ]
+        );
+    }
+
+    #[test]
+    fn a_connection_s_tools_say_what_its_state_allows() {
+        use crate::navigator::actions::{tool_entries, tools_now};
+        let subject = Subject::Connection("id".into());
+        let tools_of = |postgres: bool, connected: bool, read_only: bool| {
+            let status = if connected {
+                Status::Connected {
+                    version: "17".into(),
+                }
+            } else {
+                Status::Disconnected
+            };
+            let entries = menu(&subject, &status, &[], None, 0, read_only, false);
+            let tools = tools_now(tool_entries(None, postgres, &[]), connected, read_only);
+            labels(&with_tools(entries, tools))
+                .into_iter()
+                .find(|label| label.starts_with("Tools ▸"))
+                .unwrap()
+        };
+        assert_eq!(
+            tools_of(true, true, false),
+            "Tools ▸ [Back up…, Global backup…, Restore…, Execute script…, —, Foreign data \
+             wrappers…, —, Open dashboard, Session manager, Lock manager, —, Create new task…, \
+             Tasks]"
+        );
+        // Read-only: what writes is refused; MySQL has no global backup and
+        // no foreign data wrappers.
+        assert_eq!(
+            tools_of(false, true, true),
+            "Tools ▸ [Back up…, Restore… (read-only connection), Execute script… (read-only \
+             connection), —, Open dashboard, Session manager, Lock manager, —, Create new \
+             task…, Tasks]"
+        );
+        // Closed: only the Tasks view opens.
+        let closed = tools_of(true, false, false);
+        assert!(
+            closed.contains("Back up… (not connected)")
+                && closed.contains("Open dashboard (not connected)")
+                && closed.ends_with("Create new task… (not connected), Tasks]"),
+            "{closed}"
         );
     }
 }

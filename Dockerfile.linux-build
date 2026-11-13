@@ -1,4 +1,4 @@
-# Builds the Kerno workspace on Linux (Ubuntu 24.04, the CI runner's image)
+# Builds the Kerno workspace on Linux (Ubuntu 24.04, the image the Linux release is built on)
 # and runs the kerno-core unit tests; no database containers are reachable
 # here. The image also serves scripts/bundle-linux.sh from macOS.
 #

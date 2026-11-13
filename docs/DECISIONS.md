@@ -874,3 +874,22 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   declining keeps the verified download for the next click. A changed table form is not kept, as with Quit.
 - The setting lives in its own "Updates" section of the settings, with the line saying what is requested.
 - Not verifiable here: the real request and a real install (no repository, nothing published).
+
+## D-049 — Tools submenu, foreign data wrappers, saved tasks: what was decided while building them
+
+- **"Save as task…" is a button of each wizard**, not a Tools entry: a menu entry has no settings to save.
+  Tools has "Create new task…" (pick the tool, then its wizard, Save as the main button) and "Tasks".
+- **A task stores no client folder and no secret.** Each run chooses the client through `client_for`;
+  another user's password is typed again at each run; the kept log is the wizard's masked log (last 5,000
+  lines) and goes through `redact_secrets` once more before it is stored.
+- **A task's connection is looked up at each run**: its current read-only flag and environment rules
+  apply, and a restore or a script asks with its command every time. Deleting a connection keeps its
+  tasks, which then say they cannot run.
+- **Foreign data wrappers are a dialog**: it lists wrappers, foreign servers and user mappings (never the
+  mappings' options, which hold passwords) and creates a server, a mapping and an `IMPORT FOREIGN SCHEMA`
+  through a form with the SQL shown (password masked) and confirmed. Listing them in the tree and
+  DBeaver's table-by-table wizard are on the roadmap (NAV-10).
+- **Only the four client-tool wizards become tasks**; maintenance and export tasks (TOOL-31) and a
+  scheduler (TOOL-30: DBeaver Community has none) are on the roadmap.
+- **The Tasks view reads its list on events** (opening, a task saved, run or deleted, Refresh), never
+  while drawing: a first version reloaded at each frame and never came to rest.

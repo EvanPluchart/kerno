@@ -5144,7 +5144,8 @@ mod tests {
         let mut backup = BackupOptions::new(Engine::Postgres, "shop");
         backup.auth_user = Some("backup_user".into());
         backup.tables = vec![TableRef::new("shop", "orders")];
-        let mut restore = RestoreOptions::new(Engine::MySql, "shop", "/b/shop.sql", BackupFormat::Sql);
+        let mut restore =
+            RestoreOptions::new(Engine::MySql, "shop", "/b/shop.sql", BackupFormat::Sql);
         restore.allow_client_commands = true;
         let tasks = [
             TaskSettings::Backup(backup),
@@ -5154,9 +5155,15 @@ mod tests {
         ];
         for task in &tasks {
             let json = serde_json::to_string(task).unwrap();
-            assert!(json.contains(&format!("\"kind\":\"{}\"", task.kind())), "{json}");
+            assert!(
+                json.contains(&format!("\"kind\":\"{}\"", task.kind())),
+                "{json}"
+            );
             // No field holds a password (`role_passwords` is a switch).
-            assert!(!json.contains("password\":") && !json.contains(PASSWORD), "{json}");
+            assert!(
+                !json.contains("password\":") && !json.contains(PASSWORD),
+                "{json}"
+            );
             let back: TaskSettings = serde_json::from_str(&json).unwrap();
             // The opt-in to a file's client commands is asked at each run.
             match (task, &back) {
@@ -5176,11 +5183,19 @@ mod tests {
         // A password typed among the extra arguments is never kept.
         let mut leaky = BackupOptions::new(Engine::Postgres, "shop");
         leaky.extra_args = format!("--password={PASSWORD}");
-        assert!(TaskSettings::Backup(leaky.clone()).check(Engine::Postgres).is_err());
+        assert!(
+            TaskSettings::Backup(leaky.clone())
+                .check(Engine::Postgres)
+                .is_err()
+        );
         leaky.extra_args = "--lock-wait-timeout=5000".into();
         assert!(TaskSettings::Backup(leaky).check(Engine::Postgres).is_ok());
         let mut script = ScriptOptions::new(Engine::MySql, "shop", "/s.sql");
         script.extra_args = format!("--password={PASSWORD}");
-        assert!(TaskSettings::ExecuteScript(script).check(Engine::MySql).is_err());
+        assert!(
+            TaskSettings::ExecuteScript(script)
+                .check(Engine::MySql)
+                .is_err()
+        );
     }
 }

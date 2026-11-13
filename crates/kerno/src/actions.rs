@@ -193,6 +193,16 @@ gpui_kit::actions!(
         BackupDatabase,
         /// Restores a backup file into a database with the engine's client tool.
         RestoreDatabase,
+        /// Backs up a whole PostgreSQL server with `pg_dumpall`.
+        GlobalBackup,
+        /// Runs a SQL file with the engine's client tool.
+        ExecuteScript,
+        /// The foreign data wrappers of a PostgreSQL database.
+        ForeignDataWrappers,
+        /// A tool's wizard whose aim is a saved task.
+        CreateTask,
+        /// Opens the Tasks view.
+        ShowTasks,
         /// Opens the maintenance tools of the selected tree node.
         MaintenanceTools,
         /// Lists the statements run in the active tab's open transaction.
@@ -223,6 +233,8 @@ gpui_kit::actions!(
         UseDarkTheme,
         /// Shows the version and licence.
         About,
+        /// Asks GitHub whether a newer release is out.
+        CheckForUpdates,
         /// Quits Kerno.
         Quit,
         /// Lists the tables and views of the active connection, to open one.
@@ -1501,6 +1513,59 @@ pub const COMMANDS: &[Command] = &[
         RestoreDatabase
     ),
     command!(
+        "global_backup",
+        "Global Backup…",
+        "Server",
+        [],
+        [
+            "pg_dumpall",
+            "roles",
+            "tablespaces",
+            "whole server",
+            "backup all"
+        ],
+        GlobalBackup
+    ),
+    command!(
+        "execute_script",
+        "Execute Script…",
+        "Server",
+        [],
+        ["psql", "mysql", "run file", "sql file", "script"],
+        ExecuteScript
+    ),
+    command!(
+        "foreign_data_wrappers",
+        "Foreign Data Wrappers…",
+        "Server",
+        [],
+        [
+            "fdw",
+            "postgres_fdw",
+            "foreign server",
+            "user mapping",
+            "import foreign schema"
+        ],
+        ForeignDataWrappers
+    ),
+    // DBeaver's Database ▸ Tasks (`DatabaseTasksView`); no scheduler.
+    command!(
+        "create_task",
+        "Create New Task…",
+        "Server",
+        [],
+        ["task", "save settings", "backup task", "saved task"],
+        CreateTask
+    ),
+    command!(
+        "show_tasks",
+        "Tasks",
+        "Server",
+        [],
+        ["tasks", "saved tasks", "run again", "task log"],
+        ShowTasks
+    ),
+    command!(
         "maintenance_tools",
         "Maintenance Tools…",
         "Navigator",
@@ -1690,6 +1755,14 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["version", "licence", "license"],
         About
+    ),
+    command!(
+        "check_for_updates",
+        "Check for Updates…",
+        "Kerno",
+        [],
+        ["update", "upgrade", "release", "version", "new"],
+        CheckForUpdates
     ),
     command!(
         "quit",

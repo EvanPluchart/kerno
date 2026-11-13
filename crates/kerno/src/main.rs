@@ -13,6 +13,7 @@ mod database_dialog;
 mod engine_logo;
 mod environments_view;
 mod export_dialog;
+mod fdw_dialog;
 mod folder_dialog;
 mod import_dialog;
 mod library;
@@ -29,9 +30,11 @@ mod sql_confirm;
 mod state;
 mod structure;
 mod tabs;
+mod tasks_view;
 mod theme;
 #[cfg(test)]
 mod ui_tests;
+mod update;
 mod workspace;
 
 use gpui_kit::component::{TitleBar, WindowExt as _};
@@ -94,6 +97,22 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     app_icon::set_dock_icon();
     let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    // The one request Kerno makes by itself (CLAUDE.md §1), unless an off
+    // switch is set: where this copy lives is looked at off the UI thread.
+    let exe = std::env::current_exe().ok();
+    let updates = bridge::spawn_blocking(cx, move || {
+        let updates = update::for_this_run(|name| std::env::var_os(name).is_some(), exe);
+        if let Some(updates) = &updates {
+            update::remove_leftovers(&updates.target);
+        }
+        updates
+    });
+    cx.spawn(async move |cx| {
+        if let Some(updates) = updates.await {
+            cx.update(|cx| cx.set_global(updates));
+        }
+    })
+    .detach();
     cx.set_menus(menus());
     // One window: closing it ends the app.
     cx.on_window_closed(|cx, _| {
@@ -143,6 +162,9 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
         let workspace =
             cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
         bench::begin(&workspace, &connections, window, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.start_update_checks(window, cx)
+        });
         workspace.focus_handle(cx).focus(window, cx);
         for problem in keymap_problems {
             window.push_notification(format!("{}: {problem}", keymap_file.display()), cx);
@@ -366,6 +388,20 @@ fn menus() -> Vec<Menu> {
                 command("open_admin"),
                 command("lock_manager"),
                 command("maintenance_tools"),
+                MenuItem::submenu(menu(
+                    "Tools",
+                    vec![
+                        MenuItem::action("Back Up Database…", BackupDatabase),
+                        command("global_backup"),
+                        MenuItem::action("Restore Database…", RestoreDatabase),
+                        command("execute_script"),
+                        separator(),
+                        command("foreign_data_wrappers"),
+                        separator(),
+                        command("create_task"),
+                        command("show_tasks"),
+                    ],
+                )),
                 separator(),
                 MenuItem::submenu(menu(
                     "Connections",
@@ -431,6 +467,7 @@ fn menus() -> Vec<Menu> {
                 command("open_command_palette"),
                 command("open_keymap_file"),
                 separator(),
+                command("check_for_updates"),
                 command("about"),
             ],
         ),

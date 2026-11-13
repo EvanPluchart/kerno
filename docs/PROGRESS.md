@@ -323,12 +323,14 @@ Found and fixed on the way:
   colour and an icon; the bare binary shows the app icon. Workspace: 1,030 tests green, `cargo deny` clean.
 - The owner added items 11 to 13 (main toolbar, update check, no GitHub Actions): `plans/M10.md` Parts 12
   to 14.
+- Owner's test, items 10 (second half), 12 and 13 (D-045, D-048, D-049): the Tools submenu per engine,
+  foreign data wrappers, saved tasks and the Tasks view; the update check through the system's `curl` with
+  a verified install by swap on macOS and Linux; no GitHub Actions: `scripts/check.sh` and
+  `scripts/release.sh`.
 
 Still open:
 
-- Owner's test, what is left: the Tools submenu and saved tasks (item 10, second half), the main toolbar
-  (item 11), the update check (item 12), local check and release scripts in place of GitHub Actions
-  (item 13).
+- Owner's test, what is left: the main toolbar (item 11).
 - One test still fails about once in forty full runs:
   `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user, both idle in
   a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test

@@ -27,6 +27,8 @@ tracing-appender.workspace = true
 # already in the lock through GPUI; no feature here pulls a new crate.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+# The SHA-256 of an update's download (D-045); already in the lock.
+sha2 = "0.10"
 
 # The Dock icon of the bare binary (crates/kerno/src/app_icon.rs); already in
 # the lock through GPUI.

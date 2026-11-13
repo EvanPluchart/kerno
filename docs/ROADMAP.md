@@ -29,7 +29,7 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
    `Dialect` defaults refuse and the UI hides the entry (as it does for engines without schemas). If a new
    engine needs a capability the trait cannot express, add a method with a refusing default rather than a
    branch on the engine name in the UI.
-7. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-21, TOOL-23). Built on `execute` and
+7. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
    the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
 8. **AI assistant** (TOOL-24). Not before the owner decides how to square it with "nothing leaves the
    machine": it would be opt-in, per connection, and either local or an explicit endpoint the user
@@ -46,7 +46,7 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
   licences). An AppImage needs `appimagetool` and a desktop-integration step that the build image does not
   carry; it comes with the first public release.
 - **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
-  (arm64 here); amd64 is built by CI's `ubuntu-24.04` runner. Cross-building locally would run under
+  (arm64 here); amd64 needs an amd64 Linux host (there is no hosted CI). Cross-building locally would run under
   emulation.
 - **RSA SSH key files** are refused (RUSTSEC-2023-0071, D-013); agent-held RSA keys work.
 
@@ -66,7 +66,8 @@ The order and the driver-trait extension of each are in "Beyond v1, in order" ab
 | NAV-58 | View Diagram | PG, My | ERD is outside v1 (CLAUDE.md §4, last paragraph) |
 | OBJ-20 | ER diagram page | PG, My | ERD is outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-20 | Dashboards | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
-| TOOL-21 | Task scheduler and saved tasks | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
+| TOOL-30 | Task scheduler | PG, My | Saved tasks are done (TOOL-21); DBeaver Community has no scheduler either, and one needs a background runner while Kerno is closed |
+| TOOL-31 | Maintenance tools and data transfers as tasks | PG, My | The four client-tool wizards save tasks; the maintenance dialog and the export wizard have no serialisable settings yet (M10 Part 11b) |
 | TOOL-22 | Data compare, schema compare | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-23 | Mock data generator | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-24 | AI assistant | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
@@ -108,7 +109,7 @@ Read from CLAUDE.md (§1 "Nothing leaves the machine", the §4.B1 tree list, §4
 
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
-| NAV-10 | Aggregates, event triggers, foreign data wrappers, publications, subscriptions, tablespaces | PG | Not in CLAUDE.md §4.B1 tree list; specialised features |
+| NAV-10 | Aggregates, event triggers, foreign data wrappers, publications, subscriptions, tablespaces | PG | Not in CLAUDE.md §4.B1 tree list; specialised features. Foreign data wrappers, servers and user mappings are listed in Tools ▸ Foreign data wrappers… (M10 Part 11b): showing them in the tree needs new node kinds and driver introspection; DBeaver's foreign tables built one by one from another connection's tables (`PostgreFDWConfigWizard`) need its type mapping between engines, and Kerno imports a whole schema instead |
 | SQL-50 | Search in web | PG, My | Sends text off the machine (CLAUDE.md §1 "Nothing leaves the machine") |
 | OBJ-17 | Role / user editors | PG, My | CLAUDE.md §4.H2 asks for a read view of users and grants; editing them is beyond v1 |
 | TOOL-18 | Refresh publications (subscriptions) | PG | Replication objects are outside CLAUDE.md §4 |

@@ -49,11 +49,13 @@ use gpui_kit::{
 use kerno_core::config::{ConnectParams, ConnectionConfig, Engine, Secret, Secrets, TlsMode};
 use kerno_core::format::byte_size;
 use kerno_core::schema::{RelationKind, TableRef};
+use kerno_core::sql::LexRules;
 use kerno_core::ssh::{Tunnel, TunnelRequest};
+use kerno_core::storage::{HistoryStatus, SavedTask};
 use kerno_core::tools::{
     self, BackupContent, BackupFormat, BackupOptions, ClientFamily, ClientInstall, ClientRoots,
     ClientWanted, Compatibility, DumpMethod, EngineBackup, Finding, GlobalBackupOptions, NameVars,
-    RestoreOptions, ScriptLogLevel, ScriptOptions, Stamp, Tool, ToolCommand,
+    RestoreOptions, ScriptLogLevel, ScriptOptions, Stamp, TaskSettings, Tool, ToolCommand,
 };
 use kerno_core::{Error, Session};
 
@@ -86,9 +88,25 @@ impl Mode {
     }
 }
 
+/// What the wizard is opened for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Purpose {
+    /// A run; "Save as task…" keeps its settings too.
+    Run,
+    /// A new saved task (Tools ▸ Create new task…): "Save as task…" is the
+    /// main button.
+    NewTask,
+    /// A saved task, on its settings: "Save task" writes them back, and
+    /// each run is kept with it (DBeaver's task wizard).
+    Task(Box<SavedTask>),
+}
+
 /// Called with the connection and the database once a restore or a
 /// script succeeded.
 type Restored = dyn Fn(&str, &str, &mut Window, &mut App);
+
+/// Called once a task was saved or ran: the Tasks view reads them again.
+type TasksChanged = dyn Fn(&mut App);
 
 /// Lines of the tool's output kept on screen: the last ones.
 const LOG_LINES: usize = 5_000;
@@ -251,6 +269,11 @@ pub struct BackupDialog {
     /// Bumped at each probe, so a late answer is dropped.
     generation: u64,
     on_restored: Rc<Restored>,
+    purpose: Purpose,
+    on_tasks_changed: Option<Rc<TasksChanged>>,
+    /// Schemas ticked whole whose tables are ticked once the objects are
+    /// read (a schema's backup, a saved task).
+    pending_schemas: Vec<String>,
     probing: Option<Task<()>>,
     running: Option<Task<()>>,
     ticking: Option<Task<()>>,
@@ -489,6 +512,9 @@ impl BackupDialog {
             close_when_stopped: false,
             generation: 0,
             on_restored,
+            purpose: Purpose::Run,
+            on_tasks_changed: None,
+            pending_schemas: Vec::new(),
             probing: None,
             running: None,
             ticking: None,
@@ -589,6 +615,7 @@ impl BackupDialog {
                     this.selection.current = objects.first().map(|entry| entry.name.clone());
                 }
                 this.objects = loaded;
+                this.fill_pending();
                 cx.notify();
             });
         }));
@@ -795,6 +822,301 @@ impl BackupDialog {
         }
         self.selection.tables = tables.into_iter().collect();
         cx.notify();
+    }
+
+    /// Backup: these schemas ticked whole (DBeaver's backup of a schema);
+    /// an empty list is the whole database again.
+    pub fn only_schemas(&mut self, schemas: Vec<String>, cx: &mut Context<Self>) {
+        self.selection.complete = schemas.is_empty();
+        self.selection.schemas = schemas.iter().cloned().collect();
+        self.selection.tables.clear();
+        if let Some(first) = schemas.first() {
+            self.selection.current = Some(first.clone());
+        }
+        self.pending_schemas = schemas;
+        self.fill_pending();
+        cx.notify();
+    }
+
+    /// Ticks the tables of the schemas ticked whole, once they are read.
+    fn fill_pending(&mut self) {
+        if !matches!(self.objects, Loaded::Ready(_)) {
+            return;
+        }
+        for schema in std::mem::take(&mut self.pending_schemas) {
+            let tables = self
+                .entry(&schema)
+                .map(|entry| self.visible(entry))
+                .unwrap_or_default();
+            self.selection.tables.extend(tables);
+        }
+    }
+
+    /// What the wizard is for; `changed` is called once a task was saved or
+    /// ran.
+    pub fn set_purpose(
+        &mut self,
+        purpose: Purpose,
+        changed: impl Fn(&mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.purpose = purpose;
+        self.on_tasks_changed = Some(Rc::new(changed));
+        cx.notify();
+    }
+
+    /// Takes a saved task's settings: the options, the fields, the objects
+    /// ticked, the file. The settings are of this wizard's kind; an
+    /// authentication override's password is left empty, to be typed.
+    pub fn apply(&mut self, settings: TaskSettings, window: &mut Window, cx: &mut Context<Self>) {
+        fn set(input: &Entity<InputState>, value: String, window: &mut Window, cx: &mut App) {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        let folder = |path: &Path| path.display().to_string();
+        let (extra, auth_user) = match &settings {
+            TaskSettings::Backup(o) => (o.extra_args.clone(), o.auth_user.clone()),
+            TaskSettings::GlobalBackup(o) => (o.extra_args.clone(), o.auth_user.clone()),
+            TaskSettings::Restore(o) => (o.extra_args.clone(), o.auth_user.clone()),
+            TaskSettings::ExecuteScript(o) => (o.extra_args.clone(), o.auth_user.clone()),
+        };
+        set(&self.extra, extra, window, cx);
+        set(
+            &self.auth_user,
+            auth_user.clone().unwrap_or_default(),
+            window,
+            cx,
+        );
+        self.auth = auth_user.is_some();
+        match settings {
+            TaskSettings::Backup(options) => {
+                set(&self.folder, folder(&options.output_folder), window, cx);
+                set(&self.pattern, options.file_pattern.clone(), window, cx);
+                if let EngineBackup::Postgres(pg) = &options.engine {
+                    let text =
+                        |value: Option<u32>| value.map(|n| n.to_string()).unwrap_or_default();
+                    set(
+                        &self.compression,
+                        text(pg.compression.map(u32::from)),
+                        window,
+                        cx,
+                    );
+                    set(
+                        &self.encoding,
+                        pg.encoding.clone().unwrap_or_default(),
+                        window,
+                        cx,
+                    );
+                    set(&self.jobs, text(pg.jobs), window, cx);
+                }
+                let (schemas, tables) = (options.schemas.clone(), options.tables.clone());
+                self.backup = options;
+                if tables.is_empty() {
+                    self.only_schemas(schemas, cx);
+                } else {
+                    self.only_tables(tables, cx);
+                }
+            }
+            TaskSettings::GlobalBackup(options) => {
+                set(&self.folder, folder(&options.output_folder), window, cx);
+                set(&self.pattern, options.file_pattern.clone(), window, cx);
+                set(
+                    &self.encoding,
+                    options.encoding.clone().unwrap_or_default(),
+                    window,
+                    cx,
+                );
+                self.excluded = options.exclude_databases.iter().cloned().collect();
+                self.global = options;
+            }
+            TaskSettings::Restore(options) => {
+                let jobs = options.jobs.map(|n| n.to_string()).unwrap_or_default();
+                set(&self.jobs, jobs, window, cx);
+                let input = options.input.clone();
+                self.restore = options;
+                self.load_input(input, cx);
+            }
+            TaskSettings::ExecuteScript(options) => {
+                let input = options.input.clone();
+                self.script = options;
+                self.load_input(input, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The settings a task keeps, as the pages stand, or why they cannot
+    /// be kept (no password ever: [`TaskSettings::check`]).
+    pub fn task_settings(&self, cx: &App) -> Result<TaskSettings, String> {
+        let file = || {
+            self.file
+                .clone()
+                .ok_or_else(|| "Choose the file first.".to_string())
+        };
+        let settings = match self.mode {
+            Mode::Backup => {
+                self.output_path(cx)?;
+                TaskSettings::Backup(self.backup_options(cx)?)
+            }
+            Mode::GlobalBackup => {
+                self.output_path(cx)?;
+                TaskSettings::GlobalBackup(self.global_options(cx)?)
+            }
+            Mode::Restore => {
+                let mut options = self.restore.clone();
+                options.database = self.database.clone();
+                options.input = file()?;
+                if let Some(Ok(input)) = &self.input {
+                    options.format = input.format;
+                }
+                options.jobs = Self::number(&self.jobs, "Jobs", 1..65, cx)?;
+                options.extra_args = self.extra_value(cx);
+                options.auth_user = self.auth_user_value(cx);
+                TaskSettings::Restore(options)
+            }
+            Mode::ExecuteScript => {
+                let mut options = self.script.clone();
+                options.database = self.database.clone();
+                options.input = file()?;
+                options.extra_args = self.extra_value(cx);
+                options.auth_user = self.auth_user_value(cx);
+                TaskSettings::ExecuteScript(options)
+            }
+        };
+        settings
+            .check(self.engine)
+            .map_err(|error| error_text(&error))?;
+        Ok(settings)
+    }
+
+    /// Saves the settings as a new task, asking its name, or (`over`) back
+    /// into the task the wizard is opened on.
+    fn save_task(&mut self, over: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = match self.task_settings(cx) {
+            Ok(settings) => settings,
+            Err(why) => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(format!(
+                        "The task cannot be saved: {why}"
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        };
+        if let (true, Purpose::Task(task)) = (over, &self.purpose) {
+            let mut task = (**task).clone();
+            task.settings = settings;
+            self.store_task(task, window, cx);
+            return;
+        }
+        let suggested = format!("{} of {}", settings.label(), self.database);
+        let connection = self.connection.clone();
+        let view = cx.entity();
+        crate::tasks_view::ask_task_name(
+            "Save as task",
+            suggested,
+            String::new(),
+            window,
+            cx,
+            move |name, description, window, cx| {
+                let mut task = SavedTask::new(name, connection.clone(), settings.clone());
+                task.description = description;
+                view.update(cx, |this, cx| this.store_task(task, window, cx));
+            },
+        );
+    }
+
+    /// Writes `task` and makes it the wizard's task.
+    fn store_task(&mut self, task: SavedTask, window: &mut Window, cx: &mut Context<Self>) {
+        let storage = AppState::get(cx).storage.clone();
+        let saving = {
+            let task = task.clone();
+            bridge::spawn_blocking(cx, move || storage.save_task(&task))
+        };
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let saved = saving.await;
+            let _ = this.update_in(cx, |this, window, cx| match saved {
+                Ok(id) => {
+                    let name = task.name.clone();
+                    this.purpose = Purpose::Task(Box::new(SavedTask { id, ..task }));
+                    window.push_notification(
+                        Notification::success(SharedString::from(format!(
+                            "Saved the task “{name}”."
+                        ))),
+                        cx,
+                    );
+                    if let Some(changed) = this.on_tasks_changed.clone() {
+                        changed(cx);
+                    }
+                    cx.notify();
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(error.to_string())),
+                    cx,
+                ),
+            });
+        }));
+    }
+
+    /// Keeps how a task's run ended and its log with the task.
+    fn record_run(&self, status: HistoryStatus, ended: &str, cx: &mut Context<Self>) {
+        let Purpose::Task(task) = &self.purpose else {
+            return;
+        };
+        let lines: Vec<String> = self
+            .shown_command
+            .iter()
+            .map(|command| format!("$ {command}"))
+            .chain(self.log.iter().map(|line| line.to_string()))
+            .chain([ended.to_string()])
+            .collect();
+        let rules = match self.engine {
+            Engine::Postgres => LexRules::POSTGRES,
+            Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
+        };
+        let (storage, id) = (AppState::get(cx).storage.clone(), task.id);
+        let recording = bridge::spawn_blocking(cx, move || {
+            storage.record_task_run(id, status, &lines, rules)
+        });
+        let changed = self.on_tasks_changed.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = recording.await {
+                tracing::warn!(%error, "the task's run was not kept");
+            }
+            if let Some(changed) = changed {
+                cx.update(|cx| changed(cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Whether Start can run now with nothing more to type: the client is
+    /// found and suits, the file is read, the objects are listed, and no
+    /// password is to be typed for an authentication override (a saved
+    /// task asks it again at each run).
+    pub fn ready_to_start(&self, cx: &App) -> bool {
+        let typed = !self.auth || !self.auth_password.read(cx).value().is_empty();
+        let listed = self.mode != Mode::Backup || matches!(self.objects, Loaded::Ready(_));
+        matches!(self.step, Step::Options)
+            && matches!(self.tool_state, ToolState::Ready { .. })
+            && (!self.mode.writes() || matches!(self.input, Some(Ok(_))))
+            && listed
+            && typed
+            && self.blocked(cx).is_none()
+    }
+
+    /// Shows the last settings page, where Start is.
+    pub fn show_last_page(&mut self, cx: &mut Context<Self>) {
+        self.page = self.last_settings_page();
+        cx.notify();
+    }
+
+    /// The task the wizard is opened on, if any.
+    pub fn task(&self) -> Option<&SavedTask> {
+        match &self.purpose {
+            Purpose::Task(task) => Some(task),
+            _ => None,
+        }
     }
 
     /// The tables (and views, when shown) of a schema.
@@ -1451,7 +1773,23 @@ impl BackupDialog {
     }
 
     fn push_lines(&mut self, lines: Vec<String>, cx: &mut Context<Self>) {
-        for line in lines {
+        // A tool may echo what it was given (psql's --echo-errors prints a
+        // failed statement): the passwords of this run never show, nor
+        // reach a saved task's log.
+        let typed = self.auth_password.read(cx).value().to_string();
+        let secrets: Vec<String> = self
+            .params
+            .as_ref()
+            .and_then(|params| params.password.as_ref())
+            .map(|password| password.expose().to_string())
+            .into_iter()
+            .chain([typed])
+            .filter(|secret| !secret.is_empty())
+            .collect();
+        for mut line in lines {
+            for secret in &secrets {
+                line = line.replace(secret.as_str(), "•••");
+            }
             if self.log.len() == LOG_LINES {
                 self.log.pop_front();
             }
@@ -1485,6 +1823,11 @@ impl BackupDialog {
                 " MySQL and MariaDB run the file statement by statement: what ran before it \
                  stopped is kept."
             }
+        };
+        let run = match &ended.outcome {
+            Ok(status) if status.success() => HistoryStatus::Ok,
+            Err(Error::Cancelled) => HistoryStatus::Cancelled,
+            _ => HistoryStatus::Error,
         };
         self.step = match ended.outcome {
             Ok(status) if status.success() => {
@@ -1546,6 +1889,10 @@ impl BackupDialog {
                 text: format!("{error}. Nothing was run."),
             },
         };
+        if let Step::Finished { text, .. } = &self.step {
+            let text = text.clone();
+            self.record_run(run, &text, cx);
+        }
         if self.close_when_stopped {
             window.close_dialog(cx);
         }
@@ -3586,9 +3933,36 @@ impl BackupDialog {
             )
             .map(|this| {
                 if last {
-                    this.child(
-                        Button::new(start_id)
-                            .primary()
+                    // A new task is saved first; a run is started first.
+                    let new_task = self.purpose == Purpose::NewTask;
+                    let main = |button: Button, main: bool| {
+                        if main {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        }
+                    };
+                    this.when(self.task().is_some(), |this| {
+                        this.child(
+                            Button::new("wizard-save-task")
+                                .outline()
+                                .label("Save task")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_task(true, window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        main(Button::new("wizard-save-as-task"), new_task)
+                            .label("Save as task…")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.save_task(false, window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        main(Button::new(start_id), !new_task)
                             .label(start_label)
                             .disabled(self.blocked(cx).is_some())
                             .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
@@ -3635,7 +4009,12 @@ impl Render for BackupDialog {
             .test_support()
             .gap_3()
             .pt_1()
-            .child(div().text_sm().child(SharedString::from(intro)))
+            .child(
+                div()
+                    .text_sm()
+                    .child(SharedString::from(intro.clone()))
+                    .test_text(intro),
+            )
             .child(
                 h_flex()
                     .gap_3()

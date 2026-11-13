@@ -48,8 +48,11 @@ Then:
 nice -n 10 cargo test --workspace -- --test-threads=3
 ```
 
+Run `scripts/check.sh` before a commit: it runs `cargo fmt --check`, clippy, `cargo deny` and the tests (with
+the containers) locally and stops at the first failure. There is no hosted CI. `--no-tests` skips the tests.
+
 Tests that need a container return early with a message when it is down. Set `KERNO_REQUIRE_CONTAINERS=1`
-(CI does) to make that a failure. Stop the containers when you finish. Never point a test or the app at any
+(`scripts/check.sh` does) to make that a failure. Stop the containers when you finish. Never point a test or the app at any
 other database: Kerno's tests connect only to the `kerno-*` containers.
 
 Write the test first for core logic (SQL generation, parsing, type conversion, statement splitting). UI flows

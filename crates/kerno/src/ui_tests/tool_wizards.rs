@@ -32,7 +32,7 @@ fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> PathBuf {
 
 /// A stand-in client: the folder `root/name` holding every tool of
 /// `family`, each one `fake_tool(…, version, body)`. Its real path.
-fn fake_client(
+pub(super) fn fake_client(
     root: &Path,
     name: &str,
     family: ClientFamily,
@@ -64,7 +64,7 @@ impl Fixture {
     }
 
     /// Opens the wizard of `mode` on `database`.
-    fn wizard(
+    pub(super) fn wizard(
         &self,
         cx: &mut TestAppContext,
         database: &str,
@@ -91,12 +91,16 @@ impl Fixture {
         cx.update(|cx| dialog.read(cx).state(cx))
     }
 
-    fn wizard_state(&self, cx: &mut TestAppContext, dialog: &Entity<BackupDialog>) -> String {
+    pub(super) fn wizard_state(
+        &self,
+        cx: &mut TestAppContext,
+        dialog: &Entity<BackupDialog>,
+    ) -> String {
         cx.update(|cx| dialog.read(cx).state(cx))
     }
 
     /// Makes `dir` an added local client and the default of `family`.
-    fn use_client(&self, cx: &mut TestAppContext, family: ClientFamily, dir: &Path) {
+    pub(super) fn use_client(&self, cx: &mut TestAppContext, family: ClientFamily, dir: &Path) {
         let dir = dir.to_path_buf();
         cx.update(|cx| {
             AppState::update_settings(cx, |settings| {
@@ -107,7 +111,7 @@ impl Fixture {
     }
 
     /// Scrolls the wizard's page until `id` shows, then clicks it.
-    fn tap(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+    pub(super) fn tap(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
         let id = id.into();
         for step in 0..40 {
             let visible = self.step(cx, |window, _| {
@@ -137,21 +141,21 @@ impl Fixture {
     }
 
     /// Chooses `path` in the open prompt the last click opened.
-    fn answer_open_prompt(&self, cx: &mut TestAppContext, path: &Path) {
+    pub(super) fn answer_open_prompt(&self, cx: &mut TestAppContext, path: &Path) {
         let path = path.to_path_buf();
         cx.simulate_path_prompt_response(move |_| Some(vec![path]));
         cx.run_until_parked();
     }
 
     /// Goes on to the settings page.
-    fn to_settings(&self, cx: &mut TestAppContext, dialog: &Entity<BackupDialog>) {
+    pub(super) fn to_settings(&self, cx: &mut TestAppContext, dialog: &Entity<BackupDialog>) {
         while cx.update(|cx| dialog.read(cx).page()) != "Settings" {
             self.tap(cx, "wizard-next");
         }
     }
 
     /// The output folder and the file name pattern of a backup.
-    fn write_to(&self, cx: &mut TestAppContext, folder: &Path, pattern: Option<&str>) {
+    pub(super) fn write_to(&self, cx: &mut TestAppContext, folder: &Path, pattern: Option<&str>) {
         self.tap(cx, "backup-choose-folder");
         self.answer_open_prompt(cx, folder);
         if let Some(pattern) = pattern {
@@ -160,7 +164,7 @@ impl Fixture {
     }
 
     /// Replaces the text of the field `id`.
-    fn replace_text(&self, cx: &mut TestAppContext, id: &'static str, text: &str) {
+    pub(super) fn replace_text(&self, cx: &mut TestAppContext, id: &'static str, text: &str) {
         self.tap(cx, id);
         self.press(cx, &["secondary-a", "backspace"]);
         if !text.is_empty() {
@@ -176,7 +180,7 @@ impl Fixture {
 }
 
 /// Whether the window's last frame painted text holding `part`.
-fn paints(app: &Fixture, cx: &mut TestAppContext, part: &str) -> bool {
+pub(super) fn paints(app: &Fixture, cx: &mut TestAppContext, part: &str) -> bool {
     app.step(cx, |window, _| {
         gpui_kit::base::test_support::texts(window)
             .into_iter()

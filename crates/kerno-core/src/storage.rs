@@ -186,7 +186,11 @@ pub struct SavedTask {
 
 impl SavedTask {
     /// A task not stored yet.
-    pub fn new(name: impl Into<String>, connection_id: impl Into<String>, settings: TaskSettings) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        connection_id: impl Into<String>,
+        settings: TaskSettings,
+    ) -> Self {
         Self {
             id: 0,
             name: name.into(),
@@ -608,7 +612,17 @@ impl Storage {
 
     /// The saved tasks, by name.
     pub fn tasks(&self) -> Result<Vec<SavedTask>> {
-        type Row = (i64, String, String, String, String, i64, Option<i64>, Option<String>, String);
+        type Row = (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            String,
+        );
         let rows = self.with(|c| {
             c.prepare(
                 "SELECT id, name, description, connection_id, settings, created_at, last_run_at,
@@ -674,7 +688,14 @@ impl Storage {
                 "UPDATE tasks SET name = ?2, description = ?3, connection_id = ?4, kind = ?5,
                      settings = ?6
                  WHERE id = ?1",
-                params![task.id, task.name, task.description, task.connection_id, kind, json],
+                params![
+                    task.id,
+                    task.name,
+                    task.description,
+                    task.connection_id,
+                    kind,
+                    json
+                ],
             )
         })?;
         if updated == 0 {
@@ -1446,7 +1467,10 @@ mod tests {
         let tasks = storage.tasks().unwrap();
         // By name, case aside.
         assert_eq!(
-            tasks.iter().map(|task| task.name.as_str()).collect::<Vec<_>>(),
+            tasks
+                .iter()
+                .map(|task| task.name.as_str())
+                .collect::<Vec<_>>(),
             ["Apply fixes", "nightly"]
         );
         assert_eq!(tasks[0].id, second);
@@ -1462,7 +1486,12 @@ mod tests {
         };
         options.file_pattern = "shop-${date}".into();
         assert_eq!(storage.save_task(&renamed).unwrap(), first);
-        let stored = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        let stored = storage
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == first)
+            .unwrap();
         assert_eq!(stored.name, "Nightly backup");
         assert_eq!(stored.settings, renamed.settings);
         let mut missing = renamed.clone();
@@ -1471,29 +1500,53 @@ mod tests {
 
         // A run keeps its status and the last lines of its log, without
         // a password.
-        let mut log: Vec<String> = (0..TASK_LOG_LINES + 10).map(|n| format!("line {n}")).collect();
+        let mut log: Vec<String> = (0..TASK_LOG_LINES + 10)
+            .map(|n| format!("line {n}"))
+            .collect();
         log.push("psql:fix.sql:3: ALTER ROLE app PASSWORD 'hunter2';".into());
         storage
             .record_task_run(first, HistoryStatus::Error, &log, LexRules::POSTGRES)
             .unwrap();
-        let run = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        let run = storage
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == first)
+            .unwrap();
         assert_eq!(run.last_status, Some(HistoryStatus::Error));
         assert!(run.last_run_at_ms.is_some());
         let lines: Vec<&str> = run.last_log.lines().collect();
         assert_eq!(lines.len(), TASK_LOG_LINES);
         assert_eq!(lines[0], "line 11");
-        assert!(!run.last_log.contains("hunter2"), "{}", lines.last().unwrap());
+        assert!(
+            !run.last_log.contains("hunter2"),
+            "{}",
+            lines.last().unwrap()
+        );
         assert!(run.last_log.ends_with("PASSWORD '***';"));
         // Saving the task again keeps its last run.
         storage.save_task(&renamed).unwrap();
-        let kept = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        let kept = storage
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == first)
+            .unwrap();
         assert_eq!(kept.last_status, Some(HistoryStatus::Error));
 
         // Deleting a connection keeps its tasks: they say they cannot run.
         let connection = storage.save_connection(None, &config("c")).unwrap();
-        storage.save_task(&backup_task("orphan", &connection)).unwrap();
+        storage
+            .save_task(&backup_task("orphan", &connection))
+            .unwrap();
         storage.delete_connection(&connection).unwrap();
-        assert!(storage.tasks().unwrap().iter().any(|t| t.connection_id == connection));
+        assert!(
+            storage
+                .tasks()
+                .unwrap()
+                .iter()
+                .any(|t| t.connection_id == connection)
+        );
 
         storage.delete_task(first).unwrap();
         assert!(storage.tasks().unwrap().iter().all(|t| t.id != first));

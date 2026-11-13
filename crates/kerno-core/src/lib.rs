@@ -29,6 +29,7 @@ pub mod table_draft;
 #[cfg(feature = "test-support")]
 pub mod testing;
 pub mod tools;
+pub mod update;
 
 pub use config::{
     ConnectParams, ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshConfig, TlsConfig,

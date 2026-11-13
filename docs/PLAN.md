@@ -5,7 +5,7 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 
 | #  | Milestone                                                                 | Status |
 | -- | ------------------------------------------------------------------------- | ------ |
-| 0  | Environment, pinned GPUI hello window, workspace, licences, containers, fixtures, CI file | done  |
+| 0  | Environment, pinned GPUI hello window, workspace, licences, containers, fixtures, local check script | done  |
 | 1  | Driver trait, PostgreSQL and MySQL/MariaDB drivers with tests              | done   |
 | 2  | App shell: window, sidebar, tabs, theme tokens, command palette, storage, secrets, Tokio bridge | done  |
 | 3  | Connections (§4 A)                                                         | done   |

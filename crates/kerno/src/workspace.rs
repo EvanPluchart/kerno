@@ -22,7 +22,8 @@ use gpui_kit::{
     Anchor, AnyElement, AnyView, App, AppContext as _, BorrowAppContext as _, ClipboardItem,
     Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
-    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div,
+    px,
 };
 use kerno_core::config::{
     ConnectionConfig, Secret, export_connections_with_folders, import_connections_file,
@@ -61,6 +62,7 @@ use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
 use crate::navigator::actions::FilterAction;
+use crate::navigator::actions::ToolEntry;
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
@@ -71,6 +73,7 @@ use crate::structure::tab::{PROPERTIES_SECTION, StructureTab, StructureTabEvent}
 use crate::tabs::{
     self, Entry, Loss, StatusFacts, StatusItem, TabAction, TabKind, TabSnapshot, Target,
 };
+use crate::tasks_view::TasksView;
 use crate::theme::{self, Appearance};
 use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::WeakFocusHandle;
@@ -86,6 +89,8 @@ const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
 
 /// How many closed query tabs can be reopened.
 const CLOSED_TABS: usize = 10;
+
+pub(crate) mod updates;
 
 /// Where a menu of the central area opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +112,9 @@ enum OpenTab {
     Admin(Entity<AdminTab>),
     /// Not restored after a restart: an unsaved draft is not worth keeping.
     TableEditor(Entity<TableEditor>),
+    /// The saved tasks; not restored after a restart (reopened from Tools ▸
+    /// Tasks or the palette).
+    Tasks(Entity<TasksView>),
 }
 
 impl OpenTab {
@@ -145,6 +153,13 @@ impl OpenTab {
         }
     }
 
+    fn tasks(&self) -> Option<&Entity<TasksView>> {
+        match self {
+            OpenTab::Tasks(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     /// A restored tab reads nothing, and opens no session, until it is
     /// shown.
     fn defer_until_shown(&self, cx: &mut App) {
@@ -153,7 +168,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             // A query tab opens its session on its first run.
-            OpenTab::Query(_) | OpenTab::TableEditor(_) => {}
+            OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
     }
 
@@ -163,7 +178,9 @@ impl OpenTab {
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
-            OpenTab::Query(_) | OpenTab::TableEditor(_) => {}
+            // Called at every frame: the Tasks view reads its list when it
+            // opens and when a task changes, never from here.
+            OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
     }
 
@@ -172,7 +189,10 @@ impl OpenTab {
         match self {
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.hide(cx)),
             OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.hide(cx)),
-            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::TableEditor(_) => {}
+            OpenTab::Structure(_)
+            | OpenTab::Admin(_)
+            | OpenTab::TableEditor(_)
+            | OpenTab::Tasks(_) => {}
         }
     }
 
@@ -183,6 +203,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.entity_id(),
             OpenTab::Admin(tab) => tab.entity_id(),
             OpenTab::TableEditor(tab) => tab.entity_id(),
+            OpenTab::Tasks(tab) => tab.entity_id(),
         }
     }
 
@@ -219,7 +240,7 @@ impl OpenTab {
                 0 => Vec::new(),
                 count => vec![Loss::Pending(count)],
             },
-            OpenTab::Structure(_) | OpenTab::Admin(_) => Vec::new(),
+            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) => Vec::new(),
             OpenTab::TableEditor(tab) => {
                 if tab.read(cx).dirty(cx) {
                     vec![Loss::Form]
@@ -238,6 +259,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Admin(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::Tasks(_) => None,
         }
     }
 
@@ -249,6 +271,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Admin(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::Tasks(_) => None,
         }
     }
 
@@ -259,6 +282,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.focus_handle(cx),
             OpenTab::Admin(tab) => tab.focus_handle(cx),
             OpenTab::TableEditor(tab) => tab.focus_handle(cx),
+            OpenTab::Tasks(tab) => tab.focus_handle(cx),
         }
     }
 
@@ -269,7 +293,7 @@ impl OpenTab {
             OpenTab::Data(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Structure(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Admin(tab) => Some(tab.read(cx).snapshot()),
-            OpenTab::TableEditor(_) => None,
+            OpenTab::TableEditor(_) | OpenTab::Tasks(_) => None,
         }
     }
 
@@ -280,6 +304,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.read(cx).title(),
             OpenTab::Admin(tab) => tab.read(cx).title(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).title(),
+            OpenTab::Tasks(tab) => tab.read(cx).title(),
         }
     }
 
@@ -292,7 +317,7 @@ impl OpenTab {
                 tab.file().is_some() && tab.unsaved() || tab.pending_count(cx) > 0
             }
             OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
-            OpenTab::Structure(_) | OpenTab::Admin(_) => false,
+            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) => false,
             OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
         };
         let title = self.title(cx);
@@ -310,6 +335,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.read(cx).status(cx),
             OpenTab::Admin(tab) => tab.read(cx).status(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).status(cx),
+            OpenTab::Tasks(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -320,6 +346,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.clone().into(),
             OpenTab::Admin(tab) => tab.clone().into(),
             OpenTab::TableEditor(tab) => tab.clone().into(),
+            OpenTab::Tasks(tab) => tab.clone().into(),
         }
     }
 }
@@ -566,6 +593,12 @@ impl Workspace {
     #[cfg(test)]
     pub fn active_admin_tab(&self) -> Option<&Entity<AdminTab>> {
         self.tabs.get(self.active_tab)?.admin()
+    }
+
+    /// The active tab, when it is the Tasks view.
+    #[cfg(test)]
+    pub fn active_tasks_tab(&self) -> Option<&Entity<TasksView>> {
+        self.tabs.get(self.active_tab)?.tasks()
     }
 
     /// The active tab, when it is a table form.
@@ -1007,7 +1040,7 @@ impl Workspace {
             OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
-            OpenTab::Structure(_) | OpenTab::TableEditor(_) => {}
+            OpenTab::Structure(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
         // A closed query tab can be opened again, with its text.
         if let OpenTab::Query(tab) = tab {
@@ -1367,6 +1400,10 @@ impl Workspace {
             }
             TabAction::NewConnection => self.new_connection(&NewConnection, window, cx),
             TabAction::DisconnectAll => self.disconnect_all(&DisconnectAll, window, cx),
+            TabAction::Update
+            | TabAction::OpenReleasePage
+            | TabAction::SkipVersion
+            | TabAction::TurnOffUpdateChecks => self.update_action(action, window, cx),
             // The editor runs its entries itself.
             other => tracing::warn!(?other, "not an action of the window"),
         }
@@ -1694,16 +1731,11 @@ impl Workspace {
             } => {
                 self.import_csv_into(target.clone(), schema.clone(), table.clone(), window, cx);
             }
-            NavigatorEvent::BackupRestore {
+            NavigatorEvent::Tool {
                 target,
-                restore,
+                entry,
                 tables,
-            } => {
-                let dialog = self.backup_restore(target.clone(), *restore, window, cx);
-                if let Some(dialog) = dialog.filter(|_| !tables.is_empty()) {
-                    dialog.update(cx, |dialog, cx| dialog.only_tables(tables.clone(), cx));
-                }
-            }
+            } => self.run_tool(target.clone(), entry.clone(), tables.clone(), window, cx),
             NavigatorEvent::SetDefault { target } => {
                 let tab = self.active_query_tab().filter(|tab| {
                     tab.read(cx)
@@ -2253,6 +2285,27 @@ impl Workspace {
         }
     }
 
+    /// A Tools ▸ entry from the palette or the menu bar: on the database of
+    /// the active tab, else on the default one of the connection the tree
+    /// shows.
+    fn tool_command(&mut self, entry: ToolEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.target(cx))
+            .or_else(|| self.default_target(cx));
+        match target {
+            Some(target) => self.run_tool(target, entry, Vec::new(), window, cx),
+            None => window.push_notification(
+                Notification::warning(SharedString::from(format!(
+                    "{}: connect first, or right-click a database in the tree ▸ Tools.",
+                    entry.label().trim_end_matches('…')
+                ))),
+                cx,
+            ),
+        }
+    }
+
     /// Opens the backup of the database of `target`, or the restore of a
     /// file into it. A restore refreshes that database in the tree.
     pub fn backup_restore(
@@ -2262,24 +2315,190 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<BackupDialog>> {
-        let navigator = self.sidebar.read(cx).navigator().clone();
         let mode = if restore {
             backup_dialog::Mode::Restore
         } else {
             backup_dialog::Mode::Backup
         };
-        backup_dialog::open(
+        let dialog = self.open_wizard(target, mode, window, cx)?;
+        let workspace = cx.entity().downgrade();
+        dialog.update(cx, |dialog, cx| {
+            dialog.set_purpose(
+                backup_dialog::Purpose::Run,
+                move |cx| reload_tasks(&workspace, cx),
+                cx,
+            )
+        });
+        Some(dialog)
+    }
+
+    /// Opens the wizard of `mode` on the database of `target`. A restore
+    /// or a script refreshes that database in the tree.
+    fn open_wizard(
+        &mut self,
+        target: Target,
+        mode: backup_dialog::Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BackupDialog>> {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        open_wizard_with(
             self.connections.clone(),
+            navigator,
             target,
             mode,
             window,
             cx,
-            move |connection, database, _, cx| {
-                navigator.update(cx, |navigator, cx| {
-                    navigator.refresh_database(connection, database, cx)
-                })
-            },
         )
+    }
+
+    /// Does what a Tools ▸ entry says on `target` (maintenance tools open in
+    /// the tree): a wizard, with only `tables` or the schema of `target`
+    /// ticked for a backup; the administration on its sub-tab; the foreign
+    /// data wrappers; a new task; the Tasks view.
+    pub fn run_tool(
+        &mut self,
+        target: Target,
+        entry: ToolEntry,
+        tables: Vec<TableRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use backup_dialog::Mode;
+        let mode = match &entry {
+            ToolEntry::Backup => Some(Mode::Backup),
+            ToolEntry::GlobalBackup => Some(Mode::GlobalBackup),
+            ToolEntry::Restore => Some(Mode::Restore),
+            ToolEntry::ExecuteScript => Some(Mode::ExecuteScript),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            let schema = target.schema.clone();
+            let workspace = cx.entity().downgrade();
+            if let Some(dialog) = self.open_wizard(target, mode, window, cx) {
+                dialog.update(cx, |dialog, cx| {
+                    dialog.set_purpose(
+                        backup_dialog::Purpose::Run,
+                        move |cx| reload_tasks(&workspace, cx),
+                        cx,
+                    );
+                    if mode == Mode::Backup {
+                        if !tables.is_empty() {
+                            dialog.only_tables(tables, cx);
+                        } else if let Some(schema) = schema {
+                            dialog.only_schemas(vec![schema], cx);
+                        }
+                    }
+                });
+            }
+            return;
+        }
+        match entry {
+            ToolEntry::Dashboard => {
+                self.open_admin(&target.connection, window, cx);
+            }
+            ToolEntry::SessionManager | ToolEntry::LockManager => {
+                let section = if entry == ToolEntry::LockManager {
+                    crate::admin::tab::LOCKS
+                } else {
+                    crate::admin::tab::SESSIONS
+                };
+                let tab = self.open_admin(&target.connection, window, cx);
+                tab.update(cx, |tab, cx| tab.select(section, window, cx));
+            }
+            ToolEntry::ForeignDataWrappers => {
+                crate::fdw_dialog::open(self.connections.clone(), target, window, cx);
+            }
+            ToolEntry::NewTask => self.new_task(target, tables, window, cx),
+            ToolEntry::Tasks => {
+                self.open_tasks(window, cx);
+            }
+            ToolEntry::Backup
+            | ToolEntry::GlobalBackup
+            | ToolEntry::Restore
+            | ToolEntry::ExecuteScript
+            | ToolEntry::Maintain(_) => {}
+        }
+    }
+
+    /// Tools ▸ Create new task…: the tool to make a task of, then its
+    /// wizard, whose main button saves the task.
+    fn new_task(
+        &mut self,
+        target: Target,
+        tables: Vec<TableRef>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self
+            .connections
+            .read(cx)
+            .get(&target.connection)
+            .map(|saved| saved.config.engine)
+        else {
+            return;
+        };
+        let workspace = cx.entity().downgrade();
+        crate::tasks_view::pick_tool(engine, window, cx, move |mode, window, cx| {
+            let (target, tables, workspace) = (target.clone(), tables.clone(), workspace.clone());
+            let _ = workspace.clone().update(cx, |this, cx| {
+                let schema = target.schema.clone();
+                if let Some(dialog) = this.open_wizard(target, mode, window, cx) {
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.set_purpose(
+                            backup_dialog::Purpose::NewTask,
+                            move |cx| reload_tasks(&workspace, cx),
+                            cx,
+                        );
+                        if mode == backup_dialog::Mode::Backup {
+                            if !tables.is_empty() {
+                                dialog.only_tables(tables, cx);
+                            } else if let Some(schema) = schema {
+                                dialog.only_schemas(vec![schema], cx);
+                            }
+                        }
+                    });
+                }
+            });
+        });
+    }
+
+    /// Shows the Tasks view: the tab that shows it, else a new one.
+    pub fn open_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TasksView> {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.tasks().is_some()) {
+            self.activate_tab(index, window, cx);
+            let tab = self.tabs[index].tasks().expect("the tasks tab").clone();
+            tab.update(cx, |tab, cx| tab.reload(cx));
+            return tab;
+        }
+        let (connections, navigator) = (
+            self.connections.clone(),
+            self.sidebar.read(cx).navigator().clone(),
+        );
+        let open: Rc<crate::tasks_view::OpenWizard> = Rc::new(move |target, mode, window, cx| {
+            open_wizard_with(
+                connections.clone(),
+                navigator.clone(),
+                target,
+                mode,
+                window,
+                cx,
+            )
+        });
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| TasksView::new(connections, open, cx));
+        self.tab_subscriptions
+            .push(cx.observe(&tab, |_, _, cx| cx.notify()));
+        self.tabs.push(OpenTab::Tasks(tab.clone()));
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        tab
+    }
+
+    /// Reads the tasks again in the Tasks view, if it is open.
+    fn reload_tasks(&mut self, cx: &mut Context<Self>) {
+        for tab in self.tabs.iter().filter_map(OpenTab::tasks) {
+            tab.update(cx, |tab, cx| tab.reload(cx));
+        }
     }
 
     fn refresh_data(&mut self, _: &RefreshData, window: &mut Window, cx: &mut Context<Self>) {
@@ -2542,14 +2761,8 @@ impl Workspace {
             SidebarEvent::ImportConnections => {
                 self.import_connections(&ImportConnections, window, cx)
             }
-            SidebarEvent::OpenAdmin(id) => {
-                self.open_admin(id, window, cx);
-            }
-            SidebarEvent::OpenLocks(id) => {
-                let tab = self.open_admin(id, window, cx);
-                tab.update(cx, |tab, cx| {
-                    tab.select(crate::admin::tab::LOCKS, window, cx)
-                });
+            SidebarEvent::Tool(id, entry) => {
+                self.run_tool(connection_target(id), entry.clone(), Vec::new(), window, cx)
             }
             SidebarEvent::Disconnect { ids, action } => {
                 self.disconnect(ids.clone(), action.clone(), window, cx)
@@ -3301,14 +3514,19 @@ impl Workspace {
                             }),
                     ),
             )
-            .when(memory_only, |this| {
-                this.child(self.render_status_item(
-                    StatusItem::MemoryOnly,
-                    "Passwords are kept in memory only (no system secret store in use)",
-                    warning,
-                    cx,
-                ))
-            })
+            .child(
+                h_flex()
+                    .gap_3()
+                    .children(self.update_item(cx))
+                    .when(memory_only, |this| {
+                        this.child(self.render_status_item(
+                            StatusItem::MemoryOnly,
+                            "Passwords are kept in memory only (no system secret store in use)",
+                            warning,
+                            cx,
+                        ))
+                    }),
+            )
     }
 }
 
@@ -4070,6 +4288,35 @@ impl Workspace {
 }
 
 /// Where a tab runs on a connection: its own database and schema.
+/// Opens the wizard of `mode` on `target`; a restore or a script that
+/// succeeded refreshes its database in `navigator`.
+fn open_wizard_with(
+    connections: Entity<Connections>,
+    navigator: Entity<Navigator>,
+    target: Target,
+    mode: backup_dialog::Mode,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<BackupDialog>> {
+    backup_dialog::open(
+        connections,
+        target,
+        mode,
+        window,
+        cx,
+        move |connection, database, _, cx| {
+            navigator.update(cx, |navigator, cx| {
+                navigator.refresh_database(connection, database, cx)
+            })
+        },
+    )
+}
+
+/// Reads the tasks again in the Tasks view of `workspace`, if it is open.
+fn reload_tasks(workspace: &WeakEntity<Workspace>, cx: &mut App) {
+    let _ = workspace.update(cx, |workspace, cx| workspace.reload_tasks(cx));
+}
+
 fn connection_target(id: &str) -> Target {
     Target {
         connection: id.to_string(),
@@ -4248,6 +4495,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::use_dark_theme))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::open_sql_file))
@@ -4315,6 +4563,31 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RestoreDatabase, window, cx| {
                 this.backup_restore_command(true, window, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GlobalBackup, window, cx| {
+                    this.tool_command(ToolEntry::GlobalBackup, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ExecuteScript, window, cx| {
+                    this.tool_command(ToolEntry::ExecuteScript, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ForeignDataWrappers, window, cx| {
+                    this.tool_command(ToolEntry::ForeignDataWrappers, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateTask, window, cx| {
+                    this.tool_command(ToolEntry::NewTask, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowTasks, window, cx| {
+                    this.open_tasks(window, cx);
+                }),
+            )
             .on_action(cx.listener(Self::add_row))
             .on_action(cx.listener(Self::duplicate_rows))
             .on_action(cx.listener(Self::delete_rows))

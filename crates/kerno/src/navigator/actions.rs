@@ -178,7 +178,6 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Object(ObjectRef::Database(_)) if has_schemas => {
             vec![
                 vec![NewQueryHere, CreateSchema, CreateDatabase],
-                vec![Backup, Restore],
                 vec![Properties, CopyName, CopyQualifiedName],
                 vec![Drop],
             ]
@@ -192,7 +191,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateDatabase,
             ],
-            vec![ImportCsv, Backup, Restore],
+            vec![ImportCsv],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
@@ -216,12 +215,12 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 NewQueryHere,
                 ReadInConsole,
             ],
-            // DBeaver's Tools ▸ Backup on tables (`tools.backup.db`).
-            vec![Export, ImportCsv, Backup],
+            // Backup and Truncate are under Tools ▸ ([`tool_entries`]).
+            vec![Export, ImportCsv],
             all_templates.to_vec(),
             vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
-            vec![Rename, Truncate, Drop],
+            vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(
             _,
@@ -357,6 +356,202 @@ pub fn tools(node: &Node, dialect: &dyn Dialect) -> Vec<Maintenance> {
         tools.retain(|tool| *tool != other);
     }
     tools
+}
+
+/// An entry of Tools ▸, after DBeaver's tool groups (`toolGroup`s of
+/// `ext.postgresql.ui/plugin.xml` and `ext.mysql.ui/plugin.xml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEntry {
+    /// The backup wizard (`pg_dump`, `mysqldump`).
+    Backup,
+    /// `pg_dumpall`: the whole server.
+    GlobalBackup,
+    Restore,
+    /// A SQL file run by `psql` / `mysql`.
+    ExecuteScript,
+    /// A maintenance tool at its default options.
+    Maintain(Maintenance),
+    /// PostgreSQL's foreign servers, user mappings and imported schemas.
+    ForeignDataWrappers,
+    /// The administration tab.
+    Dashboard,
+    /// The administration tab on its sessions.
+    SessionManager,
+    /// The administration tab on its locks.
+    LockManager,
+    /// A tool's wizard whose aim is a saved task.
+    NewTask,
+    /// The Tasks view.
+    Tasks,
+}
+
+impl ToolEntry {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Backup => "Back up…".into(),
+            Self::GlobalBackup => "Global backup…".into(),
+            Self::Restore => "Restore…".into(),
+            Self::ExecuteScript => "Execute script…".into(),
+            Self::Maintain(Maintenance::RefreshMaterializedView(_)) => {
+                "Refresh materialized view…".into()
+            }
+            Self::Maintain(tool) => format!("{}…", crate::maintenance_dialog::label(tool)),
+            Self::ForeignDataWrappers => "Foreign data wrappers…".into(),
+            Self::Dashboard => "Open dashboard".into(),
+            Self::SessionManager => "Session manager".into(),
+            Self::LockManager => "Lock manager".into(),
+            Self::NewTask => "Create new task…".into(),
+            Self::Tasks => "Tasks".into(),
+        }
+    }
+
+    /// Whether it changes the database, which a read-only connection does
+    /// not allow (as before, every maintenance tool counts).
+    pub fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::Restore | Self::ExecuteScript | Self::Maintain(_)
+        )
+    }
+}
+
+/// The Tools ▸ menu of `node` (of a connection when `None`) in groups,
+/// each entry with why it does not apply there when it does not, as
+/// DBeaver lists its tools per engine: PostgreSQL — Backup, Global backup,
+/// Restore, Execute script | Analyze, Vacuum, Truncate, Refresh
+/// materialized view, Enable / Disable trigger | Foreign data wrappers |
+/// dashboard, sessions, locks | tasks; MySQL and MariaDB — Backup, Restore,
+/// Execute script | Analyze, Check, Optimize, Repair, Truncate | dashboard,
+/// sessions, locks | tasks. `maintenance` is what the dialect offers for the
+/// node ([`tools`]). Only databases, schemas, tables, views and triggers
+/// have the menu; a connection has no maintenance group (its tools act on
+/// objects of the tree).
+pub fn tool_entries(
+    node: Option<&Node>,
+    has_schemas: bool,
+    maintenance: &[Maintenance],
+) -> ToolGroups {
+    use ToolEntry::*;
+    let object = match node.map(|node| &node.kind) {
+        None => None,
+        Some(NodeKind::Object(
+            object @ (ObjectRef::Database(_)
+            | ObjectRef::Schema(_)
+            | ObjectRef::Relation(..)
+            | ObjectRef::Trigger { .. }),
+        )) => Some(object),
+        Some(_) => return Vec::new(),
+    };
+    let whole = matches!(
+        object,
+        None | Some(ObjectRef::Database(_) | ObjectRef::Schema(_))
+    );
+    let backup = match object {
+        Some(ObjectRef::Relation(_, kind)) if !kind.is_table() => {
+            Some("on a database, schema or table")
+        }
+        Some(ObjectRef::Trigger { .. }) => Some("on a database, schema or table"),
+        _ => None,
+    };
+    let into_database = (!whole).then_some("into a database");
+    let mut groups = vec![if has_schemas {
+        vec![
+            (Backup, backup),
+            (GlobalBackup, None),
+            (Restore, into_database),
+            (ExecuteScript, into_database),
+        ]
+    } else {
+        vec![
+            (Backup, backup),
+            (Restore, into_database),
+            (ExecuteScript, into_database),
+        ]
+    }];
+    if object.is_some() {
+        let offered = |wanted: &Maintenance| {
+            maintenance
+                .iter()
+                .find(|tool| std::mem::discriminant(*tool) == std::mem::discriminant(wanted))
+                .cloned()
+        };
+        let entry = |default: Maintenance, reason: &'static str| match offered(&default) {
+            Some(tool) => (Maintain(tool), None),
+            None => (Maintain(default), Some(reason)),
+        };
+        let relation = "on a database, table or materialized view";
+        groups.push(if has_schemas {
+            // A trigger offers the one switch that changes it.
+            let switch = if offered(&Maintenance::EnableTrigger).is_some() {
+                Maintenance::EnableTrigger
+            } else {
+                Maintenance::DisableTrigger
+            };
+            vec![
+                entry(Maintenance::Analyze, relation),
+                entry(Maintenance::Vacuum(Default::default()), relation),
+                entry(Maintenance::Truncate(Default::default()), "on a table"),
+                entry(
+                    Maintenance::RefreshMaterializedView(Default::default()),
+                    "on a materialized view",
+                ),
+                entry(switch, "on a trigger"),
+            ]
+        } else {
+            vec![
+                entry(Maintenance::Analyze, "on a table"),
+                entry(Maintenance::Check(None), "on a table"),
+                entry(Maintenance::Optimize, "on a table"),
+                entry(Maintenance::Repair(Default::default()), "on a table"),
+                entry(Maintenance::Truncate(Default::default()), "on a table"),
+            ]
+        });
+    }
+    if has_schemas {
+        groups.push(vec![(ForeignDataWrappers, None)]);
+    }
+    groups.push(vec![
+        (Dashboard, None),
+        (SessionManager, None),
+        (LockManager, None),
+    ]);
+    groups.push(vec![(NewTask, None), (Tasks, None)]);
+    groups
+}
+
+/// Tools ▸ in groups, each entry with why it cannot be used, if it cannot.
+pub type ToolGroups = Vec<Vec<(ToolEntry, Option<&'static str>)>>;
+
+/// `groups` with why each entry cannot be used now, besides the kind of
+/// node: a closed connection opens only the Tasks view, a read-only one
+/// refuses what writes.
+pub fn tools_now(groups: ToolGroups, connected: bool, read_only: bool) -> ToolGroups {
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|(entry, reason)| {
+                    let now = if !connected && entry != ToolEntry::Tasks {
+                        Some("not connected")
+                    } else {
+                        (entry.writes() && read_only).then_some("read-only connection")
+                    };
+                    (entry, reason.or(now))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Whether two Tools ▸ entries are the same tool, options aside.
+pub fn same_tool(a: &ToolEntry, b: &ToolEntry) -> bool {
+    match (a, b) {
+        (ToolEntry::Maintain(a), ToolEntry::Maintain(b)) => {
+            std::mem::discriminant(a) == std::mem::discriminant(b)
+        }
+        _ => a == b,
+    }
 }
 
 /// What a double click or Enter does to a node: an entry of its menu, or
@@ -557,11 +752,12 @@ mod tests {
             ShowDdl,
             CopyName,
             Rename,
-            Truncate,
             Drop,
         ] {
             assert!(table.contains(&action), "{action:?}");
         }
+        // Backup, Restore and Truncate moved under Tools ▸.
+        assert!(!table.contains(&Truncate) && !table.contains(&Backup));
         // A view is read, not written or emptied.
         let view = flat(
             NodeKind::Object(ObjectRef::Relation(orders.clone(), RelationKind::View)),
@@ -611,11 +807,10 @@ mod tests {
         assert!(view.contains(&Export) && !view.contains(&ImportCsv));
         assert!(schema.contains(&ImportCsv) && mysql_database.contains(&ImportCsv));
         assert!(!pg_database.contains(&ImportCsv));
-        // A database is what the client tools back up and restore.
-        for database in [&pg_database, &mysql_database] {
-            assert!(database.contains(&Backup) && database.contains(&Restore));
+        // The client tools are under Tools ▸ (see `tool_entries`).
+        for menu in [&pg_database, &mysql_database, &schema] {
+            assert!(!menu.contains(&Backup) && !menu.contains(&Restore));
         }
-        assert!(!schema.contains(&Backup) && !table.contains(&Restore));
         assert_eq!(
             flat(
                 NodeKind::Column {
@@ -1056,6 +1251,150 @@ mod tests {
             },
         ] {
             assert!(of(other, &pg).is_empty());
+        }
+    }
+
+    /// Tools ▸ as the menu shows it: groups apart, each disabled entry
+    /// with its reason.
+    fn tool_labels(node: Option<&Node>, dialect: &dyn Dialect) -> Vec<String> {
+        let offered = node.map(|node| tools(node, dialect)).unwrap_or_default();
+        tool_entries(node, dialect.has_schemas(), &offered)
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|(entry, reason)| match reason {
+                        Some(reason) => format!("{} ({reason})", entry.label()),
+                        None => entry.label(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_tools_submenu_follows_the_engine_and_the_kind_of_node() {
+        let pg = kerno_postgres::PgDialect;
+        let mysql = kerno_mysql::MysqlDialect::new(kerno_core::Engine::MySql);
+        let orders = TableRef::new("shop", "orders");
+        let relation = |kind| node(NodeKind::Object(ObjectRef::Relation(orders.clone(), kind)));
+        let database = node(NodeKind::Object(ObjectRef::Database("kerno".into())));
+        let schema = node(NodeKind::Object(ObjectRef::Schema("shop".into())));
+        let tail = [
+            "Foreign data wrappers…",
+            "Open dashboard, Session manager, Lock manager",
+            "Create new task…, Tasks",
+        ];
+        let with_tail = |head: &[&str]| {
+            head.iter()
+                .chain(tail.iter())
+                .map(|group| group.to_string())
+                .collect::<Vec<_>>()
+        };
+        // PostgreSQL: a database, a schema, a table, a materialized view,
+        // a view, a trigger.
+        assert_eq!(
+            tool_labels(Some(&database), &pg),
+            with_tail(&[
+                "Back up…, Global backup…, Restore…, Execute script…",
+                "Analyze…, Vacuum…, Truncate… (on a table), Refresh materialized view… (on a \
+                 materialized view), Disable trigger… (on a trigger)",
+            ])
+        );
+        assert_eq!(
+            tool_labels(Some(&schema), &pg),
+            with_tail(&[
+                "Back up…, Global backup…, Restore…, Execute script…",
+                "Analyze… (on a database, table or materialized view), Vacuum… (on a database, \
+                 table or materialized view), Truncate… (on a table), Refresh materialized \
+                 view… (on a materialized view), Disable trigger… (on a trigger)",
+            ])
+        );
+        assert_eq!(
+            tool_labels(Some(&relation(RelationKind::Table)), &pg),
+            with_tail(&[
+                "Back up…, Global backup…, Restore… (into a database), Execute script… (into a \
+                 database)",
+                "Analyze…, Vacuum…, Truncate…, Refresh materialized view… (on a materialized \
+                 view), Disable trigger… (on a trigger)",
+            ])
+        );
+        let matview = tool_labels(Some(&relation(RelationKind::MaterializedView)), &pg);
+        assert!(
+            matview[0].starts_with("Back up… (on a database, schema or table)")
+                && matview[1].contains("Truncate… (on a table), Refresh materialized view…, "),
+            "{matview:?}"
+        );
+        let view = tool_labels(Some(&relation(RelationKind::View)), &pg);
+        assert!(view[1].starts_with("Analyze… (on a database"), "{view:?}");
+        let mut trigger = node(NodeKind::Object(ObjectRef::Trigger {
+            table: orders.clone(),
+            name: "orders_log".into(),
+        }));
+        assert!(tool_labels(Some(&trigger), &pg)[1].ends_with(", Disable trigger…"));
+        trigger.muted = true;
+        assert!(tool_labels(Some(&trigger), &pg)[1].ends_with(", Enable trigger…"));
+        // A connection: the client tools and the rest, no maintenance.
+        assert_eq!(
+            tool_labels(None, &pg),
+            with_tail(&["Back up…, Global backup…, Restore…, Execute script…"])
+        );
+
+        // MySQL and MariaDB: no global backup, no foreign data wrappers.
+        let mysql_tail = &tail[1..];
+        assert_eq!(
+            tool_labels(Some(&database), &mysql),
+            [
+                "Back up…, Restore…, Execute script…",
+                "Analyze… (on a table), Check… (on a table), Optimize… (on a table), Repair… \
+                 (on a table), Truncate… (on a table)",
+            ]
+            .iter()
+            .chain(mysql_tail)
+            .map(|group| group.to_string())
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tool_labels(Some(&relation(RelationKind::Table)), &mysql)[..2],
+            [
+                "Back up…, Restore… (into a database), Execute script… (into a database)",
+                "Analyze…, Check…, Optimize…, Repair…, Truncate…",
+            ]
+        );
+        assert_eq!(
+            tool_labels(None, &mysql),
+            ["Back up…, Restore…, Execute script…"]
+                .iter()
+                .chain(mysql_tail)
+                .map(|group| group.to_string())
+                .collect::<Vec<_>>()
+        );
+        // Other nodes have no Tools ▸.
+        for other in [
+            NodeKind::Group(Group::Tables),
+            NodeKind::Column {
+                table: orders.clone(),
+                name: "id".into(),
+            },
+            NodeKind::Object(ObjectRef::Sequence(orders)),
+        ] {
+            assert!(tool_labels(Some(&node(other)), &pg).is_empty());
+        }
+        // What writes is refused on a read-only connection; the rest is not.
+        for (entry, writes) in [
+            (ToolEntry::Backup, false),
+            (ToolEntry::GlobalBackup, false),
+            (ToolEntry::Restore, true),
+            (ToolEntry::ExecuteScript, true),
+            (ToolEntry::Maintain(Maintenance::Analyze), true),
+            (ToolEntry::ForeignDataWrappers, false),
+            (ToolEntry::Dashboard, false),
+            (ToolEntry::LockManager, false),
+            (ToolEntry::NewTask, false),
+            (ToolEntry::Tasks, false),
+        ] {
+            assert_eq!(entry.writes(), writes, "{entry:?}");
         }
     }
 

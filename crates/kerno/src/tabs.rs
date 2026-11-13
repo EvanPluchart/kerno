@@ -164,6 +164,11 @@ pub enum TabAction {
     CopyStatement,
     /// Runs the statement of an incomplete result again.
     RunAgain,
+    // The update item of the status bar.
+    Update,
+    OpenReleasePage,
+    SkipVersion,
+    TurnOffUpdateChecks,
 }
 
 impl TabAction {
@@ -241,6 +246,10 @@ impl TabAction {
             Self::UnpinAll => "Unpin all tabs",
             Self::CopyStatement => "Copy statement",
             Self::RunAgain => "Run again",
+            Self::Update => "Update",
+            Self::OpenReleasePage => "Open release page",
+            Self::SkipVersion => "Skip this version",
+            Self::TurnOffUpdateChecks => "Turn off update checks",
         }
         .to_string()
     }
@@ -605,6 +614,8 @@ pub enum StatusItem {
     Messages,
     /// Passwords are kept in memory only.
     MemoryOnly,
+    /// A newer Kerno is out (CLAUDE.md §3 item 12).
+    Update,
 }
 
 impl StatusItem {
@@ -622,6 +633,7 @@ impl StatusItem {
             Self::Timing => "status-timing",
             Self::Messages => "status-messages",
             Self::MemoryOnly => "status-memory-only",
+            Self::Update => "status-update",
         }
     }
 }
@@ -715,6 +727,13 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
         ],
         StatusItem::Rows | StatusItem::Timing => vec![enabled(TabAction::CopyText(text.into()))],
         StatusItem::MemoryOnly => vec![enabled(TabAction::AboutMemoryOnly)],
+        StatusItem::Update => vec![
+            enabled(TabAction::Update),
+            enabled(TabAction::OpenReleasePage),
+            Separator,
+            enabled(TabAction::SkipVersion),
+            enabled(TabAction::TurnOffUpdateChecks),
+        ],
     }
 }
 
@@ -1212,6 +1231,16 @@ mod tests {
             ["Review SQL…", "Discard changes"]
         );
         assert_eq!(menu(StatusItem::MemoryOnly, &facts), ["What this means…"]);
+        assert_eq!(
+            menu(StatusItem::Update, &facts),
+            [
+                "Update",
+                "Open release page",
+                "—",
+                "Skip this version",
+                "Turn off update checks"
+            ]
+        );
         assert_eq!(
             menu(StatusItem::Summary, &facts),
             ["New connection…", "—", "Copy"]

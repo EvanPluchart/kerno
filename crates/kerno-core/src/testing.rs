@@ -2,7 +2,7 @@
 //! `docker-compose.yml`), for integration tests across the workspace.
 //!
 //! Tests call [`available`] first and return early when the container is
-//! down, after printing why. With `KERNO_REQUIRE_CONTAINERS=1` (set in CI) a
+//! down, after printing why. With `KERNO_REQUIRE_CONTAINERS=1` (set by `scripts/check.sh`) a
 //! missing container fails the test instead.
 
 use std::collections::BTreeMap;

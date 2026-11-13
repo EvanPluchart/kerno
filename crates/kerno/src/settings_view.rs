@@ -33,9 +33,10 @@ pub(crate) enum Section {
     Confirmations,
     Tools,
     Environments,
+    Updates,
 }
 
-pub(crate) const SECTIONS: [(Section, &str); 7] = [
+pub(crate) const SECTIONS: [(Section, &str); 8] = [
     (Section::Appearance, "Appearance"),
     (Section::Fonts, "Fonts"),
     (Section::Editor, "Editor"),
@@ -43,6 +44,7 @@ pub(crate) const SECTIONS: [(Section, &str); 7] = [
     (Section::Confirmations, "Confirmations"),
     (Section::Tools, "Local clients"),
     (Section::Environments, "Environments"),
+    (Section::Updates, "Updates"),
 ];
 
 /// One text size the settings hold.
@@ -440,6 +442,22 @@ impl SettingsView {
                 .into_any_element(),
             Section::Tools => self.local_clients.clone().into_any_element(),
             Section::Environments => self.environments.clone().into_any_element(),
+            Section::Updates => v_flex()
+                .gap_2()
+                .child(Self::toggle(
+                    "settings-check-updates",
+                    "Check for updates",
+                    settings.check_updates,
+                    |settings, on| settings.check_updates = on,
+                ))
+                .child(note(
+                    "At launch and every 6 hours, Kerno asks \
+                     https://github.com/EvanPluchart/kerno/releases/latest which version is the \
+                     newest, without following the answer; nothing else is sent. Help ▸ Check \
+                     for Updates… asks even when this is off; KERNO_NO_UPDATE_CHECK turns both \
+                     off.",
+                ))
+                .into_any_element(),
         }
     }
 }
