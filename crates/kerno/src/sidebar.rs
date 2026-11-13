@@ -15,9 +15,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter,
-    Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div,
-    px,
+    FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window, div, px,
 };
 use kerno_core::config::{connection_url, last_folder_name, parent_folder};
 use kerno_core::storage::SavedConnection;
@@ -215,6 +215,9 @@ pub struct Sidebar {
     selected: Option<String>,
     /// The schema tree of the selected connection.
     navigator: Entity<Navigator>,
+    /// The list of connections, which takes Enter and F4 once a row is
+    /// clicked (key context `ConnectionList`).
+    focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -246,6 +249,7 @@ impl Sidebar {
             connections,
             selected: None,
             navigator,
+            focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -260,6 +264,35 @@ impl Sidebar {
         self.navigator
             .update(cx, |navigator, cx| navigator.set_connection(Some(id), cx));
         cx.notify();
+    }
+
+    /// Browses a connection, connecting it first when it is closed: what a
+    /// double click and Enter do (DBeaver's default). Disconnecting is the
+    /// menu's.
+    fn open(&mut self, id: String, cx: &mut Context<Self>) {
+        self.select(id.clone(), cx);
+        self.connections.update(cx, |connections, cx| {
+            if matches!(
+                connections.status(&id),
+                Status::Disconnected | Status::Failed { .. }
+            ) {
+                connections.connect(&id, cx)
+            }
+        });
+    }
+
+    /// What Enter does to the selected connection.
+    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected.clone() {
+            self.open(id, cx);
+        }
+    }
+
+    /// What F4 does to the selected connection: opens its dialog.
+    pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected.clone() {
+            Self::edit(self.connections.clone(), id, window, cx);
+        }
     }
 
     /// The menu of `subject` as it stands now.
@@ -648,18 +681,13 @@ impl Sidebar {
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .on_click(cx.listener({
                 let id = id.clone();
-                move |this, event: &ClickEvent, _, cx| {
-                    this.select(id.clone(), cx);
-                    // A double click opens (or closes) the connection.
+                move |this, event: &ClickEvent, window, cx| {
+                    this.focus_handle.focus(window, cx);
                     if event.click_count() >= 2 {
-                        this.connections.update(cx, |connections, cx| {
-                            match connections.status(&id) {
-                                Status::Connected { .. } => connections.disconnect(&id, cx),
-                                _ => connections.connect(&id, cx),
-                            }
-                        });
+                        this.open(id.clone(), cx);
+                    } else {
+                        this.select(id.clone(), cx);
                     }
-                    cx.notify();
                 }
             }))
             .context_menu(self.context_menu_for(Subject::Connection(id), cx))
@@ -850,6 +878,8 @@ impl Render for Sidebar {
         // drops to the top level and offers the list's own menu.
         let list = v_flex()
             .id("connection-list")
+            .key_context("ConnectionList")
+            .track_focus(&self.focus_handle)
             .flex_none()
             .max_h(gpui_kit::relative(0.45))
             .overflow_y_scroll()

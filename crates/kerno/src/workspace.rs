@@ -1,7 +1,7 @@
 //! The main window: title bar, sidebar, tabs and status bar, and the
 //! commands that act on them.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -27,13 +27,14 @@ use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_co
 
 use crate::actions::{
     self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, CollapseConnectionFolders,
-    CollapseSchemaTree, DeleteRows, DiscardChanges, DuplicateRows, ExplainAnalyze,
-    ExplainStatement, ExportConnections, ExportData, FindInEditor, FormatSql, ImportConnections,
-    ImportCsv, NewConnection, NewConnectionFolder, NewQueryTab, NextTab, OpenCommandPalette,
-    OpenSettings, OpenSqlFile, PreviousTab, RefreshConnections, RefreshData, RefreshSchemaTree,
-    ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, SetDefault, SetNull,
-    ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme,
-    UseSystemTheme,
+    CollapseSchemaTree, CopyObjectName, CopyQualifiedName, DeleteRows, DiscardChanges, DropObject,
+    DuplicateRows, EditConnection, EditObject, ExplainAnalyze, ExplainStatement, ExportConnections,
+    ExportData, FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection,
+    NewConnectionFolder, NewQueryOnObject, NewQueryTab, NextTab, OpenCommandPalette,
+    OpenConnection, OpenSettings, OpenSqlFile, PreviousTab, RefreshConnections, RefreshData,
+    RefreshObject, RefreshSchemaTree, RenameObject, ReplaceInEditor, RunAll, RunStatement,
+    SaveFile, SaveFileAs, SaveQuery, SetDefault, SetDefaultSchema, SetNull, ShowHistory,
+    ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -43,6 +44,7 @@ use crate::connections::manager::{
 use crate::data::tab::{DataTab, DataTabEvent};
 use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
+use crate::navigator::actions::Action as TreeAction;
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::settings::TableDoubleClick;
@@ -181,6 +183,9 @@ pub struct Workspace {
     /// A connection being opened for "New SQL editor": its tab opens once
     /// it is connected.
     pending_editor: Option<String>,
+    /// Where the active query tab runs, written on each frame for the
+    /// schema tree's "Set as default for this tab".
+    tab_target: Rc<RefCell<Option<Target>>>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -211,6 +216,7 @@ impl Workspace {
         });
         let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), window, cx));
         let navigator = sidebar.read(cx).navigator().clone();
+        let tab_target = navigator.read(cx).tab_target();
         let navigator_events = cx.subscribe_in(&navigator, window, Self::on_navigator_event);
         let connection_events = cx.subscribe_in(&connections, window, Self::on_connections_event);
         let sidebar_events = cx.subscribe_in(&sidebar, window, Self::on_sidebar_event);
@@ -225,6 +231,7 @@ impl Workspace {
             palette,
             pending_save: None,
             pending_editor: None,
+            tab_target,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -894,7 +901,33 @@ impl Workspace {
             } => {
                 self.import_csv_into(target.clone(), schema.clone(), table.clone(), window, cx);
             }
+            NavigatorEvent::SetDefault { target } => {
+                let tab = self.active_query_tab().filter(|tab| {
+                    tab.read(cx)
+                        .target()
+                        .is_some_and(|tab| tab.connection == target.connection)
+                });
+                match tab.cloned() {
+                    Some(tab) => {
+                        tab.update(cx, |tab, cx| tab.set_target(Some(target.clone()), cx));
+                        self.schedule_save(cx);
+                    }
+                    None => window.push_notification(
+                        Notification::warning("Open a query tab on this connection first."),
+                        cx,
+                    ),
+                }
+            }
         }
+    }
+
+    /// Runs a key of the schema tree (or its palette command) on the
+    /// selected node.
+    fn on_tree(&mut self, action: TreeAction, window: &mut Window, cx: &mut Context<Self>) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| {
+            navigator.perform_on_selected(action, window, cx)
+        });
     }
 
     /// The sidebar; for tests.
@@ -2045,6 +2078,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        *self.tab_target.borrow_mut() = self
+            .active_query_tab()
+            .and_then(|tab| tab.read(cx).target().cloned());
         let sidebar_visible = AppState::get(cx).settings.sidebar_visible;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
@@ -2112,6 +2148,39 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collapse_connection_folders))
             .on_action(cx.listener(Self::refresh_schema_tree))
             .on_action(cx.listener(Self::collapse_schema_tree))
+            .on_action(cx.listener(|this, _: &EditObject, window, cx| {
+                let navigator = this.sidebar.read(cx).navigator().clone();
+                navigator.update(cx, |navigator, cx| navigator.edit_selected(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &RenameObject, window, cx| {
+                this.on_tree(TreeAction::Rename, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DropObject, window, cx| {
+                this.on_tree(TreeAction::Drop, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RefreshObject, window, cx| {
+                this.on_tree(TreeAction::Refresh, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyObjectName, window, cx| {
+                this.on_tree(TreeAction::CopyName, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyQualifiedName, window, cx| {
+                this.on_tree(TreeAction::CopyQualifiedName, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewQueryOnObject, window, cx| {
+                this.on_tree(TreeAction::NewQueryHere, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SetDefaultSchema, window, cx| {
+                this.on_tree(TreeAction::SetDefault, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditConnection, window, cx| {
+                this.sidebar
+                    .update(cx, |sidebar, cx| sidebar.edit_selected(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &OpenConnection, _, cx| {
+                this.sidebar
+                    .update(cx, |sidebar, cx| sidebar.open_selected(cx))
+            }))
             .size_full()
             .bg(background)
             .text_color(foreground)

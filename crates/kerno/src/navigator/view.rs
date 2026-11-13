@@ -1,6 +1,7 @@
 //! The schema tree of one connection: loads what is opened, filters,
 //! refreshes, and offers each object's actions.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{delete_template, insert_template, select_template, update_template};
 use kerno_core::{Session, exec};
 
-use super::actions::{Action, Template, actions, default_action};
+use super::actions::{Action, Template, actions, default_action, edit_action, qualified_name};
 use super::model::{self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Tree};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
@@ -77,6 +78,8 @@ pub enum NavigatorEvent {
         schema: String,
         table: Option<TableRef>,
     },
+    /// Make `target` (a database and schema) the active query tab's.
+    SetDefault { target: Target },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -101,6 +104,9 @@ pub struct Navigator {
     generation: u64,
     tree_state: Entity<TreeState>,
     filter: Entity<InputState>,
+    /// Where the active query tab runs, kept up to date by the window: what
+    /// "Set as default for this tab" changes.
+    tab_target: Rc<RefCell<Option<Target>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -143,6 +149,7 @@ impl Navigator {
             generation: 0,
             tree_state,
             filter,
+            tab_target: Rc::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -160,6 +167,23 @@ impl Navigator {
     /// The connection whose tree is shown.
     pub fn connection(&self) -> Option<&str> {
         self.connection.as_deref()
+    }
+
+    /// Where the window writes the active query tab's target.
+    pub fn tab_target(&self) -> Rc<RefCell<Option<Target>>> {
+        self.tab_target.clone()
+    }
+
+    /// The session that lists the connection's databases, when it is open.
+    fn meta(&self, cx: &App) -> Option<Arc<dyn Session>> {
+        let connection = self.connection.as_deref()?;
+        self.connections.read(cx).meta_session(connection)
+    }
+
+    /// Whether databases hold schemas (PostgreSQL) or tables (MySQL).
+    fn has_schemas(&self, cx: &App) -> bool {
+        self.meta(cx)
+            .is_some_and(|meta| meta.dialect().has_schemas())
     }
 
     /// Where a tab opened from `node` runs: its database, and its schema
@@ -427,6 +451,19 @@ impl Navigator {
                 }
             }
             Action::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(name_of(&node))),
+            Action::CopyQualifiedName => {
+                if let (NodeKind::Object(object), Some(meta)) = (&node.kind, self.meta(cx)) {
+                    let name = qualified_name(object, meta.dialect());
+                    cx.write_to_clipboard(ClipboardItem::new_string(name));
+                }
+            }
+            Action::SetDefault => {
+                if self.unavailable(action, &node, cx).is_none()
+                    && let Some(target) = self.target_of(&node, true)
+                {
+                    cx.emit(NavigatorEvent::SetDefault { target });
+                }
+            }
             Action::Export => {
                 if let (NodeKind::Object(ObjectRef::Relation(table, _)), Some(target)) =
                     (&node.kind, self.target_of(&node, false))
@@ -517,6 +554,13 @@ impl Navigator {
             {
                 Some("the connection is using it")
             }
+            (Action::SetDefault, _) => match &*self.tab_target.borrow() {
+                None => Some("no query tab is active"),
+                Some(tab) if tab.connection != connection => {
+                    Some("the active tab is on another connection")
+                }
+                Some(_) => None,
+            },
             _ => None,
         }
     }
@@ -529,7 +573,12 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(schema) = node.schema.clone() else {
+        // A query on a PostgreSQL database runs in no schema in particular.
+        let Some(schema) = node
+            .schema
+            .clone()
+            .or_else(|| (action == Action::NewQueryHere).then(|| node.database.clone()))
+        else {
             return;
         };
         let target = self.target_of(node, action == Action::NewQueryHere);
@@ -1124,22 +1173,80 @@ impl Navigator {
         let Some(node) = self.tree.node(&id).cloned() else {
             return;
         };
-        let has_schemas = self
-            .connection
-            .as_deref()
-            .and_then(|connection| self.connections.read(cx).meta_session(connection))
-            .is_some_and(|meta| meta.dialect().has_schemas());
         let table = AppState::get(cx).settings.table_double_click;
-        match default_action(&node, has_schemas, table) {
+        match default_action(&node, self.has_schemas(cx), table) {
+            Some(action) => self.run_entry(action, &node, window, cx),
+            None => self.toggle_row(index, cx),
+        }
+    }
+
+    /// Runs `action` on the selected node, as its menu entry does: what a
+    /// key of the tree does (F2, Delete, F5, Cmd+C…).
+    pub fn perform_on_selected(
+        &mut self,
+        action: Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(node) = self.selected_node(window, cx) {
+            self.run_entry(action, &node, window, cx);
+        }
+    }
+
+    /// What F4 does: opens the selected node's editor (see [`edit_action`]).
+    pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(node) = self.selected_node(window, cx)
+            && let Some(action) = edit_action(&node, self.has_schemas(cx))
+        {
+            self.run_entry(action, &node, window, cx);
+        }
+    }
+
+    /// The node of the selected row; says so when there is none.
+    fn selected_node(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Node> {
+        let state = self.tree_state.read(cx);
+        let node = state
+            .selected_index()
+            .and_then(|index| state.entry(index))
+            .and_then(|entry| self.tree.node(&entry.item().id))
+            .cloned();
+        if node.is_none() {
+            window.push_notification(
+                Notification::warning("Select an object in the schema tree first."),
+                cx,
+            );
+        }
+        node
+    }
+
+    /// Runs a menu entry of `node` from a key or a double click: only one
+    /// the node's menu holds, and one that cannot be used now says why.
+    fn run_entry(
+        &mut self,
+        action: Action,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !actions(node, self.has_schemas(cx))
+            .concat()
+            .contains(&action)
+        {
+            return;
+        }
+        let reason = self.unavailable(action, node, cx);
+        match (action, reason) {
             // A source that cannot be edited here (read-only connection)
             // is shown as DDL.
-            Some(Action::EditSource)
-                if self.unavailable(Action::EditSource, &node, cx).is_some() =>
-            {
-                self.perform(Action::ShowDdl, &id, window, cx)
-            }
-            Some(action) => self.perform(action, &id, window, cx),
-            None => self.toggle_row(index, cx),
+            (Action::EditSource, Some(_)) => self.perform(Action::ShowDdl, &node.id, window, cx),
+            (_, Some(reason)) => window.push_notification(
+                Notification::warning(SharedString::from(format!(
+                    "{}: {reason}.",
+                    action.label().trim_end_matches('…')
+                ))),
+                cx,
+            ),
+            (_, None) => self.perform(action, &node.id, window, cx),
         }
     }
 
@@ -1485,19 +1592,12 @@ fn glyph(kind: &NodeKind) -> Glyph {
     }
 }
 
-/// The name to copy for a node: qualified where the object has a schema.
+/// The name to copy for a node, without its schema (DBeaver's Copy; "Copy
+/// qualified name" adds the schema).
 fn name_of(node: &Node) -> String {
     match &node.kind {
-        NodeKind::Object(ObjectRef::Relation(table, _))
-        | NodeKind::Object(ObjectRef::Sequence(table))
-        | NodeKind::Object(ObjectRef::Type(table))
-        | NodeKind::Object(ObjectRef::Event(table)) => format!("{}.{}", table.schema, table.name),
-        NodeKind::Object(ObjectRef::Routine { schema, name, .. }) => format!("{schema}.{name}"),
-        NodeKind::Object(ObjectRef::Trigger { name, .. })
-        | NodeKind::Object(ObjectRef::Index { name, .. })
-        | NodeKind::Object(ObjectRef::Schema(name))
-        | NodeKind::Object(ObjectRef::Database(name))
-        | NodeKind::Column { name, .. }
+        NodeKind::Object(object) => plain_name(object),
+        NodeKind::Column { name, .. }
         | NodeKind::Extension { name, .. }
         | NodeKind::EnumValue { value: name, .. } => name.clone(),
         NodeKind::Group(group) => group.label().to_string(),
@@ -1569,13 +1669,7 @@ impl Render for Navigator {
                     let Some(node) = navigator.tree.node(&id) else {
                         return menu;
                     };
-                    let has_schemas = navigator
-                        .connection
-                        .as_deref()
-                        .and_then(|connection| {
-                            navigator.connections.read(cx).meta_session(connection)
-                        })
-                        .is_some_and(|meta| meta.dialect().has_schemas());
+                    let has_schemas = navigator.has_schemas(cx);
                     for (index, group) in actions(node, has_schemas).into_iter().enumerate() {
                         if index > 0 {
                             menu = menu.separator();
@@ -1604,13 +1698,15 @@ impl Render for Navigator {
                 .size_full();
                 // Right and Left also move to the first child and the
                 // parent; Enter does what a double click does. They run
-                // before the tree's own handling of the keys.
-                // Below the objects, the tree's own menu (a row's menu
-                // takes the click first).
+                // before the tree's own handling of the keys. The other
+                // keys are commands bound in the `Navigator` context (see
+                // `actions.rs`). Below the objects, the tree's own menu (a
+                // row's menu takes the click first).
                 let area = cx.entity();
                 div()
                     .id("navigator-tree")
                     .test_support()
+                    .key_context("Navigator")
                     .flex_1()
                     .min_h_0()
                     .capture_action(cx.listener(|this, _: &SelectRight, _, cx| {

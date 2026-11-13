@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 
-use gpui_kit::{Action, App, KeyBinding, Keystroke, OperatingSystem};
+use gpui_kit::{Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, OperatingSystem};
 use serde::Deserialize;
 
 gpui_kit::actions!(
@@ -30,6 +31,26 @@ gpui_kit::actions!(
         RefreshSchemaTree,
         /// Closes every open node of the schema tree.
         CollapseSchemaTree,
+        /// Opens the editor of the object selected in the schema tree.
+        EditObject,
+        /// Renames the object selected in the schema tree.
+        RenameObject,
+        /// Drops the object selected in the schema tree.
+        DropObject,
+        /// Reads the node selected in the schema tree again.
+        RefreshObject,
+        /// Copies the name of the object selected in the schema tree.
+        CopyObjectName,
+        /// Copies the qualified name of the object selected in the schema tree.
+        CopyQualifiedName,
+        /// Opens a query tab on the object selected in the schema tree.
+        NewQueryOnObject,
+        /// Makes the schema selected in the schema tree the active tab's.
+        SetDefaultSchema,
+        /// Opens the dialog of the connection selected in the sidebar.
+        EditConnection,
+        /// Connects the connection selected in the sidebar and browses it.
+        OpenConnection,
         /// Runs the statement at the cursor, or the selection.
         RunStatement,
         /// Runs every statement of the active tab.
@@ -119,6 +140,9 @@ pub struct Command {
     pub keywords: &'static [&'static str],
     /// Builds the action.
     pub action: fn() -> Box<dyn Action>,
+    /// The key context the shortcuts work in (everywhere when `None`):
+    /// `Navigator` is the schema tree, `ConnectionList` the sidebar's list.
+    pub context: Option<&'static str>,
 }
 
 macro_rules! command {
@@ -130,6 +154,13 @@ macro_rules! command {
             keys: &$keys,
             keywords: &$keywords,
             action: || Box::new($action),
+            context: None,
+        }
+    };
+    ($id:literal, $label:literal, $group:literal, $keys:expr, $keywords:expr, $action:ident, $context:literal) => {
+        Command {
+            context: Some($context),
+            ..command!($id, $label, $group, $keys, $keywords, $action)
         }
     };
 }
@@ -206,6 +237,98 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["close", "navigator", "objects"],
         CollapseSchemaTree
+    ),
+    // The keys of the schema tree and of the connection list, DBeaver's
+    // defaults (Ctrl is Cmd on macOS); they work while that list has the focus.
+    command!(
+        "edit_object",
+        "Edit Selected Object",
+        "Navigator",
+        ["f4"],
+        ["open", "structure", "source", "ddl"],
+        EditObject,
+        "Navigator"
+    ),
+    command!(
+        "rename_object",
+        "Rename Selected Object…",
+        "Navigator",
+        ["f2"],
+        ["name"],
+        RenameObject,
+        "Navigator"
+    ),
+    command!(
+        "drop_object",
+        "Drop Selected Object…",
+        "Navigator",
+        ["backspace", "delete"],
+        ["delete", "remove"],
+        DropObject,
+        "Navigator"
+    ),
+    command!(
+        "refresh_object",
+        "Refresh Selected Object",
+        "Navigator",
+        ["f5"],
+        ["reload"],
+        RefreshObject,
+        "Navigator"
+    ),
+    command!(
+        "copy_object_name",
+        "Copy Object Name",
+        "Navigator",
+        ["secondary-c"],
+        ["clipboard"],
+        CopyObjectName,
+        "Navigator"
+    ),
+    command!(
+        "copy_qualified_name",
+        "Copy Qualified Object Name",
+        "Navigator",
+        ["secondary-shift-c"],
+        ["clipboard", "schema", "full name"],
+        CopyQualifiedName,
+        "Navigator"
+    ),
+    command!(
+        "new_query_on_object",
+        "New Query on Selected Object",
+        "Navigator",
+        ["secondary-]"],
+        ["sql", "console", "script"],
+        NewQueryOnObject,
+        "Navigator"
+    ),
+    command!(
+        "set_default_schema",
+        "Set Selected Schema as Default for This Tab",
+        "Navigator",
+        ["secondary-shift-a"],
+        ["active", "database", "search path", "use"],
+        SetDefaultSchema,
+        "Navigator"
+    ),
+    command!(
+        "edit_connection",
+        "Edit Selected Connection…",
+        "Connections",
+        ["f4"],
+        ["settings", "properties"],
+        EditConnection,
+        "ConnectionList"
+    ),
+    command!(
+        "open_connection",
+        "Open Selected Connection",
+        "Connections",
+        ["enter"],
+        ["connect", "browse"],
+        OpenConnection,
+        "ConnectionList"
     ),
     command!(
         "new_query_tab",
@@ -572,10 +695,11 @@ fn effective_bindings(overrides: &str) -> (Vec<(String, &'static str)>, Vec<Stri
         }
     }
 
-    // The same shortcut on two commands: the later one would silently win.
-    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    // The same shortcut on two commands of one context: the later one would
+    // silently win.
+    let mut seen: BTreeMap<(Option<&str>, &str), &str> = BTreeMap::new();
     for (key, id) in &bindings {
-        if let Some(other) = seen.insert(key.as_str(), id)
+        if let Some(other) = seen.insert((context_of(id), key.as_str()), id)
             && other != *id
         {
             problems.push(format!(
@@ -584,6 +708,14 @@ fn effective_bindings(overrides: &str) -> (Vec<(String, &'static str)>, Vec<Stri
         }
     }
     (bindings, problems)
+}
+
+/// The key context of a command's shortcuts.
+fn context_of(id: &str) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .find(|command| command.id == id)
+        .and_then(|command| command.context)
 }
 
 /// Whether `stroke` is a keystroke Kerno will bind: modifiers followed by
@@ -642,7 +774,11 @@ fn bind(bindings: &[(String, &'static str)], cx: &mut App) {
         let Some(command) = COMMANDS.iter().find(|command| command.id == *id) else {
             continue;
         };
-        match KeyBinding::load(key, (command.action)(), None, false, None, cx) {
+        let context = command
+            .context
+            .and_then(|context| KeyBindingContextPredicate::parse(context).ok())
+            .map(Rc::new);
+        match KeyBinding::load(key, (command.action)(), context, false, None, cx) {
             Ok(binding) => key_bindings.push(binding),
             // Already validated; a failure here is a shortcut this keyboard
             // layout cannot produce.
@@ -729,6 +865,25 @@ mod tests {
             "{problems:?}"
         );
         assert_eq!(keys_of(&bindings, "quit"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_shortcut_is_unique_within_its_context() {
+        let (bindings, problems) = effective_bindings("");
+        assert_eq!(problems, Vec::<String>::new());
+        // F4 edits the object of the tree and the connection of the list.
+        assert_eq!(keys_of(&bindings, "edit_object"), ["f4"]);
+        assert_eq!(keys_of(&bindings, "edit_connection"), ["f4"]);
+        assert_eq!(context_of("edit_object"), Some("Navigator"));
+        assert_eq!(context_of("quit"), None);
+        // Two commands of one context cannot share a key.
+        let (_, problems) = effective_bindings(r#"{"bindings": {"rename_object": "f4"}}"#);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("\"f4\" is bound to both")),
+            "{problems:?}"
+        );
     }
 
     #[test]

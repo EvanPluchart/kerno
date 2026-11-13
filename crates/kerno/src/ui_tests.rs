@@ -766,8 +766,10 @@ fn a_connection_is_filled_from_a_url_tested_saved_and_opened(cx: &mut TestAppCon
 
     app.click(cx, "conn-save-connect");
     assert!(!app.has(cx, "conn-save"), "saving closes the dialog");
+    // The connection is saved on a storage thread before it is listed.
     app.wait_until(cx, "the connection", |app, cx| {
-        matches!(app.status(cx, 0), Status::Connected { .. })
+        let listed = cx.update(|cx| !app.connections.read(cx).saved().is_empty());
+        listed && matches!(app.status(cx, 0), Status::Connected { .. })
     });
     assert!(app.has(cx, ("connection", 0usize)));
 
@@ -801,10 +803,9 @@ fn a_connection_is_filled_from_a_url_tested_saved_and_opened(cx: &mut TestAppCon
         Some(testing::DB_PASSWORD)
     );
 
-    // A double click closes it again.
-    app.step(cx, |window, cx| {
-        window.double_click(("connection", 0usize), cx)
-    });
+    // Its menu closes it again (a double click never does).
+    let id = stored[0].id.clone();
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Disconnect);
     assert_eq!(app.status(cx, 0), Status::Disconnected);
 }
 
@@ -1490,6 +1491,194 @@ fn a_double_click_or_enter_opens_what_the_row_is_for(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_double_click_on_a_connection_connects_and_never_disconnects(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    // `connected` opens the connection with a double click.
+    let app = connected(cx, Engine::Postgres);
+    let databases = |app: &Fixture, cx: &mut TestAppContext| {
+        app.tree(cx).first().is_some_and(|row| row == "kerno")
+    };
+    app.wait_until(cx, "the databases", databases);
+    for _ in 0..2 {
+        app.step(cx, |window, cx| {
+            window.double_click(("connection", 0usize), cx)
+        });
+        assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    }
+    assert!(databases(&app, cx), "{:#?}", app.tree(cx));
+
+    // Enter does what a double click does on the selected connection.
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Disconnect);
+    app.wait_until(cx, "the disconnection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Disconnected)
+    });
+    app.click(cx, ("connection", 0usize));
+    assert!(matches!(app.status(cx, 0), Status::Disconnected));
+    app.press(cx, &["enter"]);
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    app.wait_until(cx, "the databases again", databases);
+
+    // F4 edits it.
+    assert!(!app.has(cx, "conn-name"));
+    app.press(cx, &["f4"]);
+    app.wait_until(cx, "the connection dialog", |app, cx| {
+        app.has(cx, "conn-name")
+    });
+    app.press(cx, &["escape"]);
+}
+
+#[gpui_kit::test]
+fn navigator_keys_run_the_actions_of_the_selected_node(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_keys CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_keys",
+            r#"CREATE TABLE kerno_ui_keys."Order Items" (id int PRIMARY KEY)"#,
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let orders = ["kerno", "shop", "Tables", "orders"];
+    app.open_path(cx, &orders);
+    let clipboard = |cx: &mut TestAppContext| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    };
+
+    // Cmd+C copies the name, Cmd+Shift+C the name with its schema.
+    app.click_row(cx, &orders, false);
+    app.press(cx, &["secondary-c"]);
+    assert_eq!(clipboard(cx), "orders");
+    app.press(cx, &["secondary-shift-c"]);
+    assert_eq!(clipboard(cx), "shop.orders");
+
+    // F2 asks for the new name; Delete (either key) shows the drop. Both
+    // are cancelled: `shop.orders` is fixture data.
+    app.press(cx, &["f2"]);
+    assert!(app.has(cx, "sql-name"));
+    app.click(cx, "sql-cancel");
+    for key in ["backspace", "delete"] {
+        app.click_row(cx, &orders, false);
+        app.press(cx, &[key]);
+        assert!(
+            app.has(cx, "sql-preview") && !app.has(cx, "sql-name"),
+            "{key}"
+        );
+        // Its button: the dialog is the drop's.
+        assert!(app.shows_label(cx, "Drop"), "{key}");
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview") && !app.shows_label(cx, "Drop"));
+    }
+    assert!(app.shows(cx, &orders));
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+
+    // F4 opens the structure of a table.
+    app.click_row(cx, &orders, false);
+    app.press(cx, &["f4"]);
+    assert_eq!(app.titles(cx), ["orders · structure"]);
+    assert!(cx.update(|cx| app.workspace.read(cx).active_structure_tab().is_some()));
+
+    // Cmd+] opens a query tab in the table's schema.
+    app.click_row(cx, &orders, false);
+    app.press(cx, &["secondary-]"]);
+    app.wait_until(cx, "the query tab", |app, cx| app.titles(cx).len() == 2);
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| tab.read(cx).target().cloned());
+    assert_eq!(
+        target.and_then(|target| target.schema).as_deref(),
+        Some("shop")
+    );
+    // On a PostgreSQL database, in no schema in particular.
+    app.click_row(cx, &["kerno"], false);
+    app.press(cx, &["secondary-]"]);
+    app.wait_until(cx, "the database's tab", |app, cx| {
+        app.titles(cx).len() == 3
+    });
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| tab.read(cx).target().cloned()).unwrap();
+    assert_eq!(
+        (target.database.as_deref(), target.schema),
+        (Some("kerno"), None)
+    );
+
+    // A name that needs quotes is copied quoted.
+    let mixed = ["kerno", "kerno_ui_keys", "Tables", "Order Items"];
+    app.open_path(cx, &mixed);
+    app.click_row(cx, &mixed, false);
+    app.press(cx, &["secondary-shift-c"]);
+    assert_eq!(clipboard(cx), r#"kerno_ui_keys."Order Items""#);
+
+    // F5 reads the selected folder again.
+    let tables = ["kerno", "kerno_ui_keys", "Tables"];
+    on_server(
+        Engine::Postgres,
+        "CREATE TABLE kerno_ui_keys.added_later (id int)",
+    );
+    assert!(!app.tree(cx).contains(&row(3, "added_later")));
+    app.click_row(cx, &tables, false);
+    app.press(cx, &["f5"]);
+    app.wait_until(cx, "the new table", |app, cx| {
+        app.tree(cx).contains(&row(3, "added_later"))
+    });
+}
+
+#[gpui_kit::test]
+fn set_as_default_points_the_active_tab_at_the_schema(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_default CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_default",
+            "CREATE TABLE kerno_ui_default.only_here AS SELECT 42 AS answer",
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let schema = ["kerno", "kerno_ui_default"];
+    app.open_path(cx, &schema);
+    // Without a query tab there is nothing to point.
+    app.click_row(cx, &schema, false);
+    assert_eq!(
+        app.why_not(cx, Action::SetDefault, &schema),
+        Some("no query tab is active")
+    );
+
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select answer from only_here");
+    app.click_row(cx, &schema, false);
+    assert_eq!(app.why_not(cx, Action::SetDefault, &schema), None);
+    app.press(cx, &["secondary-shift-a"]);
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| tab.read(cx).target().cloned());
+    assert_eq!(
+        target.and_then(|target| target.schema).as_deref(),
+        Some("kerno_ui_default")
+    );
+    // The unqualified name is found in that schema.
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the row", |app, cx| {
+        let outcomes = app.outcomes(cx);
+        assert!(
+            outcomes.iter().all(|outcome| !outcome.contains("error")),
+            "{outcomes:?}"
+        );
+        outcomes == ["1 rows"]
+    });
+    assert_eq!(app.result(cx, 0, 1).1, vec![cells(&["42"])]);
+}
+
+#[gpui_kit::test]
 fn the_filter_narrows_the_tree_and_clearing_it_restores_it(cx: &mut TestAppContext) {
     if !testing::available(Engine::Postgres) {
         return;
@@ -1593,9 +1782,8 @@ fn the_tree_follows_the_connection(cx: &mut TestAppContext) {
     assert!(app.has(cx, "navigator-filter"));
 
     // Disconnecting empties it and says what to do.
-    app.step(cx, |window, cx| {
-        window.double_click(("connection", 0usize), cx)
-    });
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Disconnect);
     assert_eq!(app.status(cx, 0), Status::Disconnected);
     assert_eq!(app.tree(cx), Vec::<String>::new());
     assert!(!app.has(cx, "navigator-filter"));
