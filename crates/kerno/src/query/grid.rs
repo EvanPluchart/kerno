@@ -28,7 +28,7 @@ use kerno_core::format::{CellStyle, display};
 use kerno_core::pending::Pending;
 use kerno_core::schema::TableRef;
 use kerno_core::sort::sorted_rows;
-use kerno_core::sql::CellValue;
+use kerno_core::sql::{CellValue, RowSql};
 use kerno_core::{Dialect, ResultStore, RowBatch, RowDemand, Session, TypeKind};
 
 /// Cells longer than this are cut in the grid; the value viewer shows all.
@@ -130,6 +130,9 @@ pub struct Owner {
     pub export: Option<&'static str>,
     /// The rows were read through a filter (a table's data).
     pub filtered: bool,
+    /// The rows have no key to find them by (Generate SQL ▸ can only
+    /// insert them).
+    pub keyless: bool,
 }
 
 /// What a column of a table's page takes.
@@ -178,6 +181,8 @@ pub enum GridAction {
     FitWidth,
     FitAllWidths,
     Export,
+    /// Writes statements for the selected rows into a query tab.
+    Generate(RowSql),
 }
 
 impl GridAction {
@@ -218,6 +223,7 @@ impl GridAction {
             Self::FitWidth => "Fit width",
             Self::FitAllWidths => "Fit all widths",
             Self::Export => "Export…",
+            Self::Generate(kind) => kind.label(),
         }
         .to_string()
     }
@@ -263,6 +269,8 @@ pub struct CellFacts {
     pub related: Vec<String>,
     /// Why the rows cannot be exported.
     pub export: Option<&'static str>,
+    /// The rows have no key to find them by.
+    pub keyless: bool,
 }
 
 /// What the menu of a column header depends on.
@@ -408,9 +416,30 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
             ],
         ),
         Entry::Separator,
+        generate_menu(facts),
         item(A::Export, facts.export),
     ]);
     entries
+}
+
+/// "Generate SQL ▸" for the selected rows of a table (DBeaver's
+/// `SQLGeneratorContributor` on result rows). A query result's rows are no
+/// table's in v1: every entry says so. Rows added and not applied yet are
+/// skipped; on their own, nothing is written.
+fn generate_menu(facts: &CellFacts) -> Entry {
+    let result = (!facts.data).then_some("query result");
+    let new = (!facts.many && facts.row == Mark::New).then_some("new row");
+    let no_key = facts.keyless.then_some("no key");
+    Entry::Submenu(
+        "Generate SQL",
+        RowSql::ALL
+            .into_iter()
+            .map(|kind| {
+                let key = if kind.needs_key() { no_key } else { None };
+                item(GridAction::Generate(kind), result.or(new).or(key))
+            })
+            .collect(),
+    )
 }
 
 /// The menu of a column header.
@@ -1267,6 +1296,7 @@ impl Grid {
                 .and_then(|owner| owner.related.clone())
                 .map_or_else(Vec::new, |related| related(self, row)),
             export: owner.map_or(Some("not available"), |owner| owner.export),
+            keyless: owner.is_some_and(|owner| owner.keyless),
         }
     }
 
@@ -1761,7 +1791,6 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        crate::bench::cell();
         let theme = cx.theme();
         let size = text_size(cx);
         let cell = div()
@@ -1963,6 +1992,7 @@ mod tests {
             column: column(),
             related: Vec::new(),
             export: None,
+            keyless: false,
         }
     }
 
@@ -1982,6 +2012,7 @@ mod tests {
     const ORDER: &str = "Order by this column ▸ Ascending | Descending | Clear order (not ordered)";
     const COLUMN: &str = "Column ▸ Copy column name | Pin column | Hide column | \
                           Show all columns (none hidden)";
+    const GENERATE: &str = "Generate SQL ▸ SELECT by key | SELECT … IN | INSERT | UPDATE | DELETE";
 
     #[test]
     fn a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters() {
@@ -1997,6 +2028,8 @@ mod tests {
                 "—",
                 COLUMN,
                 "—",
+                "Generate SQL ▸ SELECT by key (query result) | SELECT … IN (query result) | \
+                 INSERT (query result) | UPDATE (query result) | DELETE (query result)",
                 "Export…"
             ]
         );
@@ -2073,9 +2106,27 @@ mod tests {
                 "—",
                 COLUMN,
                 "—",
+                GENERATE,
                 "Export…",
             ]
         );
+        // A table without a key can only be inserted; a new row is not written.
+        let keyless = labels(&cell_menu(&CellFacts {
+            keyless: true,
+            ..data_cell()
+        }));
+        assert!(
+            keyless.contains(
+                &"Generate SQL ▸ SELECT by key (no key) | SELECT … IN (no key) | INSERT | \
+              UPDATE (no key) | DELETE (no key)"
+                    .to_string()
+            )
+        );
+        let new = flat(&cell_menu(&CellFacts {
+            row: Mark::New,
+            ..data_cell()
+        }));
+        assert!(new.contains(&"INSERT (new row)".to_string()), "{new:?}");
     }
 
     #[test]

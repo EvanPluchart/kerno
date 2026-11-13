@@ -117,11 +117,22 @@ pub enum TabAction {
     Paste,
     SelectAll,
     ToggleComment,
+    ToggleBlockComment,
+    UpperCase,
+    LowerCase,
+    ToggleSoftWrap,
     Find,
     Replace,
     Save,
     SaveAs,
     SaveQuery,
+    RevertFile,
+    OpenFile,
+    FetchAllRows,
+    ExportFromQuery,
+    /// Makes the tab run on this saved connection: id and name.
+    UseConnection(String, String),
+    UseSchema(String),
     // The status bar.
     Disconnect,
     Reconnect,
@@ -183,12 +194,22 @@ impl TabAction {
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::SelectAll => "Select all",
-            Self::ToggleComment => "Toggle comment",
+            Self::ToggleComment => "Toggle line comment",
+            Self::ToggleBlockComment => "Toggle block comment",
+            Self::UpperCase => "Upper case",
+            Self::LowerCase => "Lower case",
+            Self::ToggleSoftWrap => "Toggle word wrap",
             Self::Find => "Find…",
             Self::Replace => "Replace…",
             Self::Save => "Save",
             Self::SaveAs => "Save as…",
             Self::SaveQuery => "Save as query…",
+            Self::RevertFile => "Revert to saved file",
+            Self::OpenFile => "Open SQL file…",
+            Self::FetchAllRows => "Fetch all rows",
+            Self::ExportFromQuery => "Export from query…",
+            Self::UseConnection(_, name) => return name.clone(),
+            Self::UseSchema(schema) => return schema.clone(),
             Self::Disconnect => "Disconnect",
             Self::Reconnect => "Reconnect",
             Self::Administration => "Administration",
@@ -220,10 +241,11 @@ impl TabAction {
 pub enum Entry {
     /// An action, and why it cannot be used now when it cannot.
     Item(TabAction, Option<&'static str>),
+    Submenu(&'static str, Vec<Entry>),
     Separator,
 }
 
-use Entry::{Item, Separator};
+use Entry::{Item, Separator, Submenu};
 
 fn enabled(action: TabAction) -> Entry {
     Item(action, None)
@@ -296,10 +318,29 @@ pub struct EditorFacts {
     pub saved_file: bool,
     /// Source mode: the text replaces an object.
     pub source: bool,
+    /// The tab is a file.
+    pub file: bool,
+    /// The result on screen has rows left to fetch.
+    pub more_rows: bool,
 }
 
-/// The menu of the SQL editor; enabled as the toolbar's buttons are.
-pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
+/// What the editor menu offers to run on: the saved connections (id, name,
+/// connected), and the databases and schemas of the tab's, with the ones in
+/// use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Choices {
+    pub connections: Vec<(String, String, bool)>,
+    pub connection: Option<String>,
+    pub databases: Vec<String>,
+    pub database: Option<String>,
+    pub schemas: Vec<String>,
+    pub schema: Option<String>,
+}
+
+/// The menu of the SQL editor, grouped as DBeaver's (`SQLEditor` context
+/// menu: Execute ▸, Format ▸, File ▸); enabled as the toolbar's buttons are.
+/// The three ways to run used most stay on top.
+pub fn editor_menu(facts: EditorFacts, choices: &Choices) -> Vec<Entry> {
     let run = if !facts.connected {
         Some("not connected")
     } else {
@@ -307,19 +348,79 @@ pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
     };
     let no_selection = (!facts.selection).then_some("no selection");
     let empty = facts.empty.then_some("empty");
+    let current =
+        |is: bool, reason: Option<&'static str>| if is { Some("current") } else { reason };
+    let connections: Vec<Entry> = choices
+        .connections
+        .iter()
+        .map(|(id, name, connected)| {
+            Item(
+                TabAction::UseConnection(id.clone(), name.clone()),
+                current(
+                    choices.connection.as_ref() == Some(id),
+                    (!connected).then_some("not connected"),
+                ),
+            )
+        })
+        .collect();
+    let list = |names: &[String], chosen: &Option<String>, action: fn(String) -> TabAction| {
+        names
+            .iter()
+            .map(|name| {
+                Item(
+                    action(name.clone()),
+                    current(chosen.as_ref() == Some(name), None),
+                )
+            })
+            .collect()
+    };
+    // The lists to run on, those that have something to choose from.
+    let targets: Vec<Entry> = [
+        ("Active connection", connections),
+        (
+            "Active database",
+            list(
+                &choices.databases,
+                &choices.database,
+                TabAction::UseDatabase,
+            ),
+        ),
+        (
+            "Active schema",
+            list(&choices.schemas, &choices.schema, TabAction::UseSchema),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, items)| !items.is_empty())
+    .map(|(label, items)| Submenu(label, items))
+    .collect();
     let mut entries = Vec::new();
     if facts.source {
         entries.extend([Item(TabAction::ApplySource, run), Separator]);
     }
     entries.extend([
         Item(TabAction::RunStatement, run),
-        Item(TabAction::RunInNewTab, run),
-        Item(TabAction::RunFromCursor, run),
         Item(TabAction::RunScript, run),
         Item(TabAction::Explain, run),
-        Item(TabAction::ExplainAnalyze, run),
-        Item(TabAction::CountRows, run),
-        Item(TabAction::Format, empty),
+        Submenu(
+            "Execute",
+            vec![
+                Item(TabAction::RunInNewTab, run),
+                Item(TabAction::RunFromCursor, run),
+                Item(TabAction::ExplainAnalyze, run),
+                Separator,
+                Item(TabAction::CountRows, run),
+                Item(
+                    TabAction::FetchAllRows,
+                    (!facts.more_rows).then_some("no rows left"),
+                ),
+                Item(TabAction::ExportFromQuery, run.or(empty)),
+            ]
+            .into_iter()
+            .chain((!targets.is_empty()).then_some(Separator))
+            .chain(targets)
+            .collect(),
+        ),
         Separator,
         Item(TabAction::NextStatement, empty),
         Item(TabAction::PreviousStatement, empty),
@@ -333,23 +434,55 @@ pub fn editor_menu(facts: EditorFacts) -> Vec<Entry> {
         Separator,
         Item(TabAction::Cut, no_selection),
         Item(TabAction::Copy, no_selection),
+        Item(TabAction::CopyStatement, empty),
         enabled(TabAction::Paste),
         Item(TabAction::SelectAll, empty),
         Separator,
-        enabled(TabAction::ToggleComment),
+        Submenu(
+            "Format",
+            vec![
+                Item(TabAction::Format, empty),
+                Item(TabAction::UpperCase, no_selection),
+                Item(TabAction::LowerCase, no_selection),
+                Separator,
+                enabled(TabAction::ToggleComment),
+                enabled(TabAction::ToggleBlockComment),
+                Separator,
+                enabled(TabAction::ToggleSoftWrap),
+            ],
+        ),
         enabled(TabAction::Find),
         enabled(TabAction::Replace),
         Separator,
-        Item(
-            TabAction::Save,
-            if facts.saved_file {
-                Some("saved")
-            } else {
-                empty
-            },
+        Submenu(
+            "File",
+            vec![
+                Item(
+                    TabAction::Save,
+                    if facts.saved_file {
+                        Some("saved")
+                    } else {
+                        empty
+                    },
+                ),
+                Item(TabAction::SaveAs, empty),
+                Item(TabAction::SaveQuery, empty),
+                Separator,
+                Item(
+                    TabAction::Rename,
+                    facts.file.then_some("named after its file"),
+                ),
+                Item(
+                    TabAction::RevertFile,
+                    if !facts.file {
+                        Some("no file")
+                    } else {
+                        facts.saved_file.then_some("saved")
+                    },
+                ),
+                enabled(TabAction::OpenFile),
+            ],
         ),
-        Item(TabAction::SaveAs, empty),
-        Item(TabAction::SaveQuery, empty),
     ]);
     entries
 }
@@ -572,10 +705,22 @@ pub fn fit_window(menu: PopupMenu, window: &Window) -> PopupMenu {
 pub type Pick = Rc<dyn Fn(TabAction, &mut Window, &mut App)>;
 
 /// Fills `menu` with `entries`; `pick` runs the chosen one.
-pub fn fill_menu(mut menu: PopupMenu, entries: Vec<Entry>, pick: Pick) -> PopupMenu {
+pub fn fill_menu(
+    mut menu: PopupMenu,
+    entries: Vec<Entry>,
+    pick: Pick,
+    window: &mut Window,
+    cx: &mut gpui_kit::Context<PopupMenu>,
+) -> PopupMenu {
     for entry in entries {
         menu = match entry {
             Separator => menu.separator(),
+            Submenu(label, items) => {
+                let pick = pick.clone();
+                menu.submenu(label, window, cx, move |menu, window, cx| {
+                    fill_menu(menu, items.clone(), pick.clone(), window, cx)
+                })
+            }
             Item(action, reason) => {
                 // An entry that cannot be used says why.
                 let label = match reason {
@@ -728,6 +873,7 @@ mod tests {
             .map(|entry| match entry {
                 Item(action, None) => action.label(),
                 Item(action, Some(reason)) => format!("{} ({reason})", action.label()),
+                Submenu(label, items) => format!("{label} ▸ [{}]", labels(items).join(", ")),
                 Separator => "—".into(),
             })
             .collect()
@@ -797,17 +943,27 @@ mod tests {
             selection: true,
             ..EditorFacts::default()
         };
+        let choices = Choices {
+            connections: vec![
+                ("a".into(), "local".into(), true),
+                ("b".into(), "prod".into(), false),
+            ],
+            connection: Some("a".into()),
+            databases: vec!["kerno".into(), "other".into()],
+            database: Some("kerno".into()),
+            schemas: vec!["public".into(), "shop".into()],
+            schema: None,
+        };
         assert_eq!(
-            labels(&editor_menu(ready)),
+            labels(&editor_menu(ready, &choices)),
             [
                 "Run statement",
-                "Run statement in new result tab",
-                "Run script from the cursor",
                 "Run script",
                 "Explain plan",
-                "Explain analyze",
-                "Count rows of statement",
-                "Format SQL",
+                "Execute ▸ [Run statement in new result tab, Run script from the cursor, \
+                 Explain analyze, —, Count rows of statement, Fetch all rows (no rows left), \
+                 Export from query…, —, Active connection ▸ [local (current), prod (not connected)], \
+                 Active database ▸ [kerno (current), other], Active schema ▸ [public, shop]]",
                 "—",
                 "Go to next statement",
                 "Go to previous statement",
@@ -821,47 +977,83 @@ mod tests {
                 "—",
                 "Cut",
                 "Copy",
+                "Copy statement",
                 "Paste",
                 "Select all",
                 "—",
-                "Toggle comment",
+                "Format ▸ [Format SQL, Upper case, Lower case, —, Toggle line comment, \
+                 Toggle block comment, —, Toggle word wrap]",
                 "Find…",
                 "Replace…",
                 "—",
-                "Save",
-                "Save as…",
-                "Save as query…",
+                "File ▸ [Save, Save as…, Save as query…, —, Rename…, \
+                 Revert to saved file (no file), Open SQL file…]",
             ]
         );
         // No connection, no selection, nothing written.
-        let idle = labels(&editor_menu(EditorFacts {
-            empty: true,
-            ..EditorFacts::default()
-        }));
+        let idle = labels(&editor_menu(
+            EditorFacts {
+                empty: true,
+                ..EditorFacts::default()
+            },
+            &Choices::default(),
+        ));
         assert_eq!(idle[0], "Run statement (not connected)");
-        assert_eq!(idle[2], "Run script from the cursor (not connected)");
-        assert_eq!(idle[5], "Explain analyze (not connected)");
-        assert_eq!(idle[6], "Count rows of statement (not connected)");
-        assert_eq!(idle[9], "Go to next statement (empty)");
-        assert_eq!(idle[12], "Toggle results panel");
-        assert_eq!(idle[19], "Cut (no selection)");
-        assert_eq!(
-            idle[28..],
-            ["Save (empty)", "Save as… (empty)", "Save as query… (empty)"]
+        assert_eq!(idle[2], "Explain plan (not connected)");
+        assert!(
+            idle[3].contains("Count rows of statement (not connected)")
+                && idle[3].ends_with("Export from query… (not connected)]"),
+            "{}",
+            idle[3]
+        );
+        // Nothing to run on, no list: MySQL has no schemas.
+        let mysql = Choices {
+            schemas: Vec::new(),
+            ..choices.clone()
+        };
+        let execute = labels(&editor_menu(ready, &mysql))[3].clone();
+        assert!(
+            execute.contains("Active database ▸") && !execute.contains("Active schema"),
+            "{execute}"
+        );
+        assert_eq!(idle[5], "Go to next statement (empty)");
+        assert_eq!(idle[8], "Toggle results panel");
+        assert_eq!(idle[15], "Cut (no selection)");
+        assert_eq!(idle[17], "Copy statement (empty)");
+        assert!(
+            idle[21].contains("Upper case (no selection)"),
+            "{}",
+            idle[21]
+        );
+        assert!(
+            idle[25].contains("Save (empty), Save as… (empty), Save as query… (empty)"),
+            "{}",
+            idle[25]
         );
         // While a statement runs; a file saved as it is; source mode.
-        let busy = labels(&editor_menu(EditorFacts {
-            running: true,
-            saved_file: true,
-            source: true,
-            ..ready
-        }));
+        let busy = labels(&editor_menu(
+            EditorFacts {
+                running: true,
+                saved_file: true,
+                file: true,
+                more_rows: true,
+                source: true,
+                ..ready
+            },
+            &choices,
+        ));
         assert_eq!(
             busy[..3],
             ["Apply source… (running)", "—", "Run statement (running)"]
         );
-        assert_eq!(busy[3], "Run statement in new result tab (running)");
-        assert_eq!(busy[30], "Save (saved)");
+        assert!(busy[5].contains("Fetch all rows,"), "{}", busy[5]);
+        assert!(
+            busy[27].contains("Save (saved)")
+                && busy[27].contains("Rename… (named after its file)")
+                && busy[27].contains("Revert to saved file (saved)"),
+            "{}",
+            busy[27]
+        );
         // The toolbar's Run dropdown offers the same commands.
         assert_eq!(
             labels(&run_menu(ready)),

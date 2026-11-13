@@ -6468,29 +6468,49 @@ fn the_editor_answers_a_right_click_with_its_commands(cx: &mut TestAppContext) {
     // On the text of the first line.
     let on_text = Some(gpui_kit::point(px(120.), px(10.)));
 
-    assert!(!app.shows_label(cx, "Toggle comment"));
+    assert!(!app.shows_label(cx, "Execute"));
     app.right_click(cx, "query-editor", on_text);
     for label in [
         "Run statement (not connected)",
         "Run script (not connected)",
         "Explain plan (not connected)",
-        "Explain analyze (not connected)",
-        "Format SQL",
+        "Execute",
         "Undo",
         "Redo",
         "Cut (no selection)",
         "Copy (no selection)",
+        "Copy statement",
         "Paste",
         "Select all",
-        "Toggle comment",
+        "Format",
         "Find…",
         "Replace…",
-        "Save",
-        "Save as…",
-        "Save as query…",
+        "File",
     ] {
         assert!(app.shows_label(cx, label), "{label}");
     }
+    // DBeaver's submenus (G15): Execute ▸, Format ▸, File ▸.
+    click_menu_entry(&app, cx, "Execute");
+    assert!(app.shows_label(cx, "Explain analyze (not connected)"));
+    click_menu_entry(&app, cx, "Format");
+    for label in [
+        "Format SQL",
+        "Upper case (no selection)",
+        "Toggle block comment",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    click_menu_entry(&app, cx, "File");
+    for label in [
+        "Save",
+        "Save as…",
+        "Save as query…",
+        "Revert to saved file (no file)",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.press(cx, &["escape"]);
+    app.right_click(cx, "query-editor", on_text);
     // The editor's own actions run from the menu.
     app.click_label(cx, "Select all");
     let tab = app.tab(cx);
@@ -6504,7 +6524,8 @@ fn the_editor_answers_a_right_click_with_its_commands(cx: &mut TestAppContext) {
     );
     // So do the app's commands.
     app.right_click(cx, "query-editor", on_text);
-    app.click_label(cx, "Toggle comment");
+    click_menu_entry(&app, cx, "Format");
+    app.click_label(cx, "Toggle line comment");
     assert_eq!(app.active_query(cx).1, "-- select 1 as one, 2 as two");
     app.right_click(cx, "query-editor", on_text);
     app.click_label(cx, "Find…");
@@ -6948,16 +6969,32 @@ fn columns_are_added_renamed_and_dropped_from_the_tree(cx: &mut TestAppContext) 
         });
         assert!(!has_column("new_name"), "{engine:?}");
 
-        // Add: an ALTER TABLE to complete opens in a query tab.
+        // Add (CM-73): the table's form opens with a new column, the cursor
+        // in its name; nothing runs until the form is applied.
         app.act(cx, Action::AddColumn, &at(&["Tables", "t", "Columns"]));
-        app.wait_until(cx, "the template", |app, cx| app.titles(cx) == ["t"]);
-        assert!(app.active_query(cx).1.contains("new_column"), "{engine:?}");
-        assert!(!has_column("new_column"), "opening it runs nothing");
-        app.run_active_query(cx);
-        assert!(has_column("new_column"), "{engine:?}");
+        app.wait_until(cx, "the new column", |app, cx| {
+            form_columns(app, cx) == Some((vec!["id".into(), String::new()], Some(1)))
+        });
 
-        // F4 on a column opens the structure of its table.
+        // F4 on a column (CM-72) opens that form on the column.
         app.click_row(cx, &column("id"), false);
+        app.press(cx, &["f4"]);
+        app.wait_until(cx, "the column's name", |app, cx| {
+            form_columns(app, cx).is_some_and(|(_, focused)| focused == Some(0))
+        });
+        let opened = cx.update(|cx| {
+            app.workspace
+                .read(cx)
+                .active_table_editor()
+                .and_then(|tab| tab.read(cx).table().cloned())
+        });
+        assert_eq!(
+            opened,
+            Some(TableRef::new("kerno_ui_g10_columns", "t")),
+            "{engine:?}"
+        );
+        // A view's column has no form: F4 shows the view's structure.
+        app.click_row(cx, &at(&["Views", "v", "Columns", "id"]), false);
         app.press(cx, &["f4"]);
         app.wait_for_structure(cx);
         let opened = cx.update(|cx| {
@@ -6968,7 +7005,7 @@ fn columns_are_added_renamed_and_dropped_from_the_tree(cx: &mut TestAppContext) 
         });
         assert_eq!(
             opened,
-            Some(TableRef::new("kerno_ui_g10_columns", "t")),
+            Some(TableRef::new("kerno_ui_g10_columns", "v")),
             "{engine:?}"
         );
     }
@@ -10711,19 +10748,24 @@ fn an_incomplete_result_says_so_and_runs_again_from_its_menu(cx: &mut TestAppCon
     assert!(!app.has(cx, ("result-incomplete", 0usize)));
     assert!(!app.has(cx, ("result-incomplete", 1usize)));
 
-    // The editor's menu has G4's commands too.
+    // The editor's menu has G4's commands too, the rarer ones in Execute ▸.
     app.right_click(cx, "query-editor", Some(gpui_kit::point(px(120.), px(10.))));
     for label in [
-        "Run statement in new result tab",
-        "Run script from the cursor",
-        "Count rows of statement",
         "Go to previous statement",
         "Maximize results panel",
         "Focus results / editor",
     ] {
         assert!(app.shows_label(cx, label), "{label}");
     }
-    app.click_label(cx, "Count rows of statement");
+    click_menu_entry(&app, cx, "Execute");
+    for label in [
+        "Run statement in new result tab",
+        "Run script from the cursor",
+        "Count rows of statement",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    click_menu_entry(&app, cx, "Count rows of statement");
     let tab = app.tab(cx);
     app.wait_until(cx, "the count", |_, cx| {
         cx.update(|cx| tab.read(cx).messages())
@@ -11514,4 +11556,509 @@ fn result_tabs_and_selected_connection_commands_from_the_palette(cx: &mut TestAp
     app.wait_until(cx, "the deletion", |app, _| {
         app.storage.connections().unwrap().len() == 1
     });
+}
+
+// Generate SQL from rows and routines (G7), editor commands (G15), Link with
+// editor and the column form (G10 leftovers), Paste and folder Refresh in the
+// sidebar --------------------------------------------------------------------
+
+/// The column names of the active table form, and the one whose name has
+/// the keyboard; `None` without a form, or while it is read.
+fn form_columns(app: &Fixture, cx: &mut TestAppContext) -> Option<(Vec<String>, Option<usize>)> {
+    let editor = cx.update(|cx| app.workspace.read(cx).active_table_editor().cloned())?;
+    app.step(cx, |window, cx| {
+        let editor = editor.read(cx);
+        editor.ready().then(|| editor.column_focus(window, cx))
+    })
+}
+
+/// The target of the active query tab.
+fn active_target(app: &Fixture, cx: &mut TestAppContext) -> Option<Target> {
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.read(cx).target().cloned())
+}
+
+/// Runs a command as the menu bar or the palette does.
+fn dispatch(app: &Fixture, cx: &mut TestAppContext, action: impl gpui_kit::Action) {
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(action), cx)
+    });
+}
+
+#[gpui_kit::test]
+fn generate_sql_writes_the_selected_rows_into_a_tab_and_runs_nothing(cx: &mut TestAppContext) {
+    use crate::query::grid::GridAction;
+    use kerno_core::sql::RowSql;
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_g7_rows");
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                "CREATE TABLE kerno_ui_g7_rows.t (id int PRIMARY KEY, name varchar(20))",
+                "INSERT INTO kerno_ui_g7_rows.t VALUES (1, 'a'), (2, NULL)",
+            ],
+        );
+        let q = |name: &str| {
+            if pg {
+                format!("\"{name}\"")
+            } else {
+                format!("`{name}`")
+            }
+        };
+        let table = format!("{}.{}", q("kerno_ui_g7_rows"), q("t"));
+        let app = connected(cx, engine);
+        app.open_table(cx, "kerno_ui_g7_rows", "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        let grid = app.data_grid(cx);
+        let select = |app: &Fixture, cx: &mut TestAppContext, rows: (usize, usize)| {
+            app.step(cx, |_, cx| {
+                grid.update(cx, |table, cx| {
+                    table.delegate_mut().clear_selection();
+                    table.set_selected_row(rows.0, cx);
+                    if rows.1 != rows.0 {
+                        table.delegate_mut().extend_to(rows.1, 1);
+                    }
+                })
+            });
+        };
+
+        // SELECT … IN of both rows (RES-66): a new tab in the table's schema.
+        select(&app, cx, (0, 1));
+        app.on_data(cx, |tab, window, cx| {
+            tab.perform(GridAction::Generate(RowSql::SelectIn), 0, 1, window, cx)
+        });
+        let (id, name) = (q("id"), q("name"));
+        assert_eq!(
+            app.active_query(cx),
+            (
+                "t".to_string(),
+                format!("SELECT * FROM {table} WHERE {id} IN (1, 2);\n")
+            ),
+            "{engine:?}"
+        );
+        let target = active_target(&app, cx).expect("a target");
+        let place = if pg {
+            target.schema.clone()
+        } else {
+            target.database.clone()
+        };
+        assert_eq!(place.as_deref(), Some("kerno_ui_g7_rows"), "{engine:?}");
+        assert_eq!(app.outcomes(cx), Vec::<String>::new(), "nothing ran");
+        // What it wrote runs as written.
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["2 rows"]);
+
+        // INSERT and DELETE of the second row: its NULL is a literal; the
+        // DELETE is only text.
+        app.open_table(cx, "kerno_ui_g7_rows", "t", RelationKind::Table);
+        select(&app, cx, (1, 1));
+        app.on_data(cx, |tab, window, cx| {
+            tab.perform(GridAction::Generate(RowSql::Insert), 1, 1, window, cx)
+        });
+        assert_eq!(
+            app.active_query(cx).1,
+            format!("INSERT INTO {table} ({id}, {name}) VALUES (2, NULL);\n")
+        );
+        app.open_table(cx, "kerno_ui_g7_rows", "t", RelationKind::Table);
+        select(&app, cx, (1, 1));
+        app.on_data(cx, |tab, window, cx| {
+            tab.perform(GridAction::Generate(RowSql::Delete), 1, 1, window, cx)
+        });
+        assert_eq!(
+            app.active_query(cx).1,
+            format!("DELETE FROM {table} WHERE {id} = 2;\n")
+        );
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_g7_rows.t"),
+            "2"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_row_menu_generates_sql_and_a_query_result_says_why_it_cannot(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_g7_menu CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_g7_menu",
+            "CREATE TABLE kerno_ui_g7_menu.t (id int PRIMARY KEY, name text)",
+            "INSERT INTO kerno_ui_g7_menu.t VALUES (7, 'seven')",
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_g7_menu", "t", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    // CM-115: Generate SQL ▸ UPDATE from the row's own menu.
+    app.right_click(cx, "table-cell-0:2", None);
+    click_menu_entry(&app, cx, "Generate SQL");
+    click_menu_entry(&app, cx, "UPDATE");
+    assert_eq!(
+        app.active_query(cx).1,
+        "UPDATE \"kerno_ui_g7_menu\".\"t\" SET \"name\" = 'seven' WHERE \"id\" = 7;\n"
+    );
+    // A query result's rows are no table's: each entry says so.
+    app.run_in_new_tab(cx, "select 1 as one", "secondary-enter");
+    app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Generate SQL");
+    for label in ["SELECT by key (query result)", "INSERT (query result)"] {
+        assert!(menu_entry(&app, cx, label).is_some(), "{label}");
+    }
+}
+
+#[gpui_kit::test]
+fn routines_are_called_and_tables_read_in_a_console(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let (drop_schema, create_schema) = scratch_schema(engine, "kerno_ui_g7_calls");
+        let routines: [&str; 2] = if pg {
+            [
+                "CREATE FUNCTION kerno_ui_g7_calls.add_one(a integer) RETURNS integer \
+                 LANGUAGE sql AS $$ SELECT a + 1 $$",
+                "CREATE PROCEDURE kerno_ui_g7_calls.touch(a integer, OUT b integer) \
+                 LANGUAGE plpgsql AS $$ BEGIN b := a; END $$",
+            ]
+        } else {
+            [
+                "CREATE FUNCTION kerno_ui_g7_calls.add_one(a INT) RETURNS INT DETERMINISTIC \
+                 RETURN a + 1",
+                "CREATE PROCEDURE kerno_ui_g7_calls.touch(IN a INT, OUT b INT) SET b = a",
+            ]
+        };
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[&create_schema, routines[0], routines[1]],
+        );
+        let app = connected(cx, engine);
+        let (function, procedure): (Vec<&str>, Vec<&str>) = if pg {
+            (
+                vec![
+                    "kerno",
+                    "kerno_ui_g7_calls",
+                    "Functions",
+                    "add_one(a integer)",
+                ],
+                vec![
+                    "kerno",
+                    "kerno_ui_g7_calls",
+                    "Procedures",
+                    "touch(IN a integer, OUT b integer)",
+                ],
+            )
+        } else {
+            (
+                vec!["kerno_ui_g7_calls", "Routines", "add_one(IN a int)"],
+                vec![
+                    "kerno_ui_g7_calls",
+                    "Routines",
+                    "touch(IN a int, OUT b int)",
+                ],
+            )
+        };
+        app.open_path(cx, &procedure);
+        app.open_path(cx, &function);
+
+        // NAV-53 / CM-81: Generate CALL writes the call; nothing runs.
+        app.act(cx, Action::GenerateCall, &procedure);
+        let call = if pg {
+            "CALL \"kerno_ui_g7_calls\".\"touch\"(:a, NULL);\n"
+        } else {
+            "CALL `kerno_ui_g7_calls`.`touch`(:a, @b);\nSELECT @b;\n"
+        };
+        app.wait_until(cx, "the call", |app, cx| {
+            app.titles(cx).contains(&"touch".to_string())
+        });
+        assert_eq!(
+            app.active_query(cx),
+            ("touch".to_string(), call.to_string())
+        );
+        assert_eq!(app.outcomes(cx), Vec::<String>::new(), "nothing ran");
+
+        // CM-80: Execute… runs it, asking for its parameters first.
+        let (executed, value, expected) = if pg {
+            (&function, "41", "42")
+        } else {
+            (&procedure, "5", "5")
+        };
+        app.act(cx, Action::ExecuteRoutine, executed);
+        app.wait_until(cx, "the prompt", |app, cx| app.has(cx, ("param", 0usize)));
+        app.type_text(cx, value);
+        app.click(cx, "params-run");
+        app.wait_until(cx, "the result", |app, cx| {
+            !app.running(cx) && app.outcomes(cx).last().is_some_and(|last| last == "1 rows")
+        });
+        let last = app.outcomes(cx).len() - 1;
+        assert_eq!(
+            app.result(cx, last, 1).1,
+            [cells(&[expected])],
+            "{engine:?}"
+        );
+
+        // NAV-46 / CM-52: Read data in SQL console runs a SELECT of the table.
+        let customers: Vec<&str> = if pg {
+            vec!["kerno", "shop", "Tables", "customers"]
+        } else {
+            vec!["kerno", "Tables", "customers"]
+        };
+        app.open_path(cx, &customers);
+        app.act(cx, Action::ReadInConsole, &customers);
+        app.wait_until(cx, "the rows", |app, cx| {
+            app.titles(cx)
+                .last()
+                .is_some_and(|title| title == "customers")
+                && !app.running(cx)
+                && app.outcomes(cx).len() == 1
+        });
+        assert!(app.active_query(cx).1.starts_with("SELECT"), "{engine:?}");
+        assert!(
+            app.outcomes(cx)[0].ends_with("rows"),
+            "{:?}",
+            app.outcomes(cx)
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn the_editor_changes_case_comments_a_block_and_copies_its_statement(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 'Ab', \"Cd\" from t;\nselect 2");
+    let text = |app: &Fixture, cx: &mut TestAppContext| app.active_query(cx).1;
+    // SQL-35: the case of what is selected, strings and quoted names aside.
+    app.press(cx, &["secondary-a", "secondary-shift-x"]);
+    assert_eq!(text(&app, cx), "SELECT 'Ab', \"Cd\" FROM T;\nSELECT 2");
+    app.press(cx, &["secondary-shift-y"]);
+    assert_eq!(text(&app, cx), "select 'Ab', \"Cd\" from t;\nselect 2");
+    // One step to undo.
+    app.press(cx, &["secondary-z"]);
+    assert_eq!(text(&app, cx), "SELECT 'Ab', \"Cd\" FROM T;\nSELECT 2");
+    // SQL-33: a block comment around the selection, and off again.
+    app.press(cx, &["secondary-a", "secondary-shift-/"]);
+    assert_eq!(
+        text(&app, cx),
+        "/* SELECT 'Ab', \"Cd\" FROM T;\nSELECT 2 */"
+    );
+    app.press(cx, &["secondary-shift-/"]);
+    assert_eq!(text(&app, cx), "SELECT 'Ab', \"Cd\" FROM T;\nSELECT 2");
+    // SQL-48 / CM-100: the statement at the cursor goes to the clipboard.
+    let tab = app.tab(cx);
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.editor().update(cx, |editor, cx| {
+                editor.set_cursor_position(
+                    gpui_kit::component::input::Position::new(1, 3),
+                    window,
+                    cx,
+                )
+            })
+        })
+    });
+    dispatch(&app, cx, actions::CopySelectedQuery);
+    assert_eq!(app.clipboard(cx).as_deref(), Some("SELECT 2"));
+    // Upper case without a selection takes the cursor's line.
+    app.press(cx, &["secondary-shift-y"]);
+    assert_eq!(text(&app, cx), "SELECT 'Ab', \"Cd\" FROM T;\nselect 2");
+}
+
+#[gpui_kit::test]
+fn refresh_completion_metadata_finds_a_table_made_elsewhere(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    app.wait_until(cx, "the catalog", |_, cx| {
+        cx.update(|cx| tab.read(cx).catalog_ready())
+    });
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_g15_refresh CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_g15_refresh",
+            "CREATE TABLE kerno_ui_g15_refresh.fresh_table (id int)",
+        ],
+    );
+    let sql = "select * from kerno_ui_g15_refresh.";
+    let proposes = |cx: &mut TestAppContext| {
+        cx.update(|cx| tab.read(cx).completions(sql, sql.len(), cx))
+            .iter()
+            .any(|(label, _)| label == "fresh_table")
+    };
+    assert!(
+        !proposes(cx),
+        "the catalog was read before the table existed"
+    );
+    // SQL-52: the command reads it again.
+    dispatch(&app, cx, actions::RefreshCompletionMetadata);
+    app.wait_until(cx, "the new table", |_, cx| proposes(cx));
+}
+
+#[gpui_kit::test]
+fn the_editor_menu_sets_the_schema_and_exports_from_the_query(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    app.wait_until(cx, "the schemas", |_, cx| {
+        cx.update(|cx| tab.read(cx).schemas().iter().any(|schema| schema == "shop"))
+    });
+    app.type_text(cx, "select 1 as one");
+    // CM-95: Execute ▸ Active schema ▸ shop.
+    let on_text = Some(gpui_kit::point(px(120.), px(10.)));
+    app.right_click(cx, "query-editor", on_text);
+    click_menu_entry(&app, cx, "Execute");
+    click_menu_entry(&app, cx, "Active schema");
+    click_menu_entry(&app, cx, "shop");
+    app.wait_until(cx, "the schema", |app, cx| {
+        active_target(app, cx).and_then(|target| target.schema) == Some("shop".into())
+    });
+    // CM-93: Execute ▸ Export from query… opens the export of the statement.
+    app.right_click(cx, "query-editor", on_text);
+    click_menu_entry(&app, cx, "Execute");
+    for label in ["Count rows of statement", "Fetch all rows (no rows left)"] {
+        assert!(menu_entry(&app, cx, label).is_some(), "{label}");
+    }
+    click_menu_entry(&app, cx, "Export from query…");
+    app.wait_until(cx, "the export", |app, cx| app.has(cx, "export-dialog"));
+}
+
+#[gpui_kit::test]
+fn revert_puts_back_the_text_of_the_saved_file(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kept.sql");
+    std::fs::write(&path, "select 1").unwrap();
+    let app = open(cx, memory_storage());
+    let opening = path.clone();
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_sql_file_from(opening, window, cx)
+        })
+    });
+    app.wait_until(cx, "the file", |app, cx| app.titles(cx) == ["kept.sql"]);
+    app.type_text(cx, " -- changed");
+    let tab = app.tab(cx);
+    assert!(cx.update(|cx| tab.read(cx).unsaved()));
+    // CM-96: File ▸ Revert to saved file.
+    dispatch(&app, cx, actions::RevertFile);
+    app.wait_until(cx, "the revert", |app, cx| {
+        app.active_query(cx).1 == "select 1" && !cx.update(|cx| tab.read(cx).unsaved())
+    });
+}
+
+#[gpui_kit::test]
+fn link_with_editor_selects_the_table_of_the_active_tab(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "shop", "orders", RelationKind::Table);
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    let row_of = |app: &Fixture, cx: &mut TestAppContext, table: &str| {
+        cx.update(|cx| {
+            app.workspace
+                .read(cx)
+                .navigator(cx)
+                .read(cx)
+                .row_of(&["kerno", "shop", "Tables", table], cx)
+        })
+    };
+    // NAV-21 / CM-07: on (from the tree's menu), the active tab's table is
+    // selected now…
+    app.wait_until(cx, "the databases", |app, cx| !app.tree(cx).is_empty());
+    let height = app.step(cx, |window, _| {
+        window.find("navigator-tree").bounds().size.height
+    });
+    app.right_click(
+        cx,
+        "navigator-tree",
+        Some(gpui_kit::point(px(40.), height - px(8.))),
+    );
+    app.click_label(cx, "Link with editor");
+    cx.run_until_parked();
+    assert!(settings_now(cx).link_with_editor);
+    app.wait_until(cx, "customers selected", |app, cx| {
+        let row = row_of(app, cx, "customers");
+        row.is_some() && app.selected_row(cx) == row
+    });
+    // …and as tabs are activated.
+    app.press(cx, &["ctrl-shift-tab"]);
+    app.wait_until(cx, "orders selected", |app, cx| {
+        let row = row_of(app, cx, "orders");
+        row.is_some() && app.selected_row(cx) == row
+    });
+    let selected = cx.update(|cx| {
+        let workspace = app.workspace.read(cx);
+        workspace.sidebar().read(cx).selected().map(str::to_string)
+    });
+    let first = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    assert_eq!(selected, Some(first));
+    // Off again (Cmd+Shift+,): activating a tab leaves the tree alone.
+    app.press(cx, &["secondary-shift-,"]);
+    assert!(!settings_now(cx).link_with_editor);
+    let before = app.selected_row(cx);
+    app.press(cx, &["ctrl-tab"]);
+    cx.run_until_parked();
+    assert_eq!(app.selected_row(cx), before);
+}
+
+#[gpui_kit::test]
+fn paste_saves_the_copied_connection_and_a_folder_refreshes(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let config = testing::config(Engine::Postgres);
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    let sidebar = cx.update(|cx| app.workspace.read(cx).sidebar());
+    let has = |cx: &mut TestAppContext, subject: Subject, action: SidebarAction| {
+        cx.update(|cx| {
+            sidebar
+                .read(cx)
+                .menu_of(&subject, cx)
+                .contains(&crate::sidebar::Entry::Item(action, None))
+        })
+    };
+    // CM-09: nothing to paste until a connection is copied.
+    assert!(!has(cx, Subject::List, SidebarAction::Paste));
+    app.sidebar_does(cx, Subject::Connection(id.clone()), SidebarAction::CopyName);
+    assert_eq!(app.clipboard(cx), Some(config.name.clone()));
+    assert!(has(cx, Subject::List, SidebarAction::Paste));
+    app.sidebar_does(cx, Subject::List, SidebarAction::Paste);
+    app.wait_until(cx, "the copy", |app, _| {
+        app.storage.connections().unwrap().len() == 2
+    });
+    let names: Vec<String> = app
+        .storage
+        .connections()
+        .unwrap()
+        .into_iter()
+        .map(|saved| saved.config.name)
+        .collect();
+    assert!(
+        names.contains(&format!("{} copy", config.name)),
+        "{names:?}"
+    );
+
+    // CM-15: a folder's Refresh reads the list again and connects nothing.
+    let folder = Subject::Folder("Work".into());
+    assert!(has(cx, folder.clone(), SidebarAction::Refresh));
+    app.sidebar_does(cx, folder, SidebarAction::Refresh);
+    cx.run_until_parked();
+    assert_eq!(app.status(cx, 0), Status::Disconnected);
+    assert_eq!(cx.update(|cx| app.connections.read(cx).saved().len()), 2);
 }

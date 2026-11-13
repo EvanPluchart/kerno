@@ -50,7 +50,7 @@ pub fn neighbour(rows: &RangeInclusive<usize>, above: bool, total: usize) -> Opt
 }
 
 /// A fetched cell as a value to compare with or to copy.
-fn fetched(store: &ResultStore, row: usize, column: usize) -> CellValue {
+pub(crate) fn fetched(store: &ResultStore, row: usize, column: usize) -> CellValue {
     match store.cell(row, column) {
         None => CellValue::Null,
         Some(bytes) if store.columns()[column].kind == TypeKind::Binary => {

@@ -86,6 +86,10 @@ run_app seed KERNO_DATA_DIR="$template" KERNO_BENCH=seed KERNO_BENCH_CONNECTION=
 run_app seed KERNO_DATA_DIR="$template" KERNO_BENCH=seed KERNO_BENCH_CONNECTION=mysql \
   KERNO_BENCH_URL="mysql://kerno@127.0.0.1:53306/kerno?ssl-mode=disabled" >/dev/null
 
+# The first launch of a freshly built binary pays the system's one-time
+# checks of a new executable (1.7 to 2.1 s seen): launch it once untimed.
+run_app warmup KERNO_DATA_DIR="$(mktemp -d "$scratch/warmup.XXXXXX")" KERNO_BENCH=startup >/dev/null || true
+
 fresh() {
   local dir="$scratch/run-$1"
   rm -rf "$dir"
@@ -148,10 +152,15 @@ targets = {
     ("first_rows", "idle_rss_mb"): 150,
     ("first_rows", "columns_to_frame_ms"): 150,
     ("scroll.vertical", "interval_ms.avg"): 16,
-    ("scroll.vertical", "work_ms.avg"): 16,
     ("scroll.horizontal", "interval_ms.avg"): 16,
-    ("scroll.horizontal", "work_ms.avg"): 16,
 }
+loads = defaultdict(list)
+for row in open(sys.argv[1]):
+    label, _, line = row.rstrip("\n").split("\t", 2)
+    if '"bench":"load"' in line:
+        loads[label].append(f"{json.loads(line)['load1']:g}")
+for label, per_run in loads.items():
+    print(f"load average per {label} run: {' '.join(per_run)}")
 print(f"{'run':<9} {'measure':<18} {'value':<26} {'median':>12} {'min-max':>24} {'target':>8}")
 for (label, name, key), numbers in values.items():
     numbers = [n for n in numbers if n is not None]

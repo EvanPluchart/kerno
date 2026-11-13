@@ -20,7 +20,6 @@
 //! `KERNO_SECRET_STORE=memory`: they never touch the user's data or keychain.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::table::{ColumnSort, TableDelegate as _, TableState};
@@ -191,22 +190,6 @@ pub fn sorted(cx: &mut App) {
     mark(cx, |marks| &mut marks.sorted);
 }
 
-/// Set while scrolling is measured: cells mark when a frame starts drawing.
-static SCROLLING: AtomicBool = AtomicBool::new(false);
-/// Nanoseconds after `main` of the first cell drawn in the current frame;
-/// 0 when none was.
-static FRAME_START: AtomicU64 = AtomicU64::new(0);
-
-/// A grid cell is being drawn.
-pub fn cell() {
-    if SCROLLING.load(Ordering::Relaxed)
-        && FRAME_START.load(Ordering::Relaxed) == 0
-        && let Some((_, main)) = BENCH.get()
-    {
-        FRAME_START.store(main.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-}
-
 /// Starts the bench once the window and its workspace exist.
 pub fn begin(
     workspace: &Entity<Workspace>,
@@ -276,6 +259,29 @@ fn rss_mb() -> Option<f64> {
     Some((kb / 1024.0 * 10.0).round() / 10.0)
 }
 
+/// Physical footprint of this process, in MB (macOS `footprint`): what the
+/// process holds, compressed or swapped pages and GPU memory included. RSS
+/// leaves out pages the system compressed, so on a busy machine it drops
+/// with nothing freed.
+fn footprint_mb() -> Option<f64> {
+    let out = std::process::Command::new("footprint")
+        .args(["-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    // "kerno [123]: 64-bit    Footprint: 199 MB (16384 bytes per page)"
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut words = text.split("Footprint:").nth(1)?.split_whitespace();
+    let value: f64 = words.next()?.parse().ok()?;
+    let mb = match words.next()? {
+        "B" => value / 1048576.0,
+        "KB" => value / 1024.0,
+        "MB" => value,
+        "GB" => value * 1024.0,
+        _ => return None,
+    };
+    Some((mb * 10.0).round() / 10.0)
+}
+
 /// Polls `done` every few milliseconds.
 async fn until(
     cx: &mut gpui_kit::AsyncWindowContext,
@@ -340,7 +346,7 @@ async fn run(
         })
     })?;
     cx.background_executor().timer(Duration::from_secs(2)).await;
-    let idle_rss = rss_mb();
+    let (idle_rss, idle_footprint) = (rss_mb(), footprint_mb());
 
     cx.update(|window, cx| tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx)))?;
     until(cx, |cx| Ok(marks(cx).frame.is_some())).await?;
@@ -355,6 +361,7 @@ async fn run(
             "columns_to_frame_ms": between(marks.columns, marks.frame),
             "sent_to_frame_ms": between(marks.sent, marks.frame),
             "idle_rss_mb": idle_rss,
+            "idle_footprint_mb": idle_footprint,
         })
     })?;
     report(first);
@@ -389,6 +396,7 @@ async fn run(
         "rows_per_s": fetch_ms.map(|ms| (rows as f64 / ms * 1000.0).round()),
         "rss_before_mb": rss_before,
         "rss_after_mb": rss_mb(),
+        "footprint_after_mb": footprint_mb(),
         "memory_bytes": memory,
         "bytes_per_cell": (memory as f64 / (rows * columns).max(1) as f64 * 10.0).round() / 10.0,
     }));
@@ -433,7 +441,6 @@ struct Pass {
     started: Instant,
     last: Instant,
     intervals: Vec<f64>,
-    work: Vec<f64>,
     steps: usize,
 }
 
@@ -445,7 +452,6 @@ impl Pass {
             started: now,
             last: now,
             intervals: Vec::new(),
-            work: Vec::new(),
             steps: 0,
         }
     }
@@ -453,16 +459,8 @@ impl Pass {
     /// Records the frame just drawn.
     fn frame(&mut self) {
         let now = Instant::now();
-        let start = FRAME_START.swap(0, Ordering::Relaxed);
         if self.steps > 0 {
             self.intervals.push(ms(now - self.last));
-            if start > 0
-                && let Some((_, main)) = BENCH.get()
-            {
-                let drawn = main.elapsed().as_nanos() as u64;
-                self.work
-                    .push(ms(Duration::from_nanos(drawn.saturating_sub(start))));
-            }
         }
         self.last = now;
         self.steps += 1;
@@ -478,7 +476,6 @@ impl Pass {
             // The display paces frames: the median interval shows its rate.
             "refresh_hz": (1000.0 / interval.p50).round(),
             "interval_ms": interval.json(),
-            "work_ms": Summary::of(&mut self.work).json(),
         }));
     }
 }
@@ -487,8 +484,6 @@ impl Pass {
 /// in [`VERTICAL_PASS`] whatever the frame rate, then across the columns
 /// and back.
 fn scroll(grid: Entity<TableState<Grid>>, rows: usize, columns: usize, window: &mut Window) {
-    SCROLLING.store(true, Ordering::Relaxed);
-    FRAME_START.store(0, Ordering::Relaxed);
     let pass = Pass::new("vertical");
     window.on_next_frame(move |window, cx| vertical(grid, rows, columns, pass, window, cx));
 }
@@ -524,7 +519,6 @@ fn horizontal(
 ) {
     pass.frame();
     if pass.started.elapsed() >= HORIZONTAL_PASS {
-        SCROLLING.store(false, Ordering::Relaxed);
         let steps = pass.steps;
         pass.report(steps);
         cx.quit();

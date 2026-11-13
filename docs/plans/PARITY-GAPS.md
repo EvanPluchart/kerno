@@ -621,3 +621,40 @@ Left:
 - Concurrently is offered on Refresh materialized view without checking for a unique index; the server's
   error is shown instead.
 - The "Done in" time includes opening the session.
+
+## G7, G15, the G10 leftovers, CM-09 and CM-15 — delivered on 2026-11-13, and what they left (one `opus`
+agent; core: `sql/generate.rs`, `sql/text.rs`; app: `tabs.rs`, `query/tab.rs`, `query/grid.rs`,
+`data/tab.rs`, `navigator/actions.rs`, `navigator/view.rs`, `structure/editor.rs`, `sidebar.rs`,
+`actions.rs`, `main.rs`, `workspace.rs`, `ui_tests.rs`)
+
+Done:
+- G7: Generate SQL ▸ (SELECT by key, SELECT … IN, INSERT, UPDATE, DELETE) on the rows of table data,
+  values as literals through `edit_statements`, opened in a query tab on the table's schema, nothing run;
+  on a query result every entry is disabled with "query result"; a table without a key offers INSERT
+  only (RES-66, CM-115). Generate CALL and Execute… on functions and procedures (NAV-53, CM-80, CM-81):
+  PostgreSQL `CALL s.p(:a, NULL)` (OUT as NULL) / `SELECT * FROM s.f(:a)`; MySQL `SELECT db.f(:a)` /
+  `CALL db.p(:a, @b); SELECT @b;` — MySQL refuses NULL for an OUT argument (error 1414), so OUT and INOUT
+  are user variables, INOUT set first. Read data in SQL console on tables and views (NAV-46, CM-52, CM-68).
+- G15: toggle block comment (Cmd+Shift+/), upper / lower case (Cmd+Shift+X / Y) leaving strings, quoted
+  names and `:params` alone, copy statement at cursor, refresh completion metadata, export from query,
+  revert to the saved file; the editor menu grouped as DBeaver's: Execute ▸ (with Active connection ▸ /
+  database ▸ / schema ▸), Format ▸, File ▸ (SQL-33, SQL-35, SQL-48, SQL-52, CM-93, CM-95, CM-96, CM-98,
+  CM-100).
+- G10 leftovers: Link with editor (Cmd+Shift+, and a checked entry of the tree's empty-area menu; stored
+  in the settings; reveals on a tab activation, never while tabs are restored) (NAV-21, CM-07). Edit on a
+  column and Add column… open the table form on that column or on a new row (CM-72, CM-73); the
+  `ALTER … ADD COLUMN` template is gone.
+- CM-09: Copy ▸ on a connection remembers it inside the app (its id only); Paste in the list's empty area
+  saves a copy, as Duplicate does (this overrides the roadmap decision above). CM-15: Refresh on a folder
+  reads the list again and the tree when it shows a connection of the folder; nothing reconnects.
+
+Left:
+- RES-66's "CREATE from result" (DBeaver `ddlByResultSet`) is not written.
+- SQL-52: one command; DBeaver's "current schema" and "all schemas" are the same here, because the
+  completion catalog is read whole.
+- CM-96: "Import script" is Open SQL file (a new tab, DBeaver loads into the current editor); "Export
+  script" is Save as.
+- CM-93: "all rows" is Fetch all rows of the result on screen, not DBeaver's run-and-fetch-all;
+  "Evaluate expression" stays on the roadmap (SQL-14).
+- The tree's entries (Read data in SQL console, Generate CALL, Execute…) have no palette command.
+- Cmd+Shift+/ may be taken by macOS for the Help menu's search field; not checked in the real app.

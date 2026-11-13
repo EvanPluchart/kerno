@@ -84,6 +84,8 @@ pub struct Settings {
     pub null_text: String,
     /// Timestamps with a time zone show their offset.
     pub show_time_zone: bool,
+    /// The schema tree selects the table of the tab being activated.
+    pub link_with_editor: bool,
 }
 
 /// The sizes the settings allow, in points.
@@ -114,6 +116,7 @@ impl Default for Settings {
             ligatures: false,
             null_text: "NULL".to_string(),
             show_time_zone: true,
+            link_with_editor: false,
         }
     }
 }
@@ -198,6 +201,7 @@ mod tests {
             ligatures: true,
             null_text: "∅".to_string(),
             show_time_zone: false,
+            link_with_editor: true,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

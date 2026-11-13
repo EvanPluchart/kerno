@@ -586,6 +586,28 @@ impl Workspace {
                     DataTabEvent::OpenStructure { table, kind } => {
                         this.open_structure(target, table.clone(), *kind, window, cx);
                     }
+                    // In the table's schema; a MySQL table's is its database.
+                    DataTabEvent::OpenQuery { title, sql } => {
+                        let schema = tab.read(cx).table().schema.clone();
+                        let has_schemas = this
+                            .connections
+                            .read(cx)
+                            .meta_session(&target.connection)
+                            .is_some_and(|meta| meta.dialect().has_schemas());
+                        let target = if has_schemas {
+                            Target {
+                                schema: Some(schema),
+                                ..target
+                            }
+                        } else {
+                            Target {
+                                database: Some(schema),
+                                schema: None,
+                                ..target
+                            }
+                        };
+                        this.open_query(title.clone(), sql, Some(target), window, cx);
+                    }
                     DataTabEvent::TableGone { table } => {
                         let navigator = this.sidebar.read(cx).navigator().clone();
                         navigator.update(cx, |navigator, cx| {
@@ -892,8 +914,42 @@ impl Workspace {
             tab.reveal(window, cx);
             tab.focus_handle(cx).focus(window, cx);
             self.schedule_save(cx);
+            if AppState::get(cx).settings.link_with_editor {
+                self.link_active_tab(cx);
+            }
             cx.notify();
         }
+    }
+
+    /// Selects the table of the active tab (data, structure or form) in the
+    /// schema tree, and its connection in the list (DBeaver's "Link with
+    /// editor", `core.navigator.linkeditor`).
+    fn link_active_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let linked = if let Some(tab) = tab.data() {
+            let tab = tab.read(cx);
+            Some((tab.target().clone(), tab.table().clone(), tab.kind()))
+        } else if let Some(tab) = tab.structure() {
+            let tab = tab.read(cx);
+            Some((tab.target().clone(), tab.table().clone(), tab.kind()))
+        } else if let Some(tab) = tab.table_editor() {
+            let tab = tab.read(cx);
+            tab.table()
+                .map(|table| (tab.target().clone(), table.clone(), RelationKind::Table))
+        } else {
+            None
+        };
+        let Some((target, table, kind)) = linked else {
+            return;
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.select(target.connection.clone(), cx);
+            sidebar.navigator().update(cx, |navigator, cx| {
+                navigator.reveal(&target, &table, kind, cx)
+            });
+        });
     }
 
     /// Removes the tab at `index` without asking: see `close_tabs`.
@@ -1063,6 +1119,8 @@ impl Workspace {
                         })
                     });
                 }),
+                window,
+                cx,
             );
             tabs::fit_window(menu, window)
         }
@@ -1507,6 +1565,26 @@ impl Workspace {
                 self.push_query_tab(title.clone(), sql, target.clone(), window, cx);
                 self.activate_tab(self.tabs.len() - 1, window, cx);
                 self.schedule_save(cx);
+            }
+            NavigatorEvent::RunQuery { title, sql, target } => {
+                let tab = self.open_query(title.clone(), sql, target.clone(), window, cx);
+                tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx));
+            }
+            NavigatorEvent::EditTable {
+                target,
+                table,
+                column,
+            } => {
+                let editor = self.open_table_editor(
+                    target.clone(),
+                    table.schema.clone(),
+                    Some(table.clone()),
+                    window,
+                    cx,
+                );
+                editor.update(cx, |editor, cx| {
+                    editor.focus_column(column.clone(), window, cx)
+                });
             }
             NavigatorEvent::OpenData {
                 target,
@@ -3487,6 +3565,56 @@ impl Workspace {
         .on_action(cx.listener(|_, _: &actions::OpenKeymapFile, window, cx| {
             crate::settings_view::open_keymap_file(window, cx)
         }))
+        .on_action(
+            cx.listener(|this, _: &actions::ToggleBlockComment, window, cx| {
+                this.on_query(window, cx, QueryTab::toggle_block_comment)
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::UpperCase, window, cx| {
+            this.on_query(window, cx, |tab, window, cx| {
+                tab.change_case(true, window, cx)
+            })
+        }))
+        .on_action(cx.listener(|this, _: &actions::LowerCase, window, cx| {
+            this.on_query(window, cx, |tab, window, cx| {
+                tab.change_case(false, window, cx)
+            })
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::CopySelectedQuery, window, cx| {
+                this.on_query(window, cx, |tab, _, cx| {
+                    tab.copy_statement(cx);
+                })
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::RefreshCompletionMetadata, window, cx| {
+                this.on_query(window, cx, |tab, _, cx| tab.refresh_completion(cx))
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::ExportFromQuery, window, cx| {
+                this.on_query(window, cx, QueryTab::export_from_query)
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::RevertFile, window, cx| {
+            this.on_query(window, cx, QueryTab::revert_file)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::LinkWithEditor, window, cx| {
+                let on = !AppState::get(cx).settings.link_with_editor;
+                AppState::update_settings(cx, |settings| settings.link_with_editor = on);
+                if on {
+                    this.link_active_tab(cx);
+                }
+                let text = if on {
+                    "Link with editor: on. The schema tree follows the active tab."
+                } else {
+                    "Link with editor: off."
+                };
+                window.push_notification(text, cx);
+            }),
+        )
     }
 
     /// Open Table (Cmd+P) on the active tab's connection, or the one

@@ -1,14 +1,15 @@
 //! Kerno's own mark and horizontal lockup, from the owner's files in
 //! `assets/brand/` (rules in `BRAND.md`). The files are embedded byte for
-//! byte and drawn with `img()` at their own colours: never recoloured,
-//! redrawn or stretched. Their viewBoxes already carry the clear space (one
+//! byte and drawn at their own colours (rasterised at the size they are
+//! shown, [`crate::engine_logo::svg_image`]): never recoloured, redrawn or
+//! stretched. Their viewBoxes already carry the clear space (one
 //! disk height, 44 units on the 256 grid).
 
 use gpui_kit::component::{ActiveTheme as _, StyledExt as _, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Styled as _,
-    TestSupportExt as _, div, img, px, rgb,
+    TestSupportExt as _, div, px, rgb,
 };
 
 use crate::theme;
@@ -59,11 +60,11 @@ pub fn lockup(width: Pixels, cx: &App) -> impl IntoElement {
         .justify_center()
         .rounded(cx.theme().radius_lg)
         .when(dark, |panel| panel.w_full().bg(rgb(theme::NIGHT)).py_2())
-        .child(
-            img(if dark { LOCKUP_REVERSED } else { LOCKUP })
-                .w(width)
-                .h(width / LOCKUP_RATIO),
-        )
+        .child(crate::engine_logo::svg_image(
+            if dark { LOCKUP_REVERSED } else { LOCKUP },
+            width,
+            width / LOCKUP_RATIO,
+        ))
 }
 
 /// The mark, in a square of `size` that includes its clear space: olive on
@@ -77,7 +78,7 @@ pub fn mark(size: Pixels, cx: &App) -> impl IntoElement {
     div()
         .id("brand-mark")
         .test_support()
-        .child(img(path).size(size))
+        .child(crate::engine_logo::svg_image(path, size, size))
 }
 
 /// The lines of the About window under the lockup, version first.

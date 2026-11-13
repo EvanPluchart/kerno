@@ -241,6 +241,23 @@ gpui_kit::actions!(
         OpenStructureAtCursor,
         /// Opens the keymap file, made with an example first when missing.
         OpenKeymapFile,
+        /// Wraps the selection in a block comment, or unwraps it.
+        ToggleBlockComment,
+        /// Puts the selection in upper case, strings and quoted names aside.
+        UpperCase,
+        /// Puts the selection in lower case, strings and quoted names aside.
+        LowerCase,
+        /// Copies the statement at the cursor, or the selection.
+        CopySelectedQuery,
+        /// Reads again what completion knows of the tab's database.
+        RefreshCompletionMetadata,
+        /// Exports the rows of the statement at the cursor to a file.
+        ExportFromQuery,
+        /// Puts back the text of the active tab's file.
+        RevertFile,
+        /// Selects the active tab's table in the schema tree, now and as
+        /// tabs are activated, or stops.
+        LinkWithEditor,
     ]
 );
 
@@ -983,6 +1000,65 @@ pub const COMMANDS: &[Command] = &[
         ["beautify", "pretty", "indent"],
         FormatSql
     ),
+    // DBeaver's `comment.multi` (Ctrl+Shift+/) and Eclipse's To Upper /
+    // Lower Case (Ctrl+Shift+X / Y).
+    command!(
+        "toggle_block_comment",
+        "Toggle Block Comment",
+        "Editor",
+        ["secondary-shift-/"],
+        ["comment out", "uncomment", "/*", "multi-line"],
+        ToggleBlockComment
+    ),
+    command!(
+        "upper_case",
+        "Upper Case",
+        "Editor",
+        ["secondary-shift-x"],
+        ["capitals", "uppercase", "format"],
+        UpperCase
+    ),
+    command!(
+        "lower_case",
+        "Lower Case",
+        "Editor",
+        ["secondary-shift-y"],
+        ["small letters", "lowercase", "format"],
+        LowerCase
+    ),
+    // DBeaver's `copy.query`.
+    command!(
+        "copy_selected_query",
+        "Copy Statement at Cursor",
+        "Editor",
+        [],
+        ["copy query", "clipboard", "statement"],
+        CopySelectedQuery
+    ),
+    // DBeaver's `refresh.current.schema` and `refresh.all.schemas`: Kerno's
+    // catalog holds every schema, so one command reads them all again.
+    command!(
+        "refresh_completion_metadata",
+        "Refresh Completion Metadata",
+        "Editor",
+        [],
+        [
+            "reload",
+            "autocomplete",
+            "schema",
+            "tables",
+            "content assist"
+        ],
+        RefreshCompletionMetadata
+    ),
+    command!(
+        "revert_file",
+        "Revert to Saved File",
+        "Editor",
+        [],
+        ["reload", "discard", "undo changes", "file"],
+        RevertFile
+    ),
     // DBeaver's Ctrl+Alt+Shift+W (`word.wrap`).
     command!(
         "toggle_soft_wrap",
@@ -991,6 +1067,16 @@ pub const COMMANDS: &[Command] = &[
         ["ctrl-alt-shift-w"],
         ["word wrap", "long lines"],
         ToggleSoftWrap
+    ),
+    // DBeaver's `export.data` from the editor: the rows the statement
+    // returns, run again for the export.
+    command!(
+        "export_from_query",
+        "Export From Query…",
+        "Query",
+        [],
+        ["csv", "json", "file", "statement", "dump"],
+        ExportFromQuery
     ),
     command!(
         "explain_statement",
@@ -1223,6 +1309,15 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-b"],
         ["connections", "navigator"],
         ToggleSidebar
+    ),
+    // DBeaver's `core.navigator.linkeditor` (Ctrl+Shift+,).
+    command!(
+        "link_with_editor",
+        "Link Schema Tree With Editor",
+        "View",
+        ["secondary-shift-,"],
+        ["reveal", "sync", "navigator", "select table", "follow"],
+        LinkWithEditor
     ),
     command!(
         "use_system_theme",
@@ -1761,6 +1856,10 @@ mod tests {
             ("grid_zoom_in", &["secondary-=", "alt-0"]),
             ("grid_zoom_out", &["secondary--", "alt-9"]),
             ("grid_zoom_reset", &["secondary-0"]),
+            ("toggle_block_comment", &["secondary-shift-/"]),
+            ("upper_case", &["secondary-shift-x"]),
+            ("lower_case", &["secondary-shift-y"]),
+            ("link_with_editor", &["secondary-shift-,"]),
         ] {
             assert_eq!(keys_of(&bindings, id), keys, "{id}");
         }

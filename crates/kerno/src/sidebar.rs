@@ -47,6 +47,8 @@ pub enum SidebarAction {
     NewConnection,
     NewFolder,
     ImportConnections,
+    /// Saves a copy of the connection copied last.
+    Paste,
     Refresh,
     CollapseAll,
     NewConnectionHere,
@@ -80,6 +82,7 @@ impl SidebarAction {
             Self::NewConnection => "New connection…",
             Self::NewFolder => "New folder…",
             Self::ImportConnections => "Import connections…",
+            Self::Paste => "Paste",
             Self::Refresh => "Refresh",
             Self::CollapseAll => "Collapse all",
             Self::NewConnectionHere => "New connection here…",
@@ -119,7 +122,8 @@ pub enum Entry {
 /// (ignored for the other subjects); `folders` are every folder; `folder`
 /// is where the connection is; `open` counts the connections open that a
 /// disconnection would close: all of them for the list, those in the
-/// folder, the others for a connection.
+/// folder, the others for a connection; `copied` says a connection was
+/// copied, for Paste.
 pub fn menu(
     subject: &Subject,
     status: &Status,
@@ -127,6 +131,7 @@ pub fn menu(
     folder: Option<&str>,
     open: usize,
     read_only: bool,
+    copied: bool,
 ) -> Vec<Entry> {
     use Entry::{Item, Separator, Submenu};
     use SidebarAction::*;
@@ -137,6 +142,8 @@ pub fn menu(
             enabled(NewConnection),
             enabled(NewFolder),
             enabled(ImportConnections),
+            Separator,
+            Item(Paste, (!copied).then_some("no connection copied")),
             Separator,
             enabled(Refresh),
             Item(CollapseAll, folders.is_empty().then_some("no folders")),
@@ -152,6 +159,8 @@ pub fn menu(
             enabled(Rename),
             Separator,
             enabled(Delete),
+            Separator,
+            enabled(Refresh),
         ],
         Subject::Connection(_) => {
             let connected = matches!(status, Status::Connected { .. });
@@ -251,6 +260,10 @@ pub struct Sidebar {
     /// The list of connections, which takes Enter and F4 once a row is
     /// clicked (key context `ConnectionList`).
     focus_handle: FocusHandle,
+    /// The connection whose Copy ▸ was used last: what Paste duplicates.
+    /// Only its id is kept, never a secret, and nothing of it goes to the
+    /// clipboard but what was copied.
+    copied: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -283,6 +296,7 @@ impl Sidebar {
             selected: None,
             navigator,
             focus_handle: cx.focus_handle(),
+            copied: None,
             _subscriptions: subscriptions,
         }
     }
@@ -292,7 +306,8 @@ impl Sidebar {
         &self.navigator
     }
 
-    fn select(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Selects a connection in the list and shows its tree.
+    pub fn select(&mut self, id: String, cx: &mut Context<Self>) {
         self.selected = Some(id.clone());
         self.navigator
             .update(cx, |navigator, cx| navigator.set_connection(Some(id), cx));
@@ -354,7 +369,15 @@ impl Sidebar {
             folder.as_deref(),
             self.closing(subject, cx).len(),
             read_only,
+            self.copied_connection(cx).is_some(),
         )
+    }
+
+    /// The connection copied last, while it is still saved.
+    fn copied_connection(&self, cx: &App) -> Option<String> {
+        self.copied
+            .clone()
+            .filter(|id| self.connections.read(cx).get(id).is_some())
     }
 
     /// The open connections a Disconnect on `subject` closes: every one
@@ -399,7 +422,7 @@ impl Sidebar {
         let copy = |text: String, cx: &mut Context<Self>| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
         };
-        match (subject, action) {
+        match (subject, action.clone()) {
             (Subject::List, NewConnection) => ConnectionDialog::open(connections, None, window, cx),
             (Subject::Folder(path), NewConnectionHere) => {
                 ConnectionDialog::open_in(connections, path.clone(), window, cx)
@@ -420,6 +443,26 @@ impl Sidebar {
             }
             (Subject::List, ImportConnections) => cx.emit(SidebarEvent::ImportConnections),
             (Subject::List, Refresh) => connections.update(cx, |c, cx| c.reload(cx)),
+            // DBeaver pastes a copied connection as a new one.
+            (Subject::List, Paste) => {
+                if let Some(copied) = self.copied_connection(cx) {
+                    connections.update(cx, |c, cx| c.duplicate(&copied, cx))
+                }
+            }
+            // The folder's list is read again, and the tree when it shows a
+            // connection of the folder; nothing is reconnected.
+            (Subject::Folder(path), Refresh) => {
+                connections.update(cx, |c, cx| c.reload(cx));
+                let shown = self.navigator.read(cx).connection().map(str::to_string);
+                let inside = shown
+                    .and_then(|id| connections.read(cx).get(&id).cloned())
+                    .and_then(|saved| folder_of(&saved.config))
+                    .is_some_and(|folder| in_folder(&folder, path));
+                if inside {
+                    self.navigator
+                        .update(cx, |navigator, cx| navigator.reload(cx));
+                }
+            }
             (Subject::List, CollapseAll) => {
                 let folders = connections.read(cx).folders(cx);
                 AppState::update_settings(cx, |settings| {
@@ -491,20 +534,18 @@ impl Sidebar {
                 self.navigator
                     .update(cx, |navigator, cx| navigator.reload(cx));
             }
-            (Subject::Connection(_), CopyName) => {
-                if let Some(saved) = saved {
-                    copy(saved.config.name, cx)
-                }
-            }
-            (Subject::Connection(_), CopyUrl) => {
-                if let Some(saved) = saved {
-                    copy(connection_url(&saved.config), cx)
-                }
-            }
-            (Subject::Connection(_), CopyHost) => {
-                if let Some(saved) = saved {
-                    copy(saved.config.host, cx)
-                }
+            (Subject::Connection(_), CopyName | CopyUrl | CopyHost) => {
+                let Some(saved) = saved else {
+                    return;
+                };
+                let text = match action {
+                    CopyName => saved.config.name,
+                    CopyUrl => connection_url(&saved.config),
+                    _ => saved.config.host,
+                };
+                copy(text, cx);
+                // Paste in the list saves a copy of it.
+                self.copied = Some(id);
             }
             (subject, action) => {
                 tracing::warn!(?subject, ?action, "a sidebar action on the wrong subject")
@@ -1084,11 +1125,21 @@ mod tests {
     fn the_empty_area_and_a_folder_offer_what_dbeaver_does() {
         let disconnected = Status::Disconnected;
         assert_eq!(
-            labels(&menu(&Subject::List, &disconnected, &[], None, 0, false)),
+            labels(&menu(
+                &Subject::List,
+                &disconnected,
+                &[],
+                None,
+                0,
+                false,
+                false
+            )),
             [
                 "New connection…",
                 "New folder…",
                 "Import connections…",
+                "—",
+                "Paste (no connection copied)",
                 "—",
                 "Refresh",
                 "Collapse all (no folders)",
@@ -1104,8 +1155,9 @@ mod tests {
                 &folders,
                 None,
                 2,
+                false,
                 false
-            ))[5],
+            ))[7],
             "Collapse all"
         );
         assert_eq!(
@@ -1115,8 +1167,9 @@ mod tests {
                 &folders,
                 None,
                 2,
+                false,
                 false
-            ))[7],
+            ))[9],
             "Disconnect all"
         );
         assert_eq!(
@@ -1126,6 +1179,7 @@ mod tests {
                 &folders,
                 None,
                 0,
+                false,
                 false
             )),
             [
@@ -1137,6 +1191,8 @@ mod tests {
                 "Rename…",
                 "—",
                 "Delete…",
+                "—",
+                "Refresh",
             ]
         );
     }
@@ -1151,6 +1207,7 @@ mod tests {
             &folders,
             Some("Work"),
             0,
+            false,
             false,
         ));
         assert_eq!(
@@ -1186,6 +1243,7 @@ mod tests {
             None,
             1,
             true,
+            false,
         ));
         assert_eq!(
             open[..3],
@@ -1196,7 +1254,15 @@ mod tests {
         assert_eq!(open[16], "Refresh");
         assert!(open[12].starts_with("Move to folder ▸ [No folder (already there), Work,"));
         // The read-only entry carries the flag as it is, checked.
-        let entries = menu(&subject, &Status::Disconnected, &folders, None, 0, true);
+        let entries = menu(
+            &subject,
+            &Status::Disconnected,
+            &folders,
+            None,
+            0,
+            true,
+            false,
+        );
         assert!(entries.contains(&Entry::Item(SidebarAction::ReadOnly(true), None)));
 
         let connecting = labels(&menu(
@@ -1205,6 +1271,7 @@ mod tests {
             &folders,
             None,
             0,
+            false,
             false,
         ));
         assert_eq!(
@@ -1223,6 +1290,7 @@ mod tests {
             &folders,
             None,
             0,
+            false,
             false,
         ));
         assert_eq!(

@@ -12,6 +12,10 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// Days of log files kept.
 const KEPT_FILES: usize = 7;
+/// Lines waiting for the writer thread. The library's default (128,000)
+/// allocates 4 MB up front; Kerno logs a few lines per action. When the
+/// queue is full, new lines are dropped rather than blocking the UI.
+const QUEUED_LINES: usize = 1024;
 
 /// Keeps the log writer alive for as long as the app runs; dropping it
 /// with the app's globals flushes the last lines.
@@ -42,7 +46,9 @@ pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::R
         .filename_suffix("log")
         .max_log_files(KEPT_FILES)
         .build(directory)?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(QUEUED_LINES)
+        .finish(appender);
     tracing_subscriber::registry()
         .with(filter)
         .with(

@@ -3,7 +3,6 @@
 use kerno_core::Dialect;
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
-use kerno_core::table_draft::{AutoIncrement, ColumnDraft, TableChange};
 
 use super::model::{Group, Node, NodeKind};
 use crate::settings::TableDoubleClick;
@@ -73,6 +72,18 @@ pub enum Action {
     /// The engine's maintenance tools (Tools ▸, see [`tools`]): never in
     /// the lists of [`actions`], which know no dialect; the menu adds it.
     Tools,
+    /// A `SELECT` of the table run in a new query tab (DBeaver's "Read data
+    /// in SQL console", `core.sql.editor.forSelection`).
+    ReadInConsole,
+    /// The call of a routine with a parameter per argument, in a new query
+    /// tab (DBeaver's Generate SQL ▸ CALL).
+    GenerateCall,
+    /// That call, run: Kerno asks for the parameters (DBeaver's "Execute
+    /// stored procedure").
+    ExecuteRoutine,
+    /// The table's form with the cursor on this column (DBeaver's Edit on
+    /// a column).
+    EditColumn,
 }
 
 impl Action {
@@ -114,6 +125,10 @@ impl Action {
             Action::DropColumn => "Drop column…",
             Action::RevealTable => "Show table in tree",
             Action::Tools => "Tools",
+            Action::ReadInConsole => "Read data in SQL console",
+            Action::GenerateCall => "Generate CALL",
+            Action::ExecuteRoutine => "Execute…",
+            Action::EditColumn => "Edit column…",
         }
     }
 
@@ -190,9 +205,10 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
-            vec![OpenData, OpenStructure, NewQueryHere],
+            vec![OpenData, OpenStructure, NewQueryHere, ReadInConsole],
             vec![Export, ImportCsv],
             all_templates.to_vec(),
+            vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
             vec![Rename, Truncate, Drop],
         ],
@@ -204,6 +220,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 OpenData,
                 OpenStructure,
                 NewQueryHere,
+                ReadInConsole,
                 Generate(Template::Select),
             ],
             vec![Export],
@@ -214,7 +231,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             kind: RoutineKind::Function | RoutineKind::Procedure,
             ..
         }) => vec![
-            vec![NewQueryHere],
+            vec![NewQueryHere, GenerateCall, ExecuteRoutine],
             vec![ShowDdl, EditSource, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
@@ -246,9 +263,10 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 vec![if *installed { Drop } else { InstallExtension }],
             ]
         }
-        // F4 and "Open structure" show the table the column is in.
+        // F4 opens the table's form on the column; "Open structure" shows
+        // the table the column is in.
         NodeKind::Column { .. } => vec![
-            vec![OpenStructure],
+            vec![EditColumn, OpenStructure],
             vec![CopyName],
             vec![AddColumn, RenameColumn, DropColumn],
         ],
@@ -318,17 +336,22 @@ pub fn default_action(node: &Node, has_schemas: bool, table: TableDoubleClick) -
     }
 }
 
-/// What F4 does to a node (DBeaver's "Edit"): the structure of a table or
-/// view, the source of a routine, the DDL of other objects; `None` when the
-/// node has none of these.
+/// What F4 does to a node (DBeaver's "Edit"): the table's form on a
+/// column, the structure of a table or view, the source of a routine, the
+/// DDL of other objects; `None` when the node has none of these.
 pub fn edit_action(node: &Node, has_schemas: bool) -> Option<Action> {
     let available = actions(node, has_schemas).concat();
-    [Action::OpenStructure, Action::EditSource, Action::ShowDdl]
-        .into_iter()
-        .find(|action| available.contains(action))
+    [
+        Action::EditColumn,
+        Action::OpenStructure,
+        Action::EditSource,
+        Action::ShowDdl,
+    ]
+    .into_iter()
+    .find(|action| available.contains(action))
 }
 
-/// The statement a "Create …" entry (or "Add column…") opens in a query
+/// The statement a "Create …" entry opens in a query
 /// tab, to complete and run, with its tab title. The new object is named
 /// `new_…` in `schema`; a trigger is on `table`, or on a `table_name` to
 /// replace when it is created from a schema's folder. MySQL bodies sit
@@ -393,23 +416,6 @@ pub fn create_template(
             ),
             "-- statements",
         ),
-        Action::AddColumn => {
-            let column = ColumnDraft {
-                original: None,
-                name: "new_column".into(),
-                data_type: "text".into(),
-                nullable: true,
-                default: None,
-                comment: None,
-                auto_increment: AutoIncrement::Off,
-                on_update: None,
-                invisible: false,
-            };
-            let statements = dialect
-                .alter_table_sql(table?, &[TableChange::AddColumn(column)])
-                .ok()?;
-            return Some((table?.name.clone(), statements.join(";\n") + ";\n"));
-        }
         _ => return None,
     };
     let title = action
@@ -515,6 +521,25 @@ mod tests {
         assert!(view.contains(&Generate(Template::Select)) && view.contains(&Drop));
         assert!(view.contains(&OpenData) && view.contains(&OpenStructure));
         assert!(!view.contains(&Truncate) && !view.contains(&Generate(Template::Insert)));
+        // G7: tables and views are read in a console; a table takes a new
+        // column in its form (CM-73); routines are called.
+        assert!(table.contains(&ReadInConsole) && view.contains(&ReadInConsole));
+        assert!(table.contains(&AddColumn) && !view.contains(&AddColumn));
+        for kind in [RoutineKind::Function, RoutineKind::Procedure] {
+            let routine = flat(
+                NodeKind::Object(ObjectRef::Routine {
+                    schema: "shop".into(),
+                    name: "f".into(),
+                    kind,
+                    identity_arguments: String::new(),
+                }),
+                true,
+            );
+            assert!(
+                routine.contains(&GenerateCall) && routine.contains(&ExecuteRoutine),
+                "{kind:?}"
+            );
+        }
 
         let schema = flat(NodeKind::Object(ObjectRef::Schema("shop".into())), true);
         assert!(
@@ -551,6 +576,7 @@ mod tests {
                 true
             ),
             [
+                EditColumn,
                 OpenStructure,
                 CopyName,
                 AddColumn,
@@ -799,12 +825,12 @@ mod tests {
         assert_eq!(edit(schema, true), Some(ShowDdl));
         let database = NodeKind::Object(ObjectRef::Database("kerno".into()));
         assert_eq!(edit(database.clone(), false), Some(ShowDdl));
-        // A column is edited in the structure of its table.
+        // A column is edited in the form of its table (CM-72).
         let column = NodeKind::Column {
             table: orders,
             name: "id".into(),
         };
-        assert_eq!(edit(column, true), Some(OpenStructure));
+        assert_eq!(edit(column, true), Some(EditColumn));
         // Nothing to edit on a PostgreSQL database or a folder.
         assert_eq!(edit(database, true), None);
         assert_eq!(edit(NodeKind::Group(Group::Tables), true), None);
@@ -902,6 +928,10 @@ mod tests {
             CreateEvent,
             AddColumn,
             RevealTable,
+            ReadInConsole,
+            GenerateCall,
+            ExecuteRoutine,
+            EditColumn,
         ] {
             assert!(!action.writes(), "{action:?}");
         }
@@ -1045,11 +1075,8 @@ mod tests {
                 .contains("ON SCHEDULE EVERY 1 DAY")
         );
 
-        // A new column is written by the engine's ALTER TABLE.
-        let (title, sql) = template(AddColumn, &pg, Some(&orders));
-        assert_eq!(title, "orders");
-        assert!(sql.contains("ADD COLUMN \"new_column\" text"), "{sql}");
-        assert_eq!(create_template(AddColumn, &pg, "shop", None), None);
+        // A new column opens the table's form instead.
+        assert_eq!(create_template(AddColumn, &pg, "shop", Some(&orders)), None);
         assert_eq!(create_template(Drop, &pg, "shop", None), None);
     }
 }

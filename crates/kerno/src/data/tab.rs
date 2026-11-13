@@ -27,7 +27,7 @@ use kerno_core::config::Environment;
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::{Pending, neighbour};
 use kerno_core::schema::{ColumnGeneration, RelationKind, TableRef, TableStructure};
-use kerno_core::sql::{CellValue, RowChange, apply_edits, edit_statements};
+use kerno_core::sql::{CellValue, RowChange, RowSql, apply_edits, edit_statements, rows_sql};
 use kerno_core::{Error, ResultStore, Session, TxState, exec};
 
 use crate::actions::CloseTab;
@@ -60,6 +60,9 @@ pub enum DataTabEvent {
     },
     /// Show the structure of this table.
     OpenStructure { table: TableRef, kind: RelationKind },
+    /// Open a query tab holding `sql`, on this table's database and
+    /// schema; nothing runs.
+    OpenQuery { title: String, sql: String },
     /// The table is gone from the server (dropped or renamed elsewhere):
     /// the tree lists its schema's tables again.
     TableGone { table: TableRef },
@@ -588,6 +591,7 @@ impl DataTab {
                 let _ = view.update(cx, |this, cx| this.sort_by(sort, window, cx));
             }
         });
+        let keyless = structure.row_identity().is_none();
         let owner = Owner {
             act: Rc::new(move |action, row, column, window, cx| {
                 let _ = view.update(cx, |this, cx| this.perform(action, row, column, window, cx));
@@ -600,6 +604,7 @@ impl DataTab {
             })),
             export: None,
             filtered: !self.applied.is_empty(),
+            keyless,
         };
         let grid = Grid::page(
             store,
@@ -1238,8 +1243,61 @@ impl DataTab {
             GridAction::Export => {
                 self.export(window, cx);
             }
+            GridAction::Generate(kind) => self.generate_sql(kind, row, window, cx),
             // The grid runs the others itself.
             _ => {}
+        }
+    }
+
+    /// Writes `kind` statements for the selected rows (or `row`) into a new
+    /// query tab, with their values as literals: nothing runs. Rows added
+    /// and not applied yet are left out.
+    pub fn generate_sql(
+        &mut self,
+        kind: RowSql,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(table), Some(structure), Some(session)) =
+            (&self.grid, &self.structure, &self.session)
+        else {
+            return;
+        };
+        let shown = self
+            .selection(cx)
+            .map_or_else(|| vec![row], |(rows, _)| rows);
+        let grid = table.read(cx).delegate();
+        let rows: Vec<usize> = shown
+            .into_iter()
+            .map(|row| grid.source_row(row))
+            .filter(|&row| row < grid.row_count())
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let identity = structure.row_identity().unwrap_or_default();
+        let written = rows_sql(
+            kind,
+            session.dialect(),
+            &self.table,
+            &structure.columns,
+            &identity,
+            grid.store(),
+            &rows,
+        );
+        match written {
+            Ok(sql) => cx.emit(DataTabEvent::OpenQuery {
+                title: self.table.name.clone(),
+                sql,
+            }),
+            Err(error) => window.push_notification(
+                Notification::error(SharedString::from(format!(
+                    "The {} could not be written: {error}",
+                    kind.label()
+                ))),
+                cx,
+            ),
         }
     }
 

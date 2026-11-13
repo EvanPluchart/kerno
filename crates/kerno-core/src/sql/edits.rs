@@ -63,7 +63,7 @@ fn column<'a>(columns: &'a [ColumnInfo], name: &str, table: &TableRef) -> Result
 }
 
 /// The `WHERE` clause that addresses one row by its identity.
-fn where_clause(
+pub(super) fn where_clause(
     dialect: &dyn Dialect,
     table: &TableRef,
     columns: &[ColumnInfo],

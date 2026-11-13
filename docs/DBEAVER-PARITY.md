@@ -154,7 +154,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-18 | Show connected only | Hides disconnected connections | ui.navigator `navigator.filter.connected` | PG, My | **roadmap**: Small list of connections in a client; folders (CTX Part 1) organise them |
 | NAV-19 | Object filters: hide, show only selected, configure, toggle, clear | Persistent include / exclude masks per connection | core `core.object.filter.add.exclude` / `.include` / `.config` / `.toggle` / `.clear` | PG, My | **gap**: G11 |
 | NAV-20 | Collapse All | Folds the whole tree | core `org.eclipse.ui.navigate.collapseAll` (navigator view menu) | PG, My | **done**: Collapse all in the tree's menu and as a command; `a_right_click_below_the_schema_tree_opens_its_menu` |
-| NAV-21 | Link with editor | Selects in the tree the object of the active editor | ui.navigator `core.navigator.linkeditor` (Ctrl+Shift+,) | PG, My | **gap**: G10 |
+| NAV-21 | Link with editor | Selects in the tree the object of the active editor | ui.navigator `core.navigator.linkeditor` (Ctrl+Shift+,) | PG, My | **done**: Cmd+Shift+, toggles it; stored in the settings. `link_with_editor_selects_the_table_of_the_active_tab` |
 | NAV-22 | Statistics hints (row count, size) | Size and row estimates beside objects | ui.navigator pref `NAVIGATOR_SHOW_STATISTICS_INFO` (true) | PG, My | **done**: `counts_and_sizes_are_compact`, `databases_then_schemas_then_folders_of_objects` |
 | NAV-23 | Object descriptions in the tree | Comments shown beside names | ui.navigator pref `NAVIGATOR_SHOW_OBJECTS_DESCRIPTION` (false) | PG, My | **roadmap**: Off by default in DBeaver |
 | NAV-24 | Show system objects | Lists system schemas and tables | ui.editors.connection `dialog_connection_wizard_final_checkbox_show_system_objects` | PG, My | **roadmap**: System catalogs are reachable from the editor; the tree hides them by design |
@@ -179,14 +179,14 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-43 | New Index / Constraint from selected columns | Creates an index or key on the columns selected in the tree | ui.navigator `navigator.create.column.index`, `.constraint` | PG, My | **roadmap**: The table form adds indexes and keys (M7 Part 3); needs multi-selection (NAV-34) |
 | NAV-44 | Drop with cascade | Delete dialog offers a cascade option and shows the script | ui.navigator `NavigatorObjectsDeleter` (cascade checkbox of the delete confirmation) | PG, My | **done**: "Drop with cascade…" as a separate entry on PostgreSQL, through the SQL confirmation (DBeaver has a checkbox; folding it in is left in G10); `a_drop_with_cascade_also_drops_what_depends_on_the_table` |
 | NAV-45 | View Data | Opens the data of a table or view | ui.editors.data `ui.editors.data.forSelection` | PG, My | **done**: Open data; `a_table_opened_from_the_tree_comes_back_after_a_restart`, `a_table_is_read_in_pages_sorted_and_filtered_by_the_server` |
-| NAV-46 | Read data in SQL console | Opens a console with a SELECT of the table and runs it | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **gap**: G7 |
+| NAV-46 | Read data in SQL console | Opens a console with a SELECT of the table and runs it | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **done**: Read data in SQL console writes the SELECT and runs it. `routines_are_called_and_tables_read_in_a_console` |
 | NAV-47 | SQL Editor ▸ Open / Recent / New script / Open console | Script or console bound to the selected node; keys F3 / Ctrl+[, Ctrl+], Ctrl+Alt+Enter | ui.editors.sql `core.sql.editor.open`, `.recent`, `.create`, `.console` | PG, My | **done**: New query here; `statements_and_ddl_open_in_a_tab_and_run_nothing`, `a_query_result_is_exported_by_running_its_statement_again` |
 | NAV-48 | Keys for a new SQL editor on the selected node | Ctrl+] / Ctrl+Alt+Enter open an editor bound to the node | ui.editors.sql key bindings of `core.sql.editor.create` / `.console` | PG, My | **gap**: G1 (Cmd+] opens a query tab on the selected node, `navigator_keys_run_the_actions_of_the_selected_node`; the console bound to the node, Ctrl+Alt+Enter in DBeaver, is not built) |
 | NAV-49 | Generate SQL ▸ SELECT, INSERT, UPDATE, DELETE | Statement templates for a table | ui.editors.sql `sqlGenerator` tableSelect / tableInsert / tableUpdate / tableDelete | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing`, driver `tests/generate.rs` |
 | NAV-50 | Generate SQL ▸ DDL | The object's DDL in an editor | ui.editors.sql `sqlGenerator` tableDDL | PG, My | **done**: Show DDL; `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | NAV-51 | Generate SQL ▸ MERGE, JOIN, INNER JOIN | Merge statement; join of two selected tables | ui.editors.sql `sqlGenerator` tableMerge / tableJoin / tableInnerJoin | PG, My | **roadmap**: JOIN needs multi-selection (NAV-34); completion proposes joins on foreign keys already |
 | NAV-52 | Generate SQL ▸ INSERT ON CONFLICT, UPDATE FROM, DELETE USING | PostgreSQL-specific templates | ext.postgresql `sqlGenerator` | PG | **roadmap**: PostgreSQL-only variants of templates that exist |
-| NAV-53 | Generate SQL ▸ CALL; Execute stored procedure | Call template of a routine with its parameters, optionally run | ui.editors.sql `sqlGenerator` procedureCall, `core.procedure.execute` | PG, My | **gap**: G7 |
+| NAV-53 | Generate SQL ▸ CALL; Execute stored procedure | Call template of a routine with its parameters, optionally run | ui.editors.sql `sqlGenerator` procedureCall, `core.procedure.execute` | PG, My | **done**: Generate CALL and Execute… (the parameter prompt asks). `routines_are_called_and_tables_read_in_a_console` |
 | NAV-54 | Export Data / Import Data | Data transfer wizards from the tree | data.transfer.ui `core.export.data`, `core.import.data` | PG, My | **done**: Export…, Import CSV…; `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog`, `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one` |
 | NAV-55 | Rename | Renames an object with a preview | core `org.eclipse.ui.edit.rename` | PG, My | **done**: `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | NAV-56 | Delete (drop) | Drops with SQL preview and confirmation | core `org.eclipse.ui.edit.delete` | PG, My | **done**: `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` |
@@ -230,9 +230,9 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | SQL-30 | Delete this script, revert file | Script file housekeeping | ui.editors.sql `deleteThisScript`; Eclipse `file.revert` | PG, My | **roadmap**: Scripts as workspace files are Eclipse project resources; Kerno keeps tabs, files and saved queries |
 | SQL-31 | Restore editors after restart, auto-save | Editors and unsaved text come back | ui.editors.sql pref `AUTO_SAVE_ON_CLOSE` (true) | PG, My | **done**: `unsaved_text_and_tabs_come_back_after_a_restart`, `the_active_tab_is_active_again_after_a_restart` |
 | SQL-32 | Toggle line comment (Ctrl+/) | Comments or uncomments the selected lines | ui.editors.sql `comment.single` | PG, My | **done**: `toggle_comment` (Cmd+/); `the_comment_shortcut_toggles_the_lines_of_the_selection` |
-| SQL-33 | Toggle block comment (Ctrl+Shift+/) | Wraps the selection in `/* */` | ui.editors.sql `comment.multi` | PG, My | **gap**: G15 |
+| SQL-33 | Toggle block comment (Ctrl+Shift+/) | Wraps the selection in `/* */` | ui.editors.sql `comment.multi` | PG, My | **done**: Cmd+Shift+/. `the_editor_changes_case_comments_a_block_and_copies_its_statement` |
 | SQL-34 | Format SQL (Ctrl+Shift+F) | Formats the selection or the script | ui.editors.sql `text.content.format` | PG, My | **done**: `format_sql` (Cmd+Shift+I); `format_sql_rewrites_the_selection_or_everything_as_one_undo_step` |
-| SQL-35 | Format ▸ Upper case / Lower case | Changes the case of the selection | ui.editors.sql `SQLEditorBase` format menu (Eclipse upperCase / lowerCase) | PG, My | **gap**: G15 |
+| SQL-35 | Format ▸ Upper case / Lower case | Changes the case of the selection | ui.editors.sql `SQLEditorBase` format menu (Eclipse upperCase / lowerCase) | PG, My | **done**: strings, quoted names and parameters keep their case. `the_editor_changes_case_comments_a_block_and_copies_its_statement` |
 | SQL-36 | Format ▸ Morph to delimited list, trim spaces | Text transforms of the selection | ui.editors.sql `morph.delimited.list`, `trim.spaces` | PG, My | **roadmap**: Text utilities, not SQL client features |
 | SQL-37 | Toggle word wrap | Soft wrap in the editor | ui.editors.sql `word.wrap` | PG, My | **done**: `soft_wrap_is_toggled_by_its_key_in_every_editor` |
 | SQL-38 | Auto-activated completion | Proposals while typing, tables, columns, joins | ui.editors.sql pref `ENABLE_AUTO_ACTIVATION` (true) | PG, My | **done**: `completion_proposes_tables_columns_and_joins`, `typing_in_the_editor_opens_completion_and_enter_accepts_it` |
@@ -245,11 +245,11 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | SQL-45 | Find / replace | Search in the script | Eclipse `findReplace` in the editor | PG, My | **done**: `find_in_editor`, `replace_in_editor`; `the_editor_searches_and_replaces` |
 | SQL-46 | Multi-cursor | Several carets | Eclipse text editor | PG, My | **done, untested** (gap of kind test, G18): The kit's editor (Cmd+Alt+Up / Down, M5 done list); no test (G18) |
 | SQL-47 | Error position | Error shown with its position in the script | ui.editors.sql `SQLEditor` error handling | PG, My | **done**: `messages_errors_and_history_of_a_run` |
-| SQL-48 | Copy selected query | Copies the statement under the cursor | ui.editors.sql `copy.query` | PG, My | **gap**: G15 |
+| SQL-48 | Copy selected query | Copies the statement under the cursor | ui.editors.sql `copy.query` | PG, My | **done**: `the_editor_changes_case_comments_a_block_and_copies_its_statement` |
 | SQL-49 | Advanced copy in the editor | Copies with formatting | core `core.edit.copy.special` in the editor | PG, My | **roadmap**: Plain copy is enough for code |
 | SQL-50 | Search in web | Searches the selection in a browser | ui.editors.sql `search.web` | PG, My | **roadmap**: Sends text off the machine (CLAUDE.md §1 "Nothing leaves the machine") |
 | SQL-51 | Set connection from navigator, auto-sync | The editor follows the navigator selection | ui.editors.sql `sync.connection`, `sync.auto` | PG, My | **roadmap**: Off by default; "New query here" binds a tab to a node |
-| SQL-52 | Refresh current schema / all schemas | Reloads the metadata used by completion | ui.editors.sql `refresh.current.schema`, `refresh.all.schemas` | PG, My | **gap**: G15 |
+| SQL-52 | Refresh current schema / all schemas | Reloads the metadata used by completion | ui.editors.sql `refresh.current.schema`, `refresh.all.schemas` | PG, My | **done**: one command reloads the whole catalog. `refresh_completion_metadata_finds_a_table_made_elsewhere` |
 | SQL-53 | Disable SQL syntax parser | Turns off parsing for huge scripts | ui.editors.sql `disableSQLSyntaxParser` | PG, My | **roadmap**: Kerno parses only the statement at the cursor (M9 checks large scripts), so there is nothing to turn off |
 | SQL-54 | Saved scripts and query history | Scripts folder and query manager | ui.editors.sql `core.sql.editor.showScripts`; core query manager | PG, My | **done**: Saved queries and history; `history_and_saved_queries_are_searched_and_reopened` |
 
@@ -322,7 +322,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-63 | Apply and commit | Saves and commits in manual mode | ui.editors.data `core.resultset.applyAndCommitChanges` | PG, My | **done**: Apply runs in its own transaction; `cells_are_edited_reviewed_and_applied_in_one_transaction` |
 | RES-64 | Undo / redo of edits | Edit history in the grid | ui.editors.data `ResultSetUndoRedoManager` | PG, My | **done**: Cmd+Z undoes the last pending change, one step at a time; `data_keys_edit_rows_and_apply`, `undo_takes_back_one_step_at_a_time` |
 | RES-65 | Read-only when no key | Editing needs a unique key | ui.editors.data pref `RS_EDIT_DISABLE_IF_KEY_MISSING` | PG, My | **done**: Read-only with the reason; `rows_that_cannot_be_addressed_are_read_only_and_say_why` |
-| RES-66 | Generate SQL from rows | SELECT … WHERE key =, SELECT … IN, INSERT, UPDATE, DELETE by unique key, CREATE from result | ui.editors.sql `sqlGenerator` dataSelect / dataSelectMany / dataInsert / dataUpdate / dataDeleteByUniqueKey / ddlByResultSet | PG, My | **gap**: G7 (Copy as SQL INSERT exists) |
+| RES-66 | Generate SQL from rows | SELECT … WHERE key =, SELECT … IN, INSERT, UPDATE, DELETE by unique key, CREATE from result | ui.editors.sql `sqlGenerator` dataSelect / dataSelectMany / dataInsert / dataUpdate / dataDeleteByUniqueKey / ddlByResultSet | PG, My | **done**: SELECT by key, SELECT … IN, INSERT, UPDATE, DELETE from the selected rows of table data, opened in a tab and not run; no CREATE from a result. `generate_sql_writes_the_selected_rows_into_a_tab_and_runs_nothing`, `a_row_menu_generates_sql_and_a_query_result_says_why_it_cannot` |
 | RES-67 | Export data | Exports the result to a file | ui.editors.data `core.resultset.export` | PG, My | **done**: `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog`, `a_query_result_is_exported_by_running_its_statement_again` |
 | RES-68 | Open with | Opens the result in an external application | ui.editors.data `core.resultset.openWith` | PG, My | **roadmap**: Writes a temp file and launches another app; data-transfer feature beyond §4.G |
 | RES-69 | Result status line | Rows fetched and duration | ui.editors.data `ResultSetViewer` status bar | PG, My | **done**: Status bar rows and timing; `statements_run_and_their_rows_fill_the_grid` |
@@ -403,9 +403,9 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-04 | New Folder | Creates a connection folder | core `core.new.folder` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
 | CM-05 | Import connections | Kerno's own entry, no DBeaver equivalent in this menu | — (CLAUDE.md §3) | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `connections_are_exported_without_secrets_and_imported_back` |
 | CM-06 | Collapse All | Folds the tree | core `org.eclipse.ui.navigate.collapseAll` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does` |
-| CM-07 | Link with editor | Selects the active editor's object | ui.navigator `core.navigator.linkeditor` | PG, My | **gap**: G10 |
+| CM-07 | Link with editor | Selects the active editor's object | ui.navigator `core.navigator.linkeditor` | PG, My | **done**: `link_with_editor_selects_the_table_of_the_active_tab` |
 | CM-08 | Refresh | Reloads the list | core `core.project.refresh` | PG, My | **done**: `the_sidebar_answers_a_right_click_on_each_part`, `the_empty_area_and_a_folder_offer_what_dbeaver_does` |
-| CM-09 | Paste | Pastes copied connections | core `org.eclipse.ui.edit.paste` | PG, My | **gap**: no plan part; Duplicate (CM-24) covers it and the empty-area menu has no Paste |
+| CM-09 | Paste | Pastes copied connections | core `org.eclipse.ui.edit.paste` | PG, My | **done**: Paste saves a copy of the connection copied inside the app (no secret on the clipboard). `paste_saves_the_copied_connection_and_a_folder_refreshes` |
 
 ### Folder
 
@@ -416,7 +416,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-12 | Disconnect | Closes every connection of the folder | core `org.jkiss.dbeaver.folder.disconnect` | PG, My | **done**: `disconnect_others_and_a_folder_close_only_those_connections` |
 | CM-13 | Rename (F2) | Renames the folder | core `org.eclipse.ui.edit.rename` | PG, My | **done**: Rename…; `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
 | CM-14 | Delete | Removes the folder | core `org.eclipse.ui.edit.delete` | PG, My | **done**: Delete… asks, the content moves up; `the_sidebar_answers_a_right_click_on_each_part`, `a_folder_is_made_renamed_filled_by_drag_and_deleted` |
-| CM-15 | Refresh | Re-reads the folder | core `org.eclipse.ui.file.refresh` | PG, My | **gap**: no plan part holds it; the folder menu has no Refresh (the list's Refresh is CM-08) |
+| CM-15 | Refresh | Re-reads the folder | core `org.eclipse.ui.file.refresh` | PG, My | **done**: reloads the list and the tree shown under the folder; nothing reconnects. `paste_saves_the_copied_connection_and_a_folder_refreshes` |
 
 ### Connection
 
@@ -468,7 +468,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-49 | Create ▸ (column, index, constraint, foreign key, trigger) | New child objects | ui.navigator `core.object.create` | PG, My | **done**: Through the table form (Edit table…); `a_table_is_altered_from_the_form_with_a_preview`; triggers: G10 |
 | CM-50 | Generate SQL ▸ SELECT / INSERT / UPDATE / DELETE / DDL | Templates | ui.editors.sql `sqlGenerator` | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | CM-51 | Generate SQL ▸ MERGE, INSERT ON CONFLICT, UPDATE FROM, DELETE USING | Further templates | ui.editors.sql / ext.postgresql `sqlGenerator` | PG, My | **roadmap**: See NAV-51, NAV-52 |
-| CM-52 | Read data in SQL console | SELECT run in a console | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **gap**: G7 |
+| CM-52 | Read data in SQL console | SELECT run in a console | ui.editors.sql `core.sql.editor.forSelection` | PG, My | **done**: `routines_are_called_and_tables_read_in_a_console` |
 | CM-53 | SQL Editor ▸ | Editor bound to the table's schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New query here, Cmd+]; `navigator_keys_run_the_actions_of_the_selected_node`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 | CM-54 | Export Data | Export wizard | data.transfer.ui `core.export.data` | PG, My | **done**: Export…; `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog` |
 | CM-55 | Import Data | Import wizard | data.transfer.ui `core.import.data` | PG, My | **done**: Import CSV…; `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one` |
@@ -489,7 +489,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-65 | Edit View (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source / Open structure, F4; `editing_a_source_applies_it_once_its_sql_is_confirmed`, `f4_opens_the_editor_of_what_the_node_is` |
 | CM-66 | View Data | Data editor | ui.editors.data `forSelection` | PG, My | **done**: Open data; `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 | CM-67 | Generate SQL ▸ SELECT, DDL | Templates | ui.editors.sql `sqlGenerator` | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing` |
-| CM-68 | Read data in SQL console | SELECT run in a console | ui.editors.sql `forSelection` | PG, My | **gap**: G7 |
+| CM-68 | Read data in SQL console | SELECT run in a console | ui.editors.sql `forSelection` | PG, My | **done**: `routines_are_called_and_tables_read_in_a_console` |
 | CM-69 | Export Data | Export wizard | data.transfer.ui | PG, My | **done**: Export…; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `a_filtered_table_is_exported_to_csv_and_json_through_the_dialog` |
 | CM-70 | Tools ▸ Refresh materialized view | REFRESH MATERIALIZED VIEW | ext.postgresql.ui `tools.refesh.mview` | PG | **done**: Tools ▸ Refresh materialized view; `postgres_tools_analyze_vacuum_refresh_switch_triggers_and_truncate`, `the_tools_menu_lists_what_the_engine_offers_for_each_object` |
 | CM-71 | Copy, Delete, Rename, Refresh | Standard entries | core `edit.*`, `file.refresh` | PG, My | **done**: `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `dropping_renaming_and_truncating_show_the_sql_and_ask` |
@@ -498,8 +498,8 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-72 | Edit (F4) | Column properties | ui.navigator `core.object.open` | PG, My | **gap**: G10 (opens the table form on that column) |
-| CM-73 | Create ▸ Column | Adds a column | ui.navigator `core.object.create` | PG, My | **gap**: G10 |
+| CM-72 | Edit (F4) | Column properties | ui.navigator `core.object.open` | PG, My | **done**: opens the table form on that column. `columns_are_added_renamed_and_dropped_from_the_tree` |
+| CM-73 | Create ▸ Column | Adds a column | ui.navigator `core.object.create` | PG, My | **done**: Add column… opens the table form with a new row. `columns_are_added_renamed_and_dropped_from_the_tree` |
 | CM-74 | New Index / Constraint from selection | Index or key on selected columns | ui.navigator `navigator.create.column.index`, `.constraint` | PG, My | **roadmap**: See NAV-43 |
 | CM-75 | Copy | Column name | core `edit.copy` | PG, My | **done**: Copy name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 | CM-76 | Delete | Drops the column (preview) | core `edit.delete` | PG, My | **done**: Drop column from the tree through the SQL confirmation; `columns_are_added_renamed_and_dropped_from_the_tree` |
@@ -511,8 +511,8 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
 | CM-79 | Edit (F4) | Source editor | ui.navigator `core.object.open` | PG, My | **done**: Edit source (double click and F4 open it); `editing_a_source_applies_it_once_its_sql_is_confirmed`, `a_double_click_opens_what_the_node_is_for`, `f4_opens_the_editor_of_what_the_node_is` |
-| CM-80 | Execute stored procedure | Console with a call statement | ui.editors.sql `core.procedure.execute` | PG, My | **gap**: G7 |
-| CM-81 | Generate SQL ▸ CALL, DDL | Call template; definition | ui.editors.sql `sqlGenerator` procedureCall, tableDDL | PG, My | **gap**: G7 (DDL is done: Show DDL) |
+| CM-80 | Execute stored procedure | Console with a call statement | ui.editors.sql `core.procedure.execute` | PG, My | **done**: `routines_are_called_and_tables_read_in_a_console` |
+| CM-81 | Generate SQL ▸ CALL, DDL | Call template; definition | ui.editors.sql `sqlGenerator` procedureCall, tableDDL | PG, My | **done**: Generate CALL; DDL is Show DDL. `routines_are_called_and_tables_read_in_a_console` |
 | CM-82 | Copy, Delete, Rename, Refresh | Standard entries | core `edit.*`, `file.refresh` | PG, My | **done**: `each_kind_of_node_gets_the_actions_that_make_sense_for_it` |
 
 ### Sequence
@@ -544,14 +544,14 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
 | CM-92 | Execute ▸ statement, in new tab, script, from position, separate tabs, cancel | Run commands | ui.editors.sql `SQLEditor.execute` menu | PG, My | **done**: editor menu and Run dropdown. `the_editor_menu_is_enabled_as_the_toolbar_is`, `an_incomplete_result_says_so_and_runs_again_from_its_menu` |
-| CM-93 | Execute ▸ row count, all rows, expression, export from query | Other run commands | ui.editors.sql `run.count`, `run.all.rows`, `run.expression`, `export.data` | PG, My | **gap**: G15 (menu entries; row count itself G4; expression on the roadmap SQL-14) |
+| CM-93 | Execute ▸ row count, all rows, expression, export from query | Other run commands | ui.editors.sql `run.count`, `run.all.rows`, `run.expression`, `export.data` | PG, My | **done**: Execute ▸ run in new tab, from cursor, count rows, fetch all rows, Export from query…; expression on the roadmap (SQL-14). `the_editor_menu_is_enabled_as_the_toolbar_is`, `the_editor_menu_sets_the_schema_and_exports_from_the_query` |
 | CM-94 | Execute ▸ Explain, Load plan | Plans | ui.editors.sql `run.explain`, `load.plan` | PG, My | **done**: Explain plan and Explain analyze in the editor menu; load plan on the roadmap (SQL-17); `the_editor_answers_a_right_click_with_its_commands`, `the_editor_menu_is_enabled_as_the_toolbar_is` |
-| CM-95 | Execute ▸ Set active connection / schema | Target selectors | ui.navigator `ui.tools.select.connection`, `.schema` | PG, My | **gap**: G15 |
-| CM-96 | File ▸ Rename, Revert, Import / Export script | File commands | ui.editors.sql `SQLEditor.file` menu | PG, My | **planned**: `docs/plans/CTX.md` Part 2 (Save, Save as; Rename on the tab) |
+| CM-95 | Execute ▸ Set active connection / schema | Target selectors | ui.navigator `ui.tools.select.connection`, `.schema` | PG, My | **done**: Active connection, database and schema submenus. `the_editor_menu_is_enabled_as_the_toolbar_is`, `the_editor_menu_sets_the_schema_and_exports_from_the_query` |
+| CM-96 | File ▸ Rename, Revert, Import / Export script | File commands | ui.editors.sql `SQLEditor.file` menu | PG, My | **done**: File ▸ Save, Save as, Rename, Revert to saved file, Open SQL file. `revert_puts_back_the_text_of_the_saved_file`, `the_editor_menu_is_enabled_as_the_toolbar_is`, `the_editor_menu_sets_the_schema_and_exports_from_the_query` |
 | CM-97 | Layout ▸, Panels ▸ | Results layout and side panels | ui.editors.sql `SQLEditor.layout`, `.extraPanels` | PG, My | **done**: toggle and focus of the results panel in the editor menu (`the_editor_menu_is_enabled_as_the_toolbar_is`); outline and variables on the roadmap (SQL-26, SQL-27) |
-| CM-98 | Format ▸ Format SQL, upper / lower case, toggle line / block comment, word wrap | Text commands | ui.editors.sql `SQLEditorBase.editorContextMenuAboutToShow` | PG, My | **planned**: `docs/plans/CTX.md` Part 2 (Format SQL, Toggle comment); case and block comment: G15 |
+| CM-98 | Format ▸ Format SQL, upper / lower case, toggle line / block comment, word wrap | Text commands | ui.editors.sql `SQLEditorBase.editorContextMenuAboutToShow` | PG, My | **done**: Format ▸ Format SQL, upper / lower case, line and block comment, word wrap. `the_editor_menu_is_enabled_as_the_toolbar_is`, `the_editor_menu_sets_the_schema_and_exports_from_the_query` |
 | CM-99 | Cut, Copy, Paste, Select all, Undo, Redo | Standard text entries | Eclipse text editor context menu | PG, My | **done**: Cut, Copy, Paste, Select all, Undo, Redo in the editor menu; `the_editor_answers_a_right_click_with_its_commands`, `the_editor_menu_is_enabled_as_the_toolbar_is` |
-| CM-100 | Copy Advanced, Copy selected query | Copy variants | ui.editors.sql `popup:…EditorContext?after=group.copy` | PG, My | **gap**: G15 (Copy selected query); advanced copy on the roadmap (SQL-49) |
+| CM-100 | Copy Advanced, Copy selected query | Copy variants | ui.editors.sql `popup:…EditorContext?after=group.copy` | PG, My | **done**: Copy statement; advanced copy on the roadmap (SQL-49). `the_editor_changes_case_comments_a_block_and_copies_its_statement` |
 | CM-101 | Open Declaration (F4) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **done**: as SQL-41, also in the editor menu. `a_key_opens_the_rows_or_structure_of_the_table_at_the_cursor` |
 | CM-102 | Content assist proposals | Opens completion | ui.editors.sql `ACTION_CONTENT_ASSIST_PROPOSAL` | PG, My | **done**: `completion_opens_on_demand_even_when_it_does_not_open_by_itself` |
 
@@ -571,7 +571,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-112 | View / Format ▸, Hints, Logical structure | Display formats, colours, virtual keys | ui.editors.data `fillColumnViewMenu`, `fillVirtualModelMenu` | PG, My | **roadmap**: See RES-32, RES-33, RES-71 |
 | CM-113 | Layout ▸ (record mode, presentation, selection counts, filter panel, zoom) | Viewer layout | ui.editors.data `fillLayoutMenu` | PG, My | **gap**: G3 (record mode); selection counts G6; zoom `docs/plans/M10.md` Part 3 |
 | CM-114 | Export data, Open with ▸ | Export the result | ui.editors.data `CMD_EXPORT`, `ResultSetHandlerOpenWith` | PG, My | **done**: Export… in the cell menu; Open with on the roadmap (RES-68); `a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters` |
-| CM-115 | Generate SQL ▸ (from rows) | SELECT / INSERT / UPDATE / DELETE of the selected rows | ui.editors.sql `SQLGeneratorContributor` on result rows | PG, My | **gap**: G7 |
+| CM-115 | Generate SQL ▸ (from rows) | SELECT / INSERT / UPDATE / DELETE of the selected rows | ui.editors.sql `SQLGeneratorContributor` on result rows | PG, My | **done**: on table data; disabled with its reason on a query result. `generate_sql_writes_the_selected_rows_into_a_tab_and_runs_nothing`, `a_row_menu_generates_sql_and_a_query_result_says_why_it_cannot` |
 | CM-116 | Refresh | Re-reads the result | core `file.refresh` in `fillContextMenu` | PG, My | **gap**: G6 (menu entry; Refresh exists in the data tab toolbar) |
 
 ### Column header
@@ -623,12 +623,12 @@ Counts per status and per area (recounted from the rows above on 2026-11-13, HEA
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
 | Connections | 34 | 1 | 0 | 1 | 15 | 51 |
-| Navigator | 36 | 0 | 0 | 5 | 18 | 59 |
-| SQL editor | 31 | 3 | 0 | 4 | 16 | 54 |
-| Results and data editing | 38 | 2 | 1 | 16 | 15 | 72 |
+| Navigator | 39 | 0 | 0 | 2 | 18 | 59 |
+| SQL editor | 35 | 3 | 0 | 0 | 16 | 54 |
+| Results and data editing | 39 | 2 | 1 | 15 | 15 | 72 |
 | Object editors (structure) | 13 | 0 | 0 | 2 | 6 | 21 |
 | Tools and administration | 11 | 0 | 0 | 2 | 15 | 28 |
-| Context menus | 94 | 0 | 5 | 23 | 11 | 133 |
-| **All** | **257** | **6** | **6** | **53** | **96** | **418** |
+| Context menus | 109 | 0 | 3 | 10 | 11 | 133 |
+| **All** | **280** | **6** | **4** | **32** | **96** | **418** |
 
 Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.

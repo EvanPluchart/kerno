@@ -27,7 +27,9 @@ use gpui_kit::{
 use kerno_core::browse::Filter;
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
-use kerno_core::sql::{delete_template, insert_template, select_template, update_template};
+use kerno_core::sql::{
+    call_routine, delete_template, insert_template, select_template, update_template,
+};
 use kerno_core::table_draft::TableChange;
 use kerno_core::{Session, exec};
 
@@ -56,6 +58,19 @@ pub enum NavigatorEvent {
         title: String,
         sql: String,
         target: Option<Target>,
+    },
+    /// Open a query tab holding `sql` on `target`, and run all of it.
+    RunQuery {
+        title: String,
+        sql: String,
+        target: Option<Target>,
+    },
+    /// Open the form of `table` with the cursor on its `column`, or on a
+    /// new column when `None`.
+    EditTable {
+        target: Target,
+        table: TableRef,
+        column: Option<String>,
     },
     /// Show the rows of a table or view.
     OpenData {
@@ -653,14 +668,29 @@ impl Navigator {
                     self.reveal(&target, other, RelationKind::Table, cx);
                 }
             }
+            Action::AddColumn | Action::EditColumn => {
+                let column = match (&node.kind, action) {
+                    (NodeKind::Column { name, .. }, Action::EditColumn) => Some(name.clone()),
+                    _ => None,
+                };
+                if self.unavailable(action, &node, cx).is_none()
+                    && let (Some((table, _, _)), Some(target)) =
+                        (self.relation_above(&node.id), self.target_of(&node, false))
+                {
+                    cx.emit(NavigatorEvent::EditTable {
+                        target,
+                        table,
+                        column,
+                    });
+                }
+            }
             Action::NewQueryHere
             | Action::CreateView
             | Action::CreateFunction
             | Action::CreateProcedure
             | Action::CreateSequence
             | Action::CreateTrigger
-            | Action::CreateEvent
-            | Action::AddColumn => {
+            | Action::CreateEvent => {
                 if self.unavailable(action, &node, cx).is_none() {
                     self.open_template(action, &node, window, cx)
                 }
@@ -676,7 +706,11 @@ impl Navigator {
             Action::Tools => {
                 self.open_tools(id, None, window, cx);
             }
-            Action::Generate(template) => self.generate(template, &node, window, cx),
+            Action::Generate(template) => self.generate(template, &node, false, window, cx),
+            Action::ReadInConsole => self.generate(Template::Select, &node, true, window, cx),
+            Action::GenerateCall | Action::ExecuteRoutine => {
+                self.call(&node, action == Action::ExecuteRoutine, window, cx)
+            }
             Action::ShowDdl => self.show_ddl(&node, window, cx),
             Action::EditSource => {
                 if self.unavailable(action, &node, cx).is_none() {
@@ -728,10 +762,12 @@ impl Navigator {
             {
                 Some("not supported by this database")
             }
-            (Action::AddColumn | Action::RenameColumn | Action::DropColumn, _)
-                if !self
-                    .relation_above(&node.id)
-                    .is_some_and(|(_, kind, _)| kind.is_table()) =>
+            (
+                Action::AddColumn | Action::EditColumn | Action::RenameColumn | Action::DropColumn,
+                _,
+            ) if !self
+                .relation_above(&node.id)
+                .is_some_and(|(_, kind, _)| kind.is_table()) =>
             {
                 Some("a view's columns come from its query")
             }
@@ -867,11 +903,13 @@ impl Navigator {
         .detach();
     }
 
-    /// Writes a statement for a table into a new query tab.
+    /// Writes a statement for a table into a new query tab, which runs it
+    /// when `run` says so.
     fn generate(
         &mut self,
         template: Template,
         node: &Node,
+        run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -913,6 +951,11 @@ impl Navigator {
                 }
             };
             let _ = this.update_in(cx, |_, window, cx| match written {
+                Ok(sql) if run => cx.emit(NavigatorEvent::RunQuery {
+                    title: table.name.clone(),
+                    sql,
+                    target,
+                }),
                 Ok(sql) => cx.emit(NavigatorEvent::OpenQuery {
                     title: table.name.clone(),
                     sql,
@@ -922,6 +965,78 @@ impl Navigator {
                     Notification::error(SharedString::from(format!(
                         "The statement for {} could not be written: {error}",
                         table.name
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Writes the call of a routine into a new query tab, which runs it
+    /// (asking for its parameters) when `run` says so. The arguments are
+    /// read from the server, as the tree lists them.
+    fn call(&mut self, node: &Node, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let NodeKind::Object(ObjectRef::Routine {
+            schema,
+            name,
+            kind,
+            identity_arguments,
+        }) = &node.kind
+        else {
+            return;
+        };
+        let (schema, name, kind) = (schema.clone(), name.clone(), *kind);
+        let identity = identity_arguments.clone();
+        let target = self.target_of(node, false);
+        let session = self.session_for(&node.database, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let written = match session.await {
+                Err(error) => Err(error),
+                Ok(session) => {
+                    let (schema, name) = (schema.clone(), name.clone());
+                    let writing = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let objects = session.objects(&schema).await?;
+                            let arguments = objects
+                                .routines
+                                .iter()
+                                .find(|routine| {
+                                    routine.name == name
+                                        && routine.kind == kind
+                                        && routine.identity_arguments == identity
+                                })
+                                .map(|routine| routine.arguments.clone())
+                                .ok_or_else(|| {
+                                    kerno_core::Error::Config(format!("{name} is gone"))
+                                })?;
+                            Ok::<_, kerno_core::Error>(call_routine(
+                                session.dialect(),
+                                &schema,
+                                &name,
+                                kind,
+                                &arguments,
+                            ))
+                        })
+                    });
+                    match writing {
+                        Ok(writing) => writing.await,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let _ = this.update_in(cx, |_, window, cx| match written {
+                Ok(sql) => {
+                    let title = name.clone();
+                    cx.emit(if run {
+                        NavigatorEvent::RunQuery { title, sql, target }
+                    } else {
+                        NavigatorEvent::OpenQuery { title, sql, target }
+                    })
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "The call of {name} could not be written: {error}"
                     ))),
                     cx,
                 ),
@@ -1554,6 +1669,10 @@ impl Navigator {
             // A source that cannot be edited here (read-only connection)
             // is shown as DDL.
             (Action::EditSource, Some(_)) => self.perform(Action::ShowDdl, &node.id, window, cx),
+            // A view's column has no form: its structure is shown.
+            (Action::EditColumn, Some(_)) => {
+                self.perform(Action::OpenStructure, &node.id, window, cx)
+            }
             (_, Some(reason)) => window.push_notification(
                 Notification::warning(SharedString::from(format!(
                     "{}: {reason}.",
@@ -2101,8 +2220,9 @@ impl Render for Navigator {
                         }
                     })
                     .child(tree_view)
-                    .context_menu(move |menu, _, _| {
+                    .context_menu(move |menu, _, cx| {
                         let (refresh, collapse, query) = (area.clone(), area.clone(), area.clone());
+                        let linked = AppState::get(cx).settings.link_with_editor;
                         menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
                             refresh.update(cx, |this, cx| this.reload(cx))
                         }))
@@ -2110,6 +2230,20 @@ impl Render for Navigator {
                             PopupMenuItem::new("Collapse all").on_click(move |_, _, cx| {
                                 collapse.update(cx, |this, cx| this.collapse_all(cx))
                             }),
+                        )
+                        // DBeaver's toggle (CM-07): the window runs it, once
+                        // the menu has given the focus back.
+                        .item(
+                            PopupMenuItem::new("Link with editor")
+                                .checked(linked)
+                                .on_click(|_, window, cx| {
+                                    window.defer(cx, |window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(crate::actions::LinkWithEditor),
+                                            cx,
+                                        )
+                                    })
+                                }),
                         )
                         .separator()
                         .item(

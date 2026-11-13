@@ -164,6 +164,9 @@ pub struct TableEditor {
     error: Option<String>,
     load: Option<Task<()>>,
     generation: u64,
+    /// The column to put the cursor in once the table is read: a name, or
+    /// a new column when `None` (see [`TableEditor::focus_column`]).
+    wanted: Option<Option<String>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -213,6 +216,7 @@ impl TableEditor {
             error: None,
             load: None,
             generation: 0,
+            wanted: None,
             _subscriptions: vec![follow],
         };
         if editor.table.is_none() {
@@ -388,6 +392,9 @@ impl TableEditor {
                             this.fill(&draft, Some(&structure), window, cx);
                         }
                         this.structure = Some(structure);
+                    }
+                    if let Some(wanted) = this.wanted.take() {
+                        this.focus_column(wanted, window, cx);
                     }
                     cx.notify();
                 }
@@ -715,6 +722,50 @@ impl TableEditor {
             row.name.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
+    }
+
+    /// Puts the cursor in the name of the column `name`, or of a new column
+    /// added at the end when `None`: what Edit on a column and Create ▸
+    /// Column open the form with (DBeaver opens the column's own editor).
+    /// A form still being read does it once the table is there.
+    pub fn focus_column(
+        &mut self,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state != State::Ready || (self.table.is_some() && self.structure.is_none()) {
+            self.wanted = Some(name);
+            return;
+        }
+        match name {
+            None => self.add_column(window, cx),
+            Some(name) => {
+                let row = self
+                    .columns
+                    .iter()
+                    .find(|row| row.name.read(cx).value() == name.as_str());
+                if let Some(row) = row {
+                    row.name.update(cx, |input, cx| input.focus(window, cx));
+                }
+            }
+        }
+    }
+
+    /// The names of the columns of the form, and the one whose name has
+    /// the keyboard; for tests.
+    #[cfg(test)]
+    pub fn column_focus(&self, window: &Window, cx: &App) -> (Vec<String>, Option<usize>) {
+        let names = self
+            .columns
+            .iter()
+            .map(|row| row.name.read(cx).value().to_string())
+            .collect();
+        let focused = self
+            .columns
+            .iter()
+            .position(|row| row.name.read(cx).focus_handle(cx).is_focused(window));
+        (names, focused)
     }
 
     /// Removes a column, and it from the keys and indexes.

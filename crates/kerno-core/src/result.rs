@@ -2,7 +2,8 @@
 //!
 //! Drivers deliver every value in the server's own text form (or raw bytes
 //! for binary columns). Rows are packed into [`RowBatch`] arenas: one byte
-//! buffer and one offset per cell, never an allocation per cell. A
+//! buffer and one offset per cell, never an allocation per cell, each
+//! allocated at its exact size once the batch is finished. A
 //! [`ResultStore`] strings batches together and addresses rows globally.
 
 use std::sync::Arc;
@@ -80,13 +81,14 @@ impl Column {
 ///
 /// `ends[i]` is the end offset in `data` of cell `i` (row-major); a cell
 /// starts where the previous one ends. NULL is a bit in `nulls`, so it stays
-/// distinct from an empty value.
+/// distinct from an empty value. The three buffers are exactly as long as
+/// what they hold: a finished batch has no spare capacity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RowBatch {
     columns: usize,
-    ends: Vec<u32>,
-    nulls: Vec<u64>,
-    data: Vec<u8>,
+    ends: Box<[u32]>,
+    nulls: Box<[u64]>,
+    data: Box<[u8]>,
 }
 
 impl RowBatch {
@@ -128,47 +130,69 @@ impl RowBatch {
 
     /// Heap bytes held by the batch.
     pub fn memory_bytes(&self) -> usize {
-        self.ends.capacity() * 4 + self.nulls.capacity() * 8 + self.data.capacity()
+        size_of_val(&*self.ends) + size_of_val(&*self.nulls) + self.data.len()
     }
 }
 
 /// Builds a [`RowBatch`] cell by cell. Cells are appended in row-major order;
 /// a row is complete after `columns` cells.
+///
+/// Cells go into scratch buffers that the builder keeps from one batch to
+/// the next, so they stop growing after the first batch; [`Self::finish`]
+/// copies them into a batch of exactly their size.
 #[derive(Debug)]
 pub struct BatchBuilder {
-    batch: RowBatch,
+    columns: usize,
+    ends: Vec<u32>,
+    nulls: Vec<u64>,
+    data: Vec<u8>,
 }
 
 /// A batch cannot address more than this many data bytes (`u32` offsets).
 /// Builders report [`BatchBuilder::is_full`] well before the limit.
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
+/// A scratch buffer that grew past this (rows of large values) is released
+/// when its batch is finished rather than kept for the next one: a paused
+/// statement would otherwise hold it for as long as it stays open.
+const SCRATCH_KEPT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Copies `scratch` into an allocation of its exact size and empties it.
+fn take<T: Copy>(scratch: &mut Vec<T>) -> Box<[T]> {
+    let exact = Box::from(scratch.as_slice());
+    if scratch.capacity() * size_of::<T>() > SCRATCH_KEPT_BYTES {
+        *scratch = Vec::new();
+    } else {
+        scratch.clear();
+    }
+    exact
+}
+
 impl BatchBuilder {
     /// A builder for rows of `columns` cells.
     pub fn new(columns: usize) -> Self {
         Self {
-            batch: RowBatch {
-                columns,
-                ..RowBatch::default()
-            },
+            columns,
+            ends: Vec::new(),
+            nulls: Vec::new(),
+            data: Vec::new(),
         }
     }
 
     fn push(&mut self, value: Option<&[u8]>) {
-        let index = self.batch.ends.len();
+        let index = self.ends.len();
         if index.is_multiple_of(64) {
-            self.batch.nulls.push(0);
+            self.nulls.push(0);
         }
         match value {
-            Some(bytes) => self.batch.data.extend_from_slice(bytes),
-            None => self.batch.nulls[index / 64] |= 1 << (index % 64),
+            Some(bytes) => self.data.extend_from_slice(bytes),
+            None => self.nulls[index / 64] |= 1 << (index % 64),
         }
         // A single cell larger than 4 GiB cannot be addressed; no protocol
         // Kerno speaks can deliver one (PostgreSQL and MySQL cap a value at
         // 1 GiB), so saturating keeps the batch consistent instead of panicking.
-        self.batch
-            .ends
-            .push(u32::try_from(self.batch.data.len()).unwrap_or(u32::MAX));
+        self.ends
+            .push(u32::try_from(self.data.len()).unwrap_or(u32::MAX));
     }
 
     /// Appends a NULL cell.
@@ -193,17 +217,17 @@ impl BatchBuilder {
 
     /// Number of complete rows so far.
     pub fn row_count(&self) -> usize {
-        self.batch.row_count()
+        self.ends.len().checked_div(self.columns).unwrap_or(0)
     }
 
     /// Whether no cell was appended.
     pub fn is_empty(&self) -> bool {
-        self.batch.ends.is_empty()
+        self.ends.is_empty()
     }
 
     /// Whether the batch should be finished before more rows are added.
     pub fn is_full(&self) -> bool {
-        self.batch.data.len() >= MAX_BATCH_BYTES
+        self.data.len() >= MAX_BATCH_BYTES
     }
 
     /// Takes the rows built so far, leaving the builder empty and reusable.
@@ -211,22 +235,16 @@ impl BatchBuilder {
     /// # Panics
     /// Panics if the last row is incomplete: that is a driver bug.
     pub fn finish(&mut self) -> RowBatch {
-        let columns = self.batch.columns;
         assert!(
-            columns == 0 || self.batch.ends.len().is_multiple_of(columns),
+            self.columns == 0 || self.ends.len().is_multiple_of(self.columns),
             "finish() called in the middle of a row"
         );
-        let mut batch = std::mem::replace(
-            &mut self.batch,
-            RowBatch {
-                columns,
-                ..RowBatch::default()
-            },
-        );
-        batch.ends.shrink_to_fit();
-        batch.nulls.shrink_to_fit();
-        batch.data.shrink_to_fit();
-        batch
+        RowBatch {
+            columns: self.columns,
+            ends: take(&mut self.ends),
+            nulls: take(&mut self.nulls),
+            data: take(&mut self.data),
+        }
     }
 }
 
@@ -298,9 +316,15 @@ impl ResultStore {
         batch.text(local, column)
     }
 
-    /// Heap bytes held by the stored rows.
+    /// Heap bytes held by the stored rows, the store's own bookkeeping
+    /// included.
     pub fn memory_bytes(&self) -> usize {
-        self.batches.iter().map(|batch| batch.memory_bytes()).sum()
+        // Each batch sits behind an `Arc`: two counters and the batch itself.
+        let per_batch = size_of::<RowBatch>() + 2 * size_of::<usize>();
+        let rows: usize = self.batches.iter().map(|batch| batch.memory_bytes()).sum();
+        rows + self.batches.len() * per_batch
+            + self.batches.capacity() * size_of::<Arc<RowBatch>>()
+            + self.starts.capacity() * size_of::<usize>()
     }
 }
 
@@ -409,6 +433,70 @@ mod tests {
         builder.push_text("a");
         store.push(builder.finish());
         store.cell(1, 0);
+    }
+
+    /// What a batch of `cells` cells and `data` bytes must hold, no more.
+    fn exact_bytes(cells: usize, data: usize) -> usize {
+        cells * 4 + cells.div_ceil(64) * 8 + data
+    }
+
+    #[test]
+    fn a_finished_batch_holds_exactly_its_cells() {
+        let mut builder = BatchBuilder::new(3);
+        for row in 0..1000 {
+            builder.push_text(&format!("{row:06}"));
+            builder.push_null();
+            builder.push_bytes(b"abcd");
+        }
+        let big = builder.finish();
+        assert_eq!(big.memory_bytes(), exact_bytes(3000, 1000 * 10));
+
+        // The scratch kept from the big batch does not leak into the next.
+        builder.push_text("x");
+        builder.push_text("");
+        builder.push_null();
+        let small = builder.finish();
+        assert_eq!(small.memory_bytes(), exact_bytes(3, 1));
+        assert_eq!(small.text(0, 0), Some("x"));
+        assert_eq!(small.text(0, 1), Some(""));
+        assert_eq!(small.text(0, 2), None);
+        assert_eq!(big.text(999, 0), Some("000999"));
+    }
+
+    #[test]
+    fn a_scratch_grown_by_large_values_is_released() {
+        let mut builder = BatchBuilder::new(1);
+        builder.push_bytes(&vec![7; SCRATCH_KEPT_BYTES + 1]);
+        let batch = builder.finish();
+        assert_eq!(
+            batch.cell(0, 0).map(<[u8]>::len),
+            Some(SCRATCH_KEPT_BYTES + 1)
+        );
+        assert_eq!(builder.data.capacity(), 0);
+
+        // An ordinary batch keeps its scratch for the next one.
+        builder.push_text("kept");
+        builder.finish();
+        assert!(builder.data.capacity() >= 4);
+    }
+
+    #[test]
+    fn store_memory_is_its_rows_plus_bookkeeping() {
+        let mut store = ResultStore::new(columns(2));
+        let mut builder = BatchBuilder::new(2);
+        let mut cells_only = 0;
+        for batch in 1..=10 {
+            for _ in 0..batch {
+                builder.push_text("abc");
+                builder.push_null();
+            }
+            cells_only += exact_bytes(2 * batch, 3 * batch);
+            store.push(builder.finish());
+        }
+        let held = store.memory_bytes();
+        assert!(held > cells_only, "{held} <= {cells_only}");
+        // Bookkeeping is a few hundred bytes per batch, never per row.
+        assert!(held < cells_only + 10 * 256, "{held}");
     }
 
     #[test]

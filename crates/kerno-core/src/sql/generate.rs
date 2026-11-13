@@ -5,8 +5,12 @@
 //! which Kerno prompts for before the statement runs. Renaming, dropping
 //! and creating objects is on [`Dialect`], because engines disagree on it.
 
+use super::edits::{CellValue, RowChange, edit_statements, where_clause as key_condition};
 use crate::dialect::Dialect;
-use crate::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
+use crate::error::{Error, Result};
+use crate::pending::fetched;
+use crate::result::ResultStore;
+use crate::schema::{ColumnGeneration, ColumnInfo, RoutineKind, TableRef, TableStructure};
 
 /// Above this many items a column list is written one item per line.
 const INLINE_ITEMS: usize = 4;
@@ -209,6 +213,323 @@ pub fn delete_template(
         dialect.table_name(table),
         where_clause(dialect, structure, &params)
     )
+}
+
+/// What "Generate SQL ▸" writes for rows of a table: DBeaver's result-set
+/// generators (`SQLGeneratorSelectFromData`, `…SelectManyFromData`,
+/// `…InsertFromData`, `…UpdateFromData`, `…DeleteFromData` in plugin
+/// model.sql), with the row's values as literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSql {
+    /// One `SELECT … WHERE key = …` per row.
+    SelectByKey,
+    /// One `SELECT … WHERE key IN (…)` for every row.
+    SelectIn,
+    Insert,
+    /// Every other column set to the row's value, by key.
+    Update,
+    /// By key.
+    Delete,
+}
+
+impl RowSql {
+    pub const ALL: [RowSql; 5] = [
+        RowSql::SelectByKey,
+        RowSql::SelectIn,
+        RowSql::Insert,
+        RowSql::Update,
+        RowSql::Delete,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RowSql::SelectByKey => "SELECT by key",
+            RowSql::SelectIn => "SELECT … IN",
+            RowSql::Insert => "INSERT",
+            RowSql::Update => "UPDATE",
+            RowSql::Delete => "DELETE",
+        }
+    }
+
+    /// Whether the statement finds rows by their key.
+    pub fn needs_key(self) -> bool {
+        self != RowSql::Insert
+    }
+}
+
+/// The statements of `kind` for the fetched rows `rows` of `store`, rows
+/// of `table` whose columns are `columns`, each ending with `;` on a line
+/// of its own. `identity` names the columns that address a row (see
+/// [`TableStructure::row_identity`]); without one, only `Insert` can be
+/// written. Columns the server computes are not written.
+pub fn rows_sql(
+    kind: RowSql,
+    dialect: &dyn Dialect,
+    table: &TableRef,
+    columns: &[ColumnInfo],
+    identity: &[String],
+    store: &ResultStore,
+    rows: &[usize],
+) -> Result<String> {
+    let fetched_columns = store.columns();
+    let index_of = |name: &str| {
+        fetched_columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| Error::Config(format!("the column \"{name}\" was not fetched")))
+    };
+    let key_of = |row: usize| -> Result<Vec<(String, CellValue)>> {
+        identity
+            .iter()
+            .map(|name| Ok((name.clone(), fetched(store, row, index_of(name)?))))
+            .collect()
+    };
+    // The columns that take a value, as fetched.
+    let writable: Vec<(usize, &str)> = fetched_columns
+        .iter()
+        .enumerate()
+        .filter(|(_, fetched)| {
+            columns
+                .iter()
+                .any(|column| column.name == fetched.name && !is_computed(column))
+        })
+        .map(|(index, column)| (index, column.name.as_str()))
+        .collect();
+    // The row's values of the writable columns that are in the key
+    // (`Some(true)`), out of it, or all of them.
+    let values_of = |row: usize, key: Option<bool>| -> Vec<(String, CellValue)> {
+        writable
+            .iter()
+            .filter(|(_, name)| key.is_none_or(|key| identity.iter().any(|n| n == name) == key))
+            .map(|(index, name)| (name.to_string(), fetched(store, row, *index)))
+            .collect()
+    };
+    let name = dialect.table_name(table);
+    let statements = match kind {
+        RowSql::SelectByKey => rows
+            .iter()
+            .map(|&row| {
+                let condition = key_condition(dialect, table, columns, &key_of(row)?)?;
+                Ok(format!("SELECT * FROM {name} WHERE {condition}"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        RowSql::SelectIn => {
+            if identity.is_empty() {
+                // As `edits::where_clause` says it.
+                key_condition(dialect, table, columns, &[])?;
+            }
+            let literal = |(name, value): &(String, CellValue)| {
+                let info = columns.iter().find(|column| &column.name == name);
+                match info {
+                    Some(info) => Ok(dialect.literal(value, info)),
+                    None => Err(Error::Config(format!(
+                        "{} has no column \"{name}\"",
+                        table.name
+                    ))),
+                }
+            };
+            let tuples = rows
+                .iter()
+                .map(|&row| {
+                    let values = key_of(row)?
+                        .iter()
+                        .map(literal)
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(if values.len() == 1 {
+                        values[0].clone()
+                    } else {
+                        format!("({})", values.join(", "))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let names: Vec<String> = identity.iter().map(|n| dialect.quote_ident(n)).collect();
+            let names = if names.len() == 1 {
+                names[0].clone()
+            } else {
+                format!("({})", names.join(", "))
+            };
+            vec![format!(
+                "SELECT * FROM {name} WHERE {names} IN ({})",
+                tuples.join(", ")
+            )]
+        }
+        RowSql::Insert | RowSql::Update | RowSql::Delete => {
+            let changes = rows
+                .iter()
+                .map(|&row| {
+                    Ok(match kind {
+                        RowSql::Insert => RowChange::Insert {
+                            values: values_of(row, None),
+                        },
+                        RowSql::Update => {
+                            let mut set = values_of(row, Some(false));
+                            // A table that is all key sets its key, as
+                            // DBeaver does.
+                            if set.is_empty() {
+                                set = values_of(row, Some(true));
+                            }
+                            RowChange::Update {
+                                key: key_of(row)?,
+                                set,
+                            }
+                        }
+                        _ => RowChange::Delete { key: key_of(row)? },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            edit_statements(dialect, table, columns, &changes)?
+        }
+    };
+    Ok(statements
+        .iter()
+        .map(|statement| format!("{statement};\n"))
+        .collect())
+}
+
+/// How a routine takes an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    In,
+    Out,
+    InOut,
+    Variadic,
+}
+
+/// `arguments` as the engine prints them (`pg_get_function_arguments`, or
+/// MySQL's `IN name TYPE` list): each argument's mode and name, `None` for
+/// an unnamed PostgreSQL argument. Defaults are dropped.
+fn arguments_of(arguments: &str) -> Vec<(Mode, Option<String>)> {
+    // Split on the commas outside parentheses and quotes (`numeric(10,2)`).
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None, 0);
+    for (at, c) in arguments.char_indices() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                parts.push(&arguments[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&arguments[start..]);
+    // Types of more than one word, which an unnamed argument starts with.
+    const TYPES: [&str; 8] = [
+        "double precision",
+        "character varying",
+        "bit varying",
+        "timestamp with",
+        "timestamp without",
+        "time with",
+        "time without",
+        "interval ",
+    ];
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let first = part.split_whitespace().next().unwrap_or_default();
+            let (mode, rest) = match first.to_ascii_uppercase().as_str() {
+                "IN" => (Mode::In, &part[2..]),
+                "OUT" => (Mode::Out, &part[3..]),
+                "INOUT" => (Mode::InOut, &part[5..]),
+                "VARIADIC" => (Mode::Variadic, &part[8..]),
+                _ => (Mode::In, part),
+            };
+            let rest = rest.trim_start();
+            let name = if let Some(quoted) = rest.strip_prefix('"') {
+                // `"my arg" integer`: `""` is a quote inside the name.
+                let mut name = String::new();
+                let mut chars = quoted.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' if chars.peek() == Some(&'"') => {
+                            chars.next();
+                            name.push('"');
+                        }
+                        '"' => break,
+                        c => name.push(c),
+                    }
+                }
+                Some(name)
+            } else {
+                let lower = rest.to_ascii_lowercase();
+                let words = rest.split_whitespace().count();
+                let unnamed = words < 2 || TYPES.iter().any(|t| lower.starts_with(t));
+                (!unnamed).then(|| {
+                    rest.split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+            };
+            (mode, name)
+        })
+        .collect()
+}
+
+/// The statement that calls a routine, with a `:name` parameter for each
+/// value it takes, for Kerno to prompt for (DBeaver's `procedureCall`
+/// generator, `SQLDialect.generateStoredProcedureCall`). `arguments` is the
+/// list as the engine prints it ([`crate::schema::RoutineInfo::arguments`]).
+///
+/// PostgreSQL: `CALL s.p(:a, NULL)` for a procedure (an `OUT` argument is
+/// given as `NULL`), `SELECT * FROM s.f(:a)` for a function (its `OUT`
+/// arguments are its result columns). MySQL: `SELECT db.f(:a)`, and `CALL
+/// db.p(:a, @b)` where `OUT` and `INOUT` arguments are user variables (the
+/// server refuses anything else), set first for `INOUT` and read after.
+pub fn call_routine(
+    dialect: &dyn Dialect,
+    schema: &str,
+    name: &str,
+    kind: RoutineKind,
+    arguments: &str,
+) -> String {
+    let routine = dialect.table_name(&TableRef::new(schema, name));
+    let arguments = arguments_of(arguments);
+    let names: Vec<String> = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, name))| name.clone().unwrap_or_else(|| format!("arg{}", index + 1)))
+        .collect();
+    let params = placeholders(names.iter().map(String::as_str));
+    let procedure = kind == RoutineKind::Procedure;
+    let mysql = !dialect.has_schemas();
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let values: Vec<String> = arguments
+        .iter()
+        .zip(&params)
+        .filter_map(|((mode, _), param)| match mode {
+            Mode::Out if !procedure => None,
+            Mode::Out | Mode::InOut if mysql => {
+                if *mode == Mode::InOut {
+                    before.push(format!("SET @{param} = :{param};\n"));
+                }
+                after.push(format!("@{param}"));
+                Some(format!("@{param}"))
+            }
+            Mode::Out => Some("NULL".into()),
+            _ => Some(format!(":{param}")),
+        })
+        .collect();
+    let values = values.join(", ");
+    let call = match (procedure, mysql) {
+        (true, _) => format!("CALL {routine}({values});\n"),
+        (false, true) => format!("SELECT {routine}({values});\n"),
+        (false, false) => format!("SELECT * FROM {routine}({values});\n"),
+    };
+    let read = if after.is_empty() {
+        String::new()
+    } else {
+        format!("SELECT {};\n", after.join(", "))
+    };
+    format!("{}{call}{read}", before.concat())
 }
 
 #[cfg(test)]
@@ -482,6 +803,216 @@ mod tests {
         assert_eq!(
             delete_template(&AnsiDialect, &table(), &structure),
             "DELETE FROM \"shop\".\"order items\"\nWHERE \"id\" = :id;"
+        );
+    }
+
+    /// MySQL's quoting and its lack of schemas, for what differs.
+    struct Backticks;
+
+    impl Dialect for Backticks {
+        fn engine(&self) -> crate::config::Engine {
+            crate::config::Engine::MySql
+        }
+        fn has_schemas(&self) -> bool {
+            false
+        }
+        fn lex_rules(&self) -> LexRules {
+            LexRules::MYSQL
+        }
+        fn quote_ident(&self, ident: &str) -> String {
+            format!("`{}`", ident.replace('`', "``"))
+        }
+        fn quote_string(&self, text: &str) -> String {
+            format!("'{}'", text.replace('\'', "\\'"))
+        }
+        fn quote_bytes(&self, bytes: &[u8]) -> String {
+            format!("X'{}'", crate::dialect::hex(bytes))
+        }
+        fn explain(&self, sql: &str, _: bool) -> String {
+            format!("EXPLAIN {sql}")
+        }
+        fn type_for(&self, _: TypeKind) -> &'static str {
+            "text"
+        }
+        fn estimated_rows_sql(&self, _: &TableRef) -> String {
+            String::new()
+        }
+    }
+
+    fn typed(name: &str, kind: TypeKind) -> ColumnInfo {
+        ColumnInfo {
+            kind,
+            ..column(name)
+        }
+    }
+
+    /// `id` (key), `name`, `photo` (binary) and `total` (computed), with
+    /// rows (1, 'ann''s', NULL, 9) and (2, NULL, 0x00ff, 9).
+    fn rows() -> (Vec<ColumnInfo>, ResultStore) {
+        use crate::result::{BatchBuilder, Column};
+        let columns = vec![
+            ColumnInfo {
+                primary_key_position: Some(1),
+                ..typed("id", TypeKind::Integer)
+            },
+            column("name"),
+            typed("photo", TypeKind::Binary),
+            ColumnInfo {
+                generation: Some(ColumnGeneration::Stored("1".into())),
+                ..typed("total", TypeKind::Integer)
+            },
+        ];
+        let mut store = ResultStore::new(
+            vec![
+                Column::new("id", "int4", TypeKind::Integer),
+                Column::new("name", "text", TypeKind::Text),
+                Column::new("photo", "bytea", TypeKind::Binary),
+                Column::new("total", "int4", TypeKind::Integer),
+            ]
+            .into(),
+        );
+        let mut batch = BatchBuilder::new(4);
+        for (id, name, photo) in [
+            ("1", Some("ann's"), None),
+            ("2", None, Some(&[0u8, 255][..])),
+        ] {
+            batch.push_text(id);
+            match name {
+                Some(name) => batch.push_text(name),
+                None => batch.push_null(),
+            }
+            match photo {
+                Some(photo) => batch.push_bytes(photo),
+                None => batch.push_null(),
+            }
+            batch.push_text("9");
+        }
+        store.push(batch.finish());
+        (columns, store)
+    }
+
+    fn generate(kind: RowSql, dialect: &dyn Dialect, rows_of: &[usize]) -> Result<String> {
+        let (columns, store) = rows();
+        let t = TableRef::new("shop", "people");
+        rows_sql(kind, dialect, &t, &columns, &["id".into()], &store, rows_of)
+    }
+
+    #[test]
+    fn rows_become_statements_with_their_values() {
+        let pg = |kind| generate(kind, &AnsiDialect, &[0, 1]).unwrap();
+        assert_eq!(
+            pg(RowSql::SelectByKey),
+            "SELECT * FROM \"shop\".\"people\" WHERE \"id\" = 1;\n\
+             SELECT * FROM \"shop\".\"people\" WHERE \"id\" = 2;\n"
+        );
+        assert_eq!(
+            pg(RowSql::SelectIn),
+            "SELECT * FROM \"shop\".\"people\" WHERE \"id\" IN (1, 2);\n"
+        );
+        // The computed column is left to the server; NULL and bytes are literals.
+        assert_eq!(
+            pg(RowSql::Insert),
+            "INSERT INTO \"shop\".\"people\" (\"id\", \"name\", \"photo\") VALUES (1, 'ann''s', NULL);\n\
+             INSERT INTO \"shop\".\"people\" (\"id\", \"name\", \"photo\") VALUES (2, NULL, X'00ff');\n"
+        );
+        assert_eq!(
+            pg(RowSql::Update),
+            "UPDATE \"shop\".\"people\" SET \"name\" = 'ann''s', \"photo\" = NULL WHERE \"id\" = 1;\n\
+             UPDATE \"shop\".\"people\" SET \"name\" = NULL, \"photo\" = X'00ff' WHERE \"id\" = 2;\n"
+        );
+        assert_eq!(
+            pg(RowSql::Delete),
+            "DELETE FROM \"shop\".\"people\" WHERE \"id\" = 1;\n\
+             DELETE FROM \"shop\".\"people\" WHERE \"id\" = 2;\n"
+        );
+        // MySQL's quoting, one row.
+        assert_eq!(
+            generate(RowSql::Delete, &Backticks, &[1]).unwrap(),
+            "DELETE FROM `shop`.`people` WHERE `id` = 2;\n"
+        );
+        assert_eq!(
+            generate(RowSql::Insert, &Backticks, &[0]).unwrap(),
+            "INSERT INTO `shop`.`people` (`id`, `name`, `photo`) VALUES (1, 'ann\\'s', NULL);\n"
+        );
+    }
+
+    #[test]
+    fn rows_without_a_key_can_only_be_inserted() {
+        let (columns, store) = rows();
+        let t = TableRef::new("s", "t");
+        for kind in RowSql::ALL {
+            let written = rows_sql(kind, &AnsiDialect, &t, &columns, &[], &store, &[0]);
+            assert_eq!(written.is_ok(), !kind.needs_key(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_composite_key_matches_tuples() {
+        let (mut columns, store) = rows();
+        columns[1].primary_key_position = Some(2);
+        let key = ["id".to_string(), "name".to_string()];
+        let t = TableRef::new("s", "t");
+        let written = |kind| rows_sql(kind, &AnsiDialect, &t, &columns, &key, &store, &[0, 1]);
+        assert_eq!(
+            written(RowSql::SelectIn).unwrap(),
+            "SELECT * FROM \"s\".\"t\" WHERE (\"id\", \"name\") IN ((1, 'ann''s'), (2, NULL));\n"
+        );
+        // A NULL in the key is matched with IS NULL.
+        assert!(
+            written(RowSql::Delete)
+                .unwrap()
+                .ends_with("WHERE \"id\" = 2 AND \"name\" IS NULL;\n")
+        );
+    }
+
+    #[test]
+    fn a_postgresql_routine_is_called_with_a_parameter_per_value() {
+        let call = |kind, arguments| call_routine(&AnsiDialect, "shop", "f", kind, arguments);
+        assert_eq!(
+            call(RoutineKind::Function, "p_customer_id bigint"),
+            "SELECT * FROM \"shop\".\"f\"(:p_customer_id);\n"
+        );
+        // OUT arguments are the result of a function, NULL in a procedure's call.
+        let arguments = "a integer, OUT b text, INOUT c numeric(10,2), VARIADIC d integer[]";
+        assert_eq!(
+            call(RoutineKind::Function, arguments),
+            "SELECT * FROM \"shop\".\"f\"(:a, :c, :d);\n"
+        );
+        assert_eq!(
+            call(RoutineKind::Procedure, arguments),
+            "CALL \"shop\".\"f\"(:a, NULL, :c, :d);\n"
+        );
+        // Unnamed arguments, types of several words, defaults, quoted names.
+        assert_eq!(
+            call(
+                RoutineKind::Function,
+                "integer, double precision, \"My, \"\"arg\"\" \" text DEFAULT 'a, b'::text, \
+                 at timestamp with time zone"
+            ),
+            "SELECT * FROM \"shop\".\"f\"(:arg1, :arg2, :My___arg__, :at);\n"
+        );
+        assert_eq!(call(RoutineKind::Procedure, ""), "CALL \"shop\".\"f\"();\n");
+        let found = params(&call(RoutineKind::Procedure, "p_older_than interval"));
+        assert_eq!(found, [":p_older_than"]);
+    }
+
+    #[test]
+    fn a_mysql_procedure_gives_variables_for_what_it_returns() {
+        let call = |kind, arguments| call_routine(&Backticks, "kerno", "p", kind, arguments);
+        assert_eq!(
+            call(
+                RoutineKind::Procedure,
+                "IN p_customer_id bigint unsigned, OUT p_count int"
+            ),
+            "CALL `kerno`.`p`(:p_customer_id, @p_count);\nSELECT @p_count;\n"
+        );
+        assert_eq!(
+            call(RoutineKind::Procedure, "INOUT total decimal(10,2)"),
+            "SET @total = :total;\nCALL `kerno`.`p`(@total);\nSELECT @total;\n"
+        );
+        assert_eq!(
+            call(RoutineKind::Function, "p_customer_id bigint unsigned"),
+            "SELECT `kerno`.`p`(:p_customer_id);\n"
         );
     }
 }

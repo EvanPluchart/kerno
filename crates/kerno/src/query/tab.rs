@@ -36,8 +36,8 @@ use gpui_kit::{
 use kerno_core::config::Environment;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::{
-    LexRules, Param, ParamKey, ParamValue, bind_params, find_params, format_sql, split_statements,
-    statement_at,
+    LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_sql,
+    split_statements, statement_at, toggle_block_comment,
 };
 use kerno_core::sql::{StatementClass, StatementKind, TxCommand, classify};
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
@@ -51,7 +51,7 @@ use super::grid::{CopyFormat, Grid, GridAction, Owner};
 use super::params;
 use super::{plan_view, viewer};
 use crate::actions::{
-    CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
+    self, CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
     MaximizeResultsPanel, NextStatement, PreviousStatement, ReplaceInEditor, RunAll, RunFromCursor,
     RunStatement, RunStatementInNewTab, SaveFile, SaveFileAs, SaveQuery, ShowHistory,
     ShowSavedQueries, SwitchResultsFocus, ToggleComment, ToggleResultsPanel,
@@ -62,7 +62,7 @@ use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
-use crate::tabs::{self, EditorFacts, ResultFacts, TabAction, TabSnapshot, Target};
+use crate::tabs::{self, Choices, EditorFacts, ResultFacts, TabAction, TabSnapshot, Target};
 
 /// A statement to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1187,6 +1187,125 @@ impl QueryTab {
         });
     }
 
+    /// Puts the selection in upper (`upper`) or lower case, strings, quoted
+    /// names and parameters aside. One step to undo; the selection stays.
+    pub fn change_case(&mut self, upper: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        self.rewrite_selection(window, cx, |text, range| {
+            change_case(text, range, upper, rules)
+        });
+    }
+
+    /// Wraps the selection (or the cursor's line) in `/* */`, or takes the
+    /// markers off. One step to undo.
+    pub fn toggle_block_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rewrite_selection(window, cx, |text, range| toggle_block_comment(&text[range]));
+    }
+
+    /// Replaces the selection, or the cursor's whole line without one, by
+    /// what `rewrite` makes of it, and selects the result.
+    fn rewrite_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        rewrite: impl FnOnce(&str, std::ops::Range<usize>) -> String,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let mut range = editor.selected_range();
+            if text.get(range.clone()).is_none() {
+                return;
+            }
+            if range.is_empty() {
+                range = comment::lines_of(&text, range);
+            }
+            let replaced = rewrite(&text, range.clone());
+            if replaced == text[range.clone()] {
+                return;
+            }
+            let rewritten = format!("{}{replaced}{}", &text[..range.start], &text[range.end..]);
+            editor.replace_all(rewritten, window, cx);
+            editor.set_selected_range(range.start..range.start + replaced.len(), cx);
+        });
+    }
+
+    /// Copies the statement at the cursor, or the selected text (DBeaver's
+    /// "Copy selected query"). Returns whether there was one.
+    pub fn copy_statement(&mut self, cx: &mut Context<Self>) -> bool {
+        let statements = self.statements(Scope::AtCursor, cx);
+        let text = statements
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>()
+            .join(";\n");
+        if text.trim().is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    /// Reads again what completion knows of the tab's database: tables
+    /// made or dropped elsewhere since the tab opened.
+    pub fn refresh_completion(&mut self, cx: &mut Context<Self>) {
+        self.load_catalog(cx);
+    }
+
+    /// Opens the export of the rows of the statement at the cursor (or the
+    /// selection), which runs again for it (DBeaver's "Export from query").
+    pub fn export_from_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        let Some(statement) = self.statements(Scope::AtCursor, cx).into_iter().next() else {
+            return;
+        };
+        if classify(&statement.sql, rules).writes {
+            window.push_notification(
+                Notification::warning(
+                    "Export from query: the statement writes; only one that reads can be exported.",
+                ),
+                cx,
+            );
+            return;
+        }
+        if self.target.is_none() {
+            window.push_notification(
+                Notification::warning("Export from query: choose a connection first."),
+                cx,
+            );
+            return;
+        }
+        self.export_statement(statement.sql, window, cx);
+    }
+
+    /// Puts back the text of the tab's file, read off the UI thread. One
+    /// step to undo.
+    pub fn revert_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.file.clone() else {
+            return;
+        };
+        let source = path.clone();
+        let reading = bridge::spawn_blocking(cx, move || std::fs::read_to_string(&source));
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(sql) => {
+                    this.editor
+                        .update(cx, |editor, cx| editor.replace_all(sql, window, cx));
+                    // Once the edit's own event has marked the text changed.
+                    cx.defer_in(window, move |this, _, cx| this.set_file(path, false, cx));
+                }
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "{} could not be read: {error}",
+                        path.display()
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
     /// Stops what is running or waiting to be paged, keeping what arrived.
     fn stop(&mut self, cx: &mut Context<Self>) {
         // Dropping the run drops the execution, which stops the statement.
@@ -2143,6 +2262,12 @@ impl QueryTab {
         &self.databases
     }
 
+    /// The schemas the tab can switch to; for tests.
+    #[cfg(test)]
+    pub fn schemas(&self) -> &[String] {
+        &self.schemas
+    }
+
     /// What the editor's menu depends on.
     fn editor_facts(&self, cx: &App) -> EditorFacts {
         let editor = self.editor.read(cx);
@@ -2157,6 +2282,38 @@ impl QueryTab {
             empty: editor.text().len() == 0,
             saved_file: self.file.is_some() && !self.unsaved,
             source: self.source.is_some(),
+            file: self.file.is_some(),
+            more_rows: self
+                .active_grid()
+                .is_some_and(|grid| grid.read(cx).delegate().has_more()),
+        }
+    }
+
+    /// What the editor's menu offers to run on.
+    fn choices(&self, cx: &App) -> Choices {
+        let connections = self.connections.read(cx);
+        let target = self.target.as_ref();
+        Choices {
+            connections: connections
+                .saved()
+                .iter()
+                .map(|saved| {
+                    let connected =
+                        matches!(connections.status(&saved.id), Status::Connected { .. });
+                    (saved.id.clone(), saved.config.name.clone(), connected)
+                })
+                .collect(),
+            connection: target.map(|target| target.connection.clone()),
+            databases: self.databases.clone(),
+            database: target.and_then(|target| {
+                target.database.clone().or_else(|| {
+                    connections
+                        .meta_session(&target.connection)
+                        .and_then(|meta| meta.database())
+                })
+            }),
+            schemas: self.schemas.clone(),
+            schema: target.and_then(|target| target.schema.clone()),
         }
     }
 
@@ -2167,10 +2324,11 @@ impl QueryTab {
         cx: &Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
-        move |menu, _, cx| {
-            let entries = tabs::editor_menu(view.read(cx).editor_facts(cx));
+        move |menu, window, cx| {
+            let tab = view.read(cx);
+            let entries = tabs::editor_menu(tab.editor_facts(cx), &tab.choices(cx));
             let view = view.clone();
-            tabs::fill_menu(
+            let menu = tabs::fill_menu(
                 menu,
                 entries,
                 Rc::new(move |action, window, cx| {
@@ -2180,7 +2338,10 @@ impl QueryTab {
                         run_editor_action(&view, action, window, cx)
                     });
                 }),
-            )
+                window,
+                cx,
+            );
+            tabs::fit_window(menu, window)
         }
     }
 
@@ -2290,6 +2451,7 @@ impl QueryTab {
                 .writes
                 .then_some("the statement writes"),
             filtered: false,
+            keyless: false,
         });
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
@@ -2513,7 +2675,7 @@ impl QueryTab {
         cx: &Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let view = cx.entity();
-        move |menu, _, cx| {
+        move |menu, window, cx| {
             let Some(facts) = view.read(cx).result_facts(id, cx) else {
                 return menu;
             };
@@ -2528,6 +2690,8 @@ impl QueryTab {
                         view.update(cx, |this, cx| this.perform_result(id, action, window, cx))
                     });
                 }),
+                window,
+                cx,
             )
         }
     }
@@ -3204,7 +3368,7 @@ impl QueryTab {
                     .tooltip("More ways to run")
                     .dropdown_menu({
                         let view = view.clone();
-                        move |menu, _, cx| {
+                        move |menu, window, cx| {
                             let entries = tabs::run_menu(view.read(cx).editor_facts(cx));
                             let view = view.clone();
                             tabs::fill_menu(
@@ -3216,6 +3380,8 @@ impl QueryTab {
                                         run_editor_action(&view, action, window, cx)
                                     });
                                 }),
+                                window,
+                                cx,
                             )
                         }
                     }),
@@ -3587,11 +3753,62 @@ fn run_editor_action(
 ) {
     let focus = view.read(cx).focus_handle(cx);
     focus.focus(window, cx);
+    // A change of what the tab runs on, as the toolbar's lists make it.
+    let retarget = |change: &dyn Fn(Target) -> Target, cx: &mut App| {
+        view.update(cx, |tab, cx| {
+            let target = tab.target.clone().map(change);
+            tab.request_target(target, cx)
+        })
+    };
     let command: Box<dyn gpui_kit::Action> = match action {
         TabAction::ApplySource => {
             view.update(cx, |tab, cx| tab.apply_source(window, cx));
             return;
         }
+        TabAction::UseConnection(id, _) => {
+            view.update(cx, |tab, cx| {
+                tab.request_target(
+                    Some(Target {
+                        connection: id,
+                        database: None,
+                        schema: None,
+                    }),
+                    cx,
+                )
+            });
+            return;
+        }
+        TabAction::UseDatabase(database) => {
+            retarget(
+                &|target| Target {
+                    database: Some(database.clone()),
+                    schema: None,
+                    ..target
+                },
+                cx,
+            );
+            return;
+        }
+        TabAction::UseSchema(schema) => {
+            retarget(
+                &|target| Target {
+                    schema: Some(schema.clone()),
+                    ..target
+                },
+                cx,
+            );
+            return;
+        }
+        TabAction::CopyStatement => Box::new(actions::CopySelectedQuery),
+        TabAction::ToggleBlockComment => Box::new(actions::ToggleBlockComment),
+        TabAction::UpperCase => Box::new(actions::UpperCase),
+        TabAction::LowerCase => Box::new(actions::LowerCase),
+        TabAction::ToggleSoftWrap => Box::new(actions::ToggleSoftWrap),
+        TabAction::FetchAllRows => Box::new(actions::FetchAllRows),
+        TabAction::ExportFromQuery => Box::new(actions::ExportFromQuery),
+        TabAction::RevertFile => Box::new(actions::RevertFile),
+        TabAction::OpenFile => Box::new(actions::OpenSqlFile),
+        TabAction::Rename => Box::new(actions::RenameTab),
         TabAction::RunStatement => Box::new(RunStatement),
         TabAction::RunInNewTab => Box::new(RunStatementInNewTab),
         TabAction::RunFromCursor => Box::new(RunFromCursor),
