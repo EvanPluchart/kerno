@@ -17,7 +17,14 @@ ClickOptions::new().with_button(MouseButton::Right), cx)` then `window.try_find_
 entry is also a palette command when it is not tied to a position (CLAUDE.md §3 "every action reachable
 from the command palette").
 
-## Part 0 — Navigator click behaviour (§4.B item 1) — in progress
+**Parts 0 and 1 are done** (commits `dcf3f51` and "connection folders and context menus across the
+sidebar"). Kept deviations: empty folders and their open / closed state live in `Settings`; deleting a
+folder moves its sub-folders up intact; the connection dialog's folder field is a text field with a
+dropdown of the existing folders. Left for a later part: the navigator's empty-area menu is built inline
+(make it a tested pure list when Part 3 or G1 touches it); the entries of the Move to ▸ and Copy ▸ submenus
+are tested through `Sidebar::perform`, not through a real click.
+
+## Part 0 — Navigator click behaviour (§4.B item 1) — done
 
 Single click selects; chevron, Right / Left expand and collapse; double click or Enter runs the default
 action (table / view / materialized view: data tab, or per `Settings::table_double_click`; routines: their

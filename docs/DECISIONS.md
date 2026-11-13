@@ -460,3 +460,16 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   checked: scope, tests re-run with the containers required, lint. The last two are wired into the app in the
   next step of this milestone.
 
+## D-024 — DBeaver parity: what is built and what goes to the roadmap
+
+- Owner's decision of 2026-11-13: DBeaver Community is the primary reference for features and
+  interactions. `docs/DBEAVER-PARITY.md` inventories its navigator, SQL editor, results, connection,
+  object-editor and tool features and its context menus, as far as they apply to PostgreSQL and MySQL,
+  from its source at commit `cc7e36f` (418 rows).
+- Rows that Kerno lacks and that a daily DBeaver user would miss are gaps, built from
+  `docs/plans/PARITY-GAPS.md` (parts G1 to G18) and `docs/plans/CTX.md`.
+- 67 further gaps were moved to `docs/ROADMAP.md` on 2026-11-13, each with its reason (rarely used, off
+  by default in DBeaver, covered another way in Kerno, or outside CLAUDE.md §4). Four roadmap rows rest
+  on a reading of CLAUDE.md and are confirmed: specialised PostgreSQL folders (not in the §4.B tree),
+  "search in web" (§1: nothing leaves the machine), editing roles and users (§4.H2 asks for a read
+  view), replication tools (outside §4). The owner can pull any row back by naming its ID.
