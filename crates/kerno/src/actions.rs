@@ -105,6 +105,34 @@ gpui_kit::actions!(
         NewQueryTab,
         /// Closes the active tab.
         CloseTab,
+        /// Closes every tab but the active one.
+        CloseOtherTabs,
+        /// Closes the tabs to the right of the active one.
+        CloseTabsToTheRight,
+        /// Closes every tab.
+        CloseAllTabs,
+        /// Renames the active query tab.
+        RenameTab,
+        /// Opens a copy of the active query tab.
+        DuplicateTab,
+        /// Opens the query tab closed last again.
+        ReopenClosedTab,
+        /// Copies the path of the active tab's file.
+        CopyTabFilePath,
+        /// Shows the active tab's file in the file manager.
+        RevealTabFile,
+        /// Commits the open transaction of the active tab.
+        CommitTransaction,
+        /// Rolls back the open transaction of the active tab.
+        RollbackTransaction,
+        /// Switches the active tab between auto-commit and manual commit.
+        ToggleCommitMode,
+        /// Disconnects the connection of the active tab.
+        DisconnectTabConnection,
+        /// Disconnects and connects again the connection of the active tab.
+        ReconnectTabConnection,
+        /// Opens the dialog of the connection of the active tab.
+        EditTabConnection,
         /// Activates the next tab.
         NextTab,
         /// Activates the previous tab.
@@ -555,6 +583,118 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-w"],
         [],
         CloseTab
+    ),
+    command!(
+        "close_other_tabs",
+        "Close Other Tabs",
+        "Tabs",
+        [],
+        ["keep"],
+        CloseOtherTabs
+    ),
+    command!(
+        "close_tabs_to_the_right",
+        "Close Tabs to the Right",
+        "Tabs",
+        [],
+        [],
+        CloseTabsToTheRight
+    ),
+    command!(
+        "close_all_tabs",
+        "Close All Tabs",
+        "Tabs",
+        ["secondary-shift-w"],
+        [],
+        CloseAllTabs
+    ),
+    command!(
+        "rename_tab",
+        "Rename Tab…",
+        "Tabs",
+        [],
+        ["title", "name"],
+        RenameTab
+    ),
+    command!(
+        "duplicate_tab",
+        "Duplicate Tab",
+        "Tabs",
+        [],
+        ["copy", "clone"],
+        DuplicateTab
+    ),
+    command!(
+        "reopen_closed_tab",
+        "Reopen Closed Tab",
+        "Tabs",
+        [],
+        ["undo close", "restore"],
+        ReopenClosedTab
+    ),
+    command!(
+        "copy_tab_file_path",
+        "Copy File Path",
+        "Files",
+        [],
+        ["clipboard", "location"],
+        CopyTabFilePath
+    ),
+    command!(
+        "reveal_tab_file",
+        "Show File in Its Folder",
+        "Files",
+        [],
+        ["reveal", "finder", "file manager"],
+        RevealTabFile
+    ),
+    command!(
+        "commit_transaction",
+        "Commit Transaction",
+        "Query",
+        [],
+        ["end", "save"],
+        CommitTransaction
+    ),
+    command!(
+        "rollback_transaction",
+        "Roll Back Transaction",
+        "Query",
+        [],
+        ["rollback", "undo", "abort"],
+        RollbackTransaction
+    ),
+    command!(
+        "toggle_commit_mode",
+        "Switch Between Auto-Commit and Manual Commit",
+        "Query",
+        [],
+        ["transaction", "autocommit"],
+        ToggleCommitMode
+    ),
+    command!(
+        "disconnect_tab_connection",
+        "Disconnect the Active Tab's Connection",
+        "Connections",
+        [],
+        ["close"],
+        DisconnectTabConnection
+    ),
+    command!(
+        "reconnect_tab_connection",
+        "Reconnect the Active Tab's Connection",
+        "Connections",
+        [],
+        ["connect again"],
+        ReconnectTabConnection
+    ),
+    command!(
+        "edit_tab_connection",
+        "Edit the Active Tab's Connection…",
+        "Connections",
+        [],
+        ["settings", "properties"],
+        EditTabConnection
     ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(

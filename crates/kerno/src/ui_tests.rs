@@ -5619,3 +5619,414 @@ fn a_read_only_connection_cannot_import(cx: &mut TestAppContext) {
         None
     );
 }
+
+// Menus of the tabs, the editor and the status bar ---------------------------------
+
+impl Fixture {
+    /// Clicks the element with this id with the middle button.
+    fn middle_click(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
+        use gpui_kit::test::ClickOptions;
+        let options = ClickOptions::new().with_button(gpui_kit::MouseButton::Middle);
+        self.step(cx, |window, cx| window.click_with_options(id, options, cx));
+    }
+
+    /// Runs a command as its shortcut or the palette does.
+    fn dispatch(&self, cx: &mut TestAppContext, action: impl gpui_kit::Action) {
+        self.step(cx, |window, cx| {
+            window.dispatch_action(Box::new(action), cx)
+        });
+    }
+
+    fn clipboard(&self, cx: &mut TestAppContext) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    fn set_confirm_close(&self, cx: &mut TestAppContext, confirm: bool) {
+        cx.update(|cx| {
+            AppState::update_settings(cx, |settings| settings.confirm_close_tab = confirm)
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn tabs_answer_a_right_click_and_close_or_come_back_from_their_menus(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(
+        cx,
+        &["secondary-t", "secondary-t", "secondary-t", "secondary-t"],
+    );
+    app.type_text(cx, "select 'fourth'");
+
+    // A tab: what DBeaver's tab menu offers.
+    assert!(!app.shows_label(cx, "Close tabs to the right"));
+    app.right_click(cx, ("tab-title", 1usize), None);
+    for label in [
+        "Close",
+        "Close others",
+        "Close tabs to the right",
+        "Close all",
+        "Rename…",
+        "Duplicate",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.click_label(cx, "Close tabs to the right");
+    assert_eq!(app.titles(cx), ["Query 1", "Query 2"]);
+
+    // The empty area of the bar: the last tab closed comes back with its text.
+    assert!(!app.shows_label(cx, "Reopen closed tab"));
+    app.right_click(cx, "tab-bar-empty", None);
+    for label in ["New query tab", "Reopen closed tab", "Close all"] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.click_label(cx, "Reopen closed tab");
+    assert_eq!(app.titles(cx), ["Query 1", "Query 2", "Query 4"]);
+    assert_eq!(app.active(cx), Some(2));
+    assert_eq!(app.active_query(cx).1, "select 'fourth'");
+
+    // Close others, from the menu of a tab that is not the active one.
+    app.right_click(cx, ("tab-title", 2usize), None);
+    app.click_label(cx, "Close others");
+    assert_eq!(app.titles(cx), ["Query 4"]);
+    // What does not apply to the only tab says why.
+    app.right_click(cx, ("tab-title", 0usize), None);
+    assert!(app.shows_label(cx, "Close others (no other tab)"));
+    assert!(app.shows_label(cx, "Close tabs to the right (none to the right)"));
+    // A copy of the tab, its text and where it runs.
+    app.click_label(cx, "Duplicate");
+    assert_eq!(app.titles(cx), ["Query 4", "Query 5"]);
+    assert_eq!(app.active_query(cx).1, "select 'fourth'");
+
+    // A middle click closes the tab under the mouse; the active one stays.
+    app.press(cx, &["secondary-t", "ctrl-tab"]);
+    assert_eq!(app.active(cx), Some(0));
+    app.middle_click(cx, ("tab-title", 1usize));
+    assert_eq!(app.titles(cx), ["Query 4", "Query 6"]);
+    assert_eq!(app.active(cx), Some(0));
+
+    // Close all from its shortcut; the empty window still reopens, the last
+    // closed first.
+    app.press(cx, &["secondary-shift-w"]);
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+    app.right_click(cx, "tabs-empty", None);
+    assert!(app.shows_label(cx, "Close all (no tab open)"));
+    app.click_label(cx, "Reopen closed tab");
+    assert_eq!(app.titles(cx), ["Query 6"]);
+    // And from the palette's command.
+    app.dispatch(cx, actions::ReopenClosedTab);
+    assert_eq!(app.titles(cx), ["Query 6", "Query 4"]);
+    assert_eq!(app.active_query(cx).1, "select 'fourth'");
+}
+
+#[gpui_kit::test]
+async fn a_renamed_query_tab_keeps_its_name_after_a_restart(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let app = open(cx, storage.clone());
+    app.press(cx, &["secondary-t"]);
+    app.right_click(cx, ("tab-title", 0usize), None);
+    app.click_label(cx, "Rename…");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "Monthly report");
+    app.click(cx, "tab-name-ok");
+    assert_eq!(app.titles(cx), ["Monthly report"]);
+
+    // From the palette's command; an empty name is refused.
+    app.dispatch(cx, actions::RenameTab);
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.click(cx, "tab-name-ok");
+    assert!(app.has(cx, "tab-name-ok"), "the dialog stays open");
+    app.click(cx, "tab-name-cancel");
+    assert_eq!(app.titles(cx), ["Monthly report"]);
+
+    app.wait_for_stored_tabs(
+        cx,
+        |tabs| matches!(tabs, [TabSnapshot::Query { title, .. }] if title == "Monthly report"),
+    )
+    .await;
+    let restarted = open(cx, storage);
+    assert_eq!(restarted.titles(cx), ["Monthly report"]);
+}
+
+#[gpui_kit::test]
+fn a_file_with_unsaved_text_asks_before_its_tab_closes(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("report.sql");
+    std::fs::write(&file, "select 1;\n").unwrap();
+    let (workspace, path) = (app.workspace.clone(), file.clone());
+    app.step(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_sql_file_from(path, window, cx)
+        })
+    });
+    app.wait_until(cx, "the file", |app, cx| app.titles(cx) == ["report.sql"]);
+    let unsaved = |app: &Fixture, cx: &mut TestAppContext| {
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.read(cx).unsaved())
+    };
+
+    // A file tab: named after its file, which can be found.
+    app.right_click(cx, ("tab-title", 0usize), None);
+    assert!(app.shows_label(cx, "Rename… (named after its file)"));
+    assert!(app.shows_label(cx, &crate::tabs::TabAction::Reveal.label()));
+    app.click_label(cx, "Copy file path");
+    assert_eq!(app.clipboard(cx), Some(file.display().to_string()));
+
+    // A tab that holds nothing closes without a question.
+    app.type_text(cx, "-- edited\n");
+    app.press(cx, &["secondary-t", "secondary-w"]);
+    assert_eq!(app.titles(cx), ["report.sql"]);
+    assert!(!app.has(cx, "ok"));
+
+    // Cmd+W asks; Cancel keeps the tab and its text.
+    app.press(cx, &["secondary-w"]);
+    assert!(app.shows_label(cx, "Discard and close"));
+    app.click(cx, "cancel");
+    assert_eq!(app.titles(cx), ["report.sql"]);
+    assert!(unsaved(&app, cx));
+    // A middle click asks the same; confirming closes it.
+    app.middle_click(cx, ("tab-title", 0usize));
+    assert!(app.shows_label(cx, "Discard and close"));
+    app.click(cx, "ok");
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+
+    // It comes back with its file and its text, still not saved.
+    app.dispatch(cx, actions::ReopenClosedTab);
+    assert_eq!(app.titles(cx), ["report.sql"]);
+    assert_eq!(app.active_query(cx).1, "-- edited\nselect 1;\n");
+    assert!(unsaved(&app, cx));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "select 1;\n");
+
+    // With the setting off, it closes without a question.
+    app.set_confirm_close(cx, false);
+    app.press(cx, &["secondary-w"]);
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+    assert!(!app.has(cx, "ok"));
+}
+
+#[gpui_kit::test]
+fn the_editor_answers_a_right_click_with_its_commands(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 1 as one, 2 as two");
+    // On the text of the first line.
+    let on_text = Some(gpui_kit::point(px(120.), px(10.)));
+
+    assert!(!app.shows_label(cx, "Toggle comment"));
+    app.right_click(cx, "query-editor", on_text);
+    for label in [
+        "Run statement (not connected)",
+        "Run script (not connected)",
+        "Explain plan (not connected)",
+        "Explain analyze (not connected)",
+        "Format SQL",
+        "Undo",
+        "Redo",
+        "Cut (no selection)",
+        "Copy (no selection)",
+        "Paste",
+        "Select all",
+        "Toggle comment",
+        "Find…",
+        "Replace…",
+        "Save",
+        "Save as…",
+        "Save as query…",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    // The editor's own actions run from the menu.
+    app.click_label(cx, "Select all");
+    let tab = app.tab(cx);
+    let selection = cx.update(|cx| tab.read(cx).editor().read(cx).selected_range());
+    assert_eq!(selection, 0..25);
+    app.right_click(cx, "query-editor", on_text);
+    app.click_label(cx, "Copy");
+    assert_eq!(
+        app.clipboard(cx).as_deref(),
+        Some("select 1 as one, 2 as two")
+    );
+    // So do the app's commands.
+    app.right_click(cx, "query-editor", on_text);
+    app.click_label(cx, "Toggle comment");
+    assert_eq!(app.active_query(cx).1, "-- select 1 as one, 2 as two");
+    app.right_click(cx, "query-editor", on_text);
+    app.click_label(cx, "Find…");
+    assert_eq!(cx.update(|cx| tab.read(cx).searching(cx)), Some(false));
+}
+
+#[gpui_kit::test]
+fn a_read_only_connection_explains_itself_in_the_status_bar(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.press(cx, &["secondary-t"]);
+    assert!(!app.shows_label(cx, "What read-only means…"));
+    app.right_click(cx, "status-read-only", None);
+    assert!(app.shows_label(cx, "What read-only means…"));
+    assert!(app.shows_label(cx, "Edit connection…"));
+    app.click_label(cx, "What read-only means…");
+    assert!(app.has(cx, "ok"), "the explanation is shown");
+}
+
+#[gpui_kit::test]
+fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let server = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        // A failed run may leave its transaction open: it would hold the drop.
+        &[
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE query LIKE '%kerno_ui_close.entries values (2%' AND pid <> pg_backend_pid()",
+            "DROP SCHEMA IF EXISTS kerno_ui_close CASCADE",
+        ],
+        &[
+            "CREATE SCHEMA kerno_ui_close",
+            "CREATE TABLE kerno_ui_close.entries (id int PRIMARY KEY, note text)",
+            "INSERT INTO kerno_ui_close.entries VALUES (1, 'kept')",
+        ],
+    );
+    // Sessions of this test left in a transaction.
+    let open_on_server = || {
+        server(
+            "SELECT count(*) FROM pg_stat_activity WHERE state LIKE 'idle in transaction%' \
+             AND query LIKE '%kerno_ui_close.entries values (2%'",
+        )
+    };
+    let app = connected(cx, Engine::Postgres);
+
+    // A transaction left open in a query tab, its statement run from the
+    // editor's menu.
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+    app.type_text(cx, "insert into kerno_ui_close.entries values (2, 'open')");
+    app.right_click(cx, "query-editor", Some(gpui_kit::point(px(120.), px(10.))));
+    app.click_label(cx, "Run statement");
+    app.wait_until(cx, "the insert", |app, cx| {
+        app.outcomes(cx) == ["done, 1 affected"] && !app.running(cx)
+    });
+    assert!(app.status_bar(cx).contains(&"transaction open".to_string()));
+    assert_eq!(open_on_server(), "1");
+
+    // The status bar's items answer a right-click, and a click.
+    app.right_click(cx, "status-connection", None);
+    for label in [
+        "Disconnect (transaction open)",
+        "Reconnect (transaction open)",
+        "Edit connection…",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.press(cx, &["escape"]);
+    app.right_click(cx, "status-transaction", None);
+    for label in [
+        "Commit transaction",
+        "Roll back transaction",
+        "Switch to auto-commit",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.press(cx, &["escape"]);
+    assert!(!app.shows_label(cx, "Roll back transaction"));
+    app.click(cx, "status-transaction-button");
+    assert!(app.shows_label(cx, "Roll back transaction"));
+    app.press(cx, &["escape"]);
+    let database = app.status_bar(cx)[1].clone();
+    app.wait_until(cx, "the databases", |app, cx| {
+        app.has(cx, "status-database")
+    });
+    app.right_click(cx, "status-database", None);
+    assert!(app.shows_label(cx, &format!("{database} (current)")));
+    app.press(cx, &["escape"]);
+    let timing = app.status_bar(cx).last().cloned().unwrap();
+    app.right_click(cx, "status-timing", None);
+    app.click_label(cx, "Copy");
+    assert_eq!(app.clipboard(cx), Some(timing));
+    app.right_click(cx, "status-memory-only", None);
+    app.click_label(cx, "What this means…");
+    assert!(app.has(cx, "ok"), "the explanation is shown");
+    app.click(cx, "ok");
+    // From the palette, a disconnection that would lose the transaction is refused.
+    app.dispatch(cx, actions::DisconnectTabConnection);
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+
+    // A data tab with a change waiting.
+    app.open_table(cx, "kerno_ui_close", "entries", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    app.type_in_cell(cx, 0, 2, "changed", "enter");
+    assert_eq!(app.pending(cx), 1);
+    app.right_click(cx, "status-pending", None);
+    assert!(app.shows_label(cx, "Review SQL…"));
+    assert!(app.shows_label(cx, "Discard changes"));
+    app.press(cx, &["escape"]);
+
+    // A tab that holds nothing: a running statement is cancelled from the
+    // status bar, and the tab then closes without a question.
+    app.run_in_new_tab(
+        cx,
+        "select pg_sleep(60) as kerno_ui_close",
+        "secondary-enter",
+    );
+    // On the server: a cancel request that arrives before the statement is
+    // ignored there.
+    app.wait_until(cx, "the statement to start", |app, cx| {
+        app.running(cx)
+            && server(
+                "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' \
+                 AND query LIKE 'select pg_sleep(60) as kerno_ui_close%'",
+            ) == "1"
+    });
+    app.right_click(cx, "status-running", None);
+    app.click_label(cx, "Cancel running statement");
+    app.wait_until(cx, "the cancellation", |app, cx| !app.running(cx));
+    assert_eq!(app.outcomes(cx), ["cancelled"]);
+    app.press(cx, &["secondary-w"]);
+    assert_eq!(app.titles(cx), ["Query 1", "entries"]);
+    assert!(!app.has(cx, "ok"));
+
+    // Closing all asks once for both; Cancel closes nothing and keeps both.
+    app.press(cx, &["secondary-shift-w"]);
+    assert!(app.shows_label(cx, "Roll back and close"));
+    app.click(cx, "cancel");
+    assert_eq!(app.titles(cx), ["Query 1", "entries"]);
+    assert_eq!(app.pending(cx), 1);
+    assert_eq!(open_on_server(), "1");
+
+    // With the setting off the pending change no longer asks, the
+    // transaction still does; confirming rolls it back.
+    app.set_confirm_close(cx, false);
+    app.press(cx, &["secondary-shift-w"]);
+    assert!(app.shows_label(cx, "Roll back and close"));
+    app.click(cx, "ok");
+    assert_eq!(app.titles(cx), Vec::<String>::new());
+    app.wait_until(cx, "the rollback", |_, _| open_on_server() == "0");
+    assert_eq!(server("SELECT count(*) FROM kerno_ui_close.entries"), "1");
+    assert_eq!(
+        server("SELECT note FROM kerno_ui_close.entries WHERE id = 1"),
+        "kept"
+    );
+
+    // The query tab comes back with its text and where it ran, without its
+    // transaction.
+    app.dispatch(cx, actions::ReopenClosedTab);
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| {
+        tab.read(cx)
+            .target()
+            .map(|target| target.connection.clone())
+    });
+    assert_eq!(target, Some(connection));
+    assert_eq!(
+        app.active_query(cx).1,
+        "insert into kerno_ui_close.entries values (2, 'open')"
+    );
+    assert!(!app.status_bar(cx).contains(&"transaction open".to_string()));
+}

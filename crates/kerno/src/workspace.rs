@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -19,22 +21,26 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyView, App, AppContext as _, BorrowAppContext as _, Context, Entity, FocusHandle, Focusable,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions,
-    Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
+    Anchor, AnyElement, AnyView, App, AppContext as _, BorrowAppContext as _, ClipboardItem,
+    Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, CollapseConnectionFolders,
-    CollapseSchemaTree, CopyObjectName, CopyQualifiedName, DeleteRows, DiscardChanges, DropObject,
-    DuplicateRows, EditConnection, EditObject, ExplainAnalyze, ExplainStatement, ExportConnections,
-    ExportData, FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection,
-    NewConnectionFolder, NewQueryOnObject, NewQueryTab, NextTab, OpenCommandPalette,
-    OpenConnection, OpenSettings, OpenSqlFile, PreviousTab, RefreshConnections, RefreshData,
-    RefreshObject, RefreshSchemaTree, RenameObject, ReplaceInEditor, RunAll, RunStatement,
-    SaveFile, SaveFileAs, SaveQuery, SetDefault, SetDefaultSchema, SetNull, ShowHistory,
-    ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, AddRow, ApplyChanges, CancelQuery, CloseAllTabs, CloseOtherTabs, CloseTab,
+    CloseTabsToTheRight, CollapseConnectionFolders, CollapseSchemaTree, CommitTransaction,
+    CopyObjectName, CopyQualifiedName, CopyTabFilePath, DeleteRows, DiscardChanges,
+    DisconnectTabConnection, DropObject, DuplicateRows, DuplicateTab, EditConnection, EditObject,
+    EditTabConnection, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData,
+    FindInEditor, FormatSql, ImportConnections, ImportCsv, NewConnection, NewConnectionFolder,
+    NewQueryOnObject, NewQueryTab, NextTab, OpenCommandPalette, OpenConnection, OpenSettings,
+    OpenSqlFile, PreviousTab, ReconnectTabConnection, RefreshConnections, RefreshData,
+    RefreshObject, RefreshSchemaTree, RenameObject, RenameTab, ReopenClosedTab, ReplaceInEditor,
+    RevealTabFile, RollbackTransaction, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery,
+    SetDefault, SetDefaultSchema, SetNull, ShowHistory, ShowSavedQueries, ToggleComment,
+    ToggleCommitMode, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -52,7 +58,9 @@ use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{StructureTab, StructureTabEvent};
-use crate::tabs::{TabSnapshot, Target};
+use crate::tabs::{
+    self, Entry, Loss, StatusFacts, StatusItem, TabAction, TabKind, TabSnapshot, Target,
+};
 use crate::theme::{self, Appearance};
 use kerno_core::TxState;
 use kerno_core::browse::Filter;
@@ -62,6 +70,20 @@ use kerno_core::storage::SavedQuery;
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
+
+/// How many closed query tabs can be reopened.
+const CLOSED_TABS: usize = 10;
+
+/// Where a menu of the central area opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuOf {
+    /// The tab at this index.
+    Tab(usize),
+    /// The empty area of the tab bar.
+    Bar,
+    /// An item of the status bar.
+    Status(StatusItem),
+}
 
 /// A tab of the central area.
 #[derive(Clone)]
@@ -99,6 +121,63 @@ impl OpenTab {
         match self {
             OpenTab::TableEditor(tab) => Some(tab),
             _ => None,
+        }
+    }
+
+    fn entity_id(&self) -> EntityId {
+        match self {
+            OpenTab::Query(tab) => tab.entity_id(),
+            OpenTab::Data(tab) => tab.entity_id(),
+            OpenTab::Structure(tab) => tab.entity_id(),
+            OpenTab::TableEditor(tab) => tab.entity_id(),
+        }
+    }
+
+    fn kind(&self, cx: &App) -> TabKind {
+        match self {
+            OpenTab::Query(tab) => TabKind::Query {
+                file: tab.read(cx).file().is_some(),
+            },
+            _ => TabKind::Other,
+        }
+    }
+
+    /// What closing the tab would lose.
+    fn losses(&self, cx: &App) -> Vec<Loss> {
+        match self {
+            OpenTab::Query(tab) => {
+                let tab = tab.read(cx);
+                let mut losses = Vec::new();
+                if tab.tx_state() != TxState::Idle {
+                    losses.push(Loss::Transaction);
+                }
+                if tab.file().is_some() && tab.unsaved() {
+                    losses.push(Loss::Unsaved);
+                }
+                losses
+            }
+            OpenTab::Data(tab) => match tab.read(cx).pending_count(cx) {
+                0 => Vec::new(),
+                count => vec![Loss::Pending(count)],
+            },
+            OpenTab::Structure(_) => Vec::new(),
+            OpenTab::TableEditor(tab) => {
+                if tab.read(cx).dirty(cx) {
+                    vec![Loss::Form]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// The saved connection the tab works on.
+    fn connection(&self, cx: &App) -> Option<String> {
+        match self {
+            OpenTab::Query(tab) => tab.read(cx).connection_id().map(str::to_string),
+            OpenTab::Data(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::Structure(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
         }
     }
 
@@ -176,6 +255,8 @@ pub struct Workspace {
     sidebar: Entity<Sidebar>,
     tabs: Vec<OpenTab>,
     active_tab: usize,
+    /// The last query tabs closed, the latest last; in memory only.
+    closed: Vec<TabSnapshot>,
     /// Number given to the next "Query N" tab.
     next_query_number: usize,
     palette: Entity<CommandState>,
@@ -227,6 +308,7 @@ impl Workspace {
             sidebar,
             tabs: Vec::new(),
             active_tab: 0,
+            closed: Vec::new(),
             next_query_number: 1,
             palette,
             pending_save: None,
@@ -242,68 +324,72 @@ impl Workspace {
             ],
         };
         for snapshot in tabs {
-            match snapshot {
-                TabSnapshot::Query {
-                    title,
-                    sql,
-                    target,
-                    file,
-                    unsaved,
-                    source,
-                } => {
-                    let tab = workspace.push_query_tab(title, &sql, target, window, cx);
-                    tab.update(cx, |tab, cx| {
-                        if let Some(file) = file {
-                            tab.set_file(file, unsaved, cx);
-                        }
-                        tab.set_source(source, cx);
-                    });
-                }
-                TabSnapshot::Data {
-                    target,
-                    schema,
-                    table,
-                    view,
-                } => {
-                    let kind = if view {
-                        RelationKind::View
-                    } else {
-                        RelationKind::Table
-                    };
-                    workspace.push_data_tab(
-                        target,
-                        TableRef::new(schema, table),
-                        kind,
-                        Filter::default(),
-                        window,
-                        cx,
-                    );
-                }
-                TabSnapshot::Structure {
-                    target,
-                    schema,
-                    table,
-                    view,
-                    materialized,
-                } => {
-                    let kind = match (view, materialized) {
-                        (_, true) => RelationKind::MaterializedView,
-                        (true, false) => RelationKind::View,
-                        (false, false) => RelationKind::Table,
-                    };
-                    workspace.push_structure_tab(
-                        target,
-                        TableRef::new(schema, table),
-                        kind,
-                        window,
-                        cx,
-                    );
-                }
-            }
+            workspace.push_snapshot(snapshot, window, cx);
         }
         // The tab that was active is active again.
         workspace.active_tab = active_tab.min(workspace.tabs.len().saturating_sub(1));
         workspace
+    }
+
+    /// Opens a tab again from what was stored of it.
+    fn push_snapshot(
+        &mut self,
+        snapshot: TabSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match snapshot {
+            TabSnapshot::Query {
+                title,
+                sql,
+                target,
+                file,
+                unsaved,
+                source,
+            } => {
+                let tab = self.push_query_tab(title, &sql, target, window, cx);
+                tab.update(cx, |tab, cx| {
+                    if let Some(file) = file {
+                        tab.set_file(file, unsaved, cx);
+                    }
+                    tab.set_source(source, cx);
+                });
+            }
+            TabSnapshot::Data {
+                target,
+                schema,
+                table,
+                view,
+            } => {
+                let kind = if view {
+                    RelationKind::View
+                } else {
+                    RelationKind::Table
+                };
+                self.push_data_tab(
+                    target,
+                    TableRef::new(schema, table),
+                    kind,
+                    Filter::default(),
+                    window,
+                    cx,
+                );
+            }
+            TabSnapshot::Structure {
+                target,
+                schema,
+                table,
+                view,
+                materialized,
+            } => {
+                let kind = match (view, materialized) {
+                    (_, true) => RelationKind::MaterializedView,
+                    (true, false) => RelationKind::View,
+                    (false, false) => RelationKind::Table,
+                };
+                self.push_structure_tab(target, TableRef::new(schema, table), kind, window, cx);
+            }
+        }
     }
 
     /// Titles of the open tabs, in order.
@@ -612,11 +698,18 @@ impl Workspace {
         }
     }
 
+    /// Removes the tab at `index` without asking: see `close_tabs`.
     fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        // A closed query tab can be opened again, with its text.
+        if let OpenTab::Query(tab) = self.tabs.remove(index) {
+            self.closed.push(tab.read(cx).snapshot(cx));
+            if self.closed.len() > CLOSED_TABS {
+                self.closed.remove(0);
+            }
+        }
         drop(self.tab_subscriptions.remove(index));
         if self.active_tab > index || self.active_tab >= self.tabs.len() {
             self.active_tab = self.active_tab.saturating_sub(1);
@@ -627,6 +720,388 @@ impl Workspace {
         }
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    fn position(&self, tab: &OpenTab) -> Option<usize> {
+        let id = tab.entity_id();
+        self.tabs.iter().position(|open| open.entity_id() == id)
+    }
+
+    /// Closes `tabs`, after one question when any of them would lose
+    /// something; nothing is closed when the question is cancelled.
+    fn close_tabs(&mut self, tabs: Vec<OpenTab>, window: &mut Window, cx: &mut Context<Self>) {
+        let losses: Vec<(String, Loss)> = tabs
+            .iter()
+            .flat_map(|tab| {
+                let title = tab.title(cx).to_string();
+                tab.losses(cx)
+                    .into_iter()
+                    .map(move |loss| (title.clone(), loss))
+            })
+            .collect();
+        let confirm = AppState::get(cx).settings.confirm_close_tab;
+        let Some((title, text, ok)) = tabs::close_question(&losses, confirm) else {
+            self.close_now(&tabs, window, cx);
+            return;
+        };
+        let workspace = cx.entity().downgrade();
+        let (title, text) = (SharedString::from(title), SharedString::from(text));
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (workspace, tabs) = (workspace.clone(), tabs.clone());
+            alert
+                .title(title.clone())
+                .description(text.clone())
+                .confirm()
+                .ok_text(ok)
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok({
+                    let workspace = workspace.clone();
+                    move |_, window, cx| {
+                        // Once the dialog has closed, so the focus goes to
+                        // the tab that is left.
+                        let (workspace, tabs) = (workspace.clone(), tabs.clone());
+                        window.defer(cx, move |window, cx| {
+                            let _ =
+                                workspace.update(cx, |this, cx| this.close_now(&tabs, window, cx));
+                        });
+                        true
+                    }
+                })
+                // Cancelled too, the keyboard goes back to the active tab.
+                .on_close(move |_, window, cx| {
+                    let workspace = workspace.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = workspace.update(cx, |this, cx| this.focus_active(window, cx));
+                    });
+                })
+        });
+    }
+
+    /// Gives the keyboard to the active tab.
+    fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        match self.tabs.get(self.active_tab) {
+            Some(tab) => tab.focus_handle(cx).focus(window, cx),
+            None => self.focus_handle.focus(window, cx),
+        }
+    }
+
+    /// Closes those of `tabs` still open; the active tab stays active when
+    /// it is not one of them.
+    fn close_now(&mut self, tabs: &[OpenTab], window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.tabs.get(self.active_tab).cloned();
+        for tab in tabs {
+            let Some(index) = self.position(tab) else {
+                continue;
+            };
+            if let OpenTab::Query(query) = tab {
+                // Rolled back now, not whenever its session is dropped.
+                query.update(cx, |query, cx| query.end_transaction(false, window, cx));
+            }
+            self.close_tab_at(index, window, cx);
+        }
+        if let Some(index) = active.and_then(|tab| self.position(&tab)) {
+            self.activate_tab(index, window, cx);
+        }
+    }
+
+    /// The entries of a menu, as they stand now.
+    fn menu_entries(&self, of: MenuOf, cx: &App) -> Vec<Entry> {
+        match of {
+            MenuOf::Tab(index) => match self.tabs.get(index) {
+                Some(tab) => tabs::tab_menu(tab.kind(cx), index, self.tabs.len()),
+                None => Vec::new(),
+            },
+            MenuOf::Bar => tabs::bar_menu(self.tabs.len(), self.closed.len()),
+            MenuOf::Status(item) => {
+                let text = self
+                    .status_items(cx)
+                    .into_iter()
+                    .find(|(kind, ..)| *kind == item)
+                    .map(|(_, text, _)| text)
+                    .unwrap_or_default();
+                tabs::status_menu(item, &text, &self.status_facts(cx))
+            }
+        }
+    }
+
+    /// A menu, built when it opens.
+    fn menu(
+        &self,
+        of: MenuOf,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let workspace = cx.entity();
+        move |menu, _, cx| {
+            let entries = workspace.read(cx).menu_entries(of, cx);
+            let workspace = workspace.clone();
+            let index = match of {
+                MenuOf::Tab(index) => Some(index),
+                _ => None,
+            };
+            tabs::fill_menu(
+                menu,
+                entries,
+                Rc::new(move |action, window, cx| {
+                    let workspace = workspace.clone();
+                    // Once the menu has closed. A status bar item keeps the
+                    // focus it took (and may go away): the keyboard goes back
+                    // to the tab before the entry runs, so a dialog it opens
+                    // gives the focus back there.
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            if matches!(of, MenuOf::Status(_)) || window.focused(cx).is_none() {
+                                this.focus_active(window, cx);
+                            }
+                            this.perform(index, action, window, cx);
+                        })
+                    });
+                }),
+            )
+        }
+    }
+
+    /// What the status bar menus depend on.
+    fn status_facts(&self, cx: &App) -> StatusFacts {
+        let tab = self.tabs.get(self.active_tab);
+        let status = tab.map(|tab| tab.status(cx));
+        let query = tab.and_then(OpenTab::query).map(|tab| tab.read(cx));
+        let connection = tab.and_then(|tab| tab.connection(cx));
+        StatusFacts {
+            query: query.is_some(),
+            connected: connection.as_ref().is_some_and(|id| {
+                matches!(
+                    self.connections.read(cx).status(id),
+                    Status::Connected { .. }
+                )
+            }),
+            databases: query
+                .map(|tab| tab.databases().to_vec())
+                .unwrap_or_default(),
+            database: status.as_ref().and_then(|status| status.database.clone()),
+            transaction: status
+                .as_ref()
+                .map_or(TxState::Idle, |status| status.transaction),
+            connection_transaction: connection.as_ref().is_some_and(|id| {
+                self.tabs.iter().filter_map(OpenTab::query).any(|tab| {
+                    let tab = tab.read(cx);
+                    tab.connection_id() == Some(id.as_str()) && tab.tx_state() != TxState::Idle
+                })
+            }),
+            manual_commit: query.is_some_and(|tab| tab.manual_commit()),
+            running: status.is_some_and(|status| status.running),
+        }
+    }
+
+    /// Does what a menu entry (or its command) says, on the tab at `index`
+    /// or the active one.
+    pub fn perform(
+        &mut self,
+        index: Option<usize>,
+        action: TabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = index.unwrap_or(self.active_tab);
+        let tab = self.tabs.get(index).cloned();
+        let query = tab.as_ref().and_then(OpenTab::query).cloned();
+        let file = query
+            .as_ref()
+            .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf));
+        // A command run from the palette where its menu entry would be
+        // disabled says why, and does nothing.
+        let offered = match (&tab, &action) {
+            (
+                Some(tab),
+                TabAction::Rename | TabAction::Duplicate | TabAction::CopyPath | TabAction::Reveal,
+            ) => Some(tabs::tab_menu(tab.kind(cx), index, self.tabs.len())),
+            (_, TabAction::Disconnect | TabAction::Reconnect) => Some(tabs::status_menu(
+                StatusItem::Connection,
+                "",
+                &self.status_facts(cx),
+            )),
+            _ => None,
+        };
+        if let Some(entries) = offered {
+            let reason = entries
+                .into_iter()
+                .find_map(|entry| match entry {
+                    Entry::Item(offered, reason) if offered == action => Some(reason),
+                    _ => None,
+                })
+                .unwrap_or(Some("the tab has no file"));
+            if let Some(reason) = reason {
+                window.push_notification(
+                    Notification::warning(SharedString::from(format!(
+                        "{}: {reason}.",
+                        action.label().trim_end_matches('…')
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        }
+        let connection = tab.as_ref().and_then(|tab| tab.connection(cx));
+        match action {
+            TabAction::Close => self.close_tabs(tab.into_iter().collect(), window, cx),
+            TabAction::CloseOthers => {
+                let others = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, tab)| tab.clone())
+                    .collect();
+                self.close_tabs(others, window, cx)
+            }
+            TabAction::CloseToRight => {
+                let right = self.tabs.iter().skip(index + 1).cloned().collect();
+                self.close_tabs(right, window, cx)
+            }
+            TabAction::CloseAll => self.close_tabs(self.tabs.clone(), window, cx),
+            TabAction::Rename => {
+                if let Some(query) = query {
+                    self.rename_tab(query, window, cx)
+                }
+            }
+            TabAction::Duplicate => {
+                if let Some(query) = query {
+                    let (sql, target) = {
+                        let query = query.read(cx);
+                        (query.sql(cx), query.target().cloned())
+                    };
+                    let title = format!("Query {}", self.next_query_number);
+                    self.open_query(title, &sql, target, window, cx);
+                }
+            }
+            TabAction::CopyPath => {
+                if let Some(file) = file {
+                    cx.write_to_clipboard(ClipboardItem::new_string(file.display().to_string()))
+                }
+            }
+            TabAction::Reveal => {
+                if let Some(file) = file {
+                    cx.reveal_path(&file)
+                }
+            }
+            TabAction::NewQuery => self.new_query_tab(&NewQueryTab, window, cx),
+            TabAction::ReopenClosed => {
+                if let Some(snapshot) = self.closed.pop() {
+                    self.push_snapshot(snapshot, window, cx);
+                    self.activate_tab(self.tabs.len() - 1, window, cx);
+                }
+            }
+            TabAction::Disconnect | TabAction::Reconnect => {
+                if let Some(id) = connection {
+                    let reconnect = action == TabAction::Reconnect;
+                    self.connections.update(cx, |connections, cx| {
+                        connections.disconnect(&id, cx);
+                        if reconnect {
+                            connections.connect(&id, cx);
+                        }
+                    });
+                }
+            }
+            TabAction::EditConnection => {
+                if let Some(id) = connection {
+                    Sidebar::edit(self.connections.clone(), id, window, cx)
+                }
+            }
+            TabAction::UseDatabase(database) => {
+                if let Some(query) = query {
+                    query.update(cx, |query, cx| query.use_database(database, cx));
+                    self.schedule_save(cx);
+                }
+            }
+            TabAction::Commit | TabAction::Rollback => {
+                if let Some(query) = query {
+                    let commit = action == TabAction::Commit;
+                    query.update(cx, |query, cx| query.end_transaction(commit, window, cx));
+                }
+            }
+            TabAction::ManualCommit(manual) => {
+                if let Some(query) = query {
+                    query.update(cx, |query, cx| query.set_manual_commit(manual, cx));
+                }
+            }
+            TabAction::Cancel => self.cancel_query(&CancelQuery, window, cx),
+            TabAction::ReviewChanges => self.apply_changes(&ApplyChanges, window, cx),
+            TabAction::DiscardChanges => self.discard_changes(&DiscardChanges, window, cx),
+            TabAction::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            TabAction::AboutReadOnly => window.open_alert_dialog(cx, |alert, _, _| {
+                alert.title("A read-only connection").description(
+                    "Kerno refuses statements that write before they are sent, and the server                      session is opened read-only. Edit the connection and clear “Read-only” to                      change data from Kerno.",
+                )
+            }),
+            TabAction::AboutMemoryOnly => window.open_alert_dialog(cx, |alert, _, _| {
+                alert.title("Passwords kept in memory only").description(
+                    "No system secret store (macOS Keychain or a Secret Service on Linux) can be                      used, so Kerno writes no password to disk: each password is asked for when                      you connect and forgotten when Kerno quits. Start a Secret Service (GNOME                      Keyring, KWallet) and restart Kerno to save them.",
+                )
+            }),
+            // The editor runs its entries itself.
+            other => tracing::warn!(?other, "not an action of the window"),
+        }
+    }
+
+    /// Asks for a new title for a query tab.
+    fn rename_tab(&mut self, tab: Entity<QueryTab>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = tab.read(cx).title();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        let workspace = cx.entity().downgrade();
+        let submit = {
+            let input = input.clone();
+            Rc::new(move |cx: &mut App| {
+                let name = input.read(cx).value().trim().to_string();
+                if name.is_empty() {
+                    return false;
+                }
+                tab.update(cx, |tab, cx| tab.set_title(name, cx));
+                let _ = workspace.update(cx, |this, cx| {
+                    this.schedule_save(cx);
+                    cx.notify();
+                });
+                true
+            })
+        };
+        let focus = input.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, on_enter, on_click) = (input.clone(), submit.clone(), submit.clone());
+            dialog
+                .title("Rename tab")
+                .w(px(380.))
+                .on_ok(move |_, _, cx| on_enter(cx))
+                .content(move |content, _, _| {
+                    let on_click = on_click.clone();
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .child(Input::new(&input).id("tab-name"))
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("tab-name-cancel")
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        Button::new("tab-name-ok")
+                                            .primary()
+                                            .label("Rename")
+                                            .on_click(move |_, window, cx| {
+                                                if on_click(cx) {
+                                                    window.close_dialog(cx);
+                                                }
+                                            }),
+                                    ),
+                            ),
+                    )
+                })
+        });
+        window.defer(cx, move |window, cx| {
+            focus.read(cx).focus_handle(cx).focus(window, cx)
+        });
     }
 
     /// Writes the open tabs to storage shortly after the last change.
@@ -682,7 +1157,7 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab_at(self.active_tab, window, cx);
+        self.perform(None, TabAction::Close, window, cx);
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -771,6 +1246,23 @@ impl Workspace {
                                                 settings.table_double_click = *choice
                                             });
                                         }
+                                    }),
+                            )
+                            .child(div().pt_2().font_weight(FontWeight::MEDIUM).child("Tabs"))
+                            .child(
+                                Checkbox::new("confirm-close-tab")
+                                    .label(
+                                        "Ask before closing a tab with pending changes, unsaved \
+                                         text or a changed table form (an open transaction \
+                                         always asks)",
+                                    )
+                                    .checked(AppState::get(cx).settings.confirm_close_tab)
+                                    .on_click(|checked, window, cx| {
+                                        let checked = *checked;
+                                        AppState::update_settings(cx, |settings| {
+                                            settings.confirm_close_tab = checked
+                                        });
+                                        window.refresh();
                                     }),
                             ),
                     )
@@ -1870,7 +2362,11 @@ impl Workspace {
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         if self.tabs.is_empty() {
+            // The tab bar's menu, so a closed tab can come back.
             return v_flex()
+                .id("tabs-empty")
+                .test_support()
+                .context_menu(self.menu(MenuOf::Bar, cx))
                 .size_full()
                 .items_center()
                 .justify_center()
@@ -1903,20 +2399,45 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                Tab::new().label(tab.label(cx)).suffix(
-                    Button::new(("close-tab", index))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Close tab")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            // The click must not also reach the tab, which
-                            // would activate the tab being closed.
+                Tab::new()
+                    // A middle click closes the tab, as in a browser.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.close_tab_at(index, window, cx)
-                        })),
-                )
+                            this.perform(Some(index), TabAction::Close, window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(("tab-title", index))
+                            .test_support()
+                            .context_menu(self.menu(MenuOf::Tab(index), cx))
+                            .child(tab.label(cx)),
+                    )
+                    .suffix(
+                        Button::new(("close-tab", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close tab")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // The click must not also reach the tab, which
+                                // would activate the tab being closed.
+                                cx.stop_propagation();
+                                this.perform(Some(index), TabAction::Close, window, cx)
+                            })),
+                    )
             }))
+            .last_empty_space(
+                div()
+                    .id("tab-bar-empty")
+                    .test_support()
+                    .flex_1()
+                    .min_w(px(24.))
+                    .h_full()
+                    .context_menu(self.menu(MenuOf::Bar, cx)),
+            )
             .suffix(
                 Button::new("new-tab")
                     .ghost()
@@ -1939,7 +2460,7 @@ impl Workspace {
     /// What the status bar says, left to right: the active tab's
     /// connection, database, transaction, rows and timing; without a tab,
     /// how many connections are open.
-    fn status_items(&self, cx: &App) -> Vec<(String, Option<gpui_kit::Hsla>)> {
+    fn status_items(&self, cx: &App) -> Vec<(StatusItem, String, Option<Hsla>)> {
         let theme = cx.theme();
         let status = self.tabs.get(self.active_tab).map(|tab| tab.status(cx));
         let Some(TabStatus {
@@ -1955,6 +2476,7 @@ impl Workspace {
         }) = status
         else {
             return vec![(
+                StatusItem::Summary,
                 match self.connections.read(cx).connected_count() {
                     0 => "Not connected".to_string(),
                     1 => "1 connection open".to_string(),
@@ -1963,23 +2485,34 @@ impl Workspace {
                 None,
             )];
         };
-        let mut items = vec![(connection, None)];
-        items.extend(database.map(|database| (database, None)));
+        let mut items = vec![(StatusItem::Connection, connection, None)];
+        items.extend(database.map(|database| (StatusItem::Database, database, None)));
         if read_only {
-            items.push(("read-only".into(), Some(theme.warning)));
+            items.push((
+                StatusItem::ReadOnly,
+                "read-only".into(),
+                Some(theme.warning),
+            ));
         }
         match transaction {
             TxState::Idle => {}
-            TxState::Open => items.push(("transaction open".into(), Some(theme.warning))),
-            TxState::Failed => {
-                items.push(("transaction failed: roll back".into(), Some(theme.danger)))
-            }
+            TxState::Open => items.push((
+                StatusItem::Transaction,
+                "transaction open".into(),
+                Some(theme.warning),
+            )),
+            TxState::Failed => items.push((
+                StatusItem::Transaction,
+                "transaction failed: roll back".into(),
+                Some(theme.danger),
+            )),
         }
         if running {
-            items.push(("running…".into(), None));
+            items.push((StatusItem::Running, "running…".into(), None));
         }
         if pending > 0 {
             items.push((
+                StatusItem::Pending,
                 format!(
                     "{pending} pending change{}",
                     if pending == 1 { "" } else { "s" }
@@ -1989,13 +2522,15 @@ impl Workspace {
         }
         items.extend(rows.map(|rows| {
             (
+                StatusItem::Rows,
                 format!("{rows} row{}", if rows == 1 { "" } else { "s" }),
                 None,
             )
         }));
-        items.extend(elapsed.map(|elapsed| (duration_text(elapsed), None)));
+        items.extend(elapsed.map(|elapsed| (StatusItem::Timing, duration_text(elapsed), None)));
         if notices > 0 {
             items.push((
+                StatusItem::Messages,
                 format!("{notices} message{}", if notices == 1 { "" } else { "s" }),
                 None,
             ));
@@ -2008,12 +2543,44 @@ impl Workspace {
     pub fn status_text(&self, cx: &App) -> Vec<String> {
         self.status_items(cx)
             .into_iter()
-            .map(|(text, _)| text)
+            .map(|(_, text, _)| text)
             .collect()
     }
 
-    fn render_status_bar(&self, cx: &App) -> impl IntoElement {
+    /// An item of the status bar: a click or a right-click opens its
+    /// actions, when it has any.
+    fn render_status_item(
+        &self,
+        item: StatusItem,
+        text: impl Into<SharedString>,
+        color: Hsla,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let text = div().text_color(color).child(text.into());
+        if self.menu_entries(MenuOf::Status(item), cx).is_empty() {
+            return text.into_any_element();
+        }
+        div()
+            .id(item.id())
+            .test_support()
+            .context_menu(self.menu(MenuOf::Status(item), cx))
+            .child(
+                Button::new(SharedString::from(format!("{}-button", item.id())))
+                    .ghost()
+                    .xsmall()
+                    .child(text)
+                    // The bar is at the bottom: the menu opens above it.
+                    .dropdown_menu_with_anchor(
+                        Anchor::BottomLeft,
+                        self.menu(MenuOf::Status(item), cx),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let (muted, warning) = (theme.muted_foreground, theme.warning);
         let memory_only = !AppState::get(cx).secrets.is_persistent();
         h_flex()
             .h(px(24.))
@@ -2028,18 +2595,21 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_3()
-                    .children(self.status_items(cx).into_iter().map(|(text, color)| {
-                        div()
-                            .when_some(color, |this, color| this.text_color(color))
-                            .child(SharedString::from(text))
-                    })),
+                    .children(
+                        self.status_items(cx)
+                            .into_iter()
+                            .map(|(item, text, color)| {
+                                self.render_status_item(item, text, color.unwrap_or(muted), cx)
+                            }),
+                    ),
             )
             .when(memory_only, |this| {
-                this.child(
-                    div()
-                        .text_color(theme.warning)
-                        .child("Passwords are kept in memory only (no system secret store in use)"),
-                )
+                this.child(self.render_status_item(
+                    StatusItem::MemoryOnly,
+                    "Passwords are kept in memory only (no system secret store in use)",
+                    warning,
+                    cx,
+                ))
             })
     }
 }
@@ -2106,6 +2676,53 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::new_query_tab))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
+                this.perform(None, TabAction::CloseOthers, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTabsToTheRight, window, cx| {
+                this.perform(None, TabAction::CloseToRight, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
+                this.perform(None, TabAction::CloseAll, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
+                this.perform(None, TabAction::Rename, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DuplicateTab, window, cx| {
+                this.perform(None, TabAction::Duplicate, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, window, cx| {
+                this.perform(None, TabAction::ReopenClosed, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyTabFilePath, window, cx| {
+                this.perform(None, TabAction::CopyPath, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RevealTabFile, window, cx| {
+                this.perform(None, TabAction::Reveal, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CommitTransaction, window, cx| {
+                this.perform(None, TabAction::Commit, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RollbackTransaction, window, cx| {
+                this.perform(None, TabAction::Rollback, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCommitMode, window, cx| {
+                let manual = this
+                    .active_query_tab()
+                    .is_some_and(|tab| tab.read(cx).manual_commit());
+                this.perform(None, TabAction::ManualCommit(!manual), window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &DisconnectTabConnection, window, cx| {
+                    this.perform(None, TabAction::Disconnect, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ReconnectTabConnection, window, cx| {
+                this.perform(None, TabAction::Reconnect, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &EditTabConnection, window, cx| {
+                this.perform(None, TabAction::EditConnection, window, cx)
+            }))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::toggle_sidebar))

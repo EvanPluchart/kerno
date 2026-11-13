@@ -55,6 +55,9 @@ pub struct Settings {
     pub connection_folders: BTreeSet<String>,
     /// Connection folders shown closed in the sidebar.
     pub collapsed_folders: BTreeSet<String>,
+    /// Ask before closing a tab that holds pending changes, unsaved text or
+    /// a changed table form. An open transaction always asks.
+    pub confirm_close_tab: bool,
 }
 
 impl Default for Settings {
@@ -67,6 +70,7 @@ impl Default for Settings {
             table_double_click: TableDoubleClick::Data,
             connection_folders: BTreeSet::new(),
             collapsed_folders: BTreeSet::new(),
+            confirm_close_tab: true,
         }
     }
 }
@@ -107,6 +111,7 @@ mod tests {
             table_double_click: TableDoubleClick::Structure,
             connection_folders: ["Work".to_string(), "Work/Clients".to_string()].into(),
             collapsed_folders: ["Work/Clients".to_string()].into(),
+            confirm_close_tab: false,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);
@@ -126,5 +131,7 @@ mod tests {
         assert_eq!(loaded.page_size, Settings::default().page_size);
         // Settings stored before the double-click choice existed open data.
         assert_eq!(loaded.table_double_click, TableDoubleClick::Data);
+        // And ask before a tab with pending work is closed.
+        assert!(loaded.confirm_close_tab);
     }
 }

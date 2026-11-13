@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::input;
 use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     CompletionProvider, Editor, EditorState, InputEvent, Position, RopeExt as _,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -45,14 +46,17 @@ use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::grid::{CopyFormat, Grid};
 use super::params;
 use super::{plan_view, viewer};
-use crate::actions::{ShowHistory, ShowSavedQueries};
+use crate::actions::{
+    ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql, ReplaceInEditor, RunAll,
+    RunStatement, SaveFile, SaveFileAs, SaveQuery, ShowHistory, ShowSavedQueries, ToggleComment,
+};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
-use crate::tabs::{TabSnapshot, Target};
+use crate::tabs::{self, EditorFacts, TabAction, TabSnapshot, Target};
 
 /// A statement to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +355,12 @@ impl QueryTab {
         self.title.clone()
     }
 
+    /// Names the tab.
+    pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.title = title.into();
+        cx.notify();
+    }
+
     /// The editor, to observe its changes.
     pub fn editor(&self) -> &Entity<EditorState> {
         &self.editor
@@ -548,7 +558,8 @@ impl QueryTab {
         (columns, rows)
     }
 
-    fn connected(&self, cx: &App) -> bool {
+    /// Whether the tab's connection is open.
+    pub fn connected(&self, cx: &App) -> bool {
         self.target.as_ref().is_some_and(|target| {
             matches!(
                 self.connections.read(cx).status(&target.connection),
@@ -1660,6 +1671,75 @@ impl QueryTab {
         }
     }
 
+    /// Whether statements run in a transaction the user ends.
+    pub fn manual_commit(&self) -> bool {
+        self.manual_commit
+    }
+
+    /// The state of the tab's transaction.
+    pub fn tx_state(&self) -> TxState {
+        self.session
+            .as_ref()
+            .map_or(TxState::Idle, |session| session.tx_state())
+    }
+
+    /// Whether a statement is running.
+    pub fn running(&self) -> bool {
+        matches!(self.activity, Activity::Running { .. })
+    }
+
+    /// The databases the tab can switch to.
+    pub fn databases(&self) -> &[String] {
+        &self.databases
+    }
+
+    /// Runs in `database` of the same connection from now on.
+    pub fn use_database(&mut self, database: String, cx: &mut Context<Self>) {
+        let target = self.target.clone().map(|target| Target {
+            database: Some(database),
+            schema: None,
+            ..target
+        });
+        self.set_target(target, cx)
+    }
+
+    /// What the editor's menu depends on.
+    fn editor_facts(&self, cx: &App) -> EditorFacts {
+        let editor = self.editor.read(cx);
+        EditorFacts {
+            connected: self.connected(cx),
+            running: self.running(),
+            selection: !editor.selected_range().is_empty(),
+            empty: editor.text().len() == 0,
+            saved_file: self.file.is_some() && !self.unsaved,
+            source: self.source.is_some(),
+        }
+    }
+
+    /// The editor's menu, built when it opens. Its entries run as their
+    /// commands do: through the editor, which has the focus.
+    fn editor_menu(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity();
+        move |menu, _, cx| {
+            let entries = tabs::editor_menu(view.read(cx).editor_facts(cx));
+            let view = view.clone();
+            tabs::fill_menu(
+                menu,
+                entries,
+                Rc::new(move |action, window, cx| {
+                    let view = view.clone();
+                    // Once the menu has given the focus back to the editor.
+                    window.defer(cx, move |window, cx| {
+                        run_editor_action(&view, action, window, cx)
+                    });
+                }),
+            )
+        }
+    }
+
     /// Statements run in a transaction the user ends (`true`), or each is
     /// committed as it runs.
     pub fn set_manual_commit(&mut self, manual: bool, cx: &mut Context<Self>) {
@@ -2442,6 +2522,47 @@ impl QueryTab {
     }
 }
 
+/// Runs an entry of the editor's menu as its command does: through the
+/// editor, which has the focus.
+fn run_editor_action(
+    view: &Entity<QueryTab>,
+    action: TabAction,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let focus = view.read(cx).focus_handle(cx);
+    focus.focus(window, cx);
+    let command: Box<dyn gpui_kit::Action> = match action {
+        TabAction::ApplySource => {
+            view.update(cx, |tab, cx| tab.apply_source(window, cx));
+            return;
+        }
+        TabAction::RunStatement => Box::new(RunStatement),
+        TabAction::RunScript => Box::new(RunAll),
+        TabAction::Explain => Box::new(ExplainStatement),
+        TabAction::ExplainAnalyze => Box::new(ExplainAnalyze),
+        TabAction::Format => Box::new(FormatSql),
+        // The editor's own actions, as its built-in menu does.
+        TabAction::Undo => Box::new(input::Undo),
+        TabAction::Redo => Box::new(input::Redo),
+        TabAction::Cut => Box::new(input::Cut),
+        TabAction::Copy => Box::new(input::Copy),
+        TabAction::Paste => Box::new(input::Paste),
+        TabAction::SelectAll => Box::new(input::SelectAll),
+        TabAction::ToggleComment => Box::new(ToggleComment),
+        TabAction::Find => Box::new(FindInEditor),
+        TabAction::Replace => Box::new(ReplaceInEditor),
+        TabAction::Save => Box::new(SaveFile),
+        TabAction::SaveAs => Box::new(SaveFileAs),
+        TabAction::SaveQuery => Box::new(SaveQuery),
+        other => {
+            tracing::warn!(?other, "not an editor action");
+            return;
+        }
+    };
+    focus.dispatch_action(command.as_ref(), window, cx);
+}
+
 impl Focusable for QueryTab {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.read(cx).focus_handle(cx)
@@ -2450,10 +2571,20 @@ impl Focusable for QueryTab {
 
 impl Render for QueryTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = Editor::new(&self.editor)
-            .h_full()
-            .bordered(false)
-            .appearance(false);
+        // The editor's own menu is native and closed to tests: an empty one
+        // keeps its cursor placement, and the drawn menu around it shows.
+        let editor = div()
+            .id("query-editor")
+            .test_support()
+            .size_full()
+            .context_menu(self.editor_menu(cx))
+            .child(
+                Editor::new(&self.editor)
+                    .h_full()
+                    .bordered(false)
+                    .appearance(false)
+                    .context_menu(|menu, _, _| menu),
+            );
         let shows_results = !self.results.is_empty() || self.run.is_some();
         v_flex()
             .id("query-tab")
