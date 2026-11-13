@@ -310,8 +310,18 @@ Found and fixed on the way:
   none (`ui_tests/menus.rs`, `ui_tests/coverage.rs`); two bugs found by them and fixed (a click on a row
   number selects the row; a cancelled import stops instead of replaying its batch). The matching bracket
   is marked (D-041) and the last two status-bar items have a menu. Workspace: 953 tests, twice green.
+- Owner's test of 2026-11-13 (CLAUDE.md §3, ten items; `plans/M10.md` Parts 9 to 11). Wave 1 done
+  (D-042, D-043): the sidebar is one tree (folders and connections as roots, a browse state per
+  connection, states as rows under the connection), colour tags are dots, the default database comes
+  first; connection failures are told in plain words with the raw message below; the connection dialog
+  lists the server's databases; each secret is read from the OS store once per run and the macOS bundle
+  can be signed with a stable identity. Workspace: 976 tests green.
 
 Still open:
+
+- Owner's test, waves 2 and 3: environments and their colour on the chrome (items 6, 7), DBeaver's tools
+  system (item 10: wizards and local clients, then the Tools submenu and saved tasks), folder colour and
+  icon and the app icon of the bare binary (items 3, 4).
 
 - Milestone 5: tab-close confirmations (`plans/M5.md` Part 4), Ctrl+Space and catalog leftovers.
 - Milestone 6: editing comfort (`plans/M6.md` Part 1: lists for enum and boolean cells, paste, Delete,

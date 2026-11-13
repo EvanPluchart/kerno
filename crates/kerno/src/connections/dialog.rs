@@ -2,6 +2,7 @@
 //! a URL, test it, save it.
 
 use gpui_kit::TestSupportExt as _;
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -9,6 +10,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -20,6 +22,7 @@ use gpui_kit::{
 };
 use kerno_core::Error;
 use kerno_core::config::{Engine, Environment, Secrets, TlsMode};
+use kerno_core::error::{Explained, explain};
 use kerno_core::ssh::SshError;
 use kerno_core::storage::SavedConnection;
 
@@ -50,7 +53,7 @@ enum TestState {
     NotRun,
     Running,
     Passed(TestReport),
-    Failed(String),
+    Failed(Explained),
     /// The SSH server is not known yet: the user decides.
     UnknownHost {
         host: String,
@@ -58,6 +61,26 @@ enum TestState {
         algorithm: String,
         fingerprint: String,
     },
+}
+
+/// The server's databases, offered by the Database field.
+enum DatabaseList {
+    /// The fields do not allow a test yet.
+    Unknown,
+    Loading,
+    Listed(Vec<String>),
+    Failed(Explained),
+}
+
+/// How long the fields stay unchanged before the databases are listed.
+const LIST_DELAY: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// The Database field's placeholder: PostgreSQL always opens a database.
+fn database_placeholder(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "the server's default (often postgres)",
+        Engine::MySql | Engine::MariaDb => "Default database (optional)",
+    }
 }
 
 /// The text fields. Everything else lives in [`ConnectionForm`].
@@ -101,6 +124,9 @@ pub struct ConnectionDialog {
     /// An SSH host key the user agreed to trust while testing.
     trusted_fingerprint: Option<String>,
     running_test: Option<Task<()>>,
+    databases: DatabaseList,
+    /// Lists the databases once the fields settle; replaced on each change.
+    listing: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,7 +202,7 @@ impl ConnectionDialog {
         let host = text(&form.host, "localhost");
         let port = text(&form.port, "");
         let user = text(&form.user, "");
-        let database = text(&form.database, "Default database (optional)");
+        let database = text(&form.database, database_placeholder(form.engine));
         let ca_file = text(&form.ca_file, "System trust store when empty");
         let cert_file = text(&form.cert_file, "Client certificate (optional)");
         let key_file = text(&form.key_file, "Client key (optional)");
@@ -220,8 +246,25 @@ impl ConnectionDialog {
             }
         });
         let refilter = cx.observe(&engine_filter, |_, _, cx| cx.notify());
+        // What reaches the server changed: list its databases again. The
+        // password only once its field is left, so a pause in the middle of
+        // typing it never tries a login with half of it.
+        let mut subscriptions = vec![fill_on_enter, refilter];
+        for input in [&host, &port, &user, &password] {
+            let on_blur = input == &password;
+            subscriptions.push(cx.subscribe(input, move |this, _, event, cx| {
+                let settled = match event {
+                    InputEvent::Change => !on_blur,
+                    InputEvent::Blur => on_blur,
+                    _ => false,
+                };
+                if settled {
+                    this.list_databases(cx);
+                }
+            }));
+        }
 
-        Self {
+        let mut this = Self {
             connections,
             editing,
             form,
@@ -255,8 +298,54 @@ impl ConnectionDialog {
             test: TestState::NotRun,
             trusted_fingerprint: None,
             running_test: None,
-            _subscriptions: vec![fill_on_enter, refilter],
-        }
+            databases: DatabaseList::Unknown,
+            listing: None,
+            _subscriptions: subscriptions,
+        };
+        this.list_databases(cx);
+        this
+    }
+
+    /// Lists the server's databases for the Database field, once the fields
+    /// allow a test and have not changed for [`LIST_DELAY`]. Quiet while
+    /// they do not: no field errors while the user is typing.
+    fn list_databases(&mut self, cx: &mut Context<Self>) {
+        let form = ConnectionForm {
+            // Not needed to reach the server.
+            name: "-".into(),
+            ..self.read_form(cx)
+        };
+        let filled = [&form.host, &form.port, &form.user]
+            .iter()
+            .all(|value| !value.trim().is_empty());
+        let built = if filled { form.build().ok() } else { None };
+        let Some((config, secrets)) = built else {
+            self.listing = None;
+            self.databases = DatabaseList::Unknown;
+            cx.notify();
+            return;
+        };
+        let trusted = self.trusted_fingerprint.clone();
+        self.listing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LIST_DELAY).await;
+            let Ok(listing) = this.update(cx, |this, cx| {
+                this.databases = DatabaseList::Loading;
+                cx.notify();
+                this.connections
+                    .read(cx)
+                    .list_databases(config.clone(), secrets, trusted, cx)
+            }) else {
+                return;
+            };
+            let outcome = listing.await;
+            let _ = this.update(cx, |this, cx| {
+                this.databases = match outcome {
+                    Ok(names) => DatabaseList::Listed(names),
+                    Err(error) => DatabaseList::Failed(explain(&error.to_string(), &config)),
+                };
+                cx.notify();
+            });
+        }));
     }
 
     /// The form with what the text fields hold now.
@@ -303,6 +392,10 @@ impl ConnectionDialog {
         set(&i.user, &form.user);
         set(&i.password, &form.password);
         set(&i.database, &form.database);
+        let placeholder = database_placeholder(form.engine);
+        i.database.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
+        });
         if i.options.read(cx).value().as_ref() != form.options {
             let options = form.options.clone();
             i.options
@@ -310,6 +403,7 @@ impl ConnectionDialog {
         }
         self.form = form;
         self.test = TestState::NotRun;
+        self.list_databases(cx);
         cx.notify();
     }
 
@@ -367,6 +461,7 @@ impl ConnectionDialog {
             return;
         };
         self.test = TestState::Running;
+        let tested = config.clone();
         let testing =
             self.connections
                 .read(cx)
@@ -388,9 +483,11 @@ impl ConnectionDialog {
                             algorithm,
                             fingerprint,
                         },
-                        other => TestState::Failed(Error::from(other).to_string()),
+                        other => {
+                            TestState::Failed(explain(&Error::from(other).to_string(), &tested))
+                        }
                     },
-                    Err(error) => TestState::Failed(error.to_string()),
+                    Err(error) => TestState::Failed(explain(&error.to_string(), &tested)),
                 };
                 cx.notify();
             });
@@ -467,6 +564,64 @@ impl ConnectionDialog {
                 }
                 menu
             })
+    }
+
+    /// The server's databases, to fill the Database field (still free text).
+    fn database_picker(&self) -> impl IntoElement {
+        let names = match &self.databases {
+            DatabaseList::Listed(names) => names.clone(),
+            _ => Vec::new(),
+        };
+        let input = self.inputs.database.clone();
+        Button::new("conn-database-list")
+            .outline()
+            .dropdown_caret(true)
+            .disabled(names.is_empty())
+            .tooltip("Pick one of the server's databases")
+            .dropdown_menu(move |mut menu: PopupMenu, _, _| {
+                for name in &names {
+                    let (input, value) = (input.clone(), name.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(SharedString::from(name.clone())).on_click(
+                            move |_, window, cx| {
+                                let value = value.clone();
+                                input.update(cx, |input, cx| input.set_value(value, window, cx));
+                            },
+                        ),
+                    );
+                }
+                menu
+            })
+    }
+
+    /// What the listing of the databases found, under the field.
+    fn render_databases(&self, cx: &App) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        match &self.databases {
+            DatabaseList::Unknown | DatabaseList::Listed(_) => div().into_any_element(),
+            DatabaseList::Loading => div()
+                .id("conn-database-loading")
+                .test_support()
+                .text_xs()
+                .text_color(muted)
+                .child("Listing the server's databases…")
+                .into_any_element(),
+            DatabaseList::Failed(explained) => {
+                let text = format!(
+                    "The databases could not be listed. {} {}",
+                    explained.headline, explained.next_step
+                );
+                let text = SharedString::from(text.trim_end().to_string());
+                div()
+                    .id("conn-database-failed")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(text.clone())
+                    .test_text(text)
+                    .into_any_element()
+            }
+        }
     }
 
     fn field(
@@ -742,12 +897,26 @@ impl ConnectionDialog {
                         .child("Kerno will ask for the password each time it connects."),
                 )
             })
-            .child(self.field(
-                "Database",
-                None,
-                Input::new(&self.inputs.database).id("conn-database"),
-                cx,
-            ))
+            .child(
+                self.field(
+                    "Database",
+                    None,
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div().flex_1().child(
+                                        Input::new(&self.inputs.database).id("conn-database"),
+                                    ),
+                                )
+                                .child(self.database_picker()),
+                        )
+                        .child(self.render_databases(cx)),
+                    cx,
+                ),
+            )
             .child(
                 Switch::new("conn-read-only")
                     .label("Read-only: block writes here and open sessions read-only on the server")
@@ -1000,13 +1169,9 @@ impl ConnectionDialog {
                     report.latency.as_millis().max(1)
                 )))
                 .into_any_element(),
-            TestState::Failed(message) => div()
-                .id("conn-test-failed")
-                .test_support()
-                .text_sm()
-                .text_color(theme.danger)
-                .child(SharedString::from(message.clone()))
-                .into_any_element(),
+            TestState::Failed(explained) => {
+                render_failure("conn-test-failed", explained, cx).into_any_element()
+            }
             TestState::UnknownHost {
                 host,
                 port,
@@ -1155,4 +1320,62 @@ impl Render for ConnectionDialog {
                     ),
             )
     }
+}
+
+/// A connection failure in plain words (CLAUDE.md §3, item 5): what
+/// happened (strong) and what to do next, then the raw message of the
+/// driver or server, muted and selectable. `id` names the block; the raw
+/// text is `{id}-raw`.
+pub(crate) fn render_failure(id: &str, explained: &Explained, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    v_flex()
+        .id(SharedString::from(id.to_string()))
+        .test_support()
+        .gap_1()
+        .text_sm()
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.danger)
+                .child(SharedString::from(explained.headline.clone()))
+                .test_text(explained.headline.clone()),
+        )
+        .when(!explained.next_step.is_empty(), |this| {
+            this.child(
+                div()
+                    .child(SharedString::from(explained.next_step.clone()))
+                    .test_text(explained.next_step.clone()),
+            )
+        })
+        .child(raw_message(&format!("{id}-raw"), &explained.raw, cx))
+}
+
+/// A driver's or server's message, muted and selectable, shown as it came.
+pub(crate) fn raw_message(id: &str, raw: &str, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            TextView::markdown(SharedString::from(id.to_string()), plain_markdown(raw))
+                .selectable(true)
+                .text_xs()
+                .text_color(cx.theme().muted_foreground),
+        )
+}
+
+/// `text` as Markdown that renders as itself: every ASCII punctuation mark
+/// escaped, line breaks kept.
+fn plain_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("  \n"),
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

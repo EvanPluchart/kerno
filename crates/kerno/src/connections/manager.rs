@@ -971,6 +971,36 @@ impl Connections {
             Ok(TestReport { version, latency })
         })
     }
+
+    /// The names of the databases on the server `config` describes, for the
+    /// connection dialog's Database field. The session opens without the
+    /// typed database, which may be the mistyped one. PostgreSQL then opens
+    /// the database named after the user; when there is none, `postgres`,
+    /// as DBeaver does.
+    pub fn list_databases(
+        &self,
+        mut config: ConnectionConfig,
+        secrets: Secrets,
+        trusted_fingerprint: Option<String>,
+        cx: &App,
+    ) -> Task<kerno_core::Result<Vec<String>>> {
+        config.database = None;
+        let postgres = config.engine == Engine::Postgres;
+        let driver = self.drivers.get(config.engine);
+        let host_keys = self.host_keys(trusted_fingerprint, cx);
+        bridge::spawn(cx, async move {
+            let connector = Connector::open(driver?, config, secrets, &host_keys).await?;
+            let session = match connector.session(None).await {
+                Err(Error::Connect(text)) if postgres && text.contains("[3D000]") => {
+                    connector.session(Some("postgres")).await?
+                }
+                other => other?,
+            };
+            let databases = session.databases().await;
+            session.close().await;
+            Ok(databases?.into_iter().map(|info| info.name).collect())
+        })
+    }
 }
 
 /// Closes `meta` and every session in `opened` still open, off the UI thread.

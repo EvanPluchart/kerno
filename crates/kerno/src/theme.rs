@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::{App, ElementId, Hsla, Window, px, rgb};
-use kerno_core::{ConnectionConfig, Environment};
+use kerno_core::ConnectionConfig;
 use serde::{Deserialize, Serialize};
 
 /// The theme file: surface levels, text levels, accent, semantic colours,
@@ -150,24 +150,11 @@ pub fn tag_color(key: &str, cx: &App) -> Option<Hsla> {
         .map(|(_, light, dark_value)| rgb(if dark { *dark_value } else { *light }).into())
 }
 
-/// The colour that marks a connection wherever it is named (its sidebar
-/// row, its tabs, the status bar): its tag, else its environment's.
-pub fn connection_color(config: &ConnectionConfig, cx: &App) -> Hsla {
-    config
-        .color
-        .as_deref()
-        .and_then(|key| tag_color(key, cx))
-        .unwrap_or_else(|| environment_color(config.environment, cx))
-}
-
-/// The colour that marks an environment: quiet for local, amber for
-/// staging, red for production.
-pub fn environment_color(environment: Environment, cx: &App) -> Hsla {
-    match environment {
-        Environment::Local => cx.theme().muted_foreground,
-        Environment::Staging => cx.theme().warning,
-        Environment::Production => cx.theme().danger,
-    }
+/// The colour tag of a connection, drawn as a small dot wherever it is
+/// named (its sidebar row, its tabs, the status bar). `None` when it has no
+/// tag: no marker then, the environment is shown its own way.
+pub fn connection_color(config: &ConnectionConfig, cx: &App) -> Option<Hsla> {
+    config.color.as_deref().and_then(|key| tag_color(key, cx))
 }
 
 #[cfg(test)]

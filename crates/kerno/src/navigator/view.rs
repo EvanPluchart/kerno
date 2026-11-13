@@ -1,31 +1,33 @@
-//! The schema tree of one connection: loads what is opened, filters,
-//! refreshes, and offers each object's actions.
+//! The sidebar's one tree: folders and connections, and under each open
+//! connection its databases and objects. Loads what is opened, filters,
+//! refreshes, and offers each row's actions.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::base::actions::{SelectLeft, SelectRight};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::{TreeEntry, TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
-    div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
+    WeakEntity, Window, div, px,
 };
 use kerno_core::browse::Filter;
-use kerno_core::config::{ObjectFilter, exact_mask};
+use kerno_core::config::{ObjectFilter, exact_mask, parent_folder};
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
@@ -40,23 +42,24 @@ use super::actions::{
 };
 use super::filter_dialog;
 use super::model::{
-    self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Reveal, Tree,
+    self, Children, Group, Item, LINE_DETAIL, LINE_ERROR, LINE_NEXT, LINE_RETRY, LINE_STATUS,
+    Listed, Load, LoadKind, Loaded, Node, NodeKind, Reveal, RowId, Tree,
 };
 use crate::bridge;
-use crate::connections::manager::{Connections, ConnectionsEvent, Status};
+use crate::connections::manager::{Connections, ConnectionsEvent, Status, folder_of};
 use crate::database_dialog;
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, Source};
 use crate::maintenance_dialog::{self, MaintenanceDialog};
+use crate::sidebar::{DraggedConnection, Sidebar, Subject, set_collapsed};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
+use crate::theme;
 
 /// What the rest of the window does for the navigator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigatorEvent {
-    /// Open an empty query tab running on `target`.
-    NewQuery { target: Target },
     /// Open a query tab holding `sql`, running on `target`.
     OpenQuery {
         title: String,
@@ -123,33 +126,54 @@ pub enum NavigatorEvent {
     },
 }
 
-/// The databases of the connection: the root of the tree.
+/// The databases of a connection being browsed: the root of its tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Root {
-    /// No connection is shown.
-    None,
     Loading,
     Loaded,
     Failed(String),
 }
 
-pub struct Navigator {
-    connections: Entity<Connections>,
-    /// The connection whose tree is shown.
-    connection: Option<String>,
+/// What the tree holds of one connection while it is open.
+struct Browse {
     root: Root,
     tree: Tree,
     /// Sessions by database, opened as databases are browsed.
     sessions: HashMap<String, Arc<dyn Session>>,
-    /// Bumped whenever the tree is replaced, so late answers are dropped.
+    /// Given when the browse starts, so late answers to an older one are
+    /// dropped.
+    generation: u64,
+    /// The table to select once the way to it is loaded (see [`Navigator::reveal`]).
+    revealing: Option<Revealing>,
+}
+
+/// The sidebar's one tree (DBeaver's Database Navigator): folders and
+/// saved connections are its roots, and each open connection holds its
+/// databases, schemas and objects. Several connections are browsed at
+/// once; expanding a connection connects it, collapsing it never
+/// disconnects it.
+pub struct Navigator {
+    connections: Entity<Connections>,
+    /// Whose menus the folder and connection rows show.
+    sidebar: WeakEntity<Sidebar>,
+    /// The connections being browsed, by id.
+    browse: HashMap<String, Browse>,
+    /// The connection rows that are open (not kept between runs).
+    expanded: HashSet<String>,
+    /// The connection of the selected row, otherwise the one opened last.
+    current: Option<String>,
+    /// The last generation given to a [`Browse`]; only ever grows.
     generation: u64,
     tree_state: Entity<TreeState>,
     filter: Entity<InputState>,
+    /// The filter's text, lowercase.
+    filter_text: String,
+    /// The folders made and the folders closed (settings) the tree was last
+    /// built with.
+    folders_seen: (BTreeSet<String>, BTreeSet<String>),
     /// Where the active query tab runs, kept up to date by the window: what
     /// "Set as default for this tab" changes.
     tab_target: Rc<RefCell<Option<Target>>>,
-    /// The table to select once the way to it is loaded (see [`Navigator::reveal`]).
-    revealing: Option<Revealing>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -167,64 +191,114 @@ impl EventEmitter<NavigatorEvent> for Navigator {}
 impl Navigator {
     pub fn new(
         connections: Entity<Connections>,
+        sidebar: WeakEntity<Sidebar>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let tree_state = cx.new(|cx| TreeState::new(cx));
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter objects"));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter connections and objects"));
         let subscriptions = vec![
             cx.subscribe(&tree_state, |this, _, event: &TreeEvent, cx| match event {
-                TreeEvent::Expanded(id) => this.expand(id, cx),
-                TreeEvent::Collapsed(id) => this.tree.collapse(id),
+                TreeEvent::Expanded(id) => this.set_open(id, true, cx),
+                TreeEvent::Collapsed(id) => this.set_open(id, false, cx),
+            }),
+            // The kit's own Up and Down move the selection: follow it.
+            cx.observe(&tree_state, |this, state, cx| {
+                let selected = state.read(cx).selected_item().map(|item| item.id.clone());
+                if let Some(connection) = selected.as_deref().and_then(connection_of) {
+                    this.current = Some(connection.to_string());
+                }
+                cx.notify();
             }),
             cx.subscribe(&filter, |this, filter, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    let text = filter.read(cx).value().to_string();
-                    this.tree.set_filter(&text);
+                    this.filter_text = filter.read(cx).value().trim().to_lowercase();
                     this.sync(cx);
                 }
             }),
-            cx.subscribe(&connections, |this, _, event: &ConnectionsEvent, cx| {
-                match event {
-                    ConnectionsEvent::StatusChanged { id }
-                        if this.connection.as_deref() == Some(id.as_str()) =>
+            cx.subscribe(&connections, |this, connections, event, cx| match event {
+                ConnectionsEvent::StatusChanged { id } => this.follow_status(id, cx),
+                ConnectionsEvent::ListChanged => {
+                    // What was deleted goes; names, folders and the object
+                    // filters kept with the connections are shown again.
+                    let saved = connections.read(cx);
+                    this.browse.retain(|id, _| saved.get(id).is_some());
+                    this.expanded.retain(|id| saved.get(id).is_some());
+                    if this
+                        .current
+                        .as_deref()
+                        .is_some_and(|id| saved.get(id).is_none())
                     {
-                        this.follow_status(cx)
+                        this.current = None;
                     }
-                    // The object filters are kept with the connection.
-                    ConnectionsEvent::ListChanged if this.root == Root::Loaded => this.sync(cx),
-                    _ => {}
+                    this.sync(cx);
+                }
+                _ => {}
+            }),
+            // Folders made, and folders open and closed, are settings; the
+            // others (some change at each keystroke) leave the tree alone.
+            cx.observe_global::<AppState>(|this, cx| {
+                let seen = folder_settings(cx);
+                if seen != this.folders_seen {
+                    this.folders_seen = seen;
+                    this.sync(cx);
                 }
             }),
         ];
-        Self {
+        let mut navigator = Self {
             connections,
-            connection: None,
-            root: Root::None,
-            tree: Tree::default(),
-            sessions: HashMap::new(),
+            sidebar,
+            browse: HashMap::new(),
+            expanded: HashSet::new(),
+            current: None,
             generation: 0,
             tree_state,
             filter,
+            filter_text: String::new(),
+            folders_seen: folder_settings(cx),
             tab_target: Rc::default(),
-            revealing: None,
             _subscriptions: subscriptions,
-        }
+        };
+        navigator.sync(cx);
+        navigator
     }
 
-    /// Shows the tree of this connection (none when `None`).
-    pub fn set_connection(&mut self, id: Option<String>, cx: &mut Context<Self>) {
-        if self.connection == id {
-            return;
-        }
-        self.connection = id;
-        self.reset(cx);
-        self.follow_status(cx);
-    }
-
-    /// The connection whose tree is shown.
+    /// The connection of the selected row, otherwise the one opened last.
     pub fn connection(&self) -> Option<&str> {
-        self.connection.as_deref()
+        self.current.as_deref()
+    }
+
+    /// Selects the row of a connection and makes it the current one.
+    pub fn select_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.current = Some(id.to_string());
+        self.select_id(&model::connection_row(id), cx);
+        cx.notify();
+    }
+
+    /// What expanding a connection, a double click and Enter on it do:
+    /// opens its row and connects it when it is closed (DBeaver's
+    /// default), then browses it. Disconnecting is the menu's.
+    pub fn open_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.expanded.insert(id.to_string());
+        self.current = Some(id.to_string());
+        match self.connections.read(cx).status(id) {
+            Status::Disconnected | Status::Failed { .. } => self
+                .connections
+                .update(cx, |connections, cx| connections.connect(id, cx)),
+            Status::Connected { .. } if !self.browse.contains_key(id) => {
+                self.load_databases(id, cx)
+            }
+            _ => {}
+        }
+        self.sync(cx);
+    }
+
+    /// Closes every open connection row (what the empty area's "Collapse
+    /// all" does with the folders); nothing is disconnected.
+    pub fn collapse_connections(&mut self, cx: &mut Context<Self>) {
+        self.expanded.clear();
+        self.sync(cx);
     }
 
     /// Puts the keyboard in the filter field, its text selected.
@@ -246,96 +320,141 @@ impl Navigator {
         self.tab_target.clone()
     }
 
-    /// The session that lists the connection's databases, when it is open.
-    fn meta(&self, cx: &App) -> Option<Arc<dyn Session>> {
-        let connection = self.connection.as_deref()?;
+    /// The session that lists the databases of `connection`, when it is open.
+    fn meta(&self, connection: &str, cx: &App) -> Option<Arc<dyn Session>> {
         self.connections.read(cx).meta_session(connection)
     }
 
     /// Whether databases hold schemas (PostgreSQL) or tables (MySQL).
-    fn has_schemas(&self, cx: &App) -> bool {
-        self.meta(cx)
+    fn has_schemas(&self, connection: &str, cx: &App) -> bool {
+        self.meta(connection, cx)
             .is_some_and(|meta| meta.dialect().has_schemas())
+    }
+
+    /// The tree of `connection`, when it is browsed.
+    fn tree(&self, connection: &str) -> Option<&Tree> {
+        self.browse.get(connection).map(|browse| &browse.tree)
+    }
+
+    /// The browse of `connection` the answer to a load started at
+    /// `generation` belongs to, when it is still the one shown.
+    fn live(&mut self, connection: &str, generation: u64) -> Option<&mut Browse> {
+        self.browse
+            .get_mut(connection)
+            .filter(|browse| browse.generation == generation)
+    }
+
+    /// The connection and node of an object's row.
+    fn object(&self, id: &str) -> Option<(String, Node)> {
+        let RowId::Object { connection, local } = model::parse_row(id)? else {
+            return None;
+        };
+        let node = self.tree(connection)?.node(local)?.clone();
+        Some((connection.to_string(), node))
     }
 
     /// Where a tab opened from `node` runs: its database, and its schema
     /// when `in_schema`.
-    fn target_of(&self, node: &Node, in_schema: bool) -> Option<Target> {
-        Some(Target {
-            connection: self.connection.clone()?,
+    fn target_of(connection: &str, node: &Node, in_schema: bool) -> Target {
+        Target {
+            connection: connection.to_string(),
             database: Some(node.database.clone()),
             // Without schemas the database is the schema.
             schema: node
                 .schema
                 .clone()
                 .filter(|schema| in_schema && *schema != node.database),
-        })
+        }
     }
 
-    fn reset(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
-        self.root = Root::None;
-        self.tree = Tree::default();
-        self.sessions.clear();
-        self.revealing = None;
+    /// Browses an open connection once it is connected, opens it, and
+    /// forgets its tree when it closes.
+    fn follow_status(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.connections.read(cx).status(id) {
+            Status::Connected { .. } if !self.browse.contains_key(id) => {
+                self.expanded.insert(id.to_string());
+                self.current = Some(id.to_string());
+                self.load_databases(id, cx);
+                self.sync(cx);
+                self.select_id(&model::connection_row(id), cx);
+                return;
+            }
+            // Closed by the user: the row closes too.
+            Status::Disconnected => {
+                self.browse.remove(id);
+                self.expanded.remove(id);
+            }
+            // The row stays open, so what went wrong shows under it.
+            Status::Failed { .. } => {
+                self.browse.remove(id);
+            }
+            _ => {}
+        }
         self.sync(cx);
     }
 
-    /// Loads the tree once the connection is open; empties it when it closes.
-    fn follow_status(&mut self, cx: &mut Context<Self>) {
-        let connected = self.connection.as_deref().is_some_and(|id| {
-            matches!(
-                self.connections.read(cx).status(id),
-                Status::Connected { .. }
-            )
-        });
-        match (connected, &self.root) {
-            (true, Root::None) => self.load_databases(cx),
-            (false, Root::None) => {}
-            (false, _) => self.reset(cx),
-            (true, _) => {}
+    /// Fetches the list of databases of `connection` again, from scratch.
+    pub fn reload(&mut self, connection: &str, cx: &mut Context<Self>) {
+        if self.browse.contains_key(connection) {
+            self.load_databases(connection, cx);
+            self.sync(cx);
         }
-        cx.notify();
     }
 
-    /// Fetches the list of databases again, from scratch.
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.reset(cx);
-        self.follow_status(cx);
+    /// Fetches the databases of every connection being browsed again.
+    pub fn reload_all(&mut self, cx: &mut Context<Self>) {
+        let browsed: Vec<String> = self.browse.keys().cloned().collect();
+        for connection in browsed {
+            self.reload(&connection, cx);
+        }
     }
 
-    fn load_databases(&mut self, cx: &mut Context<Self>) {
-        let Some(meta) = self
-            .connection
-            .as_deref()
-            .and_then(|id| self.connections.read(cx).meta_session(id))
-        else {
+    /// Starts browsing `connection` anew: lists its databases and opens
+    /// its default one.
+    fn load_databases(&mut self, connection: &str, cx: &mut Context<Self>) {
+        let Some(meta) = self.meta(connection, cx) else {
             return;
         };
-        self.root = Root::Loading;
-        self.tree = Tree::new(meta.dialect().has_schemas());
+        self.generation += 1;
         let generation = self.generation;
         let current = meta.database();
+        let mut sessions = HashMap::new();
         // The connection's own session answers for its own database.
         if let Some(database) = &current {
-            self.sessions.insert(database.clone(), meta.clone());
+            sessions.insert(database.clone(), meta.clone());
         }
+        let revealing = self
+            .browse
+            .remove(connection)
+            .and_then(|browse| browse.revealing);
+        self.browse.insert(
+            connection.to_string(),
+            Browse {
+                root: Root::Loading,
+                tree: Tree::new(meta.dialect().has_schemas()),
+                sessions,
+                generation,
+                revealing,
+            },
+        );
         let listing = bridge::spawn(cx, async move { meta.databases().await });
+        let connection = connection.to_string();
         cx.spawn(async move |this, cx| {
             let outcome = listing.await;
             let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+                let Some(browse) = this.live(&connection, generation) else {
                     return;
-                }
+                };
                 match outcome {
                     Ok(databases) => {
-                        this.root = Root::Loaded;
-                        if let Some(load) = this.tree.set_databases(databases, current.as_deref()) {
-                            this.run(load, cx);
+                        browse.root = Root::Loaded;
+                        if let Some(load) = browse.tree.set_databases(databases, current.as_deref())
+                        {
+                            this.run(&connection, load, cx);
                         }
-                        this.advance_reveal(cx);
+                        this.advance_reveal(&connection, cx);
                     }
-                    Err(error) => this.root = Root::Failed(error.to_string()),
+                    Err(error) => browse.root = Root::Failed(error.to_string()),
                 }
                 this.sync(cx);
             });
@@ -343,13 +462,37 @@ impl Navigator {
         .detach();
     }
 
-    fn expand(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(load) = self.tree.expand(id) {
-            self.run(load, cx);
+    fn expand(&mut self, connection: &str, id: &str, cx: &mut Context<Self>) {
+        if let Some(load) = self
+            .browse
+            .get_mut(connection)
+            .and_then(|browse| browse.tree.expand(id))
+        {
+            self.run(connection, load, cx);
         }
     }
 
-    /// Closes every open node.
+    /// Opens or closes the row `id`, whatever it is: a folder (remembered),
+    /// a connection (opening it connects it), or an object.
+    fn set_open(&mut self, id: &str, open: bool, cx: &mut Context<Self>) {
+        match model::parse_row(id) {
+            Some(RowId::Folder(path)) => set_collapsed(path, !open, cx),
+            Some(RowId::Connection(connection)) if open => self.open_connection(connection, cx),
+            Some(RowId::Connection(connection)) => {
+                self.expanded.remove(connection);
+            }
+            Some(RowId::Object { connection, local }) if open => self.expand(connection, local, cx),
+            Some(RowId::Object { connection, local }) => {
+                if let Some(browse) = self.browse.get_mut(connection) {
+                    browse.tree.collapse(local);
+                }
+            }
+            Some(RowId::FolderNote(_)) | None => {}
+        }
+        self.sync(cx);
+    }
+
+    /// Closes every open object; folders and connections stay as they are.
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
         fn open(items: &[Item], ids: &mut Vec<String>) {
             for item in items {
@@ -359,21 +502,30 @@ impl Navigator {
                 open(&item.children, ids);
             }
         }
-        let mut ids = Vec::new();
-        open(&self.tree.items(), &mut ids);
-        for id in ids {
-            self.tree.collapse(&id);
+        for browse in self.browse.values_mut() {
+            let mut ids = Vec::new();
+            open(&browse.tree.items(), &mut ids);
+            for id in ids {
+                browse.tree.collapse(&id);
+            }
         }
         self.sync(cx);
     }
 
-    /// Reloads the node (or the nearest one above it that the server
-    /// answers for).
-    pub fn refresh(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(target) = self.tree.refresh_target(id)
-            && let Some(load) = self.tree.refresh(&target)
+    /// Reloads the node `id` of `connection` (or the nearest one above it
+    /// that the server answers for).
+    fn refresh(&mut self, connection: &str, id: &str, cx: &mut Context<Self>) {
+        let Some(tree) = self
+            .browse
+            .get_mut(connection)
+            .map(|browse| &mut browse.tree)
+        else {
+            return;
+        };
+        if let Some(target) = tree.refresh_target(id)
+            && let Some(load) = tree.refresh(&target)
         {
-            self.run(load, cx);
+            self.run(connection, load, cx);
             self.sync(cx);
         }
     }
@@ -387,9 +539,9 @@ impl Navigator {
         schema: &str,
         cx: &mut Context<Self>,
     ) {
-        if self.connection.as_deref() != Some(connection) {
+        let Some(tree) = self.tree(connection) else {
             return;
-        }
+        };
         fn ids(items: &[model::Item], out: &mut Vec<String>) {
             for item in items {
                 out.push(item.id.clone());
@@ -399,11 +551,11 @@ impl Navigator {
         // ponytail: walks the rows shown, so a folder hidden by the filter
         // is not refreshed; look nodes up in the model if that matters.
         let mut all = Vec::new();
-        ids(&self.tree.items(), &mut all);
+        ids(&tree.items(), &mut all);
         let folders: Vec<String> = all
             .into_iter()
             .filter(|id| {
-                self.tree.node(id).is_some_and(|node| {
+                tree.node(id).is_some_and(|node| {
                     node.kind == NodeKind::Group(Group::Tables)
                         && node.schema.as_deref() == Some(schema)
                         && database.is_none_or(|database| node.database == database)
@@ -411,64 +563,69 @@ impl Navigator {
             })
             .collect();
         for folder in folders {
-            self.refresh(&folder, cx);
+            self.refresh(connection, &folder, cx);
         }
     }
 
     /// Reads `database` of `connection` again, when the tree shows it: what
     /// a restore changed.
     pub fn refresh_database(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
-        if self.connection.as_deref() != Some(connection) {
+        let Some(tree) = self.tree(connection) else {
             return;
-        }
-        let id = self.tree.items().into_iter().find_map(|item| {
-            let node = self.tree.node(&item.id)?;
+        };
+        let id = tree.items().into_iter().find_map(|item| {
+            let node = tree.node(&item.id)?;
             (node.kind == NodeKind::Object(ObjectRef::Database(database.to_string())))
                 .then(|| item.id.clone())
         });
         if let Some(id) = id {
-            self.refresh(&id, cx);
+            self.refresh(connection, &id, cx);
         }
     }
 
-    /// The session that answers for `database`, opened if it is not yet.
+    /// The session of `connection` that answers for `database`, opened if
+    /// it is not yet.
     fn session_for(
         &mut self,
+        connection: &str,
         database: &str,
         cx: &mut Context<Self>,
     ) -> Task<kerno_core::Result<Arc<dyn Session>>> {
         let closed = || kerno_core::Error::Closed("the connection is not open".into());
-        let Some(connection) = self.connection.clone() else {
+        let Some(browse) = self.browse.get(connection) else {
             return Task::ready(Err(closed()));
         };
-        if let Some(session) = self.sessions.get(database) {
+        if let Some(session) = browse.sessions.get(database) {
             return Task::ready(Ok(session.clone()));
         }
+        let generation = browse.generation;
         let connections = self.connections.read(cx);
-        match connections.meta_session(&connection) {
+        match connections.meta_session(connection) {
             None => return Task::ready(Err(closed())),
             // Without schemas, any session sees every database.
             Some(meta) if !meta.dialect().has_schemas() => return Task::ready(Ok(meta)),
             Some(_) => {}
         }
-        let opening = connections.open_session(&connection, Some(database.to_string()), cx);
-        let generation = self.generation;
-        let database = database.to_string();
+        let opening = connections.open_session(connection, Some(database.to_string()), cx);
+        let (connection, database) = (connection.to_string(), database.to_string());
         cx.spawn(async move |this, cx| {
             let session = opening.await?;
             let _ = this.update(cx, |this, _| {
-                if this.generation == generation {
-                    this.sessions.insert(database, session.clone());
+                if let Some(browse) = this.live(&connection, generation) {
+                    browse.sessions.insert(database, session.clone());
                 }
             });
             Ok(session)
         })
     }
 
-    /// Runs a load on the session of its database.
-    fn run(&mut self, load: Load, cx: &mut Context<Self>) {
-        let generation = self.generation;
-        let session = self.session_for(&load.database, cx);
+    /// Runs a load of `connection` on the session of its database.
+    fn run(&mut self, connection: &str, load: Load, cx: &mut Context<Self>) {
+        let Some(generation) = self.browse.get(connection).map(|browse| browse.generation) else {
+            return;
+        };
+        let session = self.session_for(connection, &load.database, cx);
+        let connection = connection.to_string();
         cx.spawn(async move |this, cx| {
             let outcome = match session.await {
                 Err(error) => Err(error),
@@ -494,12 +651,12 @@ impl Navigator {
                 }
             };
             let _ = this.update(cx, |this, cx| {
-                if this.generation == generation {
-                    this.tree.finish(
+                if let Some(browse) = this.live(&connection, generation) {
+                    browse.tree.finish(
                         &load.id,
                         outcome.map_err(|error: kerno_core::Error| error.to_string()),
                     );
-                    this.advance_reveal(cx);
+                    this.advance_reveal(&connection, cx);
                     this.sync(cx);
                 }
             });
@@ -508,9 +665,10 @@ impl Navigator {
     }
 
     /// Selects a table or view in the tree, opening and loading the way to
-    /// it (DBeaver's "Link with editor", `core.navigator.linkeditor`). The
-    /// tree shows `target`'s connection first; nothing is selected when the
-    /// table is not there.
+    /// it (DBeaver's "Link with editor", `core.navigator.linkeditor`): the
+    /// folders and the row of `target`'s connection open first. A
+    /// connection that is not open is only selected, never connected;
+    /// nothing is selected when the table is not there.
     pub fn reveal(
         &mut self,
         target: &Target,
@@ -518,49 +676,70 @@ impl Navigator {
         kind: RelationKind,
         cx: &mut Context<Self>,
     ) {
-        if self.connection.as_deref() != Some(target.connection.as_str()) {
-            self.set_connection(Some(target.connection.clone()), cx);
+        let connection = target.connection.clone();
+        let folder = self
+            .connections
+            .read(cx)
+            .get(&connection)
+            .and_then(|saved| folder_of(&saved.config));
+        let mut above = folder.as_deref();
+        while let Some(folder) = above {
+            if AppState::get(cx)
+                .settings
+                .collapsed_folders
+                .contains(folder)
+            {
+                set_collapsed(folder, false, cx);
+            }
+            above = parent_folder(folder);
         }
-        self.revealing = Some(Revealing {
+        self.current = Some(connection.clone());
+        let Some(browse) = self.browse.get_mut(&connection) else {
+            self.sync(cx);
+            self.select_id(&model::connection_row(&connection), cx);
+            return;
+        };
+        browse.revealing = Some(Revealing {
             database: target.database.clone(),
             table: table.clone(),
             kind,
         });
-        self.advance_reveal(cx);
+        self.expanded.insert(connection.clone());
+        self.advance_reveal(&connection, cx);
     }
 
     /// Takes the reveal one load further; called again as loads finish.
-    fn advance_reveal(&mut self, cx: &mut Context<Self>) {
-        // The databases come first.
-        if self.root != Root::Loaded {
-            return;
-        }
-        let Some(revealing) = self.revealing.clone() else {
+    fn advance_reveal(&mut self, connection: &str, cx: &mut Context<Self>) {
+        let default = self.meta(connection, cx).and_then(|meta| meta.database());
+        let Some(browse) = self.browse.get_mut(connection) else {
             return;
         };
-        let database = revealing
-            .database
-            .or_else(|| self.meta(cx).and_then(|meta| meta.database()))
-            .unwrap_or_default();
-        let path = self
+        // The databases come first.
+        if browse.root != Root::Loaded {
+            return;
+        }
+        let Some(revealing) = browse.revealing.clone() else {
+            return;
+        };
+        let database = revealing.database.or(default).unwrap_or_default();
+        let path = browse
             .tree
             .relation_path(&database, &revealing.table, revealing.kind);
-        match self.tree.reveal(&path) {
-            Reveal::Waiting(Some(load)) => self.run(load, cx),
+        match browse.tree.reveal(&path) {
+            Reveal::Waiting(Some(load)) => self.run(connection, load, cx),
             Reveal::Waiting(None) => {}
             Reveal::Found => {
-                self.revealing = None;
+                browse.revealing = None;
                 self.sync(cx);
-                let id = SharedString::from(path.last().cloned().unwrap_or_default());
-                let shown = self.tree_state.update(cx, |state, cx| {
-                    let index = state.index_of(&id)?;
-                    state.set_selected_index(Some(index), cx);
-                    state.scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
-                    Some(())
-                });
+                let local = path.last().cloned().unwrap_or_default();
+                let shown = self.select_id(&model::object_row(connection, &local), cx);
                 // Loaded but hidden by an object filter: say so, and leave
                 // the filter as the user set it.
-                if shown.is_none() && self.tree.node(&id).is_some() {
+                if !shown
+                    && self
+                        .tree(connection)
+                        .is_some_and(|tree| tree.node(&local).is_some())
+                {
                     cx.emit(NavigatorEvent::Warn(format!(
                         "{} is hidden by an object filter of the schema tree: turn the \
                          filter off (Filter ▸ Turn on or off) to see it there.",
@@ -569,17 +748,35 @@ impl Navigator {
                 }
                 return;
             }
-            Reveal::Missing => self.revealing = None,
+            Reveal::Missing => browse.revealing = None,
         }
         self.sync(cx);
     }
 
-    /// The table or view a node is in or under (itself for a table), with
-    /// its node id.
-    fn relation_above(&self, id: &str) -> Option<(TableRef, RelationKind, String)> {
+    /// Selects the row `id` and scrolls to it; whether it is shown.
+    fn select_id(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let id = SharedString::from(id.to_string());
+        self.tree_state
+            .update(cx, |state, cx| {
+                let index = state.index_of(&id)?;
+                state.set_selected_index(Some(index), cx);
+                state.scroll_to_item(index, gpui_kit::ScrollStrategy::Center);
+                Some(())
+            })
+            .is_some()
+    }
+
+    /// The table or view a node of `connection` is in or under (itself for
+    /// a table), with its node id.
+    fn relation_above(
+        &self,
+        connection: &str,
+        id: &str,
+    ) -> Option<(TableRef, RelationKind, String)> {
+        let tree = self.tree(connection)?;
         let mut id = id;
         loop {
-            if let NodeKind::Object(ObjectRef::Relation(table, kind)) = &self.tree.node(id)?.kind {
+            if let NodeKind::Object(ObjectRef::Relation(table, kind)) = &tree.node(id)?.kind {
                 return Some((table.clone(), *kind, id.to_string()));
             }
             id = model::parent_of(id)?;
@@ -596,18 +793,19 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(node) = self.tree.node(id).cloned() else {
+        let Some((connection, node)) = self.object(id) else {
             return;
         };
+        let connection = connection.as_str();
         match action {
-            Action::Refresh => self.refresh(id, cx),
+            Action::Refresh => self.refresh(connection, &node.id, cx),
             Action::Properties
                 if matches!(
                     node.kind,
                     NodeKind::Object(ObjectRef::Database(_) | ObjectRef::Schema(_))
                 ) =>
             {
-                self.show_properties(&node, window, cx)
+                self.show_properties(connection, &node, window, cx)
             }
             Action::OpenData | Action::OpenStructure | Action::Properties => {
                 // A column opens its table; a foreign key the table at its
@@ -620,12 +818,12 @@ impl Navigator {
                         Some((other.clone(), RelationKind::Table))
                     }
                     NodeKind::Column { .. } => self
-                        .relation_above(&node.id)
+                        .relation_above(connection, &node.id)
                         .map(|(table, kind, _)| (table, kind)),
                     _ => None,
                 };
-                if let (Some((table, kind)), Some(target)) = (opened, self.target_of(&node, false))
-                {
+                if let Some((table, kind)) = opened {
+                    let target = Self::target_of(connection, &node, false);
                     cx.emit(match action {
                         Action::OpenData => NavigatorEvent::OpenData {
                             target,
@@ -647,22 +845,22 @@ impl Navigator {
             }
             Action::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(name_of(&node))),
             Action::CopyQualifiedName => {
-                if let (NodeKind::Object(object), Some(meta)) = (&node.kind, self.meta(cx)) {
+                if let (NodeKind::Object(object), Some(meta)) =
+                    (&node.kind, self.meta(connection, cx))
+                {
                     let name = qualified_name(object, meta.dialect());
                     cx.write_to_clipboard(ClipboardItem::new_string(name));
                 }
             }
             Action::SetDefault => {
-                if self.unavailable(action, &node, cx).is_none()
-                    && let Some(target) = self.target_of(&node, true)
-                {
+                if self.unavailable(connection, action, &node, cx).is_none() {
+                    let target = Self::target_of(connection, &node, true);
                     cx.emit(NavigatorEvent::SetDefault { target });
                 }
             }
             Action::Export => {
-                if let (NodeKind::Object(ObjectRef::Relation(table, _)), Some(target)) =
-                    (&node.kind, self.target_of(&node, false))
-                {
+                if let NodeKind::Object(ObjectRef::Relation(table, _)) = &node.kind {
+                    let target = Self::target_of(connection, &node, false);
                     let source = Source::Table {
                         table: table.clone(),
                         filter: Filter::default(),
@@ -672,10 +870,10 @@ impl Navigator {
                 }
             }
             Action::ImportCsv => {
-                if self.unavailable(action, &node, cx).is_none()
-                    && let (Some(target), Some(schema)) =
-                        (self.target_of(&node, false), node.schema.clone())
+                if self.unavailable(connection, action, &node, cx).is_none()
+                    && let Some(schema) = node.schema.clone()
                 {
+                    let target = Self::target_of(connection, &node, false);
                     let table = match &node.kind {
                         NodeKind::Object(ObjectRef::Relation(table, _)) => Some(table.clone()),
                         _ => None,
@@ -688,9 +886,8 @@ impl Navigator {
                 }
             }
             Action::Backup | Action::Restore => {
-                if self.unavailable(action, &node, cx).is_none()
-                    && let Some(target) = self.target_of(&node, false)
-                {
+                if self.unavailable(connection, action, &node, cx).is_none() {
+                    let target = Self::target_of(connection, &node, false);
                     let tables = match &node.kind {
                         NodeKind::Object(ObjectRef::Relation(table, _)) => vec![table.clone()],
                         _ => Vec::new(),
@@ -703,17 +900,16 @@ impl Navigator {
                 }
             }
             Action::CreateTable => {
-                if self.unavailable(action, &node, cx).is_none()
-                    && let (Some(target), Some(schema)) =
-                        (self.target_of(&node, false), node.schema.clone())
+                if self.unavailable(connection, action, &node, cx).is_none()
+                    && let Some(schema) = node.schema.clone()
                 {
+                    let target = Self::target_of(connection, &node, false);
                     cx.emit(NavigatorEvent::CreateTable { target, schema });
                 }
             }
             Action::RevealTable => {
-                if let (NodeKind::ForeignKey { other, .. }, Some(target)) =
-                    (&node.kind, self.target_of(&node, false))
-                {
+                if let NodeKind::ForeignKey { other, .. } = &node.kind {
+                    let target = Self::target_of(connection, &node, false);
                     self.reveal(&target, other, RelationKind::Table, cx);
                 }
             }
@@ -722,10 +918,10 @@ impl Navigator {
                     (NodeKind::Column { name, .. }, Action::EditColumn) => Some(name.clone()),
                     _ => None,
                 };
-                if self.unavailable(action, &node, cx).is_none()
-                    && let (Some((table, _, _)), Some(target)) =
-                        (self.relation_above(&node.id), self.target_of(&node, false))
+                if self.unavailable(connection, action, &node, cx).is_none()
+                    && let Some((table, _, _)) = self.relation_above(connection, &node.id)
                 {
+                    let target = Self::target_of(connection, &node, false);
                     cx.emit(NavigatorEvent::EditTable {
                         target,
                         table,
@@ -740,8 +936,8 @@ impl Navigator {
             | Action::CreateSequence
             | Action::CreateTrigger
             | Action::CreateEvent => {
-                if self.unavailable(action, &node, cx).is_none() {
-                    self.open_template(action, &node, window, cx)
+                if self.unavailable(connection, action, &node, cx).is_none() {
+                    self.open_template(connection, action, &node, window, cx)
                 }
             }
             Action::Truncate => {
@@ -755,19 +951,27 @@ impl Navigator {
             Action::Tools => {
                 self.open_tools(id, None, window, cx);
             }
-            Action::Generate(template) => self.generate(template, &node, false, window, cx),
-            Action::ReadInConsole => self.generate(Template::Select, &node, true, window, cx),
-            Action::GenerateCall | Action::ExecuteRoutine => {
-                self.call(&node, action == Action::ExecuteRoutine, window, cx)
+            Action::Generate(template) => {
+                self.generate(connection, template, &node, false, window, cx)
             }
-            Action::ShowDdl => self.show_ddl(&node, window, cx),
+            Action::ReadInConsole => {
+                self.generate(connection, Template::Select, &node, true, window, cx)
+            }
+            Action::GenerateCall | Action::ExecuteRoutine => self.call(
+                connection,
+                &node,
+                action == Action::ExecuteRoutine,
+                window,
+                cx,
+            ),
+            Action::ShowDdl => self.show_ddl(connection, &node, window, cx),
             Action::EditSource => {
-                if self.unavailable(action, &node, cx).is_none() {
-                    self.edit_source(&node, window, cx)
+                if self.unavailable(connection, action, &node, cx).is_none() {
+                    self.edit_source(connection, &node, window, cx)
                 }
             }
-            Action::CreateDatabase if self.offers_database_options(cx) => {
-                self.create_database_form(&node.id, window, cx);
+            Action::CreateDatabase if self.offers_database_options(connection, cx) => {
+                self.create_database_form(id, window, cx);
             }
             Action::Rename
             | Action::Drop
@@ -779,7 +983,7 @@ impl Navigator {
             | Action::RenameEnumValue
             | Action::DropCascade
             | Action::RenameColumn
-            | Action::DropColumn => self.confirm(action, &node, window, cx),
+            | Action::DropColumn => self.confirm(connection, action, &node, window, cx),
         }
     }
 
@@ -792,9 +996,8 @@ impl Navigator {
         }
     }
 
-    /// The connection's filter of the objects of kind `key`.
-    fn object_filter(&self, key: &str, cx: &App) -> Option<ObjectFilter> {
-        let connection = self.connection.as_deref()?;
+    /// The filter of `connection` on the objects of kind `key`.
+    fn object_filter(&self, connection: &str, key: &str, cx: &App) -> Option<ObjectFilter> {
         let saved = self.connections.read(cx).get(connection)?;
         saved.config.navigator_filters.get(key).cloned()
     }
@@ -802,11 +1005,14 @@ impl Navigator {
     /// Why a Filter ▸ entry cannot be used on `node`, when it cannot.
     pub fn filter_unavailable(
         &self,
+        connection: &str,
         action: FilterAction,
         node: &Node,
         cx: &App,
     ) -> Option<&'static str> {
-        let missing = self.object_filter(&Self::filter_kind(node), cx).is_none();
+        let missing = self
+            .object_filter(connection, &Self::filter_kind(node), cx)
+            .is_none();
         (matches!(action, FilterAction::Toggle | FilterAction::Clear) && missing)
             .then_some("no filter")
     }
@@ -819,16 +1025,18 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(node) = self.tree.node(id).cloned() else {
+        let Some((connection, node)) = self.object(id) else {
             return;
         };
         if !filter_actions(&node).contains(&action)
-            || self.filter_unavailable(action, &node, cx).is_some()
+            || self
+                .filter_unavailable(&connection, action, &node, cx)
+                .is_some()
         {
             return;
         }
         let key = Self::filter_kind(&node);
-        let current = self.object_filter(&key, cx);
+        let current = self.object_filter(&connection, &key, cx);
         let filter = match action {
             FilterAction::Hide | FilterAction::ShowOnly => {
                 let Some(name) = model::filter_name(&node) else {
@@ -860,28 +1068,28 @@ impl Navigator {
                     window,
                     cx,
                     move |filter, _, cx| {
-                        view.update(cx, |this, cx| this.set_object_filter(&key, filter, cx))
+                        view.update(cx, |this, cx| {
+                            this.set_object_filter(&connection, &key, filter, cx)
+                        })
                     },
                 );
                 return;
             }
         };
-        self.set_object_filter(&key, filter, cx);
+        self.set_object_filter(&connection, &key, filter, cx);
     }
 
     /// Saves the filter of a kind of object with the connection, and shows
     /// the tree through it.
     fn set_object_filter(
         &mut self,
+        connection: &str,
         key: &str,
         filter: Option<ObjectFilter>,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection) = self.connection.clone() else {
-            return;
-        };
         self.connections.update(cx, |connections, cx| {
-            connections.set_navigator_filter(&connection, key, filter, cx)
+            connections.set_navigator_filter(connection, key, filter, cx)
         });
         self.sync(cx);
     }
@@ -893,16 +1101,20 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(node) = self.selected_node(window, cx) {
-            self.perform_filter(action, &node.id, window, cx);
+        if let Some((connection, node)) = self.selected_node(window, cx) {
+            self.perform_filter(
+                action,
+                &model::object_row(&connection, &node.id),
+                window,
+                cx,
+            );
         }
     }
 
     /// What a row shows after its name: the node's hint, and on a filtered
     /// folder how many objects its filter hides.
-    fn row_hint(&self, node: &Node) -> Option<String> {
-        let hidden = self
-            .tree
+    fn row_hint(tree: &Tree, node: &Node) -> Option<String> {
+        let hidden = tree
             .hidden_below(Some(&node.id))
             .map(|hidden| match hidden {
                 0 => "filtered".to_string(),
@@ -914,16 +1126,18 @@ impl Navigator {
         }
     }
 
-    /// The hint of the row of a node; for tests.
+    /// The hint of the row of a node of the current connection, by its id
+    /// in that connection's tree; for tests.
     #[cfg(test)]
     pub fn hint_of(&self, id: &str) -> Option<String> {
-        self.tree.node(id).and_then(|node| self.row_hint(node))
+        let tree = self.tree(self.current.as_deref()?)?;
+        tree.node(id).and_then(|node| Self::row_hint(tree, node))
     }
 
     /// Whether the engine creates databases with options (see
     /// [`database_dialog`]).
-    fn offers_database_options(&self, cx: &App) -> bool {
-        self.meta(cx)
+    fn offers_database_options(&self, connection: &str, cx: &App) -> bool {
+        self.meta(connection, cx)
             .is_some_and(|meta| meta.dialect().database_options_sql().is_some())
     }
 
@@ -935,11 +1149,13 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<database_dialog::CreateDatabaseForm>> {
-        let node = self.tree.node(id)?;
-        if self.unavailable(Action::CreateDatabase, node, cx).is_some() {
+        let (connection, node) = self.object(id)?;
+        if self
+            .unavailable(&connection, Action::CreateDatabase, &node, cx)
+            .is_some()
+        {
             return None;
         }
-        let connection = self.connection.clone()?;
         let connections = self.connections.read(cx);
         let (saved, meta) = (
             connections.get(&connection)?,
@@ -948,7 +1164,7 @@ impl Navigator {
         let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
         let view = cx.entity();
         let form = database_dialog::open(meta, window, cx, move |sql, window, cx| {
-            let view = view.clone();
+            let (view, connection) = (view.clone(), connection.clone());
             sql_confirm::open(
                 Confirmation {
                     title: "Create database".into(),
@@ -963,6 +1179,7 @@ impl Navigator {
                 cx,
                 move |sql, window, cx| {
                     let plan = Plan {
+                        connection: connection.clone(),
                         database: None,
                         release: None,
                         after: After::Reload,
@@ -975,9 +1192,15 @@ impl Navigator {
         Some(form)
     }
 
-    /// Why a menu entry cannot be used on this node, when it cannot.
-    pub fn unavailable(&self, action: Action, node: &Node, cx: &App) -> Option<&'static str> {
-        let connection = self.connection.as_deref()?;
+    /// Why a menu entry cannot be used on this node of `connection`, when
+    /// it cannot.
+    pub fn unavailable(
+        &self,
+        connection: &str,
+        action: Action,
+        node: &Node,
+        cx: &App,
+    ) -> Option<&'static str> {
         let connections = self.connections.read(cx);
         let saved = connections.get(connection)?;
         let meta = connections.meta_session(connection)?;
@@ -1010,7 +1233,7 @@ impl Navigator {
                 Action::AddColumn | Action::EditColumn | Action::RenameColumn | Action::DropColumn,
                 _,
             ) if !self
-                .relation_above(&node.id)
+                .relation_above(connection, &node.id)
                 .is_some_and(|(_, kind, _)| kind.is_table()) =>
             {
                 Some("a view's columns come from its query")
@@ -1048,8 +1271,8 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<MaintenanceDialog>> {
-        let node = self.tree.node(id)?.clone();
-        let (connection, meta) = (self.connection.clone()?, self.meta(cx)?);
+        let (connection, node) = self.object(id)?;
+        let meta = self.meta(&connection, cx)?;
         let warn = |text: String, window: &mut Window, cx: &mut Context<Self>| {
             window.push_notification(Notification::warning(SharedString::from(text)), cx);
         };
@@ -1058,17 +1281,17 @@ impl Navigator {
             warn(NO_TOOLS.into(), window, cx);
             return None;
         };
-        if let Some(reason) = self.unavailable(Action::Tools, &node, cx) {
+        if let Some(reason) = self.unavailable(&connection, Action::Tools, &node, cx) {
             warn(format!("Maintenance tools: {reason}."), window, cx);
             return None;
         }
         // A database is the root of the tree: nothing above it to read again.
-        let above = model::parent_of(id)
+        let above = model::parent_of(&node.id)
             .filter(|_| !matches!(object, ObjectRef::Database(_)))
             .map(str::to_string);
         let navigator = cx.entity().downgrade();
         let opening = maintenance_dialog::Opening {
-            connection,
+            connection: connection.clone(),
             database: node.database.clone(),
             object: object.clone(),
             kind: kind_name(object),
@@ -1083,7 +1306,7 @@ impl Navigator {
             cx,
             move |_, cx| {
                 if let Some(above) = &above {
-                    let _ = navigator.update(cx, |this, cx| this.refresh(above, cx));
+                    let _ = navigator.update(cx, |this, cx| this.refresh(&connection, above, cx));
                 }
             },
         ))
@@ -1091,14 +1314,15 @@ impl Navigator {
 
     /// What "Maintenance Tools…" does: the tools of the selected node.
     pub fn tools_on_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(node) = self.selected_node(window, cx) {
-            self.open_tools(&node.id, None, window, cx);
+        if let Some((connection, node)) = self.selected_node(window, cx) {
+            self.open_tools(&model::object_row(&connection, &node.id), None, window, cx);
         }
     }
 
     /// Opens a query tab with a statement to complete: nothing runs.
     fn open_template(
         &mut self,
+        connection: &str,
         action: Action,
         node: &Node,
         window: &mut Window,
@@ -1112,10 +1336,16 @@ impl Navigator {
         else {
             return;
         };
-        let target = self.target_of(node, action == Action::NewQueryHere);
+        let target = Some(Self::target_of(
+            connection,
+            node,
+            action == Action::NewQueryHere,
+        ));
         // A trigger or column made from a table's folder is on that table.
-        let table = self.relation_above(&node.id).map(|(table, _, _)| table);
-        let session = self.session_for(&node.database, cx);
+        let table = self
+            .relation_above(connection, &node.id)
+            .map(|(table, _, _)| table);
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let outcome = session.await;
             let _ = this.update_in(cx, |_, window, cx| match outcome {
@@ -1151,6 +1381,7 @@ impl Navigator {
     /// when `run` says so.
     fn generate(
         &mut self,
+        connection: &str,
         template: Template,
         node: &Node,
         run: bool,
@@ -1161,9 +1392,9 @@ impl Navigator {
             return;
         };
         let table = table.clone();
-        let target = self.target_of(node, false);
+        let target = Some(Self::target_of(connection, node, false));
         let page_size = AppState::get(cx).settings.page_size;
-        let session = self.session_for(&node.database, cx);
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let written = match session.await {
                 Err(error) => Err(error),
@@ -1220,7 +1451,14 @@ impl Navigator {
     /// Writes the call of a routine into a new query tab, which runs it
     /// (asking for its parameters) when `run` says so. The arguments are
     /// read from the server, as the tree lists them.
-    fn call(&mut self, node: &Node, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn call(
+        &mut self,
+        connection: &str,
+        node: &Node,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let NodeKind::Object(ObjectRef::Routine {
             schema,
             name,
@@ -1232,8 +1470,8 @@ impl Navigator {
         };
         let (schema, name, kind) = (schema.clone(), name.clone(), *kind);
         let identity = identity_arguments.clone();
-        let target = self.target_of(node, false);
-        let session = self.session_for(&node.database, cx);
+        let target = Some(Self::target_of(connection, node, false));
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let written = match session.await {
                 Err(error) => Err(error),
@@ -1291,13 +1529,19 @@ impl Navigator {
 
     /// Shows what the catalogs say of a database or a schema: owner,
     /// encoding, collation, size, comment (DBeaver's object editor, F4).
-    fn show_properties(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_properties(
+        &mut self,
+        connection: &str,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let NodeKind::Object(object) = &node.kind else {
             return;
         };
         let object = object.clone();
         let title = format!("{} · properties", node.label);
-        let session = self.session_for(&node.database, cx);
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |_, cx| {
             let read = match session.await {
                 Err(error) => Err(error),
@@ -1341,13 +1585,19 @@ impl Navigator {
     }
 
     /// Opens the `CREATE` statement of an object in a query tab.
-    fn show_ddl(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_ddl(
+        &mut self,
+        connection: &str,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let NodeKind::Object(object) = &node.kind else {
             return;
         };
         let (object, name) = (object.clone(), node.label.clone());
-        let target = self.target_of(node, false);
-        let session = self.session_for(&node.database, cx);
+        let target = Some(Self::target_of(connection, node, false));
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let ddl = match session.await {
                 Err(error) => Err(error),
@@ -1379,13 +1629,19 @@ impl Navigator {
 
     /// Opens the script that replaces a view or routine by its edited
     /// definition, in a query tab in source mode. Nothing runs.
-    fn edit_source(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+    fn edit_source(
+        &mut self,
+        connection: &str,
+        node: &Node,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (NodeKind::Object(object), Some(schema)) = (&node.kind, node.schema.clone()) else {
             return;
         };
         let (object, name) = (object.clone(), node.label.clone());
-        let target = self.target_of(node, false);
-        let session = self.session_for(&node.database, cx);
+        let target = Some(Self::target_of(connection, node, false));
+        let session = self.session_for(connection, &node.database, cx);
         cx.spawn_in(window, async move |this, cx| {
             let script = match session.await {
                 Err(error) => Err(error),
@@ -1429,22 +1685,20 @@ impl Navigator {
     /// runs it once confirmed.
     fn confirm(
         &mut self,
+        connection: &str,
         action: Action,
         node: &Node,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection) = self.connection.clone() else {
-            return;
-        };
         let connections = self.connections.read(cx);
         let (Some(saved), Some(meta)) = (
-            connections.get(&connection),
-            connections.meta_session(&connection),
+            connections.get(connection),
+            connections.meta_session(connection),
         ) else {
             return;
         };
-        if self.unavailable(action, node, cx).is_some() {
+        if self.unavailable(connection, action, node, cx).is_some() {
             return;
         }
         let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
@@ -1467,7 +1721,7 @@ impl Navigator {
         // database is dropped from outside it.
         let on_root = matches!(object, Some(ObjectRef::Database(_)));
         // The table a column belongs to, read again once it changed.
-        let relation = self.relation_above(&node.id);
+        let relation = self.relation_above(connection, &node.id);
         let (title, explanation, statement, button, destructive, after, done) = match action {
             Action::Drop | Action::DropCascade => {
                 let sql = match (&node.kind, &object) {
@@ -1763,6 +2017,7 @@ impl Navigator {
             _ => None,
         };
         let plan = Plan {
+            connection: connection.to_string(),
             database,
             release,
             after,
@@ -1791,25 +2046,26 @@ impl Navigator {
     /// Runs a confirmed statement and shows what came of it.
     fn execute(&mut self, sql: String, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
         let Plan {
+            connection,
             database,
             release,
             after,
             done,
         } = plan;
-        let Some(connection) = self.connection.clone() else {
+        let Some(browse) = self.browse.get_mut(&connection) else {
             return;
         };
         if let Some(released) = release {
-            self.sessions.remove(&released);
+            browse.sessions.remove(&released);
         }
+        let generation = browse.generation;
         let session = match &database {
-            Some(database) => self.session_for(database, cx),
+            Some(database) => self.session_for(&connection, database, cx),
             None => match self.connections.read(cx).meta_session(&connection) {
                 Some(meta) => Task::ready(Ok(meta)),
                 None => return,
             },
         };
-        let generation = self.generation;
         cx.spawn_in(window, async move |this, cx| {
             let outcome = match session.await {
                 Err(error) => Err(error),
@@ -1823,12 +2079,12 @@ impl Navigator {
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(()) => {
                     window.push_notification(Notification::success(SharedString::from(done)), cx);
-                    if this.generation != generation {
+                    if this.live(&connection, generation).is_none() {
                         return;
                     }
                     match after {
-                        After::Reload => this.reload(cx),
-                        After::Refresh(Some(id)) => this.refresh(&id, cx),
+                        After::Reload => this.reload(&connection, cx),
+                        After::Refresh(Some(id)) => this.refresh(&connection, &id, cx),
                         After::Refresh(None) => {}
                     }
                 }
@@ -1841,21 +2097,43 @@ impl Navigator {
         .detach();
     }
 
-    /// Shows the model in the tree widget, keeping the selection.
+    /// Shows the folders, the connections and what each open one holds in
+    /// the tree widget, keeping the selection.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        fn convert(item: &Item) -> TreeItem {
-            TreeItem::new(item.id.clone(), item.label.clone())
-                .expanded(item.expanded)
-                .children(item.children.iter().map(convert))
+        let connections = self.connections.read(cx);
+        let filter = self.filter_text.as_str();
+        // Each tree through its connection's object filters and the
+        // filter, unless the connection's name matches it: then all of it.
+        for saved in connections.saved() {
+            if let Some(browse) = self.browse.get_mut(&saved.id) {
+                browse
+                    .tree
+                    .set_object_filters(saved.config.navigator_filters.clone());
+                let matched =
+                    !filter.is_empty() && saved.config.name.to_lowercase().contains(filter);
+                browse.tree.set_filter(if matched { "" } else { filter });
+            }
         }
-        let filters = self
-            .connection
-            .as_deref()
-            .and_then(|id| self.connections.read(cx).get(id))
-            .map(|saved| saved.config.navigator_filters.clone())
-            .unwrap_or_default();
-        self.tree.set_object_filters(filters);
-        let items: Vec<TreeItem> = self.tree.items().iter().map(convert).collect();
+        let saved: Vec<Listed> = connections
+            .saved()
+            .iter()
+            .map(|saved| {
+                (
+                    saved.id.clone(),
+                    saved.config.name.clone(),
+                    folder_of(&saved.config),
+                )
+            })
+            .collect();
+        let items = model::sidebar_items(
+            &connections.folders(cx),
+            &saved,
+            &AppState::get(cx).settings.collapsed_folders,
+            &self.expanded,
+            filter,
+            |id| self.subtree(id, connections),
+        );
+        let items: Vec<TreeItem> = items.into_iter().map(tree_item).collect();
         self.tree_state.update(cx, |state, cx| {
             let selected = state.selected_item().map(|item| item.id.clone());
             state.set_items(items, cx);
@@ -1865,14 +2143,69 @@ impl Navigator {
         cx.notify();
     }
 
+    /// What a connection shows under it, ids local to it: its databases
+    /// once listed, otherwise what is happening or what went wrong.
+    fn subtree(&self, connection: &str, connections: &Connections) -> Vec<Item> {
+        let line = |id: &str, label: &str| Item {
+            id: id.to_string(),
+            label: label.to_string(),
+            expanded: false,
+            children: Vec::new(),
+        };
+        match (&connections.status(connection), self.browse.get(connection)) {
+            (Status::Connected { .. }, Some(browse)) => match &browse.root {
+                Root::Loading => vec![line(LINE_STATUS, "Loading databases…")],
+                Root::Failed(message) => vec![
+                    line(LINE_ERROR, "The databases could not be listed."),
+                    line(LINE_DETAIL, message),
+                    line(LINE_RETRY, "Try again"),
+                ],
+                Root::Loaded => {
+                    let items = browse.tree.items();
+                    if items.is_empty() {
+                        vec![line(LINE_STATUS, "No databases")]
+                    } else {
+                        items
+                    }
+                }
+            },
+            (Status::Connected { .. }, None) => vec![line(LINE_STATUS, "Connected")],
+            (Status::Connecting, _) => vec![line(LINE_STATUS, "Connecting…")],
+            (Status::WaitingForInput, _) => vec![line(LINE_STATUS, "Waiting for your answer…")],
+            // In plain words first, then the server's own (CLAUDE.md §3 item 5).
+            (Status::Failed { message }, _) => {
+                let Some(saved) = connections.get(connection) else {
+                    return vec![line(LINE_DETAIL, message)];
+                };
+                let explained = kerno_core::error::explain(message, &saved.config);
+                let mut lines = vec![line(LINE_ERROR, &explained.headline)];
+                if !explained.next_step.is_empty() {
+                    lines.push(line(LINE_NEXT, &explained.next_step));
+                }
+                lines.push(line(LINE_DETAIL, &explained.raw));
+                lines.push(line(LINE_RETRY, "Try again"));
+                lines
+            }
+            (Status::Disconnected, _) => vec![line(LINE_STATUS, "Not connected")],
+        }
+    }
+
     // Clicks and keys --------------------------------------------------------
 
     fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let connection = self
+            .tree_state
+            .read(cx)
+            .entry(index)
+            .and_then(|entry| connection_of(&entry.item().id).map(str::to_string));
+        if connection.is_some() {
+            self.current = connection;
+        }
         self.tree_state
             .update(cx, |state, cx| state.set_selected_index(Some(index), cx));
     }
 
-    /// Opens the row's node, or closes it.
+    /// Opens the row, or closes it.
     fn toggle_row(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some((id, open)) = self
             .tree_state
@@ -1883,16 +2216,13 @@ impl Navigator {
         else {
             return;
         };
-        if open {
-            self.tree.collapse(&id);
-        } else {
-            self.expand(&id, cx);
-        }
-        self.sync(cx);
+        self.set_open(&id, !open, cx);
     }
 
-    /// What a double click or Enter does: opens the row's object (see
-    /// [`default_action`]), or opens or closes the row.
+    /// What a double click or Enter does: on an object, opens it (see
+    /// [`default_action`]) or opens or closes the row; on a connection,
+    /// opens and connects it (never closes or disconnects it); on a folder,
+    /// opens or closes it.
     fn open_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .tree_state
@@ -1902,13 +2232,19 @@ impl Navigator {
         else {
             return;
         };
-        let Some(node) = self.tree.node(&id).cloned() else {
-            return;
-        };
-        let table = AppState::get(cx).settings.table_double_click;
-        match default_action(&node, self.has_schemas(cx), table) {
-            Some(action) => self.run_entry(action, &node, window, cx),
-            None => self.toggle_row(index, cx),
+        match model::parse_row(&id) {
+            Some(RowId::Connection(connection)) => self.open_connection(connection, cx),
+            Some(RowId::Object { .. }) => {
+                let Some((connection, node)) = self.object(&id) else {
+                    return;
+                };
+                let table = AppState::get(cx).settings.table_double_click;
+                match default_action(&node, self.has_schemas(&connection, cx), table) {
+                    Some(action) => self.run_entry(&connection, action, &node, window, cx),
+                    None => self.toggle_row(index, cx),
+                }
+            }
+            _ => self.toggle_row(index, cx),
         }
     }
 
@@ -1920,61 +2256,75 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(node) = self.selected_node(window, cx) {
-            self.run_entry(action, &node, window, cx);
+        if let Some((connection, node)) = self.selected_node(window, cx) {
+            self.run_entry(&connection, action, &node, window, cx);
         }
     }
 
     /// What F4 does: opens the selected node's editor (see [`edit_action`]).
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(node) = self.selected_node(window, cx)
-            && let Some(action) = edit_action(&node, self.has_schemas(cx))
+        if let Some((connection, node)) = self.selected_node(window, cx)
+            && let Some(action) = edit_action(&node, self.has_schemas(&connection, cx))
         {
-            self.run_entry(action, &node, window, cx);
+            self.run_entry(&connection, action, &node, window, cx);
         }
     }
 
-    /// The node of the selected row; says so when there is none.
-    fn selected_node(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Node> {
-        let state = self.tree_state.read(cx);
-        let node = state
-            .selected_index()
-            .and_then(|index| state.entry(index))
-            .and_then(|entry| self.tree.node(&entry.item().id))
-            .cloned();
-        if node.is_none() {
+    /// The folder or connection of the selected row, when it is one (or a
+    /// line under one): what the sidebar's menus act on.
+    pub fn selected_subject(&self, cx: &App) -> Option<Subject> {
+        let id = self.tree_state.read(cx).selected_item()?.id.clone();
+        match model::parse_row(&id)? {
+            RowId::Folder(path) | RowId::FolderNote(path) => Some(Subject::Folder(path.into())),
+            RowId::Connection(connection) => Some(Subject::Connection(connection.into())),
+            RowId::Object { connection, local } if local.starts_with("line:") => {
+                Some(Subject::Connection(connection.into()))
+            }
+            RowId::Object { .. } => None,
+        }
+    }
+
+    /// The connection and node of the selected row; says so when there is
+    /// none.
+    fn selected_node(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<(String, Node)> {
+        let selected = self
+            .tree_state
+            .read(cx)
+            .selected_item()
+            .and_then(|item| self.object(&item.id));
+        if selected.is_none() {
             window.push_notification(
                 Notification::warning("Select an object in the schema tree first."),
                 cx,
             );
         }
-        node
+        selected
     }
 
     /// Runs a menu entry of `node` from a key or a double click: only one
     /// the node's menu holds, and one that cannot be used now says why.
     fn run_entry(
         &mut self,
+        connection: &str,
         action: Action,
         node: &Node,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !actions(node, self.has_schemas(cx))
+        if !actions(node, self.has_schemas(connection, cx))
             .concat()
             .contains(&action)
         {
             return;
         }
-        let reason = self.unavailable(action, node, cx);
+        let id = model::object_row(connection, &node.id);
+        let reason = self.unavailable(connection, action, node, cx);
         match (action, reason) {
             // A source that cannot be edited here (read-only connection)
             // is shown as DDL.
-            (Action::EditSource, Some(_)) => self.perform(Action::ShowDdl, &node.id, window, cx),
+            (Action::EditSource, Some(_)) => self.perform(Action::ShowDdl, &id, window, cx),
             // A view's column has no form: its structure is shown.
-            (Action::EditColumn, Some(_)) => {
-                self.perform(Action::OpenStructure, &node.id, window, cx)
-            }
+            (Action::EditColumn, Some(_)) => self.perform(Action::OpenStructure, &id, window, cx),
             (_, Some(reason)) => window.push_notification(
                 Notification::warning(SharedString::from(format!(
                     "{}: {reason}.",
@@ -1982,7 +2332,17 @@ impl Navigator {
                 ))),
                 cx,
             ),
-            (_, None) => self.perform(action, &node.id, window, cx),
+            (_, None) => self.perform(action, &id, window, cx),
+        }
+    }
+
+    /// What "Try again" under a connection does: connects it again, or
+    /// lists its databases again.
+    fn retry(&mut self, connection: &str, cx: &mut Context<Self>) {
+        if self.browse.contains_key(connection) {
+            self.reload(connection, cx);
+        } else {
+            self.open_connection(connection, cx);
         }
     }
 
@@ -2030,23 +2390,65 @@ impl Navigator {
         }
     }
 
+    /// Scrolls the row of a connection into view; for tests.
+    #[cfg(test)]
+    pub fn scroll_to_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let id = SharedString::from(model::connection_row(id));
+        self.tree_state.update(cx, |state, _| {
+            if let Some(index) = state.index_of(&id) {
+                state.scroll_to_item(index, gpui_kit::ScrollStrategy::Top);
+            }
+        });
+    }
+
     /// The selected row; for tests.
     #[cfg(test)]
     pub fn selected_row(&self, cx: &App) -> Option<usize> {
         self.tree_state.read(cx).selected_index()
     }
 
-    /// The rows now shown, indented by depth; for tests.
+    /// The rows under the row of `connection` (absolute index, depth below
+    /// it, label), without the lines that say what the connection is
+    /// doing; for tests.
     #[cfg(test)]
-    pub fn outline(&self, cx: &App) -> Vec<String> {
+    fn rows_under(&self, connection: &str, cx: &App) -> Vec<(usize, usize, SharedString)> {
         let state = self.tree_state.read(cx);
-        (0..)
-            .map_while(|index| state.entry(index))
-            .map(|entry| format!("{}{}", "  ".repeat(entry.depth()), entry.item().label))
+        let Some(start) = state.index_of(&model::connection_row(connection).into()) else {
+            return Vec::new();
+        };
+        let base = state.entry(start).map_or(0, |entry| entry.depth());
+        (start + 1..)
+            .map_while(|index| state.entry(index).map(|entry| (index, entry)))
+            .take_while(|(_, entry)| entry.depth() > base)
+            .filter(|(_, entry)| {
+                !matches!(
+                    model::parse_row(&entry.item().id),
+                    Some(RowId::Object { local, .. }) if local.starts_with("line:")
+                )
+            })
+            .map(|(index, entry)| (index, entry.depth() - base - 1, entry.item().label.clone()))
             .collect()
     }
 
-    /// The id of the node on a row; for tests.
+    /// The rows now shown under `connection`, indented by depth; for tests.
+    #[cfg(test)]
+    pub fn outline_of(&self, connection: &str, cx: &App) -> Vec<String> {
+        self.rows_under(connection, cx)
+            .into_iter()
+            .map(|(_, depth, label)| format!("{}{label}", "  ".repeat(depth)))
+            .collect()
+    }
+
+    /// The rows now shown under the current connection; for tests.
+    #[cfg(test)]
+    pub fn outline(&self, cx: &App) -> Vec<String> {
+        self.current
+            .as_deref()
+            .map(|connection| self.outline_of(connection, cx))
+            .unwrap_or_default()
+    }
+
+    /// The id of the row at `row`; for tests.
     #[cfg(test)]
     pub fn id_at(&self, row: usize, cx: &App) -> String {
         self.tree_state
@@ -2058,7 +2460,7 @@ impl Navigator {
             .to_string()
     }
 
-    /// Whether the node of a row is open; for tests.
+    /// Whether a row is open; for tests.
     #[cfg(test)]
     pub fn is_open(&self, row: usize, cx: &App) -> bool {
         self.tree_state
@@ -2070,34 +2472,37 @@ impl Navigator {
     /// Why an action cannot be used on the node of a row; for tests.
     #[cfg(test)]
     pub fn why_not(&self, action: Action, row: usize, cx: &App) -> Option<&'static str> {
-        let node = self.tree.node(&self.id_at(row, cx))?;
-        self.unavailable(action, node, cx)
+        let (connection, node) = self.object(&self.id_at(row, cx))?;
+        self.unavailable(&connection, action, &node, cx)
     }
 
     /// The maintenance tools of the node on a row, by label; for tests.
     #[cfg(test)]
     pub fn tools_at(&self, row: usize, cx: &App) -> Vec<&'static str> {
-        match (self.tree.node(&self.id_at(row, cx)), self.meta(cx)) {
-            (Some(node), Some(meta)) => tools(node, meta.dialect())
+        let Some((connection, node)) = self.object(&self.id_at(row, cx)) else {
+            return Vec::new();
+        };
+        match self.meta(&connection, cx) {
+            Some(meta) => tools(&node, meta.dialect())
                 .iter()
                 .map(maintenance_dialog::label)
                 .collect(),
-            _ => Vec::new(),
+            None => Vec::new(),
         }
     }
 
-    /// The row of the node with this id; for tests.
+    /// The row reached by these labels from the current connection's
+    /// first level down; for tests.
     #[cfg(test)]
     pub fn row_of(&self, label_path: &[&str], cx: &App) -> Option<usize> {
-        let state = self.tree_state.read(cx);
+        let rows = self.rows_under(self.current.as_deref()?, cx);
         let mut depth = 0;
         let mut found = None;
-        for index in 0.. {
-            let entry = state.entry(index)?;
-            if entry.depth() < depth {
+        for (index, row_depth, label) in rows {
+            if row_depth < depth {
                 return None;
             }
-            if entry.depth() == depth && entry.item().label.as_ref() == label_path[depth] {
+            if row_depth == depth && label.as_ref() == label_path[depth] {
                 found = Some(index);
                 depth += 1;
                 if depth == label_path.len() {
@@ -2117,141 +2522,364 @@ impl Navigator {
         entry: &TreeEntry,
         cx: &App,
     ) -> ListItem {
-        let theme = cx.theme();
-        let id = entry.item().id.as_ref();
-        let indent = px(14.) * entry.depth() + px(8.);
-        // An id of its own: the tree gives the bare index to the row around it.
-        let base = ListItem::new(("node", index))
-            .w_full()
-            .py_0p5()
-            .pr_2()
-            .pl(indent)
-            .text_sm();
-        let Some(node) = self.tree.node(id) else {
-            // A line of text under a node: loading, empty, or an error. The
-            // tree's own click selects it; there is nothing to open.
-            let failed = model::parent_of(id)
-                .and_then(|parent| self.tree.node(parent))
-                .is_some_and(|parent| matches!(parent.children, Children::Failed(_)));
-            return base.child(
-                div()
-                    .pl(px(20.))
-                    .text_xs()
-                    .text_color(if failed {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(entry.item().label.clone()),
-            );
+        // Every row has the height of the first: the list is virtualized.
+        let row = |id: ElementId| {
+            ListItem::new(id)
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .py_0()
+                .pr_2()
+                .pl(px(14.) * entry.depth() + px(8.))
+                .text_sm()
         };
-        let chevron = if !entry.is_folder() {
-            div().flex_none().size_3().into_any_element()
-        } else {
-            let view = view.clone();
-            div()
-                .id(("node-chevron", index))
-                .test_support()
-                .flex_none()
-                .child(
-                    Icon::new(if entry.is_expanded() {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size_3()
-                    .text_color(theme.muted_foreground),
+        let id = entry.item().id.clone();
+        match model::parse_row(&id) {
+            Some(RowId::Folder(path)) => {
+                let index_in = self
+                    .connections
+                    .read(cx)
+                    .folders(cx)
+                    .iter()
+                    .position(|folder| folder == path)
+                    .unwrap_or_default();
+                self.render_folder(
+                    view,
+                    row(("conn-folder", index_in).into()),
+                    index,
+                    entry,
+                    path,
+                    cx,
                 )
-                // The chevron opens and closes, and nothing else.
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    view.update(cx, |this, cx| {
-                        this.select_row(index, cx);
-                        this.toggle_row(index, cx);
-                    });
-                })
-                .into_any_element()
-        };
-        // Clicks are the navigator's: the tree's own would open or close
-        // the row on a single click.
+            }
+            Some(RowId::Connection(connection)) => {
+                let saved = self.connections.read(cx).saved();
+                let Some(at) = saved.iter().position(|saved| saved.id == connection) else {
+                    return row(("node", index).into());
+                };
+                self.render_connection(view, row(("connection", at).into()), index, entry, at, cx)
+            }
+            Some(RowId::Object { connection, local }) => {
+                let base = row(("node", index).into());
+                match self
+                    .tree(connection)
+                    .and_then(|tree| Some((tree, tree.node(local)?)))
+                {
+                    Some((tree, node)) => Self::clicks(view, base, index)
+                        .child(self.node_content(view, index, entry, tree, node, cx)),
+                    None => self.render_line(view, base, connection, local, entry, cx),
+                }
+            }
+            Some(RowId::FolderNote(_)) | None => row(("node", index).into()).child(line_text(
+                entry.item().label.clone(),
+                cx.theme().muted_foreground,
+            )),
+        }
+    }
+
+    /// The chevron of a row that has children: opens and closes it, and
+    /// nothing else.
+    fn chevron(
+        view: &Entity<Self>,
+        id: ElementId,
+        index: usize,
+        entry: &TreeEntry,
+        cx: &App,
+    ) -> AnyElement {
         let view = view.clone();
-        base.on_click(move |event, window, cx| {
+        div()
+            .id(id)
+            .test_support()
+            .flex_none()
+            .child(
+                Icon::new(if entry.is_expanded() {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size_3()
+                .text_color(cx.theme().muted_foreground),
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                view.update(cx, |this, cx| {
+                    this.tree_state
+                        .update(cx, |state, cx| state.focus(window, cx));
+                    this.select_row(index, cx);
+                    this.toggle_row(index, cx);
+                });
+            })
+            .into_any_element()
+    }
+
+    /// Clicks are the navigator's: the tree's own would open or close the
+    /// row on a single click. One selects, two open (see [`Self::open_row`]).
+    fn clicks(view: &Entity<Self>, row: ListItem, index: usize) -> ListItem {
+        let view = view.clone();
+        row.on_click(move |event, window, cx| {
             cx.stop_propagation();
             let count = event.click_count();
             view.update(cx, |this, cx| {
+                this.tree_state
+                    .update(cx, |state, cx| state.focus(window, cx));
                 this.select_row(index, cx);
                 if count >= 2 {
                     this.open_row(index, window, cx);
                 }
             });
         })
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .gap_1p5()
-                .child(chevron)
-                .child(
-                    Icon::new(glyph(&node.kind))
-                        .flex_none()
-                        .size_3p5()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    // The name keeps its room: the hint only gets what is
-                    // left, and the name is cut only when alone too long.
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .when(node.muted, |this| this.text_color(theme.muted_foreground))
-                        .child(entry.item().label.clone()),
-                )
-                .when_some(self.row_hint(node), |this, hint| {
-                    this.child(
+    }
+
+    fn render_folder(
+        &self,
+        view: &Entity<Self>,
+        row: ListItem,
+        index: usize,
+        entry: &TreeEntry,
+        path: &str,
+        cx: &App,
+    ) -> ListItem {
+        let theme = cx.theme();
+        let count = self.connections.read(cx).count_in(path);
+        let (connections, target) = (self.connections.clone(), path.to_string());
+        let chevron_id = ElementId::from(("folder-chevron", index));
+        Self::clicks(view, row, index)
+            .drag_over::<DraggedConnection>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .on_drop(move |dragged: &DraggedConnection, _, cx| {
+                connections.update(cx, |c, cx| {
+                    c.move_connection(&dragged.id, Some(&target), cx)
+                });
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Self::chevron(view, chevron_id, index, entry, cx))
+                    .child(
+                        Icon::new(Glyph::Folder)
+                            .size_3p5()
+                            .flex_none()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_right()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(hint)),
+                            .child(entry.item().label.clone()),
                     )
-                }),
-        )
+                    .when(count > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(count.to_string())),
+                        )
+                    }),
+            )
     }
 
-    fn render_header(&self, connection: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_connection(
+        &self,
+        view: &Entity<Self>,
+        row: ListItem,
+        index: usize,
+        entry: &TreeEntry,
+        at: usize,
+        cx: &App,
+    ) -> ListItem {
         let theme = cx.theme();
-        let saved = self.connections.read(cx).get(connection);
-        let name = saved
-            .map(|saved| saved.config.name.clone())
-            .unwrap_or_default();
-        let engine = saved.map(|saved| saved.config.engine);
-        h_flex()
-            .px_3()
-            .gap_2()
-            .when_some(engine, |this, engine| {
-                this.child(div().flex_none().child(engine_logo(engine, px(16.), cx)))
-            })
+        let connections = self.connections.read(cx);
+        let saved = &connections.saved()[at];
+        let config = &saved.config;
+        let (state_label, state_color) = match connections.status(&saved.id) {
+            Status::Disconnected => (config.engine.label(), theme.muted_foreground),
+            Status::Connecting => ("connecting…", theme.muted_foreground),
+            Status::WaitingForInput => ("waiting for you", theme.warning),
+            Status::Connected { .. } => ("connected", theme.success),
+            Status::Failed { .. } => ("failed", theme.danger),
+        };
+        // A colour tag is a small dot; no colour, no marker.
+        let dot = theme::connection_color(config, cx);
+        let dragged = DraggedConnection {
+            id: saved.id.clone(),
+            name: SharedString::from(config.name.clone()),
+        };
+        Self::clicks(view, row, index)
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Self::chevron(
+                        view,
+                        ("connection-chevron", at).into(),
+                        index,
+                        entry,
+                        cx,
+                    ))
+                    .when_some(dot, |this, color| {
+                        this.child(
+                            div()
+                                .id(("connection-dot", at))
+                                .test_support()
+                                .flex_none()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(color),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(engine_logo(config.engine, px(16.), cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(entry.item().label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(state_color)
+                            .child(state_label),
+                    ),
+            )
+    }
+
+    /// A line under a connection: what it is doing, what went wrong, or the
+    /// button that tries again; or a line of a connection's tree (loading,
+    /// empty, or an error), which the tree's own click selects.
+    fn render_line(
+        &self,
+        view: &Entity<Self>,
+        row: ListItem,
+        connection: &str,
+        local: &str,
+        entry: &TreeEntry,
+        cx: &App,
+    ) -> ListItem {
+        let theme = cx.theme();
+        let label = entry.item().label.clone();
+        let at = self
+            .connections
+            .read(cx)
+            .saved()
+            .iter()
+            .position(|saved| saved.id == connection)
+            .unwrap_or_default();
+        match local {
+            LINE_RETRY => {
+                let (view, connection) = (view.clone(), connection.to_string());
+                row.child(
+                    h_flex().pl(px(20.)).child(
+                        Button::new(("connection-retry", at))
+                            .outline()
+                            .xsmall()
+                            .label(label)
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                view.update(cx, |this, cx| this.retry(&connection, cx));
+                            }),
+                    ),
+                )
+            }
+            LINE_ERROR => row.child(line_text(label, theme.danger)),
+            LINE_NEXT => row.child(line_text(label, theme.foreground)),
+            LINE_DETAIL => row.child(
                 div()
-                    .flex_1()
+                    .id(("connection-detail", at))
+                    .min_w_0()
+                    .child(line_text(label.clone(), theme.muted_foreground))
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx)),
+            ),
+            _ => {
+                let failed = model::parent_of(local)
+                    .and_then(|parent| self.tree(connection)?.node(parent))
+                    .is_some_and(|parent| matches!(parent.children, Children::Failed(_)));
+                row.child(line_text(
+                    label,
+                    if failed {
+                        theme.danger
+                    } else {
+                        theme.muted_foreground
+                    },
+                ))
+            }
+        }
+    }
+
+    fn node_content(
+        &self,
+        view: &Entity<Self>,
+        index: usize,
+        entry: &TreeEntry,
+        tree: &Tree,
+        node: &Node,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let chevron = if entry.is_folder() {
+            Self::chevron(view, ("node-chevron", index).into(), index, entry, cx)
+        } else {
+            div().flex_none().size_3().into_any_element()
+        };
+        let default = matches!(&node.kind, NodeKind::Object(ObjectRef::Database(name))
+            if tree.default_database() == Some(name.as_str()));
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1p5()
+            .child(chevron)
+            .child(
+                Icon::new(glyph(&node.kind))
+                    .flex_none()
+                    .size_3p5()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                // The name keeps its room: the hint only gets what is
+                // left, and the name is cut only when alone too long.
+                div()
                     .min_w_0()
                     .truncate()
-                    .text_sm()
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child(SharedString::from(name)),
+                    .when(node.muted, |this| this.text_color(theme.muted_foreground))
+                    .child(entry.item().label.clone()),
             )
-            .child(
-                Button::new("navigator-reload")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(Glyph::RefreshCw))
-                    .tooltip("Reload the schema tree")
-                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-            )
+            // The database the connection opens on (CLAUDE.md §3 item 8).
+            .when(default, |this| {
+                this.child(
+                    div()
+                        .id(("node-default", index))
+                        .test_support()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("default"),
+                )
+            })
+            .when_some(Self::row_hint(tree, node), |this, hint| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_right()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(hint)),
+                )
+            })
     }
 }
 
@@ -2262,6 +2890,8 @@ const NO_TOOLS: &str = "No maintenance tool for this object: they act on tables,
 /// How a confirmed statement is run.
 #[derive(Debug, Clone)]
 struct Plan {
+    /// The connection it runs on.
+    connection: String,
     /// The database whose session runs it; the connection's own session
     /// when `None`.
     database: Option<String>,
@@ -2360,170 +2990,225 @@ fn name_of(node: &Node) -> String {
     }
 }
 
+/// The height of every row of the tree.
+const ROW_HEIGHT: f32 = 24.;
+
+/// The folders made and the folders closed, as the settings hold them.
+fn folder_settings(cx: &App) -> (BTreeSet<String>, BTreeSet<String>) {
+    let settings = &AppState::get(cx).settings;
+    (
+        settings.connection_folders.clone(),
+        settings.collapsed_folders.clone(),
+    )
+}
+
+/// The connection a row of the tree is or is under.
+fn connection_of(id: &str) -> Option<&str> {
+    match model::parse_row(id)? {
+        RowId::Connection(connection) | RowId::Object { connection, .. } => Some(connection),
+        RowId::Folder(_) | RowId::FolderNote(_) => None,
+    }
+}
+
+/// A row of the forest as the tree widget takes it. What a closed row
+/// holds is left out (one empty child keeps its chevron): the widget
+/// copies each shown row's children.
+fn tree_item(item: Item) -> TreeItem {
+    let row = TreeItem::new(item.id.clone(), item.label).expanded(item.expanded);
+    if item.expanded {
+        row.children(item.children.into_iter().map(tree_item))
+    } else if item.children.is_empty() {
+        row
+    } else {
+        row.child(TreeItem::new(format!("{}\u{1e}…", item.id), ""))
+    }
+}
+
+/// A line of text in a row.
+fn line_text(text: SharedString, color: gpui_kit::Hsla) -> impl IntoElement {
+    div()
+        .pl(px(20.))
+        .min_w_0()
+        .truncate()
+        .text_xs()
+        .text_color(color)
+        .child(text)
+}
+
+/// The menu of the object on the row `id`: each entry says why it cannot
+/// be used, when it cannot.
+fn object_menu(
+    view: &Entity<Navigator>,
+    id: &str,
+    mut menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut App,
+) -> PopupMenu {
+    let navigator = view.read(cx);
+    let Some((connection, node)) = navigator.object(id) else {
+        return menu;
+    };
+    // Read first; the Tools submenu is built afterwards.
+    let groups: Vec<Vec<(Action, Option<&'static str>)>> =
+        actions(&node, navigator.has_schemas(&connection, cx))
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|action| {
+                        (
+                            action,
+                            navigator.unavailable(&connection, action, &node, cx),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+    let tools = navigator
+        .meta(&connection, cx)
+        .map(|meta| tools(&node, meta.dialect()))
+        .unwrap_or_default();
+    let tools_reason = navigator.unavailable(&connection, Action::Tools, &node, cx);
+    let filters: Vec<(FilterAction, Option<&'static str>)> = filter_actions(&node)
+        .into_iter()
+        .map(|action| {
+            (
+                action,
+                navigator.filter_unavailable(&connection, action, &node, cx),
+            )
+        })
+        .collect();
+    let entry = |label: &str, reason: Option<&str>| match reason {
+        Some(reason) => SharedString::from(format!("{label} ({reason})")),
+        None => SharedString::from(label.to_string()),
+    };
+    let id = id.to_string();
+    let last = groups.len().saturating_sub(1);
+    for (index, group) in groups.into_iter().enumerate() {
+        if index > 0 {
+            menu = menu.separator();
+        }
+        // Tools ▸ comes just before Refresh, in a group of its own.
+        if index == last && !tools.is_empty() {
+            let (view, id, tools) = (view.clone(), id.clone(), tools.clone());
+            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
+                for tool in tools {
+                    let (view, id) = (view.clone(), id.clone());
+                    let label = format!("{}…", maintenance_dialog::label(&tool));
+                    submenu = submenu.item(
+                        PopupMenuItem::new(entry(&label, tools_reason))
+                            .disabled(tools_reason.is_some())
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_tools(&id, Some(&tool), window, cx);
+                                })
+                            }),
+                    );
+                }
+                submenu
+            });
+            menu = menu
+                .item(PopupMenuItem::submenu(Action::Tools.label(), submenu))
+                .separator();
+        }
+        // Filter ▸ too, before Refresh.
+        if index == last && !filters.is_empty() {
+            let (view, id, filters) = (view.clone(), id.clone(), filters.clone());
+            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
+                for (action, reason) in filters {
+                    let (view, id) = (view.clone(), id.clone());
+                    submenu = submenu.item(
+                        PopupMenuItem::new(entry(action.label(), reason))
+                            .disabled(reason.is_some())
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.perform_filter(action, &id, window, cx)
+                                })
+                            }),
+                    );
+                }
+                submenu
+            });
+            menu = menu
+                .item(PopupMenuItem::submenu("Filter", submenu))
+                .separator();
+        }
+        for (action, reason) in group {
+            let (view, id) = (view.clone(), id.clone());
+            menu = menu.item(
+                PopupMenuItem::new(entry(action.label(), reason))
+                    .disabled(reason.is_some())
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| this.perform(action, &id, window, cx))
+                    }),
+            );
+        }
+    }
+    menu
+}
+
+/// The sidebar's menu of `subject`, built when it opens.
+fn sidebar_menu(
+    view: &Entity<Navigator>,
+    subject: Subject,
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut App,
+) -> PopupMenu {
+    let Some(sidebar) = view.read(cx).sidebar.upgrade() else {
+        return menu;
+    };
+    let entries = sidebar.read(cx).menu_of(&subject, cx);
+    Sidebar::fill_menu(sidebar, subject, entries, menu, window, cx)
+}
+
 impl Render for Navigator {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let Some(connection) = self.connection.clone() else {
-            return v_flex()
-                .id("navigator")
-                .test_support()
-                .flex_1()
-                .min_h_0()
-                .px_3()
-                .py_2()
-                .child(div().text_xs().text_color(muted).child(
-                    "Connect to a server to browse its databases, tables and other objects here.",
-                ));
-        };
-        let body = match &self.root {
-            Root::None => div()
-                .px_3()
-                .text_xs()
-                .text_color(muted)
-                .child("Not connected. Double-click the connection to open it.")
-                .into_any_element(),
-            Root::Loading => div()
-                .px_3()
-                .text_xs()
-                .text_color(muted)
-                .child("Loading databases…")
-                .into_any_element(),
-            Root::Failed(message) => v_flex()
-                .id("navigator-error")
-                .test_support()
-                .px_3()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(SharedString::from(format!(
-                            "The databases could not be listed: {message}"
-                        ))),
-                )
-                .child(
-                    h_flex().child(
-                        Button::new("navigator-retry")
-                            .outline()
-                            .small()
-                            .label("Try again")
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
-                    ),
-                )
-                .into_any_element(),
-            Root::Loaded => {
-                let view = cx.entity();
-                let menu_view = cx.entity();
-                let keys = cx.entity();
-                let tree_view = tree(&self.tree_state, move |index, entry, _, _, cx| {
-                    view.read(cx).render_row(&view, index, entry, cx)
-                })
-                .context_menu(move |_, entry, mut menu, window, cx| {
-                    let id = entry.item().id.to_string();
-                    let navigator = menu_view.read(cx);
-                    let Some(node) = navigator.tree.node(&id) else {
-                        return menu;
-                    };
-                    // Each entry with why it cannot be used, if it cannot;
-                    // read first, the Tools submenu is built afterwards.
-                    let groups: Vec<Vec<(Action, Option<&'static str>)>> =
-                        actions(node, navigator.has_schemas(cx))
-                            .into_iter()
-                            .map(|group| {
-                                group
-                                    .into_iter()
-                                    .map(|action| (action, navigator.unavailable(action, node, cx)))
-                                    .collect()
-                            })
-                            .collect();
-                    let tools = navigator
-                        .meta(cx)
-                        .map(|meta| tools(node, meta.dialect()))
-                        .unwrap_or_default();
-                    let tools_reason = navigator.unavailable(Action::Tools, node, cx);
-                    let filters: Vec<(FilterAction, Option<&'static str>)> = filter_actions(node)
-                        .into_iter()
-                        .map(|action| (action, navigator.filter_unavailable(action, node, cx)))
-                        .collect();
-                    let entry = |label: &str, reason: Option<&str>| match reason {
-                        Some(reason) => SharedString::from(format!("{label} ({reason})")),
-                        None => SharedString::from(label.to_string()),
-                    };
-                    let last = groups.len().saturating_sub(1);
-                    for (index, group) in groups.into_iter().enumerate() {
-                        if index > 0 {
-                            menu = menu.separator();
-                        }
-                        // Tools ▸ comes just before Refresh, in a group of its own.
-                        if index == last && !tools.is_empty() {
-                            let (view, id, tools) = (menu_view.clone(), id.clone(), tools.clone());
-                            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
-                                for tool in tools {
-                                    let (view, id) = (view.clone(), id.clone());
-                                    let label = format!("{}…", maintenance_dialog::label(&tool));
-                                    submenu = submenu.item(
-                                        PopupMenuItem::new(entry(&label, tools_reason))
-                                            .disabled(tools_reason.is_some())
-                                            .on_click(move |_, window, cx| {
-                                                view.update(cx, |this, cx| {
-                                                    this.open_tools(&id, Some(&tool), window, cx);
-                                                })
-                                            }),
-                                    );
-                                }
-                                submenu
-                            });
-                            menu = menu
-                                .item(PopupMenuItem::submenu(Action::Tools.label(), submenu))
-                                .separator();
-                        }
-                        // Filter ▸ too, before Refresh.
-                        if index == last && !filters.is_empty() {
-                            let (view, id, filters) =
-                                (menu_view.clone(), id.clone(), filters.clone());
-                            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
-                                for (action, reason) in filters {
-                                    let (view, id) = (view.clone(), id.clone());
-                                    submenu = submenu.item(
-                                        PopupMenuItem::new(entry(action.label(), reason))
-                                            .disabled(reason.is_some())
-                                            .on_click(move |_, window, cx| {
-                                                view.update(cx, |this, cx| {
-                                                    this.perform_filter(action, &id, window, cx)
-                                                })
-                                            }),
-                                    );
-                                }
-                                submenu
-                            });
-                            menu = menu
-                                .item(PopupMenuItem::submenu("Filter", submenu))
-                                .separator();
-                        }
-                        for (action, reason) in group {
-                            let (view, id) = (menu_view.clone(), id.clone());
-                            menu = menu.item(
-                                PopupMenuItem::new(entry(action.label(), reason))
-                                    .disabled(reason.is_some())
-                                    .on_click(move |_, window, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.perform(action, &id, window, cx)
-                                        })
-                                    }),
-                            );
-                        }
-                    }
-                    menu
-                })
-                .size_full();
-                // Right and Left also move to the first child and the
-                // parent; Enter does what a double click does. They run
-                // before the tree's own handling of the keys. The other
-                // keys are commands bound in the `Navigator` context (see
-                // `actions.rs`). Below the objects, the tree's own menu (a
-                // row's menu takes the click first).
-                let area = cx.entity();
+        let muted = cx.theme().muted_foreground;
+        let (view, menu_view, keys, area) = (cx.entity(), cx.entity(), cx.entity(), cx.entity());
+        // Each row's menu is the one of what it is; a menu attached to the
+        // row itself would stack under the kit's.
+        let tree_view = tree(&self.tree_state, move |index, entry, _, _, cx| {
+            view.read(cx).render_row(&view, index, entry, cx)
+        })
+        .context_menu(move |_, entry, menu, window, cx| {
+            let id = entry.item().id.to_string();
+            let subject = match model::parse_row(&id) {
+                None => return menu,
+                Some(RowId::Object { local, .. }) if !local.starts_with("line:") => {
+                    return object_menu(&menu_view, &id, menu, window, cx);
+                }
+                Some(RowId::Folder(path) | RowId::FolderNote(path)) => {
+                    Subject::Folder(path.to_string())
+                }
+                Some(RowId::Connection(connection) | RowId::Object { connection, .. }) => {
+                    Subject::Connection(connection.to_string())
+                }
+            };
+            sidebar_menu(&menu_view, subject, menu, window, cx)
+        })
+        .size_full();
+        v_flex()
+            .id("navigator")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .child(
+                div().px_3().child(
+                    Input::new(&self.filter)
+                        .id("navigator-filter")
+                        .small()
+                        .cleanable(true)
+                        .prefix(Icon::new(IconName::Search).size_3p5().text_color(muted)),
+                ),
+            )
+            // Right and Left also move to the first child and the parent;
+            // Enter does what a double click does. They run before the
+            // tree's own handling of the keys. The other keys are commands
+            // bound in the `Navigator` context (see `actions.rs`). A
+            // connection dropped below the rows leaves its folder.
+            .child(
                 div()
                     .id("navigator-tree")
                     .test_support()
@@ -2548,71 +3233,15 @@ impl Render for Navigator {
                             });
                         }
                     })
-                    .child(tree_view)
-                    .context_menu(move |menu, _, cx| {
-                        let (refresh, collapse, query) = (area.clone(), area.clone(), area.clone());
-                        let linked = AppState::get(cx).settings.link_with_editor;
-                        menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
-                            refresh.update(cx, |this, cx| this.reload(cx))
-                        }))
-                        .item(
-                            PopupMenuItem::new("Collapse all").on_click(move |_, _, cx| {
-                                collapse.update(cx, |this, cx| this.collapse_all(cx))
-                            }),
-                        )
-                        // DBeaver's toggle (CM-07): the window runs it, once
-                        // the menu has given the focus back.
-                        .item(
-                            PopupMenuItem::new("Link with editor")
-                                .checked(linked)
-                                .on_click(|_, window, cx| {
-                                    window.defer(cx, |window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(crate::actions::LinkWithEditor),
-                                            cx,
-                                        )
-                                    })
-                                }),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new("New query here").on_click(move |_, _, cx| {
-                                query.update(cx, |this, cx| {
-                                    if let Some(connection) = this.connection.clone() {
-                                        cx.emit(NavigatorEvent::NewQuery {
-                                            target: Target {
-                                                connection,
-                                                database: None,
-                                                schema: None,
-                                            },
-                                        });
-                                    }
-                                })
-                            }),
-                        )
-                    })
-                    .into_any_element()
-            }
-        };
-        v_flex()
-            .id("navigator")
-            .test_support()
-            .flex_1()
-            .min_h_0()
-            .gap_2()
-            .py_2()
-            .child(self.render_header(&connection, cx))
-            .when(self.root == Root::Loaded, |this| {
-                this.child(
-                    div().px_3().child(
-                        Input::new(&self.filter)
-                            .id("navigator-filter")
-                            .small()
-                            .cleanable(true)
-                            .prefix(Icon::new(IconName::Search).size_3p5().text_color(muted)),
-                    ),
-                )
+                    .on_drop(cx.listener(|this, dragged: &DraggedConnection, _, cx| {
+                        this.connections
+                            .update(cx, |c, cx| c.move_connection(&dragged.id, None, cx));
+                    }))
+                    .child(tree_view),
+            )
+            // Every empty area of the sidebar answers with the list's menu.
+            .context_menu(move |menu, window, cx| {
+                sidebar_menu(&area, Subject::List, menu, window, cx)
             })
-            .child(body)
     }
 }

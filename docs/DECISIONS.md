@@ -760,3 +760,23 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Connection failures are classified from their text** by one pure function in `kerno-core`
   (`error::explain`): headline, next step, raw message. The markers are the SQLSTATEs, the MySQL error
   numbers and the OS error numbers, which do not follow the user's language.
+
+## D-043 — Wave 1 of the owner's test: what was decided while building it
+
+- **The tree.** Row ids are `f:{path}`, `c:{id}` and `c:{id}␞{node}`; each open connection has its own
+  browse state, and one generation counter that only grows drops late answers. A disconnect collapses the
+  connection's row; a failure keeps it open with the plain-words headline, the next step, the raw message
+  and "Try again" under it. Revealing a table (Link with editor) opens folders and the connection's row but
+  never connects. The list's menu is on the tree's root, so every empty area answers a right-click.
+- **Default database.** The database the session is in comes first, open, with a "default" badge; the
+  others follow closed, user databases before system ones.
+- **Failure kinds.** `SshHostKeyUnknown` is its own kind; "the server asks for a password and none was
+  given" is a login failure. In a query tab the next step is part of the message, because that view prints
+  the detail before the hint. The raw message is selectable text.
+- **Database list of the dialog.** Loaded 600 ms after host, port or user last changed, or when the
+  password field loses the focus (never with half a password); it ignores the database typed in the field,
+  and on PostgreSQL goes through `postgres` when there is no database named after the user, as DBeaver does.
+- **Secret cache.** Around the OS store only; one lock held across the read, so two connects starting
+  together prompt once; "no such secret" is remembered, an error is not (a refused keychain prompt can be
+  tried again). A secret added outside Kerno while it runs is seen at the next start.
+- **F4 on a folder renames it** until "Edit folder…" exists (Part 9c), which then takes the key.

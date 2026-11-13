@@ -1579,10 +1579,11 @@ impl QueryTab {
             return;
         };
         let connections = self.connections.read(cx);
-        let name = connections
-            .get(&target.connection)
+        let saved = connections.get(&target.connection);
+        let name = saved
             .map(|saved| saved.config.name.clone())
             .unwrap_or_default();
+        let mut detail = None;
         let message = match connections.status(&target.connection) {
             Status::Connecting | Status::WaitingForInput => return,
             Status::Connected { .. } => {
@@ -1599,7 +1600,19 @@ impl QueryTab {
                 return;
             }
             Status::Failed { message } => {
-                format!("“{name}” could not connect, and nothing was run: {message}")
+                // In plain words first, the raw message as the detail.
+                let words = match saved {
+                    Some(saved) => {
+                        let explained = kerno_core::error::explain(&message, &saved.config);
+                        format!("{} {}", explained.headline, explained.next_step)
+                    }
+                    None => "The connection failed.".to_string(),
+                };
+                detail = Some(message);
+                format!(
+                    "“{name}” could not connect, and nothing was run. {}",
+                    words.trim_end()
+                )
             }
             Status::Disconnected => {
                 format!("“{name}” was not connected, and nothing was run.")
@@ -1614,7 +1627,7 @@ impl QueryTab {
             Failure {
                 message,
                 code: None,
-                detail: None,
+                detail,
                 hint: Some("Run again to connect again.".into()),
                 position: None,
             },

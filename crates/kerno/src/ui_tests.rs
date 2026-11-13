@@ -39,8 +39,10 @@ use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
 mod brackets;
+mod connection_feedback;
 mod coverage;
 mod menus;
+mod sidebar_tree;
 
 struct Fixture {
     window: WindowHandle<Root>,
@@ -485,6 +487,32 @@ impl Fixture {
             let centre = window.find_by_label(label).bounds().center();
             window.drag(centre, centre, cx);
         });
+    }
+
+    /// Double-clicks the row of the saved connection `index`, scrolled into
+    /// view first: the open connections above it may have pushed it below
+    /// the rows the list draws.
+    fn open_connection_row(&self, cx: &mut TestAppContext, index: usize) {
+        let navigator = cx.update(|cx| self.workspace.read(cx).navigator(cx));
+        let id = cx.update(|cx| self.connections.read(cx).saved()[index].id.clone());
+        cx.update(|cx| {
+            navigator.update(cx, |navigator, cx| navigator.scroll_to_connection(&id, cx))
+        });
+        self.step(cx, |window, cx| {
+            window.double_click(("connection", index), cx)
+        });
+    }
+
+    /// Right-clicks the empty area of the sidebar's tree, below its rows.
+    fn right_click_below_the_tree(&self, cx: &mut TestAppContext) {
+        let height = self.step(cx, |window, _| {
+            window.find("navigator-tree").bounds().size.height
+        });
+        self.right_click(
+            cx,
+            "navigator-tree",
+            Some(gpui_kit::point(px(40.), height - px(8.))),
+        );
     }
 
     /// Runs a sidebar menu entry, as clicking it does.
@@ -1042,15 +1070,20 @@ fn the_sidebar_answers_a_right_click_on_each_part(cx: &mut TestAppContext) {
     let app = open(cx, storage);
 
     // The empty area below the rows, and the header.
-    for area in ["connection-list-end", "connections-header"] {
+    for area in ["navigator-tree", "connections-header"] {
         assert!(!app.shows_label(cx, "New folder…"));
-        app.right_click(cx, area, None);
+        if area == "navigator-tree" {
+            app.right_click_below_the_tree(cx);
+        } else {
+            app.right_click(cx, area, None);
+        }
         for label in [
             "New connection…",
             "New folder…",
             "Import connections…",
             "Refresh",
             "Collapse all",
+            "Link with editor",
         ] {
             assert!(app.shows_label(cx, label), "{area}: {label}");
         }
@@ -1088,6 +1121,13 @@ fn the_sidebar_answers_a_right_click_on_each_part(cx: &mut TestAppContext) {
     ] {
         assert!(app.shows_label(cx, label), "{label}");
     }
+    // Only the row's menu opens, not the list's under it.
+    assert!(!app.shows_label(cx, "New folder…"));
+    app.press(cx, &["escape"]);
+
+    // Around the filter too (the field has no menu of its own).
+    app.right_click(cx, "navigator-filter", None);
+    assert!(app.shows_label(cx, "New folder…"));
     app.press(cx, &["escape"]);
 }
 
@@ -1100,7 +1140,7 @@ fn a_folder_is_made_renamed_filled_by_drag_and_deleted(cx: &mut TestAppContext) 
     let app = open(cx, storage);
 
     // New folder, from the menu of the empty area.
-    app.right_click(cx, "connection-list-end", None);
+    app.right_click_below_the_tree(cx);
     app.click_label(cx, "New folder…");
     assert!(app.has(cx, "name-input"));
     app.type_text(cx, "Work/x");
@@ -1131,7 +1171,7 @@ fn a_folder_is_made_renamed_filled_by_drag_and_deleted(cx: &mut TestAppContext) 
         app.first_stored().group.as_deref() == Some("Clients")
     });
     app.step(cx, |window, cx| {
-        window.drag_to(("connection", 0usize), "connection-list-end", cx)
+        window.drag_to(("connection", 0usize), "navigator-tree", cx)
     });
     app.wait_until(cx, "the move back to be stored", |app, _| {
         app.first_stored().group.is_none()
@@ -1243,32 +1283,35 @@ fn a_right_click_below_the_schema_tree_opens_its_menu(cx: &mut TestAppContext) {
         return;
     }
     let app = connected(cx, Engine::Postgres);
-    app.wait_until(cx, "the databases", |app, cx| !app.tree(cx).is_empty());
-    assert!(!app.shows_label(cx, "New query here"));
-    let height = app.step(cx, |window, _| {
-        window.find("navigator-tree").bounds().size.height
-    });
-    app.right_click(
-        cx,
-        "navigator-tree",
-        Some(gpui_kit::point(px(40.), height - px(8.))),
-    );
-    for label in ["Refresh", "Collapse all", "New query here"] {
-        assert!(app.shows_label(cx, label), "{label}");
-    }
-    app.click_label(cx, "New query here");
-    assert_eq!(app.titles(cx).len(), 1);
-    let tab = app.tab(cx);
-    let target = cx.update(|cx| tab.read(cx).target().cloned());
-    assert_eq!(
-        target.map(|target| target.connection),
-        Some(app.storage.connections().unwrap()[0].id.clone())
-    );
-
-    // Its entries are palette commands too.
     app.wait_until(cx, "an open database", |app, cx| {
         app.tree(cx).iter().any(|row| row.starts_with("  "))
     });
+    assert!(!app.shows_label(cx, "Link with editor"));
+    // The list's menu, the one of every empty area of the sidebar: "New
+    // query here" is the connection's "New SQL editor" now.
+    app.right_click_below_the_tree(cx);
+    for label in [
+        "New connection…",
+        "New folder…",
+        "Refresh",
+        "Collapse all",
+        "Link with editor",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    assert!(!app.shows_label(cx, "New query here"));
+    // Collapse all closes the connection's row and leaves it connected.
+    app.click_label(cx, "Collapse all");
+    assert_eq!(app.tree(cx), Vec::<String>::new());
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    app.open_connection_row(cx, 0);
+    assert!(
+        app.tree(cx).iter().any(|row| row.starts_with("  ")),
+        "{:#?}",
+        app.tree(cx)
+    );
+
+    // The tree's own entries are palette commands too.
     app.step(cx, |window, cx| {
         window.dispatch_action(Box::new(actions::CollapseSchemaTree), cx)
     });
@@ -1802,12 +1845,14 @@ fn the_tree_follows_the_connection(cx: &mut TestAppContext) {
     });
     assert!(app.has(cx, "navigator-filter"));
 
-    // Disconnecting empties it and says what to do.
+    // Disconnecting closes the connection's row; the row, the filter and
+    // the rest of the sidebar stay.
     let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
     app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Disconnect);
     assert_eq!(app.status(cx, 0), Status::Disconnected);
     assert_eq!(app.tree(cx), Vec::<String>::new());
-    assert!(!app.has(cx, "navigator-filter"));
+    assert!(app.has(cx, "navigator-filter"));
+    assert!(app.has(cx, ("connection", 0usize)));
 
     // Connecting again loads it again.
     app.step(cx, |window, cx| {
@@ -6801,7 +6846,10 @@ impl Fixture {
     /// The labels of the rows just below the row at `path`, which is open.
     fn children_of(&self, cx: &mut TestAppContext, path: &[&str]) -> Vec<String> {
         let tree = self.tree(cx);
-        let at = self.tree_row(cx, path);
+        // Rows are counted from the top of the sidebar, the outline from
+        // the connection's first row.
+        let first = self.tree_row(cx, &[tree[0].as_str()]);
+        let at = self.tree_row(cx, path) - first;
         let indent = "  ".repeat(path.len());
         tree[at + 1..]
             .iter()
@@ -10566,9 +10614,7 @@ fn two_connections(cx: &mut TestAppContext, second: &str) -> Fixture {
         kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
     }
     for row in [0usize, 1] {
-        app.step(cx, |window, cx| {
-            window.double_click(("connection", row), cx)
-        });
+        app.open_connection_row(cx, row);
     }
     app.wait_until(cx, "both connections", |app, cx| {
         (0..2).all(|index| matches!(app.status(cx, index), Status::Connected { .. }))
@@ -10620,7 +10666,7 @@ fn a_tab_moved_with_a_transaction_asks_and_takes_its_new_commit_mode(cx: &mut Te
         })
     };
     app.click(cx, "tab-connection");
-    app.click_label(cx, "kerno_ui_move manual");
+    app.click_menu_label(cx, "kerno_ui_move manual");
     assert!(app.shows_label(cx, "Switch “Query 1” to “kerno_ui_move manual”?"));
     app.click(cx, "end-cancel");
     assert_eq!(connection_of(cx), Some(first.clone()));
@@ -10629,7 +10675,7 @@ fn a_tab_moved_with_a_transaction_asks_and_takes_its_new_commit_mode(cx: &mut Te
     // Rolled back, the tab moves and starts in the manual commit of its new
     // connection.
     app.click(cx, "tab-connection");
-    app.click_label(cx, "kerno_ui_move manual");
+    app.click_menu_label(cx, "kerno_ui_move manual");
     app.click(cx, "end-rollback");
     app.wait_until(cx, "the move", |_, cx| {
         connection_of(cx) == Some(second.clone())
@@ -10641,7 +10687,7 @@ fn a_tab_moved_with_a_transaction_asks_and_takes_its_new_commit_mode(cx: &mut Te
     // Without a transaction it moves at once, and takes auto-commit back.
     let first_name = cx.update(|cx| app.connections.read(cx).saved()[0].config.name.clone());
     app.click(cx, "tab-connection");
-    app.click_label(cx, &first_name);
+    app.click_menu_label(cx, &first_name);
     assert!(!app.dialog_open(cx));
     assert_eq!(connection_of(cx), Some(first));
     assert!(!cx.update(|cx| tab.read(cx).manual_commit()));
@@ -10805,22 +10851,29 @@ fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) 
         ])
         .unwrap();
     let app = open(cx, storage);
-    // A stripe on each tab of a connection, none on a tab without one.
-    assert!(app.has(cx, ("tab-stripe", 0usize)));
-    assert!(app.has(cx, ("tab-stripe", 1usize)));
-    assert!(!app.has(cx, ("tab-stripe", 2usize)));
-    // Its colour is the tag's, else the environment's: production is red.
+    // A dot for a tagged connection only, the engine's logo on each tab of
+    // a connection, nothing on a tab without one; production's title is
+    // tinted instead.
+    assert!(app.has(cx, ("tab-dot", 0usize)));
+    assert!(!app.has(cx, ("tab-dot", 1usize)));
+    assert!(!app.has(cx, ("tab-dot", 2usize)));
+    assert!(app.has(cx, ("tab-logo", 0usize)));
+    assert!(app.has(cx, ("tab-logo", 1usize)));
+    assert!(!app.has(cx, ("tab-logo", 2usize)));
+    assert!(app.has(cx, ("tab-production", 1usize)));
+    assert!(!app.has(cx, ("tab-production", 0usize)));
+    // The dot's colour is the tag's; without a tag there is none.
     cx.update(|cx| {
         assert_eq!(
             theme::connection_color(&tagged, cx),
-            theme::tag_color("blue", cx).unwrap()
+            theme::tag_color("blue", cx)
         );
-        assert_eq!(theme::connection_color(&production, cx), cx.theme().danger);
+        assert_eq!(theme::connection_color(&production, cx), None);
     });
     // The status bar's connection item carries it too, and the engine's
     // logo before the name.
     app.click(cx, ("tab-title", 0usize));
-    assert!(app.has(cx, "status-connection-stripe"));
+    assert!(app.has(cx, "status-connection-dot"));
     let (logo, name) = app.step(cx, |window, _| {
         (
             window.find("status-connection-logo").bounds(),
@@ -10829,7 +10882,7 @@ fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) 
     });
     assert!(logo.left() >= name.left() && logo.right() <= name.right());
     app.click(cx, ("tab-title", 2usize));
-    assert!(!app.has(cx, "status-connection-stripe"));
+    assert!(!app.has(cx, "status-connection-dot"));
     assert!(!app.has(cx, "status-connection-logo"));
 }
 
@@ -12139,7 +12192,7 @@ fn link_with_editor_selects_the_table_of_the_active_tab(cx: &mut TestAppContext)
     });
     let selected = cx.update(|cx| {
         let workspace = app.workspace.read(cx);
-        workspace.sidebar().read(cx).selected().map(str::to_string)
+        workspace.sidebar().read(cx).selected(cx)
     });
     let first = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
     assert_eq!(selected, Some(first));
@@ -13338,9 +13391,7 @@ fn the_tab_toolbar_changes_its_connection_database_and_schema(cx: &mut TestAppCo
         kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
     }
     for row in [0usize, 1] {
-        app.step(cx, |window, cx| {
-            window.double_click(("connection", row), cx)
-        });
+        app.open_connection_row(cx, row);
     }
     app.wait_until(cx, "both connections", |app, cx| {
         (0..2).all(|index| matches!(app.status(cx, index), Status::Connected { .. }))

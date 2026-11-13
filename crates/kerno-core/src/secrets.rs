@@ -138,14 +138,82 @@ impl SecretStore for MemorySecretStore {
     }
 }
 
+/// A store read at most once per key for the life of the process: the
+/// first `get` of a key asks `inner` and the answer is kept, "no such
+/// secret" included; `set` and `delete` write through and update what is
+/// kept. Over the OS store this keeps the keychain from asking again on
+/// every connect. Values stay in memory, in [`Secret`]s that never print;
+/// a failed read is not kept, so it can be tried again.
+pub struct CachedSecretStore<S> {
+    inner: S,
+    known: Mutex<HashMap<String, Option<Secret>>>,
+}
+
+impl<S> CachedSecretStore<S> {
+    /// Wraps `inner`.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            known: Mutex::default(),
+        }
+    }
+
+    fn known(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Option<Secret>>>> {
+        self.known
+            .lock()
+            .map_err(|_| Error::Secrets("the secret cache lock was poisoned by a panic".into()))
+    }
+}
+
+impl<S> std::fmt::Debug for CachedSecretStore<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CachedSecretStore")
+    }
+}
+
+impl<S: SecretStore> SecretStore for CachedSecretStore<S> {
+    fn get(&self, key: &str) -> Result<Option<Secret>> {
+        // ponytail: one lock for every key, held across the inner read, so
+        // two connects starting together never prompt twice for one key.
+        let mut known = self.known()?;
+        if let Some(secret) = known.get(key) {
+            return Ok(secret.clone());
+        }
+        let secret = self.inner.get(key)?;
+        known.insert(key.to_string(), secret.clone());
+        Ok(secret)
+    }
+
+    fn set(&self, key: &str, secret: &Secret) -> Result<()> {
+        let mut known = self.known()?;
+        known.remove(key);
+        self.inner.set(key, secret)?;
+        known.insert(key.to_string(), Some(secret.clone()));
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let mut known = self.known()?;
+        known.remove(key);
+        self.inner.delete(key)?;
+        known.insert(key.to_string(), None);
+        Ok(())
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.inner.is_persistent()
+    }
+}
+
 /// The store the app uses: the OS store when it works, memory otherwise.
 /// `KERNO_SECRET_STORE=memory` forces memory (used by tests and by checks
-/// of the real app, so they never write to the user's keychain).
+/// of the real app, so they never write to the user's keychain). The OS
+/// store is read once per key per run ([`CachedSecretStore`]).
 pub fn default_store() -> Arc<dyn SecretStore> {
     let forced_memory = std::env::var("KERNO_SECRET_STORE").is_ok_and(|value| value == "memory");
     if !forced_memory {
         match OsSecretStore::open() {
-            Ok(store) => return Arc::new(store),
+            Ok(store) => return Arc::new(CachedSecretStore::new(store)),
             Err(error) => {
                 tracing::warn!(%error, "secrets will be kept in memory only");
             }
@@ -242,6 +310,72 @@ mod tests {
         store.set("k", &Secret::new("hunter2")).unwrap();
         assert!(!format!("{store:?}").contains("hunter2"));
         assert!(!format!("{:?}", store.get("k").unwrap()).contains("hunter2"));
+        let cached = CachedSecretStore::new(store);
+        assert_eq!(cached.get("k").unwrap(), Some(Secret::new("hunter2")));
+        assert!(!format!("{cached:?}").contains("hunter2"));
+    }
+
+    /// Counts the reads that reach the store beneath a cache.
+    #[derive(Default)]
+    struct Counting {
+        store: MemorySecretStore,
+        reads: Mutex<HashMap<String, usize>>,
+    }
+
+    impl Counting {
+        fn reads(&self, key: &str) -> usize {
+            self.reads.lock().unwrap().get(key).copied().unwrap_or(0)
+        }
+    }
+
+    impl SecretStore for Counting {
+        fn get(&self, key: &str) -> Result<Option<Secret>> {
+            *self.reads.lock().unwrap().entry(key.into()).or_default() += 1;
+            self.store.get(key)
+        }
+        fn set(&self, key: &str, secret: &Secret) -> Result<()> {
+            self.store.set(key, secret)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            self.store.delete(key)
+        }
+        fn is_persistent(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_cached_store_reads_each_key_once() {
+        let inner = Counting::default();
+        inner.set("present", &Secret::new("pw")).unwrap();
+        let store = CachedSecretStore::new(inner);
+        assert!(store.is_persistent());
+        for _ in 0..3 {
+            assert_eq!(store.get("present").unwrap(), Some(Secret::new("pw")));
+            // "No such secret" is kept too.
+            assert_eq!(store.get("absent").unwrap(), None);
+        }
+        assert_eq!(store.inner.reads("present"), 1);
+        assert_eq!(store.inner.reads("absent"), 1);
+
+        // Writes go through and are what later reads see, without a read.
+        store.set("absent", &Secret::new("new")).unwrap();
+        assert_eq!(
+            store.inner.store.get("absent").unwrap(),
+            Some(Secret::new("new"))
+        );
+        assert_eq!(store.get("absent").unwrap(), Some(Secret::new("new")));
+        store.delete("present").unwrap();
+        assert_eq!(store.inner.store.get("present").unwrap(), None);
+        assert_eq!(store.get("present").unwrap(), None);
+        assert_eq!(store.inner.reads("present"), 1);
+        assert_eq!(store.inner.reads("absent"), 1);
+
+        // The whole contract of a store holds through the cache.
+        exercise(
+            &CachedSecretStore::new(MemorySecretStore::default()),
+            "cached",
+        );
     }
 
     /// Writes to, reads from and cleans up the real OS secret store. Opt-in

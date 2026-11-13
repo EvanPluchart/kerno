@@ -40,9 +40,15 @@ Measurements: [docs/BENCH.md](docs/BENCH.md).
 
 ## Install
 
-There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg` (ad-hoc
-signed), and `scripts/bundle-linux.sh` builds a tarball with the binary, a `.desktop` file, icons and
-licences. On Linux, unpack it into a prefix:
+There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
+`scripts/bundle-linux.sh` builds a tarball with the binary, a `.desktop` file, icons and licences.
+
+On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
+(`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). Kerno reads each saved password from
+the keychain once per run. An ad-hoc signature changes with every build, so the keychain asks for your login
+password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it.
+
+On Linux, unpack the tarball into a prefix:
 
 ```sh
 tar -xzf dist/kerno-<version>-linux-<arch>.tar.gz -C ~/.local --strip-components=1

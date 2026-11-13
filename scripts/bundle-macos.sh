@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Builds dist/Kerno.app (ad-hoc signed) and dist/Kerno-<version>.dmg.
+# Builds dist/Kerno.app and dist/Kerno-<version>.dmg.
 #   scripts/bundle-macos.sh
+# Signed with the identity in KERNO_SIGN_IDENTITY when it is set (a name or
+# hash `security find-identity -v -p codesigning` lists), ad hoc otherwise.
+# An ad-hoc signature changes with every build, so the keychain asks again
+# for Kerno's saved passwords after each rebuild; a stable identity keeps
+# "Always allow" across builds.
 # Then launches the bundle once on a scratch data directory and an
 # in-memory secret store, waits for its window and quits it.
 # KERNO_SKIP_LAUNCH_CHECK=1 skips that check (CI, no display).
@@ -47,7 +52,13 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$app/Contents/Info.plist"
 
-codesign --force --deep --sign - "$app"
+if [ -n "${KERNO_SIGN_IDENTITY:-}" ]; then
+  codesign --force --deep --options runtime --sign "$KERNO_SIGN_IDENTITY" "$app"
+  echo "signed with the identity \"$KERNO_SIGN_IDENTITY\""
+else
+  codesign --force --deep --sign - "$app"
+  echo "signed ad hoc (set KERNO_SIGN_IDENTITY to sign with a stable identity)"
+fi
 codesign --verify --deep --strict --verbose=2 "$app"
 echo "bundle: $app ($(du -sh "$app" | cut -f1))"
 

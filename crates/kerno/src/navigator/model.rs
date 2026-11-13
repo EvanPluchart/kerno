@@ -2,7 +2,7 @@
 //! filter lets through. Nothing here touches the UI or a server; the view
 //! asks for [`Load`]s, runs them and gives the answers back.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use kerno_core::config::ObjectFilter;
 use kerno_core::schema::{
@@ -186,6 +186,8 @@ pub struct Tree {
     /// The folders that were open under a node being refreshed, to open
     /// again when its new children arrive.
     reopen: HashMap<String, Vec<String>>,
+    /// The database the connection's session is in, when it is listed.
+    default: Option<String>,
 }
 
 impl Tree {
@@ -196,9 +198,10 @@ impl Tree {
         }
     }
 
-    /// Replaces the tree with the server's databases, user databases first.
-    /// `current` (the database of the connection) is opened; the returned
-    /// load fetches what is in it.
+    /// Replaces the tree with the server's databases: `current` (the
+    /// database of the connection, its default) first and opened, then the
+    /// user databases, then the system ones. The returned load fetches what
+    /// is in `current`.
     pub fn set_databases(
         &mut self,
         databases: Vec<DatabaseInfo>,
@@ -207,9 +210,14 @@ impl Tree {
         let (system, user): (Vec<_>, Vec<_>) = databases
             .into_iter()
             .partition(|database| database.is_system);
-        self.roots = user
+        let (default, others): (Vec<_>, Vec<_>) = user
             .into_iter()
             .chain(system)
+            .partition(|database| Some(database.name.as_str()) == current);
+        self.default = default.first().map(|database| database.name.clone());
+        self.roots = default
+            .into_iter()
+            .chain(others)
             .map(|database| Node {
                 id: format!("db:{}", database.name),
                 kind: NodeKind::Object(ObjectRef::Database(database.name.clone())),
@@ -222,12 +230,13 @@ impl Tree {
                 expanded: false,
             })
             .collect();
-        let current = self
-            .roots
-            .iter()
-            .find(|node| Some(node.label.as_str()) == current)?;
-        let id = current.id.clone();
+        let id = format!("db:{}", self.default.clone()?);
         self.expand(&id)
+    }
+
+    /// The database the connection's session is in, when it is listed.
+    pub fn default_database(&self) -> Option<&str> {
+        self.default.as_deref()
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {
@@ -1007,6 +1016,194 @@ pub fn is_note(id: &str) -> bool {
 /// The id of the node (or, for a note, of the node) just above `id`.
 pub fn parent_of(id: &str) -> Option<&str> {
     id.rfind(SEP).map(|at| &id[..at])
+}
+
+// The sidebar's one tree ------------------------------------------------------
+
+/// Separates a connection (or folder) from a row under it in the sidebar's
+/// tree; not [`SEP`], which separates the segments of a node id.
+const ROW_SEP: char = '\u{1e}';
+
+/// The local ids of the lines a connection shows under it instead of its
+/// databases: what is happening, or what went wrong (a headline, what to
+/// do next, the server's own words) and a "Try again" button.
+pub const LINE_STATUS: &str = "line:status";
+pub const LINE_ERROR: &str = "line:error";
+pub const LINE_NEXT: &str = "line:next";
+pub const LINE_DETAIL: &str = "line:detail";
+pub const LINE_RETRY: &str = "line:retry";
+
+/// What a row of the sidebar's tree is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowId<'a> {
+    /// A folder of connections, by path.
+    Folder(&'a str),
+    /// The line an empty folder shows.
+    FolderNote(&'a str),
+    /// A saved connection, by id.
+    Connection(&'a str),
+    /// A row under a connection: a node of its [`Tree`] (or a note of it)
+    /// by its id there, or one of the `LINE_*` lines.
+    Object { connection: &'a str, local: &'a str },
+}
+
+pub fn folder_row(path: &str) -> String {
+    format!("f:{path}")
+}
+
+pub fn connection_row(id: &str) -> String {
+    format!("c:{id}")
+}
+
+pub fn object_row(connection: &str, local: &str) -> String {
+    format!("c:{connection}{ROW_SEP}{local}")
+}
+
+/// What the row `id` (built by the functions above) is.
+pub fn parse_row(id: &str) -> Option<RowId<'_>> {
+    if let Some(path) = id.strip_prefix("f:") {
+        return Some(match path.split_once(ROW_SEP) {
+            Some((path, _)) => RowId::FolderNote(path),
+            None => RowId::Folder(path),
+        });
+    }
+    let connection = id.strip_prefix("c:")?;
+    Some(match connection.split_once(ROW_SEP) {
+        Some((connection, local)) => RowId::Object { connection, local },
+        None => RowId::Connection(connection),
+    })
+}
+
+/// Whether a local id is a line of text rather than a node.
+pub fn is_line(local: &str) -> bool {
+    local.starts_with("line:") || is_note(local)
+}
+
+/// A saved connection as the sidebar lists it: id, name, folder.
+pub type Listed = (String, String, Option<String>);
+
+/// The rows of the sidebar's one tree, as DBeaver's database navigator:
+/// folders then connections, depth first, and under each open connection
+/// what `subtree` gives for it (rows with ids local to the connection, the
+/// filter already applied). With a `filter` (lowercase), a connection whose
+/// name matches is kept, and a folder or connection that does not match is
+/// kept when something below it is, shown open.
+pub fn sidebar_items(
+    folders: &[String],
+    saved: &[Listed],
+    collapsed: &BTreeSet<String>,
+    expanded: &HashSet<String>,
+    filter: &str,
+    subtree: impl Fn(&str) -> Vec<Item>,
+) -> Vec<Item> {
+    level(
+        None,
+        &Level {
+            folders,
+            saved,
+            collapsed,
+            expanded,
+            filter,
+            subtree: &subtree,
+        },
+    )
+}
+
+/// What every level of [`sidebar_items`] reads.
+struct Level<'a> {
+    folders: &'a [String],
+    saved: &'a [Listed],
+    collapsed: &'a BTreeSet<String>,
+    expanded: &'a HashSet<String>,
+    filter: &'a str,
+    subtree: &'a dyn Fn(&str) -> Vec<Item>,
+}
+
+fn level(parent: Option<&str>, all: &Level) -> Vec<Item> {
+    let filtering = !all.filter.is_empty();
+    let folders = all
+        .folders
+        .iter()
+        .filter(|folder| kerno_core::config::parent_folder(folder) == parent)
+        .filter_map(|folder| {
+            let children = level(Some(folder), all);
+            if filtering && children.is_empty() {
+                return None;
+            }
+            let children = if children.is_empty() {
+                vec![line(
+                    format!("{}{ROW_SEP}note", folder_row(folder)),
+                    "Empty",
+                )]
+            } else {
+                children
+            };
+            Some(Item {
+                id: folder_row(folder),
+                label: kerno_core::config::last_folder_name(folder).to_string(),
+                expanded: filtering || !all.collapsed.contains(folder),
+                children,
+            })
+        });
+    let connections = all
+        .saved
+        .iter()
+        .filter(|(_, _, folder)| folder.as_deref() == parent)
+        .filter_map(|(id, name, _)| {
+            let open = all.expanded.contains(id);
+            let matched = filtering && name.to_lowercase().contains(all.filter);
+            // A closed connection still needs a child for its chevron.
+            let children: Vec<Item> = if open || filtering {
+                (all.subtree)(id)
+                    .into_iter()
+                    .map(|item| prefixed(id, item))
+                    .collect()
+            } else {
+                vec![line(object_row(id, LINE_STATUS), "")]
+            };
+            let found = filtering
+                && children.iter().any(|child| {
+                    !matches!(parse_row(&child.id), Some(RowId::Object { local, .. }) if is_line(local))
+                });
+            if filtering && !matched && !found {
+                return None;
+            }
+            Some(Item {
+                id: connection_row(id),
+                label: name.clone(),
+                expanded: open || (found && !matched),
+                children: if children.is_empty() {
+                    vec![line(object_row(id, LINE_STATUS), "")]
+                } else {
+                    children
+                },
+            })
+        });
+    folders.chain(connections).collect()
+}
+
+/// A line of text.
+fn line(id: String, label: &str) -> Item {
+    Item {
+        id,
+        label: label.into(),
+        expanded: false,
+        children: Vec::new(),
+    }
+}
+
+/// A row of a connection's tree with ids of the sidebar's tree.
+fn prefixed(connection: &str, item: Item) -> Item {
+    Item {
+        id: object_row(connection, &item.id),
+        label: item.label,
+        expanded: item.expanded,
+        children: item
+            .children
+            .into_iter()
+            .map(|child| prefixed(connection, child))
+            .collect(),
+    }
 }
 
 fn matches(node: &Node, filter: &str) -> bool {
@@ -1872,6 +2069,182 @@ mod tests {
                 format!("db:kerno{SEP}tables{SEP}rel:orders"),
             ]
         );
+    }
+
+    #[test]
+    fn the_default_database_comes_first_then_the_others_closed() {
+        let mut tree = Tree::new(true);
+        let load = tree.set_databases(
+            vec![
+                database("kerno", false),
+                database("template1", true),
+                database("kerno_other", false),
+            ],
+            Some("kerno_other"),
+        );
+        assert_eq!(load.map(|load| load.id), Some("db:kerno_other".to_string()));
+        assert_eq!(tree.default_database(), Some("kerno_other"));
+        assert_eq!(
+            outline(&tree.items()),
+            ["v kerno_other", "  Loading…", "> kerno", "> template1"]
+        );
+        // A default the server does not list marks nothing.
+        tree.set_databases(vec![database("kerno", false)], Some("gone"));
+        assert_eq!(tree.default_database(), None);
+    }
+
+    #[test]
+    fn row_ids_round_trip() {
+        assert_eq!(
+            parse_row(&folder_row("Work/Clients")),
+            Some(RowId::Folder("Work/Clients"))
+        );
+        assert_eq!(
+            parse_row(&connection_row("c1")),
+            Some(RowId::Connection("c1"))
+        );
+        let local = format!("db:kerno{SEP}schema:shop");
+        assert_eq!(
+            parse_row(&object_row("c1", &local)),
+            Some(RowId::Object {
+                connection: "c1",
+                local: &local
+            })
+        );
+        assert_eq!(
+            parse_row(&format!("{}{ROW_SEP}note", folder_row("Work"))),
+            Some(RowId::FolderNote("Work"))
+        );
+        assert_eq!(parse_row("db:kerno"), None);
+        assert!(is_line(LINE_RETRY) && is_line(&format!("db:kerno{SEP}note")));
+        assert!(!is_line("db:kerno"));
+    }
+
+    /// The labels of the sidebar's rows that are shown, indented by depth,
+    /// open rows marked.
+    fn sidebar(
+        folders: &[&str],
+        saved: &[(&str, &str, Option<&str>)],
+        collapsed: &[&str],
+        expanded: &[&str],
+        filter: &str,
+        subtree: impl Fn(&str) -> Vec<Item>,
+    ) -> Vec<String> {
+        let folders: Vec<String> = folders.iter().map(|f| f.to_string()).collect();
+        let saved: Vec<Listed> = saved
+            .iter()
+            .map(|(id, name, folder)| {
+                (id.to_string(), name.to_string(), folder.map(str::to_string))
+            })
+            .collect();
+        let collapsed = collapsed.iter().map(|f| f.to_string()).collect();
+        let expanded = expanded.iter().map(|id| id.to_string()).collect();
+        outline(&sidebar_items(
+            &folders, &saved, &collapsed, &expanded, filter, subtree,
+        ))
+    }
+
+    #[test]
+    fn folders_then_connections_depth_first() {
+        let rows = sidebar(
+            &["Work", "Work/Clients", "Zed"],
+            &[
+                ("a", "alpha", None),
+                ("b", "beta", Some("Work")),
+                ("c", "gamma", Some("Work/Clients")),
+            ],
+            &["Zed"],
+            &["b"],
+            "",
+            |id| vec![line(format!("db:{id}"), "kerno")],
+        );
+        assert_eq!(
+            rows,
+            [
+                "v Work",
+                "  v Clients",
+                "    > gamma",
+                "  v beta",
+                "    kerno",
+                // An empty folder still opens and closes.
+                "> Zed",
+                "> alpha",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_filter_keeps_the_way_to_a_match() {
+        let (tree, _) = loaded();
+        let mut filtered = Tree::new(true);
+        filtered.set_databases(vec![database("kerno", false)], None);
+        filtered.set_filter("orders");
+        let subtree = |id: &str| match id {
+            "a" => tree.items(),
+            _ => filtered.items(),
+        };
+        let saved = [
+            ("a", "shop db", Some("Work")),
+            ("b", "other", None),
+            ("c", "idle", None),
+        ];
+        // A connection's name: kept with all it holds, closed as it was.
+        assert_eq!(
+            sidebar(&["Work", "Empty"], &saved, &[], &[], "shop", subtree),
+            ["v Work", "  > shop db"]
+        );
+        // Nothing matches below "other" or "idle": both go, and so does the
+        // empty folder.
+        let mut found = Tree::new(true);
+        found.set_databases(vec![database("orders_archive", false)], None);
+        let subtree = |id: &str| match id {
+            "b" => found.items(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            sidebar(
+                &["Work", "Empty"],
+                &saved,
+                &["Work"],
+                &[],
+                "orders",
+                subtree
+            ),
+            ["v other", "  > orders_archive"]
+        );
+    }
+
+    #[test]
+    fn the_sidebar_rows_of_thousands_of_objects_are_built_quickly() {
+        // Three connections, each with a schema of 3,000 tables open.
+        let mut objects = objects();
+        objects.relations = (0..3_000)
+            .map(|index| relation(&format!("table_{index}"), RelationKind::Table))
+            .collect();
+        let trees: Vec<Tree> = (0..3)
+            .map(|_| {
+                let mut tree = Tree::new(true);
+                tree.set_databases(vec![database("kerno", false)], Some("kerno"));
+                tree.finish("db:kerno", Ok(Loaded::Schemas(vec![schema("shop", false)])));
+                let shop = format!("db:kerno{SEP}schema:shop");
+                tree.expand(&shop);
+                tree.finish(&shop, Ok(Loaded::Objects(Box::new(objects.clone()))));
+                tree.expand(&format!("{shop}{SEP}tables"));
+                tree
+            })
+            .collect();
+        let saved: Vec<Listed> = (0..3)
+            .map(|index| (index.to_string(), format!("db {index}"), None))
+            .collect();
+        let expanded = saved.iter().map(|(id, _, _)| id.clone()).collect();
+        let started = std::time::Instant::now();
+        let items = sidebar_items(&[], &saved, &BTreeSet::new(), &expanded, "", |id| {
+            trees[id.parse::<usize>().unwrap()].items()
+        });
+        let took = started.elapsed();
+        eprintln!("sidebar_items over 9,000 tables: {took:?}");
+        assert!(outline(&items).len() > 9_000);
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

@@ -1,34 +1,31 @@
-//! The sidebar: saved connections in their folders, with their live status
-//! and a context menu on every part (the empty area, a folder, a
-//! connection), modelled on DBeaver's database navigator.
+//! The sidebar: its header, its empty state, and the one tree of folders,
+//! connections and their objects (see [`Navigator`]); the menus of the
+//! empty area, of a folder and of a connection, modelled on DBeaver's
+//! database navigator, are defined and carried out here.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
-    Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::{connection_url, in_folder, last_folder_name, parent_folder};
 use kerno_core::storage::SavedConnection;
 
 use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
-use crate::connections::manager::{Connections, ConnectionsEvent, Status, folder_of};
-use crate::engine_logo::engine_logo;
+use crate::connections::manager::{Connections, Status, folder_of};
 use crate::navigator::view::Navigator;
 use crate::state::AppState;
-use crate::theme;
 
 /// What a sidebar menu is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +48,8 @@ pub enum SidebarAction {
     Paste,
     Refresh,
     CollapseAll,
+    /// DBeaver's toggle, as it is now (a checked entry).
+    LinkWithEditor(bool),
     NewConnectionHere,
     NewSubfolder,
     Rename,
@@ -87,6 +86,7 @@ impl SidebarAction {
             Self::Paste => "Paste",
             Self::Refresh => "Refresh",
             Self::CollapseAll => "Collapse all",
+            Self::LinkWithEditor(_) => "Link with editor",
             Self::NewConnectionHere => "New connection here…",
             Self::NewSubfolder => "New subfolder…",
             Self::Rename => "Rename…",
@@ -121,19 +121,20 @@ pub enum Entry {
     Separator,
 }
 
-/// The menu of `subject`. `status` and `read_only` are the connection's
-/// (ignored for the other subjects); `folders` are every folder; `folder`
-/// is where the connection is; `open` counts the connections open that a
-/// disconnection would close: all of them for the list, those in the
-/// folder, the others for a connection; `copied` says a connection was
-/// copied, for Paste.
+/// The menu of `subject`. `status` is the connection's (ignored for the
+/// other subjects); `checked` is the state of the menu's checked entry:
+/// the connection's read-only flag, or Link with editor for the list;
+/// `folders` are every folder; `folder` is where the connection is; `open`
+/// counts the connections open that a disconnection would close: all of
+/// them for the list, those in the folder, the others for a connection;
+/// `copied` says a connection was copied, for Paste.
 pub fn menu(
     subject: &Subject,
     status: &Status,
     folders: &[String],
     folder: Option<&str>,
     open: usize,
-    read_only: bool,
+    checked: bool,
     copied: bool,
 ) -> Vec<Entry> {
     use Entry::{Item, Separator, Submenu};
@@ -149,7 +150,8 @@ pub fn menu(
             Item(Paste, (!copied).then_some("no connection copied")),
             Separator,
             enabled(Refresh),
-            Item(CollapseAll, folders.is_empty().then_some("no folders")),
+            enabled(CollapseAll),
+            enabled(LinkWithEditor(checked)),
             Separator,
             Item(DisconnectAll, none_open),
         ],
@@ -189,7 +191,7 @@ pub fn menu(
                 Item(Disconnect, closed.then_some("not connected")),
                 Item(Reconnect, not_connected),
                 Item(DisconnectOthers, (open == 0).then_some("no other open")),
-                enabled(ReadOnly(read_only)),
+                enabled(ReadOnly(checked)),
                 Separator,
                 enabled(NewSqlEditor),
                 Item(Administration, not_connected),
@@ -235,9 +237,9 @@ pub enum SidebarEvent {
 
 /// A connection row being dragged onto a folder.
 #[derive(Clone)]
-struct DraggedConnection {
-    id: String,
-    name: SharedString,
+pub(crate) struct DraggedConnection {
+    pub(crate) id: String,
+    pub(crate) name: SharedString,
 }
 
 impl Render for DraggedConnection {
@@ -259,13 +261,8 @@ impl Render for DraggedConnection {
 /// The sidebar view.
 pub struct Sidebar {
     connections: Entity<Connections>,
-    /// The connection last clicked.
-    selected: Option<String>,
-    /// The schema tree of the selected connection.
+    /// The one tree of folders, connections and their objects.
     navigator: Entity<Navigator>,
-    /// The list of connections, which takes Enter and F4 once a row is
-    /// clicked (key context `ConnectionList`).
-    focus_handle: FocusHandle,
     /// The connection whose Copy ▸ was used last: what Paste duplicates.
     /// Only its id is kept, never a secret, and nothing of it goes to the
     /// clipboard but what was copied.
@@ -282,74 +279,39 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let navigator = cx.new(|cx| Navigator::new(connections.clone(), window, cx));
-        let subscriptions = vec![
-            cx.observe(&connections, |_, _, cx| cx.notify()),
-            // A connection that has just opened is the one to browse.
-            cx.subscribe(
-                &connections,
-                |this, connections, event: &ConnectionsEvent, cx| {
-                    if let ConnectionsEvent::StatusChanged { id } = event
-                        && matches!(connections.read(cx).status(id), Status::Connected { .. })
-                    {
-                        this.select(id.clone(), cx);
-                    }
-                },
-            ),
-        ];
+        let sidebar = cx.weak_entity();
+        let navigator = cx.new(|cx| Navigator::new(connections.clone(), sidebar, window, cx));
+        let subscriptions = vec![cx.observe(&connections, |_, _, cx| cx.notify())];
         Self {
             connections,
-            selected: None,
             navigator,
-            focus_handle: cx.focus_handle(),
             copied: None,
             _subscriptions: subscriptions,
         }
     }
 
-    /// The schema tree shown under the connections.
+    /// The one tree of folders, connections and their objects.
     pub fn navigator(&self) -> &Entity<Navigator> {
         &self.navigator
     }
 
-    /// Selects a connection in the list and shows its tree.
-    pub fn select(&mut self, id: String, cx: &mut Context<Self>) {
-        self.selected = Some(id.clone());
-        self.navigator
-            .update(cx, |navigator, cx| navigator.set_connection(Some(id), cx));
-        cx.notify();
+    /// The connection of the selected row, otherwise the one opened last.
+    pub fn selected(&self, cx: &App) -> Option<String> {
+        self.navigator.read(cx).connection().map(str::to_string)
     }
 
-    /// Browses a connection, connecting it first when it is closed: what a
-    /// double click and Enter do (DBeaver's default). Disconnecting is the
-    /// menu's.
-    fn open(&mut self, id: String, cx: &mut Context<Self>) {
-        self.select(id.clone(), cx);
-        self.connections.update(cx, |connections, cx| {
-            if matches!(
-                connections.status(&id),
-                Status::Disconnected | Status::Failed { .. }
-            ) {
-                connections.connect(&id, cx)
-            }
-        });
-    }
-
-    /// The connection selected in the list.
-    pub fn selected(&self) -> Option<&str> {
-        self.selected.as_deref()
-    }
-
-    /// What Enter does to the selected connection.
+    /// What Enter does to the selected connection: browses it, connecting
+    /// it first when it is closed (DBeaver's default).
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected.clone() {
-            self.open(id, cx);
+        if let Some(id) = self.selected(cx) {
+            self.navigator
+                .update(cx, |navigator, cx| navigator.open_connection(&id, cx));
         }
     }
 
     /// What F4 does to the selected connection: opens its dialog.
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected.clone() {
+        if let Some(id) = self.selected(cx) {
             Self::edit(self.connections.clone(), id, window, cx);
         }
     }
@@ -357,7 +319,7 @@ impl Sidebar {
     /// The menu of `subject` as it stands now.
     pub fn menu_of(&self, subject: &Subject, cx: &App) -> Vec<Entry> {
         let connections = self.connections.read(cx);
-        let (status, folder, read_only) = match subject {
+        let (status, folder, checked) = match subject {
             Subject::Connection(id) => {
                 let saved = connections.get(id);
                 (
@@ -366,7 +328,12 @@ impl Sidebar {
                     saved.is_some_and(|saved| saved.config.read_only),
                 )
             }
-            _ => (Status::Disconnected, None, false),
+            Subject::List => (
+                Status::Disconnected,
+                None,
+                AppState::get(cx).settings.link_with_editor,
+            ),
+            Subject::Folder(_) => (Status::Disconnected, None, false),
         };
         menu(
             subject,
@@ -374,7 +341,7 @@ impl Sidebar {
             &connections.folders(cx),
             folder.as_deref(),
             self.closing(subject, cx).len(),
-            read_only,
+            checked,
             self.copied_connection(cx).is_some(),
         )
     }
@@ -448,34 +415,50 @@ impl Sidebar {
                 });
             }
             (Subject::List, ImportConnections) => cx.emit(SidebarEvent::ImportConnections),
-            (Subject::List, Refresh) => connections.update(cx, |c, cx| c.reload(cx)),
+            // The list is read again, and every tree being browsed.
+            (Subject::List, Refresh) => {
+                connections.update(cx, |c, cx| c.reload(cx));
+                self.navigator
+                    .update(cx, |navigator, cx| navigator.reload_all(cx));
+            }
             // DBeaver pastes a copied connection as a new one.
             (Subject::List, Paste) => {
                 if let Some(copied) = self.copied_connection(cx) {
                     connections.update(cx, |c, cx| c.duplicate(&copied, cx))
                 }
             }
-            // The folder's list is read again, and the tree when it shows a
-            // connection of the folder; nothing is reconnected.
+            // The folder's list is read again, and the trees of the
+            // connections in it; nothing is reconnected.
             (Subject::Folder(path), Refresh) => {
                 connections.update(cx, |c, cx| c.reload(cx));
-                let shown = self.navigator.read(cx).connection().map(str::to_string);
-                let inside = shown
-                    .and_then(|id| connections.read(cx).get(&id).cloned())
-                    .and_then(|saved| folder_of(&saved.config))
-                    .is_some_and(|folder| in_folder(&folder, path));
-                if inside {
-                    self.navigator
-                        .update(cx, |navigator, cx| navigator.reload(cx));
-                }
+                let inside: Vec<String> = connections
+                    .read(cx)
+                    .saved()
+                    .iter()
+                    .filter(|saved| {
+                        folder_of(&saved.config).is_some_and(|folder| in_folder(&folder, path))
+                    })
+                    .map(|saved| saved.id.clone())
+                    .collect();
+                self.navigator.update(cx, |navigator, cx| {
+                    for id in &inside {
+                        navigator.reload(id, cx);
+                    }
+                });
             }
+            // Folders and connections close; nothing is disconnected.
             (Subject::List, CollapseAll) => {
                 let folders = connections.read(cx).folders(cx);
                 AppState::update_settings(cx, |settings| {
                     settings.collapsed_folders = folders.into_iter().collect()
                 });
-                cx.notify();
+                self.navigator
+                    .update(cx, |navigator, cx| navigator.collapse_connections(cx));
             }
+            // The window runs it, once the menu has given the focus back.
+            (Subject::List, LinkWithEditor(_)) => window.defer(cx, |window, cx| {
+                window.dispatch_action(Box::new(crate::actions::LinkWithEditor), cx)
+            }),
             (Subject::Folder(path), Rename) => {
                 let path = path.clone();
                 let current = last_folder_name(&path).to_string();
@@ -537,9 +520,10 @@ impl Sidebar {
                 }
             }
             (Subject::Connection(_), Refresh) => {
-                self.select(id, cx);
-                self.navigator
-                    .update(cx, |navigator, cx| navigator.reload(cx));
+                self.navigator.update(cx, |navigator, cx| {
+                    navigator.select_connection(&id, cx);
+                    navigator.reload(&id, cx);
+                });
             }
             (Subject::Connection(_), CopyName | CopyUrl | CopyHost) => {
                 let Some(saved) = saved else {
@@ -649,29 +633,23 @@ impl Sidebar {
     }
 
     /// Fills `menu` with `entries`, each running on `subject`.
-    fn fill_menu(
+    pub(crate) fn fill_menu(
         sidebar: Entity<Self>,
         subject: Subject,
         entries: Vec<Entry>,
         mut menu: PopupMenu,
         window: &mut Window,
-        cx: &mut Context<PopupMenu>,
+        cx: &mut App,
     ) -> PopupMenu {
         for entry in entries {
             menu = match entry {
                 Entry::Separator => menu.separator(),
                 Entry::Submenu(label, entries) => {
                     let (sidebar, subject) = (sidebar.clone(), subject.clone());
-                    menu.submenu(label, window, cx, move |menu, window, cx| {
-                        Self::fill_menu(
-                            sidebar.clone(),
-                            subject.clone(),
-                            entries.clone(),
-                            menu,
-                            window,
-                            cx,
-                        )
-                    })
+                    let submenu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        Self::fill_menu(sidebar, subject, entries, menu, window, cx)
+                    });
+                    menu.item(PopupMenuItem::submenu(label, submenu))
                 }
                 Entry::Item(action, reason) => {
                     // An entry that cannot be used says why.
@@ -682,7 +660,10 @@ impl Sidebar {
                     let (sidebar, subject) = (sidebar.clone(), subject.clone());
                     menu.item(
                         PopupMenuItem::new(SharedString::from(label))
-                            .checked(action == SidebarAction::ReadOnly(true))
+                            .checked(matches!(
+                                action,
+                                SidebarAction::ReadOnly(true) | SidebarAction::LinkWithEditor(true)
+                            ))
                             .disabled(reason.is_some())
                             .on_click(move |_, window, cx| {
                                 sidebar.update(cx, |this, cx| {
@@ -708,218 +689,10 @@ impl Sidebar {
             Self::fill_menu(sidebar.clone(), subject.clone(), entries, menu, window, cx)
         }
     }
-
-    fn render_folder(
-        &self,
-        index: usize,
-        path: &str,
-        depth: usize,
-        open: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let count = self.connections.read(cx).count_in(path);
-        let toggled = path.to_string();
-        let target = path.to_string();
-        h_flex()
-            .id(("conn-folder", index))
-            .test_support()
-            .pl(px(12. + 14. * depth as f32))
-            .pr_3()
-            .py_1()
-            .gap_1p5()
-            .hover(|style| style.bg(theme.sidebar_accent))
-            .cursor_pointer()
-            .drag_over::<DraggedConnection>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedConnection, _, cx| {
-                    this.connections.update(cx, |c, cx| {
-                        c.move_connection(&dragged.id, Some(&target), cx)
-                    });
-                }),
-            )
-            .on_click(cx.listener(move |_, _, _, cx| {
-                set_collapsed(&toggled, open, cx);
-                cx.notify();
-            }))
-            .context_menu(self.context_menu_for(Subject::Folder(path.to_string()), cx))
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size_3()
-                .flex_none()
-                .text_color(theme.muted_foreground),
-            )
-            .child(
-                Icon::new(Glyph::Folder)
-                    .size_3p5()
-                    .flex_none()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .truncate()
-                    .child(SharedString::from(last_folder_name(path).to_string())),
-            )
-            .when(count > 0, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(count.to_string())),
-                )
-            })
-    }
-
-    fn render_row(
-        &self,
-        index: usize,
-        saved: &SavedConnection,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let config = &saved.config;
-        let status = self.connections.read(cx).status(&saved.id);
-        let tag = theme::connection_color(config, cx);
-        let (state_label, state_color) = match &status {
-            Status::Disconnected => ("", theme.muted_foreground),
-            Status::Connecting => ("connecting…", theme.muted_foreground),
-            Status::WaitingForInput => ("waiting for you", theme.warning),
-            Status::Connected { .. } => ("connected", theme.success),
-            Status::Failed { .. } => ("failed", theme.danger),
-        };
-        let failure = match &status {
-            Status::Failed { message } => Some(SharedString::from(message.clone())),
-            _ => None,
-        };
-        let selected = self.selected.as_deref() == Some(saved.id.as_str());
-        let indent = px(12. + 14. * depth as f32);
-        let dragged = DraggedConnection {
-            id: saved.id.clone(),
-            name: SharedString::from(config.name.clone()),
-        };
-
-        let id = saved.id.clone();
-        v_flex()
-            .id(("connection", index))
-            .test_support()
-            .pl(indent)
-            .pr_3()
-            .py_1()
-            .when(selected, |this| this.bg(theme.sidebar_accent))
-            .hover(|style| style.bg(theme.sidebar_accent))
-            .cursor_pointer()
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .on_click(cx.listener({
-                let id = id.clone();
-                move |this, event: &ClickEvent, window, cx| {
-                    this.focus_handle.focus(window, cx);
-                    if event.click_count() >= 2 {
-                        this.open(id.clone(), cx);
-                    } else {
-                        this.select(id.clone(), cx);
-                    }
-                }
-            }))
-            .context_menu(self.context_menu_for(Subject::Connection(id), cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    // The tag (or environment) colour, then the engine.
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(3.))
-                            .h(px(16.))
-                            .rounded_full()
-                            .bg(tag),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(engine_logo(config.engine, px(16.), cx)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .truncate()
-                            .child(SharedString::from(config.name.clone())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(if state_label.is_empty() {
-                                theme.muted_foreground
-                            } else {
-                                state_color
-                            })
-                            .child(if state_label.is_empty() {
-                                config.engine.label()
-                            } else {
-                                state_label
-                            }),
-                    ),
-            )
-            .when_some(failure, |this, message| {
-                this.child(
-                    div()
-                        .pl(px(16.))
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(message),
-                )
-            })
-    }
-
-    /// The rows of the folders and connections in `parent`, and of what
-    /// open folders hold, depth first: folders, then connections.
-    fn render_level(
-        &self,
-        parent: Option<&str>,
-        depth: usize,
-        folders: &[String],
-        saved: &[SavedConnection],
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        let collapsed = AppState::get(cx).settings.collapsed_folders.clone();
-        for (index, folder) in folders.iter().enumerate() {
-            if parent_folder(folder) != parent {
-                continue;
-            }
-            let open = !collapsed.contains(folder);
-            rows.push(
-                self.render_folder(index, folder, depth, open, cx)
-                    .into_any_element(),
-            );
-            if open {
-                self.render_level(Some(folder), depth + 1, folders, saved, rows, cx);
-            }
-        }
-        for (index, connection) in saved.iter().enumerate() {
-            if folder_of(&connection.config).as_deref() == parent {
-                rows.push(
-                    self.render_row(index, connection, depth, cx)
-                        .into_any_element(),
-                );
-            }
-        }
-    }
 }
 
 /// Opens or closes a folder of the sidebar; remembered in the settings.
-fn set_collapsed(path: &str, collapsed: bool, cx: &mut App) {
+pub(crate) fn set_collapsed(path: &str, collapsed: bool, cx: &mut App) {
     let path = path.to_string();
     AppState::update_settings(cx, move |settings| {
         if collapsed {
@@ -1005,40 +778,9 @@ fn ask_name(
 
 impl Render for Sidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let saved: Vec<SavedConnection> = self.connections.read(cx).saved().to_vec();
-        let folders = self.connections.read(cx).folders(cx);
-        let empty = saved.is_empty() && folders.is_empty();
-        let mut rows = Vec::new();
-        self.render_level(None, 0, &folders, &saved, &mut rows, cx);
-
+        let connections = self.connections.read(cx);
+        let empty = connections.saved().is_empty() && connections.folders(cx).is_empty();
         let theme = cx.theme();
-        // The list takes what it needs, up to a share of the sidebar; the
-        // schema tree gets the rest. Below the rows, an empty strip takes
-        // drops to the top level and offers the list's own menu.
-        let list = v_flex()
-            .id("connection-list")
-            .key_context("ConnectionList")
-            .track_focus(&self.focus_handle)
-            .flex_none()
-            .max_h(gpui_kit::relative(0.45))
-            .overflow_y_scroll()
-            .children(rows)
-            .child(
-                div()
-                    .id("connection-list-end")
-                    .test_support()
-                    .h(px(20.))
-                    .flex_none()
-                    .drag_over::<DraggedConnection>(|style, _, _, cx| {
-                        style.bg(cx.theme().drop_target)
-                    })
-                    .on_drop(cx.listener(|this, dragged: &DraggedConnection, _, cx| {
-                        this.connections
-                            .update(cx, |c, cx| c.move_connection(&dragged.id, None, cx));
-                    }))
-                    .context_menu(self.context_menu_for(Subject::List, cx)),
-            );
-
         let header = h_flex()
             .id("connections-header")
             .test_support()
@@ -1075,6 +817,7 @@ impl Render for Sidebar {
                 this.child(
                     v_flex()
                         .id("connections-empty")
+                        .flex_1()
                         .px_3()
                         .pt_2()
                         .gap_2()
@@ -1097,16 +840,7 @@ impl Render for Sidebar {
                         ),
                 )
             })
-            .when(!empty, |this| {
-                this.child(list).child(
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .border_t_1()
-                        .border_color(theme.sidebar_border)
-                        .child(self.navigator.clone()),
-                )
-            })
+            .when(!empty, |this| this.child(self.navigator.clone()))
     }
 }
 
@@ -1149,11 +883,15 @@ mod tests {
                 "Paste (no connection copied)",
                 "—",
                 "Refresh",
-                "Collapse all (no folders)",
+                "Collapse all",
+                "Link with editor",
                 "—",
                 "Disconnect all (none open)",
             ]
         );
+        // Link with editor is a checked entry that carries its state.
+        let linked = menu(&Subject::List, &disconnected, &[], None, 0, true, false);
+        assert!(linked.contains(&Entry::Item(SidebarAction::LinkWithEditor(true), None)));
         let folders = ["Work".to_string()];
         assert_eq!(
             labels(&menu(
@@ -1176,7 +914,7 @@ mod tests {
                 2,
                 false,
                 false
-            ))[9],
+            ))[10],
             "Disconnect all"
         );
         assert_eq!(

@@ -804,7 +804,7 @@ impl Workspace {
             .tabs
             .get(self.active_tab)
             .and_then(|tab| tab.connection(cx))
-            .or_else(|| self.sidebar.read(cx).selected().map(str::to_string));
+            .or_else(|| self.sidebar.read(cx).selected(cx));
         match connection {
             Some(connection) => Some(self.open_admin(&connection, window, cx)),
             None => {
@@ -987,11 +987,9 @@ impl Workspace {
         let Some((target, table, kind)) = linked else {
             return;
         };
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.select(target.connection.clone(), cx);
-            sidebar.navigator().update(cx, |navigator, cx| {
-                navigator.reveal(&target, &table, kind, cx)
-            });
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| {
+            navigator.reveal(&target, &table, kind, cx)
         });
     }
 
@@ -1619,9 +1617,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            NavigatorEvent::NewQuery { target } => {
-                self.new_query_on(Some(target.clone()), window, cx);
-            }
             NavigatorEvent::OpenQuery { title, sql, target } => {
                 self.push_query_tab(title.clone(), sql, target.clone(), window, cx);
                 self.activate_tab(self.tabs.len() - 1, window, cx);
@@ -1728,9 +1723,28 @@ impl Workspace {
     }
 
     /// Runs a key of the schema tree (or its palette command) on the
-    /// selected node.
+    /// selected row: on a folder or a connection, the sidebar's entry that
+    /// does the same (F2 renames, Delete deletes, F5 refreshes…).
     fn on_tree(&mut self, action: TreeAction, window: &mut Window, cx: &mut Context<Self>) {
         let navigator = self.sidebar.read(cx).navigator().clone();
+        if let Some(subject) = navigator.read(cx).selected_subject(cx) {
+            let mapped = match (&subject, action) {
+                (_, TreeAction::Rename) => Some(SidebarAction::Rename),
+                (_, TreeAction::Drop) => Some(SidebarAction::Delete),
+                (_, TreeAction::Refresh) => Some(SidebarAction::Refresh),
+                (Subject::Connection(_), TreeAction::CopyName) => Some(SidebarAction::CopyName),
+                (Subject::Connection(_), TreeAction::NewQueryHere) => {
+                    Some(SidebarAction::NewSqlEditor)
+                }
+                _ => None,
+            };
+            if let Some(mapped) = mapped {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.perform(&subject, mapped, window, cx)
+                });
+            }
+            return;
+        }
         navigator.update(cx, |navigator, cx| {
             navigator.perform_on_selected(action, window, cx)
         });
@@ -2498,7 +2512,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let navigator = self.sidebar.read(cx).navigator().clone();
-        navigator.update(cx, |navigator, cx| navigator.reload(cx));
+        navigator.update(cx, |navigator, cx| {
+            if let Some(connection) = navigator.connection().map(str::to_string) {
+                navigator.reload(&connection, cx)
+            }
+        });
     }
 
     fn collapse_schema_tree(
@@ -2578,8 +2596,23 @@ impl Workspace {
                 if let (Status::Failed { message }, Some(saved)) =
                     (connections.status(id), connections.get(id))
                 {
-                    let text = format!("{}: {message}", saved.config.name);
-                    window.push_notification(Notification::error(SharedString::from(text)), cx);
+                    // In plain words first, the raw message below.
+                    let explained = kerno_core::error::explain(&message, &saved.config);
+                    let title = format!("{}: {}", saved.config.name, explained.headline);
+                    let raw = explained.raw.clone();
+                    window.push_notification(
+                        Notification::error(SharedString::from(explained.next_step))
+                            .title(SharedString::from(title))
+                            .content(move |_, _, cx| {
+                                crate::connections::dialog::raw_message(
+                                    "connection-failed-raw",
+                                    &raw,
+                                    cx,
+                                )
+                                .into_any_element()
+                            }),
+                        cx,
+                    );
                 }
             }
             ConnectionsEvent::Failed { message } => {
@@ -2954,20 +2987,43 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                // The connection's tag colour, as in the sidebar (CON-47).
-                let stripe = self.connection_color(tab.connection(cx).as_deref(), cx);
+                // The connection's tag as a dot, then its engine's logo; a
+                // production connection's title is tinted instead.
+                let config = self.connection_config(tab.connection(cx).as_deref(), cx);
+                let dot = config
+                    .as_ref()
+                    .and_then(|config| theme::connection_color(config, cx));
+                let production = config.as_ref().is_some_and(|config| {
+                    config.environment == kerno_core::Environment::Production
+                });
+                let danger = theme.danger;
                 Tab::new()
-                    .when_some(stripe, |tab, color| {
+                    .when_some(config.as_ref(), |tab, config| {
                         tab.prefix(
-                            div()
-                                .id(("tab-stripe", index))
-                                .test_support()
+                            h_flex()
                                 .flex_none()
                                 .ml_1()
-                                .w(px(3.))
-                                .h(px(14.))
-                                .rounded_full()
-                                .bg(color),
+                                .gap_1()
+                                .children(dot.map(|color| {
+                                    div()
+                                        .id(("tab-dot", index))
+                                        .test_support()
+                                        .flex_none()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(color)
+                                }))
+                                .child(
+                                    div()
+                                        .id(("tab-logo", index))
+                                        .test_support()
+                                        .flex_none()
+                                        .child(crate::engine_logo::engine_logo(
+                                            config.engine,
+                                            px(12.),
+                                            cx,
+                                        )),
+                                ),
                         )
                     })
                     // A middle click closes the tab, as in a browser.
@@ -2984,7 +3040,23 @@ impl Workspace {
                             .map(|title| marked(title, index))
                             .test_support()
                             .context_menu(self.menu(MenuOf::Tab(index), cx))
-                            .child(tab.label(cx)),
+                            .map(|title| {
+                                // The kit's tab paints its own background, so
+                                // the tint goes on the title.
+                                if production {
+                                    title.child(
+                                        div()
+                                            .id(("tab-production", index))
+                                            .test_support()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(danger.opacity(0.12))
+                                            .child(tab.label(cx)),
+                                    )
+                                } else {
+                                    title.child(tab.label(cx))
+                                }
+                            }),
                     )
                     .suffix(
                         Button::new(("close-tab", index))
@@ -3150,9 +3222,9 @@ impl Workspace {
                     .map(|saved| saved.config.clone())
             })
             .flatten();
-        let stripe = saved
+        let dot = saved
             .as_ref()
-            .map(|config| theme::connection_color(config, cx));
+            .and_then(|config| theme::connection_color(config, cx));
         let logo = saved.as_ref().map(|config| {
             div()
                 .id("status-connection-logo")
@@ -3162,15 +3234,14 @@ impl Workspace {
         });
         let text = h_flex()
             .gap_1p5()
-            .children(stripe.map(|stripe| {
+            .children(dot.map(|dot| {
                 div()
-                    .id("status-connection-stripe")
+                    .id("status-connection-dot")
                     .test_support()
                     .flex_none()
-                    .w(px(3.))
-                    .h(px(12.))
+                    .size(px(6.))
                     .rounded_full()
-                    .bg(stripe)
+                    .bg(dot)
             }))
             .children(logo)
             .child(div().text_color(color).child(text.into()));
@@ -3199,14 +3270,30 @@ impl Workspace {
         let theme = cx.theme();
         let (muted, warning) = (theme.muted_foreground, theme.warning);
         let memory_only = !AppState::get(cx).secrets.is_persistent();
+        // A production connection tints the whole bar.
+        let production = self
+            .connection_config(
+                self.tabs
+                    .get(self.active_tab)
+                    .and_then(|tab| tab.connection(cx))
+                    .as_deref(),
+                cx,
+            )
+            .is_some_and(|config| config.environment == kerno_core::Environment::Production);
         h_flex()
+            .id("status-bar")
+            .test_support()
             .h(px(24.))
             .px_3()
             .gap_3()
             .justify_between()
             .border_t_1()
             .border_color(theme.status_bar_border)
-            .bg(theme.status_bar)
+            .bg(if production {
+                theme.status_bar.blend(theme.danger.opacity(0.12))
+            } else {
+                theme.status_bar
+            })
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(
@@ -3237,11 +3324,9 @@ impl Workspace {
 type Then = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
 impl Workspace {
-    /// The colour that marks a saved connection (its tag, else its
-    /// environment's); `None` without one.
-    fn connection_color(&self, id: Option<&str>, cx: &App) -> Option<Hsla> {
-        let saved = self.connections.read(cx).get(id?)?;
-        Some(theme::connection_color(&saved.config, cx))
+    /// The settings of a saved connection, when there is one.
+    fn connection_config(&self, id: Option<&str>, cx: &App) -> Option<ConnectionConfig> {
+        Some(self.connections.read(cx).get(id?)?.config.clone())
     }
 
     fn connection_name(&self, id: &str, cx: &App) -> String {
@@ -3258,7 +3343,7 @@ impl Workspace {
         self.tabs
             .get(self.active_tab)
             .and_then(|tab| tab.connection(cx))
-            .or_else(|| self.sidebar.read(cx).selected().map(str::to_string))
+            .or_else(|| self.sidebar.read(cx).selected(cx))
     }
 
     /// Closes the connections `ids` once what their tabs hold is ended.
@@ -3910,7 +3995,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.sidebar.read(cx).selected().map(str::to_string) else {
+        let Some(id) = self.sidebar.read(cx).selected(cx) else {
             window.push_notification(
                 Notification::warning("Select a connection in the sidebar first."),
                 cx,
@@ -4260,7 +4345,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collapse_schema_tree))
             .on_action(cx.listener(|this, _: &EditObject, window, cx| {
                 let navigator = this.sidebar.read(cx).navigator().clone();
-                navigator.update(cx, |navigator, cx| navigator.edit_selected(window, cx));
+                // F4 on a connection edits it; on a folder, renames it.
+                let edit = match navigator.read(cx).selected_subject(cx) {
+                    Some(subject @ Subject::Connection(_)) => Some((subject, SidebarAction::Edit)),
+                    Some(subject) => Some((subject, SidebarAction::Rename)),
+                    None => None,
+                };
+                match edit {
+                    Some((subject, action)) => this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.perform(&subject, action, window, cx)
+                    }),
+                    None => {
+                        navigator.update(cx, |navigator, cx| navigator.edit_selected(window, cx))
+                    }
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &crate::actions::MaintenanceTools, window, cx| {
