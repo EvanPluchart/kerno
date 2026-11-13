@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-env="local">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kerno: a native database client for PostgreSQL, MySQL and MariaDB</title>
+<meta name="description" content="Kerno is a native, open-source database client for macOS and Linux, written in Rust. Run real SQL in the live window on this page, then download it.">
+<link rel="canonical" href="https://evanpluchart.github.io/kerno/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Kerno: the database client that never freezes">
+<meta property="og:description" content="A native, open-source client for PostgreSQL, MySQL and MariaDB on macOS and Linux. Try it in the page: the window runs real SQL.">
+<meta property="og:url" content="https://evanpluchart.github.io/kerno/">
+<meta property="og:image" content="https://evanpluchart.github.io/kerno/img/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="img/brand/kerno-app-icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="img/brand/kerno-256.png">
+<link rel="preload" href="fonts/inter-SemiBold.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/inter-Regular.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="css/site.css">
+<script>
+  // Before first paint: the stored theme, else the system's. No cookie, one localStorage key.
+  (function () {
+    var root = document.documentElement, stored = null;
+    try { stored = localStorage.getItem('kerno-theme'); } catch (e) {}
+    root.dataset.theme = stored || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    root.classList.add('js');
+    // If the module never runs, show the tiles anyway.
+    setTimeout(function () { if (!window.kernoReady) root.classList.remove('js'); }, 4000);
+  })();
+</script>
+<script type="module" src="js/main.js"></script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Kerno","applicationCategory":"DeveloperApplication","operatingSystem":"macOS, Linux","description":"A native, open-source database client for PostgreSQL, MySQL and MariaDB, written in Rust with GPUI.","license":"https://spdx.org/licenses/MIT.html","isAccessibleForFree":true,"url":"https://evanpluchart.github.io/kerno/","downloadUrl":"https://github.com/EvanPluchart/kerno/releases/latest","author":{"@type":"Person","name":"Evan Pluchart"}}
+</script>
+</head>
+<body>
+<a class="skip" href="#demo">Skip to the live demo</a>
+
+<header class="board">
+  <nav class="tile toolbar s12" aria-label="Main">
+    <a class="brand" href="#top" aria-label="Kerno, top of the page"><svg viewBox="0 0 820.852 256" width="96" height="30" role="img" aria-hidden="true"><path class="mark" transform="translate(0 0) scale(1)" d="M62 44H94A14 14 0 0 1 108 58V74A14 14 0 0 1 94 88H62A14 14 0 0 1 48 74V58A14 14 0 0 1 62 44Z M62 168H94A14 14 0 0 1 108 182V198A14 14 0 0 1 94 212H62A14 14 0 0 1 48 198V182A14 14 0 0 1 62 168Z M62 106H120V150H62A14 14 0 0 1 48 136V120A14 14 0 0 1 62 106Z M152 44H214L130 128L214 212H152L68 128Z"/><path class="word" transform="translate(258 212) scale(0.0931664)" d="M138 0V-1490H398V-667H417L820 -1118H1125L692 -635L1151 0H839L494 -479L398 -376V0ZM1757.04 23Q1588.04 23 1466.54 -48.0Q1345.04 -119 1279.54 -248.0Q1214.04 -377 1214.04 -552Q1214.04 -724 1278.54 -854.5Q1343.04 -985 1461.54 -1058.5Q1580.04 -1132 1740.04 -1132Q1876.04 -1132 1992.54 -1072.5Q2109.04 -1013 2180.04 -888.5Q2251.04 -764 2251.04 -568V-486H1473.04Q1478.04 -337 1556.54 -259.0Q1635.04 -181 1760.04 -181Q1846.04 -181 1907.54 -218.0Q1969.04 -255 1995.04 -326L2234.04 -277Q2194.04 -142 2068.54 -59.5Q1943.04 23 1757.04 23ZM1474.04 -663H1998.04Q1986.04 -783 1921.54 -855.5Q1857.04 -928 1741.04 -928Q1622.04 -928 1552.54 -851.5Q1483.04 -775 1474.04 -663ZM2433.08 0V-1118H2685.08V-931H2697.08Q2727.08 -1028 2802.08 -1080.5Q2877.08 -1133 2973.08 -1133Q3023.08 -1133 3068.08 -1126V-887Q3052.08 -891 3016.08 -895.5Q2980.08 -900 2945.08 -900Q2836.08 -900 2764.58 -832.5Q2693.08 -765 2693.08 -658V0ZM3465.12 -655V0H3205.12V-1118H3451.12L3454.12 -895Q3554.12 -1132 3800.12 -1132Q3973.12 -1132 4077.62 -1022.0Q4182.12 -912 4182.12 -711V0H3922.12V-671Q3922.12 -783 3864.12 -847.0Q3806.12 -911 3704.12 -911Q3600.12 -911 3532.62 -844.0Q3465.12 -777 3465.12 -655ZM4902.16 23Q4739.16 23 4619.16 -49.5Q4499.16 -122 4433.66 -251.5Q4368.16 -381 4368.16 -553Q4368.16 -727 4433.66 -857.5Q4499.16 -988 4619.16 -1060.0Q4739.16 -1132 4902.16 -1132Q5065.16 -1132 5185.16 -1060.0Q5305.16 -988 5371.16 -857.5Q5437.16 -727 5437.16 -553Q5437.16 -381 5371.16 -251.5Q5305.16 -122 5185.16 -49.5Q5065.16 23 4902.16 23ZM4902.16 -188Q4993.16 -188 5053.16 -237.0Q5113.16 -286 5143.16 -369.0Q5173.16 -452 5173.16 -554Q5173.16 -657 5143.16 -740.0Q5113.16 -823 5053.16 -872.0Q4993.16 -921 4902.16 -921Q4812.16 -921 4752.16 -872.0Q4692.16 -823 4662.66 -740.0Q4633.16 -657 4633.16 -554Q4633.16 -452 4662.66 -369.0Q4692.16 -286 4752.16 -237.0Q4812.16 -188 4902.16 -188Z"/></svg></a>
+    <ul class="toolbar-links">
+      <li><a href="#tour">Tour</a></li>
+      <li><a href="#performance">Performance</a></li>
+      <li><a href="#privacy">Privacy</a></li>
+      <li><a href="#install">Install</a></li>
+    </ul>
+    <button class="ghost palette-open" type="button" data-palette aria-haspopup="dialog">
+      <span>Search</span> <kbd><span class="mod">⌘</span>K</kbd>
+    </button>
+    <button class="ghost icon" type="button" id="theme-toggle" aria-label="Switch to the light theme">
+      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path class="moon" d="M16.5 12.2A7 7 0 0 1 7.8 3.5a7 7 0 1 0 8.7 8.7Z"/><g class="sun"><circle cx="10" cy="10" r="3.6"/><path d="M10 1.5v2.2M10 16.3v2.2M1.5 10h2.2M16.3 10h2.2M4 4l1.6 1.6M14.4 14.4 16 16M4 16l1.6-1.6M14.4 5.6 16 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></g></svg>
+    </button>
+    <a class="ghost" href="https://github.com/EvanPluchart/kerno">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+<!-- ───────────── Hero: the live window ───────────── -->
+<section class="board" id="hero" data-section="Live demo" aria-labelledby="h-hero">
+  <div class="tile s8 hero-title">
+    <h1 id="h-hero">The database client that never freezes.</h1>
+  </div>
+  <div class="stack s4">
+    <div class="tile hero-say">
+      <p class="statement">Kerno is a native, open-source client for PostgreSQL, MySQL and MariaDB on macOS and Linux, written in Rust. No query runs on the UI thread, so the window stays responsive while results stream in, and anything still running can be cancelled.</p>
+    </div>
+    <a class="tile lime action" href="https://github.com/EvanPluchart/kerno/releases/latest" data-reveal>
+      <span class="action-label">Download Kerno</span>
+      <span class="action-note">macOS and Linux, free</span>
+      <svg class="arrow" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><path d="M6 16h20M17 7l9 9-9 9" fill="none" stroke="currentColor" stroke-width="3.5"/></svg>
+    </a>
+  </div>
+
+  <div class="tile s9 win-tile" data-reveal>
+    <div class="win" id="demo" data-ui tabindex="-1">
+      <div class="win-title"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span>Kerno</span></div>
+      <div class="win-body">
+        <div class="win-side">
+          <p class="side-head">Connections</p>
+          <ul class="tree" aria-label="Objects of the demo database">
+            <li class="lv0"><span class="node"><i class="dot env-dot"></i><span class="js-conn">Shop (local)</span><small>connected</small></span></li>
+            <li class="lv1"><span class="node"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/></svg>kerno<em>default</em></span></li>
+            <li class="lv2"><span class="node"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="4.5" r="2.2"/><circle cx="4.5" cy="10.5" r="2.2"/><circle cx="11.5" cy="10.5" r="2.2"/></svg>shop</span></li>
+            <li class="lv3"><span class="node group">Tables<small>4</small></span></li>
+            <li class="lv4"><button type="button" data-table="shop.customers"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M6.5 6.5V13"/></svg>customers<small>120</small></button></li>
+            <li class="lv4"><button type="button" data-table="shop.order_items"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M6.5 6.5V13"/></svg>order_items<small>4.0k</small></button></li>
+            <li class="lv4"><button type="button" data-table="shop.orders"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M6.5 6.5V13"/></svg>orders<small>2.0k</small></button></li>
+            <li class="lv4"><button type="button" data-table="shop.products"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M6.5 6.5V13"/></svg>products<small>24</small></button></li>
+            <li class="lv3"><span class="node group">Views<small>1</small></span></li>
+            <li class="lv4"><button type="button" data-table="shop.revenue_by_country"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.100 12.500 8 12.500 1.500 8 1.500 8Z"/><circle cx="8" cy="8" r="1.8"/></svg>revenue_by_country</button></li>
+          </ul>
+        </div>
+        <div class="win-main">
+          <div class="win-tabs"><span class="tab"><i class="dot env-dot"></i>Query 1</span></div>
+          <div class="win-bar">
+            <span class="crumb"><b class="js-conn">Shop (local)</b><span>kerno</span><span>Auto-commit</span></span>
+            <button class="run" type="button" id="demo-run">Run <kbd><span class="mod">⌘</span>↵</kbd></button>
+          </div>
+          <div class="editor">
+            <div class="gutter" id="demo-gutter" aria-hidden="true">1</div>
+            <div class="code">
+              <pre id="demo-paint" aria-hidden="true"></pre>
+              <textarea id="demo-sql" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="SQL editor. Control or Command plus Enter runs the query."></textarea>
+            </div>
+          </div>
+          <div class="result" id="demo-result" role="region" aria-label="Query result" tabindex="0">
+            <noscript><p class="result-msg">The live window needs JavaScript. The captures of the real app further down do not.</p></noscript>
+          </div>
+        </div>
+      </div>
+      <div class="win-status" id="demo-status" role="status">
+        <span class="st-conn"><i class="dot env-dot"></i><span class="js-conn">Shop (local)</span></span>
+        <span>kerno</span>
+        <span id="st-rows"></span>
+        <span id="st-ms"></span>
+        <span class="st-note" id="st-note"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="tile s3 controls" data-reveal>
+    <h2 id="h-controls">Pick a connection</h2>
+    <div class="seg" role="radiogroup" aria-labelledby="h-controls">
+      <label><input type="radio" name="env" value="local" checked><span>Local</span></label>
+      <label><input type="radio" name="env" value="staging"><span>Staging</span></label>
+      <label><input type="radio" name="env" value="production"><span>Production</span></label>
+    </div>
+    <p class="env-note" id="env-note" aria-live="polite">No tint and no questions, except before a statement that would empty a table.</p>
+    <h3>Run a sample</h3>
+    <ul class="samples" id="samples"></ul>
+    <p class="fine">PostgreSQL runs in this page through PGlite (WebAssembly, about 5 MB, fetched on your first run). The timing shown is your browser's. <button class="link" type="button" id="demo-reset">Reset the demo data</button></p>
+  </div>
+</section>
+
+<!-- ───────────── Tour ───────────── -->
+<section class="board" id="tour" data-section="Tour" aria-labelledby="h-tour">
+  <div class="tile s12 head" data-reveal>
+    <h2 id="h-tour">A tour of the real app</h2>
+    <p>Kerno's feature set follows DBeaver Community, from the navigator to the backup wizards. These are captures of the app itself. Select one to see the full window.</p>
+  </div>
+
+  <a class="tile cell s8" href="img/full/explain-dark.webp" data-shot="explain" data-reveal>
+    <div class="cell-text"><h3>Plans you can read</h3><p>EXPLAIN and EXPLAIN ANALYZE open as a tree with cost, rows and time for each node, and the slowest node is marked. The raw output is one tab away.</p></div>
+    <div class="frag"><img data-themed src="img/tour/explain-dark.webp" width="1010" height="320" alt="An EXPLAIN ANALYZE plan in Kerno: a tree of nodes with cost, rows and time, the slowest step marked in red" loading="lazy" decoding="async"></div>
+  </a>
+  <a class="tile cell s4 flip" href="img/full/navigator-dark.webp" data-shot="navigator" data-reveal>
+    <div class="cell-text"><h3>A right-click everywhere</h3><p>One tree holds folders, connections, databases and objects. Every node has a context menu, down to a Tools submenu with backup, vacuum and the session manager.</p></div>
+    <div class="frag"><img data-themed src="img/tour/navigator-dark.webp" width="500" height="380" alt="The context menu of a table in Kerno's navigator, with its Tools submenu open" loading="lazy" decoding="async"></div>
+  </a>
+
+  <a class="tile cell s4 flip" href="img/full/production-dark.webp" data-shot="production" data-reveal>
+    <div class="cell-text"><h3>Production asks first</h3><p>An environment gives a connection a colour and rules. On production the window's chrome turns red, and a statement shows its SQL and waits for you.</p></div>
+    <div class="frag"><img data-themed src="img/tour/production-dark.webp" width="560" height="200" alt="Kerno asking, under a red Production band, before it runs a statement on a production connection" loading="lazy" decoding="async"></div>
+  </a>
+  <a class="tile cell s8" href="img/full/edits-dark.webp" data-shot="edits" data-reveal>
+    <div class="cell-text"><h3>Edits wait until you apply them</h3><p>Change cells, add rows, delete rows: the server sees none of it yet. Review the exact SQL, then apply everything in one transaction or discard it. If the apply fails it rolls back and your edits stay.</p></div>
+    <div class="frag"><img data-themed src="img/tour/edits-dark.webp" width="1010" height="280" alt="A table in Kerno with three pending changes highlighted, beside the Discard, Review SQL and Apply buttons" loading="lazy" decoding="async"></div>
+  </a>
+
+  <a class="tile cell s4" href="img/full/structure-dark.webp" data-shot="structure" data-reveal>
+    <div class="cell-text"><h3>Tables as a form</h3><p>Add, rename and retype columns, indexes and foreign keys in a form. The DDL preview follows as you type and runs once you confirm it.</p></div>
+    <div class="frag"><img data-themed src="img/tour/structure-dark.webp" width="500" height="280" alt="Kerno's table editor: one row per column with its name, type, nullability and default" loading="lazy" decoding="async"></div>
+  </a>
+  <a class="tile cell s4 flip" href="img/full/export-dark.webp" data-shot="export" data-reveal>
+    <div class="cell-text"><h3>Data in and out</h3><p>Export a table or a result as CSV, JSON, NDJSON, SQL INSERT or Markdown, streamed to disk with a cancel button. Import CSV with column mapping and a preview.</p></div>
+    <div class="frag"><img data-themed src="img/tour/export-dark.webp" width="500" height="260" alt="Kerno's export dialog with its format, delimiter, NULL text and encoding options" loading="lazy" decoding="async"></div>
+  </a>
+  <a class="tile cell s4" href="img/full/backup-dark.webp" data-shot="backup" data-reveal>
+    <div class="cell-text"><h3>Backups with your own pg_dump</h3><p>Backup and restore are wizards over the pg_dump, pg_restore and mysqldump already on your machine, with the tools' real options. Kerno finds every install and warns you when one is older than the server.</p></div>
+    <div class="frag"><img data-themed src="img/tour/backup-dark.webp" width="500" height="320" alt="The settings step of Kerno's backup wizard: the pg_dump client in use, format, compression, content and output folder" loading="lazy" decoding="async"></div>
+  </a>
+
+  <a class="tile cell s6 flip" href="img/full/connection-dark.webp" data-shot="connection" data-reveal>
+    <div class="cell-text"><h3>TLS and SSH built in</h3><p>Connections support five TLS modes with your own CA, certificate and key, and SSH tunnels by password, key file or agent. Passwords go to the system keychain, or stay in memory if you would rather be asked each time.</p></div>
+    <div class="frag"><img data-themed src="img/tour/connection-dark.webp" width="720" height="320" alt="Kerno's new connection dialog with General, SSL/TLS, SSH tunnel and Advanced tabs" loading="lazy" decoding="async"></div>
+  </a>
+  <a class="tile cell s6" href="img/full/palette-dark.webp" data-shot="palette" data-reveal>
+    <div class="cell-text"><h3>Everything from the keyboard</h3><p>The command palette reaches every action. <kbd><span class="mod">⌘</span>↵</kbd> runs the statement under the cursor and <kbd><span class="mod">⌘</span>.</kbd> cancels it. This page has a palette of its own: use Search.</p></div>
+    <div class="frag"><img data-themed src="img/tour/palette-dark.webp" width="720" height="175" alt="Kerno's command palette filtered to two matching commands" loading="lazy" decoding="async"></div>
+  </a>
+</section>
+
+<!-- ───────────── Performance ───────────── -->
+<section class="board" id="performance" data-section="Performance" aria-labelledby="h-perf">
+  <div class="tile s4 head" data-reveal>
+    <h2 id="h-perf">Measured against a budget</h2>
+    <p>Each bar is a budget from the project's spec, and the filled part is what the bench measured on a release build on Apple Silicon. The method and every run are in <a href="https://github.com/EvanPluchart/kerno/blob/main/docs/BENCH.md">docs/BENCH.md</a>.</p>
+  </div>
+  <!-- BENCH: the figures below come only from docs/BENCH.md. Until it is committed on main each
+       budget stays "pending" (no data-measured). To fill one: set data-measured, the figure text
+       and style="--fill: measured / budget". -->
+  <ul class="tile s8 budgets" data-ui data-reveal>
+    <li class="budget pending">
+      <p class="figure">Not measured yet</p>
+      <p class="what">Cold start to the first interactive frame. Budget: 400 ms.</p>
+      <div class="bar"><span class="fill"></span></div>
+    </li>
+    <li class="budget pending">
+      <p class="figure">Not measured yet</p>
+      <p class="what">Memory at idle with one connection and one query tab. Budget: 150 MB.</p>
+      <div class="bar"><span class="fill"></span></div>
+    </li>
+    <li class="budget pending">
+      <p class="figure">Not measured yet</p>
+      <p class="what">First rows on screen after the server starts sending. Budget: 150 ms.</p>
+      <div class="bar"><span class="fill"></span></div>
+    </li>
+    <li class="budget pending">
+      <p class="figure">Not measured yet</p>
+      <p class="what">Average frame while scrolling 1,000,000 rows. Budget: 16 ms.</p>
+      <div class="bar"><span class="fill"></span></div>
+    </li>
+  </ul>
+
+  <div class="tile s9 million-tile" data-reveal>
+    <div class="million" id="million" data-ui tabindex="0" role="group" aria-label="A grid of 1,000,000 generated rows. Scroll it, or use the arrow, Page and Home and End keys.">
+      <div class="m-head" aria-hidden="true"></div>
+      <div class="m-space"><div class="m-rows" aria-hidden="true"></div></div>
+    </div>
+  </div>
+  <div class="tile s3 million-say" data-reveal>
+    <h3>Scroll a million rows</h3>
+    <p>Kerno lays out only the rows and columns that are on screen, so a result scrolls the same whatever its size. This grid does the same thing in your browser, with 1,000,000 generated rows.</p>
+    <dl class="readout">
+      <div><dt>Top row</dt><dd id="m-top">1</dd></div>
+      <div><dt>Rows in the page</dt><dd id="m-dom">0</dd></div>
+      <div><dt>Frame rate here</dt><dd id="m-frame">n/a</dd></div>
+    </dl>
+    <form class="jump" id="m-jump">
+      <label for="m-row">Go to row</label>
+      <input id="m-row" type="number" inputmode="numeric" min="1" max="1000000" value="500000">
+      <button class="btn" type="submit">Go</button>
+    </form>
+  </div>
+</section>
+
+<!-- ───────────── Privacy ───────────── -->
+<section class="board" id="privacy" data-section="Privacy" aria-labelledby="h-privacy">
+  <div class="tile s6 lime head" data-reveal>
+    <h2 id="h-privacy">Your data stays on your machine</h2>
+    <p>A database client sees your credentials and your data. Kerno keeps both to itself.</p>
+  </div>
+  <div class="tile s3 fact" data-reveal><h3>No telemetry</h3><p>Kerno has no analytics and no crash upload, so there is no setting to opt out of.</p></div>
+  <div class="tile s3 fact" data-reveal><h3>One request</h3><p>The update check asks GitHub for the latest release and sends no identifier. You can turn it off.</p></div>
+  <div class="tile s3 fact" data-reveal><h3>Your keychain</h3><p>Passwords and passphrases go to the macOS Keychain or the Linux Secret Service. They are never written to disk in plain text or to a log.</p></div>
+  <div class="tile s3 fact" data-reveal><h3>Checked updates</h3><p>An update installs only after its SHA-256 matches the release's SHA256SUMS file.</p></div>
+  <div class="tile s3 fact" data-reveal><h3>Open source</h3><p>MIT or Apache-2.0, your choice. The code is on GitHub and every dependency licence is checked with cargo deny.</p></div>
+  <div class="tile s3 fact" data-reveal><h3>This page too</h3><p>This page sets no cookie, loads no tracker and serves its own fonts. Its one outside file is PGlite, fetched when you run a query.</p></div>
+</section>
+
+<!-- ───────────── Install ───────────── -->
+<section class="board" id="install" data-section="Install" aria-labelledby="h-install">
+  <div class="tile s4 head" data-reveal>
+    <h2 id="h-install">Install Kerno</h2>
+    <p>Builds for macOS and Linux are on the <a href="https://github.com/EvanPluchart/kerno/releases/latest">releases page</a>, next to a SHA256SUMS file. Check your download against it before you open it.</p>
+    <a class="btn primary" href="https://github.com/EvanPluchart/kerno/releases/latest">Open the latest release</a>
+  </div>
+  <div class="tile s8 tabs" data-reveal>
+    <div class="tablist" role="tablist" aria-label="Install on">
+      <button role="tab" type="button" id="tab-mac" aria-controls="panel-mac" aria-selected="true">macOS</button>
+      <button role="tab" type="button" id="tab-linux" aria-controls="panel-linux" aria-selected="false" tabindex="-1">Linux</button>
+      <button role="tab" type="button" id="tab-source" aria-controls="panel-source" aria-selected="false" tabindex="-1">From source</button>
+    </div>
+    <div role="tabpanel" id="panel-mac" aria-labelledby="tab-mac" tabindex="0">
+      <p>Apple Silicon. Download <code>Kerno-&lt;version&gt;-macos-arm64.dmg</code> and <code>SHA256SUMS</code> into the same folder, then:</p>
+      <div class="snippet"><pre><code>cd ~/Downloads
+shasum -a 256 --ignore-missing -c SHA256SUMS
+open Kerno-*-macos-arm64.dmg</code></pre><button class="copy" type="button">Copy</button></div>
+      <p>Drag Kerno to Applications. It keeps itself up to date from the same releases page, and checks each update the same way.</p>
+    </div>
+    <div role="tabpanel" id="panel-linux" aria-labelledby="tab-linux" tabindex="0" hidden>
+      <p>Download <code>kerno-&lt;version&gt;-linux-&lt;arch&gt;.tar.gz</code> and <code>SHA256SUMS</code> into the same folder, then unpack into a prefix:</p>
+      <div class="snippet"><pre><code>sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf kerno-*-linux-*.tar.gz -C ~/.local --strip-components=1</code></pre><button class="copy" type="button">Copy</button></div>
+      <p>The tarball holds the binary, a <code>.desktop</code> file, the icons and the licences.</p>
+    </div>
+    <div role="tabpanel" id="panel-source" aria-labelledby="tab-source" tabindex="0" hidden>
+      <p>The repository pins its Rust toolchain, and rustup installs it on first use. On macOS you need the Xcode command line tools.</p>
+      <div class="snippet"><pre><code>git clone https://github.com/EvanPluchart/kerno.git
+cd kerno
+cargo run --release -p kerno</code></pre><button class="copy" type="button">Copy</button></div>
+      <p>On Debian or Ubuntu, run <code>sudo scripts/install-linux-deps.sh</code> first for GPUI's native dependencies.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ───────────── Footer ───────────── -->
+<footer class="board" data-section="Credits">
+  <div class="tile s4 foot-say" data-reveal>
+    <p class="statement">Kerno means "core" in Esperanto.</p>
+    <p class="fine">© 2026 Evan Pluchart. Kerno is licensed under MIT OR Apache-2.0.</p>
+  </div>
+  <nav class="tile s3 foot-nav" aria-label="Footer" data-reveal>
+    <ul>
+      <li><a href="#demo">Live demo</a></li>
+      <li><a href="#tour">Tour</a></li>
+      <li><a href="#performance">Performance</a></li>
+      <li><a href="#install">Install</a></li>
+      <li><a href="https://github.com/EvanPluchart/kerno">Source on GitHub</a></li>
+    </ul>
+  </nav>
+  <div class="tile s5 foot-credits" data-reveal>
+    <p>Set in Inter and JetBrains Mono, both under the SIL Open Font License. The live window runs on <a href="https://pglite.dev">PGlite</a> (Apache-2.0).</p>
+    <p class="fine">PostgreSQL, MySQL, MariaDB and DBeaver are trademarks of their owners. Kerno is an independent project and is not affiliated with them.</p>
+  </div>
+  <div class="tile s8 lime foot-mark" data-reveal>
+    <img src="img/brand/kerno-horizontal.svg" width="821" height="256" alt="Kerno" loading="lazy">
+  </div>
+  <a class="tile s4 invert action tall" href="https://github.com/EvanPluchart/kerno/releases/latest" data-reveal>
+    <span class="action-label">Download Kerno</span>
+    <span class="action-note">macOS and Linux</span>
+    <svg class="arrow" viewBox="0 0 32 32" width="44" height="44" aria-hidden="true"><path d="M6 16h20M17 7l9 9-9 9" fill="none" stroke="currentColor" stroke-width="4"/></svg>
+  </a>
+</footer>
+
+<!-- The page's own status bar, as the app's: it takes the environment's colour. -->
+<div class="statusbar" id="statusbar" data-ui>
+  <span class="st-conn"><i class="dot env-dot"></i><span class="js-conn">Shop (local)</span></span>
+  <span id="sb-section">Live demo</span>
+  <span class="sb-fill"></span>
+  <span id="sb-rows"></span>
+  <span id="sb-ms"></span>
+  <button type="button" data-palette aria-haspopup="dialog">Search <kbd><span class="mod">⌘</span>K</kbd></button>
+</div>
+
+<dialog class="palette" id="palette" aria-label="Command palette">
+  <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" placeholder="Type a command" autocomplete="off" spellcheck="false">
+  <ul id="palette-list" role="listbox" aria-label="Commands"></ul>
+</dialog>
+
+<dialog class="confirm" id="confirm" aria-labelledby="confirm-title" data-ui>
+  <form method="dialog">
+    <h2 id="confirm-title">Run this statement?</h2>
+    <p class="confirm-band" id="confirm-band" hidden></p>
+    <p id="confirm-why"></p>
+    <pre id="confirm-sql"></pre>
+    <div class="confirm-actions">
+      <button class="btn" value="cancel" autofocus>Cancel</button>
+      <button class="btn primary" value="run">Run</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="shot" id="shot" aria-label="Screenshot of Kerno">
+  <form method="dialog"><button class="btn" aria-label="Close the screenshot">Close</button></form>
+  <img id="shot-img" alt="" width="1920" height="1200">
+</dialog>
+</body>
+</html>
