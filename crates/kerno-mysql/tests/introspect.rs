@@ -1614,3 +1614,160 @@ async fn the_row_estimate_of_the_big_table_is_of_its_order() {
         assert!(common::rows(&session, &missing).await.is_empty());
     }
 }
+
+/// The columns and rows of the first result of `sql`.
+async fn table(session: &Arc<dyn Session>, sql: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    let collected = run(session, sql)
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{sql}"));
+    let result = collected.results.into_iter().next().unwrap();
+    let columns = result.columns.iter().map(|c| c.name.clone()).collect();
+    (columns, result.rows())
+}
+
+fn property(columns: &[String], row: &[Option<String>], name: &str) -> Option<String> {
+    let at = columns
+        .iter()
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("no property {name} in {columns:?}"));
+    row[at].clone()
+}
+
+#[tokio::test]
+async fn properties_describe_tables_and_views() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let d = session.dialect();
+        let sql = d
+            .properties_sql(&TableRef::new("kerno", "customers"), RelationKind::Table)
+            .unwrap();
+        let (columns, rows) = table(&session, &sql).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(property(&columns, row, "Engine").as_deref(), Some("InnoDB"));
+        assert_eq!(
+            property(&columns, row, "Kind").as_deref(),
+            Some("BASE TABLE")
+        );
+        assert_eq!(
+            property(&columns, row, "Comment").as_deref(),
+            Some("People who can place orders")
+        );
+        assert!(property(&columns, row, "Collation").is_some());
+        assert!(property(&columns, row, "Created").is_some());
+        assert_eq!(property(&columns, row, "Definer"), None);
+
+        // A view's "comment" is the word VIEW: not shown; its definer is.
+        let sql = d
+            .properties_sql(&TableRef::new("kerno", "order_totals"), RelationKind::View)
+            .unwrap();
+        let (columns, rows) = table(&session, &sql).await;
+        assert_eq!(
+            property(&columns, &rows[0], "Kind").as_deref(),
+            Some("VIEW")
+        );
+        assert_eq!(property(&columns, &rows[0], "Comment"), None);
+        assert!(property(&columns, &rows[0], "Definer").is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_database_is_created_with_a_character_set_and_collation() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let d = session.dialect();
+        let (_, choices) = table(&session, d.database_options_sql().unwrap()).await;
+        let has = |field: &str, value: &str, applies_to: Option<&str>| {
+            choices.iter().any(|row| {
+                row[0].as_deref() == Some(field)
+                    && row[1].as_deref() == Some(value)
+                    && row[2].as_deref() == applies_to
+            })
+        };
+        assert!(has("encoding", "utf8mb4", None) && has("encoding", "latin1", None));
+        assert!(has("collation", "latin1_swedish_ci", Some("latin1")));
+
+        let name = common::scratch_database("created_with_options");
+        exec_ok(&session, &format!("DROP DATABASE IF EXISTS {name}")).await;
+        let options = kerno_core::dialect::DatabaseOptions {
+            encoding: Some("latin1".into()),
+            collation: Some("latin1_bin".into()),
+            ..Default::default()
+        };
+        exec_ok(
+            &session,
+            &d.create_database_with_sql(&name, &options).unwrap(),
+        )
+        .await;
+        let made = common::rows(
+            &session,
+            &format!(
+                "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME \
+                 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '{name}'"
+            ),
+        )
+        .await;
+        exec_ok(&session, &format!("DROP DATABASE {name}")).await;
+        assert_eq!(
+            made,
+            [[Some("latin1".to_string()), Some("latin1_bin".to_string())]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_lock_view_names_the_waiting_session_and_its_blocker() {
+    for engine in engines() {
+        let holder = common::session(engine).await;
+        let waiter = common::session(engine).await;
+        let watcher = common::session(engine).await;
+        let database = common::fresh_database(&holder, "locks").await;
+        exec_ok(
+            &holder,
+            &format!("CREATE TABLE {database}.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB"),
+        )
+        .await;
+        exec_ok(&holder, &format!("INSERT INTO {database}.t VALUES (1, 1)")).await;
+        let holder_id = scalar(&holder, "SELECT CONNECTION_ID()").await;
+        let waiter_id = scalar(&waiter, "SELECT CONNECTION_ID()").await;
+
+        // The waiter gives up on its own after a few seconds, whatever
+        // happens to this test.
+        exec_ok(&holder, "START TRANSACTION").await;
+        exec_ok(
+            &holder,
+            &format!("UPDATE {database}.t SET v = 2 WHERE id = 1"),
+        )
+        .await;
+        exec_ok(&waiter, "SET SESSION innodb_lock_wait_timeout = 8").await;
+        let blocked = {
+            let (waiter, sql) = (
+                waiter.clone(),
+                format!("UPDATE {database}.t SET v = 3 WHERE id = 1"),
+            );
+            tokio::spawn(async move { run(&waiter, &sql).await.map(drop) })
+        };
+        let sql = watcher.admin_query(AdminView::Locks).unwrap();
+        let mut found = None;
+        for _ in 0..50 {
+            let (columns, rows) = table(&watcher, &sql).await;
+            if let Some(row) = rows
+                .into_iter()
+                .find(|row| row[0].as_deref() == Some(waiter_id.as_str()))
+            {
+                found = Some((columns, row));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        exec_ok(&holder, "ROLLBACK").await;
+        let _ = blocked.await;
+        exec_ok(&holder, &format!("DROP DATABASE {database}")).await;
+        let (columns, row) = found.expect("the waiting session is listed");
+        assert_eq!(columns[0], "waiting_id");
+        let blocking = columns.iter().position(|c| c == "blocking_id").unwrap();
+        assert_eq!(row[blocking].as_deref(), Some(holder_id.as_str()));
+        let query = columns.iter().position(|c| c == "waiting_query").unwrap();
+        assert!(row[query].as_deref().unwrap().contains("SET v = 3"));
+    }
+}

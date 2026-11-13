@@ -11,13 +11,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableSelection, TableState};
 use gpui_kit::component::{ActiveTheme as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Div, Entity, Focusable as _,
+    App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable as _,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
     SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, TextRun, Window,
     div, font, px,
@@ -26,7 +28,7 @@ use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
 use kerno_core::format::{CellStyle, display};
 use kerno_core::pending::Pending;
-use kerno_core::schema::TableRef;
+use kerno_core::schema::{TableRef, TableStructure};
 use kerno_core::sort::sorted_rows;
 use kerno_core::sql::{CellValue, RowSql};
 use kerno_core::{Dialect, ResultStore, RowBatch, RowDemand, Session, TypeKind};
@@ -133,6 +135,9 @@ pub struct Owner {
     /// The rows have no key to find them by (Generate SQL ▸ can only
     /// insert them).
     pub keyless: bool,
+    /// The table the rows are from, when they are one table's: the
+    /// columns panel and the enum editor read it.
+    pub structure: Option<Arc<TableStructure>>,
 }
 
 /// What a column of a table's page takes.
@@ -183,6 +188,51 @@ pub enum GridAction {
     Export,
     /// Writes statements for the selected rows into a query tab.
     Generate(RowSql),
+    /// The numbers of the selected rows, one per line.
+    CopyRowNumbers,
+    AddRow,
+    /// Reads the rows again.
+    Refresh,
+    /// Edits the cell in the value panel.
+    EditValue,
+    /// One row as a list of its columns, or the grid again (`true` while
+    /// the list shows).
+    RecordView(bool),
+    /// The figures of the selection in the footer, on or off (`true` while
+    /// on).
+    SelectionStats(bool),
+    /// Larger text (`1`), smaller (`-1`), the usual size (`0`).
+    Zoom(i8),
+    Panel(Panel),
+}
+
+/// Where "First / Previous / Next / Last row" moves the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowMove {
+    First,
+    Previous,
+    Next,
+    Last,
+}
+
+/// The row and the column of the grid a selection starts at: what the
+/// record view shows, where the row commands move from.
+pub fn current(selection: TableSelection) -> (usize, usize) {
+    match selection {
+        TableSelection::Cell(row, column) => (row, column),
+        TableSelection::Row(row) => (row, 1),
+        TableSelection::Column(column) => (0, column),
+        TableSelection::None => (0, 1),
+    }
+}
+
+/// A panel about the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// Count, sum, average, minimum, maximum of the selection.
+    Aggregate,
+    /// The result's columns: type, table, key, nullability.
+    Columns,
 }
 
 impl GridAction {
@@ -224,6 +274,17 @@ impl GridAction {
             Self::FitAllWidths => "Fit all widths",
             Self::Export => "Export…",
             Self::Generate(kind) => kind.label(),
+            Self::CopyRowNumbers => "Copy row numbers",
+            Self::AddRow => "Add row",
+            Self::Refresh => "Refresh",
+            Self::EditValue => "Edit in value panel",
+            Self::RecordView(_) => "Record view",
+            Self::SelectionStats(_) => "Selection statistics",
+            Self::Zoom(1..) => "Larger text",
+            Self::Zoom(..0) => "Smaller text",
+            Self::Zoom(0) => "Usual text size",
+            Self::Panel(Panel::Aggregate) => "Aggregate",
+            Self::Panel(Panel::Columns) => "Columns",
         }
         .to_string()
     }
@@ -271,6 +332,10 @@ pub struct CellFacts {
     pub export: Option<&'static str>,
     /// The rows have no key to find them by.
     pub keyless: bool,
+    /// The record view shows.
+    pub record: bool,
+    /// The footer shows the figures of the selection.
+    pub stats: bool,
 }
 
 /// What the menu of a column header depends on.
@@ -381,8 +446,10 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
             Mark::New => Some("new row: delete it"),
             Mark::Edited | Mark::Deleted => None,
         };
+        let typed = read_only.or(deleted).or(computed).or(binary);
         entries.extend([
-            item(A::EditCell, read_only.or(deleted).or(computed).or(binary)),
+            item(A::EditCell, typed),
+            item(A::EditValue, typed),
             item(
                 A::SetNull,
                 takes_value.or(this_cell((!facts.nullable).then_some("NOT NULL"))),
@@ -415,10 +482,94 @@ pub fn cell_menu(facts: &CellFacts) -> Vec<Entry> {
                 ),
             ],
         ),
+        layout_menu(facts),
+        panels_menu(),
         Entry::Separator,
         generate_menu(facts),
         item(A::Export, facts.export),
     ]);
+    // DBeaver ends the menu with `file.refresh`.
+    if facts.data {
+        entries.extend([Entry::Separator, enabled(A::Refresh)]);
+    }
+    entries
+}
+
+/// "Layout ▸" (DBeaver's `fillLayoutMenu`): the record view, the figures of
+/// the selection, the text size.
+fn layout_menu(facts: &CellFacts) -> Entry {
+    use GridAction as A;
+    Entry::Submenu(
+        "Layout",
+        vec![
+            Entry::Item(A::RecordView(facts.record), None, facts.record),
+            Entry::Item(A::SelectionStats(facts.stats), None, facts.stats),
+            Entry::Separator,
+            enabled(A::Zoom(1)),
+            enabled(A::Zoom(-1)),
+            enabled(A::Zoom(0)),
+        ],
+    )
+}
+
+/// "Panels ▸" (DBeaver's `PanelsMenuContributor`); the value has its own
+/// entry.
+fn panels_menu() -> Entry {
+    Entry::Submenu(
+        "Panels",
+        vec![
+            enabled(GridAction::Panel(Panel::Aggregate)),
+            enabled(GridAction::Panel(Panel::Columns)),
+        ],
+    )
+}
+
+/// The menu of a row number (DBeaver's `ROW_HEADER` entries of
+/// `ResultSetViewer.fillContextMenu`): its number, the row's copies and
+/// edits, export.
+pub fn row_menu(facts: &CellFacts) -> Vec<Entry> {
+    use GridAction as A;
+    let copy_as = CopyFormat::COPY_AS
+        .into_iter()
+        .map(|format| enabled(A::CopyAs(format)))
+        .collect();
+    let mut entries = vec![
+        enabled(A::CopyRowNumbers),
+        Entry::Separator,
+        enabled(A::Copy),
+        Entry::Submenu("Copy as", copy_as),
+    ];
+    if facts.data {
+        let read_only = facts.read_only;
+        let deleted = (facts.row == Mark::Deleted).then_some("row deleted");
+        let revert = match facts.row {
+            Mark::Fetched => Some("no change"),
+            Mark::New => Some("new row: delete it"),
+            Mark::Edited | Mark::Deleted => None,
+        };
+        entries.extend([
+            Entry::Separator,
+            item(A::AddRow, read_only),
+            item(A::DuplicateRow, read_only),
+            item(A::DeleteRow, read_only.or(deleted)),
+            item(A::RevertRow, read_only.or(revert)),
+            Entry::Separator,
+            item(
+                A::ClearFilters,
+                (!facts.column.filtered).then_some("no filter"),
+            ),
+        ]);
+    }
+    entries.extend([
+        Entry::Separator,
+        layout_menu(facts),
+        Entry::Separator,
+        generate_menu(facts),
+        item(A::Export, facts.export),
+    ]);
+    if facts.data {
+        entries.extend([Entry::Separator, enabled(A::Refresh)]);
+    }
     entries
 }
 
@@ -528,7 +679,7 @@ fn text_block(text: &str) -> Vec<Vec<&str>> {
 /// What putting `typed` in a cell of `kind` that showed `initial` gives:
 /// nothing when the text is unchanged; emptied text is NULL, except in a
 /// text column, where it is the empty string.
-fn typed_value(typed: &str, initial: &str, kind: TypeKind) -> Option<CellValue> {
+pub(super) fn typed_value(typed: &str, initial: &str, kind: TypeKind) -> Option<CellValue> {
     if typed == initial {
         None
     } else if typed.is_empty() && kind != TypeKind::Text {
@@ -538,6 +689,49 @@ fn typed_value(typed: &str, initial: &str, kind: TypeKind) -> Option<CellValue> 
     }
 }
 
+/// The numbers of rows of the grid as the row-number column shows them, one
+/// per line (DBeaver's `grid.copyRowNames`, `ResultSetHandlerMain`).
+pub fn row_numbers(rows: &RangeInclusive<usize>) -> String {
+    rows.clone()
+        .map(|row| (row + 1).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a click on a boolean cell makes of it: true becomes false, false
+/// becomes NULL when the column takes it (true when it does not), NULL and
+/// anything else become true. Ported from DBeaver's
+/// `SpreadsheetPresentation.toggleBooleanValue` (plugin ui.editors.data).
+pub fn next_bool(current: Option<bool>, nullable: bool) -> Option<bool> {
+    match current {
+        Some(true) => Some(false),
+        Some(false) if nullable => None,
+        _ => Some(true),
+    }
+}
+
+/// A boolean as `column` holds it: `1`/`0` in MySQL's `TINYINT(1)` and
+/// `BIT(1)`, `t`/`f` elsewhere, so that toggling twice is no change.
+pub fn bool_text(column: &kerno_core::Column, value: bool) -> &'static str {
+    let numeric = ["tinyint", "bit"]
+        .iter()
+        .any(|prefix| column.type_name.to_ascii_lowercase().starts_with(prefix));
+    match (numeric, value) {
+        (true, true) => "1",
+        (true, false) => "0",
+        (false, true) => "t",
+        (false, false) => "f",
+    }
+}
+
+/// What is open in a cell being edited.
+pub(super) enum Editor {
+    /// Typed text.
+    Text(Entity<InputState>),
+    /// A list of the column's values.
+    Choice(Entity<PopupMenu>),
+}
+
 /// The cell being typed in.
 struct Editing {
     row: usize,
@@ -545,7 +739,7 @@ struct Editing {
     column: usize,
     /// What the cell held when the edit began.
     initial: String,
-    input: Entity<InputState>,
+    editor: Editor,
     _subscription: Subscription,
 }
 
@@ -610,6 +804,17 @@ pub struct Grid {
     /// Sorting is the server's work (a page of a table), not the grid's.
     sort_on_server: Option<Rc<SortOnServer>>,
     owner: Option<Owner>,
+    /// One row as a list of its columns instead of the grid.
+    pub record: bool,
+    /// The figures of the selection, made when first shown.
+    stats: Option<Entity<super::grid_view::SelectionStats>>,
+    /// The record view, made when first shown.
+    pub(super) record_view: Option<Entity<super::grid_view::RecordView>>,
+    /// Waits for the rows "Go to row" asked the server for.
+    going_to: Option<Subscription>,
+    /// Counts the changes to what the cells show (edits, order): the
+    /// figures of a selection that did not move follow it.
+    generation: u64,
 }
 
 impl Grid {
@@ -641,6 +846,11 @@ impl Grid {
             read_only: None,
             sort_on_server: None,
             owner: None,
+            record: false,
+            stats: None,
+            record_view: None,
+            going_to: None,
+            generation: 0,
         }
     }
 
@@ -686,6 +896,11 @@ impl Grid {
             }),
             sort_on_server: Some(sort_on_server),
             owner: None,
+            record: false,
+            stats: None,
+            record_view: None,
+            going_to: None,
+            generation: 0,
             store,
         }
     }
@@ -704,7 +919,13 @@ impl Grid {
         if let Some(edits) = &mut self.edits {
             edits.editing = None;
             change(&mut edits.pending, &self.store);
+            self.generation += 1;
         }
+    }
+
+    /// Changes each time what the cells show changes, rows aside.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Rows shown: the fetched ones, then the new ones.
@@ -715,7 +936,7 @@ impl Grid {
     /// What a cell holds as it shows: the pending value when there is one,
     /// else what was fetched. `None` for NULL (and for a default not known
     /// yet).
-    fn cell(&self, row: usize, source: usize) -> Option<&[u8]> {
+    pub(super) fn cell(&self, row: usize, source: usize) -> Option<&[u8]> {
         let fetched = self.store.row_count();
         match self
             .pending()
@@ -811,9 +1032,59 @@ impl Grid {
         let Some(source) = self.source_column(column) else {
             return false;
         };
+        // A boolean has no editor: editing it toggles it, as DBeaver's
+        // checkbox does.
+        if self.store.columns()[source].kind == TypeKind::Boolean {
+            self.toggle(row, source);
+            cx.notify();
+            return true;
+        }
         let initial = self.cell(row, source).map_or(String::new(), |bytes| {
             String::from_utf8_lossy(bytes).into_owned()
         });
+        if let Some(choices) = self.choices(source) {
+            let table = cx.entity();
+            let current = self.cell(row, source).is_some().then(|| initial.clone());
+            let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+                for choice in choices {
+                    let (table, label) = (table.clone(), choice.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(SharedString::from(
+                            label.clone().unwrap_or_else(|| "NULL".into()),
+                        ))
+                        .checked(label == current)
+                        .on_click(move |_, window, cx| {
+                            table.update(cx, |table, cx| {
+                                let value = label.clone().map_or(CellValue::Null, CellValue::Text);
+                                table.delegate_mut().choose(row, source, value);
+                                table.focus_handle(cx).focus(window, cx);
+                                table.refresh(cx);
+                                cx.notify();
+                            })
+                        }),
+                    );
+                }
+                menu
+            });
+            let subscription =
+                cx.subscribe_in(&menu, window, |table, _, _: &DismissEvent, window, cx| {
+                    table.delegate_mut().cancel_edit();
+                    table.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                });
+            menu.update(cx, |menu, cx| menu.focus_handle(cx).focus(window, cx));
+            if let Some(edits) = &mut self.edits {
+                edits.editing = Some(Editing {
+                    row,
+                    column: source,
+                    initial,
+                    editor: Editor::Choice(menu),
+                    _subscription: subscription,
+                });
+            }
+            cx.notify();
+            return true;
+        }
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial.clone()));
         let subscription = cx.subscribe_in(
             &input,
@@ -842,12 +1113,59 @@ impl Grid {
                 row,
                 column: source,
                 initial,
-                input,
+                editor: Editor::Text(input),
                 _subscription: subscription,
             });
         }
         cx.notify();
         true
+    }
+
+    /// The values a cell of an enum column is chosen from, NULL (`None`)
+    /// last when the column takes it; `None` for other columns.
+    pub fn choices(&self, source: usize) -> Option<Vec<Option<String>>> {
+        let name = &self.store.columns().get(source)?.name;
+        let structure = self.owner.as_ref()?.structure.as_ref()?;
+        let info = structure.columns.iter().find(|info| &info.name == name)?;
+        if info.enum_values.is_empty() {
+            return None;
+        }
+        let mut choices: Vec<_> = info.enum_values.iter().cloned().map(Some).collect();
+        if self.nullable(source) {
+            choices.push(None);
+        }
+        Some(choices)
+    }
+
+    /// Gives a cell a value chosen from its list, as one change.
+    pub fn choose(&mut self, row: usize, source: usize, value: CellValue) {
+        self.edit(|pending, store| pending.step(|pending| pending.set(store, row, source, value)));
+    }
+
+    /// Toggles a boolean cell (see [`next_bool`]); a selection of several
+    /// rows that holds it takes the same value in its column, as in
+    /// DBeaver.
+    pub fn toggle(&mut self, row: usize, source: usize) {
+        let column = &self.store.columns()[source];
+        let current = self
+            .cell(row, source)
+            .and_then(kerno_core::format::parse_bool);
+        let value = match next_bool(current, self.nullable(source)) {
+            Some(value) => CellValue::Text(bool_text(column, value).into()),
+            None => CellValue::Null,
+        };
+        let rows = self
+            .selected(self.anchor)
+            .filter(|selected| selected.rows.contains(&row) && selected.columns.contains(&source))
+            .map_or(row..=row, |selected| selected.rows);
+        let rows: Vec<usize> = rows.filter(|&row| self.takes_value(row, source)).collect();
+        self.edit(|pending, store| {
+            pending.step(|pending| {
+                for row in rows {
+                    pending.set(store, row, source, value.clone());
+                }
+            })
+        });
     }
 
     /// Keeps what was typed as a pending change. Text left as it was is no
@@ -860,13 +1178,18 @@ impl Grid {
         let Some(editing) = edits.editing.take() else {
             return;
         };
-        let typed = editing.input.read(cx).value().to_string();
+        // A list sets its value when a choice is clicked.
+        let Editor::Text(input) = &editing.editor else {
+            return;
+        };
+        let typed = input.read(cx).value().to_string();
         let kind = self.store.columns()[editing.column].kind;
         if let Some(value) = typed_value(&typed, &editing.initial, kind) {
             let store = &self.store;
             edits
                 .pending
                 .step(|pending| pending.set(store, editing.row, editing.column, value));
+            self.generation += 1;
         }
     }
 
@@ -892,24 +1215,212 @@ impl Grid {
         self.store.row_count()
     }
 
-    /// Shows the whole value of the selected cell, as its menu's "View
-    /// value" does.
+    /// Shows the whole value of the selected cell in the value panel,
+    /// editable when the cell takes typed values (Shift+Enter, DBeaver's
+    /// `row.edit`).
     pub fn view_selected_value(
         table: &Entity<TableState<Self>>,
         window: &mut Window,
         cx: &mut App,
     ) {
         if let Some((row, column)) = table.read(cx).selected_cell() {
-            Self::run(
-                table,
-                None,
-                GridAction::ViewValue,
-                Some(row),
-                column,
-                window,
-                cx,
-            );
+            Self::open_value(table, row, column, true, window, cx);
         }
+    }
+
+    /// Shows one row as a list of its columns, or the grid again, on the
+    /// same row (Tab, DBeaver's `toggleMode`).
+    pub fn toggle_record(table: &Entity<TableState<Self>>, window: &mut Window, cx: &mut App) {
+        table.update(cx, |table, cx| {
+            let (row, column) = current(table.selection());
+            let grid = table.delegate_mut();
+            grid.commit_edit(cx);
+            grid.record = !grid.record;
+            if table.delegate().total_rows() > 0 {
+                Self::select(table, row, column, cx);
+            }
+            table.focus_handle(cx).focus(window, cx);
+            cx.notify();
+        });
+    }
+
+    /// Moves the selection to another row, in the same column (DBeaver's
+    /// `row.first` … `row.last`).
+    pub fn move_row(table: &Entity<TableState<Self>>, to: RowMove, cx: &mut App) {
+        table.update(cx, |table, cx| {
+            let Some(last) = table.delegate().total_rows().checked_sub(1) else {
+                return;
+            };
+            let (row, column) = current(table.selection());
+            let row = match to {
+                RowMove::First => 0,
+                RowMove::Previous => row.saturating_sub(1),
+                RowMove::Next => row + 1,
+                RowMove::Last => last,
+            };
+            Self::select(table, row.min(last), column, cx);
+        });
+    }
+
+    /// Selects row `number` (counted from 1) in the current column. A row
+    /// the server has not sent yet is asked for and selected when it
+    /// arrives. Returns why it cannot be reached, when it cannot.
+    pub fn go_to_row(
+        table: &Entity<TableState<Self>>,
+        number: usize,
+        cx: &mut App,
+    ) -> Option<&'static str> {
+        table.update(cx, |table, cx| {
+            let row = number.checked_sub(1)?;
+            let (_, column) = current(table.selection());
+            let grid = table.delegate_mut();
+            if row < grid.total_rows() {
+                Self::select(table, row, column, cx);
+                return None;
+            }
+            if !grid.loading() {
+                return Some(if grid.sort_on_server.is_some() {
+                    "There is no such row on this page."
+                } else {
+                    "The result has fewer rows."
+                });
+            }
+            // As many rows as reach it, and the rest of their page, unless
+            // they were asked for already.
+            if let Some(demand) = &grid.demand
+                && row as u64 >= grid.requested
+            {
+                let wanted = row as u64 + 1 - grid.requested + grid.page;
+                grid.requested += wanted;
+                demand.request_rows(wanted);
+            }
+            grid.going_to = Some(cx.observe_self(move |table, cx| {
+                let grid = table.delegate();
+                if row < grid.total_rows() || !grid.loading() {
+                    let last = grid.total_rows().saturating_sub(1);
+                    table.delegate_mut().going_to = None;
+                    Self::select(table, row.min(last), column, cx);
+                }
+            }));
+            None
+        })
+    }
+
+    /// Selects a column of the grid on the current row and shows it.
+    pub fn go_to_column(table: &Entity<TableState<Self>>, column: usize, cx: &mut App) {
+        table.update(cx, |table, cx| {
+            let (row, _) = current(table.selection());
+            if table.delegate().total_rows() > 0 {
+                Self::select(table, row, column, cx);
+            }
+            table.scroll_to_col(column, cx);
+        });
+    }
+
+    /// Selects one cell (the whole row when no column shows) and scrolls
+    /// to it.
+    pub(super) fn select(
+        table: &mut TableState<Self>,
+        row: usize,
+        column: usize,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let grid = table.delegate_mut();
+        grid.clear_selection();
+        let row = row.min(grid.total_rows().saturating_sub(1));
+        let columns = grid.layout.len();
+        if columns == 0 {
+            table.set_selected_row(row, cx);
+        } else {
+            table.set_selected_cell(row, column.clamp(1, columns), cx);
+        }
+        let selection = table.selection();
+        table.delegate_mut().set_anchor(selection);
+        table.scroll_to_row(row, cx);
+        cx.notify();
+    }
+
+    /// The columns shown, left to right, as columns of the result.
+    pub fn layout(&self) -> &[usize] {
+        &self.layout
+    }
+
+    /// What is open in a cell being edited, when it is this one.
+    pub(super) fn editor_at(&self, row: usize, source: usize) -> Option<&Editor> {
+        let editing = self.edits.as_ref()?.editing.as_ref()?;
+        (editing.row == row && editing.column == source).then_some(&editing.editor)
+    }
+
+    /// The rows in the order shown, when sorted here.
+    pub(super) fn order(&self) -> Option<Arc<[u32]>> {
+        self.order.clone()
+    }
+
+    /// Whether changes wait to be applied.
+    pub(super) fn has_pending(&self) -> bool {
+        self.pending().is_some_and(|pending| !pending.is_empty())
+    }
+
+    /// The table the rows are from, when they are one table's.
+    pub(super) fn structure(&self) -> Option<&Arc<TableStructure>> {
+        self.owner.as_ref()?.structure.as_ref()
+    }
+
+    /// The figures of the selection, made the first time they are asked.
+    pub(super) fn stats_view(&mut self) -> &mut Option<Entity<super::grid_view::SelectionStats>> {
+        &mut self.stats
+    }
+
+    pub(super) fn stats_entity(&self) -> Option<Entity<super::grid_view::SelectionStats>> {
+        self.stats.clone()
+    }
+
+    /// Rows are still arriving, or can still be asked for.
+    pub(super) fn has_more_coming(&self) -> bool {
+        self.loading()
+    }
+
+    /// The table the rows are from.
+    pub(super) fn table(&self) -> Option<&TableRef> {
+        self.table.as_ref()
+    }
+
+    /// Shows a cell's whole value. With `edit`, a cell that takes typed
+    /// values is edited there: saving makes one pending change, as typing
+    /// in the cell does.
+    pub fn open_value(
+        table: &Entity<TableState<Self>>,
+        row: usize,
+        column: usize,
+        edit: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let grid = table.read(cx).delegate();
+        let Some((described, value)) = grid.value_at(row, column) else {
+            return;
+        };
+        let (described, value) = (described.clone(), value.map(<[u8]>::to_vec));
+        let save = grid
+            .source_column(column)
+            .filter(|_| edit && grid.editable(row, column).is_ok())
+            .map(|source| {
+                let table = table.clone();
+                super::viewer::Save {
+                    nullable: grid.nullable(source),
+                    apply: Rc::new(move |value, _: &mut Window, cx: &mut App| {
+                        table.update(cx, |table, cx| {
+                            table.delegate_mut().choose(row, source, value);
+                            table.refresh(cx);
+                            cx.notify();
+                        })
+                    }),
+                }
+            });
+        // The keyboard goes back to the grid, whether the panel was opened
+        // from a key or from a menu.
+        let back = table.read(cx).focus_handle(cx);
+        super::viewer::edit(&described, value.as_deref(), save, back, window, cx);
     }
 
     /// Whether the server has, or may have, rows that were not asked for.
@@ -1261,7 +1772,14 @@ impl Grid {
     }
 
     /// What the menu of a cell of the grid depends on.
-    fn cell_facts(&self, row: usize, column: usize, many: bool, clipboard: bool) -> CellFacts {
+    fn cell_facts(
+        &self,
+        row: usize,
+        column: usize,
+        many: bool,
+        clipboard: bool,
+        cx: &App,
+    ) -> CellFacts {
         let source = self.source_column(column).unwrap_or_default();
         let fetched = self.store.row_count();
         let row_mark = match self.pending() {
@@ -1297,6 +1815,8 @@ impl Grid {
                 .map_or_else(Vec::new, |related| related(self, row)),
             export: owner.map_or(Some("not available"), |owner| owner.export),
             keyless: owner.is_some_and(|owner| owner.keyless),
+            record: self.record,
+            stats: crate::state::AppState::get(cx).settings.selection_stats,
         }
     }
 
@@ -1389,9 +1909,41 @@ impl Grid {
                 .is_some_and(|selected| {
                     selected.rows.start() != selected.rows.end() || selected.columns.len() > 1
                 });
-            cell_menu(&table.delegate().cell_facts(row, column, many, clipboard))
+            cell_menu(
+                &table
+                    .delegate()
+                    .cell_facts(row, column, many, clipboard, cx),
+            )
         });
         let pick = Self::pick(table, Some(row), column, cx);
+        let menu = fill_menu(menu, &entries, &pick, window, cx);
+        crate::tabs::fit_window(menu, window)
+    }
+
+    /// Opens the menu of a row number. A right-click outside the selected
+    /// rows selects the row first.
+    fn number_menu(
+        table: &Entity<TableState<Self>>,
+        row: usize,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let entries = table.update(cx, |table, cx| {
+            let selected = table.delegate().selected(table.selection());
+            if !selected.is_some_and(|selected| selected.rows.contains(&row)) {
+                table.delegate_mut().clear_selection();
+                table.set_selected_row(row, cx);
+                let selection = table.selection();
+                table.delegate_mut().set_anchor(selection);
+            }
+            let many = table
+                .delegate()
+                .selected(table.selection())
+                .is_some_and(|selected| selected.rows.start() != selected.rows.end());
+            row_menu(&table.delegate().cell_facts(row, 1, many, false, cx))
+        });
+        let pick = Self::pick(table, Some(row), 1, cx);
         let menu = fill_menu(menu, &entries, &pick, window, cx);
         crate::tabs::fit_window(menu, window)
     }
@@ -1410,8 +1962,26 @@ impl Grid {
         crate::tabs::fit_window(menu, window)
     }
 
+    /// Runs an entry of the grid menus on the current cell, as its menu
+    /// does: a command of the menu bar or the palette.
+    pub fn perform(
+        table: &Entity<TableState<Self>>,
+        action: GridAction,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (row, column) = current(table.read(cx).selection());
+        let pick = Self::pick(table, Some(row), column, cx);
+        pick(action, window, cx);
+    }
+
     /// What runs an entry of the menu of a cell (`row`) or of a header.
-    fn pick(table: &Entity<TableState<Self>>, row: Option<usize>, column: usize, cx: &App) -> Pick {
+    pub(super) fn pick(
+        table: &Entity<TableState<Self>>,
+        row: Option<usize>,
+        column: usize,
+        cx: &App,
+    ) -> Pick {
         let owner = table
             .read(cx)
             .delegate()
@@ -1463,13 +2033,32 @@ impl Grid {
                     cx.write_to_clipboard(ClipboardItem::new_string(name));
                 }
             }
-            GridAction::ViewValue => {
-                let grid = table.read(cx).delegate();
-                if let Some((described, value)) = row.and_then(|row| grid.value_at(row, column)) {
-                    let (described, value) = (described.clone(), value.map(<[u8]>::to_vec));
-                    super::viewer::open(&described, value.as_deref(), window, cx);
+            GridAction::ViewValue | GridAction::EditValue => {
+                if let Some(row) = row {
+                    let edit = action == GridAction::EditValue;
+                    Self::open_value(table, row, column, edit, window, cx);
                 }
             }
+            GridAction::CopyRowNumbers => {
+                let selection = table.read(cx).selection();
+                let grid = table.read(cx).delegate();
+                let rows = grid
+                    .selected(selection)
+                    .map_or_else(|| row.map(|row| row..=row), |selected| Some(selected.rows));
+                if let Some(rows) = rows {
+                    cx.write_to_clipboard(ClipboardItem::new_string(row_numbers(&rows)));
+                }
+            }
+            GridAction::RecordView(_) => Self::toggle_record(table, window, cx),
+            GridAction::SelectionStats(shown) => {
+                crate::state::AppState::update_settings(cx, |settings| {
+                    settings.selection_stats = !shown;
+                });
+            }
+            GridAction::Zoom(step) => {
+                crate::settings_view::zoom_grid((step != 0).then_some(f32::from(step)), window, cx)
+            }
+            GridAction::Panel(panel) => super::grid_view::open_panel(table, panel, window, cx),
             GridAction::Order(order) => table.update(cx, |table, cx| {
                 let sort = match order {
                     Some(false) => ColumnSort::Ascending,
@@ -1497,6 +2086,69 @@ impl Grid {
                     owner(action, row.unwrap_or_default(), column, window, cx);
                 }
             }
+        }
+    }
+}
+
+/// What a cell being edited draws, in the grid and in the record view: the
+/// text input, right-aligned for numbers, or the list of the column's
+/// values open under the value (`shown`).
+pub(super) fn editor_element(
+    table: &Entity<TableState<Grid>>,
+    editor: &Editor,
+    shown: SharedString,
+    numeric: bool,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let theme = cx.theme();
+    let size = text_size(cx);
+    let cancel = {
+        let table = table.clone();
+        move |window: &mut Window, cx: &mut App| {
+            table.update(cx, |table, cx| {
+                table.delegate_mut().cancel_edit();
+                table.focus_handle(cx).focus(window, cx);
+                cx.notify();
+            })
+        }
+    };
+    match editor {
+        Editor::Text(input) => div()
+            .id("cell-editor")
+            .w_full()
+            // Escape, once the input has no use for it, drops the edit.
+            .on_action(move |_: &Escape, window, cx| cancel(window, cx))
+            // Tab while typing stays in the cell: it does not switch to the
+            // record view.
+            .on_action(|_: &crate::actions::ToggleRecordView, _, cx| cx.stop_propagation())
+            .child(
+                Input::new(input)
+                    .xsmall()
+                    .text_size(size)
+                    .appearance(false)
+                    .font_family(theme.mono_font_family.clone())
+                    .when(numeric, |input| input.text_right()),
+            )
+            .into_any_element(),
+        Editor::Choice(menu) => {
+            let menu = menu.clone();
+            Popover::new("cell-choices")
+                .open(true)
+                .appearance(false)
+                .on_open_change(move |open, window, cx| {
+                    if !open {
+                        cancel(window, cx);
+                    }
+                })
+                .trigger(
+                    Button::new("cell-choice")
+                        .ghost()
+                        .xsmall()
+                        .label(shown)
+                        .dropdown_caret(true),
+                )
+                .content(move |_, _, _| menu.clone())
+                .into_any_element()
         }
     }
 }
@@ -1602,6 +2254,7 @@ impl TableDelegate for Grid {
             ColumnSort::Default => {
                 self.sort = None;
                 self.order = None;
+                self.generation += 1;
                 cx.notify();
                 return;
             }
@@ -1609,6 +2262,7 @@ impl TableDelegate for Grid {
         self.sort = Some((source, descending));
         if self.store.row_count() <= SORT_INLINE_ROWS {
             self.order = Some(sorted_rows(&self.store, source, descending).into());
+            self.generation += 1;
             cx.notify();
             return;
         }
@@ -1624,6 +2278,7 @@ impl TableDelegate for Grid {
                 let grid = table.delegate_mut();
                 if grid.sort == Some((source, descending)) {
                     grid.order = Some(order.into());
+                    grid.generation += 1;
                     crate::bench::sorted(cx);
                     grid.sorting = None;
                     cx.notify();
@@ -1806,35 +2461,30 @@ impl TableDelegate for Grid {
                 Mark::Deleted => ((row + 1).to_string(), theme.danger),
                 _ => ((row + 1).to_string(), theme.muted_foreground),
             };
-            return cell
-                .text_size(size * 0.85)
-                .text_color(color)
-                .child(SharedString::from(label))
+            // The row number answers a right-click with the row's menu.
+            let table = cx.entity();
+            return div()
+                .id(("row-number", row))
+                .test_support()
+                .w_full()
+                .child(
+                    cell.text_size(size * 0.85)
+                        .text_color(color)
+                        .child(SharedString::from(label)),
+                )
+                .context_menu(move |menu, window, cx| {
+                    Grid::number_menu(&table, row, menu, window, cx)
+                })
                 .into_any_element();
         };
-        if let Some(editing) = self
-            .edits
-            .as_ref()
-            .and_then(|edits| edits.editing.as_ref())
-            .filter(|editing| editing.row == row && editing.column == source)
-        {
-            return div()
-                .id("cell-editor")
-                .w_full()
-                // Escape, once the input has no use for it, drops the edit.
-                .on_action(cx.listener(|table, _: &Escape, window, cx| {
-                    table.delegate_mut().cancel_edit();
-                    table.focus_handle(cx).focus(window, cx);
-                    cx.notify();
-                }))
-                .child(
-                    Input::new(&editing.input)
-                        .xsmall()
-                        .text_size(size)
-                        .appearance(false)
-                        .font_family(theme.mono_font_family.clone()),
-                )
-                .into_any_element();
+        if let Some(editor) = self.editor_at(row, source) {
+            let numeric = self.store.columns()[source].kind.is_numeric();
+            let shown = self
+                .cell(row, source)
+                .map_or(SharedString::from("NULL"), |bytes| {
+                    SharedString::from(String::from_utf8_lossy(bytes).into_owned())
+                });
+            return editor_element(&cx.entity(), editor, shown, numeric, cx);
         }
         let mark = self.mark(row, source);
         let pending = self
@@ -1895,7 +2545,20 @@ impl TableDelegate for Grid {
                         table.delegate_mut().extend_to(row, column);
                         cx.stop_propagation();
                     } else {
-                        table.delegate_mut().clear_selection();
+                        let grid = table.delegate_mut();
+                        // A click on a selected boolean cell toggles it, as
+                        // DBeaver's checkbox does; the click that selects it
+                        // does not.
+                        let toggle = event.click_count == 1
+                            && grid.anchor == TableSelection::Cell(row, column)
+                            && grid.store.columns()[source].kind == TypeKind::Boolean
+                            && grid.editable(row, column).is_ok();
+                        grid.clear_selection();
+                        if toggle {
+                            grid.commit_edit(cx);
+                            grid.toggle(row, source);
+                            table.refresh(cx);
+                        }
                     }
                     cx.notify();
                 }),
@@ -1993,6 +2656,8 @@ mod tests {
             related: Vec::new(),
             export: None,
             keyless: false,
+            record: false,
+            stats: true,
         }
     }
 
@@ -2013,6 +2678,9 @@ mod tests {
     const COLUMN: &str = "Column ▸ Copy column name | Pin column | Hide column | \
                           Show all columns (none hidden)";
     const GENERATE: &str = "Generate SQL ▸ SELECT by key | SELECT … IN | INSERT | UPDATE | DELETE";
+    const LAYOUT: &str = "Layout ▸ Record view | ✓ Selection statistics | — | Larger text | \
+                          Smaller text | Usual text size";
+    const PANELS: &str = "Panels ▸ Aggregate | Columns";
 
     #[test]
     fn a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters() {
@@ -2027,6 +2695,8 @@ mod tests {
                 "View value",
                 "—",
                 COLUMN,
+                LAYOUT,
+                PANELS,
                 "—",
                 "Generate SQL ▸ SELECT by key (query result) | SELECT … IN (query result) | \
                  INSERT (query result) | UPDATE (query result) | DELETE (query result)",
@@ -2098,6 +2768,7 @@ mod tests {
                 "—",
                 "View value",
                 "Edit cell",
+                "Edit in value panel",
                 "Set NULL",
                 "Set default",
                 "—",
@@ -2105,9 +2776,13 @@ mod tests {
                  Copy from row above | Copy from row below",
                 "—",
                 COLUMN,
+                LAYOUT,
+                PANELS,
                 "—",
                 GENERATE,
                 "Export…",
+                "—",
+                "Refresh",
             ]
         );
         // A table without a key can only be inserted; a new row is not written.
@@ -2265,6 +2940,107 @@ mod tests {
         );
         // A result has no filter.
         assert!(!labels(&header_menu(&column())).contains(&"Filter on this column…".to_string()));
+    }
+
+    #[test]
+    fn the_record_view_and_the_value_panel_are_in_the_cell_menu() {
+        let menu = labels(&cell_menu(&CellFacts {
+            record: true,
+            stats: false,
+            kind: TypeKind::Binary,
+            ..data_cell()
+        }));
+        assert!(
+            menu.contains(
+                &"Layout ▸ ✓ Record view | Selection statistics | — | Larger text | \
+              Smaller text | Usual text size"
+                    .to_string()
+            )
+        );
+        // Binary values are shown, not edited, in the value panel.
+        assert!(menu.contains(&"Edit in value panel (binary value)".to_string()));
+        let view = flat(&cell_menu(&CellFacts {
+            read_only: Some("view"),
+            ..data_cell()
+        }));
+        assert!(view.contains(&"Edit in value panel (view)".to_string()));
+        // Refresh ends the menu of a table's rows only.
+        assert_eq!(
+            cell_menu(&data_cell()).last(),
+            Some(&enabled(GridAction::Refresh))
+        );
+        assert!(!flat(&cell_menu(&result_cell())).contains(&"Refresh".to_string()));
+    }
+
+    #[test]
+    fn a_row_number_opens_the_menu_of_its_row() {
+        assert_eq!(
+            labels(&row_menu(&data_cell())),
+            [
+                "Copy row numbers",
+                "—",
+                "Copy",
+                COPY_AS,
+                "—",
+                "Add row",
+                "Duplicate row",
+                "Delete row",
+                "Revert row (no change)",
+                "—",
+                "Clear filters (no filter)",
+                "—",
+                LAYOUT,
+                "—",
+                GENERATE,
+                "Export…",
+                "—",
+                "Refresh",
+            ]
+        );
+        // A result's row copies, changes the layout and exports.
+        assert_eq!(
+            labels(&row_menu(&result_cell())),
+            [
+                "Copy row numbers",
+                "—",
+                "Copy",
+                COPY_AS,
+                "—",
+                LAYOUT,
+                "—",
+                "Generate SQL ▸ SELECT by key (query result) | SELECT … IN (query result) | \
+                 INSERT (query result) | UPDATE (query result) | DELETE (query result)",
+                "Export…",
+            ]
+        );
+        let read_only = flat(&row_menu(&CellFacts {
+            read_only: Some("view"),
+            ..data_cell()
+        }));
+        assert!(read_only.contains(&"Add row (view)".to_string()));
+    }
+
+    #[test]
+    fn row_numbers_are_copied_one_per_line_from_one() {
+        assert_eq!(row_numbers(&(0..=0)), "1");
+        assert_eq!(row_numbers(&(4..=6)), "5\n6\n7");
+    }
+
+    #[test]
+    fn a_boolean_toggles_through_null_when_its_column_takes_it() {
+        assert_eq!(next_bool(Some(true), true), Some(false));
+        assert_eq!(next_bool(Some(false), true), None);
+        assert_eq!(next_bool(None, true), Some(true));
+        assert_eq!(next_bool(Some(false), false), Some(true));
+        assert_eq!(next_bool(None, false), Some(true));
+        // Written as the server prints it, so that two toggles are no change.
+        let pg = kerno_core::Column::new("b", "bool", TypeKind::Boolean);
+        let mysql = kerno_core::Column::new("b", "TINYINT(1)", TypeKind::Boolean);
+        assert_eq!((bool_text(&pg, true), bool_text(&pg, false)), ("t", "f"));
+        assert_eq!(
+            (bool_text(&mysql, true), bool_text(&mysql, false)),
+            ("1", "0")
+        );
     }
 
     #[test]

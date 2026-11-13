@@ -1,16 +1,22 @@
 //! The value viewer: one cell in full, as text, as indented JSON or as a
-//! hex dump.
+//! hex dump; and the value panel, which edits a cell that takes typed
+//! values (DBeaver's `row.edit`, Shift+Enter).
+
+use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     TestSupportExt as _, Window, div, px,
 };
-use kerno_core::format::{byte_size, hex_dump, pretty_json};
+use gpui_kit::{Entity, FocusHandle, Focusable as _};
+use kerno_core::format::{byte_size, compact_json, hex_dump, pretty_json};
+use kerno_core::sql::CellValue;
 use kerno_core::{Column, TypeKind};
 
 /// The most a view draws: beyond it the text is cut and says so (the
@@ -33,8 +39,225 @@ struct ValueViewer {
     views: Vec<View>,
 }
 
-/// Opens the viewer on a cell of `column`.
+/// Makes a value a pending change of the cell.
+pub type Apply = dyn Fn(CellValue, &mut Window, &mut App);
+
+/// What saving the value panel does.
+pub struct Save {
+    /// The column takes NULL.
+    pub nullable: bool,
+    pub apply: Rc<Apply>,
+}
+
+/// Opens the value panel on a cell of `column`: editable with `save`
+/// (binary values are only shown), else the viewer.
+/// `back` takes the keyboard once the panel closes.
+pub fn edit(
+    column: &Column,
+    value: Option<&[u8]>,
+    save: Option<Save>,
+    back: FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(save) = save.filter(|_| column.kind != TypeKind::Binary) else {
+        return show(column, value, Some(back), window, cx);
+    };
+    let title = SharedString::from(format!("{} · {}", column.name, column.type_name));
+    let fetched = value.map_or(String::new(), |bytes| {
+        String::from_utf8_lossy(bytes).into_owned()
+    });
+    let json = column.kind == TypeKind::Json;
+    // JSON is edited laid out; left as it was, it is no change.
+    let shown = if json {
+        pretty_json(&fetched).unwrap_or_else(|| fetched.clone())
+    } else {
+        fetched.clone()
+    };
+    let kind = column.kind;
+    let editor = cx.new(|cx| ValueEditor {
+        text: cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(14)
+                .default_value(shown.clone())
+        }),
+        shown,
+        fetched,
+        kind,
+        problem: None,
+        save,
+    });
+    let text = editor.read(cx).text.clone();
+    let back = Some(back);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (editor, back) = (editor.clone(), back.clone());
+        dialog
+            .title(title.clone())
+            .w(px(720.))
+            // Enter is a new line, never the dialog's OK.
+            .on_ok(|_, _, _| false)
+            .on_close(move |_, window, cx| give_back(back.clone(), window, cx))
+            .content(move |content, _, _| content.child(editor.clone()))
+    });
+    window.defer(cx, move |window, cx| {
+        text.read(cx).focus_handle(cx).focus(window, cx)
+    });
+}
+
+/// Once a dialog has closed, the keyboard goes back where it was.
+pub fn give_back(focus: Option<FocusHandle>, window: &mut Window, cx: &mut App) {
+    if let Some(focus) = focus {
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+}
+
+/// The value panel in edit mode.
+struct ValueEditor {
+    text: Entity<TextareaState>,
+    /// What the panel showed first.
+    shown: String,
+    /// What the cell holds.
+    fetched: String,
+    kind: TypeKind,
+    /// Why the text cannot be saved.
+    problem: Option<String>,
+    save: Save,
+}
+
+impl ValueEditor {
+    /// Saves the text as the cell's value, unless it is JSON the parser
+    /// refuses. Text left as shown is no change; emptied text is NULL
+    /// except in a text column, as when typing in the cell.
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.text.read(cx).value().to_string();
+        if typed != self.shown {
+            if self.kind == TypeKind::Json
+                && !typed.is_empty()
+                && let Err(error) = serde_json::from_str::<serde_json::Value>(&typed)
+            {
+                self.problem = Some(format!("This is not valid JSON: {error}."));
+                cx.notify();
+                return;
+            }
+            if let Some(value) = super::grid::typed_value(&typed, &self.fetched, self.kind) {
+                (self.save.apply)(value, window, cx);
+            }
+        }
+        window.close_dialog(cx);
+    }
+
+    /// Lays the JSON out on lines (`pretty`) or on one line.
+    fn reformat(&mut self, pretty: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.text.read(cx).value().to_string();
+        let rewritten = if pretty {
+            pretty_json(&typed)
+        } else {
+            compact_json(&typed)
+        };
+        match rewritten {
+            Some(text) => {
+                self.problem = None;
+                self.text
+                    .update(cx, |state, cx| state.set_value(text, window, cx));
+            }
+            None => {
+                let error = serde_json::from_str::<serde_json::Value>(&typed)
+                    .err()
+                    .map_or_else(String::new, |error| format!(": {error}"));
+                self.problem = Some(format!("This is not valid JSON{error}."));
+            }
+        }
+        cx.notify();
+    }
+}
+
+impl Render for ValueEditor {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let json = self.kind == TypeKind::Json;
+        v_flex()
+            .id("value-editor")
+            .test_support()
+            .gap_3()
+            .pt_1()
+            .child(
+                div()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_sm()
+                    .child(Textarea::new(&self.text)),
+            )
+            .children(self.problem.clone().map(|problem| {
+                div()
+                    .id("value-problem")
+                    .test_support()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(problem))
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when(json, |bar| {
+                        bar.child(
+                            Button::new("value-pretty")
+                                .ghost()
+                                .label("Format JSON")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reformat(true, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("value-compact")
+                                .ghost()
+                                .label("Compact JSON")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reformat(false, window, cx)
+                                })),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("value-null")
+                            .outline()
+                            .label("Set NULL")
+                            .disabled(!self.save.nullable)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                (this.save.apply)(CellValue::Null, window, cx);
+                                window.close_dialog(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("value-cancel")
+                            .outline()
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("value-save")
+                            .primary()
+                            .label("Save")
+                            .tooltip("Keep the value as a pending change")
+                            .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
+                    ),
+            )
+    }
+}
+
+/// Opens the viewer on a cell of `column`; the keyboard comes back where
+/// it is.
 pub fn open(column: &Column, value: Option<&[u8]>, window: &mut Window, cx: &mut App) {
+    let back = window.focused(cx);
+    show(column, value, back, window, cx);
+}
+
+/// Opens the viewer; `back` takes the keyboard once it closes.
+fn show(
+    column: &Column,
+    value: Option<&[u8]>,
+    back: Option<FocusHandle>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let title = SharedString::from(format!("{} · {}", column.name, column.type_name));
     let text = value.and_then(|bytes| std::str::from_utf8(bytes).ok());
     let json = text.and_then(pretty_json);
@@ -56,10 +279,11 @@ pub fn open(column: &Column, value: Option<&[u8]>, window: &mut Window, cx: &mut
         views,
     });
     window.open_dialog(cx, move |dialog, _, _| {
-        let viewer = viewer.clone();
+        let (viewer, back) = (viewer.clone(), back.clone());
         dialog
             .title(title.clone())
             .w(px(720.))
+            .on_close(move |_, window, cx| give_back(back.clone(), window, cx))
             .content(move |content, _, _| content.child(viewer.clone()))
     });
 }

@@ -2,8 +2,9 @@
 //! filter lets through. Nothing here touches the UI or a server; the view
 //! asks for [`Load`]s, runs them and gives the answers back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use kerno_core::config::ObjectFilter;
 use kerno_core::schema::{
     ConstraintKind, DatabaseInfo, ExtensionInfo, ObjectRef, RelationKind, RoutineKind, SchemaInfo,
     SchemaObjects, TableRef, TableStructure, TypeShape,
@@ -180,6 +181,8 @@ pub struct Tree {
     has_schemas: bool,
     roots: Vec<Node>,
     filter: String,
+    /// The connection's object filters, by [`filter_key`].
+    object_filters: BTreeMap<String, ObjectFilter>,
     /// The folders that were open under a node being refreshed, to open
     /// again when its new children arrive.
     reopen: HashMap<String, Vec<String>>,
@@ -319,12 +322,65 @@ impl Tree {
         self.filter = filter.trim().to_lowercase();
     }
 
+    /// Hides the objects the connection's filters leave out (see
+    /// [`ObjectFilter`]): they stay loaded, so a change shows at once.
+    pub fn set_object_filters(&mut self, filters: BTreeMap<String, ObjectFilter>) {
+        self.object_filters = filters;
+    }
+
+    /// The filter on the children of the node `id` (on the databases when
+    /// `None`), when it hides anything.
+    fn active_filter(&self, id: Option<&str>) -> Option<&ObjectFilter> {
+        let key = id.map_or_else(|| "databases".to_string(), children_key);
+        self.object_filters
+            .get(&key)
+            .filter(|filter| !filter.is_inactive())
+    }
+
+    /// How many children of the node `id` (of the databases when `None`)
+    /// its filter hides; `None` when no filter applies to them.
+    pub fn hidden_below(&self, id: Option<&str>) -> Option<usize> {
+        let filter = self.active_filter(id)?;
+        let children = match id {
+            None => &self.roots,
+            Some(id) => match &self.node(id)?.children {
+                Children::Loaded(children) => children,
+                _ => return Some(0),
+            },
+        };
+        Some(
+            children
+                .iter()
+                .filter(|child| filter_name(child).is_some_and(|name| !filter.shows(name)))
+                .count(),
+        )
+    }
+
     /// The rows to show.
     pub fn items(&self) -> Vec<Item> {
-        self.roots
+        let shown = |node: &&Node| {
+            let filter = self.active_filter(None);
+            filter_name(node).is_none_or(|name| filter.is_none_or(|filter| filter.shows(name)))
+        };
+        let mut items: Vec<Item> = self
+            .roots
             .iter()
-            .filter_map(|node| item(node, &self.filter))
-            .collect()
+            .filter(shown)
+            .filter_map(|node| item(node, &self.filter, self))
+            .collect();
+        // The databases have no folder to say they are filtered.
+        if let Some(hidden) = self.hidden_below(None).filter(|hidden| *hidden > 0) {
+            items.push(Item {
+                id: format!("databases{SEP}note"),
+                label: format!(
+                    "{hidden} database{} hidden by a filter",
+                    if hidden == 1 { "" } else { "s" }
+                ),
+                expanded: false,
+                children: Vec::new(),
+            });
+        }
+        items
     }
 
     /// The ids from the root down to the node of a table or view in
@@ -957,7 +1013,55 @@ fn matches(node: &Node, filter: &str) -> bool {
     !matches!(node.kind, NodeKind::Group(_)) && node.label.to_lowercase().contains(filter)
 }
 
-fn item(node: &Node, filter: &str) -> Option<Item> {
+/// The kind of object an object filter applies to, for the children of
+/// the node `id`: `schemas` in a PostgreSQL database, else the folder's
+/// name (`tables`, `views`, `functions`…).
+pub fn children_key(id: &str) -> String {
+    let last = id.rsplit(SEP).next().unwrap_or(id);
+    if last.starts_with("db:") {
+        "schemas".into()
+    } else {
+        last.to_string()
+    }
+}
+
+/// The kind of object an object filter applies to for the node `id`
+/// itself: `databases` for a root, else what its parent holds.
+pub fn filter_key(id: &str) -> String {
+    parent_of(id).map_or_else(|| "databases".into(), children_key)
+}
+
+/// What an object filter names in a kind, for `key` (see [`filter_key`]):
+/// "databases", "materialized views".
+pub fn filter_kind_label(key: &str) -> String {
+    key.replace('-', " ")
+}
+
+/// The name an object filter matches for a node; `None` for what is never
+/// filtered (folders, enum values).
+pub fn filter_name(node: &Node) -> Option<&str> {
+    Some(match &node.kind {
+        NodeKind::Object(ObjectRef::Database(name) | ObjectRef::Schema(name)) => name,
+        NodeKind::Object(
+            ObjectRef::Relation(table, _)
+            | ObjectRef::Sequence(table)
+            | ObjectRef::Type(table)
+            | ObjectRef::Event(table),
+        ) => &table.name,
+        NodeKind::Object(
+            ObjectRef::Routine { name, .. }
+            | ObjectRef::Trigger { name, .. }
+            | ObjectRef::Index { name, .. },
+        ) => name,
+        NodeKind::Extension { name, .. }
+        | NodeKind::Column { name, .. }
+        | NodeKind::Constraint { name, .. }
+        | NodeKind::ForeignKey { name, .. } => name,
+        NodeKind::Group(_) | NodeKind::EnumValue { .. } => return None,
+    })
+}
+
+fn item(node: &Node, filter: &str, tree: &Tree) -> Option<Item> {
     // A node that matches keeps everything below it.
     let below = if filter.is_empty() || matches(node, filter) {
         ""
@@ -969,10 +1073,23 @@ fn item(node: &Node, filter: &str) -> Option<Item> {
         Children::Unloaded | Children::Loading => vec![note(node, "Loading…")],
         Children::Failed(message) => vec![note(node, message)],
         Children::Loaded(children) if children.is_empty() => vec![note(node, "Nothing here")],
-        Children::Loaded(children) => children
-            .iter()
-            .filter_map(|child| item(child, below))
-            .collect(),
+        Children::Loaded(children) => {
+            let object_filter = tree.active_filter(Some(&node.id));
+            let shown: Vec<Item> = children
+                .iter()
+                .filter(|child| {
+                    filter_name(child).is_none_or(|name| {
+                        object_filter.is_none_or(|object_filter| object_filter.shows(name))
+                    })
+                })
+                .filter_map(|child| item(child, below, tree))
+                .collect();
+            if shown.is_empty() && object_filter.is_some() {
+                vec![note(node, "Everything here is hidden by a filter")]
+            } else {
+                shown
+            }
+        }
     };
     let found_below = !below.is_empty() && children.iter().any(|child| !is_note(&child.id));
     if !below.is_empty() && !found_below {
@@ -1598,6 +1715,85 @@ mod tests {
         );
         tree.set_filter("");
         assert_eq!(outline(&tree.items())[0], "v kerno");
+    }
+
+    #[test]
+    fn object_filters_hide_by_kind_and_say_how_many() {
+        let (mut tree, shop) = loaded();
+        let filter = |include: &[&str], exclude: &[&str]| ObjectFilter {
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+        };
+        let tables = format!("{shop}{SEP}tables");
+        assert_eq!(filter_key(&format!("{tables}{SEP}rel:orders")), "tables");
+        assert_eq!(filter_key(&shop), "schemas");
+        assert_eq!(filter_key("db:kerno"), "databases");
+        assert_eq!(tree.hidden_below(Some(&tables)), None);
+
+        // Tables: one hidden by a mask, the views untouched.
+        tree.expand(&tables);
+        tree.expand(&format!("{shop}{SEP}views"));
+        tree.set_object_filters(BTreeMap::from([(
+            "tables".to_string(),
+            filter(&[], &["order_*"]),
+        )]));
+        let lines = outline(&tree.items());
+        assert!(lines.contains(&"      > orders".to_string()), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("order_items")),
+            "{lines:?}"
+        );
+        assert_eq!(tree.hidden_below(Some(&tables)), Some(1));
+        // A view is another kind: a mask that would match it is not its.
+        tree.set_object_filters(BTreeMap::from([(
+            "tables".to_string(),
+            filter(&[], &["*orders*"]),
+        )]));
+        assert!(
+            outline(&tree.items())
+                .iter()
+                .any(|line| line.contains("recent_orders"))
+        );
+
+        // Schemas and databases: what is hidden is counted where it was.
+        tree.set_object_filters(BTreeMap::from([
+            ("schemas".to_string(), filter(&["shop"], &[])),
+            ("databases".to_string(), filter(&[], &["template1"])),
+        ]));
+        let lines = outline(&tree.items());
+        assert!(
+            !lines.iter().any(|line| line.contains("pg_catalog")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("template1")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.last().unwrap(), "1 database hidden by a filter");
+        assert_eq!(tree.hidden_below(Some("db:kerno")), Some(1));
+
+        // Off, the filter hides nothing and is not counted.
+        let mut off = filter(&["nothing"], &[]);
+        off.enabled = false;
+        tree.set_object_filters(BTreeMap::from([("schemas".to_string(), off)]));
+        assert_eq!(tree.hidden_below(Some("db:kerno")), None);
+        assert!(
+            outline(&tree.items())
+                .iter()
+                .any(|line| line.contains("pg_catalog"))
+        );
+
+        // A folder whose every object is hidden says so.
+        tree.set_object_filters(BTreeMap::from([(
+            "tables".to_string(),
+            filter(&["none_such"], &[]),
+        )]));
+        assert!(
+            outline(&tree.items())
+                .iter()
+                .any(|line| line.contains("Everything here is hidden by a filter"))
+        );
     }
 
     #[test]

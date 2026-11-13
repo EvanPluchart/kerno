@@ -48,6 +48,12 @@ pub enum AdminView {
     TableSizes,
     /// Server configuration settings.
     Settings,
+    /// Sessions waiting for a lock, one row per session in their way
+    /// (DBeaver's lock manager). Column 0 is the waiting session's id and
+    /// the column `blocking_id` the id of the session holding the lock:
+    /// both are ids [`Session::cancel_session`] and
+    /// [`Session::terminate_session`] accept.
+    Locks,
 }
 
 /// Opens sessions for one or more engines.

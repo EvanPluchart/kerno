@@ -2,7 +2,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kerno_core::dialect::{Dialect, column_list, default_literal, foreign_key_sql, hex};
+use kerno_core::dialect::{
+    DatabaseOptions, Dialect, column_list, default_literal, foreign_key_sql, hex,
+};
 use kerno_core::maintenance::{Maintenance, MaintenanceSql, TruncateOptions};
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef,
@@ -390,6 +392,94 @@ impl Dialect for MysqlDialect {
             }
             ObjectRef::Type(_) => return Err(unsupported("user-defined types")),
         })
+    }
+
+    /// A character set and a collation, both names from the server's lists
+    /// written as they are: nothing but letters, digits and `_` is taken.
+    fn create_database_with_sql(&self, name: &str, options: &DatabaseOptions) -> Result<String> {
+        let given = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let postgres_only = [
+            &options.owner,
+            &options.template,
+            &options.ctype,
+            &options.tablespace,
+        ];
+        if postgres_only
+            .into_iter()
+            .any(|value| given(value).is_some())
+        {
+            return Err(unsupported(
+                "an owner, template, character type or tablespace for a database",
+            ));
+        }
+        let mut sql = format!("CREATE DATABASE {}", self.quote_ident(name));
+        for (key, value) in [
+            ("CHARACTER SET", given(&options.encoding)),
+            ("COLLATE", given(&options.collation)),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(Error::Config(format!(
+                    "“{value}” is not a {} name",
+                    key.to_lowercase()
+                )));
+            }
+            sql.push_str(&format!(" {key} {value}"));
+        }
+        Ok(sql)
+    }
+
+    /// A collation belongs to one character set; on MariaDB 11 the
+    /// `uca1400` ones have none, and go with any.
+    fn database_options_sql(&self) -> Option<&'static str> {
+        Some(
+            "\
+SELECT 'encoding' AS field, c.CHARACTER_SET_NAME AS value, NULL AS applies_to
+FROM information_schema.CHARACTER_SETS c
+UNION ALL
+SELECT 'collation', l.COLLATION_NAME, l.CHARACTER_SET_NAME
+FROM information_schema.COLLATIONS l
+ORDER BY 1, 2",
+        )
+    }
+
+    /// From `information_schema.TABLES`, and `VIEWS` for a view. A view's
+    /// comment is the word `VIEW`, not a comment.
+    fn properties_sql(&self, table: &TableRef, _kind: RelationKind) -> Option<String> {
+        Some(format!(
+            "\
+SELECT t.TABLE_TYPE AS `Kind`,
+       t.ENGINE AS `Engine`,
+       t.TABLE_COLLATION AS `Collation`,
+       t.ROW_FORMAT AS `Row format`,
+       t.TABLE_ROWS AS `Estimated rows`,
+       t.AVG_ROW_LENGTH AS `Average row length`,
+       t.DATA_LENGTH AS `Data size`,
+       t.INDEX_LENGTH AS `Index size`,
+       t.DATA_FREE AS `Free space size`,
+       t.AUTO_INCREMENT AS `Next auto-increment`,
+       t.CREATE_TIME AS `Created`,
+       t.UPDATE_TIME AS `Updated`,
+       NULLIF(t.CREATE_OPTIONS, '') AS `Options`,
+       v.DEFINER AS `Definer`,
+       v.SECURITY_TYPE AS `Security`,
+       v.IS_UPDATABLE AS `Updatable`,
+       CASE WHEN t.TABLE_TYPE <> 'VIEW' THEN NULLIF(t.TABLE_COMMENT, '') END AS `Comment`
+FROM information_schema.TABLES t
+LEFT JOIN information_schema.VIEWS v
+       ON v.TABLE_SCHEMA = t.TABLE_SCHEMA AND v.TABLE_NAME = t.TABLE_NAME
+WHERE t.TABLE_SCHEMA = {} AND t.TABLE_NAME = {}",
+            self.quote_string(&table.schema),
+            self.quote_string(&table.name)
+        ))
     }
 
     /// Databases hold tables directly on these engines.
@@ -1016,6 +1106,35 @@ mod tests {
             assert_eq!(
                 d.create_database_sql("odd `name`").unwrap(),
                 "CREATE DATABASE `odd ``name```"
+            );
+            let options = DatabaseOptions {
+                encoding: Some("utf8mb4".into()),
+                collation: Some(" utf8mb4_bin ".into()),
+                ..DatabaseOptions::default()
+            };
+            assert_eq!(
+                d.create_database_with_sql("db", &options).unwrap(),
+                "CREATE DATABASE `db` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+            );
+            // Names only, never SQL; and PostgreSQL's options are refused.
+            let sneaky = DatabaseOptions {
+                collation: Some("x; DROP DATABASE y".into()),
+                ..DatabaseOptions::default()
+            };
+            assert!(d.create_database_with_sql("db", &sneaky).is_err());
+            let owner = DatabaseOptions {
+                owner: Some("root".into()),
+                ..DatabaseOptions::default()
+            };
+            assert!(matches!(
+                d.create_database_with_sql("db", &owner),
+                Err(Error::Unsupported(_))
+            ));
+            assert!(d.database_options_sql().is_some());
+            let properties = d.properties_sql(&t(), RelationKind::Table).unwrap();
+            assert!(
+                properties.contains("t.TABLE_SCHEMA = 'shop' AND t.TABLE_NAME = 'order items'"),
+                "{properties}"
             );
         }
     }

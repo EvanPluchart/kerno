@@ -658,3 +658,117 @@ Left:
   "Evaluate expression" stays on the roadmap (SQL-14).
 - The tree's entries (Read data in SQL console, Generate CALL, Execute…) have no palette command.
 - Cmd+Shift+/ may be taken by macOS for the Help menu's search field; not checked in the real app.
+
+## G3, G6, G9 — delivered on 2026-11-13, and what they left (one `opus` agent, app: `query/grid.rs`,
+`query/grid_view.rs` (new), `query/viewer.rs`, `data/tab.rs`, `query/tab.rs`, `actions.rs`, `main.rs`,
+`workspace.rs`, `settings.rs`; core: `aggregate.rs` (new))
+
+- G3: Tab in a grid (results and table data) toggles the record view: one line per shown column (name,
+  type, value), the current row's; Up / Down move between fields, Enter / F2 / a double click edit in place
+  through the grid's own editor (pending changes, Review SQL, Apply unchanged), Tab goes back on the same
+  row. First / Previous / Next / Last row (Ctrl+Alt+Shift+Left, Ctrl+Alt+Left / Right,
+  Ctrl+Alt+Shift+Right) in both modes, buttons in the record view; a "Record" button in the result and
+  data footers; Layout ▸ in the cell and row menus: Record view, Selection statistics, the three zoom
+  entries (RES-02, RES-18, CM-113). Test `record_view_shows_one_row_and_edits_it`.
+- G6: the footer shows "N cells (R rows, C columns) · D distinct · sum · avg · min · max" whenever more
+  than one cell is selected (numbers only for numeric columns; off with Layout ▸ / "Toggle Selection
+  Statistics", stored in the settings); more than 100,000 cells are counted off the UI thread with
+  "computing…", stopped when the selection changes (RES-31). Panels ▸ Aggregate and Columns (palette:
+  Show Aggregate / Columns Panel): count, count distinct, sum, average, minimum, maximum; position, name,
+  type, and for a table's rows its table, primary key and nullability (RES-27, RES-28, CM-111). Go to Row…
+  (Ctrl+G; a row not fetched yet is asked of the server and selected when it arrives; a table's page says
+  the row is not on it) and Go to Column… (Ctrl+Shift+G, a filtered list) (RES-17). A right-click on a row
+  number opens the row's menu: Copy row numbers first, Copy / Copy as, add / duplicate / delete / revert
+  row and Clear filters on table data, Layout, Generate SQL, Export, Refresh; "Copy Row Numbers" in the
+  palette (RES-46, CM-123, CM-124). Refresh ends the cell menu of table data (CM-116). Tests
+  `selection_figures_show_in_the_footer_and_the_panels`, `go_to_row_and_column_move_the_selection`,
+  `a_right_click_on_a_row_number_opens_the_menu_of_its_row`; units `aggregate::tests`,
+  `grid_view::tests::the_columns_panel_adds_what_the_table_says`,
+  `grid::tests::a_row_number_opens_the_menu_of_its_row`,
+  `grid::tests::the_record_view_and_the_value_panel_are_in_the_cell_menu`.
+- G9: Shift+Enter ("View or Edit Value of the Selected Cell") and "Edit in value panel" in the cell menu
+  open the value panel editable on a cell that takes typed values: multi-line text, JSON laid out, Format
+  / Compact JSON, an invalid JSON refused with the parser's message, Set NULL when the column takes it;
+  Save is one pending change (one undo step), as typing in the cell. Binary values, query results and
+  read-only rows open the viewer as before (RES-50, CM-109). Test
+  `the_value_panel_edits_a_json_cell_and_apply_writes_it`.
+
+Differs from DBeaver:
+- Panels are dialogs, not panes docked beside the grid (the value viewer already was one); the footer is
+  the live aggregate. No median or mode; minimum and maximum of numbers only (DBeaver also compares text).
+- Count distinct stops counting past 1,000,000 different values ("over 1000000"): an exact set of a whole
+  1M x 20 result would take most of a gigabyte.
+- A whole column of a result still arriving keeps the figures of the rows it had when selected.
+- Go to Row and Go to Column are not in the cell menu (DBeaver has them in its Navigate submenu).
+
+Left:
+- After Apply, the page is read into a new grid and the keyboard is not given back to it (as before this
+  part); the tests focus the grid again.
+- The record view shows one row; DBeaver's record mode with several selected rows shows them side by side.
+
+## G11, G14, G16, G17 and CM-58 — delivered on 2026-11-13, and what they left (one `opus` agent; core:
+`config.rs`, `dialect.rs`, `driver.rs`, `storage.rs`, both drivers' `admin.rs`, `dialect.rs` and
+`tests/introspect.rs`; app: `navigator/` (`filter_dialog.rs` new), `database_dialog.rs` (new),
+`query/tx_log.rs` (new), `admin/tab.rs`, `structure/tab.rs`, `sql_confirm.rs`, `backup_dialog.rs`,
+`connections/`, `query/tab.rs`, `tabs.rs`, `actions.rs`, `main.rs`, `workspace.rs`, `settings.rs`)
+
+- G14 (CON-45, CM-133): a query tab in manual commit keeps the statements of its open transaction (text
+  redacted as the history is, time, duration, rows, status, error); emptied by Commit / Rollback and by a
+  statement that ends the transaction (typed COMMIT, MySQL's implicit commits). "Transaction log…" on the
+  status bar's transaction item and the palette / Database menu command "Transaction Log". Tests
+  `the_transaction_log_lists_the_statements_until_the_transaction_ends`,
+  `tx_log::tests::the_log_keeps_what_the_history_keeps`.
+- G16 (TOOL-13, TOOL-14): "Hide idle" (PostgreSQL `state = 'idle'`) / "Hide sleeping" (MySQL, MariaDB
+  `Command = 'Sleep'`) on the Sessions sub-tab, with the count hidden, kept in the settings. A Locks
+  sub-tab (`AdminView::Locks`): one row per waiting session and session in its way, from
+  `pg_blocking_pids()` and `pg_locks` (PostgreSQL), `performance_schema.data_lock_waits` and `threads`
+  (MySQL 8.4), `information_schema.INNODB_LOCK_WAITS` / `INNODB_TRX` / `INNODB_LOCKS` (MariaDB 11),
+  with both statements; Cancel / Terminate of the blocking session on the toolbar, and of either session
+  in the row's menu, through the usual confirmation; auto-refresh. Tests
+  `the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker`, drivers'
+  `the_lock_view_names_the_waiting_session_and_its_blocker`.
+- G17 (OBJ-03, CM-33 for tables and views, OBJ-14): a Properties sub-tab first in the structure tab
+  (PostgreSQL owner, kind, persistence, tablespace, access method, estimated rows, sizes, row security,
+  options, last vacuum / analyze, OID, comment; MySQL / MariaDB kind, engine, collation, row format, rows,
+  sizes, next auto-increment, created, updated, options, a view's definer / security / updatable,
+  comment); "Edit…" sets or removes a table's comment through the confirmation. F4 and a new "Properties"
+  entry open a table or view there; "Open structure" still opens on the columns. Create database… is a
+  form with the server's lists (PostgreSQL owner, template, encoding, LC_COLLATE, LC_CTYPE, tablespace;
+  MySQL / MariaDB character set and its collations) and a live preview, then the confirmation. Tests
+  `properties_open_first_on_f4_and_the_comment_is_set_from_there`,
+  `a_database_is_created_with_the_options_of_the_form`, drivers' `properties_describe_tables_and_views`,
+  `a_database_is_created_with_the_options_the_server_lists` /
+  `a_database_is_created_with_a_character_set_and_collation`.
+- G11 (NAV-19, CM-20, CM-37, CM-60): Filter ▸ on every object and folder of the tree (Hide this object,
+  Show only this object, Configure…, Turn on or off, Clear) and five palette commands; masks with `*` and
+  `?` per connection and kind (`databases`, `schemas`, the folder names) in
+  `ConnectionConfig::navigator_filters` (exported with the connection, no migration: a JSON field with a
+  default); applied when the tree is drawn, so a change shows at once; a filtered folder's hint says
+  "N hidden" (or "filtered"), databases hidden say so in a line below them. Matching ported from
+  DBeaver's `DBSObjectFilter`. Tests `object_filters_hide_schemas_and_last_after_a_restart`,
+  `model::tests::object_filters_hide_by_kind_and_say_how_many`,
+  `config::tests::object_filters_match_as_dbeaver_masks_do`.
+- CM-58: "Back up…" on a table of the tree opens the backup with that table alone (`pg_dump --table`,
+  `mysqldump <database> <table>`), the names passed as they are, never parsed from text; "Every table"
+  goes back to the whole database. Test `a_table_is_backed_up_alone_from_the_tree`.
+
+Differs from DBeaver:
+- Object filter masks take `*` and `?` only: DBeaver also reads `%` and `_`, which would make hiding
+  `order_items` hide `orderXitems` too. No filter per schema of another kind than its folder (DBeaver's
+  global "filter for all schemas" is the same here).
+- The lock manager is a table of waiting → blocking pairs, not DBeaver's tree, and shows InnoDB row and
+  table locks only on MySQL / MariaDB (no metadata locks).
+- A PostgreSQL database made with another encoding or locale than its template needs `template0`: the
+  form says so; Kerno does not switch it silently.
+- "Hide idle" leaves out PostgreSQL's `idle` sessions only, never `idle in transaction` ones: those hold
+  locks.
+
+Left:
+- CM-33 on databases and schemas: F4 there still shows the DDL (no properties page of a database or
+  schema).
+- The tree selects one node at a time: a backup of several selected tables is typed in the dialog.
+- "Link with editor" on a table hidden by a filter selects nothing (the node is loaded, not shown).
+- The connection's sidebar menu has no "Lock Manager" entry: the Locks sub-tab is in Administration.
+- The Properties page is read-only but for a table's comment; a view's comment is not set from it.
+- The transaction log is also emptied when a new transaction begins (after a lost connection or a
+  rollback on close); that path has no test.

@@ -38,6 +38,16 @@ pub enum Statement {
         /// The statement for a name, or why there is none for it.
         build: Rc<BuildStatement>,
     },
+    /// Built from a text the user types, which may be left empty (a
+    /// comment, removed when empty).
+    Text {
+        /// Label of the field.
+        label: &'static str,
+        /// What the field holds at first.
+        initial: String,
+        /// The statement for the text, trimmed, or why there is none.
+        build: Rc<BuildStatement>,
+    },
     /// Built from a name and a list typed one item per line (an enum and
     /// its values).
     NamedList {
@@ -109,7 +119,9 @@ impl ConfirmView {
     ) -> Self {
         let initial = match &confirmation.statement {
             Statement::Fixed(_) => None,
-            Statement::Named { initial, .. } => Some(initial.clone()),
+            Statement::Named { initial, .. } | Statement::Text { initial, .. } => {
+                Some(initial.clone())
+            }
             Statement::NamedList { .. } => Some(String::new()),
         };
         let name =
@@ -150,6 +162,7 @@ impl ConfirmView {
         };
         match &self.confirmation.statement {
             Statement::Fixed(sql) => Ok(sql.clone()),
+            Statement::Text { build, .. } => build(&typed),
             Statement::Named { label, .. } if typed.is_empty() => {
                 Err(format!("Type a {}.", label.to_lowercase()))
             }
@@ -207,7 +220,7 @@ impl Render for ConfirmView {
                 .child(field)
         };
         let name_label = match &self.confirmation.statement {
-            Statement::Named { label, .. } => label,
+            Statement::Named { label, .. } | Statement::Text { label, .. } => label,
             _ => "Name",
         };
         let field = self.name.as_ref().map(|name| {

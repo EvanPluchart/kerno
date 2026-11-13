@@ -5001,7 +5001,7 @@ fn the_structure_of_a_table_is_shown_in_tabs(cx: &mut TestAppContext) {
         // Cmd+C copies the selected cell.
         let tab = app.structure(cx);
         let grid = cx.update(|cx| tab.read(cx).grid(List::Columns)).unwrap();
-        app.on_structure(cx, |tab, _, cx| tab.select(0, cx));
+        app.on_structure(cx, |tab, _, cx| tab.select(1, cx));
         app.step(cx, |window, cx| {
             grid.update(cx, |table, cx| table.set_selected_cell(1, 2, cx));
             grid.read(cx).focus_handle(cx).focus(window, cx);
@@ -5079,9 +5079,9 @@ fn a_view_shows_its_columns_and_ddl(cx: &mut TestAppContext) {
             app.structure_rows(cx, List::Indexes),
             Vec::<Vec<String>>::new()
         );
-        app.on_structure(cx, |tab, _, cx| tab.select(1, cx));
+        app.on_structure(cx, |tab, _, cx| tab.select(2, cx));
         assert!(app.has(cx, ("structure-empty", 1usize)), "{engine:?}");
-        app.on_structure(cx, |tab, _, cx| tab.select(3, cx));
+        app.on_structure(cx, |tab, _, cx| tab.select(4, cx));
         assert!(
             app.has(cx, ("structure-empty", 3usize)) && app.has(cx, ("structure-empty", 4usize)),
             "{engine:?}"
@@ -12061,4 +12061,1039 @@ fn paste_saves_the_copied_connection_and_a_folder_refreshes(cx: &mut TestAppCont
     cx.run_until_parked();
     assert_eq!(app.status(cx, 0), Status::Disconnected);
     assert_eq!(cx.update(|cx| app.connections.read(cx).saved().len()), 2);
+}
+
+// Record view, grid navigation and panels, value panel, boolean and enum
+// cells (docs/plans/PARITY-GAPS.md G3, G6, G9; docs/plans/M6.md Part 1) ---
+
+/// A small table to edit: a key, text, a number, JSON, a boolean.
+fn record_scratch(schema: &str) -> Scratch {
+    Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")],
+        &[
+            &format!("CREATE SCHEMA {schema}"),
+            &format!(
+                "CREATE TABLE {schema}.items (id integer PRIMARY KEY, name varchar(20), \
+                 qty integer, doc jsonb, flag boolean)"
+            ),
+            &format!(
+                "INSERT INTO {schema}.items VALUES (1, 'a', 10, '{{\"a\": 1}}', true), \
+                 (2, 'b', 20, NULL, false), (3, 'c', 30, '[]', NULL)"
+            ),
+        ],
+    )
+}
+
+/// Selects a cell of the grid and gives it the keys.
+fn select_cell(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    grid: &Entity<TableState<Grid>>,
+    cell: (usize, usize),
+) {
+    app.step(cx, |window, cx| {
+        grid.update(cx, |table, cx| {
+            table.delegate_mut().clear_selection();
+            table.set_selected_cell(cell.0, cell.1, cx);
+            let selection = table.selection();
+            table.delegate_mut().set_anchor(selection);
+        });
+        grid.read(cx).focus_handle(cx).focus(window, cx);
+    });
+}
+
+#[gpui_kit::test]
+fn record_view_shows_one_row_and_edits_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = record_scratch("kerno_ui_record");
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_record", "items", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–3 of 3");
+    let grid = app.data_grid(cx);
+    // The row the record view shows, from 1.
+    let row_label = |app: &Fixture, cx: &mut TestAppContext| -> String {
+        app.step(cx, |_, _| ());
+        let (row, _) = crate::query::grid::current(cx.update(|cx| grid.read(cx).selection()));
+        format!("Row {} of 3", row + 1)
+    };
+    // Tab while typing in a cell stays in the cell.
+    app.on_data(cx, |tab, window, cx| tab.edit_cell(0, 2, window, cx));
+    app.press(cx, &["tab"]);
+    let (record, editing) = cx.update(|cx| {
+        (
+            grid.read(cx).delegate().record,
+            grid.read(cx).delegate().editing(),
+        )
+    });
+    assert!(!record);
+    assert_eq!(editing, Some((0, 1)));
+    app.press(cx, &["escape"]);
+    // The figures of a selection that stays follow its cells' changes.
+    let figures = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |_, _| ());
+        cx.update(|cx| {
+            crate::query::grid_view::SelectionStats::of(&grid, cx)
+                .read(cx)
+                .text()
+        })
+    };
+    select_cell(&app, cx, &grid, (0, 3));
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(1, 3)));
+    assert!(figures(&app, cx).is_some_and(|text| text.contains("sum 30 ")));
+    app.press(cx, &["delete"]);
+    assert_eq!(
+        figures(&app, cx).as_deref(),
+        Some("2 cells (2 rows, 1 column) · 1 distinct")
+    );
+    app.press(cx, &["secondary-z"]);
+    assert!(figures(&app, cx).is_some_and(|text| text.contains("sum 30 ")));
+    select_cell(&app, cx, &grid, (0, 2));
+    // Tab: the row as one line per column.
+    app.press(cx, &["tab"]);
+    assert!(app.has(cx, "record-view"));
+    assert!(!app.has(cx, "table-inner"));
+    assert_eq!(row_label(&app, cx), "Row 1 of 3");
+    for field in 0usize..5 {
+        assert!(app.has(cx, ("record-field", field)), "{field}");
+    }
+    // Next row, from the keys and the buttons.
+    app.press(cx, &["ctrl-alt-right"]);
+    assert_eq!(row_label(&app, cx), "Row 2 of 3");
+    app.click(cx, "record-last");
+    assert_eq!(row_label(&app, cx), "Row 3 of 3");
+    app.press(cx, &["ctrl-alt-shift-left"]);
+    assert_eq!(row_label(&app, cx), "Row 1 of 3");
+    app.press(cx, &["ctrl-alt-right"]);
+    // A field is picked with the arrows and typed in with Enter.
+    app.press(cx, &["down"]);
+    assert_eq!(cx.update(|cx| grid.read(cx).selected_cell()), Some((1, 3)));
+    app.press(cx, &["enter", "secondary-a", "backspace"]);
+    app.type_text(cx, "21");
+    app.press(cx, &["enter"]);
+    assert_eq!(app.pending(cx), 1);
+    assert_eq!(app.data_rows(cx)[1][2], "21");
+    // Tab goes back to the grid, on the same row.
+    app.press(cx, &["tab"]);
+    assert!(!app.has(cx, "record-view"));
+    assert_eq!(cx.update(|cx| grid.read(cx).selected_cell()), Some((1, 3)));
+    app.click(cx, "data-discard");
+    assert_eq!(app.pending(cx), 0);
+}
+
+#[gpui_kit::test]
+fn selection_figures_show_in_the_footer_and_the_panels(cx: &mut TestAppContext) {
+    use crate::query::grid_view::SelectionStats;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g as n, g * 2 as m, 'x' || g as t from generate_series(1, 4) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["4 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    let figures = |app: &Fixture, cx: &mut TestAppContext, grid: &Entity<TableState<Grid>>| {
+        app.step(cx, |_, _| ());
+        cx.update(|cx| SelectionStats::of(grid, cx).read(cx).text())
+    };
+    // One cell: no figures.
+    select_cell(&app, cx, &grid, (0, 1));
+    assert_eq!(figures(&app, cx, &grid), None);
+    // The numbers of two columns.
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(3, 2)));
+    assert_eq!(
+        figures(&app, cx, &grid).as_deref(),
+        Some("8 cells (4 rows, 2 columns) · 6 distinct · sum 30 · avg 3.75 · min 1 · max 8")
+    );
+    // The first two rows of `n`, then the first two once ordered
+    // descending: the figures are of the cells as shown.
+    select_cell(&app, cx, &grid, (0, 1));
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(1, 1)));
+    assert!(figures(&app, cx, &grid).is_some_and(|text| text.contains("sum 3 ")));
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Order by this column");
+    click_menu_entry(&app, cx, "Descending");
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(1, 1)));
+    let ordered = figures(&app, cx, &grid).unwrap_or_default();
+    assert!(ordered.contains("sum 7 "), "{ordered}");
+    // Text has no sum.
+    select_cell(&app, cx, &grid, (0, 3));
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(1, 3)));
+    assert_eq!(
+        figures(&app, cx, &grid).as_deref(),
+        Some("2 cells (2 rows, 1 column) · 2 distinct")
+    );
+    // Layout ▸ Selection statistics turns the line off.
+    app.dispatch(cx, actions::ToggleSelectionStats);
+    assert!(!cx.update(|cx| AppState::get(cx).settings.selection_stats));
+    app.dispatch(cx, actions::ToggleSelectionStats);
+    // Panels ▸ Aggregate and Columns.
+    app.dispatch(cx, actions::ShowAggregatePanel);
+    assert!(app.has(cx, "aggregate-panel"));
+    app.press(cx, &["escape"]);
+    app.dispatch(cx, actions::ShowColumnsPanel);
+    assert!(app.has(cx, "columns-panel"));
+    app.press(cx, &["escape"]);
+
+    // A whole column of a large result is counted off the UI thread.
+    app.run_in_new_tab(
+        cx,
+        "select g as n from generate_series(1, 300000) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.outcomes(cx)
+            .first()
+            .is_some_and(|outcome| outcome.contains("rows"))
+    });
+    let tab = app.tab(cx);
+    let large = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    app.dispatch(cx, actions::FetchAllRows);
+    app.wait_until(cx, "every row", |_, cx| {
+        cx.update(|cx| large.read(cx).delegate().is_complete())
+    });
+    app.step(cx, |window, cx| {
+        large.update(cx, |table, cx| table.set_selected_col(1, cx));
+        large.read(cx).focus_handle(cx).focus(window, cx);
+    });
+    let first = figures(&app, cx, &large).unwrap_or_default();
+    assert!(
+        first.starts_with("300000 cells (300000 rows, 1 column)"),
+        "{first}"
+    );
+    app.wait_until(cx, "the figures", |app, cx| {
+        figures(app, cx, &large).is_some_and(|text| text.contains("sum"))
+    });
+    assert_eq!(
+        figures(&app, cx, &large).as_deref(),
+        Some(
+            "300000 cells (300000 rows, 1 column) · 300000 distinct · sum 45000150000 · \
+             avg 150000.5 · min 1 · max 300000"
+        )
+    );
+}
+
+#[gpui_kit::test]
+fn go_to_row_and_column_move_the_selection(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g as first, g as second, g as third from generate_series(1, 2500) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.outcomes(cx)
+            .first()
+            .is_some_and(|outcome| outcome.contains("rows"))
+    });
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    assert!(cx.update(|cx| grid.read(cx).delegate().row_count()) < 1500);
+    select_cell(&app, cx, &grid, (0, 1));
+    // Ctrl+G: a row the server has not sent yet is fetched, then selected.
+    app.press(cx, &["ctrl-g"]);
+    assert!(app.has(cx, "go-to-row"));
+    app.type_text(cx, "1500");
+    app.press(cx, &["enter"]);
+    app.wait_until(cx, "row 1500", |_, cx| {
+        cx.update(|cx| grid.read(cx).selected_cell()) == Some((1499, 1))
+    });
+    // Ctrl+Shift+G: a column found by a few letters.
+    app.press(cx, &["ctrl-shift-g"]);
+    assert!(app.has(cx, "go-to-column"));
+    app.type_text(cx, "thi");
+    app.press(cx, &["enter"]);
+    assert_eq!(
+        cx.update(|cx| grid.read(cx).selected_cell()),
+        Some((1499, 3))
+    );
+    // First and previous row.
+    app.press(cx, &["ctrl-alt-left"]);
+    assert_eq!(
+        cx.update(|cx| grid.read(cx).selected_cell()),
+        Some((1498, 3))
+    );
+    app.dispatch(cx, actions::FirstRow);
+    assert_eq!(cx.update(|cx| grid.read(cx).selected_cell()), Some((0, 3)));
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_a_row_number_opens_the_menu_of_its_row(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g as n from generate_series(1, 3) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["3 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    app.right_click(cx, ("row-number", 1usize), None);
+    assert!(menu_entry(&app, cx, "Copy row numbers").is_some());
+    assert!(menu_entry(&app, cx, "Export…").is_some());
+    click_menu_entry(&app, cx, "Copy row numbers");
+    assert_eq!(app.clipboard(cx).as_deref(), Some("2"));
+    // The right-clicked row is selected; inside a selection, it stays.
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(2, 1)));
+    app.right_click(cx, ("row-number", 2usize), None);
+    click_menu_entry(&app, cx, "Copy row numbers");
+    assert_eq!(app.clipboard(cx).as_deref(), Some("2\n3"));
+    app.dispatch(cx, actions::CopyRowNumbers);
+    assert_eq!(app.clipboard(cx).as_deref(), Some("2\n3"));
+}
+
+#[gpui_kit::test]
+fn the_value_panel_edits_a_json_cell_and_apply_writes_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = record_scratch("kerno_ui_value_panel");
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_value_panel", "items", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–3 of 3");
+    let grid = app.data_grid(cx);
+    select_cell(&app, cx, &grid, (0, 4));
+    // Shift+Enter: the value panel, editable, the JSON laid out.
+    app.press(cx, &["shift-enter"]);
+    assert!(app.has(cx, "value-editor"));
+    // Invalid JSON is refused with the parser's message.
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, "{\"b\": ");
+    app.click(cx, "value-save");
+    assert!(app.has(cx, "value-problem"));
+    assert_eq!(app.pending(cx), 0);
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, "{\"b\":   2}");
+    app.click(cx, "value-compact");
+    app.click(cx, "value-save");
+    assert!(!app.has(cx, "value-editor"));
+    assert_eq!(app.pending(cx), 1);
+    let tab = app.data(cx);
+    let (_, statements) = cx.update(|cx| tab.read(cx).pending_sql(cx)).unwrap();
+    assert_eq!(
+        statements,
+        ["UPDATE \"kerno_ui_value_panel\".\"items\" SET \"doc\" = '{\"b\":2}' WHERE \"id\" = 1"]
+    );
+    // Set NULL from the panel, on another row; then apply both.
+    select_cell(&app, cx, &grid, (2, 2));
+    app.press(cx, &["shift-enter"]);
+    app.click(cx, "value-null");
+    assert_eq!(app.pending(cx), 2);
+    assert!(!app.has(cx, "value-editor"));
+    app.click(cx, "data-apply");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the applied changes", |app, cx| {
+        app.pending(cx) == 0 && app.data_state(cx) == "Rows 1–3 of 3"
+    });
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT string_agg(doc::text || '|' || coalesce(name, 'NULL'), E'\\n' ORDER BY id) \
+             FROM kerno_ui_value_panel.items WHERE id IN (1, 3)"
+        ),
+        "{\"b\": 2}|a\n[]|NULL"
+    );
+    // A query result is only shown. (The page read again is a new grid:
+    // the keyboard goes to it first.)
+    let grid = app.data_grid(cx);
+    select_cell(&app, cx, &grid, (0, 1));
+    app.run_in_new_tab(cx, "select '{}'::jsonb as doc", "secondary-enter");
+    app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    let tab = app.tab(cx);
+    let result = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    select_cell(&app, cx, &result, (0, 1));
+    app.press(cx, &["shift-enter"]);
+    assert!(app.has(cx, "value-text"));
+    assert!(!app.has(cx, "value-editor"));
+}
+
+#[gpui_kit::test]
+fn boolean_and_enum_cells_take_their_values(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_choices";
+        let (drop_schema, create_schema) = scratch_schema(engine, schema);
+        let (types, columns) = match engine {
+            Engine::Postgres => (
+                format!("CREATE TYPE {schema}.mood AS ENUM ('sad', 'ok', 'happy')"),
+                format!("flag boolean, mood {schema}.mood"),
+            ),
+            _ => (
+                "SELECT 1".to_string(),
+                "flag TINYINT(1), mood ENUM('sad', 'ok', 'happy')".to_string(),
+            ),
+        };
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_schema],
+            &[
+                &create_schema,
+                &types,
+                &scratch_table(engine, &format!("{schema}.items"), &columns),
+                &format!("INSERT INTO {schema}.items (flag, mood) VALUES (true, 'ok')"),
+            ],
+        );
+        let app = connected(cx, engine);
+        app.open_table(cx, schema, "items", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        let grid = app.data_grid(cx);
+        // Space toggles: true, false, NULL (the column takes it), true.
+        select_cell(&app, cx, &grid, (0, 2));
+        let flag = |app: &Fixture, cx: &mut TestAppContext| app.data_rows(cx)[0][1].clone();
+        assert_eq!(flag(&app, cx), "true");
+        app.press(cx, &["space"]);
+        assert_eq!(flag(&app, cx), "false");
+        app.press(cx, &["space"]);
+        assert_eq!(flag(&app, cx), "NULL");
+        app.press(cx, &["space"]);
+        assert_eq!(flag(&app, cx), "true");
+        assert_eq!(app.pending(cx), 0, "{engine:?}: back to what was fetched");
+        // A click on the selected cell toggles it.
+        app.click(cx, "table-cell-0:2");
+        assert_eq!(flag(&app, cx), "false");
+        // Enter on an enum: the list of its values, NULL last.
+        select_cell(&app, cx, &grid, (0, 3));
+        app.press(cx, &["enter"]);
+        for label in ["sad", "ok", "happy", "NULL"] {
+            assert!(menu_entry(&app, cx, label).is_some(), "{engine:?}: {label}");
+        }
+        click_menu_entry(&app, cx, "happy");
+        assert_eq!(app.data_rows(cx)[0][2], "happy");
+        assert_eq!(app.pending(cx), 1);
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied changes", |app, cx| {
+            app.pending(cx) == 0 && app.data_state(cx) == "Rows 1–1 of 1"
+        });
+        let stored = on_server(
+            engine,
+            &format!("SELECT CONCAT(flag, '|', mood) FROM {schema}.items"),
+        );
+        let expected = match engine {
+            Engine::Postgres => "f|happy",
+            _ => "0|happy",
+        };
+        assert_eq!(stored, expected, "{engine:?}");
+    }
+}
+
+// G11, G14, G16, G17 and CM-58: object filters, transaction log, locks and
+// idle sessions, properties and database options, backup of tables -----------
+
+/// A session holding a row of `table` in an open transaction, and another
+/// waiting for it; each gives up on its own within seconds. Returns their
+/// ids and the threads, which end with what each statement came to.
+type LockThread = std::thread::JoinHandle<Result<(), String>>;
+
+fn lock_pair(engine: Engine, table: &str) -> (String, String, LockThread, LockThread) {
+    use kerno_core::Driver as _;
+    let session_of = move |params: kerno_core::ConnectParams| async move {
+        match engine {
+            Engine::Postgres => kerno_postgres::PostgresDriver.connect(&params).await,
+            Engine::MySql | Engine::MariaDb => kerno_mysql::MysqlDriver.connect(&params).await,
+        }
+        .expect("the test server")
+    };
+    let postgres = engine == Engine::Postgres;
+    let own_id = if postgres {
+        "SELECT pg_backend_pid()"
+    } else {
+        "SELECT CONNECTION_ID()"
+    };
+    let run = |statements: Vec<String>, sender: std::sync::mpsc::Sender<String>| {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let session = session_of(testing::params(engine)).await;
+                let collect = |sql: String| kerno_core::exec::collect(session.clone(), sql);
+                let id = collect(own_id.into()).await.unwrap().results[0].rows()[0][0]
+                    .clone()
+                    .unwrap();
+                let mut outcome = Ok(());
+                for (index, sql) in statements.into_iter().enumerate() {
+                    // The id goes out once the lock is held (the holder's
+                    // second statement) or about to be waited for.
+                    if index == 2 || (index == 1 && sql.starts_with("SET")) {
+                        let _ = sender.send(id.clone());
+                    }
+                    if let Err(error) = collect(sql).await {
+                        outcome = Err(error.to_string());
+                        break;
+                    }
+                }
+                session.close().await;
+                outcome
+            })
+        })
+    };
+    let begin = if postgres {
+        "BEGIN"
+    } else {
+        "START TRANSACTION"
+    };
+    let (sleep, wait) = if postgres {
+        ("SELECT pg_sleep(8)", "SET lock_timeout = '10s'")
+    } else {
+        (
+            "SELECT SLEEP(8)",
+            "SET SESSION innodb_lock_wait_timeout = 10",
+        )
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let holder = run(
+        vec![
+            begin.into(),
+            format!("UPDATE {table} SET v = 2 WHERE id = 1"),
+            sleep.into(),
+            "ROLLBACK".into(),
+        ],
+        sender.clone(),
+    );
+    let holder_id = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    let waiter = run(
+        vec![
+            "SELECT 1".into(),
+            wait.into(),
+            format!("UPDATE {table} SET v = 3 WHERE id = 1"),
+        ],
+        sender,
+    );
+    let waiter_id = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    (holder_id, waiter_id, holder, waiter)
+}
+
+#[gpui_kit::test]
+fn the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker(cx: &mut TestAppContext) {
+    use crate::admin::tab::{LOCKS, Pane};
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, setup): (&str, Vec<&str>) = match engine {
+            Engine::Postgres => (
+                "DROP SCHEMA IF EXISTS kerno_ui_locks CASCADE",
+                vec![
+                    "CREATE SCHEMA kerno_ui_locks",
+                    "CREATE TABLE kerno_ui_locks.t (id int PRIMARY KEY, v int)",
+                    "INSERT INTO kerno_ui_locks.t VALUES (1, 1)",
+                ],
+            ),
+            _ => (
+                "DROP DATABASE IF EXISTS kerno_ui_locks",
+                vec![
+                    "CREATE DATABASE kerno_ui_locks",
+                    "CREATE TABLE kerno_ui_locks.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB",
+                    "INSERT INTO kerno_ui_locks.t VALUES (1, 1)",
+                ],
+            ),
+        };
+        let _scratch = Scratch::new(engine, &[cleanup], &setup);
+        let app = connected(cx, engine);
+        let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+        app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Administration);
+        app.wait_admin(cx, Pane::Sessions);
+
+        // TOOL-13: idle (PostgreSQL) or sleeping sessions are left out, and
+        // the choice is kept in the settings.
+        let (column, idle) = match engine {
+            Engine::Postgres => ("State", "idle"),
+            _ => ("Command", "Sleep"),
+        };
+        app.on_admin(cx, |tab, _, cx| tab.set_hide_idle(true, cx));
+        assert!(settings_now(cx).hide_idle_sessions, "{engine:?}");
+        let (headers, rows) = app.admin_shown(cx, Pane::Sessions);
+        let at = headers.iter().position(|h| h == column).unwrap();
+        assert!(
+            rows.iter().all(|row| row[at] != idle),
+            "{engine:?}: {rows:?}"
+        );
+        assert!(app.has(cx, "admin-hide-idle"));
+        app.on_admin(cx, |tab, _, cx| tab.set_hide_idle(false, cx));
+
+        // TOOL-14: an empty list says what it would show.
+        app.on_admin(cx, |tab, window, cx| tab.select(LOCKS, window, cx));
+        app.wait_admin(cx, Pane::Locks);
+        let (holder, waiter, holder_thread, waiter_thread) = lock_pair(engine, "kerno_ui_locks.t");
+        let rows = app.admin_rows_until(cx, Pane::Locks, "the waiting session", |rows| {
+            rows.iter().any(|row| row[0] == waiter)
+        });
+        let (headers, _) = app.admin_shown(cx, Pane::Locks);
+        let blocking = headers.iter().position(|h| h == "Blocking id").unwrap();
+        let row = rows.iter().position(|row| row[0] == waiter).unwrap();
+        assert_eq!(rows[row][blocking], holder, "{engine:?}: {headers:?}");
+
+        // Terminate the session holding the lock, from the toolbar: the
+        // waiting one goes on.
+        app.click(cx, ("admin-locks-cell", row << 12));
+        app.click(cx, "admin-terminate");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        let expected = match engine {
+            Engine::Postgres => format!("SELECT pg_catalog.pg_terminate_backend({holder})"),
+            _ => format!("KILL CONNECTION {holder}"),
+        };
+        assert_eq!(app.admin_asked(cx), Some(expected));
+        app.click(cx, "sql-confirm");
+        assert_eq!(waiter_thread.join().unwrap(), Ok(()), "{engine:?}");
+        assert!(holder_thread.join().unwrap().is_err(), "{engine:?}");
+        app.admin_rows_until(cx, Pane::Locks, "no more waiting", |rows| {
+            !rows.iter().any(|row| row[0] == waiter)
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn the_transaction_log_lists_the_statements_until_the_transaction_ends(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, setup): (&str, Vec<&str>) = match engine {
+            Engine::Postgres => (
+                "DROP SCHEMA IF EXISTS kerno_ui_txlog CASCADE",
+                vec![
+                    "CREATE SCHEMA kerno_ui_txlog",
+                    "CREATE TABLE kerno_ui_txlog.entries (id int PRIMARY KEY)",
+                ],
+            ),
+            _ => (
+                "DROP DATABASE IF EXISTS kerno_ui_txlog",
+                vec![
+                    "CREATE DATABASE kerno_ui_txlog",
+                    "CREATE TABLE kerno_ui_txlog.entries (id INT PRIMARY KEY)",
+                ],
+            ),
+        };
+        let _scratch = Scratch::new(engine, &[cleanup], &setup);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+        let log = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                tab.read(cx)
+                    .transaction_log()
+                    .iter()
+                    .map(|entry| (entry.sql.clone(), entry.outcome()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        // Nothing open yet: the command says so.
+        app.step(cx, |window, cx| {
+            window.dispatch_action(Box::new(actions::ShowTransactionLog), cx)
+        });
+        assert!(app.has(cx, "tx-log-empty"), "{engine:?}");
+        app.press(cx, &["escape"]);
+
+        for (index, sql) in [
+            "insert into kerno_ui_txlog.entries values (1)",
+            "update kerno_ui_txlog.entries set id = 2 where id = 1",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.press(cx, &["secondary-a"]);
+            app.type_text(cx, sql);
+            app.press(cx, &["secondary-enter"]);
+            app.wait_until(cx, "the statement", |app, cx| {
+                log(cx).len() == index + 1 && !app.running(cx)
+            });
+        }
+        assert_eq!(
+            log(cx),
+            [
+                (
+                    "insert into kerno_ui_txlog.entries values (1)".to_string(),
+                    "1 row".to_string()
+                ),
+                (
+                    "update kerno_ui_txlog.entries set id = 2 where id = 1".to_string(),
+                    "1 row".to_string()
+                ),
+            ],
+            "{engine:?}"
+        );
+        // From the status bar's transaction item.
+        app.click(cx, "status-transaction-button");
+        app.click_label(cx, "Transaction log…");
+        assert!(
+            app.has(cx, ("tx-log-entry", 0usize)) && app.has(cx, ("tx-log-entry", 1usize)),
+            "{engine:?}"
+        );
+        app.press(cx, &["escape"]);
+        assert!(!app.dialog_open(cx), "{engine:?}");
+
+        // Rollback empties it.
+        app.click(cx, "tab-rollback");
+        app.wait_until(cx, "the rollback", |app, cx| {
+            !app.status_bar(cx).contains(&"transaction open".to_string())
+        });
+        assert!(log(cx).is_empty(), "{engine:?}");
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_txlog.entries"),
+            "0"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn properties_open_first_on_f4_and_the_comment_is_set_from_there(cx: &mut TestAppContext) {
+    use crate::structure::tab::PROPERTIES_SECTION;
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let (cleanup, setup, path, comment_sql): (&str, Vec<&str>, Vec<&str>, &str) = match engine {
+            Engine::Postgres => (
+                "DROP SCHEMA IF EXISTS kerno_ui_props CASCADE",
+                vec![
+                    "CREATE SCHEMA kerno_ui_props",
+                    "CREATE TABLE kerno_ui_props.t (id int PRIMARY KEY)",
+                    "COMMENT ON TABLE kerno_ui_props.t IS 'first'",
+                ],
+                vec!["kerno", "kerno_ui_props", "Tables", "t"],
+                "SELECT COALESCE(obj_description('kerno_ui_props.t'::regclass, 'pg_class'), '-')",
+            ),
+            _ => (
+                "DROP DATABASE IF EXISTS kerno_ui_props",
+                vec![
+                    "CREATE DATABASE kerno_ui_props",
+                    "CREATE TABLE kerno_ui_props.t (id INT PRIMARY KEY) COMMENT = 'first'",
+                ],
+                vec!["kerno_ui_props", "Tables", "t"],
+                "SELECT COALESCE(NULLIF(TABLE_COMMENT, ''), '-') FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'kerno_ui_props' AND TABLE_NAME = 't'",
+            ),
+        };
+        let _scratch = Scratch::new(engine, &[cleanup], &setup);
+        let app = connected(cx, engine);
+        // The connection's own database opens by itself.
+        let start = if path[0] == "kerno" { 2 } else { 1 };
+        for depth in start..path.len() {
+            let above: Vec<String> = path[..depth].iter().map(|s| s.to_string()).collect();
+            app.wait_until(cx, "the way to the table", |app, cx| {
+                app.tree_row_of(cx, &above).is_some()
+            });
+            app.toggle(cx, &path[..depth]);
+        }
+        let whole: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        app.wait_until(cx, "the table", |app, cx| {
+            app.tree_row_of(cx, &whole).is_some()
+        });
+        // F4 is "Edit": the structure tab on its properties (OBJ-03, CM-33).
+        app.click_row(cx, &path, false);
+        app.press(cx, &["f4"]);
+        let structure = app.structure(cx);
+        let properties = |cx: &mut TestAppContext| cx.update(|cx| structure.read(cx).properties());
+        app.wait_until(cx, "the properties", |_, cx| properties(cx).is_ok());
+        assert_eq!(
+            cx.update(|cx| structure.read(cx).section()),
+            PROPERTIES_SECTION
+        );
+        let shown = properties(cx).unwrap();
+        let value = |shown: &[(String, String)], name: &str| {
+            shown
+                .iter()
+                .find(|(property, _)| property == name)
+                .map(|(_, value)| value.clone())
+        };
+        match engine {
+            Engine::Postgres => {
+                assert_eq!(value(&shown, "Owner").as_deref(), Some("kerno"));
+                assert_eq!(value(&shown, "Persistence").as_deref(), Some("permanent"));
+            }
+            _ => assert_eq!(value(&shown, "Engine").as_deref(), Some("InnoDB")),
+        }
+        assert_eq!(value(&shown, "Comment").as_deref(), Some("first"));
+        assert!(app.has(cx, "structure-properties"), "{engine:?}");
+
+        // The comment is changed, then removed, each after the statement
+        // was shown.
+        for (typed, expected, stored) in [("second", "second", "second"), ("", "—", "-")] {
+            app.click(cx, "structure-edit-comment");
+            assert!(app.has(cx, "sql-name"), "{engine:?}");
+            app.press(cx, &["secondary-a", "backspace"]);
+            if !typed.is_empty() {
+                app.type_text(cx, typed);
+            }
+            app.click(cx, "sql-confirm");
+            app.wait_until(cx, "the new comment", |_, cx| {
+                properties(cx)
+                    .ok()
+                    .is_some_and(|shown| value(&shown, "Comment").as_deref() == Some(expected))
+            });
+            assert_eq!(on_server(engine, comment_sql), stored, "{engine:?}");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_database_is_created_with_the_options_of_the_form(cx: &mut TestAppContext) {
+    use crate::database_dialog::Field;
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_created_db";
+        let _scratch = Scratch::new(engine, &[&format!("DROP DATABASE IF EXISTS {name}")], &[]);
+        let app = connected(cx, engine);
+        app.wait_until(cx, "the databases", |app, cx| {
+            app.tree(cx).contains(&row(0, "kerno"))
+        });
+        let kerno = app.tree_row(cx, &["kerno"]);
+        let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+        let form = app
+            .step(cx, |window, cx| {
+                navigator.update(cx, |navigator, cx| {
+                    let id = navigator.id_at(kerno, cx);
+                    navigator.create_database_form(&id, window, cx)
+                })
+            })
+            .expect("the form");
+        app.wait_until(cx, "the server's lists", |_, cx| {
+            cx.update(|cx| form.read(cx).ready())
+        });
+        app.click(cx, "create-database-name");
+        app.type_text(cx, name);
+        let (expected, check) = match engine {
+            Engine::Postgres => {
+                cx.update(|cx| {
+                    form.update(cx, |form, cx| {
+                        assert!(form.offered(Field::Template).contains(&"template0".into()));
+                        form.set(Field::Template, Some("template0".into()), cx);
+                        form.set(Field::Collation, Some("C".into()), cx);
+                        form.set(Field::Ctype, Some("C".into()), cx);
+                    })
+                });
+                (
+                    format!(
+                        "CREATE DATABASE \"{name}\"\n    TEMPLATE = \"template0\"\n    \
+                         LC_COLLATE = 'C'\n    LC_CTYPE = 'C'"
+                    ),
+                    format!("SELECT datcollate FROM pg_database WHERE datname = '{name}'"),
+                )
+            }
+            _ => {
+                cx.update(|cx| {
+                    form.update(cx, |form, cx| {
+                        form.set(Field::Encoding, Some("latin1".into()), cx);
+                        let collations = form.offered(Field::Collation);
+                        assert!(collations.contains(&"latin1_bin".into()), "{collations:?}");
+                        assert!(
+                            !collations.contains(&"utf8mb4_bin".into()),
+                            "{collations:?}"
+                        );
+                        form.set(Field::Collation, Some("latin1_bin".into()), cx);
+                    })
+                });
+                (
+                    format!("CREATE DATABASE `{name}` CHARACTER SET latin1 COLLATE latin1_bin"),
+                    format!(
+                        "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA \
+                         WHERE SCHEMA_NAME = '{name}'"
+                    ),
+                )
+            }
+        };
+        let statement = cx.update(|cx| form.read(cx).statement(cx));
+        assert_eq!(statement, Ok(expected.clone()), "{engine:?}");
+        // The form gives way to the confirmation, which runs it.
+        app.click(cx, "create-database-create");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the new database", |app, cx| {
+            app.tree(cx).contains(&row(0, name))
+        });
+        let collation = on_server(engine, &check);
+        assert!(
+            collation == "C" || collation == "latin1_bin",
+            "{engine:?}: {collation}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+async fn object_filters_hide_schemas_and_last_after_a_restart(cx: &mut TestAppContext) {
+    use crate::navigator::actions::FilterAction;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            "DROP SCHEMA IF EXISTS kerno_ui_filter_a CASCADE",
+            "DROP SCHEMA IF EXISTS kerno_ui_filter_b CASCADE",
+        ],
+        &[
+            "CREATE SCHEMA kerno_ui_filter_a",
+            "CREATE SCHEMA kerno_ui_filter_b",
+        ],
+    );
+    let filter = |app: &Fixture, cx: &mut TestAppContext, action, label: &str| {
+        let row = app.tree_row(cx, &["kerno", label]);
+        let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+        app.step(cx, |window, cx| {
+            navigator.update(cx, |navigator, cx| {
+                let id = navigator.id_at(row, cx);
+                navigator.perform_filter(action, &id, window, cx)
+            })
+        });
+    };
+    let shows =
+        |app: &Fixture, cx: &mut TestAppContext, label: &str| app.tree(cx).contains(&row(1, label));
+    let app = connected(cx, Engine::Postgres);
+    app.wait_until(cx, "the schemas", |app, cx| {
+        shows(app, cx, "kerno_ui_filter_a") && shows(app, cx, "kerno_ui_filter_b")
+    });
+    // The tree's menu has a Filter ▸ entry.
+    let row_a = app.tree_row(cx, &["kerno", "kerno_ui_filter_a"]);
+    app.right_click(cx, ("node", row_a), None);
+    assert!(app.shows_label(cx, "Filter"));
+    app.press(cx, &["escape"]);
+
+    // Hide: gone from the tree, counted on its database, kept with the
+    // connection.
+    filter(&app, cx, FilterAction::Hide, "kerno_ui_filter_a");
+    assert!(!shows(&app, cx, "kerno_ui_filter_a") && shows(&app, cx, "kerno_ui_filter_b"));
+    let hint = cx.update(|cx| {
+        app.workspace
+            .read(cx)
+            .navigator(cx)
+            .read(cx)
+            .hint_of("db:kerno")
+    });
+    assert!(hint.is_some_and(|hint| hint.ends_with("1 hidden")));
+    let stored = |app: &Fixture| {
+        app.storage.connections().unwrap()[0]
+            .config
+            .navigator_filters
+            .clone()
+    };
+    app.wait_until(cx, "the stored filter", |app, _| {
+        stored(app).contains_key("schemas")
+    });
+
+    // After a restart the schema is still hidden.
+    let restarted = open(cx, app.storage.clone());
+    let id = cx.update(|cx| restarted.connections.read(cx).saved()[0].id.clone());
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+    restarted.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    restarted.wait_until(cx, "the schemas", |app, cx| {
+        shows(app, cx, "kerno_ui_filter_b")
+    });
+    assert!(!shows(&restarted, cx, "kerno_ui_filter_a"));
+
+    // Toggle: off shows it, on hides it again; Clear removes the filter.
+    filter(&restarted, cx, FilterAction::Toggle, "kerno_ui_filter_b");
+    assert!(shows(&restarted, cx, "kerno_ui_filter_a"));
+    filter(&restarted, cx, FilterAction::Toggle, "kerno_ui_filter_b");
+    assert!(!shows(&restarted, cx, "kerno_ui_filter_a"));
+    filter(&restarted, cx, FilterAction::Clear, "kerno_ui_filter_b");
+    assert!(shows(&restarted, cx, "kerno_ui_filter_a"));
+    restarted.wait_until(cx, "the filter removed", |app, _| stored(app).is_empty());
+
+    // Configure: masks typed one per line.
+    filter(&restarted, cx, FilterAction::Configure, "kerno_ui_filter_b");
+    assert!(restarted.has(cx, "filter-dialog"));
+    restarted.click(cx, "filter-exclude");
+    restarted.type_text(cx, "KERNO_UI_FILTER_*");
+    restarted.click(cx, "filter-save");
+    assert!(
+        !shows(&restarted, cx, "kerno_ui_filter_a") && !shows(&restarted, cx, "kerno_ui_filter_b")
+    );
+    assert!(shows(&restarted, cx, "shop"));
+}
+
+#[gpui_kit::test]
+fn a_table_is_backed_up_alone_from_the_tree(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        // "Back up…" on a table of the tree: the dialog names it alone.
+        let path: Vec<&str> = match engine {
+            Engine::Postgres => vec!["kerno", "shop", "Tables", "orders"],
+            _ => vec!["kerno", "Tables", "orders"],
+        };
+        // The connection's own database opens by itself.
+        let start = if path[0] == "kerno" { 2 } else { 1 };
+        for depth in start..path.len() {
+            let above: Vec<String> = path[..depth].iter().map(|s| s.to_string()).collect();
+            app.wait_until(cx, "the way to the table", |app, cx| {
+                app.tree_row_of(cx, &above).is_some()
+            });
+            app.toggle(cx, &path[..depth]);
+        }
+        let whole: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        app.wait_until(cx, "the table", |app, cx| {
+            app.tree_row_of(cx, &whole).is_some()
+        });
+        app.act(cx, Action::Backup, &path);
+        // Once the tool is found (or said missing).
+        app.wait_until(cx, "the dialog's options", |app, cx| {
+            app.has(cx, "backup-only-tables") || app.has(cx, "backup-choose-tool")
+        });
+        let found = app.has(cx, "backup-only-tables");
+        app.click(cx, "backup-close");
+        if !found {
+            continue;
+        }
+
+        // The names are arguments of their own, never read by a shell.
+        let dialog = app.backup_dialog(cx, "kerno", false).expect("the dialog");
+        let schema = if engine == Engine::Postgres {
+            "shop"
+        } else {
+            "kerno"
+        };
+        cx.update(|cx| {
+            dialog.update(cx, |dialog, cx| {
+                dialog.only_tables(vec![TableRef::new(schema, "order items; rm -rf x")], cx)
+            })
+        });
+        let state = app.wait_backup(cx, &dialog, &["no tool", "ready"]);
+        if state.starts_with("no tool") {
+            app.click(cx, "backup-close");
+            continue;
+        }
+        let command = cx
+            .update(|cx| dialog.read(cx).pending_command(cx))
+            .expect("a command");
+        let expected = match engine {
+            Engine::Postgres => "--table=\"shop\".\"order items; rm -rf x\"",
+            _ => "order items; rm -rf x",
+        };
+        assert!(
+            command.args.iter().any(|arg| arg == expected),
+            "{engine:?}: {:?}",
+            command.args
+        );
+        assert!(state.contains("order items"), "{engine:?}: {state}");
+        app.click(cx, "backup-all-tables");
+        let command = cx
+            .update(|cx| dialog.read(cx).pending_command(cx))
+            .expect("a command");
+        assert!(!command.args.iter().any(|arg| arg.contains("order items")));
+        app.click(cx, "backup-close");
+    }
 }

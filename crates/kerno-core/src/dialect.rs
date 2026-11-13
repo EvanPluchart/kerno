@@ -13,6 +13,33 @@ use crate::table_draft::{
     AutoIncrement, ColumnDraft, ForeignKeyDraft, TableChange, TableDraft, present,
 };
 
+/// How a new database is made (DBeaver's create-database dialogs:
+/// `PostgreDatabaseManager`, `MySQLDatabaseManager`); `None` keeps the
+/// server's default. Which fields an engine takes is in
+/// [`Dialect::database_options_sql`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatabaseOptions {
+    /// PostgreSQL: the role that owns it.
+    pub owner: Option<String>,
+    /// PostgreSQL: the database it is copied from.
+    pub template: Option<String>,
+    /// PostgreSQL `ENCODING`; MySQL and MariaDB `CHARACTER SET`.
+    pub encoding: Option<String>,
+    /// PostgreSQL `LC_COLLATE`; MySQL and MariaDB `COLLATE`.
+    pub collation: Option<String>,
+    /// PostgreSQL `LC_CTYPE`.
+    pub ctype: Option<String>,
+    /// PostgreSQL: where its files go.
+    pub tablespace: Option<String>,
+}
+
+impl DatabaseOptions {
+    /// The names of the options, as [`Dialect::database_options_sql`]
+    /// lists them; `ctype` takes its values from `collation`.
+    pub const FIELDS: [&'static str; 5] =
+        ["owner", "template", "encoding", "collation", "tablespace"];
+}
+
 /// The SQL dialect of an engine. Pure functions: no I/O.
 pub trait Dialect: Send + Sync {
     /// Engine this dialect belongs to.
@@ -164,7 +191,35 @@ pub trait Dialect: Send + Sync {
     /// The statement that creates the database `name` with the server's
     /// defaults.
     fn create_database_sql(&self, name: &str) -> Result<String> {
+        self.create_database_with_sql(name, &DatabaseOptions::default())
+    }
+
+    /// The statement that creates the database `name` with `options`.
+    /// `Unsupported` for an option the engine does not have.
+    fn create_database_with_sql(&self, name: &str, options: &DatabaseOptions) -> Result<String> {
+        if *options != DatabaseOptions::default() {
+            return Err(Error::Unsupported(
+                "this engine takes no option when creating a database".into(),
+            ));
+        }
         Ok(format!("CREATE DATABASE {}", self.quote_ident(name)))
+    }
+
+    /// The query that lists what [`DatabaseOptions`] can hold on this
+    /// server: rows of `(option, value, applies_to)` where `option` is one
+    /// of [`DatabaseOptions::FIELDS`], and `applies_to` the encoding a
+    /// collation belongs to (`NULL`: any). `None` when the engine has no
+    /// option.
+    fn database_options_sql(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The query that describes a table or view for its Properties page:
+    /// one row, one column per property, named for people (`Owner`,
+    /// `Estimated rows`, …), `NULL` where the server does not know. No row
+    /// when the object is not found; `None` when the engine has no such query.
+    fn properties_sql(&self, _table: &TableRef, _kind: RelationKind) -> Option<String> {
+        None
     }
 
     /// The script that replaces `object` by the definition in `ddl`: what
@@ -858,6 +913,20 @@ mod tests {
         assert_eq!(
             d.create_database_sql("my db").unwrap(),
             "CREATE DATABASE \"my db\""
+        );
+        // An engine without options refuses them rather than drop them.
+        let options = DatabaseOptions {
+            encoding: Some("UTF8".into()),
+            ..DatabaseOptions::default()
+        };
+        assert!(matches!(
+            d.create_database_with_sql("x", &options),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(d.database_options_sql().is_none());
+        assert!(
+            d.properties_sql(&TableRef::new("s", "t"), RelationKind::Table)
+                .is_none()
         );
     }
 

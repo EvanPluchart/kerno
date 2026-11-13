@@ -1,6 +1,6 @@
 //! PostgreSQL's SQL dialect.
 
-use kerno_core::dialect::{Dialect, default_drop_sql, default_rename_sql, hex};
+use kerno_core::dialect::{DatabaseOptions, Dialect, default_drop_sql, default_rename_sql, hex};
 use kerno_core::maintenance::{Maintenance, MaintenanceSql};
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::LexRules;
@@ -314,6 +314,94 @@ impl Dialect for PgDialect {
             self.quote_string(to)
         ))
     }
+
+    /// Roles, databases and tablespaces are names; the encoding and the
+    /// locales are strings. Another encoding or locale than the template's
+    /// needs `template0` as the template: the server says so otherwise.
+    fn create_database_with_sql(&self, name: &str, options: &DatabaseOptions) -> Result<String> {
+        let mut sql = format!("CREATE DATABASE {}", self.quote_ident(name));
+        let mut with = |key: &str, value: &Option<String>, as_name: bool| {
+            if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                let value = if as_name {
+                    self.quote_ident(value)
+                } else {
+                    self.quote_string(value)
+                };
+                sql.push_str(&format!("\n    {key} = {value}"));
+            }
+        };
+        with("OWNER", &options.owner, true);
+        with("TEMPLATE", &options.template, true);
+        with("ENCODING", &options.encoding, false);
+        with("LC_COLLATE", &options.collation, false);
+        with("LC_CTYPE", &options.ctype, false);
+        with("TABLESPACE", &options.tablespace, true);
+        Ok(sql)
+    }
+
+    /// The encodings a server can store are the first 35 of PostgreSQL's
+    /// list (`SQL_ASCII` to `KOI8U`, "Server: Yes" in the documentation's
+    /// table of character sets); the others are client-only. Locales are
+    /// the operating system's (`libc` collations), each for one encoding or
+    /// for any; `pg_global` holds shared catalogs, not databases.
+    fn database_options_sql(&self) -> Option<&'static str> {
+        Some(
+            "\
+SELECT 'owner' AS field, r.rolname::text AS value, NULL::text AS applies_to
+FROM pg_catalog.pg_roles r
+WHERE r.rolname !~ '^pg_'
+UNION ALL
+SELECT 'template', d.datname::text, NULL
+FROM pg_catalog.pg_database d
+UNION ALL
+SELECT 'encoding', pg_catalog.pg_encoding_to_char(e), NULL
+FROM generate_series(0, 34) e
+UNION ALL
+SELECT DISTINCT 'collation', c.collcollate,
+       CASE WHEN c.collencoding >= 0 THEN pg_catalog.pg_encoding_to_char(c.collencoding) END
+FROM pg_catalog.pg_collation c
+WHERE c.collprovider = 'c' AND c.collcollate IS NOT NULL
+UNION ALL
+SELECT 'tablespace', t.spcname::text, NULL
+FROM pg_catalog.pg_tablespace t
+WHERE t.spcname <> 'pg_global'
+ORDER BY 1, 2",
+        )
+    }
+
+    /// From `pg_class` and the statistics collector. PostgreSQL does not
+    /// record when a table was created or altered.
+    fn properties_sql(&self, table: &TableRef, _kind: RelationKind) -> Option<String> {
+        Some(format!(
+            "\
+SELECT pg_catalog.pg_get_userbyid(c.relowner) AS \"Owner\",
+       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                      WHEN 'f' THEN 'foreign table' WHEN 'v' THEN 'view'
+                      WHEN 'm' THEN 'materialized view' ELSE c.relkind::text END AS \"Kind\",
+       CASE c.relpersistence WHEN 'p' THEN 'permanent' WHEN 'u' THEN 'unlogged'
+                             WHEN 't' THEN 'temporary' END AS \"Persistence\",
+       CASE WHEN c.relkind <> 'v' THEN COALESCE(ts.spcname, '(database default)') END AS \"Tablespace\",
+       am.amname AS \"Access method\",
+       CASE WHEN c.relkind <> 'v' AND c.reltuples >= 0 THEN c.reltuples::bigint END AS \"Estimated rows\",
+       CASE WHEN c.relkind <> 'v' THEN pg_catalog.pg_table_size(c.oid) END AS \"Table size\",
+       CASE WHEN c.relkind <> 'v' THEN pg_catalog.pg_indexes_size(c.oid) END AS \"Index size\",
+       CASE WHEN c.relkind <> 'v' THEN pg_catalog.pg_total_relation_size(c.oid) END AS \"Total size\",
+       c.relrowsecurity AS \"Row-level security\",
+       pg_catalog.array_to_string(c.reloptions, ', ') AS \"Options\",
+       GREATEST(s.last_vacuum, s.last_autovacuum) AS \"Last vacuum\",
+       GREATEST(s.last_analyze, s.last_autoanalyze) AS \"Last analyze\",
+       c.oid AS \"OID\",
+       pg_catalog.obj_description(c.oid, 'pg_class') AS \"Comment\"
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = c.reltablespace
+LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+LEFT JOIN pg_catalog.pg_stat_all_tables s ON s.relid = c.oid
+WHERE n.nspname = {} AND c.relname = {}",
+            self.quote_string(&table.schema),
+            self.quote_string(&table.name)
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +601,35 @@ mod tests {
             d.create_database_sql("my db").unwrap(),
             "CREATE DATABASE \"my db\""
         );
+        let options = DatabaseOptions {
+            owner: Some("app owner".into()),
+            template: Some("template0".into()),
+            encoding: Some("UTF8".into()),
+            collation: Some("C".into()),
+            ctype: Some("en_US.utf8".into()),
+            tablespace: Some("pg_default".into()),
+        };
+        assert_eq!(
+            d.create_database_with_sql("my db", &options).unwrap(),
+            "CREATE DATABASE \"my db\"\n    OWNER = \"app owner\"\n    TEMPLATE = \"template0\"\
+             \n    ENCODING = 'UTF8'\n    LC_COLLATE = 'C'\n    LC_CTYPE = 'en_US.utf8'\
+             \n    TABLESPACE = \"pg_default\""
+        );
+        // Blank fields are the server's defaults; quotes are doubled.
+        let options = DatabaseOptions {
+            owner: Some("  ".into()),
+            collation: Some("it's".into()),
+            ..DatabaseOptions::default()
+        };
+        assert_eq!(
+            d.create_database_with_sql("x", &options).unwrap(),
+            "CREATE DATABASE \"x\"\n    LC_COLLATE = 'it''s'"
+        );
+        assert!(d.database_options_sql().is_some());
+        let properties = d
+            .properties_sql(&TableRef::new("sh'op", "orders"), RelationKind::Table)
+            .unwrap();
+        assert!(properties.contains("n.nspname = 'sh''op' AND c.relname = 'orders'"));
     }
 
     #[test]

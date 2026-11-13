@@ -122,7 +122,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-42 | Smart commit mode | Switches to manual mode when a modifying statement runs, back to auto after commit | ui.editors.connection `action_menu_transaction_smart_auto_commit` | PG, My | **roadmap**: Off by default in DBeaver; manual mode per tab covers the need |
 | CON-43 | Commit / Rollback | Ends the transaction of the active session | core `core.commit` (Ctrl+4), `core.rollback` (Ctrl+8) | PG, My | **done**: Toolbar Commit / Rollback; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
 | CON-44 | Commit / Rollback shortcuts | Keys for commit and rollback | core key bindings of `core.commit` / `core.rollback` | PG, My | **done**: Commit (Ctrl+4), Roll back (Ctrl+8), toggle commit mode (Ctrl+Alt+A). `commit_rollback_and_the_commit_mode_have_keys` |
-| CON-45 | Transaction log | Statements run in the current transaction, with time and result | core `core.txn.log` | PG, My | **gap**: G14 |
+| CON-45 | Transaction log | Statements run in the current transaction, with time and result | core `core.txn.log` | PG, My | **done**: `the_transaction_log_lists_the_statements_until_the_transaction_ends` |
 | CON-46 | Pending transactions | Every connection with an open transaction, across the app | core `core.txn.pending` | PG, My | **roadmap**: Kerno shows the open transaction per tab in the status bar; a cross-app list is rarely needed |
 | CON-47 | Connection type colour on editors | Editor area and toolbars tinted with the connection type colour | ui `CSSUtils.markConnectionTypeColor` | PG, My | **done**: a stripe in the connection's colour on its tabs and on the status bar (no tinted toolbar). `tabs_and_the_status_bar_carry_the_connection_colour` |
 | CON-48 | Change user password | Changes the password of the connected user | ui.editors.connection `connection.changeCurrentPassword` | PG, My | **roadmap**: An `ALTER USER` in the editor does it; rare |
@@ -152,7 +152,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-16 | Focus navigator filter command | Keyboard command that jumps to the filter field | ui.navigator `core.navigator.filter.focus` | PG, My | **done**: Cmd+Alt+F. `a_key_puts_the_keyboard_in_the_tree_filter` |
 | NAV-17 | Filter by object type | Filter applies to connections, containers or tables | ui.navigator `navigator.filter.object.type` | PG, My | **roadmap**: The filter keeps matches and their path; type scoping is rarely used |
 | NAV-18 | Show connected only | Hides disconnected connections | ui.navigator `navigator.filter.connected` | PG, My | **roadmap**: Small list of connections in a client; folders (CTX Part 1) organise them |
-| NAV-19 | Object filters: hide, show only selected, configure, toggle, clear | Persistent include / exclude masks per connection | core `core.object.filter.add.exclude` / `.include` / `.config` / `.toggle` / `.clear` | PG, My | **gap**: G11 |
+| NAV-19 | Object filters: hide, show only selected, configure, toggle, clear | Persistent include / exclude masks per connection | core `core.object.filter.add.exclude` / `.include` / `.config` / `.toggle` / `.clear` | PG, My | **done**: masks with `*` and `?` per connection and kind. `object_filters_hide_schemas_and_last_after_a_restart` |
 | NAV-20 | Collapse All | Folds the whole tree | core `org.eclipse.ui.navigate.collapseAll` (navigator view menu) | PG, My | **done**: Collapse all in the tree's menu and as a command; `a_right_click_below_the_schema_tree_opens_its_menu` |
 | NAV-21 | Link with editor | Selects in the tree the object of the active editor | ui.navigator `core.navigator.linkeditor` (Ctrl+Shift+,) | PG, My | **done**: Cmd+Shift+, toggles it; stored in the settings. `link_with_editor_selects_the_table_of_the_active_tab` |
 | NAV-22 | Statistics hints (row count, size) | Size and row estimates beside objects | ui.navigator pref `NAVIGATOR_SHOW_STATISTICS_INFO` (true) | PG, My | **done**: `counts_and_sizes_are_compact`, `databases_then_schemas_then_folders_of_objects` |
@@ -258,7 +258,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | ID | Feature (as DBeaver names it) | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
 | RES-01 | Grid presentation | Virtual grid of the result | ui.editors.data `SpreadsheetPresentation` | PG, My | **done**: `statements_run_and_their_rows_fill_the_grid` |
-| RES-02 | Record mode (Tab) | One row as a list of column / value pairs, with row navigation | ui.editors.data `core.resultset.toggleMode` (Tab) | PG, My | **gap**: G3 |
+| RES-02 | Record mode (Tab) | One row as a list of column / value pairs, with row navigation | ui.editors.data `core.resultset.toggleMode` (Tab) | PG, My | **done**: Tab shows the current row as one line per column, editable where the grid is. `record_view_shows_one_row_and_edits_it` |
 | RES-03 | Text presentation, switch presentation | Result as aligned plain text | ui.editors.data `core.resultset.switchPresentation`, `plaintext/` | PG, My | **roadmap**: Copy as Markdown gives a text table; second renderer to maintain |
 | RES-04 | Filter field on a query result | WHERE criteria applied to an editor result by re-running it | ui.editors.data `ResultSetFilterPanel` | PG, My | **gap**: G5 (the filter bar exists on table data only) |
 | RES-05 | Filter field on table data | WHERE criteria on a table | ui.editors.data `ResultSetFilterPanel` | PG, My | **done**: Filter bar (builder and raw WHERE); `a_table_is_read_in_pages_sorted_and_filtered_by_the_server` |
@@ -273,8 +273,8 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-14 | Customize filters dialog (Alt+Shift+F) | Columns, order and criteria in one dialog | ui.editors.data `core.resultset.filterSettings` | PG, My | **roadmap**: The filter bar and the header menus cover it |
 | RES-15 | Navigate foreign key (Alt+Space) and References | Jump to the referenced row; rows referencing this one | ui.editors.data `core.resultset.navigateLink`, `referencesMenu` (Ctrl+Shift+1) | PG, My | **done**: Row menu on table data; `foreign_keys_lead_to_the_referenced_row_and_back` |
 | RES-16 | Back / forward in the result viewer | History of followed links | ui.editors.data `fillNavigateMenu` (backward / forward history) | PG, My | **done**: A followed key opens its own data tab; previous tab stays; `foreign_keys_lead_to_the_referenced_row_and_back` |
-| RES-17 | Go to row (Ctrl+G), go to column (Ctrl+Shift+G) | Jumps to a row number or a column | ui.editors.data `grid.gotoRow`, `grid.gotoColumn` | PG, My | **gap**: G6 |
-| RES-18 | First / previous / next / last row | Moves the current row | ui.editors.data `row.first` / `.previous` / `.next` / `.last` | PG, My | **gap**: G3 (record mode navigation) |
+| RES-17 | Go to row (Ctrl+G), go to column (Ctrl+Shift+G) | Jumps to a row number or a column | ui.editors.data `grid.gotoRow`, `grid.gotoColumn` | PG, My | **done**: Ctrl+G and Ctrl+Shift+G. `go_to_row_and_column_move_the_selection` |
+| RES-18 | First / previous / next / last row | Moves the current row | ui.editors.data `row.first` / `.previous` / `.next` / `.last` | PG, My | **done**: `record_view_shows_one_row_and_edits_it`, `go_to_row_and_column_move_the_selection` |
 | RES-19 | Fetch next page / fetch all | Reads more rows or all rows | ui.editors.data `core.resultset.fetch.page`, `.fetch.all` | PG, My | **done**: `fetch-more`, `fetch-all`; `a_large_result_arrives_a_page_at_a_time` |
 | RES-20 | Fetch keys (Ctrl+Alt+N, Ctrl+Shift+=) | Shortcuts for fetching | ui.editors.data key bindings | PG, My | **done**: `fetch_keys_page_a_result_and_zoom_keys_size_the_grid` |
 | RES-21 | Fetch next segment on scroll | Reaching the end reads the next page (default on) | ui.editors.data pref `RESULT_SET_AUTO_FETCH_NEXT_SEGMENT` (true) | PG, My | **done, untested** (gap of kind test, G18): `Grid::load_more` on reaching the end; no test scrolls to it (G18) |
@@ -283,14 +283,14 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-24 | Refresh (F5) | Re-reads the result | core `org.eclipse.ui.file.refresh` in the result menu | PG, My | **done**: `refresh_data` (Cmd+R) on table data; `a_table_is_read_in_pages_sorted_and_filtered_by_the_server` |
 | RES-25 | Auto-refresh | Re-reads every 1, 5, 10, 15, 30 or 60 s | ui `AutoRefreshControl` in `ResultSetViewer` | PG, My | **gap**: G5 |
 | RES-26 | Panels: value viewer (F7 toggles panels) | Side panel showing the selected value | ui.editors.data `grid.togglePreview`, `panel/valueviewer` | PG, My | **done**: Value viewer (double click, row menu); `a_double_click_on_a_cell_shows_its_whole_value` |
-| RES-27 | Panels: aggregate | Count, sum, average, min, max of the selected cells | ui.editors.data `panel/aggregate` (`column-aggregate`) | PG, My | **gap**: G6 |
-| RES-28 | Panels: metadata | Columns of the result with type, table, key, nullability | ui.editors.data `panel/metadata` | PG, My | **gap**: G6 |
+| RES-27 | Panels: aggregate | Count, sum, average, min, max of the selected cells | ui.editors.data `panel/aggregate` (`column-aggregate`) | PG, My | **done**: a dialog, not a docked panel; no median or mode. `selection_figures_show_in_the_footer_and_the_panels` |
+| RES-28 | Panels: metadata | Columns of the result with type, table, key, nullability | ui.editors.data `panel/metadata` | PG, My | **done**: Columns panel (position, name, type; table, key and nullability on table data). `selection_figures_show_in_the_footer_and_the_panels` |
 | RES-29 | Panels: grouping | Group-by counts on chosen columns | ui.editors.data `panel/grouping` | PG, My | **roadmap**: A GROUP BY in the editor does it |
 | RES-30 | Panels: references | Rows referencing the selected row | ui.editors.data `panel/references` | PG, My | **done**: Row menu entries on table data; `foreign_keys_lead_to_the_referenced_row_and_back` |
-| RES-31 | Selection counts in the status | Selected rows / columns / cells shown | ui.editors.data `ToggleSelectionStatAction` (off by default) | PG, My | **gap**: G6 |
+| RES-31 | Selection counts in the status | Selected rows / columns / cells shown | ui.editors.data `ToggleSelectionStatAction` (off by default) | PG, My | **done**: cells, rows, columns, distinct, sum, average, min, max in the footer; computed off the UI thread above 100,000 cells. `selection_figures_show_in_the_footer_and_the_panels` |
 | RES-32 | View / Format ▸ display format, transformers, binary format | How values are shown (UI, editable, native; hex / text / base64) | ui.editors.data `fillColumnViewMenu` | PG, My | **roadmap**: Kerno shows server text and hex for binary (CLAUDE.md §4.D2); formats are a preference set |
 | RES-33 | Row colours by value, colorize data types | Colour rows matching a value; colour by type | ui.editors.data `grid.selectRowColor`, `ColorizeDataTypesToggleAction` | PG, My | **roadmap**: Visual nicety |
-| RES-34 | Boolean as checkbox, click toggles | Booleans drawn as checkboxes and toggled by click (default on) | ui.editors.data prefs `RESULT_SET_SHOW_BOOLEAN_AS_CHECKBOX`, `RESULT_SET_CLICK_TOGGLE_BOOLEAN` | PG, My | **planned**: `docs/plans/M6.md` Part 1 (boolean and enum cells edited from a list) |
+| RES-34 | Boolean as checkbox, click toggles | Booleans drawn as checkboxes and toggled by click (default on) | ui.editors.data prefs `RESULT_SET_SHOW_BOOLEAN_AS_CHECKBOX`, `RESULT_SET_CLICK_TOGGLE_BOOLEAN` | PG, My | **done**: a boolean toggles true, false, NULL (drawn as text); an enum is picked from its values. `boolean_and_enum_cells_take_their_values` |
 | RES-35 | Zoom in / out | Grid font size | ui.editors.data `core.resultset.zoomIn` / `zoomOut` | PG, My | **done**: grid text larger / smaller / usual. `fetch_keys_page_a_result_and_zoom_keys_size_the_grid` |
 | RES-36 | Hide / show columns | Hide columns, show hidden ones | ui.editors.data `grid.hideColumns`, `grid.showColumns` | PG, My | **done**: Header menu; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
 | RES-37 | Pin / unpin columns | Keeps columns on the left while scrolling | ui.editors.data `SpreadsheetPresentation` pin action | PG, My | **done**: Header menu; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
@@ -302,11 +302,11 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-43 | Copy as ▸ CSV, JSON, Markdown, SQL | Copy in a data-transfer format | ui.editors.data `core.resultset.copyAs`; data.transfer processors | PG, My | **done**: Copy as CSV / JSON / Markdown / SQL INSERT; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
 | RES-44 | Copy as ▸ HTML, XML, TXT, source code, DbUnit | Other data-transfer formats | data.transfer `stream.html`, `stream.xml`, `stream.txt`, `stream.source.code`, `stream.dbunit` | PG, My | **roadmap**: Data-transfer formats beyond CLAUDE.md §4.D3 / §4.G |
 | RES-45 | Copy column names (Alt+Shift+C) | Copies the selected column names | ui.editors.data `grid.copyColumnNames` | PG, My | **done**: Copy column names; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
-| RES-46 | Copy row numbers | Copies the selected row numbers | ui.editors.data `grid.copyRowNames` | PG, My | **gap**: G6 |
+| RES-46 | Copy row numbers | Copies the selected row numbers | ui.editors.data `grid.copyRowNames` | PG, My | **done**: `a_right_click_on_a_row_number_opens_the_menu_of_its_row` |
 | RES-47 | Paste (Ctrl+V) | Pastes the clipboard into the selected cells | Eclipse `edit.paste` in the grid | PG, My | **done**: Cmd+V pastes a value or a tab-separated block as pending changes; `pasting_fills_cells_from_the_clipboard_and_delete_empties_them`, `a_pasted_block_is_split_in_rows_and_cells` |
 | RES-48 | Advanced Paste (Ctrl+Shift+V) | Paste with options, including as new rows | core `core.edit.paste.special`; ui.editors.data `ResultSetPasteSettings` | PG, My | **roadmap**: Paste into cells comes with M6 Part 1; inserting new rows from a spreadsheet is less common |
 | RES-49 | Inline edit (Enter, double click) | Edits the cell in place (double click default `INLINE_EDITOR`) | ui.editors.data `row.edit.inline`, pref `RESULT_SET_DOUBLE_CLICK` | PG, My | **done**: Double click, Enter or F2 on table data; `cells_are_edited_reviewed_and_applied_in_one_transaction` |
-| RES-50 | Edit cell in a value editor (Shift+Enter) | Dialog editor for long text, JSON, binary | ui.editors.data `core.resultset.row.edit` | PG, My | **gap**: G9 |
+| RES-50 | Edit cell in a value editor (Shift+Enter) | Dialog editor for long text, JSON, binary | ui.editors.data `core.resultset.row.edit` | PG, My | **done**: the value panel edits text and JSON and sets NULL, as a pending change. `the_value_panel_edits_a_json_cell_and_apply_writes_it` |
 | RES-51 | Edit results of a query | A single-table SELECT with a key is editable in the SQL editor | ui.editors.data `ResultSetViewer` (single-source model) | PG, My | **gap**: G8 |
 | RES-52 | Add row, duplicate row, delete row | Row editing commands | ui.editors.data `row.add`, `row.copy`, `row.delete` | PG, My | **done**: `add_row`, `duplicate_rows`, `delete_rows`; `cells_are_edited_reviewed_and_applied_in_one_transaction` |
 | RES-53 | Row editing keys (Alt+Insert, Ctrl+Alt+Insert, Alt+Delete) | Shortcuts to add, duplicate, delete rows | ui.editors.data key bindings | PG, My | **done**: Alt+Insert, Alt+Delete, Ctrl+Alt+Insert and Mac alternatives; `data_keys_edit_rows_and_apply` |
@@ -336,7 +336,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | -- | ---- | ---- | ---- | ---- | ---- |
 | OBJ-01 | Table editor tabs | Columns, constraints, foreign keys, indexes, references, triggers, DDL | ui.editors.entity / engine `databaseEditor` pages | PG, My | **done**: Structure tab; `the_structure_of_a_table_is_shown_in_tabs` |
 | OBJ-02 | View editor | Columns and source of a view | ext.postgresql.ui `postgresql.source.view`; ext.mysql.ui `mysql.source.view` | PG, My | **done**: `a_view_shows_its_columns_and_ddl` |
-| OBJ-03 | Properties page | Owner, comment, row estimate, sizes; MySQL engine, collation, auto-increment | ui.editors.entity properties page | PG, My | **gap**: G17 |
+| OBJ-03 | Properties page | Owner, comment, row estimate, sizes; MySQL engine, collation, auto-increment | ui.editors.entity properties page | PG, My | **done**: Properties sub-tab on tables and views; the comment is set from there. `properties_open_first_on_f4_and_the_comment_is_set_from_there` |
 | OBJ-04 | Edit and save a table (Ctrl+S with SQL preview) | Changes persisted after a script preview | ui.editors.entity save; ui.navigator pref `NAVIGATOR_SHOW_SQL_PREVIEW` (true) | PG, My | **done**: Table form with live DDL; `a_table_is_altered_from_the_form_with_a_preview`, `the_form_refuses_what_is_invalid` |
 | OBJ-05 | Create table | New table editor | ui.navigator `core.object.create` on Tables | PG, My | **done**: `a_table_is_created_from_the_form` |
 | OBJ-06 | Columns, indexes, keys created from the editor | Add column / index / foreign key dialogs | engine `*Manager` classes (e.g. `PostgreTableColumnManager`) | PG, My | **done**: `a_table_is_altered_from_the_form_with_a_preview` |
@@ -347,7 +347,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | OBJ-11 | Sequence editor | Start, increment, bounds, cycle, current value | ext.postgresql `PostgreSequence` properties | PG | **roadmap**: Show DDL gives the definition; current value is a query away |
 | OBJ-12 | Enum type editing | Add and rename values | ext.postgresql `alterTypeAddValue` generator; type editor | PG | **done**: `enums_are_created_and_their_values_added_and_renamed` |
 | OBJ-13 | Extensions | Install and drop extensions | ext.postgresql tree `avalextensions` | PG | **done**: `extensions_are_installed_and_dropped_from_the_tree` |
-| OBJ-14 | Create database with options | PostgreSQL owner, encoding, template; MySQL charset, collation | ext.postgresql `PostgreDatabaseManager`; ext.mysql `MySQLDatabaseManager` | PG, My | **gap**: G17 |
+| OBJ-14 | Create database with options | PostgreSQL owner, encoding, template; MySQL charset, collation | ext.postgresql `PostgreDatabaseManager`; ext.mysql `MySQLDatabaseManager` | PG, My | **done**: `a_database_is_created_with_the_options_of_the_form` |
 | OBJ-15 | Create schema | New schema with owner | ext.postgresql `PostgreSchemaManager` | PG | **done**: `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | OBJ-16 | Permissions page | Table and role privileges (PostgreSQL); schema privileges (MySQL) | ext.postgresql.ui `postgresql.table.permissions`, `postgresql.role.permissions`; ext.mysql.ui `editor.schema_privileges` | PG, My | **done**: Roles with their grants in the administration tab, read only (CLAUDE.md §4.H2); `roles_and_their_grants_sizes_and_settings_are_listed` |
 | OBJ-17 | Role / user editors | Create and edit roles or users, attributes, limits, privileges | ext.postgresql.ui role editor; ext.mysql.ui `MySQLUserEditorGeneral`, `MySQLUserEditorPrivileges` | PG, My | **roadmap**: CLAUDE.md §4.H2 asks for a read view of users and grants; editing them is beyond v1 |
@@ -372,8 +372,8 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | TOOL-10 | Enable / disable triggers | ALTER TABLE … ENABLE / DISABLE TRIGGER | ext.postgresql.ui `PostgreToolTriggerEnable`, `PostgreToolTriggerDisable` | PG | **done**: Enable / disable trigger; `postgres_tools_analyze_vacuum_refresh_switch_triggers_and_truncate` |
 | TOOL-11 | Analyze / Check / Optimize / Repair table (MySQL) | Table maintenance statements with their result | ext.mysql.ui `tools.analyzeTable`, `.checkTable`, `.optimizeTable`, `.repairTable` | My | **done**: Analyze, Check, Optimize, Repair with the server's status rows; `mysql_and_mariadb_tools_show_their_status_rows` |
 | TOOL-12 | Session manager | Sessions with refresh, auto-refresh, cancel query, terminate | ext.postgresql.ui `PostgreSessionEditor`; ext.mysql.ui `MySQLSessionEditor`; ui.editors.session | PG, My | **done**: Sessions with a filter, auto-refresh, Cancel query and Terminate session confirmed (refused on read-only and on the tab's own session); `the_sessions_list_cancels_and_terminates_what_the_test_opened`, `the_sessions_refresh_on_their_own_only_while_shown`, `a_read_only_connection_sends_no_signal` |
-| TOOL-13 | Session manager: hide idle / sleeping | Toggle that hides idle sessions | ext.postgresql.ui `ShowIdleAction`; ext.mysql.ui `hideSleeping` | PG, My | **gap**: G16 |
-| TOOL-14 | Lock manager | Waiting and blocking locks with the sessions holding them | ext.postgresql.ui `PostgreLockEditor`; ui.editors.locks | PG | **gap**: G16 |
+| TOOL-13 | Session manager: hide idle / sleeping | Toggle that hides idle sessions | ext.postgresql.ui `ShowIdleAction`; ext.mysql.ui `hideSleeping` | PG, My | **done**: `the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker` |
+| TOOL-14 | Lock manager | Waiting and blocking locks with the sessions holding them | ext.postgresql.ui `PostgreLockEditor`; ui.editors.locks | PG | **done**: Locks sub-tab, a waiting → blocking table (InnoDB locks only on MySQL / MariaDB). `the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker` |
 | TOOL-15 | Session details: query text and plan | Selected session's statement and its plan | ui.editors.session `SessionManagerViewer` details | PG, My | **roadmap**: M8 Part 4 shows the query column; the plan of another session is rarely needed |
 | TOOL-16 | Server settings | pg_settings / SHOW VARIABLES | ext.postgresql tree `PostgreSetting`; ext.mysql `sessionVariables`, `globalVariables` | PG, My | **done**: Server settings with a filter; `roles_and_their_grants_sizes_and_settings_are_listed` |
 | TOOL-17 | MySQL status, engines, charsets, collations, plugins | System information folders | ext.mysql tree `MySQLInformation` | My | **roadmap**: Available through SHOW statements in the editor |
@@ -426,7 +426,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-17 | Create ▸ (database, schema) | New child object | ui.navigator `core.object.create` | PG, My | **roadmap**: Create database / schema exist on the navigator's database and schema nodes (`dropping_renaming_and_truncating_show_the_sql_and_ask`); the sidebar connection menu need not repeat them |
 | CM-18 | SQL Editor ▸ (open script, recent, new script, console) | Editor bound to the connection | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New SQL editor connects first when needed; `new_sql_editor_connects_first_then_opens_a_tab_on_the_connection`, `the_sidebar_answers_a_right_click_on_each_part`; no recent-scripts list or console |
 | CM-19 | Connection view ▸ | Tree presets | core `ConnectionViewSettingsContributor` | PG, My | **roadmap**: See NAV-59 |
-| CM-20 | Filter ▸ | Object filters | core `navigator.filter` menu | PG, My | **gap**: G11 |
+| CM-20 | Filter ▸ | Object filters | core `navigator.filter` menu | PG, My | **done**: `object_filters_hide_schemas_and_last_after_a_restart` |
 | CM-21 | Compare / Migrate ▸ | Schema compare | cmp.simple.ui | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | CM-22 | Tools ▸ (session manager, lock manager, backup all) | Connection-level tools | ext.postgresql.ui / ext.mysql.ui `connectionEditor` contributions, `tools.backup.all.db` | PG, My | **done** (Administration, session manager): on the connection menu; `the_sessions_list_cancels_and_terminates_what_the_test_opened`; lock manager G16; "backup all" is Back up on the database |
 | CM-23 | Copy | Copies the connection | core `org.eclipse.ui.edit.copy` | PG, My | **done**: Copy ▸ Name, Connection URL without the password, Host; `the_copied_connection_url_has_no_password`, `the_connection_url_has_no_password_and_reads_back` |
@@ -448,7 +448,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-34 | Create ▸ (schema, table, view, function, sequence, …) | New child object | ui.navigator `core.object.create` | PG, My | **done**: Create schema / database / table / view; `dropping_renaming_and_truncating_show_the_sql_and_ask`, `a_table_is_created_from_the_form`; other kinds: G10 |
 | CM-35 | SQL Editor ▸ | Editor bound to the database or schema | ui.editors.sql `popup:…?after=sql_tools` | PG, My | **done**: New query here on schemas, MySQL databases and PostgreSQL databases; `statements_and_ddl_open_in_a_tab_and_run_nothing`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | CM-36 | Set as default (Ctrl+Shift+A) | Makes it the active database / schema | ui.navigator `core.navigator.set.default` | PG, My | **done**: Set as default for this tab, Cmd+Shift+A; `set_as_default_points_the_active_tab_at_the_schema` |
-| CM-37 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **gap**: G11 |
+| CM-37 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **done**: `object_filters_hide_schemas_and_last_after_a_restart` |
 | CM-38 | Generate SQL ▸ DDL | DDL of the schema / database | ui.editors.sql `sqlGenerator` | PG, My | **done**: Show DDL (schemas, MySQL databases); `statements_and_ddl_open_in_a_tab_and_run_nothing` |
 | CM-39 | Tools ▸ Backup, Restore | Dump and restore | ext.postgresql.ui / ext.mysql.ui tools | PG, My | **done**: Back up… and Restore… on a database; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `a_database_is_backed_up_and_restored_with_the_real_tools` |
 | CM-40 | Tools ▸ Analyze, Vacuum | Database maintenance | ext.postgresql.ui `tools.analyze`, `tools.vacuum` | PG | **done**: Analyze and Vacuum on a PostgreSQL database node; `a_postgres_database_is_vacuumed_and_analysed_from_its_node` |
@@ -474,9 +474,9 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-55 | Import Data | Import wizard | data.transfer.ui `core.import.data` | PG, My | **done**: Import CSV…; `a_csv_file_is_imported_into_an_existing_table_and_into_a_new_one` |
 | CM-56 | Tools ▸ Analyze, Vacuum, Truncate (options), Enable / Disable triggers (PG) | Table maintenance | ext.postgresql.ui tools | PG | **done**: Tools ▸ Vacuum, Analyze, Truncate and trigger switches open the maintenance dialog, guarded on read-only and production; `the_tools_menu_and_command_open_the_dialog_and_read_only_or_production_guard_it`, `the_tools_menu_lists_what_the_engine_offers_for_each_object` |
 | CM-57 | Tools ▸ Analyze, Check, Optimize, Repair, Truncate (MySQL) | Table maintenance | ext.mysql.ui tools | My | **done**: Tools ▸ Analyze, Check, Optimize, Repair, Truncate; `mysql_and_mariadb_tools_show_their_status_rows`, `the_tools_menu_lists_what_the_engine_offers_for_each_object` |
-| CM-58 | Tools ▸ Backup (selected tables) | Dump of one table | ext.postgresql.ui `tools.backup.db` | PG, My | **planned**: `docs/plans/M8.md` Part 3 (selected tables option) |
+| CM-58 | Tools ▸ Backup (selected tables) | Dump of one table | ext.postgresql.ui `tools.backup.db` | PG, My | **done**: Back up… on a table backs up that table alone. `a_table_is_backed_up_alone_from_the_tree` |
 | CM-59 | Compare / Migrate ▸ | Compare | cmp.simple.ui | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
-| CM-60 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **gap**: G11 |
+| CM-60 | Filter ▸ | Hide / show only | core `navigator.filter` | PG, My | **done**: `object_filters_hide_schemas_and_last_after_a_restart` |
 | CM-61 | Copy, Copy Advanced Info | Names | core `edit.copy`, `core.edit.copy.special` | PG, My | **done**: Copy name, Copy qualified name; `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `navigator_keys_run_the_actions_of_the_selected_node` |
 | CM-62 | Delete | Drop with preview | core `edit.delete` | PG, My | **done**: Drop…; `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | CM-63 | Rename | Rename with preview | core `edit.rename` | PG, My | **done**: Rename…; `dropping_renaming_and_truncating_show_the_sql_and_ask` |
@@ -565,14 +565,14 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-106 | Filter ▸ (by value, operators, distinct values, clear, save default) | Filters from the cell | ui.editors.data `fillFiltersMenu` | PG, My | **planned**: `docs/plans/CTX.md` Part 3 (value, exclude, operators, clear); distinct values: G5; on query results: G5 |
 | CM-107 | Order ▸ Ascending / Descending / Default | Ordering from the cell | ui.editors.data `fillOrderingsMenu` | PG, My | **done**: Order by this column ▸ Ascending / Descending / Clear in the cell menu; `a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters`, `the_menu_of_a_result_cell_acts_on_the_selection_or_on_its_cell` |
 | CM-108 | Navigate ▸ (foreign key, references, go to row / column, fetch, refresh on scroll, back / forward) | Navigation entries | ui.editors.data `fillNavigateMenu` | PG, My | **done**: Foreign-key entries on table data; `foreign_keys_lead_to_the_referenced_row_and_back`; go to row / column G6 |
-| CM-109 | Edit ▸ Edit cell, inline edit, set NULL, set default, reset | Cell edit entries | ui.editors.data `fillEditMenu` | PG, My | **planned**: `docs/plans/CTX.md` Part 3 (Edit cell, Set NULL, Set default); value editor G9; reset cell G2 |
+| CM-109 | Edit ▸ Edit cell, inline edit, set NULL, set default, reset | Cell edit entries | ui.editors.data `fillEditMenu` | PG, My | **done**: Edit cell, Edit in value panel, Set NULL, Set default, Revert. `the_value_panel_edits_a_json_cell_and_apply_writes_it`, `the_record_view_and_the_value_panel_are_in_the_cell_menu` |
 | CM-110 | Edit ▸ Add row, duplicate row, delete row, copy from above / below | Row edit entries | ui.editors.data `fillContextMenu` edit submenu | PG, My | **done**: Duplicate row, Delete row, Revert row on table data; `a_right_click_on_a_cell_opens_the_menu_of_its_row`; add row / copy from above: G2 |
-| CM-111 | Panels ▸ | Value, aggregate, metadata, grouping, references | ui.editors.data `PanelsMenuContributor` | PG, My | **gap**: G6 (aggregate, metadata); value viewer done (View value: `docs/plans/CTX.md` Part 3) |
+| CM-111 | Panels ▸ | Value, aggregate, metadata, grouping, references | ui.editors.data `PanelsMenuContributor` | PG, My | **done**: Panels ▸ Value, Aggregate, Columns. `selection_figures_show_in_the_footer_and_the_panels` |
 | CM-112 | View / Format ▸, Hints, Logical structure | Display formats, colours, virtual keys | ui.editors.data `fillColumnViewMenu`, `fillVirtualModelMenu` | PG, My | **roadmap**: See RES-32, RES-33, RES-71 |
-| CM-113 | Layout ▸ (record mode, presentation, selection counts, filter panel, zoom) | Viewer layout | ui.editors.data `fillLayoutMenu` | PG, My | **gap**: G3 (record mode); selection counts G6; zoom `docs/plans/M10.md` Part 3 |
+| CM-113 | Layout ▸ (record mode, presentation, selection counts, filter panel, zoom) | Viewer layout | ui.editors.data `fillLayoutMenu` | PG, My | **done**: Layout ▸ Record view, Selection statistics, zoom. `record_view_shows_one_row_and_edits_it`, `selection_figures_show_in_the_footer_and_the_panels` |
 | CM-114 | Export data, Open with ▸ | Export the result | ui.editors.data `CMD_EXPORT`, `ResultSetHandlerOpenWith` | PG, My | **done**: Export… in the cell menu; Open with on the roadmap (RES-68); `a_result_cell_copies_orders_shows_and_exports_but_never_edits_or_filters` |
 | CM-115 | Generate SQL ▸ (from rows) | SELECT / INSERT / UPDATE / DELETE of the selected rows | ui.editors.sql `SQLGeneratorContributor` on result rows | PG, My | **done**: on table data; disabled with its reason on a query result. `generate_sql_writes_the_selected_rows_into_a_tab_and_runs_nothing`, `a_row_menu_generates_sql_and_a_query_result_says_why_it_cannot` |
-| CM-116 | Refresh | Re-reads the result | core `file.refresh` in `fillContextMenu` | PG, My | **gap**: G6 (menu entry; Refresh exists in the data tab toolbar) |
+| CM-116 | Refresh | Re-reads the result | core `file.refresh` in `fillContextMenu` | PG, My | **done**: `the_record_view_and_the_value_panel_are_in_the_cell_menu` |
 
 ### Column header
 
@@ -589,8 +589,8 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-123 | Copy row number(s) | Copies row numbers | ui.editors.data `grid.copyRowNames` | PG, My | **gap**: G6 |
-| CM-124 | Edit ▸ add / duplicate / delete row, Filter ▸, Order ▸, Export | Same entries as a cell, for the row | ui.editors.data `fillContextMenu` (`ROW_HEADER`) | PG, My | **gap**: G6 (row-number column has no menu) |
+| CM-123 | Copy row number(s) | Copies row numbers | ui.editors.data `grid.copyRowNames` | PG, My | **done**: `a_right_click_on_a_row_number_opens_the_menu_of_its_row` |
+| CM-124 | Edit ▸ add / duplicate / delete row, Filter ▸, Order ▸, Export | Same entries as a cell, for the row | ui.editors.data `fillContextMenu` (`ROW_HEADER`) | PG, My | **done**: `a_right_click_on_a_row_number_opens_the_menu_of_its_row` |
 
 ### Tab
 
@@ -614,7 +614,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | -- | ---- | ---- | ---- | ---- | ---- |
 | CM-131 | Active connection / schema selector | Switch the editor's target | core / ui.navigator `ui.tools.select.connection`, `.schema` (toolbar) | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
 | CM-132 | Transaction mode, Commit, Rollback | Transaction controls | core `menu.txn`, `commit.menu`, `rollback.menu` | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
-| CM-133 | Transaction log, pending transactions | Transaction monitor entries | core `menu.txn.log` (`core.txn.log`, `core.txn.pending`) | PG, My | **gap**: G14 (log); pending list on the roadmap (CON-46) |
+| CM-133 | Transaction log, pending transactions | Transaction monitor entries | core `menu.txn.log` (`core.txn.log`, `core.txn.pending`) | PG, My | **done**: Transaction log… on the status bar's transaction item; pending list on the roadmap (CON-46). `the_transaction_log_lists_the_statements_until_the_transaction_ends` |
 
 ## Summary
 
@@ -622,13 +622,13 @@ Counts per status and per area (recounted from the rows above on 2026-11-13, HEA
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
-| Connections | 34 | 1 | 0 | 1 | 15 | 51 |
-| Navigator | 39 | 0 | 0 | 2 | 18 | 59 |
+| Connections | 35 | 1 | 0 | 0 | 15 | 51 |
+| Navigator | 40 | 0 | 0 | 1 | 18 | 59 |
 | SQL editor | 35 | 3 | 0 | 0 | 16 | 54 |
-| Results and data editing | 39 | 2 | 1 | 15 | 15 | 72 |
-| Object editors (structure) | 13 | 0 | 0 | 2 | 6 | 21 |
-| Tools and administration | 11 | 0 | 0 | 2 | 15 | 28 |
-| Context menus | 109 | 0 | 3 | 10 | 11 | 133 |
-| **All** | **280** | **6** | **4** | **32** | **96** | **418** |
+| Results and data editing | 48 | 2 | 0 | 7 | 15 | 72 |
+| Object editors (structure) | 15 | 0 | 0 | 0 | 6 | 21 |
+| Tools and administration | 13 | 0 | 0 | 0 | 15 | 28 |
+| Context menus | 120 | 0 | 1 | 1 | 11 | 133 |
+| **All** | **306** | **6** | **1** | **9** | **96** | **418** |
 
 Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.

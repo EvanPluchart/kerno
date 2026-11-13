@@ -118,6 +118,9 @@ pub struct BackupDialog {
     content: BackupContent,
     /// Backup: only these tables, comma-separated; every table when empty.
     tables: Entity<InputState>,
+    /// Backup: the tables chosen in the tree, whose names are never parsed
+    /// from text; they replace `tables` while there are some.
+    only: Vec<TableRef>,
     /// Backup: the file chosen; a name is proposed until then.
     output: Option<PathBuf>,
     /// Restore: the file chosen, and what reading it found.
@@ -278,6 +281,7 @@ impl BackupDialog {
             format: BackupFormat::Sql,
             content: BackupContent::All,
             tables,
+            only: Vec::new(),
             output: None,
             file: None,
             input: None,
@@ -462,6 +466,9 @@ impl BackupDialog {
     /// The tables typed, qualified: `schema.table`, or a bare name in
     /// `public` (PostgreSQL) or in the database (MySQL, MariaDB).
     fn tables(&self, cx: &App) -> Vec<TableRef> {
+        if !self.only.is_empty() {
+            return self.only.clone();
+        }
         let default_schema = match self.engine {
             Engine::Postgres => "public",
             Engine::MySql | Engine::MariaDb => self.database.as_str(),
@@ -519,6 +526,13 @@ impl BackupDialog {
     }
 
     /// Starts the backup, asking for the file first if none was chosen.
+    /// Backs up only `tables` (DBeaver's Tools ▸ Backup on selected
+    /// tables): `pg_dump --table` for each, `mysqldump <database> <table>…`.
+    pub fn only_tables(&mut self, tables: Vec<TableRef>, cx: &mut Context<Self>) {
+        self.only = tables;
+        cx.notify();
+    }
+
     pub fn back_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.output.is_none() {
             self.choose_output(true, window, cx);
@@ -1245,10 +1259,41 @@ impl BackupDialog {
             ),
             Self::field(
                 "Tables",
-                TextInput::new(&self.tables)
-                    .small()
-                    .id("backup-tables")
-                    .into_any_element(),
+                if self.only.is_empty() {
+                    TextInput::new(&self.tables)
+                        .small()
+                        .id("backup-tables")
+                        .into_any_element()
+                } else {
+                    let names: Vec<String> = self
+                        .only
+                        .iter()
+                        .map(|table| format!("{}.{}", table.schema, table.name))
+                        .collect();
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("backup-only-tables")
+                                .test_support()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .child(SharedString::from(names.join(", "))),
+                        )
+                        .child(
+                            Button::new("backup-all-tables")
+                                .small()
+                                .ghost()
+                                .label("Every table")
+                                .tooltip("Back up the whole database instead")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.only_tables(Vec::new(), cx)),
+                                ),
+                        )
+                        .into_any_element()
+                },
                 cx,
             ),
             Self::field(

@@ -121,6 +121,39 @@ SELECT s.name, s.setting AS value, s.unit, s.category, s.short_desc AS descripti
 FROM pg_catalog.pg_settings s
 ORDER BY s.category, s.name"
             .to_string(),
+        // pg_blocking_pids() names the sessions in a waiting one's way, for
+        // row locks too (the waiter waits on the holder's transaction id).
+        // The lock it waits for is its one ungranted row of pg_locks.
+        // Without pg_read_all_stats the statements of other users' sessions
+        // read "<insufficient privilege>".
+        AdminView::Locks => "\
+SELECT w.pid AS waiting_id,
+       w.usename AS waiting_user,
+       w.datname AS database,
+       date_trunc('second', clock_timestamp() - l.waitstart) AS waited,
+       l.mode AS lock_mode,
+       CASE l.locktype
+            WHEN 'relation' THEN l.relation::regclass::text
+            WHEN 'tuple' THEN l.relation::regclass::text || ' (row)'
+            WHEN 'transactionid' THEN 'a row, held by transaction ' || l.transactionid
+            ELSE l.locktype
+       END AS object,
+       w.query AS waiting_query,
+       b.pid AS blocking_id,
+       b.usename AS blocking_user,
+       b.state AS blocking_state,
+       b.query AS blocking_query
+FROM pg_catalog.pg_stat_activity w
+CROSS JOIN LATERAL unnest(pg_catalog.pg_blocking_pids(w.pid)) AS blocker(pid)
+LEFT JOIN pg_catalog.pg_stat_activity b ON b.pid = blocker.pid
+LEFT JOIN LATERAL (
+    SELECT * FROM pg_catalog.pg_locks k
+    WHERE k.pid = w.pid AND NOT k.granted
+    LIMIT 1
+) l ON true
+WHERE w.wait_event_type = 'Lock'
+ORDER BY l.waitstart NULLS LAST, w.pid, b.pid"
+            .to_string(),
     }
 }
 

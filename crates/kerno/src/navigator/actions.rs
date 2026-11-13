@@ -4,7 +4,7 @@ use kerno_core::Dialect;
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 
-use super::model::{Group, Node, NodeKind};
+use super::model::{Group, Node, NodeKind, filter_name};
 use crate::settings::TableDoubleClick;
 
 /// A statement written for a table.
@@ -84,6 +84,9 @@ pub enum Action {
     /// The table's form with the cursor on this column (DBeaver's Edit on
     /// a column).
     EditColumn,
+    /// The structure tab of a table or view on its Properties sub-tab:
+    /// where DBeaver's object editor ("Edit", F4) opens.
+    Properties,
 }
 
 impl Action {
@@ -129,6 +132,7 @@ impl Action {
             Action::GenerateCall => "Generate CALL",
             Action::ExecuteRoutine => "Execute…",
             Action::EditColumn => "Edit column…",
+            Action::Properties => "Properties",
         }
     }
 
@@ -205,8 +209,15 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![Rename, Drop],
         ],
         NodeKind::Object(ObjectRef::Relation(_, kind)) if kind.is_table() => vec![
-            vec![OpenData, OpenStructure, NewQueryHere, ReadInConsole],
-            vec![Export, ImportCsv],
+            vec![
+                OpenData,
+                OpenStructure,
+                Properties,
+                NewQueryHere,
+                ReadInConsole,
+            ],
+            // DBeaver's Tools ▸ Backup on tables (`tools.backup.db`).
+            vec![Export, ImportCsv, Backup],
             all_templates.to_vec(),
             vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
@@ -219,6 +230,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
             vec![
                 OpenData,
                 OpenStructure,
+                Properties,
                 NewQueryHere,
                 ReadInConsole,
                 Generate(Template::Select),
@@ -292,6 +304,42 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         .collect()
 }
 
+/// An entry of a node's Filter ▸ menu (DBeaver's `navigator.filter`: hide
+/// or show only the selected object, configure, toggle, clear the filter of
+/// its kind). Like Tools ▸, the menu adds it: never in [`actions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterAction {
+    Hide,
+    ShowOnly,
+    Configure,
+    Toggle,
+    Clear,
+}
+
+impl FilterAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterAction::Hide => "Hide this object",
+            FilterAction::ShowOnly => "Show only this object",
+            FilterAction::Configure => "Configure…",
+            FilterAction::Toggle => "Turn on or off",
+            FilterAction::Clear => "Clear",
+        }
+    }
+}
+
+/// The Filter ▸ entries of a node: an object filters its own kind, a
+/// folder the kind it holds; folders under a table hold columns and keys
+/// too. Enum values are never filtered.
+pub fn filter_actions(node: &Node) -> Vec<FilterAction> {
+    use FilterAction::*;
+    match node.kind {
+        NodeKind::Group(_) => vec![Configure, Toggle, Clear],
+        _ if filter_name(node).is_some() => vec![Hide, ShowOnly, Configure, Toggle, Clear],
+        _ => Vec::new(),
+    }
+}
+
 /// The maintenance tools of a node (DBeaver's Tools ▸), at their default
 /// options: what the dialect writes for its object. A trigger is enabled
 /// when disabled (shown muted) and disabled when enabled.
@@ -337,12 +385,13 @@ pub fn default_action(node: &Node, has_schemas: bool, table: TableDoubleClick) -
 }
 
 /// What F4 does to a node (DBeaver's "Edit"): the table's form on a
-/// column, the structure of a table or view, the source of a routine, the
+/// column, the properties of a table or view, the source of a routine, the
 /// DDL of other objects; `None` when the node has none of these.
 pub fn edit_action(node: &Node, has_schemas: bool) -> Option<Action> {
     let available = actions(node, has_schemas).concat();
     [
         Action::EditColumn,
+        Action::Properties,
         Action::OpenStructure,
         Action::EditSource,
         Action::ShowDdl,
@@ -805,8 +854,9 @@ mod tests {
             RelationKind::View,
             RelationKind::MaterializedView,
         ] {
+            // DBeaver's object editor opens on its properties (G17).
             let relation = NodeKind::Object(ObjectRef::Relation(orders.clone(), kind));
-            assert_eq!(edit(relation, true), Some(OpenStructure));
+            assert_eq!(edit(relation, true), Some(Properties));
         }
         let routine = |kind| {
             NodeKind::Object(ObjectRef::Routine {

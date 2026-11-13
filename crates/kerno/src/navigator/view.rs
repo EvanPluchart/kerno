@@ -25,6 +25,7 @@ use gpui_kit::{
     div, px,
 };
 use kerno_core::browse::Filter;
+use kerno_core::config::{ObjectFilter, exact_mask};
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
@@ -34,13 +35,16 @@ use kerno_core::table_draft::TableChange;
 use kerno_core::{Session, exec};
 
 use super::actions::{
-    Action, Template, actions, create_template, default_action, edit_action, qualified_name, tools,
+    Action, FilterAction, Template, actions, create_template, default_action, edit_action,
+    filter_actions, qualified_name, tools,
 };
+use super::filter_dialog;
 use super::model::{
     self, Children, Group, Item, Load, LoadKind, Loaded, Node, NodeKind, Reveal, Tree,
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
+use crate::database_dialog;
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, Source};
 use crate::maintenance_dialog::{self, MaintenanceDialog};
@@ -84,6 +88,12 @@ pub enum NavigatorEvent {
         table: TableRef,
         kind: RelationKind,
     },
+    /// Show the structure of a table or view on its Properties sub-tab.
+    ShowProperties {
+        target: Target,
+        table: TableRef,
+        kind: RelationKind,
+    },
     /// Open the form of a new table in `schema`.
     CreateTable { target: Target, schema: String },
     /// Open a query tab in source mode holding `sql`, the script that
@@ -102,8 +112,13 @@ pub enum NavigatorEvent {
     },
     /// Make `target` (a database and schema) the active query tab's.
     SetDefault { target: Target },
-    /// Back up the database of `target`, or restore a file into it.
-    BackupRestore { target: Target, restore: bool },
+    /// Back up the database of `target` (only `tables` when there are
+    /// some), or restore a file into it.
+    BackupRestore {
+        target: Target,
+        restore: bool,
+        tables: Vec<TableRef>,
+    },
 }
 
 /// The databases of the connection: the root of the tree.
@@ -168,10 +183,15 @@ impl Navigator {
                 }
             }),
             cx.subscribe(&connections, |this, _, event: &ConnectionsEvent, cx| {
-                if let ConnectionsEvent::StatusChanged { id } = event
-                    && this.connection.as_deref() == Some(id.as_str())
-                {
-                    this.follow_status(cx);
+                match event {
+                    ConnectionsEvent::StatusChanged { id }
+                        if this.connection.as_deref() == Some(id.as_str()) =>
+                    {
+                        this.follow_status(cx)
+                    }
+                    // The object filters are kept with the connection.
+                    ConnectionsEvent::ListChanged if this.root == Root::Loaded => this.sync(cx),
+                    _ => {}
                 }
             }),
         ];
@@ -570,7 +590,7 @@ impl Navigator {
         };
         match action {
             Action::Refresh => self.refresh(id, cx),
-            Action::OpenData | Action::OpenStructure => {
+            Action::OpenData | Action::OpenStructure | Action::Properties => {
                 // A column opens its table; a foreign key the table at its
                 // other end.
                 let opened = match &node.kind {
@@ -589,6 +609,11 @@ impl Navigator {
                 {
                     cx.emit(match action {
                         Action::OpenData => NavigatorEvent::OpenData {
+                            target,
+                            table,
+                            kind,
+                        },
+                        Action::Properties => NavigatorEvent::ShowProperties {
                             target,
                             table,
                             kind,
@@ -647,9 +672,14 @@ impl Navigator {
                 if self.unavailable(action, &node, cx).is_none()
                     && let Some(target) = self.target_of(&node, false)
                 {
+                    let tables = match &node.kind {
+                        NodeKind::Object(ObjectRef::Relation(table, _)) => vec![table.clone()],
+                        _ => Vec::new(),
+                    };
                     cx.emit(NavigatorEvent::BackupRestore {
                         target,
                         restore: action == Action::Restore,
+                        tables,
                     });
                 }
             }
@@ -717,6 +747,9 @@ impl Navigator {
                     self.edit_source(&node, window, cx)
                 }
             }
+            Action::CreateDatabase if self.offers_database_options(cx) => {
+                self.create_database_form(&node.id, window, cx);
+            }
             Action::Rename
             | Action::Drop
             | Action::CreateSchema
@@ -729,6 +762,198 @@ impl Navigator {
             | Action::RenameColumn
             | Action::DropColumn => self.confirm(action, &node, window, cx),
         }
+    }
+
+    /// The kind of object the Filter ▸ entries of `node` act on: a
+    /// folder's objects, or the node's own kind.
+    fn filter_kind(node: &Node) -> String {
+        match node.kind {
+            NodeKind::Group(_) => model::children_key(&node.id),
+            _ => model::filter_key(&node.id),
+        }
+    }
+
+    /// The connection's filter of the objects of kind `key`.
+    fn object_filter(&self, key: &str, cx: &App) -> Option<ObjectFilter> {
+        let connection = self.connection.as_deref()?;
+        let saved = self.connections.read(cx).get(connection)?;
+        saved.config.navigator_filters.get(key).cloned()
+    }
+
+    /// Why a Filter ▸ entry cannot be used on `node`, when it cannot.
+    pub fn filter_unavailable(
+        &self,
+        action: FilterAction,
+        node: &Node,
+        cx: &App,
+    ) -> Option<&'static str> {
+        let missing = self.object_filter(&Self::filter_kind(node), cx).is_none();
+        (matches!(action, FilterAction::Toggle | FilterAction::Clear) && missing)
+            .then_some("no filter")
+    }
+
+    /// Does what a Filter ▸ entry says for the node `id`.
+    pub fn perform_filter(
+        &mut self,
+        action: FilterAction,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.tree.node(id).cloned() else {
+            return;
+        };
+        if !filter_actions(&node).contains(&action)
+            || self.filter_unavailable(action, &node, cx).is_some()
+        {
+            return;
+        }
+        let key = Self::filter_kind(&node);
+        let current = self.object_filter(&key, cx);
+        let filter = match action {
+            FilterAction::Hide | FilterAction::ShowOnly => {
+                let Some(name) = model::filter_name(&node) else {
+                    return;
+                };
+                let mut filter = current.unwrap_or_default();
+                filter.enabled = true;
+                let mask = exact_mask(name);
+                let masks = if action == FilterAction::Hide {
+                    &mut filter.exclude
+                } else {
+                    &mut filter.include
+                };
+                if !masks.contains(&mask) {
+                    masks.push(mask);
+                }
+                Some(filter)
+            }
+            FilterAction::Toggle => current.map(|filter| ObjectFilter {
+                enabled: !filter.enabled,
+                ..filter
+            }),
+            FilterAction::Clear => None,
+            FilterAction::Configure => {
+                let view = cx.entity();
+                filter_dialog::open(
+                    &model::filter_kind_label(&key),
+                    current.unwrap_or_default(),
+                    window,
+                    cx,
+                    move |filter, _, cx| {
+                        view.update(cx, |this, cx| this.set_object_filter(&key, filter, cx))
+                    },
+                );
+                return;
+            }
+        };
+        self.set_object_filter(&key, filter, cx);
+    }
+
+    /// Saves the filter of a kind of object with the connection, and shows
+    /// the tree through it.
+    fn set_object_filter(
+        &mut self,
+        key: &str,
+        filter: Option<ObjectFilter>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.connection.clone() else {
+            return;
+        };
+        self.connections.update(cx, |connections, cx| {
+            connections.set_navigator_filter(&connection, key, filter, cx)
+        });
+        self.sync(cx);
+    }
+
+    /// Runs a Filter ▸ entry on the selected node; says so when there is none.
+    pub fn filter_selected(
+        &mut self,
+        action: FilterAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(node) = self.selected_node(window, cx) {
+            self.perform_filter(action, &node.id, window, cx);
+        }
+    }
+
+    /// What a row shows after its name: the node's hint, and on a filtered
+    /// folder how many objects its filter hides.
+    fn row_hint(&self, node: &Node) -> Option<String> {
+        let hidden = self
+            .tree
+            .hidden_below(Some(&node.id))
+            .map(|hidden| match hidden {
+                0 => "filtered".to_string(),
+                hidden => format!("{hidden} hidden"),
+            });
+        match (node.hint.clone(), hidden) {
+            (Some(hint), Some(hidden)) => Some(format!("{hint} · {hidden}")),
+            (hint, hidden) => hint.or(hidden),
+        }
+    }
+
+    /// The hint of the row of a node; for tests.
+    #[cfg(test)]
+    pub fn hint_of(&self, id: &str) -> Option<String> {
+        self.tree.node(id).and_then(|node| self.row_hint(node))
+    }
+
+    /// Whether the engine creates databases with options (see
+    /// [`database_dialog`]).
+    fn offers_database_options(&self, cx: &App) -> bool {
+        self.meta(cx)
+            .is_some_and(|meta| meta.dialect().database_options_sql().is_some())
+    }
+
+    /// Opens the form of a new database with its options; what it writes
+    /// is confirmed, then run on the connection's own session.
+    pub fn create_database_form(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<database_dialog::CreateDatabaseForm>> {
+        let node = self.tree.node(id)?;
+        if self.unavailable(Action::CreateDatabase, node, cx).is_some() {
+            return None;
+        }
+        let connection = self.connection.clone()?;
+        let connections = self.connections.read(cx);
+        let (saved, meta) = (
+            connections.get(&connection)?,
+            connections.meta_session(&connection)?,
+        );
+        let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let view = cx.entity();
+        let form = database_dialog::open(meta, window, cx, move |sql, window, cx| {
+            let view = view.clone();
+            sql_confirm::open(
+                Confirmation {
+                    title: "Create database".into(),
+                    explanation: "A new, empty database on this server.".into(),
+                    statement: Statement::Fixed(sql),
+                    action: "Create database",
+                    destructive: false,
+                    connection: connection_name.clone(),
+                    environment,
+                },
+                window,
+                cx,
+                move |sql, window, cx| {
+                    let plan = Plan {
+                        database: None,
+                        release: None,
+                        after: After::Reload,
+                        done: "Created the database.".into(),
+                    };
+                    view.update(cx, |this, cx| this.execute(sql, plan, window, cx));
+                },
+            );
+        });
+        Some(form)
     }
 
     /// Why a menu entry cannot be used on this node, when it cannot.
@@ -1553,6 +1778,13 @@ impl Navigator {
                 .expanded(item.expanded)
                 .children(item.children.iter().map(convert))
         }
+        let filters = self
+            .connection
+            .as_deref()
+            .and_then(|id| self.connections.read(cx).get(id))
+            .map(|saved| saved.config.navigator_filters.clone())
+            .unwrap_or_default();
+        self.tree.set_object_filters(filters);
         let items: Vec<TreeItem> = self.tree.items().iter().map(convert).collect();
         self.tree_state.update(cx, |state, cx| {
             let selected = state.selected_item().map(|item| item.id.clone());
@@ -1904,7 +2136,7 @@ impl Navigator {
                         .when(node.muted, |this| this.text_color(theme.muted_foreground))
                         .child(entry.item().label.clone()),
                 )
-                .when_some(node.hint.clone(), |this, hint| {
+                .when_some(self.row_hint(node), |this, hint| {
                     this.child(
                         div()
                             .flex_1()
@@ -2140,6 +2372,10 @@ impl Render for Navigator {
                         .map(|meta| tools(node, meta.dialect()))
                         .unwrap_or_default();
                     let tools_reason = navigator.unavailable(Action::Tools, node, cx);
+                    let filters: Vec<(FilterAction, Option<&'static str>)> = filter_actions(node)
+                        .into_iter()
+                        .map(|action| (action, navigator.filter_unavailable(action, node, cx)))
+                        .collect();
                     let entry = |label: &str, reason: Option<&str>| match reason {
                         Some(reason) => SharedString::from(format!("{label} ({reason})")),
                         None => SharedString::from(label.to_string()),
@@ -2170,6 +2406,29 @@ impl Render for Navigator {
                             });
                             menu = menu
                                 .item(PopupMenuItem::submenu(Action::Tools.label(), submenu))
+                                .separator();
+                        }
+                        // Filter ▸ too, before Refresh.
+                        if index == last && !filters.is_empty() {
+                            let (view, id, filters) =
+                                (menu_view.clone(), id.clone(), filters.clone());
+                            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
+                                for (action, reason) in filters {
+                                    let (view, id) = (view.clone(), id.clone());
+                                    submenu = submenu.item(
+                                        PopupMenuItem::new(entry(action.label(), reason))
+                                            .disabled(reason.is_some())
+                                            .on_click(move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.perform_filter(action, &id, window, cx)
+                                                })
+                                            }),
+                                    );
+                                }
+                                submenu
+                            });
+                            menu = menu
+                                .item(PopupMenuItem::submenu("Filter", submenu))
                                 .separator();
                         }
                         for (action, reason) in group {

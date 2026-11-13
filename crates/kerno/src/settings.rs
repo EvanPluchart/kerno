@@ -86,6 +86,11 @@ pub struct Settings {
     pub show_time_zone: bool,
     /// The schema tree selects the table of the tab being activated.
     pub link_with_editor: bool,
+    /// The footer of a grid shows the figures of the selected cells.
+    pub selection_stats: bool,
+    /// The administration's sessions list leaves out idle (PostgreSQL) and
+    /// sleeping (MySQL, MariaDB) sessions.
+    pub hide_idle_sessions: bool,
 }
 
 /// The sizes the settings allow, in points.
@@ -117,6 +122,8 @@ impl Default for Settings {
             null_text: "NULL".to_string(),
             show_time_zone: true,
             link_with_editor: false,
+            selection_stats: true,
+            hide_idle_sessions: false,
         }
     }
 }
@@ -202,6 +209,8 @@ mod tests {
             null_text: "∅".to_string(),
             show_time_zone: false,
             link_with_editor: true,
+            selection_stats: false,
+            hide_idle_sessions: true,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

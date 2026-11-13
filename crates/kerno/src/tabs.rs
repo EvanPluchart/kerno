@@ -141,6 +141,8 @@ pub enum TabAction {
     UseDatabase(String),
     Commit,
     Rollback,
+    /// Lists the statements of the open transaction.
+    TransactionLog,
     /// Statements run in a transaction the user ends (`true`), or not.
     ManualCommit(bool),
     Cancel,
@@ -217,6 +219,7 @@ impl TabAction {
             Self::UseDatabase(database) => return database.clone(),
             Self::Commit => "Commit transaction",
             Self::Rollback => "Roll back transaction",
+            Self::TransactionLog => "Transaction log…",
             Self::ManualCommit(true) => "Switch to manual commit",
             Self::ManualCommit(false) => "Switch to auto-commit",
             Self::Cancel => "Cancel running statement",
@@ -678,6 +681,7 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
                     },
                 ),
                 Item(TabAction::Rollback, running),
+                enabled(TabAction::TransactionLog),
                 Separator,
                 enabled(TabAction::ManualCommit(!facts.manual_commit)),
             ]
@@ -1201,6 +1205,7 @@ mod tests {
             [
                 "Commit transaction",
                 "Roll back transaction",
+                "Transaction log…",
                 "—",
                 "Switch to auto-commit"
             ]

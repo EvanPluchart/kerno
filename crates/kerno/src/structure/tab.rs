@@ -1,30 +1,38 @@
-//! The structure of one table or view, read from the server: its columns,
-//! indexes, constraints, foreign keys both ways, triggers and DDL, each in
-//! a sub-tab of its own. Nothing here changes the database.
+//! The structure of one table or view, read from the server: its
+//! properties (owner, sizes, engine, comment…), columns, indexes,
+//! constraints, foreign keys both ways, triggers and DDL, each in a sub-tab
+//! of its own. The comment is the one thing changed from here, through the
+//! confirmation every write takes.
 
 use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels,
-    Render, SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    TestSupportExt as _, Window, div, px,
 };
+use kerno_core::format::byte_size;
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ConstraintKind, ObjectRef, RelationKind, TableRef, TableStructure,
 };
-use kerno_core::{Error, TxState};
+use kerno_core::table_draft::TableChange;
+use kerno_core::{Error, TxState, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::query::tab::TabStatus;
+use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::tabs::{TabSnapshot, Target};
 
 /// What a structure tab asks of the workspace.
@@ -62,8 +70,10 @@ impl List {
     ];
 }
 
-/// The sub-tabs, in order, with the lists each shows; the last is the DDL.
-const SECTIONS: [(&str, &[List]); 6] = [
+/// The sub-tabs, in order, with the lists each shows; the first is the
+/// properties (DBeaver's object editor opens there), the last the DDL.
+const SECTIONS: [(&str, &[List]); 7] = [
+    ("Properties", &[]),
     ("Columns", &[List::Columns]),
     ("Indexes", &[List::Indexes]),
     ("Constraints", &[List::Constraints]),
@@ -72,8 +82,15 @@ const SECTIONS: [(&str, &[List]); 6] = [
     ("DDL", &[]),
 ];
 
+/// Index of the properties sub-tab.
+pub const PROPERTIES_SECTION: usize = 0;
+/// Index of the columns sub-tab, where "Open structure" shows a table.
+pub const COLUMNS_SECTION: usize = 1;
 /// Index of the DDL sub-tab.
-pub const DDL_SECTION: usize = 5;
+pub const DDL_SECTION: usize = 6;
+
+/// A property and its value (`None`: the server does not know).
+type Properties = Vec<(String, Option<String>)>;
 
 /// Where the tab is with the structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +117,9 @@ pub struct StructureTab {
     ddl: Option<Entity<EditorState>>,
     /// The DDL, or why it could not be read, as a SQL comment.
     ddl_text: String,
+    /// The properties, or why they could not be read; `None` when the
+    /// engine has no such query.
+    properties: Option<Result<Properties, String>>,
     /// The sub-tab on screen.
     section: usize,
     state: State,
@@ -143,7 +163,8 @@ impl StructureTab {
             grids: Vec::new(),
             ddl: None,
             ddl_text: String::new(),
-            section: 0,
+            properties: None,
+            section: COLUMNS_SECTION,
             state: State::Waiting,
             load: None,
             generation: 0,
@@ -279,8 +300,8 @@ impl StructureTab {
             self.target.database.clone(),
             cx,
         );
-        let table = self.table.clone();
-        let object = ObjectRef::Relation(table.clone(), self.kind);
+        let (table, kind) = (self.table.clone(), self.kind);
+        let object = ObjectRef::Relation(table.clone(), kind);
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
             // One statement at a time on the session.
             if let Some(previous) = previous {
@@ -304,8 +325,17 @@ impl StructureTab {
                         }),
                         Err(_) => String::new(),
                     };
+                    let properties = match session.dialect().properties_sql(&table, kind) {
+                        Some(sql) if structure.is_ok() => Some(
+                            exec::collect(session.clone(), sql)
+                                .await
+                                .map(properties_of)
+                                .map_err(|error| error.to_string()),
+                        ),
+                        _ => None,
+                    };
                     session.close().await;
-                    Ok::<_, Error>((structure?, ddl))
+                    Ok::<_, Error>((structure?, ddl, properties))
                 })
             });
             let Ok(reading) = reading else {
@@ -313,7 +343,8 @@ impl StructureTab {
             };
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok((structure, ddl)) if this.generation == generation => {
+                Ok((structure, ddl, properties)) if this.generation == generation => {
+                    this.properties = properties;
                     this.show(structure, ddl, window, cx)
                 }
                 Ok(_) => {}
@@ -383,6 +414,96 @@ impl StructureTab {
     }
 
     // Actions -----------------------------------------------------------------
+
+    /// Asks for the table's new comment (empty removes it) with the
+    /// statement that sets it, then runs it.
+    pub fn edit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.read_only_reason(cx) {
+            window.push_notification(Notification::warning(SharedString::from(reason)), cx);
+            return;
+        }
+        let manager = self.connections.read(cx);
+        let (Some(meta), Some(saved)) = (
+            manager.meta_session(&self.target.connection),
+            manager.get(&self.target.connection),
+        ) else {
+            return;
+        };
+        let environment = saved.config.environment;
+        let connection = saved.config.name.clone();
+        let current = self
+            .structure
+            .as_ref()
+            .and_then(|structure| structure.comment.clone())
+            .unwrap_or_default();
+        let table = self.table.clone();
+        let build = move |text: &str| {
+            let comment = (!text.is_empty()).then(|| text.to_string());
+            meta.dialect()
+                .alter_table_sql(&table, &[TableChange::SetTableComment(comment)])
+                .map(|statements| statements.join(";\n"))
+                .map_err(|error| error.to_string())
+        };
+        let view = cx.entity();
+        sql_confirm::open(
+            Confirmation {
+                title: format!("Comment of {}", self.table.name),
+                explanation: "The comment describes the table to whoever reads its structure. \
+                              Leave the field empty to remove it."
+                    .into(),
+                statement: Statement::Text {
+                    label: "Comment",
+                    initial: current,
+                    build: std::rc::Rc::new(build),
+                },
+                action: "Set comment",
+                destructive: false,
+                connection,
+                environment,
+            },
+            window,
+            cx,
+            move |sql, window, cx| view.update(cx, |this, cx| this.run_write(sql, window, cx)),
+        );
+    }
+
+    /// Runs a confirmed statement on a session of its own, then reads the
+    /// structure again.
+    fn run_write(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = self.connections.read(cx).open_session(
+            &self.target.connection,
+            self.target.database.clone(),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = match opening.await {
+                Ok(session) => {
+                    let Ok(running) = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let outcome = exec::collect(session.clone(), sql).await;
+                            session.close().await;
+                            outcome
+                        })
+                    }) else {
+                        return;
+                    };
+                    running.await
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let notification = match outcome {
+                    Ok(_) => Notification::success("Changed the comment."),
+                    Err(error) => Notification::error(SharedString::from(format!(
+                        "The comment was not changed: {error}"
+                    ))),
+                };
+                window.push_notification(notification, cx);
+                this.reload(window, cx);
+            });
+        })
+        .detach();
+    }
 
     /// Shows a sub-tab.
     pub fn select(&mut self, section: usize, cx: &mut Context<Self>) {
@@ -459,6 +580,25 @@ impl StructureTab {
     #[cfg(test)]
     pub fn ddl(&self) -> &str {
         &self.ddl_text
+    }
+
+    /// The properties as shown, or why they are not; for tests.
+    #[cfg(test)]
+    pub fn properties(&self) -> Result<Vec<(String, String)>, String> {
+        match &self.properties {
+            Some(Ok(properties)) => Ok(properties
+                .iter()
+                .map(|(name, value)| (name.clone(), property_text(name, value.as_deref())))
+                .collect()),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err("none".into()),
+        }
+    }
+
+    /// The sub-tab on screen; for tests.
+    #[cfg(test)]
+    pub fn section(&self) -> usize {
+        self.section
     }
 
     /// Where the tab is, in words; for tests.
@@ -678,6 +818,7 @@ impl StructureTab {
                 cx,
             ),
             _ if self.section == DDL_SECTION => self.render_ddl(cx),
+            _ if self.section == PROPERTIES_SECTION => self.render_properties(cx),
             _ => self.render_lists(cx),
         }
     }
@@ -719,6 +860,105 @@ impl StructureTab {
                                 .child(DataTable::new(grid).xsmall().focus_ring(false)),
                         ),
                 )
+            }))
+            .into_any_element()
+    }
+
+    /// The properties, one per line, and the comment's "Edit…" on a table.
+    fn render_properties(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let properties = match &self.properties {
+            None => {
+                return self.render_notice(
+                    "structure-no-properties",
+                    "No properties",
+                    "This server does not describe its tables here. The columns, keys and DDL \
+                     are in the other sub-tabs."
+                        .into(),
+                    None,
+                    cx,
+                );
+            }
+            Some(Err(error)) => {
+                let retry = Button::new("structure-properties-retry")
+                    .outline()
+                    .label("Try again")
+                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx)))
+                    .into_any_element();
+                return self.render_notice(
+                    "structure-properties-error",
+                    "The properties could not be read",
+                    format!(
+                        "{error} The account may lack the privilege to read the catalog: the \
+                         other sub-tabs may still show the {}.",
+                        self.noun()
+                    ),
+                    Some(retry),
+                    cx,
+                );
+            }
+            Some(Ok(properties)) if properties.is_empty() => {
+                return self.render_notice(
+                    "structure-properties-missing",
+                    "Not found",
+                    format!(
+                        "The server did not find {}.{}: it may have been renamed or dropped. \
+                         Refresh the tree.",
+                        self.table.schema, self.table.name
+                    ),
+                    None,
+                    cx,
+                );
+            }
+            Some(Ok(properties)) => properties,
+        };
+        // Only a table's comment is set from here: a view's is part of its
+        // source, and MySQL views have none.
+        let editable = self.kind.is_table() && self.read_only_reason(cx).is_none();
+        v_flex()
+            .id("structure-properties")
+            .test_support()
+            .size_full()
+            .overflow_y_scroll()
+            .p_3()
+            .gap_1()
+            .children(properties.iter().enumerate().map(|(index, (name, value))| {
+                let comment = name == "Comment";
+                h_flex()
+                    .id(("structure-property", index))
+                    .gap_3()
+                    .items_start()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(160.))
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(name.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .when(value.is_none(), |this| {
+                                this.text_color(theme.muted_foreground)
+                            })
+                            .child(SharedString::from(property_text(name, value.as_deref()))),
+                    )
+                    .when(comment && editable, |this| {
+                        this.child(
+                            Button::new("structure-edit-comment")
+                                .ghost()
+                                .xsmall()
+                                .label("Edit…")
+                                .tooltip("Set or remove the table's comment")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.edit_comment(window, cx)
+                                    }),
+                                ),
+                        )
+                    })
             }))
             .into_any_element()
     }
@@ -842,6 +1082,33 @@ impl ListGrid {
             widths,
             empty: SharedString::from(empty),
         }
+    }
+}
+
+/// The properties in the one row of a properties query: its columns.
+fn properties_of(collected: exec::Collected) -> Properties {
+    let Some(result) = collected.results.into_iter().next() else {
+        return Vec::new();
+    };
+    let names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    match result.rows().into_iter().next() {
+        Some(row) => names.into_iter().zip(row).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// What a property shows: sizes for people, flags as words, a dash for
+/// what the server does not know.
+fn property_text(name: &str, value: Option<&str>) -> String {
+    match value {
+        None => "—".into(),
+        Some(text) if name.ends_with(" size") => match text.parse::<u64>() {
+            Ok(bytes) => byte_size(bytes),
+            Err(_) => text.into(),
+        },
+        Some("t") => "yes".into(),
+        Some("f") => "no".into(),
+        Some(text) => text.into(),
     }
 }
 
@@ -1115,5 +1382,19 @@ fn generation_of(generation: Option<&ColumnGeneration>) -> String {
         Some(ColumnGeneration::AutoIncrement) => "auto increment".into(),
         Some(ColumnGeneration::Stored(expression)) => format!("stored: {expression}"),
         Some(ColumnGeneration::Virtual(expression)) => format!("virtual: {expression}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::property_text;
+
+    #[test]
+    fn properties_read_for_people() {
+        assert_eq!(property_text("Total size", Some("16384")), "16 kB");
+        assert_eq!(property_text("Total size", Some("n/a")), "n/a");
+        assert_eq!(property_text("Row-level security", Some("f")), "no");
+        assert_eq!(property_text("Owner", Some("kerno")), "kerno");
+        assert_eq!(property_text("Comment", None), "—");
     }
 }

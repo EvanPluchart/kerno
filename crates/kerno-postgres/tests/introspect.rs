@@ -1162,3 +1162,188 @@ async fn the_row_estimate_of_the_big_table_is_close_to_its_count() {
         .estimated_rows_sql(&TableRef::new("analytics", "no_such_table"));
     assert!(rows(&session, &missing).await.is_empty());
 }
+
+/// The value of the property `name` in the one row of a properties query.
+fn property(columns: &[String], row: &[Option<String>], name: &str) -> Option<String> {
+    let at = columns
+        .iter()
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("no property {name} in {columns:?}"));
+    row[at].clone()
+}
+
+#[tokio::test]
+async fn properties_describe_tables_and_views() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let describe = |table: TableRef, kind: RelationKind| {
+        let session = session.clone();
+        async move {
+            let sql = session.dialect().properties_sql(&table, kind).unwrap();
+            let collected = run(&session, &sql).await.unwrap();
+            let result = collected.results.into_iter().next().unwrap();
+            let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+            (columns, result.rows())
+        }
+    };
+    let (columns, rows) = describe(TableRef::new("shop", "customers"), RelationKind::Table).await;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(&columns[..3], ["Owner", "Kind", "Persistence"]);
+    assert_eq!(property(&columns, row, "Owner").as_deref(), Some("kerno"));
+    assert_eq!(property(&columns, row, "Kind").as_deref(), Some("table"));
+    assert_eq!(
+        property(&columns, row, "Persistence").as_deref(),
+        Some("permanent")
+    );
+    assert_eq!(
+        property(&columns, row, "Comment").as_deref(),
+        Some("People who can place orders")
+    );
+    let size: u64 = property(&columns, row, "Total size")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(size > 0);
+
+    // A view has no size, no rows of its own, no tablespace.
+    let (columns, rows) = describe(TableRef::new("shop", "order_totals"), RelationKind::View).await;
+    assert_eq!(
+        property(&columns, &rows[0], "Kind").as_deref(),
+        Some("view")
+    );
+    assert_eq!(property(&columns, &rows[0], "Total size"), None);
+    assert_eq!(property(&columns, &rows[0], "Tablespace"), None);
+    let (columns, rows) = describe(
+        TableRef::new("shop", "product_sales"),
+        RelationKind::MaterializedView,
+    )
+    .await;
+    assert_eq!(
+        property(&columns, &rows[0], "Kind").as_deref(),
+        Some("materialized view")
+    );
+    // Nothing is found for a table that does not exist.
+    let (_, rows) = describe(TableRef::new("shop", "no_such"), RelationKind::Table).await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn a_database_is_created_with_the_options_the_server_lists() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let d = session.dialect();
+    let choices = rows(&session, d.database_options_sql().unwrap()).await;
+    let values = |field: &str| -> Vec<String> {
+        choices
+            .iter()
+            .filter(|row| row[0].as_deref() == Some(field))
+            .map(|row| row[1].clone().unwrap())
+            .collect()
+    };
+    assert!(values("owner").contains(&"kerno".to_string()));
+    assert!(values("owner").iter().all(|role| !role.starts_with("pg_")));
+    assert!(values("template").contains(&"template0".to_string()));
+    let encodings = values("encoding");
+    assert!(
+        encodings.contains(&"UTF8".to_string()) && encodings.contains(&"SQL_ASCII".to_string())
+    );
+    // Client-only encodings cannot be a database's.
+    assert!(!encodings.contains(&"SJIS".to_string()), "{encodings:?}");
+    assert!(values("collation").contains(&"C".to_string()));
+    assert_eq!(values("tablespace"), ["pg_default"]);
+
+    let name = "kerno_test_created_with_options";
+    exec_ok(&session, &format!("DROP DATABASE IF EXISTS {name}")).await;
+    let options = kerno_core::dialect::DatabaseOptions {
+        owner: Some("kerno".into()),
+        template: Some("template0".into()),
+        encoding: Some("UTF8".into()),
+        collation: Some("C".into()),
+        ctype: Some("C".into()),
+        tablespace: Some("pg_default".into()),
+    };
+    exec_ok(
+        &session,
+        &d.create_database_with_sql(name, &options).unwrap(),
+    )
+    .await;
+    let made = rows(
+        &session,
+        &format!(
+            "SELECT pg_catalog.pg_get_userbyid(datdba), pg_catalog.pg_encoding_to_char(encoding), \
+             datcollate, datctype FROM pg_catalog.pg_database WHERE datname = '{name}'"
+        ),
+    )
+    .await;
+    exec_ok(&session, &format!("DROP DATABASE {name}")).await;
+    assert_eq!(
+        made,
+        [[Some("kerno"), Some("UTF8"), Some("C"), Some("C")].map(|v| v.map(str::to_string))]
+    );
+}
+
+#[tokio::test]
+async fn the_lock_view_names_the_waiting_session_and_its_blocker() {
+    let Some(holder) = common::session().await else {
+        return;
+    };
+    let waiter = common::connect(&kerno_core::testing::params(common::ENGINE))
+        .await
+        .unwrap();
+    let watcher = common::session().await.unwrap();
+    let schema = common::scratch_schema("locks");
+    exec_ok(&holder, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&holder, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(
+        &holder,
+        &format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, v int); INSERT INTO {schema}.t VALUES (1, 1)"),
+    )
+    .await;
+    let holder_pid = scalar(&holder, "SELECT pg_backend_pid()").await;
+    let waiter_pid = scalar(&waiter, "SELECT pg_backend_pid()").await;
+
+    // The holder keeps the row; the waiter gives up on its own after a
+    // few seconds, whatever happens to this test.
+    exec_ok(&holder, "BEGIN").await;
+    exec_ok(
+        &holder,
+        &format!("UPDATE {schema}.t SET v = 2 WHERE id = 1"),
+    )
+    .await;
+    exec_ok(&waiter, "SET lock_timeout = '8s'").await;
+    let blocked = {
+        let (waiter, sql) = (
+            waiter.clone(),
+            format!("UPDATE {schema}.t SET v = 3 WHERE id = 1"),
+        );
+        tokio::spawn(async move { run(&waiter, &sql).await.map(drop) })
+    };
+    let sql = watcher.admin_query(AdminView::Locks).unwrap();
+    let mut found = None;
+    for _ in 0..50 {
+        let collected = run(&watcher, &sql).await.unwrap();
+        let result = collected.results.into_iter().next().unwrap();
+        let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+        if let Some(row) = result
+            .rows()
+            .into_iter()
+            .find(|row| row[0].as_deref() == Some(waiter_pid.as_str()))
+        {
+            found = Some((columns, row));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    exec_ok(&holder, "ROLLBACK").await;
+    let _ = blocked.await;
+    exec_ok(&holder, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    let (columns, row) = found.expect("the waiting session is listed");
+    assert_eq!(columns[0], "waiting_id");
+    let blocking = columns.iter().position(|c| c == "blocking_id").unwrap();
+    assert_eq!(row[blocking].as_deref(), Some(holder_pid.as_str()));
+    let query = columns.iter().position(|c| c == "waiting_query").unwrap();
+    assert!(row[query].as_deref().unwrap().contains("SET v = 3"));
+}

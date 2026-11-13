@@ -1,6 +1,7 @@
 //! Kerno's engine-neutral core: the driver trait, the value and type model,
 //! connection settings, SSH tunnels and SQL helpers. No UI dependency.
 
+pub mod aggregate;
 pub mod browse;
 pub mod config;
 pub mod connector;

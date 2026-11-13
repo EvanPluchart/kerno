@@ -126,7 +126,7 @@ pub fn display<'a>(cell: Option<&'a [u8]>, column: &Column, max_chars: usize) ->
 
 /// The boolean a cell holds, in the spellings the servers print: `t`/`f`
 /// (PostgreSQL), `1`/`0` (MySQL `TINYINT(1)`), `true`/`false`.
-pub(crate) fn parse_bool(bytes: &[u8]) -> Option<bool> {
+pub fn parse_bool(bytes: &[u8]) -> Option<bool> {
     let is = |spellings: [&[u8]; 3]| spellings.iter().any(|s| bytes.eq_ignore_ascii_case(s));
     if is([b"t", b"1", b"true"]) {
         Some(true)
@@ -225,7 +225,7 @@ pub fn pretty_json(text: &str) -> Option<String> {
 
 /// `text` without the whitespace between its tokens, so on one line, or
 /// `None` when it is not JSON. Values are copied as they are written.
-pub(crate) fn compact_json(text: &str) -> Option<String> {
+pub fn compact_json(text: &str) -> Option<String> {
     rewrite_json(text, false)
 }
 

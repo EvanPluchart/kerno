@@ -8,6 +8,7 @@ mod brand;
 mod bridge;
 mod connections;
 mod data;
+mod database_dialog;
 mod engine_logo;
 mod export_dialog;
 mod import_dialog;
@@ -311,6 +312,19 @@ fn menus() -> Vec<Menu> {
                 command("copy_as_markdown"),
                 command("copy_as_sql_insert"),
                 command("view_cell_value"),
+                command("copy_row_numbers"),
+                separator(),
+                command("toggle_record_view"),
+                command("first_row"),
+                command("previous_row"),
+                command("next_row"),
+                command("last_row"),
+                command("go_to_row"),
+                command("go_to_column"),
+                separator(),
+                command("toggle_selection_stats"),
+                command("show_aggregate_panel"),
+                command("show_columns_panel"),
             ],
         ),
         // The connection of the active tab, as DBeaver's Database menu.
@@ -331,6 +345,7 @@ fn menus() -> Vec<Menu> {
                     "Switch Between Auto-Commit and Manual Commit",
                     actions::ToggleCommitMode,
                 ),
+                command("transaction_log"),
                 separator(),
                 command("open_admin"),
                 command("maintenance_tools"),
@@ -362,6 +377,12 @@ fn menus() -> Vec<Menu> {
                         command("copy_qualified_name"),
                         command("new_query_on_object"),
                         command("set_default_schema"),
+                        separator(),
+                        command("hide_object_in_tree"),
+                        command("show_only_object_in_tree"),
+                        command("configure_object_filter"),
+                        command("toggle_object_filter"),
+                        command("clear_object_filter"),
                     ],
                 )),
             ],

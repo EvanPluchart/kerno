@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kerno_core::config::{
-    ConnectionConfig, Engine, Environment, Secret, Secrets, SshAuth, SshConfig, TlsConfig, TlsMode,
-    bootstrap_refusal, is_secret_option, parse_connection_url,
+    ConnectionConfig, Engine, Environment, ObjectFilter, Secret, Secrets, SshAuth, SshConfig,
+    TlsConfig, TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
 };
 use kerno_core::sql::{LexRules, split_statements};
 
@@ -104,6 +104,8 @@ pub struct ConnectionForm {
     /// Bootstrap statements, separated by `;`.
     pub init_sql: String,
     pub ignore_init_errors: bool,
+    /// Not edited here (the tree's Filter ▸ menu does): kept as it was.
+    pub navigator_filters: BTreeMap<String, ObjectFilter>,
 }
 
 /// The commit modes the dialog offers, with their labels.
@@ -185,6 +187,7 @@ impl ConnectionForm {
                 .collect::<Vec<_>>()
                 .join("\n"),
             ignore_init_errors: config.ignore_init_errors,
+            navigator_filters: config.navigator_filters.clone(),
         }
     }
 
@@ -437,6 +440,7 @@ impl ConnectionForm {
                 .flatten(),
             init_sql,
             ignore_init_errors: self.ignore_init_errors,
+            navigator_filters: self.navigator_filters.clone(),
         };
         // Secrets are kept exactly as typed (a password may start or end
         // with a space), and only the ones the chosen methods use.

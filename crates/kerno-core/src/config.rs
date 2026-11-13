@@ -274,10 +274,121 @@ pub struct ConnectionConfig {
     /// skipped instead of failing the connection.
     #[serde(default)]
     pub ignore_init_errors: bool,
+    /// What the schema tree hides, per kind of object (see [`ObjectFilter`]):
+    /// keys are `databases`, `schemas` and the tree's folder names
+    /// (`tables`, `views`, `functions`, …). Exported with the connection.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub navigator_filters: BTreeMap<String, ObjectFilter>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// The objects of one kind the schema tree shows: DBeaver's object filter
+/// (`DBSObjectFilter`, ported from
+/// `org.jkiss.dbeaver.model/.../struct/DBSObjectFilter.java`). A name is
+/// shown when it matches one of `include` (or `include` is empty) and none
+/// of `exclude`. Masks compare without regard to case; `*` stands for any
+/// run of characters, `?` for one, `\` takes the next character as it is.
+/// Unlike DBeaver, `%` and `_` are plain characters: names hold `_` often,
+/// and hiding `order_items` must not hide `orderXitems`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectFilter {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Off: kept, not applied (DBeaver's "Toggle filter").
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ObjectFilter {
+    fn default() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl ObjectFilter {
+    /// Whether the filter hides nothing: off, or without masks.
+    pub fn is_inactive(&self) -> bool {
+        !self.enabled || (self.include.is_empty() && self.exclude.is_empty())
+    }
+
+    /// Whether the tree shows an object named `name`.
+    pub fn shows(&self, name: &str) -> bool {
+        if self.is_inactive() {
+            return true;
+        }
+        let any = |masks: &[String]| masks.iter().any(|mask| mask_matches(mask, name));
+        (self.include.is_empty() || any(&self.include)) && !any(&self.exclude)
+    }
+}
+
+/// `name` as a mask that matches it and nothing else: its wildcards and
+/// backslashes escaped.
+pub fn exact_mask(name: &str) -> String {
+    let mut mask = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '*' | '?' | '\\') {
+            mask.push('\\');
+        }
+        mask.push(c);
+    }
+    mask
+}
+
+/// Whether `name` matches `mask` (see [`ObjectFilter`]): a glob over
+/// characters, backtracking on the last `*` seen.
+fn mask_matches(mask: &str, name: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Token {
+        Any,
+        One,
+        Char(char),
+    }
+    let mut tokens = Vec::new();
+    let mut chars = mask.trim().chars();
+    while let Some(c) = chars.next() {
+        tokens.push(match c {
+            '*' => Token::Any,
+            '?' => Token::One,
+            '\\' => Token::Char(chars.next().unwrap_or('\\')),
+            c => Token::Char(c),
+        });
+    }
+    if tokens.is_empty() {
+        return false;
+    }
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let name: Vec<char> = name.chars().collect();
+    let (mut t, mut n) = (0, 0);
+    // Where the last `*` was, and the name position it now covers up to.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match tokens.get(t) {
+            Some(Token::Any) => {
+                star = Some((t, n));
+                t += 1;
+            }
+            Some(Token::One) => (t, n) = (t + 1, n + 1),
+            Some(Token::Char(c)) if same(*c, name[n]) => (t, n) = (t + 1, n + 1),
+            _ => match star {
+                // The `*` takes one more character and the rest is tried again.
+                Some((at, covered)) => {
+                    star = Some((at, covered + 1));
+                    (t, n) = (at + 1, covered + 1);
+                }
+                None => return false,
+            },
+        }
+    }
+    tokens[t..].iter().all(|token| *token == Token::Any)
 }
 
 impl ConnectionConfig {
@@ -302,6 +413,7 @@ impl ConnectionConfig {
             default_schema: None,
             init_sql: Vec::new(),
             ignore_init_errors: false,
+            navigator_filters: BTreeMap::new(),
         }
     }
 
@@ -1494,5 +1606,62 @@ mod tests {
         for mode in TlsMode::ALL {
             assert_eq!(TlsMode::parse(mode.as_str()), Some(mode));
         }
+    }
+
+    #[test]
+    fn object_filters_match_as_dbeaver_masks_do() {
+        let masks = |include: &[&str], exclude: &[&str]| ObjectFilter {
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+        };
+        // No mask, or switched off: everything is shown.
+        assert!(ObjectFilter::default().shows("anything"));
+        let mut off = masks(&["a*"], &[]);
+        off.enabled = false;
+        assert!(off.is_inactive() && off.shows("zzz"));
+
+        // Exact names compare without regard to case.
+        let only = masks(&["Orders"], &[]);
+        assert!(only.shows("orders") && only.shows("ORDERS") && !only.shows("orders2"));
+        // `*` is any run, `?` one character; `_` and `%` are plain.
+        let wild = masks(&["ord*", "t?p"], &[]);
+        assert!(wild.shows("ord") && wild.shows("orders") && wild.shows("tip"));
+        assert!(!wild.shows("tp") && !wild.shows("tiip") && !wild.shows("word"));
+        let plain = masks(&["order_items"], &[]);
+        assert!(plain.shows("order_items") && !plain.shows("orderXitems"));
+        assert!(masks(&["*_log"], &[]).shows("audit_log"));
+        assert!(masks(&["a*b*c"], &[]).shows("aXXbYYbZc") && !masks(&["a*b*c"], &[]).shows("acb"));
+        // Excludes win over includes.
+        let both = masks(&["shop*"], &["shop_old"]);
+        assert!(both.shows("shop") && !both.shows("SHOP_OLD") && !both.shows("other"));
+        assert!(!masks(&[], &["pg_*"]).shows("pg_toast") && masks(&[], &["pg_*"]).shows("public"));
+
+        // A name added as it is matches only itself, wildcards included.
+        let odd = "we*rd?\\name";
+        let exact = masks(&[&exact_mask(odd)], &[]);
+        assert!(exact.shows(odd) && !exact.shows("weXrdY\\name"));
+        assert_eq!(exact_mask("plain_name"), "plain_name");
+    }
+
+    #[test]
+    fn filters_are_kept_with_the_connection_and_old_files_still_read() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "f".into();
+        let json = export_connections(std::slice::from_ref(&config)).unwrap();
+        // Nothing written when there is no filter.
+        assert!(!json.contains("navigator_filters"), "{json}");
+        config.navigator_filters.insert(
+            "tables".into(),
+            ObjectFilter {
+                exclude: vec!["tmp_*".into()],
+                ..ObjectFilter::default()
+            },
+        );
+        let json = export_connections(std::slice::from_ref(&config)).unwrap();
+        assert_eq!(import_connections(&json).unwrap(), [config]);
+        // A filter written without `enabled` is on.
+        let filter: ObjectFilter = serde_json::from_str(r#"{"include":["a"]}"#).unwrap();
+        assert!(filter.enabled && !filter.shows("b"));
     }
 }

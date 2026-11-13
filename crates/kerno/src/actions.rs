@@ -183,6 +183,18 @@ gpui_kit::actions!(
         RestoreDatabase,
         /// Opens the maintenance tools of the selected tree node.
         MaintenanceTools,
+        /// Lists the statements run in the active tab's open transaction.
+        ShowTransactionLog,
+        /// Hides the object selected in the schema tree (its kind's filter).
+        HideObjectInTree,
+        /// Shows only the object selected in the schema tree, of its kind.
+        ShowOnlyObjectInTree,
+        /// Edits the filter of the kind of the object selected in the tree.
+        ConfigureObjectFilter,
+        /// Turns the filter of the selected object's kind on or off.
+        ToggleObjectFilter,
+        /// Removes the filter of the selected object's kind.
+        ClearObjectFilter,
         /// Activates the next tab.
         NextTab,
         /// Activates the previous tab.
@@ -258,6 +270,30 @@ gpui_kit::actions!(
         /// Selects the active tab's table in the schema tree, now and as
         /// tabs are activated, or stops.
         LinkWithEditor,
+        /// Shows the current row of the grid as a list of its columns, or
+        /// the grid again.
+        ToggleRecordView,
+        /// Selects the first row of the grid.
+        FirstRow,
+        /// Selects the row above.
+        PreviousRow,
+        /// Selects the row below.
+        NextRow,
+        /// Selects the last row fetched.
+        LastRow,
+        /// Asks for a row number and selects that row.
+        GoToRow,
+        /// Lists the columns of the grid to select one.
+        GoToColumn,
+        /// Copies the numbers of the selected rows.
+        CopyRowNumbers,
+        /// Shows the figures of the selected cells in the grid's footer, or
+        /// stops.
+        ToggleSelectionStats,
+        /// Shows count, sum, average, minimum and maximum of the selection.
+        ShowAggregatePanel,
+        /// Lists the columns of the result with their types and keys.
+        ShowColumnsPanel,
     ]
 );
 
@@ -890,12 +926,120 @@ pub const COMMANDS: &[Command] = &[
     ),
     command!(
         "view_cell_value",
-        "View Value of the Selected Cell",
+        "View or Edit Value of the Selected Cell",
         "Data",
         ["shift-enter"],
-        ["viewer", "json", "text", "hex", "long"],
+        [
+            "viewer",
+            "value panel",
+            "edit",
+            "json",
+            "text",
+            "hex",
+            "long"
+        ],
         ViewCellValue,
         "DataTable"
+    ),
+    // DBeaver's keys of the result viewer (`ui.editors.data` plugin.xml):
+    // Tab toggles the record mode, Ctrl+Alt+arrows move between rows,
+    // Ctrl+G and Ctrl+Shift+G go to a row or a column.
+    command!(
+        "toggle_record_view",
+        "Toggle Record View",
+        "Data",
+        ["tab"],
+        ["record mode", "row as list", "transpose", "layout"],
+        ToggleRecordView,
+        "DataTable"
+    ),
+    command!(
+        "first_row",
+        "Go to First Row",
+        "Data",
+        ["ctrl-alt-shift-left"],
+        ["navigate", "top"],
+        FirstRow,
+        "DataTable"
+    ),
+    command!(
+        "previous_row",
+        "Go to Previous Row",
+        "Data",
+        ["ctrl-alt-left"],
+        ["navigate", "up"],
+        PreviousRow,
+        "DataTable"
+    ),
+    command!(
+        "next_row",
+        "Go to Next Row",
+        "Data",
+        ["ctrl-alt-right"],
+        ["navigate", "down"],
+        NextRow,
+        "DataTable"
+    ),
+    command!(
+        "last_row",
+        "Go to Last Row",
+        "Data",
+        ["ctrl-alt-shift-right"],
+        ["navigate", "bottom"],
+        LastRow,
+        "DataTable"
+    ),
+    command!(
+        "go_to_row",
+        "Go to Row…",
+        "Data",
+        ["ctrl-g"],
+        ["jump", "row number", "navigate"],
+        GoToRow,
+        "DataTable"
+    ),
+    command!(
+        "go_to_column",
+        "Go to Column…",
+        "Data",
+        ["ctrl-shift-g"],
+        ["jump", "find column", "navigate"],
+        GoToColumn,
+        "DataTable"
+    ),
+    command!(
+        "copy_row_numbers",
+        "Copy Row Numbers",
+        "Data",
+        [],
+        ["clipboard", "row names"],
+        CopyRowNumbers
+    ),
+    command!(
+        "toggle_selection_stats",
+        "Toggle Selection Statistics",
+        "Data",
+        [],
+        ["count", "sum", "average", "status", "layout"],
+        ToggleSelectionStats
+    ),
+    command!(
+        "show_aggregate_panel",
+        "Show Aggregate Panel",
+        "Data",
+        [],
+        [
+            "count", "distinct", "sum", "average", "min", "max", "panels"
+        ],
+        ShowAggregatePanel
+    ),
+    command!(
+        "show_columns_panel",
+        "Show Columns Panel",
+        "Data",
+        [],
+        ["metadata", "types", "keys", "nullable", "panels"],
+        ShowColumnsPanel
     ),
     // DBeaver's Alt+0 / Alt+9 (`resultset.zoomIn` / `zoomOut`), after the
     // Cmd keys a Mac keyboard reaches.
@@ -1292,6 +1436,56 @@ pub const COMMANDS: &[Command] = &[
             "vacuum", "analyze", "refresh", "truncate", "trigger", "check", "optimize", "repair"
         ],
         MaintenanceTools
+    ),
+    // DBeaver's transaction monitor (`core.txn.log`).
+    command!(
+        "transaction_log",
+        "Transaction Log",
+        "Query",
+        [],
+        ["statements", "pending", "transaction monitor", "commit"],
+        ShowTransactionLog
+    ),
+    // DBeaver's Filter ▸ of the navigator (`core.object.filter.*`).
+    command!(
+        "hide_object_in_tree",
+        "Filter: Hide Selected Object",
+        "Navigator",
+        [],
+        ["object filter", "exclude", "schema tree"],
+        HideObjectInTree
+    ),
+    command!(
+        "show_only_object_in_tree",
+        "Filter: Show Only Selected Object",
+        "Navigator",
+        [],
+        ["object filter", "include", "schema tree"],
+        ShowOnlyObjectInTree
+    ),
+    command!(
+        "configure_object_filter",
+        "Filter: Configure…",
+        "Navigator",
+        [],
+        ["object filter", "mask", "include", "exclude", "schema tree"],
+        ConfigureObjectFilter
+    ),
+    command!(
+        "toggle_object_filter",
+        "Filter: Turn On or Off",
+        "Navigator",
+        [],
+        ["object filter", "enable", "disable", "schema tree"],
+        ToggleObjectFilter
+    ),
+    command!(
+        "clear_object_filter",
+        "Filter: Clear",
+        "Navigator",
+        [],
+        ["object filter", "remove", "reset", "schema tree"],
+        ClearObjectFilter
     ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(

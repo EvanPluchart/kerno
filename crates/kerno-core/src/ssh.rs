@@ -214,6 +214,36 @@ impl std::fmt::Debug for Tunnel {
     }
 }
 
+/// The SSH client's settings for a tunnel: keep-alive and host-key offer.
+fn client_config(ssh: &SshConfig) -> client::Config {
+    client::Config {
+        keepalive_interval: (ssh.keepalive_secs > 0)
+            .then(|| Duration::from_secs(ssh.keepalive_secs.into())),
+        // Three missed keep-alives and the tunnel is declared dead.
+        keepalive_max: 3,
+        // Without the `rsa` crate an RSA host key cannot be verified:
+        // leave it out of the offer, so a server with only an RSA host
+        // key fails with "no common key algorithm" rather than "wrong
+        // server signature", which reads like an interception.
+        preferred: russh::Preferred {
+            key: Cow::Borrowed(&[
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384,
+                },
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP521,
+                },
+            ]),
+            ..russh::Preferred::DEFAULT
+        },
+        ..client::Config::default()
+    }
+}
+
 impl Tunnel {
     /// Connects to the SSH server and authenticates.
     pub async fn open(request: TunnelRequest<'_>) -> Result<Self, SshError> {
@@ -227,32 +257,7 @@ impl Tunnel {
             trusted_fingerprint: request.trusted_fingerprint.map(str::to_string),
             verdict: verdict.clone(),
         };
-        let config = Arc::new(client::Config {
-            keepalive_interval: (ssh.keepalive_secs > 0)
-                .then(|| Duration::from_secs(ssh.keepalive_secs.into())),
-            // Three missed keep-alives and the tunnel is declared dead.
-            keepalive_max: 3,
-            // Without the `rsa` crate an RSA host key cannot be verified:
-            // leave it out of the offer, so a server with only an RSA host
-            // key fails with "no common key algorithm" rather than "wrong
-            // server signature", which reads like an interception.
-            preferred: russh::Preferred {
-                key: Cow::Borrowed(&[
-                    Algorithm::Ed25519,
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP256,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP384,
-                    },
-                    Algorithm::Ecdsa {
-                        curve: EcdsaCurve::NistP521,
-                    },
-                ]),
-                ..russh::Preferred::DEFAULT
-            },
-            ..client::Config::default()
-        });
+        let config = Arc::new(client_config(ssh));
 
         let connect = client::connect(config, (ssh.host.as_str(), ssh.port), handler);
         let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
@@ -620,5 +625,27 @@ impl client::Handler for HostKeyCheck {
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_keepalive_is_passed_to_the_client() {
+        let mut ssh = SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "kerno".into(),
+            auth: SshAuth::default(),
+            keepalive_secs: 45,
+        };
+        let config = client_config(&ssh);
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(45)));
+        assert_eq!(config.keepalive_max, 3);
+
+        ssh.keepalive_secs = 0;
+        assert_eq!(client_config(&ssh).keepalive_interval, None);
     }
 }

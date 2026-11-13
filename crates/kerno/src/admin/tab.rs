@@ -1,5 +1,5 @@
 //! Server administration: the sessions on the server, which can be
-//! cancelled or terminated; the roles and what each was granted; the sizes
+//! cancelled or terminated; who waits for whose lock; the roles and what each was granted; the sizes
 //! of the databases and tables; the server's settings. Each list is one of
 //! the driver's administrative views (`Session::admin_query`) read on the
 //! tab's own session. The two signals are the only statements that act on
@@ -26,8 +26,8 @@ use gpui_kit::component::table::{
     Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableSelection, TableState,
 };
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -47,12 +47,15 @@ use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::query::tab::TabStatus;
 use crate::sql_confirm::{self, Confirmation, Statement};
+use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
 
 /// One list of the tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Sessions,
+    /// Sessions waiting for a lock, with the session holding it.
+    Locks,
     Roles,
     /// The grants of the role selected in `Roles`.
     Grants,
@@ -62,8 +65,9 @@ pub enum Pane {
 }
 
 impl Pane {
-    const ALL: [Pane; 6] = [
+    const ALL: [Pane; 7] = [
         Pane::Sessions,
+        Pane::Locks,
         Pane::Roles,
         Pane::Grants,
         Pane::Databases,
@@ -74,6 +78,7 @@ impl Pane {
     fn view(self) -> AdminView {
         match self {
             Pane::Sessions => AdminView::Sessions,
+            Pane::Locks => AdminView::Locks,
             Pane::Roles => AdminView::Roles,
             Pane::Grants => AdminView::Grants,
             Pane::Databases => AdminView::DatabaseSizes,
@@ -86,6 +91,7 @@ impl Pane {
     fn cell_id(self) -> &'static str {
         match self {
             Pane::Sessions => "admin-sessions-cell",
+            Pane::Locks => "admin-locks-cell",
             Pane::Roles => "admin-roles-cell",
             Pane::Grants => "admin-grants-cell",
             Pane::Databases => "admin-databases-cell",
@@ -98,6 +104,7 @@ impl Pane {
     fn noun(self) -> &'static str {
         match self {
             Pane::Sessions => "sessions",
+            Pane::Locks => "locks",
             Pane::Roles => "roles",
             Pane::Grants => "grants",
             Pane::Databases => "database sizes",
@@ -108,8 +115,9 @@ impl Pane {
 }
 
 /// The sub-tabs, in order, with the lists each shows.
-const SECTIONS: [(&str, &[Pane]); 4] = [
+const SECTIONS: [(&str, &[Pane]); 5] = [
     ("Sessions", &[Pane::Sessions]),
+    ("Locks", &[Pane::Locks]),
     ("Roles", &[Pane::Roles, Pane::Grants]),
     ("Sizes", &[Pane::Databases, Pane::Tables]),
     ("Settings", &[Pane::Settings]),
@@ -117,9 +125,10 @@ const SECTIONS: [(&str, &[Pane]); 4] = [
 
 /// Index of each sub-tab.
 pub const SESSIONS: usize = 0;
-pub const ROLES: usize = 1;
-pub const SIZES: usize = 2;
-pub const SETTINGS: usize = 3;
+pub const LOCKS: usize = 1;
+pub const ROLES: usize = 2;
+pub const SIZES: usize = 3;
+pub const SETTINGS: usize = 4;
 
 /// What can be sent to another session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +204,7 @@ pub struct AdminTab {
     /// One per pane, in `Pane::ALL` order.
     panes: Vec<PaneView>,
     /// The filter box of each sub-tab that has one.
-    filters: [Option<Entity<InputState>>; 4],
+    filters: [Option<Entity<InputState>>; 5],
     section: usize,
     auto_refresh: Option<Duration>,
     ticker: Option<Task<()>>,
@@ -242,7 +251,9 @@ impl AdminTab {
         let panes: Vec<PaneView> = Pane::ALL
             .iter()
             .map(|&pane| {
-                let grid = AdminGrid::new(pane, tab.clone());
+                let mut grid = AdminGrid::new(pane, tab.clone());
+                grid.hide_idle =
+                    pane == Pane::Sessions && AppState::get(cx).settings.hide_idle_sessions;
                 PaneView {
                     grid: cx.new(|cx| {
                         TableState::new(grid, window, cx)
@@ -271,11 +282,12 @@ impl AdminTab {
                 }
             },
         ));
-        let filters = [SESSIONS, ROLES, SIZES, SETTINGS].map(|section| {
+        let filters = [SESSIONS, LOCKS, ROLES, SIZES, SETTINGS].map(|section| {
             (section != ROLES).then(|| {
                 let input = cx.new(|cx| {
                     InputState::new(window, cx).placeholder(match section {
                         SESSIONS => "Filter sessions",
+                        LOCKS => "Filter locks",
                         SIZES => "Filter databases and tables",
                         _ => "Filter settings",
                     })
@@ -601,8 +613,13 @@ impl AdminTab {
     /// they are on screen and not being read already.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shown = self.shown.get() == Some(cx.entity_id());
-        if shown && self.section == SESSIONS && !self.busy() && self.connected(cx) {
-            self.read(vec![Pane::Sessions], window, cx);
+        let pane = match self.section {
+            SESSIONS => Pane::Sessions,
+            LOCKS => Pane::Locks,
+            _ => return,
+        };
+        if shown && !self.busy() && self.connected(cx) {
+            self.read(vec![pane], window, cx);
         }
     }
 
@@ -651,6 +668,28 @@ impl AdminTab {
         let (row, _) = selected(table)?;
         let grid = table.delegate();
         Some((grid.raw(row, 0)?.to_string(), grid.is_own(row)))
+    }
+
+    /// The session holding the lock of the row selected in the locks list.
+    fn selected_blocker(&self, cx: &App) -> Option<String> {
+        let table = self.view(Pane::Locks).grid.read(cx);
+        let (row, _) = selected(table)?;
+        let grid = table.delegate();
+        let column = grid.column_named("blocking_id")?;
+        Some(grid.raw(row, column)?.to_string())
+    }
+
+    /// Leaves idle (PostgreSQL) or sleeping (MySQL, MariaDB) sessions out
+    /// of the list, or shows them again; remembered in the settings.
+    pub fn set_hide_idle(&mut self, hide: bool, cx: &mut Context<Self>) {
+        AppState::update_settings(cx, |settings| settings.hide_idle_sessions = hide);
+        self.view(Pane::Sessions).grid.update(cx, |table, cx| {
+            table.delegate_mut().hide_idle = hide;
+            table.delegate_mut().recompute();
+            table.clear_selection(cx);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// Whether `id` is this tab's own session, as the last read said.
@@ -790,7 +829,11 @@ impl AdminTab {
                 };
                 window.push_notification(notification, cx);
                 this.message = Some((failed, text));
-                this.read(vec![Pane::Sessions], window, cx);
+                let read: Vec<Pane> = [Pane::Sessions, Pane::Locks]
+                    .into_iter()
+                    .filter(|&pane| pane == Pane::Sessions || this.view(pane).loaded)
+                    .collect();
+                this.read(read, window, cx);
             });
         }));
         cx.notify();
@@ -947,7 +990,7 @@ impl AdminTab {
                     .child(SharedString::from(version))
             }))
             .child(div().flex_1())
-            .when(self.section == SESSIONS, |bar| {
+            .when(matches!(self.section, SESSIONS | LOCKS), |bar| {
                 bar.child(
                     Button::new("admin-auto-refresh")
                         .ghost()
@@ -956,7 +999,7 @@ impl AdminTab {
                             "Auto-refresh: {}",
                             every_label(self.auto_refresh)
                         )))
-                        .tooltip("Read the sessions again on their own while this tab is shown")
+                        .tooltip("Read the list again on its own while this tab is shown")
                         .dropdown_caret(true)
                         .dropdown_menu(auto_menu),
                 )
@@ -999,18 +1042,30 @@ impl AdminTab {
     /// done to the one selected.
     fn render_section_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let filter = self.filters[self.section].as_ref()?;
-        let selected = self.selected_session(cx);
+        let locks = self.section == LOCKS;
+        // On the locks, the buttons act on the session holding the lock.
+        let selected = if locks {
+            self.selected_blocker(cx).map(|id| (id, false))
+        } else {
+            self.selected_session(cx)
+        };
         let read_only = self.read_only(cx);
         let signal_button = |signal: Signal, id: &'static str, cx: &mut Context<Self>| {
             let reason = match &selected {
                 Some((_, own)) => signal_unavailable(read_only, *own),
+                None if locks => Some("select a lock first"),
                 None => Some("select a session first"),
             };
             let target = selected.as_ref().map(|(id, _)| id.clone());
+            let label = match (locks, signal) {
+                (true, Signal::Cancel) => "Cancel blocking query",
+                (true, Signal::Terminate) => "Terminate blocking session",
+                (false, signal) => signal.label(),
+            };
             Button::new(id)
                 .outline()
                 .small()
-                .label(signal.label())
+                .label(label)
                 .when_some(reason, |button, reason| button.tooltip(reason))
                 .disabled(reason.is_some())
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -1020,17 +1075,42 @@ impl AdminTab {
                 }))
         };
         let sessions = self.section == SESSIONS;
-        let buttons = sessions.then(|| {
+        let buttons = (sessions || locks).then(|| {
             [
                 signal_button(Signal::Cancel, "admin-cancel", cx),
                 signal_button(Signal::Terminate, "admin-terminate", cx),
             ]
         });
+        // DBeaver's "Show idle" (PostgreSQL) and "Hide sleeping" (MySQL).
+        let hide_idle = sessions.then(|| {
+            let grid = self.view(Pane::Sessions).grid.read(cx).delegate();
+            let (hide, hidden) = (grid.hide_idle, grid.hidden_idle);
+            let word = if self.engine(cx) == Some(Engine::Postgres) {
+                "idle"
+            } else {
+                "sleeping"
+            };
+            Button::new("admin-hide-idle")
+                .ghost()
+                .small()
+                .label(SharedString::from(if hide && hidden > 0 {
+                    format!("Hide {word} ({hidden} hidden)")
+                } else {
+                    format!("Hide {word}")
+                }))
+                .selected(hide)
+                .tooltip(if hide {
+                    "Show every session again"
+                } else {
+                    "Leave out the sessions that wait for their next statement"
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.set_hide_idle(!hide, cx)))
+        });
         let theme = cx.theme();
         let message = self
             .message
             .as_ref()
-            .filter(|_| sessions)
+            .filter(|_| sessions || locks)
             .map(|(failed, text)| {
                 div()
                     .id("admin-message")
@@ -1061,6 +1141,7 @@ impl AdminTab {
                             .cleanable(true),
                     ),
                 )
+                .children(hide_idle)
                 .children(buttons.into_iter().flatten())
                 .children(message)
                 .into_any_element(),
@@ -1307,6 +1388,10 @@ pub struct AdminGrid {
     /// Grants only: the grantee whose grants are shown; none when no role
     /// is selected.
     only: Option<String>,
+    /// Sessions only: idle and sleeping sessions are left out.
+    hide_idle: bool,
+    /// How many sessions `hide_idle` left out at the last count.
+    hidden_idle: usize,
     sort: Option<(usize, ColumnSort)>,
     widths: Vec<Pixels>,
 }
@@ -1323,8 +1408,29 @@ impl AdminGrid {
             visible: Vec::new(),
             filter: String::new(),
             only: None,
+            hide_idle: false,
+            hidden_idle: 0,
             sort: None,
             widths: Vec::new(),
+        }
+    }
+
+    /// The index of the server's column named `name`.
+    fn column_named(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|column| column.name == name)
+    }
+
+    /// Whether a row of `rows` is a session waiting for its next statement:
+    /// PostgreSQL's `idle` (not `idle in transaction`, which holds locks),
+    /// MySQL's `Sleep` command.
+    fn is_idle(&self, row: usize) -> bool {
+        let cell = |name: &str| {
+            self.column_named(name)
+                .and_then(|column| self.rows[row][column].as_deref())
+        };
+        match self.column_named("command") {
+            Some(_) => cell("command") == Some("Sleep"),
+            None => cell("state") == Some("idle"),
         }
     }
 
@@ -1385,7 +1491,13 @@ impl AdminGrid {
 
     /// Works out the rows on screen from the filter and the sort.
     fn recompute(&mut self) {
+        let hide_idle = self.pane == Pane::Sessions && self.hide_idle;
+        let idle: Vec<bool> = (0..self.rows.len())
+            .map(|row| hide_idle && self.is_idle(row))
+            .collect();
+        self.hidden_idle = idle.iter().filter(|idle| **idle).count();
         let mut visible: Vec<usize> = (0..self.rows.len())
+            .filter(|&row| !idle[row])
             .filter(|&row| {
                 if self.pane == Pane::Grants && self.rows[row][0].as_deref() != self.only.as_deref()
                 {
@@ -1552,15 +1664,45 @@ impl AdminGrid {
         menu = menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
         }));
-        let (Pane::Sessions, Some(id), Some(view)) = (pane, id, tab.upgrade()) else {
+        let (Pane::Sessions | Pane::Locks, Some(id), Some(view)) = (pane, id, tab.upgrade()) else {
             return menu;
         };
         let reason = signal_unavailable(view.read(cx).read_only(cx), own);
         menu = menu.separator();
-        for signal in [Signal::Cancel, Signal::Terminate] {
+        // A lock names two sessions: the one holding it first (DBeaver's
+        // lock manager acts on the holder), then the one waiting.
+        let targets: Vec<(Signal, String, String)> = if pane == Pane::Locks {
+            let blocker = {
+                let grid = table.read(cx).delegate();
+                grid.column_named("blocking_id")
+                    .and_then(|column| grid.raw(row, column))
+                    .map(str::to_string)
+            };
+            let mut targets = Vec::new();
+            if let Some(blocker) = blocker {
+                targets.push((
+                    Signal::Cancel,
+                    blocker.clone(),
+                    "Cancel blocking query".into(),
+                ));
+                targets.push((
+                    Signal::Terminate,
+                    blocker,
+                    "Terminate blocking session".into(),
+                ));
+            }
+            targets.push((Signal::Cancel, id.clone(), "Cancel waiting query".into()));
+            targets.push((Signal::Terminate, id, "Terminate waiting session".into()));
+            targets
+        } else {
+            [Signal::Cancel, Signal::Terminate]
+                .map(|signal| (signal, id.clone(), signal.label().to_string()))
+                .into()
+        };
+        for (signal, id, label) in targets {
             let label = match reason {
-                Some(reason) => format!("{} ({reason})", signal.label()),
-                None => signal.label().to_string(),
+                Some(reason) => format!("{label} ({reason})"),
+                None => label,
             };
             let (view, id) = (view.clone(), id.clone());
             menu = menu.item(
@@ -1593,6 +1735,15 @@ impl AdminGrid {
                  their own objects without a grant."
             ),
             (Pane::Tables, _) => "No table in this database.".into(),
+            (Pane::Sessions, _) if self.hidden_idle > 0 => format!(
+                "Every session waits for its next statement: {} hidden. Turn the filter of \
+                 idle sessions off to see them.",
+                self.hidden_idle
+            ),
+            (Pane::Locks, _) => "No session is waiting for a lock. A session shows here, with \
+                                 the one in its way, while it waits for a row or table another \
+                                 session holds. Refresh to look again."
+                .into(),
             (pane, _) => format!("No {} on this server.", pane.noun()),
         }
     }

@@ -6,12 +6,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::table::{DataTable, TableEvent, TableState};
+use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
     v_flex,
@@ -592,6 +591,7 @@ impl DataTab {
             }
         });
         let keyless = structure.row_identity().is_none();
+        let described = structure.clone();
         let owner = Owner {
             act: Rc::new(move |action, row, column, window, cx| {
                 let _ = view.update(cx, |this, cx| this.perform(action, row, column, window, cx));
@@ -605,6 +605,7 @@ impl DataTab {
             export: None,
             filtered: !self.applied.is_empty(),
             keyless,
+            structure: Some(described),
         };
         let grid = Grid::page(
             store,
@@ -644,8 +645,16 @@ impl DataTab {
                     }
                     // A double click types in the cell, or shows the whole
                     // value of one that cannot be typed in.
+                    // A boolean that takes a value is toggled by the click on
+                    // it already selected, not by a double click.
                     if let TableEvent::DoubleClickedCell(row, column) = event {
-                        this.edit_cell(*row, *column, window, cx);
+                        let grid = table.read(cx).delegate();
+                        let toggled = grid.value_at(*row, *column).is_some_and(|(column, _)| {
+                            column.kind == kerno_core::TypeKind::Boolean
+                        }) && grid.editable(*row, *column).is_ok();
+                        if !toggled {
+                            this.edit_cell(*row, *column, window, cx);
+                        }
                     }
                 },
             ),
@@ -1244,6 +1253,8 @@ impl DataTab {
                 self.export(window, cx);
             }
             GridAction::Generate(kind) => self.generate_sql(kind, row, window, cx),
+            GridAction::AddRow => self.add_row(window, cx),
+            GridAction::Refresh => self.refresh(window, cx),
             // The grid runs the others itself.
             _ => {}
         }
@@ -1877,6 +1888,19 @@ impl DataTab {
                     .filter(|_| !loading && !self.read_failed())
                     .map(|elapsed| SharedString::from(duration_text(elapsed))),
             )
+            .children(self.grid.clone().map(|table| {
+                Button::new("data-record")
+                    .ghost()
+                    .xsmall()
+                    .label("Record")
+                    .tooltip("One row as a list of its columns, or the grid again (Tab)")
+                    .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
+            }))
+            .children(
+                self.grid
+                    .as_ref()
+                    .map(|table| crate::query::grid_view::SelectionStats::of(table, cx)),
+            )
             .child(div().flex_1())
             // No pages to turn when the rows could not be read.
             .when(!self.read_failed(), |footer| {
@@ -1943,7 +1967,6 @@ impl DataTab {
     }
 
     fn render_rows(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
         match (&self.state, &self.grid) {
             (State::Waiting, _) => {
                 let connect = Button::new("data-connect")
@@ -1998,14 +2021,12 @@ impl DataTab {
             ),
             (_, Some(table)) => {
                 let empty = table.read(cx).delegate().total_rows() == 0;
+                let rows = crate::query::grid_view::render(table, cx);
+                let theme = cx.theme();
                 div()
                     .size_full()
                     .relative()
-                    .child(
-                        DataTable::new(table)
-                            .with_size(crate::query::grid::table_size(cx))
-                            .focus_ring(false),
-                    )
+                    .child(rows)
                     .when(empty, |area| {
                         area.child(
                             div()
@@ -2138,6 +2159,21 @@ impl Render for DataTab {
                     }
                     "enter" | "f2" => {
                         if let Some((row, column)) = table.read(cx).selected_cell() {
+                            this.edit_cell(row, column, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }
+                    // Space toggles a boolean, as a click on DBeaver's
+                    // checkbox does.
+                    "space" if !keystroke.modifiers.modified() => {
+                        let boolean = table.read(cx).selected_cell().and_then(|(row, column)| {
+                            let grid = table.read(cx).delegate();
+                            let (described, _) = grid.value_at(row, column)?;
+                            (described.kind == kerno_core::TypeKind::Boolean
+                                && grid.editable(row, column).is_ok())
+                            .then_some((row, column))
+                        });
+                        if let Some((row, column)) = boolean {
                             this.edit_cell(row, column, window, cx);
                             cx.stop_propagation();
                         }

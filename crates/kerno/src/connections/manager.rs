@@ -609,6 +609,31 @@ impl Connections {
         }
     }
 
+    /// Sets (or with `None` removes) the schema tree's filter of the
+    /// objects of kind `key` of a connection, and saves it with the
+    /// connection's settings (never its secrets).
+    pub fn set_navigator_filter(
+        &mut self,
+        id: &str,
+        key: &str,
+        filter: Option<kerno_core::config::ObjectFilter>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.saved.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let filters = &mut connection.config.navigator_filters;
+        if filters.get(key) == filter.as_ref() {
+            return;
+        }
+        match filter {
+            Some(filter) => filters.insert(key.to_string(), filter),
+            None => filters.remove(key),
+        };
+        let changed = vec![connection.clone()];
+        self.store(changed, cx);
+    }
+
     /// Shows connections already changed in memory, and writes their
     /// settings (never their secrets) in the background. If that fails,
     /// the list is read back from storage.

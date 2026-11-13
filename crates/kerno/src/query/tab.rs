@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Glyph;
-use gpui_kit::base::FocusableExt as _;
 use gpui_kit::base::input;
 use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -20,7 +19,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::table::{DataTable, TableEvent, TableState};
+use gpui_kit::component::table::{TableEvent, TableState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt as _,
@@ -49,6 +48,7 @@ use super::comment;
 use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::grid::{CopyFormat, Grid, GridAction, Owner};
 use super::params;
+use super::tx_log::{self, TxLogEntry};
 use super::{plan_view, viewer};
 use crate::actions::{
     self, CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
@@ -284,6 +284,8 @@ pub struct QueryTab {
     cancel_requested: bool,
     /// Statements run in a transaction that the user commits or rolls back.
     manual_commit: bool,
+    /// The statements of the open transaction, in manual commit.
+    tx_log: Vec<TxLogEntry>,
     /// What was typed for each parameter last time, by its label.
     param_values: HashMap<String, String>,
     /// The editor shows where the last statement failed.
@@ -412,6 +414,7 @@ impl QueryTab {
             run: None,
             cancel_requested: false,
             manual_commit,
+            tx_log: Vec::new(),
             param_values: HashMap::new(),
             error_marked: false,
             file: None,
@@ -1900,6 +1903,9 @@ impl QueryTab {
                     });
                     return;
                 }
+                // A new transaction: its log starts empty, whatever ended
+                // the last one (a lost connection, a rollback on close).
+                let _ = this.update(cx, |this, _| this.tx_log.clear());
             }
             let mut changed_schema = false;
             let mut any_failed = false;
@@ -2180,11 +2186,45 @@ impl QueryTab {
             })
             .detach();
         }
+        // In manual commit the statement joins the transaction's log; one
+        // that ended the transaction (COMMIT typed, MySQL's DDL) empties it.
+        if self.manual_commit {
+            if self.tx_state() == TxState::Idle {
+                self.tx_log.clear();
+            } else {
+                self.tx_log.push(TxLogEntry::new(
+                    &statement.sql,
+                    self.lex_rules(cx),
+                    started_at_ms,
+                    elapsed,
+                    row_count,
+                    status,
+                    failure.as_ref().map(|failure| failure.message.clone()),
+                ));
+            }
+        }
         if let (Some(origin), Some(failure)) = (statement.origin, &failure)
             && let Some(position) = failure.position
         {
             self.mark_error(origin, &statement.sql, position, &failure.message, cx);
         }
+    }
+
+    /// The statements run in the open transaction; none when no
+    /// transaction is open.
+    pub fn transaction_log(&self) -> &[TxLogEntry] {
+        if self.tx_state() == TxState::Idle {
+            &[]
+        } else {
+            &self.tx_log
+        }
+    }
+
+    /// Shows the statements of the open transaction (DBeaver's
+    /// "Transaction log").
+    pub fn show_transaction_log(&self, window: &mut Window, cx: &mut App) {
+        let open = self.tx_state() != TxState::Idle;
+        tx_log::open(self.transaction_log().to_vec(), open, window, cx);
     }
 
     /// Underlines the place of an error in the editor. `position` is the
@@ -2384,7 +2424,12 @@ impl QueryTab {
         let ending = bridge::spawn(cx, exec::collect(session, sql));
         cx.spawn(async move |this, cx| {
             let outcome = ending.await;
-            let _ = this.update(cx, |_, cx| cx.notify());
+            let _ = this.update(cx, |this, cx| {
+                if outcome.is_ok() {
+                    this.tx_log.clear();
+                }
+                cx.notify()
+            });
             outcome
                 .map(drop)
                 .map_err(|error| format!("{sql} failed: {error}"))
@@ -2452,6 +2497,7 @@ impl QueryTab {
                 .then_some("the statement writes"),
             filtered: false,
             keyless: false,
+            structure: None,
         });
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
@@ -3392,10 +3438,7 @@ impl QueryTab {
         let theme = cx.theme();
         match &pane.outcome {
             // Striped by the grid itself (`Grid::render_tr`).
-            Outcome::Rows(grid) => DataTable::new(grid)
-                .with_size(super::grid::table_size(cx))
-                .focus_ring(false)
-                .into_any_element(),
+            Outcome::Rows(grid) => super::grid_view::render(grid, cx),
             Outcome::Done => div()
                 .id("result-done")
                 .test_support()
@@ -3700,6 +3743,18 @@ impl QueryTab {
                     .text_xs()
                     .text_color(muted)
                     .child(SharedString::from(summary))
+                    .children(grid.clone().map(|table| {
+                        Button::new("result-record")
+                            .ghost()
+                            .xsmall()
+                            .label("Record")
+                            .tooltip("One row as a list of its columns, or the grid again (Tab)")
+                            .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
+                    }))
+                    .children(
+                        grid.as_ref()
+                            .map(|table| super::grid_view::SelectionStats::of(table, cx)),
+                    )
                     .when(grid.is_some() && has_more, |this| {
                         this.child(
                             Button::new("fetch-more")

@@ -58,12 +58,14 @@ use crate::data::tab::{DataTab, DataTabEvent};
 use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
+use crate::navigator::actions::FilterAction;
 use crate::navigator::view::{Navigator, NavigatorEvent};
+use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
-use crate::structure::tab::{StructureTab, StructureTabEvent};
+use crate::structure::tab::{PROPERTIES_SECTION, StructureTab, StructureTabEvent};
 use crate::tabs::{
     self, Entry, Loss, StatusFacts, StatusItem, TabAction, TabKind, TabSnapshot, Target,
 };
@@ -759,6 +761,19 @@ impl Workspace {
         tab
     }
 
+    /// Runs a Filter ▸ entry of the schema tree on its selected node.
+    fn filter_in_tree(
+        &mut self,
+        action: FilterAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| {
+            navigator.filter_selected(action, window, cx)
+        });
+    }
+
     /// The palette's "Server Administration": of the active tab's
     /// connection, else of the one selected in the sidebar.
     fn open_admin_command(&mut self, _: &OpenAdmin, window: &mut Window, cx: &mut Context<Self>) {
@@ -1287,6 +1302,16 @@ impl Workspace {
                     query.update(cx, |query, cx| query.end_transaction(commit, window, cx));
                 }
             }
+            TabAction::TransactionLog => match query {
+                Some(query) => query.update(cx, |query, cx| query.show_transaction_log(window, cx)),
+                None => window.push_notification(
+                    Notification::warning(
+                        "Transaction log: open a query tab; its transaction's statements are \
+                         listed.",
+                    ),
+                    cx,
+                ),
+            },
             TabAction::ManualCommit(manual) => {
                 if let Some(query) = query {
                     query.update(cx, |query, cx| query.set_manual_commit(manual, cx));
@@ -1607,6 +1632,14 @@ impl Workspace {
             } => {
                 self.open_structure(target.clone(), table.clone(), *kind, window, cx);
             }
+            NavigatorEvent::ShowProperties {
+                target,
+                table,
+                kind,
+            } => {
+                let tab = self.open_structure(target.clone(), table.clone(), *kind, window, cx);
+                tab.update(cx, |tab, cx| tab.select(PROPERTIES_SECTION, cx));
+            }
             NavigatorEvent::CreateTable { target, schema } => {
                 self.open_table_editor(target.clone(), schema.clone(), None, window, cx);
             }
@@ -1626,8 +1659,15 @@ impl Workspace {
             } => {
                 self.import_csv_into(target.clone(), schema.clone(), table.clone(), window, cx);
             }
-            NavigatorEvent::BackupRestore { target, restore } => {
-                self.backup_restore(target.clone(), *restore, window, cx);
+            NavigatorEvent::BackupRestore {
+                target,
+                restore,
+                tables,
+            } => {
+                let dialog = self.backup_restore(target.clone(), *restore, window, cx);
+                if let Some(dialog) = dialog.filter(|_| !tables.is_empty()) {
+                    dialog.update(cx, |dialog, cx| dialog.only_tables(tables.clone(), cx));
+                }
             }
             NavigatorEvent::SetDefault { target } => {
                 let tab = self.active_query_tab().filter(|tab| {
@@ -3553,6 +3593,57 @@ impl Workspace {
             crate::settings_view::zoom_grid(None, window, cx)
         }))
         .on_action(
+            cx.listener(|this, _: &actions::ToggleRecordView, window, cx| {
+                if let Some(grid) = this.active_grid(cx) {
+                    Grid::toggle_record(&grid, window, cx);
+                }
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::FirstRow, _, cx| this.move_row(RowMove::First, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::PreviousRow, _, cx| {
+                this.move_row(RowMove::Previous, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::NextRow, _, cx| this.move_row(RowMove::Next, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::LastRow, _, cx| this.move_row(RowMove::Last, cx)),
+        )
+        .on_action(cx.listener(|this, _: &actions::GoToRow, window, cx| {
+            if let Some(grid) = this.active_grid(cx) {
+                crate::query::grid_view::go_to_row(&grid, window, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &actions::GoToColumn, window, cx| {
+            if let Some(grid) = this.active_grid(cx) {
+                crate::query::grid_view::go_to_column(&grid, window, cx);
+            }
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::CopyRowNumbers, window, cx| {
+                this.on_grid(GridAction::CopyRowNumbers, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|_, _: &actions::ToggleSelectionStats, _, cx| {
+            AppState::update_settings(cx, |settings| {
+                settings.selection_stats = !settings.selection_stats
+            });
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::ShowAggregatePanel, window, cx| {
+                this.on_grid(GridAction::Panel(Panel::Aggregate), window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::ShowColumnsPanel, window, cx| {
+                this.on_grid(GridAction::Panel(Panel::Columns), window, cx)
+            }),
+        )
+        .on_action(
             cx.listener(|this, _: &actions::OpenTableAtCursor, window, cx| {
                 this.open_at_cursor(false, window, cx)
             }),
@@ -3679,6 +3770,21 @@ impl Workspace {
                 self.active_query_tab()
                     .and_then(|tab| tab.read(cx).active_grid())
             })
+    }
+
+    /// Moves the selection of the grid on screen to another row.
+    fn move_row(&mut self, to: RowMove, cx: &mut Context<Self>) {
+        if let Some(grid) = self.active_grid(cx) {
+            Grid::move_row(&grid, to, cx);
+        }
+    }
+
+    /// Runs an entry of the grid menus on the selection of the grid on
+    /// screen.
+    fn on_grid(&mut self, action: GridAction, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(grid) = self.active_grid(cx) {
+            Grid::perform(&grid, action, window, cx);
+        }
     }
 
     /// Opens the rows (or the structure) of the table named at the active
@@ -3980,6 +4086,36 @@ impl Render for Workspace {
                 cx.listener(|this, _: &crate::actions::MaintenanceTools, window, cx| {
                     let navigator = this.sidebar.read(cx).navigator().clone();
                     navigator.update(cx, |navigator, cx| navigator.tools_on_selected(window, cx));
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowTransactionLog, window, cx| {
+                    this.perform(None, TabAction::TransactionLog, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::HideObjectInTree, window, cx| {
+                    this.filter_in_tree(FilterAction::Hide, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ShowOnlyObjectInTree, window, cx| {
+                    this.filter_in_tree(FilterAction::ShowOnly, window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ConfigureObjectFilter, window, cx| {
+                    this.filter_in_tree(FilterAction::Configure, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ToggleObjectFilter, window, cx| {
+                    this.filter_in_tree(FilterAction::Toggle, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ClearObjectFilter, window, cx| {
+                    this.filter_in_tree(FilterAction::Clear, window, cx)
                 }),
             )
             .on_action(cx.listener(|this, _: &RenameObject, window, cx| {

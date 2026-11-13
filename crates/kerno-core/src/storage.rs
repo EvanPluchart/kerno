@@ -58,7 +58,17 @@ const MIGRATIONS: &[&str] = &[
          key   TEXT PRIMARY KEY,
          value TEXT NOT NULL
      );",
+    // 2: the filters last applied to each table's data and query's result.
+    "CREATE TABLE filter_history (
+         key     TEXT NOT NULL,
+         filter  TEXT NOT NULL,
+         used_at INTEGER NOT NULL,
+         PRIMARY KEY (key, filter)
+     );",
 ];
+
+/// How many filters [`Storage::filters`] keeps for one key.
+pub const FILTERS_KEPT: usize = 20;
 
 /// A connection as stored: its id and its settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +498,52 @@ impl Storage {
         })
         .map(|_| ())
     }
+
+    // Filter history ------------------------------------------------------
+
+    /// Remembers `filter` (the text of a `WHERE`) as just applied to what
+    /// `key` names (a table's data, a statement's result), keeping the last
+    /// [`FILTERS_KEPT`]. Nothing is kept when the key or the filter holds
+    /// what [`redact_secrets`] would mask, nor an empty filter. Returns
+    /// whether it was kept.
+    pub fn add_filter(&self, key: &str, filter: &str, rules: LexRules) -> Result<bool> {
+        let filter = filter.trim();
+        if filter.is_empty()
+            || redact_secrets(key, rules) != key
+            || redact_secrets(filter, rules) != filter
+        {
+            return Ok(false);
+        }
+        self.with(|c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO filter_history (key, filter, used_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (key, filter) DO UPDATE SET used_at = excluded.used_at",
+                params![key, filter, now_ms()],
+            )?;
+            tx.execute(
+                "DELETE FROM filter_history WHERE key = ?1 AND filter NOT IN (
+                     SELECT filter FROM filter_history WHERE key = ?1
+                     ORDER BY used_at DESC, rowid DESC LIMIT ?2)",
+                params![key, FILTERS_KEPT as i64],
+            )?;
+            tx.commit()
+        })?;
+        Ok(true)
+    }
+
+    /// The filters applied to what `key` names, the latest first.
+    pub fn filters(&self, key: &str) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT filter FROM filter_history WHERE key = ?1
+                 ORDER BY used_at DESC, rowid DESC",
+            )?;
+            statement
+                .query_map([key], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        })
+    }
 }
 
 /// Creates an empty file only its owner can read or write.
@@ -543,7 +599,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 /// servers echo part of the statement in some messages (MySQL's syntax
 /// errors quote what follows the error point), possibly cutting a literal
 /// in two, so the message cannot be cleaned reliably.
-const ERROR_WITHHELD: &str = "(message not kept: the statement contained a password)";
+pub const ERROR_WITHHELD: &str = "(message not kept: the statement contained a password)";
 
 /// Removes passwords from a statement, so they never reach the history or
 /// a log. Redacted, each becoming `'***'` or `***`:
@@ -954,6 +1010,48 @@ mod tests {
         storage.set_setting("grid.page_size", &500u32).unwrap();
         assert_eq!(storage.setting::<u32>("grid.page_size").unwrap(), Some(500));
         assert_eq!(storage.setting::<String>("grid.page_size").unwrap(), None);
+    }
+
+    #[test]
+    fn filters_are_kept_per_key_latest_first_without_secrets() {
+        let storage = Storage::in_memory().unwrap();
+        let rules = LexRules::POSTGRES;
+        assert!(storage.filters("t").unwrap().is_empty());
+        assert!(storage.add_filter("t", " id > 1 ", rules).unwrap());
+        assert!(storage.add_filter("t", "status = 'paid'", rules).unwrap());
+        assert!(storage.add_filter("other", "id = 2", rules).unwrap());
+        assert_eq!(
+            storage.filters("t").unwrap(),
+            ["status = 'paid'", "id > 1"]
+        );
+        // Applied again, it comes first and is not listed twice.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(storage.add_filter("t", "id > 1", rules).unwrap());
+        assert_eq!(
+            storage.filters("t").unwrap(),
+            ["id > 1", "status = 'paid'"]
+        );
+        // Only the latest are kept.
+        for n in 0..FILTERS_KEPT {
+            storage.add_filter("t", &format!("id = {n}"), rules).unwrap();
+        }
+        let kept = storage.filters("t").unwrap();
+        assert_eq!(kept.len(), FILTERS_KEPT);
+        assert!(!kept.contains(&"status = 'paid'".to_string()));
+        // Nothing the history would mask is kept in clear, nor nothing.
+        assert!(!storage.add_filter("t", "  ", rules).unwrap());
+        assert!(
+            !storage
+                .add_filter("t", "dsn = 'postgres://u:hunter2@h/db'", rules)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .add_filter("q:select password 'hunter2'", "id = 1", rules)
+                .unwrap()
+        );
+        assert_eq!(storage.filters("q:select password 'hunter2'").unwrap().len(), 0);
+        assert_eq!(storage.filters("other").unwrap(), ["id = 2"]);
     }
 
     #[test]
