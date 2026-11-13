@@ -278,6 +278,14 @@ mod tests {
             ),
             ("secondary.foreground", "secondary.background"),
             ("danger.foreground", "danger.background"),
+            // A destructive button's label on the button itself (the
+            // kit's default is the red on a 20 % red tint: too faint in dark).
+            ("button.danger.foreground", "button.danger.background"),
+            ("button.danger.foreground", "button.danger.hover.background"),
+            (
+                "button.danger.foreground",
+                "button.danger.active.background",
+            ),
             ("success.foreground", "success.background"),
             ("warning.foreground", "warning.background"),
             ("info.foreground", "info.background"),
@@ -403,6 +411,20 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "below 3:1:\n{}", failures.join("\n"));
+    }
+
+    /// A selected row stands out from the rows around it in the dark
+    /// theme (where it carries no light-on-dark wash): at least 1.45:1
+    /// against a plain and a striped row. (The light theme's Lime wash is
+    /// a brand rule and carries the Olive marker.)
+    #[test]
+    fn a_selected_row_stands_out_in_the_dark_theme() {
+        let themes = themes();
+        let dark = &themes[1].colors;
+        for row in ["table.background", "table.even.background"] {
+            let ratio = contrast(&dark["table.active.background"], &dark[row]);
+            assert!(ratio >= 1.45, "selected row on {row} is {ratio:.2}:1");
+        }
     }
 
     /// The SQL editor: its text, its line numbers and every syntax colour

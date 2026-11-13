@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::base::FocusableExt as _;
 use gpui_kit::base::actions::{SelectDown, SelectUp};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
@@ -173,11 +173,16 @@ fn record_view(table: &Entity<TableState<Grid>>, cx: &App) -> AnyElement {
     });
     let step = |id: &'static str, label: &'static str, to: RowMove| {
         let table = table.clone();
+        // Nowhere to go before the first row or after the last.
+        let at_end = match to {
+            RowMove::First | RowMove::Previous => row == 0,
+            RowMove::Next | RowMove::Last => row + 1 >= total,
+        };
         Button::new(id)
-            .ghost()
+            .outline()
             .xsmall()
             .label(label)
-            .disabled(total == 0)
+            .disabled(total == 0 || at_end)
             .on_click(move |_, _, cx| Grid::move_row(&table, to, cx))
     };
     let (up, down) = (table.clone(), table.clone());

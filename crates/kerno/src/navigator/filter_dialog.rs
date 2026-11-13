@@ -10,7 +10,8 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, TestSupportExt as _, Window, div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::ObjectFilter;
 
@@ -43,7 +44,7 @@ pub fn open(
             })
         };
         FilterDialog {
-            include: area(lines(&filter.include), "every one: leave empty", cx),
+            include: area(lines(&filter.include), "orders_*", cx),
             exclude: area(lines(&filter.exclude), "tmp_*", cx),
             enabled: filter.enabled,
             on_save: Rc::new(on_save),
@@ -97,8 +98,10 @@ impl Render for FilterDialog {
                 .gap_1()
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .id(SharedString::from(format!("{id}-label")))
+                        .test_support()
+                        .aria_label(label)
+                        .text_sm()
                         .child(label),
                 )
                 .child(div().id(id).test_support().child(Textarea::new(area)))
@@ -108,13 +111,19 @@ impl Render for FilterDialog {
             .test_support()
             .gap_3()
             .pt_1()
-            .child(div().text_sm().child(
-                "One name or mask per line, without regard to case: * stands for any \
-                 characters, ? for one. An object is shown when it matches a line to show \
-                 (or there is none) and no line to hide.",
+            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                "One per line, upper or lower case alike: * stands for any characters, ? for one.",
             ))
-            .child(labelled("Show only", &self.include, "filter-include"))
-            .child(labelled("Hide", &self.exclude, "filter-exclude"))
+            .child(labelled(
+                "Show only: names or masks to keep. Empty keeps every object.",
+                &self.include,
+                "filter-include",
+            ))
+            .child(labelled(
+                "Hide: names or masks to leave out.",
+                &self.exclude,
+                "filter-exclude",
+            ))
             .child(
                 Checkbox::new("filter-enabled")
                     .label("Apply this filter")

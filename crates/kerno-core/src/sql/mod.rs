@@ -30,4 +30,4 @@ pub use generate::{
 pub use lex::{LexRules, Token, TokenKind, lex};
 pub use params::{Param, ParamKey, ParamValue, bind_params, find_params};
 pub use split::{StatementSpan, split_statements, statement_at};
-pub use text::{change_case, toggle_block_comment};
+pub use text::{change_case, matching_bracket, toggle_block_comment};

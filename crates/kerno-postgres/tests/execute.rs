@@ -220,8 +220,12 @@ async fn the_cancel_of_an_abandoned_result_never_stops_the_next_statement() {
         let (seen, complete) = read_rows(&mut execution, 1_000).await;
         assert_eq!((seen, complete), (1_000, false));
         drop(execution);
-        let next = run(&session, "SELECT pg_sleep(0.05), 'next'").await;
+        let next = run(&session, "SELECT pg_sleep(0.05), 'next'::text AS next").await;
         assert!(next.is_ok(), "round {round}: {next:?}");
+        // Nor on its description: the columns keep their types (a result
+        // read again is drawn with the same header).
+        let columns = next.unwrap().results[0].columns.clone();
+        assert_eq!(columns[1].type_name, "text", "round {round}");
     }
 }
 

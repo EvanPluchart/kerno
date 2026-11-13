@@ -6,6 +6,7 @@
 //! and click) is kept here, as the far corner of a rectangle whose near
 //! corner is the table's own selection.
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable as _,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
-    SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, TextRun, Window,
-    div, font, px,
+    SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, Window, div,
+    font, px,
 };
 use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
@@ -934,6 +935,8 @@ pub struct Grid {
     /// Counts the changes to what the cells show (edits, order): the
     /// figures of a selection that did not move follow it.
     generation: u64,
+    /// Widths kept from before the result was read again, by column name.
+    widths: HashMap<String, Pixels>,
 }
 
 impl Grid {
@@ -972,6 +975,7 @@ impl Grid {
             record_view: None,
             going_to: None,
             generation: 0,
+            widths: HashMap::new(),
         }
     }
 
@@ -1048,6 +1052,7 @@ impl Grid {
             record_view: None,
             going_to: None,
             generation: 0,
+            widths: HashMap::new(),
             store,
         }
     }
@@ -2416,20 +2421,81 @@ pub(super) fn editor_element(
     }
 }
 
-/// A first width for a column, from its type and name; the user resizes.
-fn initial_width(name: &str, kind: TypeKind) -> Pixels {
-    let by_kind: f32 = match kind {
-        TypeKind::Boolean => 70.,
-        TypeKind::Integer | TypeKind::Float | TypeKind::Decimal | TypeKind::Bit => 100.,
-        TypeKind::Date | TypeKind::Time => 110.,
-        TypeKind::DateTime | TypeKind::DateTimeTz | TypeKind::Interval => 210.,
-        TypeKind::Uuid => 300.,
-        TypeKind::Json | TypeKind::Array | TypeKind::Text | TypeKind::Binary => 220.,
-        TypeKind::Enum | TypeKind::Other => 140.,
-    };
-    // Room for the name and the sort arrow.
-    let by_name = name.chars().count() as f32 * 8. + 44.;
-    px(by_kind.max(by_name).min(360.))
+/// The widest a column is first drawn; the user resizes, "Fit width" goes
+/// further.
+const DEFAULT_WIDTH_CAP: f32 = 360.;
+
+impl Grid {
+    /// How wide column `source` draws its header (the name, the gap, the
+    /// type and the sort arrow) and the longest of its first rows.
+    pub(crate) fn content_width(&self, source: usize, cx: &App) -> Pixels {
+        let described = &self.store.columns()[source];
+        let theme = cx.theme();
+        let text = cx.text_system();
+        let size = text_size(cx);
+        let measure = |shown: &str, family: &SharedString, size: Pixels| -> Pixels {
+            let id = text.resolve_font(&font(family.clone()));
+            shown
+                .chars()
+                .map(|c| {
+                    text.advance(id, size, c)
+                        .map_or(px(0.), |advance| advance.width)
+                })
+                .sum()
+        };
+        let header = measure(&described.name, &theme.font_family, size)
+            + measure(&described.type_name, &theme.font_family, size * 0.85)
+            + px(8.)
+            + px(16.);
+        // ponytail: the cells of the first rows only, and the longest by
+        // characters (the font is monospaced); a longer value further down
+        // stays cut. Sample the rows on screen if that matters.
+        let longest = (0..self.total_rows().min(FIT_ROWS))
+            .map(|row| {
+                let shown = display(self.cell(row, source), described, MAX_CELL_CHARS);
+                if shown.truncated {
+                    format!("{}…", shown.text)
+                } else {
+                    shown.text.into_owned()
+                }
+            })
+            .max_by_key(|text| text.chars().count())
+            .unwrap_or_default();
+        header.max(measure(&longest, &theme.mono_font_family, size))
+    }
+
+    /// The width column `source` is first drawn at: what it shows, up to a
+    /// cap, or the width it had before the result was read again.
+    fn default_width(&self, source: usize, cx: &App) -> Pixels {
+        if let Some(width) = self.widths.get(&self.store.columns()[source].name) {
+            return *width;
+        }
+        let padding = table_size(cx).table_cell_padding();
+        (self.content_width(source, cx) + padding.left + padding.right)
+            .ceil()
+            .min(px(DEFAULT_WIDTH_CAP))
+    }
+
+    /// Draws the columns of these names at these widths (those of the same
+    /// result before it was read again).
+    pub fn with_widths(mut self, widths: HashMap<String, Pixels>) -> Self {
+        self.widths = widths;
+        self
+    }
+
+    /// The width each shown column is drawn at, by name.
+    pub fn widths(table: &TableState<Self>) -> HashMap<String, Pixels> {
+        let grid = table.delegate();
+        (1..=grid.layout.len())
+            .filter_map(|column| {
+                let source = grid.source_column(column)?;
+                Some((
+                    grid.store.columns()[source].name.clone(),
+                    table.col_width(column)?,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Width of the row-number column for a result of `rows` rows.
@@ -2448,7 +2514,7 @@ impl TableDelegate for Grid {
         self.total_rows()
     }
 
-    fn column(&self, index: usize, _: &App) -> Column {
+    fn column(&self, index: usize, cx: &App) -> Column {
         let Some(source) = self.source_column(index) else {
             return Column::new("row-number", "")
                 .width(number_width(self.total_rows()))
@@ -2463,7 +2529,7 @@ impl TableDelegate for Grid {
             format!("column-{source}"),
             SharedString::from(column.name.clone()),
         )
-        .width(initial_width(&column.name, column.kind))
+        .width(self.default_width(source, cx))
         .min_width(px(48.))
         .resizable(true)
         .movable(!self.is_pinned(index));
@@ -2572,55 +2638,11 @@ impl TableDelegate for Grid {
     fn fit_column(
         &mut self,
         column: usize,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Option<Pixels> {
         let source = self.source_column(column)?;
-        let described = &self.store.columns()[source];
-        let theme = cx.theme();
-        let (sans, mono, color) = (
-            theme.font_family.clone(),
-            theme.mono_font_family.clone(),
-            theme.foreground,
-        );
-        let rem = window.rem_size();
-        let cell_size = text_size(cx) / rem;
-        let width = |text: String, family: SharedString, size: f32| {
-            let run = TextRun {
-                len: text.len(),
-                font: font(family),
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_line(text.into(), rem * size, &[run], None)
-                .width
-        };
-        // The name, the gap, the type and the sort arrow with its padding.
-        let header = width(described.name.clone(), sans, cell_size)
-            + width(described.type_name.clone(), mono.clone(), cell_size * 0.85)
-            + px(8.)
-            + rem * 0.75
-            + px(4.);
-        // ponytail: the cells of the first rows only, and the longest by
-        // characters (the font is monospaced); a longer value further down
-        // stays cut. Sample the rows on screen if that matters.
-        let longest = (0..self.total_rows().min(FIT_ROWS))
-            .map(|row| {
-                let shown = display(self.cell(row, source), described, MAX_CELL_CHARS);
-                if shown.truncated {
-                    format!("{}…", shown.text)
-                } else {
-                    shown.text.into_owned()
-                }
-            })
-            .max_by_key(|text| text.chars().count())
-            .unwrap_or_default();
-        let cells = width(longest, mono, cell_size);
-        Some(header.max(cells).min(px(600.)))
+        Some(self.content_width(source, cx).min(px(600.)))
     }
 
     fn move_column(
@@ -2660,20 +2682,31 @@ impl TableDelegate for Grid {
         let described = &self.store.columns()[source];
         let table = cx.entity();
         let size = text_size(cx);
+        // The sort mark keeps its room; the type gives way first, and the
+        // name is cut only when there is no room left for it whole.
         h_flex()
             .id(("column-header", column))
             .test_support()
-            .w_full()
+            .flex_1()
+            .min_w_0()
             .gap_2()
             .text_size(size)
             .child(
                 div()
+                    .id(("column-name", column))
+                    .test_support()
+                    .flex_none()
+                    .max_w_full()
                     .truncate()
                     .child(SharedString::from(described.name.clone())),
             )
             .child(
                 div()
-                    .flex_none()
+                    .id(("column-type", column))
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .text_size(size * 0.85)
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from(described.type_name.clone())),
@@ -2752,6 +2785,27 @@ impl TableDelegate for Grid {
                     cell.text_size(size * 0.85)
                         .text_color(color)
                         .child(SharedString::from(label)),
+                )
+                // A click selects the whole row (the table alone would
+                // select the number's cell); shift and click stretches the
+                // selection of rows to it.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                        // The table takes the keyboard, as a click on a cell
+                        // gives it.
+                        table.focus_handle(cx).focus(window, cx);
+                        if event.modifiers.shift {
+                            table.delegate_mut().extend_to(row, 1);
+                        } else {
+                            table.delegate_mut().clear_selection();
+                            table.set_selected_row(row, cx);
+                            let selection = table.selection();
+                            table.delegate_mut().set_anchor(selection);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
                 )
                 .context_menu(move |menu, window, cx| {
                     Grid::number_menu(&table, row, menu, window, cx)

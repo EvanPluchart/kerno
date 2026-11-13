@@ -302,6 +302,14 @@ Found and fixed on the way:
   sizes list leaves out a table being dropped, tests assert on their own objects only and wait for the
   statement to be on the server before cancelling. `docs/plans/README.md` has the rules. Measured: the app
   suite 20 of 20 before review, then 12 of 12, and the workspace 8 of 9, after it.
+- Third visual list of `plans/M10.md` Part 4 done (D-040): the session question without a primary button,
+  grid headers that keep the name whole and first widths from the content, Stop only while something runs,
+  counts grouped, Properties, Open Table matches, object-filter wording, Truncate set apart, "Sessions (2
+  of 6)", record-view buttons, Cmd+, with the focus nowhere, the dark danger button and selected row, the
+  engine logo in the status bar. A real right-click test per surface and tests for the v1 items that had
+  none (`ui_tests/menus.rs`, `ui_tests/coverage.rs`); two bugs found by them and fixed (a click on a row
+  number selects the row; a cancelled import stops instead of replaying its batch). The matching bracket
+  is marked (D-041) and the last two status-bar items have a menu. Workspace: 953 tests, twice green.
 
 Still open:
 
@@ -386,7 +394,6 @@ Still open:
   a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test
   now prints those sessions and their last statements when the count never settles, so the next failure
   names its cause.
-- A third list of visual defects (`plans/M10.md` Part 4).
 - The clean performance measurement on an idle machine and `docs/BENCH.md` (GOAL criterion 5).
 - The final screenshots in `docs/screenshots/final/` (criterion 7).
 - The final verification of every criterion of `docs/GOAL.md`.

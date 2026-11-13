@@ -554,17 +554,39 @@ impl MaintenanceDialog {
     }
 
     fn render_options(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let chip = |index: usize, tool: &Maintenance| {
+            let selected = index == self.opening.selected;
+            // Truncate empties the table: shown in the danger colour once
+            // chosen.
+            let chip = if selected && matches!(tool, Maintenance::Truncate(_)) {
+                Button::new(("maintenance-tool", index)).danger()
+            } else {
+                theme::chip(("maintenance-tool", index), selected)
+            };
+            chip.small()
+                .label(label(tool))
+                .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
+        };
+        let (destructive, safe): (Vec<_>, Vec<_>) = self
+            .opening
+            .tools
+            .iter()
+            .enumerate()
+            .partition(|(_, tool)| matches!(tool, Maintenance::Truncate(_)));
         let mut rows = vec![Self::field(
             "Tool",
             h_flex()
                 .gap_1()
                 .flex_wrap()
-                .children(self.opening.tools.iter().enumerate().map(|(index, tool)| {
-                    theme::chip(("maintenance-tool", index), index == self.opening.selected)
-                        .small()
-                        .label(label(tool))
-                        .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
-                }))
+                .children(safe.into_iter().map(|(index, tool)| chip(index, tool)))
+                // Set apart, last, after a gap.
+                .when(!destructive.is_empty(), |row| {
+                    row.child(div().w(px(12.))).children(
+                        destructive
+                            .into_iter()
+                            .map(|(index, tool)| chip(index, tool)),
+                    )
+                })
                 .into_any_element(),
             cx,
         )];

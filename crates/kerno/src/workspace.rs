@@ -1192,6 +1192,7 @@ impl Workspace {
                 .map_or(TxState::Idle, |status| status.transaction),
             manual_commit: query.is_some_and(|tab| tab.manual_commit()),
             running: status.is_some_and(|status| status.running),
+            open_connections: self.connections.read(cx).connected_count(),
         }
     }
 
@@ -1359,6 +1360,13 @@ impl Workspace {
                     "No system secret store (macOS Keychain or a Secret Service on Linux) can be                      used, so Kerno writes no password to disk: each password is asked for when                      you connect and forgotten when Kerno quits. Start a Secret Service (GNOME                      Keyring, KWallet) and restart Kerno to save them.",
                 )
             }),
+            TabAction::ShowMessages => {
+                if let Some(query) = query {
+                    query.update(cx, |query, cx| query.show_messages(cx));
+                }
+            }
+            TabAction::NewConnection => self.new_connection(&NewConnection, window, cx),
+            TabAction::DisconnectAll => self.disconnect_all(&DisconnectAll, window, cx),
             // The editor runs its entries itself.
             other => tracing::warn!(?other, "not an action of the window"),
         }
@@ -3131,13 +3139,27 @@ impl Workspace {
         color: Hsla,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // The connection carries its tag colour, as its tabs do.
-        let stripe = (item == StatusItem::Connection)
+        // The connection carries its tag colour, as its tabs do, and its
+        // engine's logo, as the tab toolbar's connection selector does.
+        let saved = (item == StatusItem::Connection)
             .then(|| {
                 let tab = self.tabs.get(self.active_tab)?;
-                self.connection_color(tab.connection(cx).as_deref(), cx)
+                self.connections
+                    .read(cx)
+                    .get(&tab.connection(cx)?)
+                    .map(|saved| saved.config.clone())
             })
             .flatten();
+        let stripe = saved
+            .as_ref()
+            .map(|config| theme::connection_color(config, cx));
+        let logo = saved.as_ref().map(|config| {
+            div()
+                .id("status-connection-logo")
+                .test_support()
+                .flex_none()
+                .child(crate::engine_logo::engine_logo(config.engine, px(12.), cx))
+        });
         let text = h_flex()
             .gap_1p5()
             .children(stripe.map(|stripe| {
@@ -3150,6 +3172,7 @@ impl Workspace {
                     .rounded_full()
                     .bg(stripe)
             }))
+            .children(logo)
             .child(div().text_color(color).child(text.into()));
         if self.menu_entries(MenuOf::Status(item), cx).is_empty() {
             return text.into_any_element();
@@ -3434,7 +3457,8 @@ impl Workspace {
                                 },
                                 Some(true),
                             )
-                            .primary()
+                            // Neither answer is the safe one: no primary.
+                            .outline()
                             .disabled(commit.is_some()),
                         ],
                         tabs::Ending::Discard => vec![
@@ -3532,7 +3556,7 @@ impl Workspace {
     /// worked). Called on each frame: remembers what had the keyboard in
     /// the window while no dialog was open, and gives it back to that (or
     /// to the active tab) when a dialog closed and the focus is nowhere in
-    /// the window.
+    /// the window, or whenever nothing at all has the focus.
     fn keep_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_open = std::mem::replace(&mut self.dialog_open, window.has_active_dialog(cx));
         if self.dialog_open {
@@ -3540,7 +3564,10 @@ impl Workspace {
         }
         if self.focus_handle.contains_focused(window, cx) {
             self.last_focus = window.focused(cx).map(|focus| focus.downgrade());
-        } else if was_open {
+        } else if was_open || window.focused(cx).is_none() {
+            // The focus nowhere at all (nothing focused yet, or what had it
+            // was dropped) also leaves every key and menu-bar command
+            // without a path to the workspace: Cmd+, did nothing.
             let workspace = cx.entity().downgrade();
             // Once what closing the dialog ran is done (it may have closed
             // the tab that had the keyboard, or given it elsewhere).

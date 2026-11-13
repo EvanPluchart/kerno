@@ -705,3 +705,41 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   and `NULL` sorts first in a descending order.
 - Tests assert only on objects of their own (`docs/plans/README.md`, "Reliability of the suite"); a failed
   test's cleanup reports what it could not drop instead of panicking a second time, which aborted the run.
+
+## D-040 — Choices of the third visual pass (M10 Part 4)
+
+- **Danger buttons are filled.** The kit's default danger button is a red label on a 20 % red tint, under
+  AA in the dark theme. The theme file defines it: filled red with a white label in light (5.4:1), filled
+  red with a dark-red label in dark (6.4:1). This holds for every danger button of the app.
+- **The dark selected row is `#323B20`** (1.53:1 against a row; text on it 9.7:1, muted text 4.6:1). A test
+  asks for at least 1.45:1 between a selected and an unselected row in dark. The light theme keeps the
+  brand's Lime wash.
+- **The session question has no primary button.** Rolling back and committing are both outline buttons:
+  neither is the safe answer, and Enter confirms nothing.
+- **The keyboard goes back to the active tab whenever nothing has the focus.** With no focused element the
+  window dispatched keys from its root, above the workspace, and Cmd+, or any workspace shortcut did
+  nothing.
+- **A column is first drawn at the width of what it shows** (its name, its type, the longest value of the
+  first page), up to 360 px, measured when the first page arrives and not per frame. A result read again
+  (filtered or ordered on the server) keeps the widths it had, by column name.
+- **Open Table lists scattered-letter matches only when no name contains the text.**
+- **A click on a row number selects the row**, shift and click stretches the selection of rows.
+- **A cancelled import is not a refused record**: the batch is not tried again row by row; the import ends
+  cancelled and rolls back.
+
+## D-041 — The matching bracket is Kerno's, drawn with the editor's range decorations
+
+- gpui-kit 0.9.1's editor closes brackets but never marks the matching one (§4 C2). Kerno finds it with its
+  own lexer (`sql::text::matching_bracket`): the bracket just before the cursor wins, else the one just
+  after; depth counts the same kind only; a match never crosses a `;`; brackets in strings, quoted names
+  and comments are text, except that a dollar-quoted body is code and is matched as a script of its own.
+- Both brackets get a 1 px outline in the editor's text colour (no new token; the existing contrast test
+  covers that colour on the editor and on the active line). The error mark stays on the editor's
+  diagnostics: brackets there would count as errors and take their style.
+- The scan is bounded to 8 KiB each way from the cursor, from a line start, so a long script costs what a
+  short one does. Known limit: a block comment or dollar-quoted body that opens more than 8 KiB above the
+  cursor and closes before it leaves the brackets after its end unmarked.
+- Setting a decoration collection always notifies the editor in this kit version, even with nothing
+  changed: Kerno compares before setting, or its editor observer would loop.
+- The status bar's summary answers a right-click with "New connection…" or "Disconnect all" (as it says
+  "Not connected" or "N connections open") and Copy; the messages count with "Show messages" and Copy.

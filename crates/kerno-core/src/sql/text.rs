@@ -1,9 +1,10 @@
 //! Text commands of the SQL editor that need to know what is SQL and what
-//! is data: changing the case of a selection, and block comments.
+//! is data: changing the case of a selection, block comments, and the
+//! bracket that matches the one at the cursor.
 
 use std::ops::Range;
 
-use super::lex::{LexRules, TokenKind, lex};
+use super::lex::{LexRules, Token, TokenKind, lex};
 
 /// The text of `range` of `text` in upper case (`upper`) or lower case
 /// (Eclipse's Format ▸ To Upper / Lower Case, which DBeaver's editor
@@ -49,6 +50,86 @@ pub fn toggle_block_comment(selected: &str) -> String {
         return format!("{lead}{inner}{trail}");
     }
     format!("{lead}/* {body} */{trail}")
+}
+
+/// The bracket just before `offset` (else the one just after it) and the
+/// bracket that matches it, for the editor to mark. Only brackets of SQL
+/// count: those in strings, quoted names and comments are text. Depth
+/// counts the same kind of bracket only, and a match never crosses a `;`.
+/// A dollar-quoted body is code: inside one, its own brackets are matched.
+/// `None` when no bracket touches `offset` or it has no match.
+pub fn matching_bracket(
+    sql: &str,
+    offset: usize,
+    rules: LexRules,
+) -> Option<(Range<usize>, Range<usize>)> {
+    let tokens = lex(sql, rules);
+    // The body of a routine is code in a dollar-quoted string: inside one,
+    // its brackets are matched as those of a script of their own.
+    if let Some(body) = tokens.iter().find(|token| {
+        token.kind == TokenKind::String
+            && token.range.start < offset
+            && offset < token.range.end
+            && sql[token.range.clone()].starts_with('$')
+    }) {
+        let quoted = &sql[body.range.clone()];
+        let tag = quoted[1..].find('$')? + 2;
+        let inner = body.range.start + tag..body.range.end.checked_sub(tag)?;
+        if !quoted.ends_with(&quoted[..tag]) || !(inner.start..=inner.end).contains(&offset) {
+            return None;
+        }
+        let shift = |range: Range<usize>| range.start + inner.start..range.end + inner.start;
+        return matching_bracket(&sql[inner.clone()], offset - inner.start, rules)
+            .map(|(at, other)| (shift(at), shift(other)));
+    }
+    // A bracket is a one-byte punctuation token: `(` and `)` give
+    // `Some(('(', ')'))` and `Some((')', '('))`.
+    let bracket = |token: &Token| {
+        if token.kind != TokenKind::Punct || token.range.len() != 1 {
+            return None;
+        }
+        match sql.as_bytes()[token.range.start] {
+            b'(' => Some((b'(', b')')),
+            b'[' => Some((b'[', b']')),
+            b'{' => Some((b'{', b'}')),
+            b')' => Some((b')', b'(')),
+            b']' => Some((b']', b'[')),
+            b'}' => Some((b'}', b'{')),
+            _ => None,
+        }
+    };
+    let at = tokens
+        .iter()
+        .position(|token| token.range.end == offset && bracket(token).is_some())
+        .or_else(|| {
+            tokens
+                .iter()
+                .position(|token| token.range.start == offset && bracket(token).is_some())
+        })?;
+    let (same, other) = bracket(&tokens[at])?;
+    let forward = matches!(same, b'(' | b'[' | b'{');
+    let rest: Box<dyn Iterator<Item = &Token>> = if forward {
+        Box::new(tokens[at + 1..].iter())
+    } else {
+        Box::new(tokens[..at].iter().rev())
+    };
+    let mut depth = 0usize;
+    for token in rest {
+        if token.kind == TokenKind::Semicolon {
+            return None;
+        }
+        match bracket(token) {
+            Some((byte, _)) if byte == same => depth += 1,
+            Some((byte, _)) if byte == other => {
+                if depth == 0 {
+                    return Some((tokens[at].range.clone(), token.range.clone()));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -114,5 +195,106 @@ mod tests {
         assert_eq!(toggle_block_comment("/*  */"), "");
         // `/*/` is not a comment of its own.
         assert_eq!(toggle_block_comment("/*/"), "/* /*/ */");
+    }
+
+    /// The marked pair as the text it covers, with the cursor at the `|`.
+    fn pair(marked: &str, rules: LexRules) -> Option<(String, String)> {
+        let offset = marked.find('|').expect("a cursor");
+        let text = marked.replacen('|', "", 1);
+        matching_bracket(&text, offset, rules).map(|(at, other)| {
+            (
+                format!("{}@{}", &text[at.clone()], at.start),
+                format!("{}@{}", &text[other.clone()], other.start),
+            )
+        })
+    }
+
+    fn pg(marked: &str) -> Option<(String, String)> {
+        pair(marked, LexRules::POSTGRES)
+    }
+
+    fn found(at: &str, other: &str) -> Option<(String, String)> {
+        Some((at.to_string(), other.to_string()))
+    }
+
+    #[test]
+    fn the_bracket_beside_the_cursor_and_its_match_are_found_either_way() {
+        // Just after the bracket, and just before it.
+        assert_eq!(pg("count(|*)"), found("(@5", ")@7"));
+        assert_eq!(pg("count|(*)"), found("(@5", ")@7"));
+        assert_eq!(pg("count(*)|"), found(")@7", "(@5"));
+        assert_eq!(pg("count(*|)"), found(")@7", "(@5"));
+        // Between two brackets, the one before the cursor wins.
+        assert_eq!(pg("f(a)|(b)"), found(")@3", "(@1"));
+        // Square brackets and braces too.
+        assert_eq!(pg("a[|1]"), found("[@1", "]@3"));
+        assert_eq!(pg("|{x}"), found("{@0", "}@2"));
+        // Elsewhere, nothing.
+        assert_eq!(pg("count(*) |from t"), None);
+        assert_eq!(pg("|"), None);
+    }
+
+    #[test]
+    fn nested_brackets_match_at_their_own_depth() {
+        assert_eq!(pg("|(a + (b * c))"), found("(@0", ")@12"));
+        assert_eq!(pg("(a + |(b * c))"), found("(@5", ")@11"));
+        assert_eq!(pg("(a + (b * c)|)"), found(")@11", "(@5"));
+        // Another kind of bracket does not count.
+        assert_eq!(pg("|(a[1], b[2])"), found("(@0", ")@11"));
+    }
+
+    #[test]
+    fn brackets_in_a_dollar_quoted_body_match_inside_it() {
+        let sql = "create function f() returns int as $body$ begin return (1 + (2)); end $body$";
+        let open = sql.find("(1").unwrap();
+        let close = sql.rfind("))").unwrap() + 1;
+        assert_eq!(
+            matching_bracket(sql, open + 1, LexRules::POSTGRES),
+            Some((open..open + 1, close..close + 1))
+        );
+        // Not across the end of the body, and an unfinished body has none.
+        assert_eq!(
+            matching_bracket("select $$ ( $$ )", 11, LexRules::POSTGRES),
+            None
+        );
+        assert_eq!(
+            matching_bracket("select $$ ()", 11, LexRules::POSTGRES),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_bracket_has_no_match() {
+        assert_eq!(pg("|(a + (b)"), None);
+        assert_eq!(pg("a)|"), None);
+        // A match never crosses the end of a statement.
+        assert_eq!(pg("select (1;|)"), None);
+        assert_eq!(pg("select |(1; select 2)"), None);
+    }
+
+    #[test]
+    fn brackets_in_strings_names_and_comments_do_not_count() {
+        assert_eq!(pg("|(')' || x)"), found("(@0", ")@9"));
+        assert_eq!(pg("|(\")\" + x)"), found("(@0", ")@8"));
+        assert_eq!(pg("|(x -- )\n)"), found("(@0", ")@8"));
+        assert_eq!(pg("|(x /* ) */)"), found("(@0", ")@10"));
+        assert_eq!(pg("|($$)$$)"), found("(@0", ")@6"));
+        // A bracket inside a string is not marked itself.
+        assert_eq!(pg("'(|'"), None);
+        assert_eq!(pg("-- (|)"), None);
+        // MySQL: backticks name, double quotes are strings, `#` comments.
+        let mysql = |marked| pair(marked, LexRules::MYSQL);
+        assert_eq!(mysql("|(`)` + \")\")"), found("(@0", ")@10"));
+        assert_eq!(mysql("|(x # )\n)"), found("(@0", ")@7"));
+    }
+
+    #[test]
+    fn multi_byte_text_around_the_brackets_is_safe() {
+        assert_eq!(pg("'été', (|'ü')"), found("(@9", ")@14"));
+        assert_eq!(pg("(é)|"), found(")@3", "(@0"));
+        // An offset inside a character is not a bracket's edge.
+        assert_eq!(pg("é|"), None);
+        assert_eq!(matching_bracket("é", 1, LexRules::POSTGRES), None);
+        assert_eq!(matching_bracket("()", 9, LexRules::POSTGRES), None);
     }
 }

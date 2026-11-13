@@ -388,8 +388,8 @@ SELECT pg_catalog.pg_get_userbyid(c.relowner) AS \"Owner\",
        CASE WHEN c.relkind <> 'v' THEN pg_catalog.pg_total_relation_size(c.oid) END AS \"Total size\",
        c.relrowsecurity AS \"Row-level security\",
        pg_catalog.array_to_string(c.reloptions, ', ') AS \"Options\",
-       GREATEST(s.last_vacuum, s.last_autovacuum) AS \"Last vacuum\",
-       GREATEST(s.last_analyze, s.last_autoanalyze) AS \"Last analyze\",
+       date_trunc('second', GREATEST(s.last_vacuum, s.last_autovacuum)) AS \"Last vacuum\",
+       date_trunc('second', GREATEST(s.last_analyze, s.last_autoanalyze)) AS \"Last analyze\",
        c.oid AS \"OID\",
        pg_catalog.obj_description(c.oid, 'pg_class') AS \"Comment\"
 FROM pg_catalog.pg_class c

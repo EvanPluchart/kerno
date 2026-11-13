@@ -45,7 +45,7 @@ use kerno_core::sql::{
 };
 use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_sql,
-    split_statements, statement_at, toggle_block_comment,
+    matching_bracket, split_statements, statement_at, toggle_block_comment,
 };
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
@@ -384,6 +384,10 @@ pub struct QueryTab {
     /// What the run being prepared reads again, and the run in progress.
     next_requery: Option<Requery>,
     requery: Option<Requery>,
+    /// The column widths of the result being read again, kept by the
+    /// run being prepared, and by the run in progress.
+    next_widths: HashMap<String, gpui_kit::Pixels>,
+    widths: HashMap<String, gpui_kit::Pixels>,
     /// The filter of the result on screen, and the pane it shows.
     result_filter: Entity<InputState>,
     result_filter_for: Option<u64>,
@@ -398,6 +402,8 @@ pub struct QueryTab {
     auto_refresh: Option<AutoRefresh>,
     /// Why auto-refresh stopped by itself, until it is started again.
     auto_refresh_stopped: Option<&'static str>,
+    /// The frames around the bracket at the cursor and its match.
+    brackets: input::RangeDecorationCollection,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -444,10 +450,11 @@ impl QueryTab {
                 .placeholder("Write SQL here")
         });
         let settings = cx.observe_global_in::<AppState>(window, Self::follow_settings);
-        editor.update(cx, |editor, _| {
+        let brackets = editor.update(cx, |editor, cx| {
             editor
                 .lsp_mut()
                 .set_completion_highlighter(Rc::new(completion::highlight));
+            editor.create_range_decorations_collection(Vec::new(), cx)
         });
         // An edit makes a file's tab differ from its file. (Moving the
         // cursor also notifies observers; only a change of text counts.)
@@ -457,6 +464,10 @@ impl QueryTab {
                 cx.notify();
             }
         });
+        // Every change of the editor (text, cursor, blink) re-marks the
+        // brackets: the scan is bounded, and nothing is redrawn when the
+        // marks stay the same.
+        let cursor_moves = cx.observe(&editor, |this: &mut Self, _, cx| this.mark_brackets(cx));
         let subscription = cx.subscribe_in(
             &connections,
             window,
@@ -527,6 +538,8 @@ impl QueryTab {
             source: None,
             editor_options,
             next_requery: None,
+            next_widths: HashMap::new(),
+            widths: HashMap::new(),
             requery: None,
             result_filter,
             result_filter_for: None,
@@ -535,7 +548,8 @@ impl QueryTab {
             side: None,
             auto_refresh: None,
             auto_refresh_stopped: None,
-            _subscriptions: vec![subscription, edits, settings, filtering],
+            brackets,
+            _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
         tab.follow_connection(cx);
         tab
@@ -1163,6 +1177,53 @@ impl QueryTab {
             .as_ref()
             .and_then(|target| self.connections.read(cx).meta_session(&target.connection))
             .map_or(LexRules::POSTGRES, |meta| meta.dialect().lex_rules())
+    }
+
+    /// Frames the bracket beside the cursor and the one that matches it
+    /// (C2 bracket matching), or nothing.
+    fn mark_brackets(&mut self, cx: &mut Context<Self>) {
+        // ponytail: lexes 8 KiB each way from the cursor, from a line
+        // start, so a long script costs no more than a short one. In a
+        // script longer than that, a window that begins inside a multi-line
+        // string or comment can misread the brackets after it; cache the
+        // whole text's tokens per edit if that is ever seen.
+        const WINDOW: usize = 8 * 1024;
+        let editor = self.editor.read(cx);
+        let cursor = editor.cursor();
+        let text = editor.text();
+        let start = text.floor_char_boundary(cursor.saturating_sub(WINDOW));
+        let end = text.ceil_char_boundary((cursor + WINDOW).min(text.len()));
+        let window = text.slice(start..end).to_string();
+        let from = start
+            + if start == 0 {
+                0
+            } else {
+                window[..cursor - start]
+                    .find('\n')
+                    .map_or(0, |line| line + 1)
+            };
+        let marks: Vec<_> =
+            matching_bracket(&window[from - start..], cursor - from, self.lex_rules(cx))
+                .map(|(at, other)| {
+                    vec![
+                        at.start + from..at.end + from,
+                        other.start + from..other.end + from,
+                    ]
+                })
+                .unwrap_or_default();
+        // Setting them notifies the editor, which calls this again: set
+        // only what changed.
+        if self.brackets.get_ranges(cx) != marks {
+            let marks = marks.into_iter().map(input::RangeDecoration::new).collect();
+            self.brackets.set(marks, cx);
+        }
+    }
+
+    /// The ranges framed as the bracket at the cursor and its match; for
+    /// tests.
+    #[cfg(test)]
+    pub fn marked_brackets(&self, cx: &App) -> Vec<std::ops::Range<usize>> {
+        self.brackets.get_ranges(cx)
     }
 
     fn statements(&self, scope: Scope, cx: &App) -> Vec<Statement> {
@@ -1829,6 +1890,14 @@ impl QueryTab {
         }
     }
 
+    /// Shows the messages of the last run, after the result tabs (the
+    /// status bar's messages item).
+    pub fn show_messages(&mut self, cx: &mut Context<Self>) {
+        self.show_results();
+        self.active_result = self.results.len();
+        cx.notify();
+    }
+
     /// Before a run: the results that are not pinned go, unless the run
     /// keeps them. Their rows are freed with them.
     fn clear_results(&mut self) {
@@ -1980,6 +2049,7 @@ impl QueryTab {
         self.stop(cx);
         self.generation += 1;
         self.requery = self.next_requery.take();
+        self.widths = std::mem::take(&mut self.next_widths);
         self.clear_results();
         self.notices.clear();
         // The first result of this run is shown; the editor and the
@@ -2118,8 +2188,14 @@ impl QueryTab {
                                 {
                                     let paused = grid.update(cx, |grid, cx| {
                                         grid.delegate_mut().push(batch);
+                                        let paused = grid.delegate().has_more();
+                                        // The first page sets the widths of the
+                                        // columns (more pages keep them).
+                                        if paused && grid.delegate().row_count() as u64 <= page {
+                                            grid.refresh(cx);
+                                        }
                                         cx.notify();
-                                        grid.delegate().has_more()
+                                        paused
                                     });
                                     if paused {
                                         // The rows asked for are here: the tab is not
@@ -2433,6 +2509,13 @@ impl QueryTab {
             .map_or(TxState::Idle, |session| session.tx_state())
     }
 
+    /// Whether a statement holds the tab's session: running, or a result
+    /// waiting to be paged; for tests.
+    #[cfg(test)]
+    pub fn holds_session(&self) -> bool {
+        self.run.is_some()
+    }
+
     /// Whether a statement is running.
     pub fn running(&self) -> bool {
         matches!(self.activity, Activity::Running { .. })
@@ -2638,7 +2721,7 @@ impl QueryTab {
         // filters it.
         let view = cx.weak_entity();
         let sql = statement.to_string();
-        let mut grid = grid.with_owner(Owner {
+        let mut grid = grid.with_widths(self.widths.clone()).with_owner(Owner {
             act: Rc::new(move |action, row, column, window, cx| {
                 let _ = view.update(cx, |this, cx| match action {
                     GridAction::Export => {
@@ -3943,6 +4026,11 @@ impl QueryTab {
                 return;
             }
         };
+        // Read again, the result keeps its column widths.
+        self.next_widths = self
+            .pane_grid(id)
+            .map(|grid| Grid::widths(grid.read(cx)))
+            .unwrap_or_default();
         self.next_requery = Some(Requery {
             filter,
             sort,
@@ -4651,7 +4739,16 @@ impl QueryTab {
             .collect();
         let (databases, schemas) = (self.databases.clone(), self.schemas.clone());
         let running = matches!(self.activity, Activity::Running { .. });
-        let waiting = self.run.is_some() || self.pending.is_some();
+        // Stop while a statement runs or rows are on their way; a result
+        // that only waits for "Fetch more" has nothing to stop.
+        let fetching = self
+            .receiving
+            .and_then(|id| self.pane_grid(id))
+            .is_some_and(|grid| {
+                let grid = grid.read(cx).delegate();
+                !grid.is_complete() && !grid.has_more()
+            });
+        let waiting = running || self.pending.is_some() || (self.run.is_some() && fetching);
         let transaction = self
             .session
             .as_ref()
@@ -5068,8 +5165,22 @@ impl QueryTab {
     /// (DBeaver's `ResultSetFilterPanel` over an editor's result).
     fn render_result_filter(&self, requery: &Requery, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let refined = !requery.filter.trim().is_empty() || requery.sort.is_some();
+        let filtered = !requery.filter.trim().is_empty();
+        let refined = filtered || requery.sort.is_some();
         let statement = SharedString::from(requery.statement.clone());
+        let done = match (filtered, requery.sort.is_some()) {
+            (true, true) => "filtered and ordered",
+            (true, false) => "filtered",
+            _ => "ordered",
+        };
+        let origin = SharedString::from(if requery.order_dropped {
+            format!(
+                "{done} on the server, which ignored the statement's ORDER BY: \
+                 order by a column header"
+            )
+        } else {
+            format!("{done} on the server")
+        });
         h_flex()
             .id("result-filter-bar")
             .test_support()
@@ -5140,12 +5251,8 @@ impl QueryTab {
                         .flex_none()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(if requery.order_dropped {
-                            "read again by the server, which ignored the statement's ORDER BY: \
-                             order by a column header"
-                        } else {
-                            "read again by the server"
-                        })
+                        .aria_label(origin.clone())
+                        .child(origin)
                         .tooltip(move |window, cx| {
                             Tooltip::new(statement.clone()).build(window, cx)
                         }),
@@ -5444,17 +5551,16 @@ impl QueryTab {
                 let grid = grid.read(cx).delegate();
                 let rows = grid.row_count();
                 let more = grid.has_more();
+                let count = plan_view::number(rows as f64);
                 let text = match pane.total {
                     _ if grid.is_complete() => {
-                        format!("{rows} row{}", if rows == 1 { "" } else { "s" })
+                        format!("{count} row{}", if rows == 1 { "" } else { "s" })
                     }
-                    Some(total) => format!(
-                        "first {} of {} rows",
-                        plan_view::number(rows as f64),
-                        plan_view::number(total as f64)
-                    ),
-                    None if more => format!("first {rows} rows; more on the server"),
-                    None => format!("{rows} rows so far"),
+                    Some(total) => {
+                        format!("first {count} of {} rows", plan_view::number(total as f64))
+                    }
+                    None if more => format!("first {count} rows; more on the server"),
+                    None => format!("{count} rows so far"),
                 };
                 // Which order the rows are in, as DBeaver's smart ordering
                 // chose it.
@@ -5506,7 +5612,14 @@ impl QueryTab {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child(SharedString::from(summary))
+                    .child({
+                        let summary = SharedString::from(summary);
+                        div()
+                            .id("result-summary")
+                            .test_support()
+                            .aria_label(summary.clone())
+                            .child(summary)
+                    })
                     .children(
                         order.map(|order| div().id("result-order").test_support().child(order)),
                     )

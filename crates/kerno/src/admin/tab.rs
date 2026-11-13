@@ -1021,27 +1021,40 @@ impl AdminTab {
             )
     }
 
-    fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let counts: Vec<Option<usize>> = SECTIONS
+    /// The names of the sub-tabs with their counts: "Sessions (2 of 6)"
+    /// when the filter or "Hide idle" leaves some out.
+    pub fn section_titles(&self, cx: &App) -> Vec<String> {
+        SECTIONS
             .iter()
-            .map(|(_, panes)| {
+            .map(|(label, panes)| {
                 // The grants count with their role, not apart.
                 let pane = self.view(panes[0]);
-                pane.loaded
-                    .then(|| pane.grid.read(cx).delegate().rows.len())
+                if !pane.loaded {
+                    return label.to_string();
+                }
+                let grid = pane.grid.read(cx).delegate();
+                let (shown, all) = (grid.visible.len(), grid.rows.len());
+                if shown < all {
+                    format!("{label} ({shown} of {all})")
+                } else {
+                    format!("{label} ({all})")
+                }
             })
-            .collect();
+            .collect()
+    }
+
+    fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let titles = self.section_titles(cx);
         TabBar::new("admin-sections")
             .selected_index(self.section)
             .on_click(
                 cx.listener(|this, index: &usize, window, cx| this.select(*index, window, cx)),
             )
-            .children(SECTIONS.iter().zip(counts).map(|((label, _), count)| {
-                Tab::new().label(SharedString::from(match count {
-                    Some(count) => format!("{label} ({count})"),
-                    None => label.to_string(),
-                }))
-            }))
+            .children(
+                titles
+                    .into_iter()
+                    .map(|title| Tab::new().label(SharedString::from(title))),
+            )
     }
 
     /// The filter box of the sub-tab and, for the sessions, what can be

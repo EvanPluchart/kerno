@@ -460,12 +460,18 @@ pub async fn import_csv(
                     inserted += batch.len() as u64;
                     progress(inserted);
                 }
+                // A cancel that stopped the statement on the server is not a
+                // record it refused: nothing is tried again.
+                Err(_) if cancel.load(Ordering::Acquire) => return Err(Error::Cancelled),
                 Err(error) if error.db().is_some() => {
                     // Find the record the server refuses.
                     run(&session, &format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}")).await?;
                     for (record, row) in batch.iter().zip(&rows) {
                         match run(&session, &format!("{head}{row}")).await {
                             Ok(()) => {}
+                            Err(_) if cancel.load(Ordering::Acquire) => {
+                                return Err(Error::Cancelled);
+                            }
                             Err(error) if error.db().is_some() => {
                                 return Ok(Some(refused(record.line, &error)));
                             }

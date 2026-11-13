@@ -925,6 +925,7 @@ impl StructureTab {
                 let comment = name == "Comment";
                 property_line(name, value.as_deref(), cx)
                     .id(("structure-property", index))
+                    .test_support()
                     .when(comment && editable, |this| {
                         this.child(
                             Button::new("structure-edit-comment")
@@ -1079,9 +1080,10 @@ fn property_line(name: &str, value: Option<&str>, cx: &App) -> gpui_kit::Div {
                 .text_color(theme.muted_foreground)
                 .child(SharedString::from(name.to_string())),
         )
+        // The value takes only its own width: an action after it (the
+        // comment's "Edit…") sits beside it.
         .child(
             div()
-                .flex_1()
                 .min_w_0()
                 .when(value.is_none(), |this| {
                     this.text_color(theme.muted_foreground)

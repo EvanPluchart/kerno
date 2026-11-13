@@ -152,6 +152,10 @@ pub enum TabAction {
     CopyText(String),
     AboutReadOnly,
     AboutMemoryOnly,
+    /// Shows the messages of the query tab's last run.
+    ShowMessages,
+    NewConnection,
+    DisconnectAll,
     // A result tab of a query tab.
     CloseToLeft,
     Pin,
@@ -228,6 +232,9 @@ impl TabAction {
             Self::CopyText(_) => "Copy",
             Self::AboutReadOnly => "What read-only means…",
             Self::AboutMemoryOnly => "What this means…",
+            Self::ShowMessages => "Show messages",
+            Self::NewConnection => "New connection…",
+            Self::DisconnectAll => "Disconnect all",
             Self::CloseToLeft => "Close tabs to the left",
             Self::Pin => "Pin tab",
             Self::Unpin => "Unpin tab",
@@ -632,6 +639,8 @@ pub struct StatusFacts {
     pub transaction: TxState,
     pub manual_commit: bool,
     pub running: bool,
+    /// How many connections are open (the summary, without a tab on one).
+    pub open_connections: usize,
 }
 
 /// The actions of a status bar item showing `text`; none when it has none.
@@ -640,7 +649,19 @@ pub struct StatusFacts {
 pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Entry> {
     let not_connected = (!facts.connected).then_some("not connected");
     match item {
-        StatusItem::Summary | StatusItem::Messages => Vec::new(),
+        StatusItem::Summary => vec![
+            enabled(if facts.open_connections == 0 {
+                TabAction::NewConnection
+            } else {
+                TabAction::DisconnectAll
+            }),
+            Separator,
+            enabled(TabAction::CopyText(text.into())),
+        ],
+        StatusItem::Messages => vec![
+            enabled(TabAction::ShowMessages),
+            enabled(TabAction::CopyText(text.into())),
+        ],
         StatusItem::Connection => vec![
             Item(TabAction::Disconnect, not_connected),
             Item(TabAction::Reconnect, not_connected),
@@ -1191,8 +1212,22 @@ mod tests {
             ["Review SQL…", "Discard changes"]
         );
         assert_eq!(menu(StatusItem::MemoryOnly, &facts), ["What this means…"]);
-        assert!(menu(StatusItem::Summary, &facts).is_empty());
-        assert!(menu(StatusItem::Messages, &facts).is_empty());
+        assert_eq!(
+            menu(StatusItem::Summary, &facts),
+            ["New connection…", "—", "Copy"]
+        );
+        let two_open = StatusFacts {
+            open_connections: 2,
+            ..StatusFacts::default()
+        };
+        assert_eq!(
+            menu(StatusItem::Summary, &two_open),
+            ["Disconnect all", "—", "Copy"]
+        );
+        assert_eq!(
+            menu(StatusItem::Messages, &facts),
+            ["Show messages", "Copy"]
+        );
 
         // An open transaction: ended from here; switching or closing the
         // session asks first (`end_question`), so they stay offered.

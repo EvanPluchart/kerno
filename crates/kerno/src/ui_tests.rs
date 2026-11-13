@@ -38,6 +38,10 @@ use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
+mod brackets;
+mod coverage;
+mod menus;
+
 struct Fixture {
     window: WindowHandle<Root>,
     workspace: Entity<Workspace>,
@@ -3453,14 +3457,24 @@ fn the_menu_of_a_column_header_orders_filters_and_fits(cx: &mut TestAppContext) 
     app.wait_for_rows(cx, "Rows 1–1 of 1");
     assert_eq!(app.data_rows(cx)[0][2], "2");
 
-    // Fit width narrows "name" (short values) to what it shows.
+    // A column is first drawn at the width it needs; widened by hand,
+    // Fit width brings "name" (short values) back to it.
     let grid = app.data_grid(cx);
     let width = |cx: &mut TestAppContext| cx.update(|cx| grid.read(cx).col_width(2).unwrap());
-    let before = width(cx);
+    let default = width(cx);
+    let header = app.step(cx, |window, _| window.find(("col-header", 2usize)).bounds());
+    let from = gpui_kit::point(header.right() - px(2.), header.center().y);
+    let to = gpui_kit::point(from.x + px(80.), from.y);
+    app.step(cx, |window, cx| window.drag(from, to, cx));
+    let widened = width(cx);
+    assert!(widened > default + px(70.), "{default:?} → {widened:?}");
     app.right_click(cx, ("column-header", 2usize), None);
     click_menu_entry(&app, cx, "Fit width");
-    let after = width(cx);
-    assert!(after < before && after > px(40.), "{before:?} → {after:?}");
+    let fitted = width(cx);
+    assert!(
+        (fitted - default).abs() <= px(1.) && fitted > px(40.),
+        "{default:?} → {widened:?} → {fitted:?}"
+    );
 
     // Copy column name and Hide column, from the header's own menu.
     app.right_click(cx, ("column-header", 2usize), None);
@@ -9139,10 +9153,16 @@ fn result_tabs_close_pin_and_rename(cx: &mut TestAppContext) {
     app.wait_until(cx, "the first page", |app, cx| {
         app.outcomes(cx) == ["1 rows", "1000 rows, more"]
     });
-    assert!(app.has(cx, "tab-cancel"), "the statement waits to be paged");
+    let holds = |app: &Fixture, cx: &mut TestAppContext| {
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.read(cx).holds_session())
+    };
+    assert!(holds(&app, cx), "the statement waits to be paged");
+    // Nothing to stop while it only waits for Fetch more.
+    assert!(!app.has(cx, "tab-cancel"));
     app.middle_click(cx, ("result-tab", 1usize));
     assert_eq!(app.result_tabs(cx), ["*kept"]);
-    assert!(!app.has(cx, "tab-cancel"), "its statement stopped");
+    assert!(!holds(&app, cx), "its statement stopped");
 
     // A result added beside a kept one pages; the kept one's cells copy
     // and export from their menu.
@@ -10166,6 +10186,17 @@ fn mysql_and_mariadb_tools_show_their_status_rows(cx: &mut TestAppContext) {
             app.tool_state(cx, &dialog),
             "options: OPTIMIZE TABLE `kerno_ui_maint_my`.`t`"
         );
+        // Truncate is set apart: last, after a gap.
+        let (truncate, repair) = app.step(cx, |window, _| {
+            (
+                window.find(("maintenance-tool", 1usize)).bounds(),
+                window.find(("maintenance-tool", 4usize)).bounds(),
+            )
+        });
+        assert!(
+            truncate.left() >= repair.right() + px(12.),
+            "{truncate:?} {repair:?}"
+        );
         assert_eq!(app.run_tool(cx, &dialog), "done", "{engine:?}");
         let (rows, _) = cx.update(|cx| dialog.read(cx).report());
         assert!(ends_ok(&rows, "optimize"), "{engine:?}: {rows:?}");
@@ -10786,11 +10817,20 @@ fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) 
         );
         assert_eq!(theme::connection_color(&production, cx), cx.theme().danger);
     });
-    // The status bar's connection item carries it too.
+    // The status bar's connection item carries it too, and the engine's
+    // logo before the name.
     app.click(cx, ("tab-title", 0usize));
     assert!(app.has(cx, "status-connection-stripe"));
+    let (logo, name) = app.step(cx, |window, _| {
+        (
+            window.find("status-connection-logo").bounds(),
+            window.find("status-connection").bounds(),
+        )
+    });
+    assert!(logo.left() >= name.left() && logo.right() <= name.right());
     app.click(cx, ("tab-title", 2usize));
     assert!(!app.has(cx, "status-connection-stripe"));
+    assert!(!app.has(cx, "status-connection-logo"));
 }
 
 #[gpui_kit::test]
@@ -12250,6 +12290,20 @@ fn record_view_shows_one_row_and_edits_it(cx: &mut TestAppContext) {
     assert!(app.has(cx, "record-view"));
     assert!(!app.has(cx, "table-inner"));
     assert_eq!(row_label(&app, cx), "Row 1 of 3");
+    // First and Previous have nowhere to go from the first row.
+    let disabled = |app: &Fixture, cx: &mut TestAppContext| -> Vec<bool> {
+        app.step(cx, |window, _| {
+            [
+                "record-first",
+                "record-previous",
+                "record-next",
+                "record-last",
+            ]
+            .map(|id| window.find(id).disabled() == Some(true))
+            .to_vec()
+        })
+    };
+    assert_eq!(disabled(&app, cx), [true, true, false, false]);
     for field in 0usize..5 {
         assert!(app.has(cx, ("record-field", field)), "{field}");
     }
@@ -12258,6 +12312,7 @@ fn record_view_shows_one_row_and_edits_it(cx: &mut TestAppContext) {
     assert_eq!(row_label(&app, cx), "Row 2 of 3");
     app.click(cx, "record-last");
     assert_eq!(row_label(&app, cx), "Row 3 of 3");
+    assert_eq!(disabled(&app, cx), [false, false, true, true]);
     app.press(cx, &["ctrl-alt-shift-left"]);
     assert_eq!(row_label(&app, cx), "Row 1 of 3");
     app.press(cx, &["ctrl-alt-right"]);
@@ -12719,7 +12774,18 @@ fn the_lock_manager_lists_who_waits_for_whom_and_ends_the_blocker(cx: &mut TestA
             "{engine:?}: {rows:?}"
         );
         assert!(app.has(cx, "admin-hide-idle"));
+        // The sub-tab says how many of the sessions read are shown.
+        let admin = app.admin(cx);
+        let title = cx.update(|cx| admin.read(cx).section_titles(cx))[0].clone();
+        // Showing them again only recomputes the rows read: no new read.
         app.on_admin(cx, |tab, _, cx| tab.set_hide_idle(false, cx));
+        let all = app.admin_shown(cx, Pane::Sessions).1.len();
+        let expected = if rows.len() < all {
+            format!("Sessions ({} of {all})", rows.len())
+        } else {
+            format!("Sessions ({all})")
+        };
+        assert_eq!(title, expected, "{engine:?}");
 
         // TOOL-14: an empty list says what it would show.
         app.on_admin(cx, |tab, window, cx| tab.select(LOCKS, window, cx));
@@ -12860,6 +12926,7 @@ fn properties_open_first_on_f4_and_the_comment_is_set_from_there(cx: &mut TestAp
                     "CREATE SCHEMA kerno_ui_props",
                     "CREATE TABLE kerno_ui_props.t (id int PRIMARY KEY)",
                     "COMMENT ON TABLE kerno_ui_props.t IS 'first'",
+                    "ANALYZE kerno_ui_props.t",
                 ],
                 vec!["kerno", "kerno_ui_props", "Tables", "t"],
                 "SELECT COALESCE(obj_description('kerno_ui_props.t'::regclass, 'pg_class'), '-')",
@@ -12916,6 +12983,25 @@ fn properties_open_first_on_f4_and_the_comment_is_set_from_there(cx: &mut TestAp
         }
         assert_eq!(value(&shown, "Comment").as_deref(), Some("first"));
         assert!(app.has(cx, "structure-properties"), "{engine:?}");
+        // Times to the second.
+        if let Some(analyzed) = value(&shown, "Last analyze") {
+            assert!(!analyzed.contains('.'), "{analyzed}");
+        }
+        // The comment's "Edit…" sits beside its value, not at the far end.
+        let (line, edit) = app.step(cx, |window, _| {
+            let comment = shown
+                .iter()
+                .position(|(name, _)| name == "Comment")
+                .unwrap();
+            (
+                window.find(("structure-property", comment)).bounds(),
+                window.find("structure-edit-comment").bounds(),
+            )
+        });
+        assert!(
+            edit.left() < line.left() + px(400.),
+            "{engine:?}: {line:?} {edit:?}"
+        );
 
         // The comment is changed, then removed, each after the statement
         // was shown.
@@ -13108,6 +13194,15 @@ async fn object_filters_hide_schemas_and_last_after_a_restart(cx: &mut TestAppCo
     // Configure: masks typed one per line.
     filter(&restarted, cx, FilterAction::Configure, "kerno_ui_filter_b");
     assert!(restarted.has(cx, "filter-dialog"));
+    // Each field says in one plain line what it does.
+    assert_eq!(
+        restarted.label_of(cx, "filter-include-label"),
+        "Show only: names or masks to keep. Empty keeps every object."
+    );
+    assert_eq!(
+        restarted.label_of(cx, "filter-exclude-label"),
+        "Hide: names or masks to leave out."
+    );
     restarted.click(cx, "filter-exclude");
     restarted.type_text(cx, "KERNO_UI_FILTER_*");
     restarted.click(cx, "filter-save");
@@ -14739,5 +14834,291 @@ fn result_changes_stay_where_their_rows_were_read(cx: &mut TestAppContext) {
     assert_eq!(
         g8_rows(engine, schema),
         "1|uno|1,2|two|2,3|three|3,9|nine|9"
+    );
+}
+
+// M10 Part 4, third list: the captures of the new screens -------------------
+
+use gpui_kit::Pixels;
+
+impl Fixture {
+    /// The accessible label of the element with this id.
+    fn label_of(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> String {
+        let id = id.into();
+        self.step(cx, |window, _| {
+            window.find(id).label().unwrap_or_default().to_string()
+        })
+    }
+
+    /// Name, type and drawn width of each column of the first result of
+    /// the active tab, and the width its header and first rows need.
+    fn result_header(&self, cx: &mut TestAppContext) -> Vec<(String, String, Pixels, Pixels)> {
+        let tab = self.tab(cx);
+        let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+        cx.update(|cx| {
+            let table = grid.read(cx);
+            let delegate = table.delegate();
+            (1..=delegate.shown_columns().len())
+                .map(|column| {
+                    let source = delegate.source_column(column).unwrap();
+                    let described = &delegate.store().columns()[source];
+                    (
+                        described.name.clone(),
+                        described.type_name.clone(),
+                        table.col_width(column).unwrap(),
+                        delegate.content_width(source, cx),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Whether every column of the first result of the active tab offers
+    /// its sort mark.
+    fn sort_marks(&self, cx: &mut TestAppContext) -> bool {
+        let tab = self.tab(cx);
+        let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+        cx.update(|cx| {
+            let delegate = grid.read(cx).delegate();
+            (1..=delegate.shown_columns().len())
+                .all(|column| delegate.column(column, cx).sort.is_some())
+        })
+    }
+}
+
+#[gpui_kit::test]
+fn the_header_of_a_table_never_cuts_a_name_while_its_type_shows(cx: &mut TestAppContext) {
+    if !testing::available(Engine::MySql) {
+        return;
+    }
+    let app = connected(cx, Engine::MySql);
+    app.open_table(cx, "kerno", "order_items", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1–")
+    });
+    let grid = app.data_grid(cx);
+    let columns = cx.update(|cx| grid.read(cx).delegate().shown_columns());
+    // The name is drawn whole (at least as wide as its text) beside its
+    // type, the type in full too, in every column of the capture.
+    for (index, name) in columns.iter().enumerate() {
+        let column = index + 1;
+        let (drawn, typed) = app.step(cx, |window, _| {
+            (
+                window.find(("column-name", column)).bounds().size.width,
+                window.find(("column-type", column)).bounds().size.width,
+            )
+        });
+        let (needed, type_needed) = cx.update(|cx| {
+            let text = cx.text_system();
+            let theme = cx.theme();
+            let id = text.resolve_font(&gpui_kit::font(theme.font_family.clone()));
+            let size = crate::query::grid::text_size(cx);
+            let type_name = {
+                let delegate = grid.read(cx).delegate();
+                let source = delegate.source_column(column).unwrap();
+                delegate.store().columns()[source].type_name.clone()
+            };
+            let width = |shown: &str, size: Pixels| -> Pixels {
+                shown
+                    .chars()
+                    .map(|c| {
+                        text.advance(id, size, c)
+                            .map_or(px(0.), |advance| advance.width)
+                    })
+                    .sum()
+            };
+            (width(name, size), width(&type_name, size * 0.85))
+        });
+        assert!(drawn + px(1.) >= needed, "{name}: {drawn:?} < {needed:?}");
+        assert!(
+            typed + px(1.) >= type_needed,
+            "{name}: type {typed:?} < {type_needed:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_result_header_shows_name_and_type_whole_and_keeps_them_when_read_again(
+    cx: &mut TestAppContext,
+) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let paid = on_server(
+        Engine::Postgres,
+        "select count(*) from shop.orders where status = 'paid'",
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(cx, "select * from shop.orders", "secondary-enter");
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.outcomes(cx) == ["1000 rows, more"]
+    });
+    // A page that only waits for Fetch more has nothing to stop; its
+    // count is written as every count is.
+    assert!(!app.has(cx, "tab-cancel"));
+    assert_eq!(
+        app.label_of(cx, "result-summary"),
+        "first 1,000 rows; more on the server"
+    );
+    // Each column is first drawn wide enough for its name, its type and
+    // the values of the first page (a `timestamptz` whole).
+    let before = app.result_header(cx);
+    for (name, type_name, width, needed) in &before {
+        assert!(!type_name.is_empty(), "{name}");
+        assert!(
+            *width >= (*needed).min(px(360.)),
+            "{name}: {width:?} < {needed:?}"
+        );
+    }
+    let placed = before
+        .iter()
+        .find(|column| column.0 == "placed_at")
+        .unwrap();
+    assert!(placed.2 < px(360.), "{placed:?}");
+    // The first page in, the header orders (on the server) as it will
+    // once read again.
+    assert!(app.sort_marks(cx));
+
+    // Filtered on the server: the same header, the same widths.
+    let tab = app.tab(cx);
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.filter_result("status = 'paid'", window, cx)
+        })
+    });
+    app.wait_until(cx, "the paid orders", |app, cx| {
+        app.outcomes(cx) == [format!("{paid} rows")] && !app.running(cx)
+    });
+    let after = app.result_header(cx);
+    let shape = |header: &[(String, String, Pixels, Pixels)]| -> Vec<(String, String, Pixels)> {
+        header
+            .iter()
+            .map(|(name, type_name, width, _)| (name.clone(), type_name.clone(), *width))
+            .collect()
+    };
+    assert_eq!(shape(&after), shape(&before));
+    assert!(app.sort_marks(cx));
+    assert_eq!(
+        app.label_of(cx, "result-filter-origin"),
+        "filtered on the server"
+    );
+    assert_eq!(app.label_of(cx, "result-summary"), format!("{paid} rows"));
+
+    // Ordered too, from a header: still the same header.
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    app.step(cx, |window, cx| {
+        grid.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .perform_sort(1, ColumnSort::Descending, window, cx)
+        })
+    });
+    app.wait_until(cx, "the order of the server", |app, cx| {
+        g5_requery(app, cx).0.and_then(|requery| requery.sort) == Some(("id".into(), true))
+            && app.outcomes(cx) == [format!("{paid} rows")]
+            && !app.running(cx)
+    });
+    assert_eq!(shape(&app.result_header(cx)), shape(&before));
+    assert!(app.sort_marks(cx));
+    assert_eq!(
+        app.label_of(cx, "result-filter-origin"),
+        "filtered and ordered on the server"
+    );
+}
+
+#[gpui_kit::test]
+fn the_connection_menu_ticks_read_only_when_it_is_on(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let read_only_entry = |app: &Fixture, cx: &mut TestAppContext| -> Option<bool> {
+        use gpui_kit::test::TestQueryExt as _;
+        let popup = gpui_kit::ElementId::Name("popup-menu".into());
+        app.step(cx, |window, _| {
+            window
+                .find_all_by_label("Read-only")
+                .into_iter()
+                .find(|entry| entry.path().contains(&popup))
+                .expect("a Read-only entry")
+                .checked()
+        })
+    };
+    let mut config = testing::config(Engine::Postgres);
+    config.read_only = true;
+    let app = connected_as(cx, config);
+    app.right_click(cx, ("connection", 0usize), None);
+    assert_eq!(read_only_entry(&app, cx), Some(true));
+    app.press(cx, &["escape"]);
+
+    let app = connected(cx, Engine::Postgres);
+    app.right_click(cx, ("connection", 0usize), None);
+    assert_ne!(read_only_entry(&app, cx), Some(true));
+    app.press(cx, &["escape"]);
+}
+
+#[gpui_kit::test]
+fn cmd_comma_opens_the_settings_wherever_the_keyboard_is(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    // The keyboard nowhere (nothing focused yet, or what had it is gone).
+    app.step(cx, |window, cx| window.blur(cx));
+    app.press(cx, &["secondary-,"]);
+    assert!(app.dialog_open(cx), "nothing focused");
+    app.press(cx, &["escape"]);
+    assert!(!app.dialog_open(cx));
+    // In the editor of a query tab.
+    app.press(cx, &["secondary-t"]);
+    assert!(app.editor_has_keyboard(cx));
+    app.press(cx, &["secondary-,"]);
+    assert!(app.dialog_open(cx), "in the editor");
+    app.press(cx, &["escape"]);
+    assert!(!app.dialog_open(cx));
+}
+
+#[gpui_kit::test]
+fn go_to_row_from_the_palette_acts_on_the_grid_of_the_active_tab(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    // A result under the editor, which keeps the keyboard.
+    app.run_in_new_tab(
+        cx,
+        "select g from generate_series(1, 30) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["30 rows"]);
+    assert!(app.editor_has_keyboard(cx));
+    let go = |app: &Fixture, cx: &mut TestAppContext, row: &str| {
+        app.press(cx, &["secondary-k"]);
+        app.type_text(cx, "go to row");
+        app.press(cx, &["enter"]);
+        assert!(app.has(cx, "go-to-row"), "the Go to Row dialog");
+        app.type_text(cx, row);
+        app.press(cx, &["enter"]);
+        assert!(!app.dialog_open(cx));
+    };
+    go(&app, cx, "12");
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    let row = |cx: &mut TestAppContext| {
+        cx.update(|cx| crate::query::grid::current(grid.read(cx).selection()).0)
+    };
+    assert_eq!(row(cx), 11);
+    // With the keyboard nowhere, the palette still reaches the grid.
+    app.step(cx, |window, cx| window.blur(cx));
+    go(&app, cx, "3");
+    assert_eq!(row(cx), 2);
+
+    // A table's rows, the keyboard in its filter field.
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1–")
+    });
+    app.click(cx, "filter-raw");
+    go(&app, cx, "5");
+    let grid = app.data_grid(cx);
+    assert_eq!(
+        cx.update(|cx| crate::query::grid::current(grid.read(cx).selection()).0),
+        4
     );
 }

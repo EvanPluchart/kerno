@@ -58,8 +58,9 @@ pub fn relations(catalog: &Catalog) -> Vec<Relation> {
 }
 
 /// The relations matching `query`, best first: the name itself, then names
-/// that start with it, then names and `schema.name` that hold it, then those
-/// whose letters come in its order (`shcu` finds `shop.customers`).
+/// that start with it, then names and `schema.name` that hold it; only when
+/// none holds it, those whose letters come in its order (`shcu` finds
+/// `shop.customers`).
 pub fn ranked<'a>(relations: &'a [Relation], query: &str) -> Vec<&'a Relation> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -90,8 +91,11 @@ pub fn ranked<'a>(relations: &'a [Relation], query: &str) -> Vec<&'a Relation> {
         })
         .collect();
     scored.sort_by_key(|(score, index, _)| (*score, *index));
+    // Scattered letters only when no name holds the text itself.
+    let contained = scored.iter().any(|(score, _, _)| *score < 3);
     scored
         .into_iter()
+        .filter(|(score, _, _)| !contained || *score < 3)
         .map(|(_, _, relation)| relation)
         .collect()
 }
@@ -288,5 +292,31 @@ mod tests {
         assert_eq!(found("daily"), ["analytics.orders_daily"]);
         assert_eq!(found("zzz"), Vec::<String>::new());
         assert_eq!(found("").len(), 3);
+    }
+
+    #[test]
+    fn scattered_letters_match_only_when_no_name_holds_the_text() {
+        let catalog = Catalog {
+            schemas: vec![CatalogSchema {
+                name: "shop".into(),
+                relations: vec![
+                    relation("orders", RelationKind::Table),
+                    relation("product_sales", RelationKind::View),
+                    relation("products", RelationKind::Table),
+                ],
+                routines: Vec::new(),
+            }],
+            search_path: vec!["shop".into()],
+        };
+        let all = relations(&catalog);
+        let found = |query: &str| -> Vec<String> {
+            ranked(&all, query)
+                .into_iter()
+                .map(Relation::qualified)
+                .collect()
+        };
+        // `shop.product_sales` and `shop.products` hold o, r, d in order.
+        assert_eq!(found("ord"), ["shop.orders"]);
+        assert_eq!(found("prsa"), ["shop.product_sales"]);
     }
 }
