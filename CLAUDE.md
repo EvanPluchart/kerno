@@ -188,6 +188,24 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
       Postgres.app versions, EDB installers, `mysql-client`, `mariadb`, PATH) with its version, lets the user
       add one by folder and pick the default per engine; a connection can override it (Advanced tab); the
       dialog warns before running when the client is older than the server (pg_dump refuses a newer server).
+      The owner wants DBeaver's complete system here, compared screen by screen with DBeaver Community's
+      source (`org.jkiss.dbeaver.ext.postgresql` and `ext.mysql` tools and `tasks` plugins, `plugin.xml`):
+      - A "Tools" submenu on databases, schemas and tables, as DBeaver's: Backup, Global backup
+        (`pg_dumpall`, roles and tablespaces too), Restore, Execute script (`psql` / `mysql` client on a file),
+        Analyze, Vacuum (PostgreSQL), Optimize/Check/Repair (MySQL), Foreign data wrappers, Open dashboard
+        (Kerno's admin tab), Session manager, Lock manager, Save as task / Create new task.
+      - Wizards with the steps listed on the left and Back / Next / Start: (1) choose objects: schemas with
+        checkboxes, then the tables of the checked schemas, All / None, "Complete backup", "Show views";
+        (2) settings: format (plain, custom, directory, tar), compression, encoding, INSERT instead of COPY,
+        no privileges, discard owner, add DROP / CREATE DATABASE; output folder and a file name pattern with
+        `${database}`, `${schema}`, `${timestamp}` variables (preview of the resulting name); extra command
+        arguments; authentication override for the tool; (3) progress with the tool's log. Restore the same way.
+      - Local client button in every wizard: the list of every install found (each Homebrew Cellar version of
+        `postgresql@N` and `libpq`, Postgres.app versions, PATH, …) with its version, Browse…, remembered per
+        connection; the default is the newest client not older than the server.
+      - Save as task: a named task with all its settings, listed in a Tasks view (run again, edit, duplicate,
+        delete, last run status and log). No scheduler (DBeaver Community has none).
+      Kerno's look, not DBeaver's: same steps and options, drawn with Kerno's components and theme.
 
 ## 4. v1 features (all required, priority order)
 
