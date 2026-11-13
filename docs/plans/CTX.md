@@ -129,6 +129,16 @@ the **cell** (row and column) and build it from a pure function of (row, column,
 Performance: the menu is attached per cell; keep the closure cheap (no allocation per cell beyond what
 exists) and re-check scrolling in milestone 9.
 
+**Part 3 is done** (with M6 Part 1 items 4 and 5: paste, Delete sets NULL). Every surface of CLAUDE.md §3
+now answers a right-click in a UI test. Left, small (one `opus` agent, with the leftovers of Parts 1 and 2):
+palette commands for Clear filters, Show all columns, Fit all widths and Export (in `actions.rs`); the
+toolbar's "Set NULL" still writes NULL into NOT NULL cells while the menu's does not (make both skip them
+and change the test that relies on it to fail an apply another way); "Filter by this value" on a PostgreSQL
+`real` column may match nothing (the value goes out as a bare number: compare as text or cast); pasted text
+is not unquoted (a value with a tab or a line break splits); ordering from a menu resets dragged column
+widths; Fit width measures the first 1,000 rows only; paste and Delete are tested on PostgreSQL only; the
+row-number column has no menu (G6).
+
 ## Part 4 — Docs — `sonnet`
 
 `docs/FEATURES.md`: a section "Context menus" listing each surface of CLAUDE.md §3 with its entries, the
