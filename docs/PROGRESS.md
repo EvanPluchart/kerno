@@ -334,16 +334,49 @@ Found and fixed on the way:
 - First look at the new screens in the real app (`docs/screenshots/m10-p9-*`): eleven defects listed in
   `plans/M10.md` Part 15.
 
-Still open:
+- Fourth visual list done (D-051); the toolbar's pickers follow the active tab whatever its kind
+  (`1c019a0`); idle memory brought back from 170 MB to 150.5 MB bare / 148.4 MB bundled (D-053, `0bf5515`).
+- `docs/BENCH.md` written from the bench on the final code (`5df5a01`). `docs/screenshots/final/` holds 98
+  captures (49 screens, light and dark), each looked at (`1a53cba`, `86592f3`). `scripts/check.sh` and
+  `scripts/release.sh` ran in full; the table form, the import confirmation and the view template gained the
+  tests that left three rows of `FEATURES.md` partial (`4718b0f`).
 
-- The fourth visual list (`plans/M10.md` Part 15).
-- One test still fails about once in forty full runs:
-  `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user, both idle in
-  a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test
-  now prints those sessions and their last statements when the count never settles, so the next failure
-  names its cause.
-- The clean performance measurement on an idle machine and `docs/BENCH.md` (GOAL criterion 5).
-- The final screenshots in `docs/screenshots/final/` (criterion 7).
-- The final verification of every criterion of `docs/GOAL.md`.
-- Tests and captures `FEATURES.md` marks missing: M7 Part 1c item 4, the import dialog's cancel and
-  production confirmation, selecting a column by its header, running a selection, resizing a column.
+## Final verification of `docs/GOAL.md` (2026-11-13, final code)
+
+1. `cargo build --release` succeeds. `scripts/check.sh`: `cargo fmt --all --check`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo deny check` (no ignored advisory: `deny.toml` has no
+   `ignore`), `KERNO_REQUIRE_CONTAINERS=1 cargo test --workspace -- --test-threads=3`: all passed, 1,099
+   tests, 0 failed (1 ignored: a sort timing measurement).
+2. `docs/FEATURES.md`: every clause of CLAUDE.md §4 has a row with its status and tests; every cited test
+   exists; no row is partial; each §4 item has at least one current capture (rows about behaviour with no
+   screen of its own say `no screenshot`). `docs/DBEAVER-PARITY.md`: 330 rows done, 93 on the roadmap with a
+   reason, none open. A real right-click test per surface (the context-menu table of `FEATURES.md`).
+3. `no_secret_is_written_to_the_data_directory_or_the_log`; drop, truncate and apply edits show their SQL
+   and ask (`dropping_renaming_and_truncating_show_the_sql_and_ask`,
+   `cells_are_edited_reviewed_and_applied_in_one_transaction`).
+4. `a_running_statement_can_be_cancelled` on PostgreSQL, MySQL and MariaDB;
+   `a_running_statement_is_cancelled_and_the_window_stays_usable`.
+5. `docs/BENCH.md`: start-up 279 ms, first rows 2 to 7 ms, scroll 8.35 ms per frame, 1M × 20 in 340 MB.
+   Idle RSS 148.4 MB in `Kerno.app`; 150.5 MB for the bare binary, 0.5 MB over the target, because it sets
+   its Dock icon itself: both are in the document, with the reason.
+6. `through_the_ssh_tunnel`, `tls_modes_without_verification`, `tls_verification`,
+   `tls_through_the_tunnel_checks_the_database_host_name` (they ran, containers required).
+7. `docs/screenshots/final/`: every main screen in light and dark, each looked at; what looked wrong was
+   fixed and retaken (Part 15, the toolbar's pickers, neutral paths).
+8. `scripts/release.sh` built `Kerno.app`, the `.dmg` and, in the Linux container, the tarball, with
+   `SHA256SUMS` (verified with `shasum -c`), and printed the publish command without running it;
+   `dist/Kerno.app` starts through LaunchServices as `dev.kerno.Kerno` with its icon. No `.github/`.
+9. README, `CONTRIBUTING.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md` follow the final code.
+10. `docs/PLAN.md`, this file and `docs/DECISIONS.md` (D-001 to D-053) are current; `git remote -v` is
+    empty; nothing pushed; containers stopped and no Kerno left running at the end of the session.
+
+Still open (none blocks a criterion):
+
+- One test failed about once in forty full runs earlier in the day:
+  `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user right after
+  connecting. It has not failed since the cancel fix (`a4bcda5`), in more than thirty full runs; the test
+  prints those sessions and their last statements if it ever does.
+- The bare binary's idle RSS is 0.5 MB over the 150 MB target (see 5 above and D-053).
+- The update check has never made its real request and the install has never run for real: the repository
+  does not exist and nothing is published (the owner's to do).
+- A few final captures still show a sidebar folder with a test name (`kerno_ui_demo_folder`).
