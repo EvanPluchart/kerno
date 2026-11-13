@@ -453,6 +453,105 @@ pub fn import_connections(json: &str) -> Result<Vec<ConnectionConfig>> {
     Ok(file.connections)
 }
 
+// Folders ---------------------------------------------------------------------
+//
+// A connection's folder is its `group`: folder names joined by `/`, from the
+// top ("Work/Clients"). A folder that holds no connection is kept by the app
+// in its settings.
+
+/// A folder path as typed or stored, tidied: each name trimmed, empty names
+/// dropped. `None` is the top level.
+pub fn folder_path(text: &str) -> Option<String> {
+    let names: Vec<&str> = text
+        .split('/')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    (!names.is_empty()).then(|| names.join("/"))
+}
+
+/// Checks a name typed for one folder; returns it trimmed.
+pub fn folder_name(text: &str) -> std::result::Result<String, String> {
+    let name = text.trim();
+    if name.is_empty() {
+        return Err("A folder needs a name.".into());
+    }
+    if name.contains('/') {
+        return Err("A folder name cannot contain “/”.".into());
+    }
+    Ok(name.to_string())
+}
+
+/// The folder holding `path`; `None` when it is at the top level.
+pub fn parent_folder(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+/// The last name of a folder path.
+pub fn last_folder_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// Whether `path` is `folder` or lies inside it (`Work` does not hold
+/// `Workshop`).
+pub fn in_folder(path: &str, folder: &str) -> bool {
+    path.strip_prefix(folder)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// `path`, which lies in `from` (see [`in_folder`]), with `from` replaced
+/// by `to`: what a folder's content becomes when the folder is renamed or
+/// removed. `None` is the top level.
+pub fn rebase_folder(path: &str, from: &str, to: Option<&str>) -> Option<String> {
+    let rest = path.strip_prefix(from).unwrap_or_default();
+    folder_path(&format!("{}/{rest}", to.unwrap_or_default()))
+}
+
+/// Every folder of `paths`, their parents included, sorted, once each.
+pub fn all_folders<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut folders = std::collections::BTreeSet::new();
+    for path in paths {
+        let mut current = folder_path(path);
+        while let Some(folder) = current {
+            current = parent_folder(&folder).map(str::to_string);
+            folders.insert(folder);
+        }
+    }
+    folders.into_iter().collect()
+}
+
+/// The connection as a URL (`postgresql://user@host:port/database`), for
+/// the clipboard. It never holds a password: [`ConnectionConfig`] has none.
+pub fn connection_url(config: &ConnectionConfig) -> String {
+    use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+    const PART: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let scheme = match config.engine {
+        Engine::Postgres => "postgresql",
+        Engine::MySql => "mysql",
+        Engine::MariaDb => "mariadb",
+    };
+    let host = if config.host.contains(':') {
+        format!("[{}]", config.host)
+    } else {
+        config.host.clone()
+    };
+    let mut url = format!(
+        "{scheme}://{}@{host}:{}/{}",
+        utf8_percent_encode(&config.user, PART),
+        config.port,
+        utf8_percent_encode(config.database.as_deref().unwrap_or_default(), PART),
+    );
+    if config.tls.mode != TlsMode::default() {
+        url.push_str("?sslmode=");
+        url.push_str(config.tls.mode.as_str());
+    }
+    url
+}
+
 /// The fields a pasted connection URL fills in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedUrl {
@@ -725,7 +824,8 @@ mod tests {
         first.name = "Shop".into();
         first.environment = Environment::Production;
         first.color = Some("red".into());
-        first.group = Some("Work".into());
+        // A nested folder travels as it is stored.
+        first.group = Some("Work/Clients".into());
         first.read_only = true;
         first
             .options
@@ -746,6 +846,83 @@ mod tests {
             import_connections(&export_connections(&[]).unwrap()).unwrap(),
             []
         );
+    }
+
+    #[test]
+    fn folder_paths_are_tidied_checked_and_moved() {
+        assert_eq!(
+            folder_path(" Work / Clients/ "),
+            Some("Work/Clients".into())
+        );
+        assert_eq!(folder_path("//"), None);
+        assert_eq!(folder_path(""), None);
+
+        assert_eq!(folder_name("  Clients "), Ok("Clients".into()));
+        assert!(folder_name("   ").unwrap_err().contains("needs a name"));
+        assert!(folder_name("a/b").unwrap_err().contains("“/”"));
+
+        assert_eq!(parent_folder("Work/Clients/Acme"), Some("Work/Clients"));
+        assert_eq!(parent_folder("Work"), None);
+        assert_eq!(last_folder_name("Work/Clients"), "Clients");
+        assert_eq!(last_folder_name("Work"), "Work");
+
+        assert!(in_folder("Work", "Work"));
+        assert!(in_folder("Work/Clients", "Work"));
+        assert!(!in_folder("Workshop", "Work"));
+        assert!(!in_folder("Workshop/x", "Work"));
+        assert!(!in_folder("Work", "Work/Clients"));
+
+        // Renaming Work/Clients to Work/Customers.
+        let to = Some("Work/Customers");
+        assert_eq!(
+            rebase_folder("Work/Clients", "Work/Clients", to),
+            Some("Work/Customers".into())
+        );
+        assert_eq!(
+            rebase_folder("Work/Clients/Acme", "Work/Clients", to),
+            Some("Work/Customers/Acme".into())
+        );
+        // Removing Work: what it held moves up one level, intact.
+        assert_eq!(rebase_folder("Work", "Work", None), None);
+        assert_eq!(
+            rebase_folder("Work/Clients/Acme", "Work", None),
+            Some("Clients/Acme".into())
+        );
+
+        assert_eq!(
+            all_folders(["Work/Clients/Acme", "Home", "Work", " Lab / "]),
+            ["Home", "Lab", "Work", "Work/Clients", "Work/Clients/Acme"]
+        );
+    }
+
+    #[test]
+    fn the_connection_url_has_no_password_and_reads_back() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.host = "db.example.com".into();
+        config.port = 6543;
+        config.user = "ada lovelace".into();
+        config.database = Some("shop/eu".into());
+        config.tls.mode = TlsMode::VerifyFull;
+        let url = connection_url(&config);
+        assert_eq!(
+            url,
+            "postgresql://ada%20lovelace@db.example.com:6543/shop%2Feu?sslmode=verify-full"
+        );
+        let parsed = parse_connection_url(&url).unwrap();
+        assert_eq!(parsed.engine, Engine::Postgres);
+        assert_eq!(parsed.host.as_deref(), Some("db.example.com"));
+        assert_eq!(parsed.port, Some(6543));
+        assert_eq!(parsed.user.as_deref(), Some("ada lovelace"));
+        assert_eq!(parsed.database.as_deref(), Some("shop/eu"));
+        assert_eq!(parsed.tls_mode, Some(TlsMode::VerifyFull));
+        assert!(parsed.password.is_none());
+
+        let mut config = ConnectionConfig::new(Engine::MariaDb);
+        config.host = "::1".into();
+        assert_eq!(connection_url(&config), "mariadb://root@[::1]:3306/");
+        let parsed = parse_connection_url(&connection_url(&config)).unwrap();
+        assert_eq!(parsed.host.as_deref(), Some("::1"));
+        assert_eq!(parsed.tls_mode, None);
     }
 
     #[test]

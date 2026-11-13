@@ -1,5 +1,7 @@
 //! User settings, stored as one value in Kerno's storage.
 
+use std::collections::BTreeSet;
+
 use kerno_core::storage::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,11 @@ pub struct Settings {
     pub sidebar_visible: bool,
     /// What a double click on a table or view in the tree opens.
     pub table_double_click: TableDoubleClick,
+    /// Connection folders made by the user, kept even when empty (a folder
+    /// that holds connections also lives in their `group`).
+    pub connection_folders: BTreeSet<String>,
+    /// Connection folders shown closed in the sidebar.
+    pub collapsed_folders: BTreeSet<String>,
 }
 
 impl Default for Settings {
@@ -58,6 +65,8 @@ impl Default for Settings {
             confirm_destructive: true,
             sidebar_visible: true,
             table_double_click: TableDoubleClick::Data,
+            connection_folders: BTreeSet::new(),
+            collapsed_folders: BTreeSet::new(),
         }
     }
 }
@@ -96,6 +105,8 @@ mod tests {
             confirm_destructive: false,
             sidebar_visible: false,
             table_double_click: TableDoubleClick::Structure,
+            connection_folders: ["Work".to_string(), "Work/Clients".to_string()].into(),
+            collapsed_folders: ["Work/Clients".to_string()].into(),
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

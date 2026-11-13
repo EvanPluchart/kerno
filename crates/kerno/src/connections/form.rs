@@ -386,7 +386,7 @@ impl ConnectionForm {
             read_only: self.read_only,
             environment: self.environment,
             color: self.color.clone(),
-            group: non_empty(&self.group),
+            group: kerno_core::config::folder_path(&self.group),
             save_password: self.save_password,
             options,
         };
@@ -672,5 +672,17 @@ mod tests {
         };
         let form = ConnectionForm::from_saved(&config, &secrets);
         assert_eq!(form.build().unwrap(), (config, secrets));
+    }
+
+    #[test]
+    fn the_folder_is_stored_as_a_tidy_path() {
+        let mut form = ConnectionForm::new(Engine::Postgres);
+        form.group = " Work / Clients /".into();
+        assert_eq!(
+            form.build().unwrap().0.group.as_deref(),
+            Some("Work/Clients")
+        );
+        form.group = " / ".into();
+        assert_eq!(form.build().unwrap().0.group, None);
     }
 }

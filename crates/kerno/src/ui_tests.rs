@@ -28,7 +28,7 @@ use crate::navigator::actions::{Action, Template};
 use crate::query::grid::Grid;
 use crate::query::tab::Activity;
 use crate::settings::Settings;
-use crate::sidebar::Sidebar;
+use crate::sidebar::{Sidebar, SidebarAction, Subject};
 use crate::state::AppState;
 use crate::structure::editor::TableEditor;
 use crate::structure::tab::{DDL_SECTION, List, StructureTab};
@@ -431,6 +431,54 @@ impl Fixture {
                 .read(cx)
                 .selected_row(cx)
         })
+    }
+
+    /// Opens the context menu of the element with this id with a real
+    /// right-click, `offset` from its top-left corner (its centre when `None`).
+    fn right_click(
+        &self,
+        cx: &mut TestAppContext,
+        id: impl Into<gpui_kit::ElementId>,
+        offset: Option<Point<gpui_kit::Pixels>>,
+    ) {
+        use gpui_kit::test::ClickOptions;
+        let options = ClickOptions::new().with_button(gpui_kit::MouseButton::Right);
+        let options = match offset {
+            Some(offset) => options.with_offset(offset),
+            None => options,
+        };
+        self.step(cx, |window, cx| window.click_with_options(id, options, cx));
+    }
+
+    /// Whether a menu entry (or any element) with this label is shown.
+    fn shows_label(&self, cx: &mut TestAppContext, label: &str) -> bool {
+        use gpui_kit::test::TestQueryExt as _;
+        self.step(cx, |window, _| window.try_find_by_label(label).is_some())
+    }
+
+    /// Clicks the element (a menu entry) with this label: a press and a
+    /// release where it is drawn.
+    fn click_label(&self, cx: &mut TestAppContext, label: &str) {
+        use gpui_kit::test::TestQueryExt as _;
+        self.step(cx, |window, cx| {
+            let centre = window.find_by_label(label).bounds().center();
+            window.drag(centre, centre, cx);
+        });
+    }
+
+    /// Runs a sidebar menu entry, as clicking it does.
+    fn sidebar_does(&self, cx: &mut TestAppContext, subject: Subject, action: SidebarAction) {
+        let sidebar = cx.update(|cx| self.workspace.read(cx).sidebar());
+        self.step(cx, move |window, cx| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.perform(&subject, action, window, cx)
+            })
+        });
+    }
+
+    /// The stored settings of the first saved connection.
+    fn first_stored(&self) -> ConnectionConfig {
+        self.storage.connections().unwrap()[0].config.clone()
     }
 
     /// Waits until the stored tabs satisfy `predicate`.
@@ -961,6 +1009,249 @@ fn a_tunnelled_connection_asks_for_trust_then_for_each_missing_secret(cx: &mut T
         );
         matches!(app.status(cx, 0), Status::Connected { .. })
     });
+}
+
+#[gpui_kit::test]
+fn the_sidebar_answers_a_right_click_on_each_part(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let mut config = testing::config(Engine::Postgres);
+    config.group = Some("Work".into());
+    storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+
+    // The empty area below the rows, and the header.
+    for area in ["connection-list-end", "connections-header"] {
+        assert!(!app.shows_label(cx, "New folder…"));
+        app.right_click(cx, area, None);
+        for label in [
+            "New connection…",
+            "New folder…",
+            "Import connections…",
+            "Refresh",
+            "Collapse all",
+        ] {
+            assert!(app.shows_label(cx, label), "{area}: {label}");
+        }
+        app.press(cx, &["escape"]);
+    }
+
+    // A folder.
+    assert!(!app.shows_label(cx, "New subfolder…"));
+    app.right_click(cx, ("conn-folder", 0usize), None);
+    for label in [
+        "New connection here…",
+        "New subfolder…",
+        "Rename…",
+        "Delete…",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.press(cx, &["escape"]);
+
+    // A connection: what does not apply to a closed one is disabled.
+    assert!(!app.shows_label(cx, "New SQL editor"));
+    app.right_click(cx, ("connection", 0usize), None);
+    for label in [
+        "Connect",
+        "Disconnect (not connected)",
+        "Reconnect (not connected)",
+        "New SQL editor",
+        "Edit…",
+        "Duplicate",
+        "Rename…",
+        "Move to folder",
+        "Delete…",
+        "Refresh (not connected)",
+        "Copy",
+    ] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.press(cx, &["escape"]);
+}
+
+#[gpui_kit::test]
+fn a_folder_is_made_renamed_filled_by_drag_and_deleted(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let app = open(cx, storage);
+
+    // New folder, from the menu of the empty area.
+    app.right_click(cx, "connection-list-end", None);
+    app.click_label(cx, "New folder…");
+    assert!(app.has(cx, "name-input"));
+    app.type_text(cx, "Work/x");
+    app.press(cx, &["enter"]);
+    assert!(app.has(cx, "name-error"), "a name with “/” is refused");
+    app.press(cx, &["backspace", "backspace"]);
+    app.press(cx, &["enter"]);
+    assert!(!app.has(cx, "name-input"));
+    assert!(app.has(cx, ("conn-folder", 0usize)));
+    let folders = |app: &Fixture, cx: &mut TestAppContext| {
+        cx.update(|cx| app.connections.read(cx).folders(cx))
+    };
+    assert_eq!(folders(&app, cx), ["Work"]);
+
+    // Rename it.
+    app.right_click(cx, ("conn-folder", 0usize), None);
+    app.click_label(cx, "Rename…");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "Clients");
+    app.click(cx, "name-ok");
+    assert_eq!(folders(&app, cx), ["Clients"]);
+
+    // Drag the connection onto it, then back to the top level.
+    app.step(cx, |window, cx| {
+        window.drag_to(("connection", 0usize), ("conn-folder", 0usize), cx)
+    });
+    app.wait_until(cx, "the move to be stored", |app, _| {
+        app.first_stored().group.as_deref() == Some("Clients")
+    });
+    app.step(cx, |window, cx| {
+        window.drag_to(("connection", 0usize), "connection-list-end", cx)
+    });
+    app.wait_until(cx, "the move back to be stored", |app, _| {
+        app.first_stored().group.is_none()
+    });
+    app.step(cx, |window, cx| {
+        window.drag_to(("connection", 0usize), ("conn-folder", 0usize), cx)
+    });
+    app.wait_until(cx, "the second move to be stored", |app, _| {
+        app.first_stored().group.as_deref() == Some("Clients")
+    });
+
+    // A connection made from the folder's menu starts in it.
+    app.right_click(cx, ("conn-folder", 0usize), None);
+    app.click_label(cx, "New connection here…");
+    let folder = app.step(cx, |window, _| {
+        window.find("conn-group").value().map(|v| v.to_string())
+    });
+    assert_eq!(folder.as_deref(), Some("Clients"));
+    app.click(cx, "conn-cancel");
+
+    // Deleting a folder that holds a connection asks, and the connection
+    // stays, at the top level.
+    app.right_click(cx, ("conn-folder", 0usize), None);
+    app.click_label(cx, "Delete…");
+    app.click(cx, "cancel");
+    assert_eq!(folders(&app, cx), ["Clients"]);
+    app.right_click(cx, ("conn-folder", 0usize), None);
+    app.click_label(cx, "Delete…");
+    app.click(cx, "ok");
+    assert_eq!(folders(&app, cx), Vec::<String>::new());
+    assert!(!app.has(cx, ("conn-folder", 0usize)));
+    assert!(app.has(cx, ("connection", 0usize)));
+    app.wait_until(cx, "the connection to be back at the top", |app, _| {
+        app.first_stored().group.is_none()
+    });
+}
+
+#[gpui_kit::test]
+fn the_copied_connection_url_has_no_password(cx: &mut TestAppContext) {
+    const PASSWORD: &str = "kerno-ui-url-secret-7Qz";
+    let storage = memory_storage();
+    let id = storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    let password = Secrets {
+        password: Some(Secret::new(PASSWORD)),
+        ..Secrets::default()
+    };
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &password).unwrap();
+
+    app.sidebar_does(cx, Subject::Connection(id.clone()), SidebarAction::CopyUrl);
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert_eq!(
+        copied,
+        format!(
+            "postgresql://kerno@127.0.0.1:{}/kerno?sslmode=disable",
+            testing::port(Engine::Postgres)
+        )
+    );
+    assert!(!copied.contains(PASSWORD));
+
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::CopyName);
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some(app.first_stored().name.as_str()));
+}
+
+#[gpui_kit::test]
+fn new_sql_editor_connects_first_then_opens_a_tab_on_the_connection(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let storage = memory_storage();
+    let id = storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+
+    app.right_click(cx, ("connection", 0usize), None);
+    app.click_label(cx, "New SQL editor");
+    app.wait_until(cx, "the tab", |app, cx| app.titles(cx).len() == 1);
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| tab.read(cx).target().cloned());
+    assert_eq!(target.map(|target| target.connection), Some(id.clone()));
+
+    // Open already: the tab comes at once. Reconnect leaves it connected.
+    app.sidebar_does(
+        cx,
+        Subject::Connection(id.clone()),
+        SidebarAction::NewSqlEditor,
+    );
+    assert_eq!(app.titles(cx).len(), 2);
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Reconnect);
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+}
+
+#[gpui_kit::test]
+fn a_right_click_below_the_schema_tree_opens_its_menu(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.wait_until(cx, "the databases", |app, cx| !app.tree(cx).is_empty());
+    assert!(!app.shows_label(cx, "New query here"));
+    let height = app.step(cx, |window, _| {
+        window.find("navigator-tree").bounds().size.height
+    });
+    app.right_click(
+        cx,
+        "navigator-tree",
+        Some(gpui_kit::point(px(40.), height - px(8.))),
+    );
+    for label in ["Refresh", "Collapse all", "New query here"] {
+        assert!(app.shows_label(cx, label), "{label}");
+    }
+    app.click_label(cx, "New query here");
+    assert_eq!(app.titles(cx).len(), 1);
+    let tab = app.tab(cx);
+    let target = cx.update(|cx| tab.read(cx).target().cloned());
+    assert_eq!(
+        target.map(|target| target.connection),
+        Some(app.storage.connections().unwrap()[0].id.clone())
+    );
+
+    // Its entries are palette commands too.
+    app.wait_until(cx, "an open database", |app, cx| {
+        app.tree(cx).iter().any(|row| row.starts_with("  "))
+    });
+    app.step(cx, |window, cx| {
+        window.dispatch_action(Box::new(actions::CollapseSchemaTree), cx)
+    });
+    let rows = app.tree(cx);
+    assert!(rows.iter().all(|row| !row.starts_with(' ')), "{rows:?}");
 }
 
 // Schema navigator ------------------------------------------------------------

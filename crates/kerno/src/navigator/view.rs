@@ -10,7 +10,7 @@ use gpui_kit::base::actions::{SelectLeft, SelectRight};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
-use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tree::{TreeEntry, TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{
@@ -41,6 +41,8 @@ use crate::tabs::Target;
 /// What the rest of the window does for the navigator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigatorEvent {
+    /// Open an empty query tab running on `target`.
+    NewQuery { target: Target },
     /// Open a query tab holding `sql`, running on `target`.
     OpenQuery {
         title: String,
@@ -247,6 +249,24 @@ impl Navigator {
         if let Some(load) = self.tree.expand(id) {
             self.run(load, cx);
         }
+    }
+
+    /// Closes every open node.
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        fn open(items: &[Item], ids: &mut Vec<String>) {
+            for item in items {
+                if item.expanded {
+                    ids.push(item.id.clone());
+                }
+                open(&item.children, ids);
+            }
+        }
+        let mut ids = Vec::new();
+        open(&self.tree.items(), &mut ids);
+        for id in ids {
+            self.tree.collapse(&id);
+        }
+        self.sync(cx);
     }
 
     /// Reloads the node (or the nearest one above it that the server
@@ -1585,7 +1605,12 @@ impl Render for Navigator {
                 // Right and Left also move to the first child and the
                 // parent; Enter does what a double click does. They run
                 // before the tree's own handling of the keys.
+                // Below the objects, the tree's own menu (a row's menu
+                // takes the click first).
+                let area = cx.entity();
                 div()
+                    .id("navigator-tree")
+                    .test_support()
                     .flex_1()
                     .min_h_0()
                     .capture_action(cx.listener(|this, _: &SelectRight, _, cx| {
@@ -1607,6 +1632,33 @@ impl Render for Navigator {
                         }
                     })
                     .child(tree_view)
+                    .context_menu(move |menu, _, _| {
+                        let (refresh, collapse, query) = (area.clone(), area.clone(), area.clone());
+                        menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                            refresh.update(cx, |this, cx| this.reload(cx))
+                        }))
+                        .item(
+                            PopupMenuItem::new("Collapse all").on_click(move |_, _, cx| {
+                                collapse.update(cx, |this, cx| this.collapse_all(cx))
+                            }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("New query here").on_click(move |_, _, cx| {
+                                query.update(cx, |this, cx| {
+                                    if let Some(connection) = this.connection.clone() {
+                                        cx.emit(NavigatorEvent::NewQuery {
+                                            target: Target {
+                                                connection,
+                                                database: None,
+                                                schema: None,
+                                            },
+                                        });
+                                    }
+                                })
+                            }),
+                        )
+                    })
                     .into_any_element()
             }
         };

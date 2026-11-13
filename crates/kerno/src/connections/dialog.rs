@@ -5,6 +5,7 @@ use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -114,7 +115,22 @@ impl ConnectionDialog {
             Some((saved, _)) => format!("Edit “{}”", saved.config.name),
             None => "New connection".to_string(),
         };
-        let view = cx.new(|cx| Self::new(connections, existing, window, cx));
+        let view = cx.new(|cx| Self::new(connections, existing, None, window, cx));
+        Self::show(view, title, window, cx);
+    }
+
+    /// Opens the dialog for a new connection in `folder`.
+    pub fn open_in(
+        connections: Entity<Connections>,
+        folder: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let view = cx.new(|cx| Self::new(connections, None, Some(folder), window, cx));
+        Self::show(view, "New connection".into(), window, cx);
+    }
+
+    fn show(view: Entity<Self>, title: String, window: &mut Window, cx: &mut App) {
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
             dialog
@@ -129,16 +145,20 @@ impl ConnectionDialog {
     fn new(
         connections: Entity<Connections>,
         existing: Option<(SavedConnection, Secrets)>,
+        folder: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (editing, form) = match &existing {
+        let (editing, mut form) = match &existing {
             Some((saved, secrets)) => (
                 Some(saved.id.clone()),
                 ConnectionForm::from_saved(&saved.config, secrets),
             ),
             None => (None, ConnectionForm::new(Engine::Postgres)),
         };
+        if let Some(folder) = folder {
+            form.group = folder;
+        }
         let mut text = |value: &str, placeholder: &'static str| {
             let value = value.to_string();
             cx.new(|cx| {
@@ -149,7 +169,7 @@ impl ConnectionDialog {
         };
         let engine_filter = text("", "Search engines");
         let name = text(&form.name, "A name for the sidebar");
-        let group = text(&form.group, "Folder (optional)");
+        let group = text(&form.group, "No folder");
         let url = text("", "postgres://user:password@host:5432/database");
         let host = text(&form.host, "localhost");
         let port = text(&form.port, "");
@@ -411,6 +431,30 @@ impl ConnectionDialog {
     }
 
     /// A labelled field with its error, if any, underneath.
+    /// The existing folders, to fill the folder field. A new folder is
+    /// typed there (`Work/Clients`).
+    fn folder_picker(&self, cx: &App) -> impl IntoElement {
+        let folders = self.connections.read(cx).folders(cx);
+        let input = self.inputs.group.clone();
+        Button::new("conn-folder-pick")
+            .outline()
+            .dropdown_caret(true)
+            .tooltip("Pick a folder, or type a new one like Work/Clients")
+            .dropdown_menu(move |mut menu: PopupMenu, _, _| {
+                for folder in std::iter::once(None).chain(folders.iter().cloned().map(Some)) {
+                    let input = input.clone();
+                    let label = folder.clone().unwrap_or_else(|| "No folder".into());
+                    menu = menu.item(PopupMenuItem::new(SharedString::from(label)).on_click(
+                        move |_, window, cx| {
+                            let value = folder.clone().unwrap_or_default();
+                            input.update(cx, |input, cx| input.set_value(value, window, cx));
+                        },
+                    ));
+                }
+                menu
+            })
+    }
+
     fn field(
         &self,
         label: &'static str,
@@ -587,12 +631,19 @@ impl ConnectionDialog {
                         Input::new(&self.inputs.name).id("conn-name"),
                         cx,
                     )))
-                    .child(div().w(px(220.)).child(self.field(
-                        "Group",
-                        None,
-                        Input::new(&self.inputs.group).id("conn-group"),
-                        cx,
-                    ))),
+                    .child(
+                        div().w(px(240.)).child(
+                            self.field(
+                                "Folder",
+                                None,
+                                h_flex()
+                                    .gap_1()
+                                    .child(Input::new(&self.inputs.group).id("conn-group").flex_1())
+                                    .child(self.folder_picker(cx)),
+                                cx,
+                            ),
+                        ),
+                    ),
             )
             .child(
                 h_flex()

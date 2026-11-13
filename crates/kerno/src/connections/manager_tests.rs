@@ -622,3 +622,154 @@ fn a_lost_connection_is_re_established(cx: &mut TestAppContext) {
     // No prompt: the secrets of this run were reused.
     assert_eq!(app.last_request(), None);
 }
+
+#[gpui_kit::test]
+fn folders_are_made_renamed_and_removed_with_what_they_hold(cx: &mut TestAppContext) {
+    let app = fixture(cx);
+    let in_folder = |name: &str, folder: &str| {
+        let mut config = pg();
+        config.name = name.into();
+        config.group = Some(folder.into());
+        config
+    };
+    let a = app.save(cx, in_folder("A", "Work"), db_password());
+    let b = app.save(cx, in_folder("B", "Work/Clients"), db_password());
+    let c = app.save(cx, in_folder("C", "Workshop"), db_password());
+    let folders = |cx: &mut TestAppContext| cx.update(|cx| app.connections.read(cx).folders(cx));
+    let group = |cx: &mut TestAppContext, id: &str| {
+        cx.update(|cx| {
+            app.connections
+                .read(cx)
+                .get(id)
+                .unwrap()
+                .config
+                .group
+                .clone()
+        })
+    };
+    let stored = |id: &str| {
+        app.storage
+            .connections()
+            .unwrap()
+            .into_iter()
+            .find(|saved| saved.id == id)
+            .unwrap()
+            .config
+    };
+    assert_eq!(folders(cx), ["Work", "Work/Clients", "Workshop"]);
+
+    // A folder without connections is kept, in the stored settings too.
+    let made = cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.create_folder(Some("Work"), " Archive ", cx))
+    });
+    assert_eq!(made, Ok("Work/Archive".to_string()));
+    for (parent, name, problem) in [
+        (None, "Work", "already a folder"),
+        (None, "a/b", "“/”"),
+        (Some("Work"), "  ", "needs a name"),
+    ] {
+        let refused = cx.update(|cx| {
+            app.connections
+                .update(cx, |c, cx| c.create_folder(parent, name, cx))
+        });
+        assert!(refused.unwrap_err().contains(problem), "{name}");
+    }
+    assert_eq!(
+        folders(cx),
+        ["Work", "Work/Archive", "Work/Clients", "Workshop"]
+    );
+    wait_until(cx, "the empty folder to be stored", |_| {
+        Settings::load(&app.storage)
+            .connection_folders
+            .contains("Work/Archive")
+    });
+
+    // Renaming rewrites what is inside, at any depth, and nothing that only
+    // starts with the same letters.
+    let renamed = cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.rename_folder("Work", "Job", cx))
+    });
+    assert_eq!(renamed, Ok(()));
+    assert_eq!(
+        folders(cx),
+        ["Job", "Job/Archive", "Job/Clients", "Workshop"]
+    );
+    assert_eq!(group(cx, &a).as_deref(), Some("Job"));
+    assert_eq!(group(cx, &b).as_deref(), Some("Job/Clients"));
+    assert_eq!(group(cx, &c).as_deref(), Some("Workshop"));
+    let clash = cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.rename_folder("Job/Clients", "Archive", cx))
+    });
+    assert!(clash.unwrap_err().contains("already a folder"));
+    wait_until(cx, "the renamed folders to be stored", |_| {
+        stored(&b).group.as_deref() == Some("Job/Clients")
+            && Settings::load(&app.storage)
+                .connection_folders
+                .contains("Job/Archive")
+    });
+
+    // Deleting a folder moves what it holds up one level, intact.
+    assert_eq!(cx.update(|cx| app.connections.read(cx).count_in("Job")), 2);
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.delete_folder("Job", cx))
+    });
+    assert_eq!(folders(cx), ["Archive", "Clients", "Workshop"]);
+    assert_eq!(group(cx, &a), None);
+    assert_eq!(group(cx, &b).as_deref(), Some("Clients"));
+
+    // Moving and renaming a connection.
+    cx.update(|cx| {
+        app.connections.update(cx, |manager, cx| {
+            manager.move_connection(&a, Some("Archive"), cx);
+            manager.move_connection(&c, None, cx);
+        })
+    });
+    assert_eq!(group(cx, &a).as_deref(), Some("Archive"));
+    assert_eq!(group(cx, &c), None);
+    // The folder it left stays, empty.
+    assert_eq!(folders(cx), ["Archive", "Clients", "Workshop"]);
+    let refused = cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.rename_connection(&a, "  ", cx))
+    });
+    assert!(refused.unwrap_err().contains("needs a name"));
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.rename_connection(&a, " Orders ", cx))
+    })
+    .unwrap();
+
+    // What is stored is what is shown; the secrets were not touched.
+    wait_until(cx, "the changes to be stored", |_| {
+        let config = stored(&a);
+        config.name == "Orders" && config.group.as_deref() == Some("Archive")
+    });
+    assert_eq!(stored(&b).group.as_deref(), Some("Clients"));
+    assert_eq!(stored(&c).group, None);
+    wait_until(cx, "the folders to be stored", |cx| {
+        Settings::load(&app.storage) == cx.update(|cx| AppState::get(cx).settings.clone())
+    });
+    for id in [&a, &b, &c] {
+        assert_eq!(
+            load_secrets(app.secrets.as_ref(), id).unwrap(),
+            db_password()
+        );
+    }
+
+    // An imported connection brings its folder.
+    let mut imported = testing::config(Engine::Postgres);
+    imported.group = Some("Import/Old".into());
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.import(vec![imported], cx))
+    });
+    wait_until(cx, "the import", |cx| folders(cx).len() == 5);
+    assert_eq!(
+        folders(cx),
+        ["Archive", "Clients", "Import", "Import/Old", "Workshop"]
+    );
+}

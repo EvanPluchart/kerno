@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{App, Context, EventEmitter, Task};
-use kerno_core::config::{ConnectionConfig, Engine, Secret, Secrets, SshAuth};
+use kerno_core::config::{
+    ConnectionConfig, Engine, Secret, Secrets, SshAuth, all_folders, folder_name, folder_path,
+    in_folder, parent_folder, rebase_folder,
+};
 use kerno_core::connector::{Connector, HostKeyStore};
 use kerno_core::secrets::{self, SecretStore};
 use kerno_core::ssh::SshError;
@@ -137,6 +140,8 @@ pub struct Connections {
     runtime: HashMap<String, Runtime>,
     /// The user's own SSH known-hosts file, read but never written.
     user_known_hosts: Option<PathBuf>,
+    /// The last write of moved or renamed connections.
+    writing: Option<Task<()>>,
 }
 
 impl EventEmitter<ConnectionsEvent> for Connections {}
@@ -158,6 +163,7 @@ impl Connections {
             saved,
             runtime: HashMap::new(),
             user_known_hosts,
+            writing: None,
         }
     }
 
@@ -325,6 +331,7 @@ impl Connections {
     /// secrets.
     pub fn delete(&mut self, id: &str, cx: &mut Context<Self>) {
         self.disconnect(id, cx);
+        keep_folder(self.get(id).and_then(|saved| folder_of(&saved.config)), cx);
         let state = AppState::get(cx);
         let (storage, store) = (state.storage.clone(), state.secrets.clone());
         let deleted_id = id.to_string();
@@ -372,6 +379,219 @@ impl Connections {
             Some(secrets) => Ok(secrets),
             None => secrets::load_secrets(store.as_ref(), &id),
         })
+    }
+
+    /// Reads the saved list again from storage, and checks the open
+    /// connections now rather than at their next keep-alive.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let storage = AppState::get(cx).storage.clone();
+        // A change still being written is read back, not undone.
+        let previous = self.writing.take();
+        cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let reading = cx.update(|cx| bridge::spawn_blocking(cx, move || storage.connections()));
+            let outcome = reading.await;
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(saved) => {
+                    this.saved = saved;
+                    cx.emit(ConnectionsEvent::ListChanged);
+                    cx.notify();
+                }
+                Err(error) => this.fail(
+                    format!("The saved connections could not be read: {error}"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+        let open: Vec<(String, Arc<dyn Session>)> = self
+            .runtime
+            .iter()
+            .filter_map(|(id, runtime)| Some((id.clone(), runtime.meta.clone()?)))
+            .collect();
+        for (id, meta) in open {
+            let ping = bridge::spawn(cx, async move { meta.ping().await });
+            cx.spawn(async move |this, cx| {
+                if ping.await.is_err() {
+                    let _ = this.update(cx, |this, cx| this.connection_lost(&id, cx));
+                }
+            })
+            .detach();
+        }
+    }
+
+    // Folders ------------------------------------------------------------------
+
+    /// Every folder, sorted: the ones the user made (kept even when empty)
+    /// and the ones connections are in, with their parents.
+    pub fn folders(&self, cx: &App) -> Vec<String> {
+        let kept = &AppState::get(cx).settings.connection_folders;
+        all_folders(
+            kept.iter()
+                .map(String::as_str)
+                .chain(self.saved.iter().filter_map(|c| c.config.group.as_deref())),
+        )
+    }
+
+    /// How many connections `folder` holds, in its sub-folders too.
+    pub fn count_in(&self, folder: &str) -> usize {
+        self.saved
+            .iter()
+            .filter(|c| folder_of(&c.config).is_some_and(|path| in_folder(&path, folder)))
+            .count()
+    }
+
+    /// Makes a folder named `name` in `parent` (the top level when `None`);
+    /// returns its path.
+    pub fn create_folder(
+        &mut self,
+        parent: Option<&str>,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let name = folder_name(name)?;
+        let path = match parent {
+            Some(parent) => format!("{parent}/{name}"),
+            None => name,
+        };
+        if self.folders(cx).contains(&path) {
+            return Err(format!("There is already a folder “{path}”."));
+        }
+        let kept = path.clone();
+        AppState::update_settings(cx, move |settings| {
+            settings.connection_folders.insert(kept);
+        });
+        cx.emit(ConnectionsEvent::ListChanged);
+        cx.notify();
+        Ok(path)
+    }
+
+    /// Renames the folder at `path`; the connections and folders inside
+    /// follow.
+    pub fn rename_folder(
+        &mut self,
+        path: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let name = folder_name(name)?;
+        let to = match parent_folder(path) {
+            Some(parent) => format!("{parent}/{name}"),
+            None => name,
+        };
+        if to == path {
+            return Ok(());
+        }
+        if self.folders(cx).contains(&to) {
+            return Err(format!("There is already a folder “{to}”."));
+        }
+        self.rebase(path, Some(&to), cx);
+        Ok(())
+    }
+
+    /// Removes the folder at `path`. What it holds, connections and
+    /// folders, moves up to its parent.
+    pub fn delete_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        let parent = parent_folder(path).map(str::to_string);
+        self.rebase(path, parent.as_deref(), cx);
+    }
+
+    /// Moves everything inside `from` (included) under `to`.
+    fn rebase(&mut self, from: &str, to: Option<&str>, cx: &mut Context<Self>) {
+        let rebased = |set: &mut std::collections::BTreeSet<String>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .filter_map(|path| match in_folder(&path, from) {
+                    true => rebase_folder(&path, from, to),
+                    false => Some(path),
+                })
+                .collect();
+        };
+        AppState::update_settings(cx, |settings| {
+            rebased(&mut settings.connection_folders);
+            rebased(&mut settings.collapsed_folders);
+        });
+        let mut changed = Vec::new();
+        for connection in &mut self.saved {
+            if let Some(path) = folder_of(&connection.config)
+                && in_folder(&path, from)
+            {
+                connection.config.group = rebase_folder(&path, from, to);
+                changed.push(connection.clone());
+            }
+        }
+        self.store(changed, cx);
+    }
+
+    /// Puts a connection in `folder` (the top level when `None`).
+    pub fn move_connection(&mut self, id: &str, folder: Option<&str>, cx: &mut Context<Self>) {
+        let folder = folder.and_then(folder_path);
+        let Some(connection) = self.saved.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let left = folder_of(&connection.config);
+        if left == folder {
+            return;
+        }
+        connection.config.group = folder;
+        let changed = vec![connection.clone()];
+        keep_folder(left, cx);
+        self.store(changed, cx);
+    }
+
+    /// Gives a connection another name.
+    pub fn rename_connection(
+        &mut self,
+        id: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("A connection needs a name.".into());
+        }
+        if let Some(connection) = self.saved.iter_mut().find(|c| c.id == id)
+            && connection.config.name != name
+        {
+            connection.config.name = name.to_string();
+            let changed = vec![connection.clone()];
+            self.store(changed, cx);
+        }
+        Ok(())
+    }
+
+    /// Shows connections already changed in memory, and writes their
+    /// settings (never their secrets) in the background. If that fails,
+    /// the list is read back from storage.
+    fn store(&mut self, changed: Vec<SavedConnection>, cx: &mut Context<Self>) {
+        cx.emit(ConnectionsEvent::ListChanged);
+        cx.notify();
+        if changed.is_empty() {
+            return;
+        }
+        let storage = AppState::get(cx).storage.clone();
+        // One write after the other, so the last change is the one stored.
+        let previous = self.writing.take();
+        self.writing = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let writing = cx.update(|cx| {
+                bridge::spawn_blocking(cx, move || {
+                    changed
+                        .iter()
+                        .try_for_each(|c| storage.save_connection(Some(&c.id), &c.config).map(drop))
+                })
+            });
+            if let Err(error) = writing.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.fail(format!("The change could not be saved: {error}"), cx);
+                    this.reload(cx);
+                });
+            }
+        }));
     }
 
     /// How many connections are open.
@@ -678,6 +898,20 @@ impl Connections {
             session.close().await;
             Ok(TestReport { version, latency })
         })
+    }
+}
+
+/// The folder a connection is in, tidied; `None` at the top level.
+pub fn folder_of(config: &ConnectionConfig) -> Option<String> {
+    config.group.as_deref().and_then(folder_path)
+}
+
+/// Keeps a folder a connection leaves, so it does not vanish once empty.
+fn keep_folder(folder: Option<String>, cx: &mut App) {
+    if let Some(folder) = folder {
+        AppState::update_settings(cx, |settings| {
+            settings.connection_folders.insert(folder);
+        });
     }
 }
 

@@ -20,6 +20,16 @@ gpui_kit::actions!(
         ImportConnections,
         /// Writes the saved connections, without secrets, to a file.
         ExportConnections,
+        /// Makes a connection folder at the top level.
+        NewConnectionFolder,
+        /// Reads the saved connections again and checks the open ones.
+        RefreshConnections,
+        /// Closes every connection folder of the sidebar.
+        CollapseConnectionFolders,
+        /// Reads the schema tree of the browsed connection again.
+        RefreshSchemaTree,
+        /// Closes every open node of the schema tree.
+        CollapseSchemaTree,
         /// Runs the statement at the cursor, or the selection.
         RunStatement,
         /// Runs every statement of the active tab.
@@ -156,6 +166,46 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["json", "file", "backup", "share"],
         ExportConnections
+    ),
+    command!(
+        "new_connection_folder",
+        "New Connection Folder…",
+        "Connections",
+        [],
+        ["group", "organize", "directory"],
+        NewConnectionFolder
+    ),
+    command!(
+        "refresh_connections",
+        "Refresh Connections",
+        "Connections",
+        [],
+        ["reload", "saved", "status"],
+        RefreshConnections
+    ),
+    command!(
+        "collapse_connection_folders",
+        "Collapse All Connection Folders",
+        "Connections",
+        [],
+        ["close", "folders", "sidebar"],
+        CollapseConnectionFolders
+    ),
+    command!(
+        "refresh_schema_tree",
+        "Refresh Schema Tree",
+        "Connections",
+        [],
+        ["reload", "navigator", "objects"],
+        RefreshSchemaTree
+    ),
+    command!(
+        "collapse_schema_tree",
+        "Collapse Schema Tree",
+        "Connections",
+        [],
+        ["close", "navigator", "objects"],
+        CollapseSchemaTree
     ),
     command!(
         "new_query_tab",

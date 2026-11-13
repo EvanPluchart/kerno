@@ -26,12 +26,14 @@ use gpui_kit::{
 use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
 
 use crate::actions::{
-    self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, DeleteRows, DiscardChanges,
-    DuplicateRows, ExplainAnalyze, ExplainStatement, ExportConnections, ExportData, FindInEditor,
-    FormatSql, ImportConnections, ImportCsv, NewConnection, NewQueryTab, NextTab,
-    OpenCommandPalette, OpenSettings, OpenSqlFile, PreviousTab, RefreshData, ReplaceInEditor,
-    RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, SetDefault, SetNull, ShowHistory,
-    ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme, UseSystemTheme,
+    self, About, AddRow, ApplyChanges, CancelQuery, CloseTab, CollapseConnectionFolders,
+    CollapseSchemaTree, DeleteRows, DiscardChanges, DuplicateRows, ExplainAnalyze,
+    ExplainStatement, ExportConnections, ExportData, FindInEditor, FormatSql, ImportConnections,
+    ImportCsv, NewConnection, NewConnectionFolder, NewQueryTab, NextTab, OpenCommandPalette,
+    OpenSettings, OpenSqlFile, PreviousTab, RefreshConnections, RefreshData, RefreshSchemaTree,
+    ReplaceInEditor, RunAll, RunStatement, SaveFile, SaveFileAs, SaveQuery, SetDefault, SetNull,
+    ShowHistory, ShowSavedQueries, ToggleComment, ToggleSidebar, UseDarkTheme, UseLightTheme,
+    UseSystemTheme,
 };
 use crate::bridge;
 use crate::connections::dialog::ConnectionDialog;
@@ -44,7 +46,7 @@ use crate::library::{self, Library, Shelf};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::settings::TableDoubleClick;
-use crate::sidebar::Sidebar;
+use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{StructureTab, StructureTabEvent};
@@ -176,6 +178,9 @@ pub struct Workspace {
     next_query_number: usize,
     palette: Entity<CommandState>,
     pending_save: Option<Task<()>>,
+    /// A connection being opened for "New SQL editor": its tab opens once
+    /// it is connected.
+    pending_editor: Option<String>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -197,11 +202,18 @@ impl Workspace {
             }
         });
         // Text typed in the last moments before quitting is not lost.
-        let flush_on_quit = cx.on_app_quit(|this, cx| this.save_tabs(cx));
+        let flush_on_quit = cx.on_app_quit(|this, cx| {
+            let (tabs, settings) = (this.save_tabs(cx), AppState::flush_settings(cx));
+            async move {
+                tabs.await;
+                settings.await;
+            }
+        });
         let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), window, cx));
         let navigator = sidebar.read(cx).navigator().clone();
         let navigator_events = cx.subscribe_in(&navigator, window, Self::on_navigator_event);
         let connection_events = cx.subscribe_in(&connections, window, Self::on_connections_event);
+        let sidebar_events = cx.subscribe_in(&sidebar, window, Self::on_sidebar_event);
 
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
@@ -212,12 +224,14 @@ impl Workspace {
             next_query_number: 1,
             palette,
             pending_save: None,
+            pending_editor: None,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
                 flush_on_quit,
                 connection_events,
                 navigator_events,
+                sidebar_events,
             ],
         };
         for snapshot in tabs {
@@ -645,11 +659,19 @@ impl Workspace {
     // Commands ----------------------------------------------------------------
 
     fn new_query_tab(&mut self, _: &NewQueryTab, window: &mut Window, cx: &mut Context<Self>) {
-        let title = format!("Query {}", self.next_query_number);
         let target = self.default_target(cx);
-        self.push_query_tab(title, "", target, window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
-        self.schedule_save(cx);
+        self.new_query_on(target, window, cx);
+    }
+
+    /// Opens an empty "Query N" tab running on `target`.
+    fn new_query_on(
+        &mut self,
+        target: Option<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = format!("Query {}", self.next_query_number);
+        self.open_query(title, "", target, window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -824,6 +846,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
+            NavigatorEvent::NewQuery { target } => {
+                self.new_query_on(Some(target.clone()), window, cx);
+            }
             NavigatorEvent::OpenQuery { title, sql, target } => {
                 self.push_query_tab(title.clone(), sql, target.clone(), window, cx);
                 self.activate_tab(self.tabs.len() - 1, window, cx);
@@ -872,6 +897,12 @@ impl Workspace {
         }
     }
 
+    /// The sidebar; for tests.
+    #[cfg(test)]
+    pub fn sidebar(&self) -> Entity<Sidebar> {
+        self.sidebar.clone()
+    }
+
     /// The schema tree of the sidebar.
     #[cfg(test)]
     pub fn navigator(&self, cx: &App) -> Entity<Navigator> {
@@ -893,11 +924,7 @@ impl Workspace {
                     Status::Connected { .. }
                 )
             })
-            .map(|id| Target {
-                connection: id.to_string(),
-                database: None,
-                schema: None,
-            })
+            .map(connection_target)
     }
 
     /// Opens a tab holding `sql` and gives it the keyboard.
@@ -1386,6 +1413,86 @@ impl Workspace {
         ConnectionDialog::open(self.connections.clone(), None, window, cx);
     }
 
+    fn on_list(&mut self, action: SidebarAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.perform(&Subject::List, action, window, cx)
+        });
+    }
+
+    fn new_connection_folder(
+        &mut self,
+        _: &NewConnectionFolder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_list(SidebarAction::NewFolder, window, cx);
+    }
+
+    fn refresh_connections(
+        &mut self,
+        _: &RefreshConnections,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_list(SidebarAction::Refresh, window, cx);
+    }
+
+    fn collapse_connection_folders(
+        &mut self,
+        _: &CollapseConnectionFolders,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_list(SidebarAction::CollapseAll, window, cx);
+    }
+
+    fn refresh_schema_tree(
+        &mut self,
+        _: &RefreshSchemaTree,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| navigator.reload(cx));
+    }
+
+    fn collapse_schema_tree(
+        &mut self,
+        _: &CollapseSchemaTree,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        navigator.update(cx, |navigator, cx| navigator.collapse_all(cx));
+    }
+
+    fn on_sidebar_event(
+        &mut self,
+        _: &Entity<Sidebar>,
+        event: &SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SidebarEvent::ImportConnections => {
+                self.import_connections(&ImportConnections, window, cx)
+            }
+            SidebarEvent::NewEditor(id) => {
+                if matches!(
+                    self.connections.read(cx).status(id),
+                    Status::Connected { .. }
+                ) {
+                    self.new_query_on(Some(connection_target(id)), window, cx);
+                } else {
+                    // Connect first (with its prompts); the tab follows.
+                    self.pending_editor = Some(id.clone());
+                    self.connections
+                        .update(cx, |connections, cx| connections.connect(id, cx));
+                }
+            }
+        }
+    }
+
     fn on_connections_event(
         &mut self,
         _: &Entity<Connections>,
@@ -1396,6 +1503,16 @@ impl Workspace {
         match event {
             ConnectionsEvent::ListChanged => {}
             ConnectionsEvent::StatusChanged { id } => {
+                if self.pending_editor.as_ref() == Some(id) {
+                    match self.connections.read(cx).status(id) {
+                        Status::Connected { .. } => {
+                            self.pending_editor = None;
+                            self.new_query_on(Some(connection_target(id)), window, cx);
+                        }
+                        Status::Disconnected | Status::Failed { .. } => self.pending_editor = None,
+                        Status::Connecting | Status::WaitingForInput => {}
+                    }
+                }
                 let connections = self.connections.read(cx);
                 if let (Status::Failed { message }, Some(saved)) =
                     (connections.status(id), connections.get(id))
@@ -1894,6 +2011,15 @@ impl Workspace {
     }
 }
 
+/// Where a tab runs on a connection: its own database and schema.
+fn connection_target(id: &str) -> Target {
+    Target {
+        connection: id.to_string(),
+        database: None,
+        schema: None,
+    }
+}
+
 /// The commands shown in the palette, grouped, in display order.
 fn palette_groups() -> Vec<(&'static str, Vec<&'static actions::Command>)> {
     let mut groups: Vec<(&'static str, Vec<&'static actions::Command>)> = Vec::new();
@@ -1981,6 +2107,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::import_connections))
             .on_action(cx.listener(Self::export_connections))
+            .on_action(cx.listener(Self::new_connection_folder))
+            .on_action(cx.listener(Self::refresh_connections))
+            .on_action(cx.listener(Self::collapse_connection_folders))
+            .on_action(cx.listener(Self::refresh_schema_tree))
+            .on_action(cx.listener(Self::collapse_schema_tree))
             .size_full()
             .bg(background)
             .text_color(foreground)
