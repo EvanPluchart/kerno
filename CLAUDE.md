@@ -141,8 +141,12 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
   shortcuts (Cmd+Enter run statement, Cmd+Shift+Enter run all, Cmd+. cancel, Cmd+T new query, Cmd+W close tab,
   Cmd+S save, Cmd+P quick open table), a keymap file the user can override, native menu bar on macOS.
 - Motion is short and functional (tab/panel transitions under 150 ms), never blocks input.
-- App icon and wordmark: design them with the `logo-design` skill (Kerno = "core" in Esperanto). Ship macOS
-  `.icns` and Linux PNG sizes.
+- Brand (owner-approved, 2026-11-13): identity, icons and colours are in `assets/brand/BRAND.md`; use those
+  files, do not redraw them. The theme accent moves from teal to the brand: dark theme primary = Lime
+  `#C8F03C` with Ink text, selection tints from lime; light theme primary buttons = Lime with Ink text,
+  while text accents, links and focus rings use Olive `#4D6B00` and selected rows use Lime wash `#F1F8D6`.
+  Keep WCAG AA (BRAND.md lists the ratios). Show the horizontal lockup in the About window and the README
+  header, and the mark in the empty state of the main window.
 
 ## 4. v1 features (all required, priority order)
 
