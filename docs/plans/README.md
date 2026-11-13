@@ -176,6 +176,11 @@ time holds the servers (`testing::exclusive_run`). A new test follows these rule
 
 ## Real-app checks and captures (main session or a `sonnet` agent)
 
+- **Keyboard layout.** The owner's Mac uses the French (AZERTY) layout and `orca computer hotkey` sends
+  physical key positions: `cmd+a` arrives as Cmd+Q and quits the app, `cmd+w` and `cmd+z` are swapped,
+  `cmd+m` and punctuation land elsewhere. Drive letter shortcuts through the command palette (Cmd+K is at
+  the same place) or the menus; an app that "quit by itself" with exit status 0 was told to.
+
 `scripts/capture.sh` and `scripts/window-id.swift` capture the window (`screencapture -l <id>`). The app runs
 on a scratch data directory: `KERNO_DATA_DIR=<dir> KERNO_SECRET_STORE=memory KERNO_APPEARANCE=<light|dark>
 nice -n 10 target/release/kerno`. It is driven with the `orca-computer-use` skill (`orca computer click
