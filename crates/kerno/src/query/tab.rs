@@ -43,7 +43,7 @@ use kerno_core::{
 
 use super::comment;
 use super::completion::{self, SharedCatalog, SqlCompletion};
-use super::grid::{CopyFormat, Grid};
+use super::grid::{CopyFormat, Grid, GridAction, Owner};
 use super::params;
 use super::{plan_view, viewer};
 use crate::actions::{
@@ -809,12 +809,21 @@ impl QueryTab {
         if !self.exportable(pane, cx) {
             return None;
         }
+        let sql = pane.statement.clone();
+        self.export_statement(sql, window, cx)
+    }
+
+    /// Opens the export of the rows of a statement that only reads.
+    fn export_statement(
+        &mut self,
+        sql: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ExportDialog>> {
         export_dialog::open(
             self.connections.clone(),
             self.target.clone()?,
-            Source::Query {
-                sql: pane.statement.clone(),
-            },
+            Source::Query { sql },
             window,
             cx,
         )
@@ -1815,6 +1824,24 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        // The menu of a cell exports the result of its own statement (it
+        // says when that statement writes, and does not run it).
+        let view = cx.weak_entity();
+        let sql = statement.to_string();
+        let grid = grid.with_owner(Owner {
+            act: Rc::new(move |action, _, _, window, cx| {
+                if action == GridAction::Export {
+                    let _ = view.update(cx, |this, cx| {
+                        this.export_statement(sql.clone(), window, cx)
+                    });
+                }
+            }),
+            related: None,
+            export: classify(statement, self.lex_rules(cx))
+                .writes
+                .then_some("the statement writes"),
+            filtered: false,
+        });
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
                 .col_resizable(true)

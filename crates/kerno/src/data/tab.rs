@@ -33,13 +33,18 @@ use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
-use crate::query::grid::{CopyFormat, Grid, RowMenu, SortOnServer};
+use crate::query::grid::{ColumnEdit, CopyFormat, Grid, GridAction, Owner, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
 use crate::query::viewer;
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
+
+// Why rows take no change, as the menus say it.
+const READ_ONLY_CONNECTION: &str = "read-only connection";
+const VIEW: &str = "view";
+const NO_KEY: &str = "no key";
 
 /// What a data tab asks of the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,27 +271,33 @@ impl DataTab {
         }
     }
 
-    /// Why the rows cannot be edited, when they cannot.
-    pub fn read_only_reason(&self, cx: &App) -> Option<String> {
+    /// Why the rows cannot be edited, in a few words, when they cannot.
+    fn read_only(&self, cx: &App) -> Option<&'static str> {
         let read_only = self
             .connections
             .read(cx)
             .get(&self.target.connection)
             .is_some_and(|saved| saved.config.read_only);
         if read_only {
-            return Some(format!(
-                "“{}” is a read-only connection.",
-                self.connection_name(cx)
-            ));
+            Some(READ_ONLY_CONNECTION)
+        } else if !self.kind.is_table() {
+            Some(VIEW)
+        } else {
+            let structure = self.structure.as_ref()?;
+            structure.row_identity().is_none().then_some(NO_KEY)
         }
-        if !self.kind.is_table() {
-            return Some("The rows of a view are read-only here.".into());
-        }
-        let structure = self.structure.as_ref()?;
-        structure.row_identity().is_none().then(|| {
-            "Read-only: this table has no primary key and no unique index on NOT NULL columns, \
-             so a row cannot be told from another."
-                .into()
+    }
+
+    /// Why the rows cannot be edited, when they cannot.
+    pub fn read_only_reason(&self, cx: &App) -> Option<String> {
+        Some(match self.read_only(cx)? {
+            READ_ONLY_CONNECTION => {
+                format!("“{}” is a read-only connection.", self.connection_name(cx))
+            }
+            VIEW => "The rows of a view are read-only here.".into(),
+            _ => "Read-only: this table has no primary key and no unique index on NOT NULL \
+                  columns, so a row cannot be told from another."
+                .into(),
         })
     }
 
@@ -459,16 +470,18 @@ impl DataTab {
         });
         // A computed column takes no value, nor does an identity the server
         // always generates.
-        let writable = self.read_only_reason(cx).is_none().then(|| {
-            store
+        let columns = match self.read_only(cx) {
+            Some(reason) => Err(reason),
+            None => Ok(store
                 .columns()
                 .iter()
                 .map(|column| {
-                    structure
+                    let info = structure
                         .columns
                         .iter()
-                        .find(|info| info.name == column.name)
-                        .is_some_and(|info| {
+                        .find(|info| info.name == column.name);
+                    ColumnEdit {
+                        writable: info.is_some_and(|info| {
                             !matches!(
                                 info.generation,
                                 Some(
@@ -477,10 +490,12 @@ impl DataTab {
                                         | ColumnGeneration::IdentityAlways
                                 )
                             )
-                        })
+                        }),
+                        nullable: info.is_some_and(|info| info.nullable),
+                    }
                 })
-                .collect()
-        });
+                .collect()),
+        };
         let view = cx.weak_entity();
         let sort_on_server: Rc<SortOnServer> = Rc::new({
             let view = view.clone();
@@ -488,27 +503,28 @@ impl DataTab {
                 let _ = view.update(cx, |this, cx| this.sort_by(sort, window, cx));
             }
         });
-        let row_menu: Rc<RowMenu> = Rc::new({
-            let editable = writable.is_some();
-            move |grid, row, menu, _, _| {
-                related_rows(
-                    &view,
-                    &structure,
-                    grid,
-                    row,
-                    row_actions(&view, grid, row, editable, menu),
-                )
-            }
-        });
+        let owner = Owner {
+            act: Rc::new(move |action, row, column, window, cx| {
+                let _ = view.update(cx, |this, cx| this.perform(action, row, column, window, cx));
+            }),
+            related: Some(Rc::new(move |grid, row| {
+                related(&structure, grid, row)
+                    .into_iter()
+                    .map(|related| related.label)
+                    .collect()
+            })),
+            export: None,
+            filtered: !self.applied.is_empty(),
+        };
         let grid = Grid::page(
             store,
             session,
             self.table.clone(),
             sort,
-            writable,
+            columns,
             sort_on_server,
-            row_menu,
-        );
+        )
+        .with_owner(owner);
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
                 .col_resizable(true)
@@ -865,6 +881,23 @@ impl DataTab {
 
     /// Gives every selected cell `value` (`NULL` or the column's default).
     pub fn set_selected(&mut self, value: CellValue, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_cells(value, false, window, cx);
+    }
+
+    /// Sets the selected cells that take NULL to NULL (Delete, Backspace).
+    pub fn clear_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_cells(CellValue::Null, true, window, cx);
+    }
+
+    /// Gives the selected cells `value`; with `nullable_only`, not those
+    /// of a NOT NULL column.
+    fn set_cells(
+        &mut self,
+        value: CellValue,
+        nullable_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_edit(window, cx) {
             return;
         }
@@ -880,7 +913,9 @@ impl DataTab {
             let grid = table.delegate();
             rows.iter()
                 .flat_map(|&row| columns.iter().map(move |&column| (row, column)))
-                .filter(|&(row, column)| grid.takes_value(row, column))
+                .filter(|&(row, column)| {
+                    grid.takes_value(row, column) && (!nullable_only || grid.nullable(column))
+                })
                 .collect()
         };
         self.change(cx, |pending, store| {
@@ -888,6 +923,151 @@ impl DataTab {
                 pending.set(store, row, column, value.clone());
             }
         });
+    }
+
+    /// Puts the text of the clipboard in the selected cells: one value in
+    /// each, or a block of tab-separated cells from the first one. Each
+    /// pasted cell is a pending change, as a typed one is.
+    pub fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() || !self.can_edit(window, cx) {
+            return;
+        }
+        let Some(table) = self.grid.clone() else {
+            return;
+        };
+        let cells = {
+            let table = table.read(cx);
+            let Some(selected) = table.delegate().selected(table.selection()) else {
+                return;
+            };
+            table.delegate().pasted(&selected, &text)
+        };
+        self.change(cx, |pending, store| {
+            for (row, column, value) in cells {
+                pending.set(store, row, column, value);
+            }
+        });
+    }
+
+    /// A condition on the column of a cell of the grid, with the cell's
+    /// value: `operator`, or for a NULL cell `IS NULL` (`=`) and
+    /// `IS NOT NULL` (`<>`).
+    fn condition_at(
+        &self,
+        row: usize,
+        column: usize,
+        operator: Operator,
+        cx: &App,
+    ) -> Option<Condition> {
+        let grid = self.grid.as_ref()?.read(cx).delegate();
+        let (described, value) = grid.value_at(row, column)?;
+        let operator = match (value, operator) {
+            (None, Operator::Equals) => Operator::IsNull,
+            (None, Operator::NotEquals) => Operator::IsNotNull,
+            (None, _) => return None,
+            (Some(_), operator) => operator,
+        };
+        Some(Condition {
+            column: described.name.clone(),
+            operator,
+            value: value.map_or(String::new(), |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            }),
+        })
+    }
+
+    /// Adds a condition to the filter bar and reads the rows it keeps
+    /// (refused, the bar unchanged, while changes are pending).
+    fn filter_by(&mut self, condition: Condition, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.free_to_move(window, cx) {
+            return;
+        }
+        self.push_filter_row(condition, window, cx);
+        self.apply_filter(window, cx);
+    }
+
+    /// Adds a condition to the filter bar, to be finished and applied
+    /// there: its value is focused.
+    fn prefill_filter(
+        &mut self,
+        condition: Condition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_filter_row(condition, window, cx);
+        if let Some(row) = self.filter_rows.last() {
+            row.value.update(cx, |value, cx| value.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Runs an entry of a menu of the grid that is the tab's, on the cell
+    /// at `row` and `column` of the grid.
+    pub fn perform(
+        &mut self,
+        action: GridAction,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let condition =
+            |this: &Self, operator, cx: &App| this.condition_at(row, column, operator, cx);
+        match action {
+            GridAction::Paste => self.paste(window, cx),
+            GridAction::FilterByValue | GridAction::ExcludeValue => {
+                let operator = if action == GridAction::FilterByValue {
+                    Operator::Equals
+                } else {
+                    Operator::NotEquals
+                };
+                if let Some(condition) = condition(self, operator, cx) {
+                    self.filter_by(condition, window, cx);
+                }
+            }
+            GridAction::FilterWith(operator) => {
+                if let Some(condition) = condition(self, operator, cx) {
+                    self.prefill_filter(condition, window, cx);
+                }
+            }
+            GridAction::FilterColumn => {
+                let name = self.grid.as_ref().and_then(|table| {
+                    let grid = table.read(cx).delegate();
+                    let source = grid.source_column(column)?;
+                    Some(grid.store().columns()[source].name.clone())
+                });
+                if let Some(name) = name {
+                    self.prefill_filter(Condition::equals(name, ""), window, cx);
+                }
+            }
+            GridAction::ClearFilters => self.set_filter(Filter::default(), window, cx),
+            GridAction::Follow(index, _) => {
+                let related = match (&self.grid, &self.structure) {
+                    (Some(table), Some(structure)) => {
+                        related(structure, table.read(cx).delegate(), row)
+                    }
+                    _ => Vec::new(),
+                };
+                if let Some(related) = related.get(index) {
+                    self.follow(related, cx);
+                }
+            }
+            GridAction::EditCell => self.edit_cell(row, column, window, cx),
+            // Cells of NOT NULL columns are left alone, as with Delete.
+            GridAction::SetNull => self.clear_selected(window, cx),
+            GridAction::SetDefault => self.set_selected(CellValue::Default, window, cx),
+            GridAction::DuplicateRow => self.duplicate_rows(Some(row), window, cx),
+            GridAction::DeleteRow => self.delete_rows(Some(row), window, cx),
+            GridAction::RevertRow => self.revert_row(row, cx),
+            GridAction::Export => {
+                self.export(window, cx);
+            }
+            // The grid runs the others itself.
+            _ => {}
+        }
     }
 
     /// Opens the other end of a foreign key in a tab of its own.
@@ -1592,50 +1772,6 @@ impl DataTab {
     }
 }
 
-/// The entries of a row's menu that change the row.
-fn row_actions(
-    view: &gpui_kit::WeakEntity<DataTab>,
-    grid: &Grid,
-    row: usize,
-    editable: bool,
-    menu: PopupMenu,
-) -> PopupMenu {
-    if !editable {
-        return menu;
-    }
-    let item = |label: &'static str,
-                act: fn(&mut DataTab, usize, &mut Window, &mut Context<DataTab>)| {
-        let view = view.clone();
-        PopupMenuItem::new(label).on_click(move |_, window, cx| {
-            let _ = view.update(cx, |this, cx| act(this, row, window, cx));
-        })
-    };
-    let fetched = grid.store().row_count();
-    let pending = grid.pending();
-    let deleted = pending.is_some_and(|pending| pending.is_deleted(row));
-    let touched = row < fetched
-        && (deleted
-            || (0..grid.store().columns().len()).any(|column| {
-                pending.is_some_and(|pending| pending.value(fetched, row, column).is_some())
-            }));
-    let mut menu = menu
-        .item(item("Duplicate row", |this, row, window, cx| {
-            this.duplicate_rows(Some(row), window, cx)
-        }))
-        .item(
-            item("Delete row", |this, row, window, cx| {
-                this.delete_rows(Some(row), window, cx)
-            })
-            .disabled(deleted),
-        );
-    if touched {
-        menu = menu.item(item("Revert row", |this, row, _, cx| {
-            this.revert_row(row, cx)
-        }));
-    }
-    menu
-}
-
 /// The other end of a foreign key of a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Related {
@@ -1692,31 +1828,6 @@ pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Relat
     references.chain(referenced_by).collect()
 }
 
-/// The entries of a row's menu that follow its foreign keys.
-fn related_rows(
-    view: &gpui_kit::WeakEntity<DataTab>,
-    structure: &TableStructure,
-    grid: &Grid,
-    row: usize,
-    mut menu: PopupMenu,
-) -> PopupMenu {
-    let related = related(structure, grid, row);
-    if !related.is_empty() {
-        menu = menu.separator();
-    }
-    for related in related {
-        let view = view.clone();
-        menu = menu.item(
-            PopupMenuItem::new(SharedString::from(related.label.clone())).on_click(
-                move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.follow(&related, cx));
-                },
-            ),
-        );
-    }
-    menu
-}
-
 impl Focusable for DataTab {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1733,8 +1844,8 @@ impl Render for DataTab {
             .test_support()
             .track_focus(&self.focus_handle)
             .size_full()
-            // With the grid focused: copy the selection, select everything,
-            // type in the selected cell.
+            // With the grid focused: copy the selection, paste, select
+            // everything, type in the selected cell, set it to NULL.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
                 let Some(table) = this.grid.clone() else {
@@ -1755,6 +1866,14 @@ impl Render for DataTab {
                             table.delegate_mut().select_all();
                             cx.notify();
                         });
+                        cx.stop_propagation();
+                    }
+                    "v" if secondary => {
+                        this.paste(window, cx);
+                        cx.stop_propagation();
+                    }
+                    "delete" | "backspace" if !keystroke.modifiers.modified() => {
+                        this.clear_selected(window, cx);
                         cx.stop_propagation();
                     }
                     "enter" | "f2" => {

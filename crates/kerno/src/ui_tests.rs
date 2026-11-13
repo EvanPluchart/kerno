@@ -3051,17 +3051,16 @@ fn a_double_click_on_a_cell_shows_its_whole_value(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_right_click_on_a_cell_opens_the_menu_of_its_row(cx: &mut TestAppContext) {
-    use gpui_kit::test::{ClickOptions, TestQueryExt as _};
+    use gpui_kit::test::ClickOptions;
     if !testing::available(Engine::Postgres) {
         return;
     }
     let app = connected(cx, Engine::Postgres);
     app.run_in_new_tab(cx, "select 1 as a, 'x' as b", "secondary-enter");
     app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
-    let menu_has = |app: &Fixture, cx: &mut TestAppContext, label: &str| {
-        app.step(cx, |window, _| window.try_find_by_label(label).is_some())
-    };
-    assert!(!menu_has(&app, cx, "Copy as CSV"));
+    let menu_has =
+        |app: &Fixture, cx: &mut TestAppContext, label: &str| menu_entry(app, cx, label).is_some();
+    assert!(!menu_has(&app, cx, "Copy as"));
     // On the first row, under the headers, in the first column of values.
     app.step(cx, |window, cx| {
         window.click_with_options(
@@ -3072,8 +3071,380 @@ fn a_right_click_on_a_cell_opens_the_menu_of_its_row(cx: &mut TestAppContext) {
             cx,
         )
     });
-    assert!(menu_has(&app, cx, "Copy as CSV"));
-    assert!(menu_has(&app, cx, "Copy column names"));
+    // The menu of a cell of a result (its entries: `query::grid::tests`).
+    for label in [
+        "Copy",
+        "Copy as",
+        "Copy column name",
+        "Order by this column",
+        "View value",
+        "Hide column",
+        "Export…",
+    ] {
+        assert!(menu_has(&app, cx, label), "{label}");
+    }
+    // A result has no edits and no server-side filter.
+    for label in ["Paste", "Edit cell", "Filter by this value"] {
+        assert!(!menu_has(&app, cx, label), "{label}");
+    }
+}
+
+// Grid menus (docs/plans/CTX.md Part 3) -------------------------------------------
+
+/// Where the entry of an open menu with this label is drawn (a button
+/// elsewhere may have the same label).
+fn menu_entry(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    label: &str,
+) -> Option<Point<gpui_kit::Pixels>> {
+    use gpui_kit::test::TestQueryExt as _;
+    let popup = gpui_kit::ElementId::Name("popup-menu".into());
+    app.step(cx, |window, _| {
+        window
+            .find_all_by_label(label)
+            .into_iter()
+            .find(|entry| entry.path().contains(&popup))
+            .map(|entry| entry.bounds().center())
+    })
+}
+
+/// Clicks the entry of an open menu with this label.
+fn click_menu_entry(app: &Fixture, cx: &mut TestAppContext, label: &str) {
+    let centre = menu_entry(app, cx, label).unwrap_or_else(|| panic!("no menu entry {label:?}"));
+    app.step(cx, |window, cx| window.drag(centre, centre, cx));
+}
+
+#[gpui_kit::test]
+fn the_menu_of_a_result_cell_acts_on_the_selection_or_on_its_cell(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g as n, 'v' || g as label from generate_series(1, 3) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the rows", |app, cx| app.outcomes(cx) == ["3 rows"]);
+    let tab = app.tab(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid_of(0)).expect("a grid");
+    let clipboard = |cx: &mut TestAppContext| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    };
+    // Two rows by two columns selected; a right-click inside keeps them.
+    cx.update(|cx| {
+        grid.update(cx, |table, cx| {
+            table.set_selected_cell(0, 1, cx);
+            table.delegate_mut().extend_to(1, 2);
+        })
+    });
+    app.right_click(cx, "table-cell-1:2", None);
+    click_menu_entry(&app, cx, "Copy");
+    assert_eq!(clipboard(cx), "1\tv1\n2\tv2\n");
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Copy column name");
+    assert_eq!(clipboard(cx), "n\nlabel");
+    // Outside the selection, the right-click selects its cell.
+    app.right_click(cx, "table-cell-2:2", None);
+    click_menu_entry(&app, cx, "Copy");
+    assert_eq!(clipboard(cx), "v3");
+    // Copy as ▸ JSON, from the submenu.
+    app.right_click(cx, "table-cell-2:2", None);
+    click_menu_entry(&app, cx, "Copy as");
+    click_menu_entry(&app, cx, "JSON");
+    assert_eq!(clipboard(cx), "[{\"label\":\"v3\"}]");
+
+    // Order ▸ Descending sorts what was fetched; Clear order undoes it.
+    let first_column = |cx: &mut TestAppContext| -> Vec<String> {
+        cx.update(|cx| grid.read(cx).delegate().shown())
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    };
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Order by this column");
+    click_menu_entry(&app, cx, "Descending");
+    assert_eq!(first_column(cx), ["3", "2", "1"]);
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Order by this column");
+    click_menu_entry(&app, cx, "Clear order");
+    assert_eq!(first_column(cx), ["1", "2", "3"]);
+
+    // Export… opens the export of this result.
+    app.right_click(cx, "table-cell-0:1", None);
+    click_menu_entry(&app, cx, "Export…");
+    assert!(app.has(cx, "export-dialog"));
+}
+
+/// A table with a NULL and a repeated value, for filters from a cell.
+fn filter_scratch(engine: Engine, schema: &str) -> Scratch {
+    let (drop_schema, create_schema) = scratch_schema(engine, schema);
+    Scratch::new(
+        engine,
+        &[&drop_schema],
+        &[
+            &create_schema,
+            &scratch_table(
+                engine,
+                &format!("{schema}.items"),
+                "name VARCHAR(20) NOT NULL, qty INT",
+            ),
+            &format!(
+                "INSERT INTO {schema}.items (name, qty) \
+                 VALUES ('a', 1), ('b', 2), ('c', NULL), ('b', 3)"
+            ),
+        ],
+    )
+}
+
+#[gpui_kit::test]
+fn filter_by_this_value_and_exclude_it_change_the_rows(cx: &mut TestAppContext) {
+    use crate::query::grid::GridAction;
+
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = filter_scratch(engine, "kerno_ui_cell_filter");
+        let app = connected(cx, engine);
+        app.open_table(cx, "kerno_ui_cell_filter", "items", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+        let ids = |app: &Fixture, cx: &mut TestAppContext| -> Vec<String> {
+            app.data_rows(cx)
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect()
+        };
+        let perform = |app: &Fixture, cx: &mut TestAppContext, action, row, column| {
+            app.on_data(cx, |tab, window, cx| {
+                tab.perform(action, row, column, window, cx)
+            })
+        };
+
+        // A real right-click on the name "b" of the second row.
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("x".into()));
+        app.right_click(cx, "table-cell-1:2", None);
+        // "name" is NOT NULL: the entry says why it cannot be used.
+        for label in [
+            "Paste",
+            "Edit cell",
+            "Set NULL (NOT NULL)",
+            "Exclude this value",
+        ] {
+            assert!(menu_entry(&app, cx, label).is_some(), "{engine:?} {label}");
+        }
+        click_menu_entry(&app, cx, "Filter by this value");
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        assert_eq!(ids(&app, cx), ["2", "4"], "{engine:?}");
+        // The condition is in the filter bar, where it can be changed.
+        assert!(app.has(cx, ("filter-column", 0usize)), "{engine:?}");
+        perform(&app, cx, GridAction::ClearFilters, 0, 2);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+        assert!(!app.has(cx, ("filter-column", 0usize)), "{engine:?}");
+
+        perform(&app, cx, GridAction::ExcludeValue, 1, 2);
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        assert_eq!(ids(&app, cx), ["1", "3"], "{engine:?}");
+        perform(&app, cx, GridAction::ClearFilters, 0, 2);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+
+        // A NULL cell: IS NULL, and IS NOT NULL.
+        perform(&app, cx, GridAction::FilterByValue, 2, 3);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        assert_eq!(ids(&app, cx), ["3"], "{engine:?}");
+        perform(&app, cx, GridAction::ClearFilters, 0, 2);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+        perform(&app, cx, GridAction::ExcludeValue, 2, 3);
+        app.wait_for_rows(cx, "Rows 1–3 of 3");
+        assert_eq!(ids(&app, cx), ["1", "2", "4"], "{engine:?}");
+        perform(&app, cx, GridAction::ClearFilters, 0, 2);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+
+        // Filter ▸ > puts the condition in the bar without applying it.
+        perform(&app, cx, GridAction::FilterWith(Operator::Greater), 1, 3);
+        assert!(app.has(cx, ("filter-column", 0usize)), "{engine:?}");
+        assert_eq!(app.data_state(cx), "Rows 1–4 of 4", "{engine:?}");
+        app.click(cx, "filter-apply");
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        assert_eq!(ids(&app, cx), ["4"], "{engine:?}");
+        perform(&app, cx, GridAction::ClearFilters, 0, 2);
+        app.wait_for_rows(cx, "Rows 1–4 of 4");
+
+        // With a change pending, a filter is refused and the bar unchanged.
+        app.type_in_cell(cx, 0, 2, "z", "enter");
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        perform(&app, cx, GridAction::FilterByValue, 1, 2);
+        cx.run_until_parked();
+        assert!(!app.has(cx, ("filter-column", 0usize)), "{engine:?}");
+        assert_eq!(
+            (app.pending(cx), app.data_state(cx).as_str()),
+            (1, "Rows 1–4 of 4"),
+            "{engine:?}"
+        );
+        app.click(cx, "data-discard");
+    }
+}
+
+#[gpui_kit::test]
+fn the_menu_of_a_column_header_orders_filters_and_fits(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = filter_scratch(Engine::Postgres, "kerno_ui_header_menu");
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_header_menu", "items", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–4 of 4");
+    // A real right-click on the header of "qty".
+    app.right_click(cx, ("column-header", 3usize), None);
+    for label in [
+        "Copy column name",
+        "Order by this column",
+        "Filter on this column…",
+        "Pin column",
+        "Hide column",
+        "Fit width",
+        "Fit all widths",
+    ] {
+        assert!(menu_entry(&app, cx, label).is_some(), "{label}");
+    }
+    // Order ▸ Descending is the server's work on a table.
+    click_menu_entry(&app, cx, "Order by this column");
+    click_menu_entry(&app, cx, "Descending");
+    app.wait_until(cx, "the sorted page", |app, cx| {
+        let tab = app.data(cx);
+        cx.update(|cx| tab.read(cx).sort() == Some(("qty", true)))
+            && app.data_state(cx) == "Rows 1–4 of 4"
+    });
+    let qty: Vec<String> = app
+        .data_rows(cx)
+        .into_iter()
+        .map(|row| row[2].clone())
+        .collect();
+    // PostgreSQL puts NULL first when descending.
+    assert_eq!(qty, ["NULL", "3", "2", "1"]);
+
+    // Filter on this column… adds a line on it, to be filled in.
+    app.right_click(cx, ("column-header", 3usize), None);
+    click_menu_entry(&app, cx, "Filter on this column…");
+    assert!(app.has(cx, ("filter-column", 0usize)));
+    app.type_text(cx, "2");
+    app.press(cx, &["enter"]);
+    app.wait_for_rows(cx, "Rows 1–1 of 1");
+    assert_eq!(app.data_rows(cx)[0][2], "2");
+
+    // Fit width narrows "name" (short values) to what it shows.
+    let grid = app.data_grid(cx);
+    let width = |cx: &mut TestAppContext| cx.update(|cx| grid.read(cx).col_width(2).unwrap());
+    let before = width(cx);
+    app.right_click(cx, ("column-header", 2usize), None);
+    click_menu_entry(&app, cx, "Fit width");
+    let after = width(cx);
+    assert!(after < before && after > px(40.), "{before:?} → {after:?}");
+
+    // Copy column name and Hide column, from the header's own menu.
+    app.right_click(cx, ("column-header", 2usize), None);
+    click_menu_entry(&app, cx, "Copy column name");
+    let copied = cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(copied.as_deref(), Some("name"));
+    app.right_click(cx, ("column-header", 3usize), None);
+    click_menu_entry(&app, cx, "Hide column");
+    let shown = cx.update(|cx| grid.read(cx).delegate().shown_columns());
+    assert_eq!(shown, ["id", "name"]);
+}
+
+#[gpui_kit::test]
+fn pasting_fills_cells_from_the_clipboard_and_delete_empties_them(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_paste CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_paste",
+            "CREATE TABLE kerno_ui_paste.items (id integer PRIMARY KEY, \
+             name varchar(20) NOT NULL, qty integer, \
+             twice integer GENERATED ALWAYS AS (qty * 2) STORED, note varchar(20))",
+            "INSERT INTO kerno_ui_paste.items (id, name, qty, note) \
+             VALUES (1, 'a', 1, 'x'), (2, 'b', 2, 'y'), (3, 'c', 3, 'z')",
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "kerno_ui_paste", "items", RelationKind::Table);
+    app.wait_for_rows(cx, "Rows 1–3 of 3");
+    let grid = app.data_grid(cx);
+    // Selects from a cell to another and gives the grid the keys.
+    let select =
+        |app: &Fixture, cx: &mut TestAppContext, from: (usize, usize), to: (usize, usize)| {
+            app.step(cx, |window, cx| {
+                grid.update(cx, |table, cx| {
+                    table.delegate_mut().clear_selection();
+                    table.set_selected_cell(from.0, from.1, cx);
+                    if to != from {
+                        table.delegate_mut().extend_to(to.0, to.1);
+                    }
+                });
+                grid.read(cx).focus_handle(cx).focus(window, cx);
+            });
+        };
+    let paste = |app: &Fixture, cx: &mut TestAppContext, text: &str| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.to_string()));
+        app.press(cx, &["secondary-v"]);
+    };
+    let row = |cells: [&str; 5]| cells.map(str::to_string).to_vec();
+
+    // One value: in the selected cell, then in each of a range.
+    select(&app, cx, (0, 5), (0, 5));
+    paste(&app, cx, "q");
+    assert_eq!(app.data_rows(cx)[0], row(["1", "a", "1", "2", "q"]));
+    select(&app, cx, (1, 3), (2, 3));
+    paste(&app, cx, "9\n");
+    assert_eq!(app.data_rows(cx)[1][2], "9");
+    assert_eq!(app.data_rows(cx)[2][2], "9");
+    assert_eq!(app.pending(cx), 3);
+    app.click(cx, "data-discard");
+
+    // A block from the selected cell: the computed column is skipped, an
+    // empty number is NULL, and nothing goes past the last row or column.
+    select(&app, cx, (1, 3), (1, 3));
+    paste(&app, cx, "10\t99\tn1\textra\n\t99\tn2\n30\t99\tn3\n");
+    assert_eq!(
+        app.data_rows(cx),
+        [
+            row(["1", "a", "1", "2", "x"]),
+            row(["2", "b", "10", "4", "n1"]),
+            row(["3", "c", "NULL", "6", "n2"]),
+        ]
+    );
+    assert_eq!(app.pending(cx), 2);
+    let tab = app.data(cx);
+    let (_, statements) = cx.update(|cx| tab.read(cx).pending_sql(cx)).unwrap();
+    assert_eq!(
+        statements[0],
+        "UPDATE \"kerno_ui_paste\".\"items\" SET \"qty\" = 10, \"note\" = 'n1' WHERE \"id\" = 2"
+    );
+    app.click(cx, "data-discard");
+
+    // Delete sets a nullable cell to NULL; a NOT NULL one is left alone.
+    select(&app, cx, (0, 2), (0, 3));
+    app.press(cx, &["delete"]);
+    assert_eq!(app.data_rows(cx)[0][..3], ["1", "a", "NULL"]);
+    assert_eq!(app.pending(cx), 1);
+    select(&app, cx, (1, 3), (1, 3));
+    app.press(cx, &["backspace"]);
+    assert_eq!(app.data_rows(cx)[1][2], "NULL");
+    assert_eq!(app.pending(cx), 2);
+    // The menu's Set NULL skips the NOT NULL cells of a range too.
+    select(&app, cx, (2, 2), (2, 3));
+    app.on_data(cx, |tab, window, cx| {
+        tab.perform(crate::query::grid::GridAction::SetNull, 2, 2, window, cx)
+    });
+    assert_eq!(app.data_rows(cx)[2][..3], ["3", "c", "NULL"]);
+    assert_eq!(app.pending(cx), 3);
+    app.click(cx, "data-discard");
 }
 
 // Plans and guards ----------------------------------------------------------------
@@ -6029,4 +6400,449 @@ fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) 
         "insert into kerno_ui_close.entries values (2, 'open')"
     );
     assert!(!app.status_bar(cx).contains(&"transaction open".to_string()));
+}
+
+// Navigator tree completeness (G10) ------------------------------------------
+
+impl Fixture {
+    /// Runs the whole text of the active query tab and waits until every
+    /// statement is done.
+    fn run_active_query(&self, cx: &mut TestAppContext) {
+        let tab = self.tab(cx);
+        self.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.run(crate::query::tab::Scope::All, window, cx)
+            })
+        });
+        self.wait_until(cx, "the run", |app, cx| {
+            !app.running(cx) && !app.outcomes(cx).is_empty()
+        });
+        let outcomes = self.outcomes(cx);
+        assert!(
+            outcomes.iter().all(|outcome| outcome.starts_with("done")),
+            "{outcomes:?} running\n{}",
+            self.active_query(cx).1
+        );
+    }
+
+    /// The labels of the rows just below the row at `path`, which is open.
+    fn children_of(&self, cx: &mut TestAppContext, path: &[&str]) -> Vec<String> {
+        let tree = self.tree(cx);
+        let at = self.tree_row(cx, path);
+        let indent = "  ".repeat(path.len());
+        tree[at + 1..]
+            .iter()
+            .take_while(|line| line.starts_with(&indent))
+            .filter(|line| !line[indent.len()..].starts_with(' '))
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+}
+
+#[gpui_kit::test]
+fn a_table_lists_its_constraints_keys_references_and_triggers(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let server = |sql: &str| on_server(engine, sql);
+        // The keys of the fixture, named as the server named them.
+        let (key, reference, primary) = if pg {
+            (
+                server(
+                    "SELECT conname FROM pg_constraint \
+                     WHERE conrelid = 'shop.orders'::regclass AND contype = 'f'",
+                ),
+                server(
+                    "SELECT conname FROM pg_constraint \
+                     WHERE conrelid = 'shop.order_items'::regclass \
+                     AND confrelid = 'shop.orders'::regclass",
+                ),
+                "orders_pkey",
+            )
+        } else {
+            (
+                "orders_customer_fk".to_string(),
+                "order_items_order_fk".to_string(),
+                "PRIMARY",
+            )
+        };
+        let root: &[&str] = if pg { &["kerno", "shop"] } else { &["kerno"] };
+        let at = |rest: &[&str]| -> Vec<String> {
+            root.iter()
+                .chain(rest)
+                .map(|part| part.to_string())
+                .collect()
+        };
+        fn path(parts: &[String]) -> Vec<&str> {
+            parts.iter().map(String::as_str).collect()
+        }
+        let app = connected(cx, engine);
+        let orders = at(&["Tables", "orders"]);
+        app.open_path(cx, &path(&at(&["Tables", "orders", "Triggers"])));
+
+        // DBeaver's folders, in its order for the engine, from one load.
+        let folders = if pg {
+            [
+                "Columns",
+                "Constraints",
+                "Foreign keys",
+                "Indexes",
+                "References",
+                "Triggers",
+            ]
+        } else {
+            [
+                "Columns",
+                "Constraints",
+                "Foreign keys",
+                "References",
+                "Triggers",
+                "Indexes",
+            ]
+        };
+        assert_eq!(app.children_of(cx, &path(&orders)), folders, "{engine:?}");
+        for folder in ["Constraints", "Foreign keys", "References", "Triggers"] {
+            app.toggle(cx, &path(&at(&["Tables", "orders", folder])));
+        }
+        for (folder, name) in [
+            ("Constraints", primary),
+            ("Foreign keys", key.as_str()),
+            ("References", reference.as_str()),
+            ("Triggers", "orders_log_status"),
+        ] {
+            assert!(
+                app.shows(cx, &path(&at(&["Tables", "orders", folder, name]))),
+                "{engine:?}: {name} in {folder}: {:#?}",
+                app.tree(cx)
+            );
+        }
+
+        // A double click on a foreign key opens the referenced table.
+        let schema = if pg { "shop" } else { "kerno" };
+        app.click_row(
+            cx,
+            &path(&at(&["Tables", "orders", "Foreign keys", &key])),
+            true,
+        );
+        app.wait_for_structure(cx);
+        let opened = cx.update(|cx| {
+            app.workspace
+                .read(cx)
+                .active_structure_tab()
+                .map(|tab| tab.read(cx).table().clone())
+        });
+        assert_eq!(
+            opened,
+            Some(TableRef::new(schema, "customers")),
+            "{engine:?}"
+        );
+
+        // A reference selects the table it comes from.
+        app.act(
+            cx,
+            Action::RevealTable,
+            &path(&at(&["Tables", "orders", "References", &reference])),
+        );
+        let order_items = at(&["Tables", "order_items"]);
+        assert_eq!(
+            app.selected_row(cx),
+            Some(app.tree_row(cx, &path(&order_items))),
+            "{engine:?}"
+        );
+
+        // Revealing a table of a schema never opened loads the way to it.
+        let (other, other_root): (&str, &[&str]) = if pg {
+            ("analytics", &["kerno", "analytics"])
+        } else {
+            ("kerno_analytics", &["kerno_analytics"])
+        };
+        let table = server(&format!(
+            "SELECT min(table_name) FROM information_schema.tables \
+             WHERE table_schema = '{other}' AND table_type = 'BASE TABLE'"
+        ));
+        assert!(!app.shows(cx, &[other_root, &["Tables"]].concat()));
+        let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+        let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+        let target = Target {
+            connection,
+            database: None,
+            schema: None,
+        };
+        let revealed = TableRef::new(other, table.clone());
+        app.step(cx, |_, cx| {
+            navigator.update(cx, |navigator, cx| {
+                navigator.reveal(&target, &revealed, RelationKind::Table, cx)
+            })
+        });
+        let revealed_path = [other_root, &["Tables", table.as_str()]].concat();
+        app.wait_until(cx, "the revealed table", |app, cx| {
+            app.shows(cx, &revealed_path)
+                && app.selected_row(cx) == Some(app.tree_row(cx, &revealed_path))
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn columns_are_added_renamed_and_dropped_from_the_tree(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let (cleanup, create) = if pg {
+            (
+                "DROP SCHEMA IF EXISTS kerno_ui_g10_columns CASCADE",
+                "CREATE SCHEMA kerno_ui_g10_columns",
+            )
+        } else {
+            (
+                "DROP DATABASE IF EXISTS kerno_ui_g10_columns",
+                "CREATE DATABASE kerno_ui_g10_columns",
+            )
+        };
+        let _scratch = Scratch::new(
+            engine,
+            &[cleanup],
+            &[
+                create,
+                "CREATE TABLE kerno_ui_g10_columns.t (id int PRIMARY KEY, old_name int)",
+                "CREATE VIEW kerno_ui_g10_columns.v AS SELECT id FROM kerno_ui_g10_columns.t",
+            ],
+        );
+        let has_column = |name: &str| {
+            on_server(
+                engine,
+                &format!(
+                    "SELECT count(*) FROM information_schema.columns \
+                     WHERE table_schema = 'kerno_ui_g10_columns' AND table_name = 't' \
+                     AND column_name = '{name}'"
+                ),
+            ) == "1"
+        };
+        let root: &[&str] = if pg {
+            &["kerno", "kerno_ui_g10_columns"]
+        } else {
+            &["kerno_ui_g10_columns"]
+        };
+        let at = |rest: &[&'static str]| [root, rest].concat();
+        let column = |name: &'static str| at(&["Tables", "t", "Columns", name]);
+        let app = connected(cx, engine);
+        app.open_path(cx, &column("old_name"));
+
+        // A view's columns come from its query: they are not changed here.
+        app.open_path(cx, &at(&["Views", "v", "Columns", "id"]));
+        for action in [Action::RenameColumn, Action::DropColumn, Action::AddColumn] {
+            assert_eq!(
+                app.why_not(cx, action, &at(&["Views", "v", "Columns", "id"])),
+                Some("a view's columns come from its query"),
+                "{engine:?}"
+            );
+        }
+
+        // Rename: the new name is typed, the table is read again.
+        app.act(cx, Action::RenameColumn, &column("old_name"));
+        assert!(app.has(cx, "sql-name"), "{engine:?}");
+        app.press(cx, &["secondary-a"]);
+        app.type_text(cx, "new_name");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the rename", |app, cx| {
+            app.shows(cx, &column("new_name"))
+        });
+        assert!(
+            has_column("new_name") && !has_column("old_name"),
+            "{engine:?}"
+        );
+
+        // Drop: the statement is shown, then run.
+        app.act(cx, Action::DropColumn, &column("new_name"));
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the drop", |app, cx| {
+            !app.shows(cx, &column("new_name")) && app.shows(cx, &column("id"))
+        });
+        assert!(!has_column("new_name"), "{engine:?}");
+
+        // Add: an ALTER TABLE to complete opens in a query tab.
+        app.act(cx, Action::AddColumn, &at(&["Tables", "t", "Columns"]));
+        app.wait_until(cx, "the template", |app, cx| app.titles(cx) == ["t"]);
+        assert!(app.active_query(cx).1.contains("new_column"), "{engine:?}");
+        assert!(!has_column("new_column"), "opening it runs nothing");
+        app.run_active_query(cx);
+        assert!(has_column("new_column"), "{engine:?}");
+
+        // F4 on a column opens the structure of its table.
+        app.click_row(cx, &column("id"), false);
+        app.press(cx, &["f4"]);
+        app.wait_for_structure(cx);
+        let opened = cx.update(|cx| {
+            app.workspace
+                .read(cx)
+                .active_structure_tab()
+                .map(|tab| tab.read(cx).table().clone())
+        });
+        assert_eq!(
+            opened,
+            Some(TableRef::new("kerno_ui_g10_columns", "t")),
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn create_entries_open_templates_that_run_once_named(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            return;
+        }
+        let pg = engine == Engine::Postgres;
+        let (cleanup, create) = if pg {
+            (
+                "DROP SCHEMA IF EXISTS kerno_ui_g10_create CASCADE",
+                "CREATE SCHEMA kerno_ui_g10_create",
+            )
+        } else {
+            (
+                "DROP DATABASE IF EXISTS kerno_ui_g10_create",
+                "CREATE DATABASE kerno_ui_g10_create",
+            )
+        };
+        let _scratch = Scratch::new(
+            engine,
+            &[cleanup],
+            &[create, "CREATE TABLE kerno_ui_g10_create.t (id int)"],
+        );
+        let root: &[&str] = if pg {
+            &["kerno", "kerno_ui_g10_create"]
+        } else {
+            &["kerno_ui_g10_create"]
+        };
+        // Folder, entry, and how the server counts what it made.
+        let made: Vec<(&str, Action, String)> = if pg {
+            let proc = |name: &str| {
+                format!(
+                    "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                     WHERE n.nspname = 'kerno_ui_g10_create' AND p.proname = '{name}'"
+                )
+            };
+            vec![
+                ("Functions", Action::CreateFunction, proc("new_function")),
+                ("Procedures", Action::CreateProcedure, proc("new_procedure")),
+                (
+                    "Sequences",
+                    Action::CreateSequence,
+                    "SELECT count(*) FROM information_schema.sequences \
+                     WHERE sequence_schema = 'kerno_ui_g10_create' \
+                     AND sequence_name = 'new_sequence'"
+                        .into(),
+                ),
+                (
+                    "Triggers",
+                    Action::CreateTrigger,
+                    "SELECT count(*) FROM pg_trigger \
+                     WHERE tgrelid = 'kerno_ui_g10_create.t'::regclass AND tgname = 'new_trigger'"
+                        .into(),
+                ),
+            ]
+        } else {
+            let routine = |name: &str| {
+                format!(
+                    "SELECT count(*) FROM information_schema.routines \
+                     WHERE routine_schema = 'kerno_ui_g10_create' AND routine_name = '{name}'"
+                )
+            };
+            vec![
+                ("Routines", Action::CreateFunction, routine("new_function")),
+                (
+                    "Routines",
+                    Action::CreateProcedure,
+                    routine("new_procedure"),
+                ),
+                (
+                    "Triggers",
+                    Action::CreateTrigger,
+                    "SELECT count(*) FROM information_schema.triggers \
+                     WHERE trigger_schema = 'kerno_ui_g10_create' AND trigger_name = 'new_trigger'"
+                        .into(),
+                ),
+                (
+                    "Events",
+                    Action::CreateEvent,
+                    "SELECT count(*) FROM information_schema.events \
+                     WHERE event_schema = 'kerno_ui_g10_create' AND event_name = 'new_event'"
+                        .into(),
+                ),
+            ]
+        };
+        let app = connected(cx, engine);
+        app.open_path(cx, &[root, &["Tables"]].concat());
+        for (index, (folder, action, count)) in made.into_iter().enumerate() {
+            app.act(cx, action, &[root, &[folder]].concat());
+            app.wait_until(cx, "the template", |app, cx| {
+                app.titles(cx).len() == index + 1
+            });
+            assert_eq!(on_server(engine, &count), "0", "{engine:?} {action:?}");
+            // A trigger made from the schema's folder names its table.
+            if app.active_query(cx).1.contains("table_name") {
+                app.edit_query(cx, "table_name", "t");
+            }
+            app.run_active_query(cx);
+            assert_eq!(on_server(engine, &count), "1", "{engine:?} {action:?}");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_drop_with_cascade_also_drops_what_depends_on_the_table(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let pg = |sql: &str| on_server(Engine::Postgres, sql);
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &["DROP SCHEMA IF EXISTS kerno_ui_g10_cascade CASCADE"],
+        &[
+            "CREATE SCHEMA kerno_ui_g10_cascade",
+            "CREATE TABLE kerno_ui_g10_cascade.t (id int)",
+            "CREATE VIEW kerno_ui_g10_cascade.v AS SELECT id FROM kerno_ui_g10_cascade.t",
+            "CREATE TABLE kerno_ui_g10_cascade.marker (id int)",
+        ],
+    );
+    let count = |kind: &str, name: &str| {
+        pg(&format!(
+            "SELECT count(*) FROM information_schema.{kind} \
+             WHERE table_schema = 'kerno_ui_g10_cascade' AND table_name = '{name}'"
+        ))
+    };
+    let app = connected(cx, Engine::Postgres);
+    let table = |name: &'static str| ["kerno", "kerno_ui_g10_cascade", "Tables", name];
+    app.open_path(cx, &table("t"));
+
+    // A plain drop fails: the view depends on the table.
+    app.act(cx, Action::Drop, &table("t"));
+    app.click(cx, "sql-confirm");
+    // The navigator's statements run one after the other on its session:
+    // once a rename after it is seen, the drop has been tried.
+    app.act(cx, Action::Rename, &table("marker"));
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "marker_seen");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the rename", |app, cx| {
+        app.shows(cx, &table("marker_seen"))
+    });
+    assert_eq!(
+        (count("tables", "t"), count("views", "v")),
+        ("1".into(), "1".into())
+    );
+
+    // With cascade, the table and the view go.
+    app.act(cx, Action::DropCascade, &table("t"));
+    assert!(app.has(cx, "sql-preview"));
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the drop", |app, cx| !app.shows(cx, &table("t")));
+    assert_eq!(
+        (count("tables", "t"), count("views", "v")),
+        ("0".into(), "0".into())
+    );
 }
