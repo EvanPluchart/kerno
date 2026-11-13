@@ -62,6 +62,7 @@ export function initDemo({ onStatus }) {
   function setSql(sql) {
     editor.value = sql;
     repaint();
+    for (const node of document.querySelectorAll('[data-table][aria-current]')) node.removeAttribute('aria-current');
     for (const button of document.querySelectorAll('#samples button')) {
       button.setAttribute('aria-pressed', String(flat(button.dataset.sql) === flat(sql)));
     }
@@ -124,7 +125,9 @@ export function initDemo({ onStatus }) {
     out.scrollTop = 0;
   }
 
-  function draw(result, note) {
+  const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function draw(result, note, stream) {
     const { columns, rows, affected } = result;
     const ms = result.ms === undefined ? '' : formatMs(result.ms);
     if (!columns.length) {
@@ -134,7 +137,10 @@ export function initDemo({ onStatus }) {
     }
     const table = el('table');
     const head = el('tr');
-    head.append(el('th', 'n'));
+    const corner = el('th', 'n');
+    corner.scope = 'col';
+    corner.append(el('span', 'sr-only', 'Row'));
+    head.append(corner);
     for (const column of columns) {
       const th = el('th', NUMERIC_OIDS.has(column.oid) ? 'num' : '', column.name);
       th.scope = 'col';
@@ -144,19 +150,35 @@ export function initDemo({ onStatus }) {
     const thead = el('thead');
     thead.append(head);
     const body = el('tbody');
-    rows.slice(0, MAX_ROWS).forEach((row, index) => {
+    const drawn = rows.slice(0, MAX_ROWS);
+    const addRow = (row, index) => {
       const tr = el('tr');
       tr.append(el('td', 'n', String(index + 1)));
       row.forEach((value, i) => {
-        if (value === null) tr.append(el('td', 'null', 'NULL'));
-        else tr.append(el('td', NUMERIC_OIDS.has(columns[i].oid) ? 'num' : '', value));
+        const td = el('td', value === null ? 'null' : NUMERIC_OIDS.has(columns[i].oid) ? 'num' : '');
+        td.append(el('samp', '', value === null ? 'NULL' : value)); // samp: output of a program
+        tr.append(td);
       });
       body.append(tr);
-    });
+    };
     table.append(thead, body);
     out.replaceChildren(table);
     out.scrollTop = 0;
     out.scrollLeft = 0;
+    if (stream && !calm) {
+      // The first result arrives a row per frame, the way a streamed result fills Kerno's grid.
+      let index = 0;
+      const next = () => {
+        if (out.firstChild !== table) return; // another result replaced it
+        addRow(drawn[index], index);
+        index += 1;
+        status({ rows: plural(index, 'row'), ms, note });
+        if (index < drawn.length) requestAnimationFrame(next);
+      };
+      next();
+      return;
+    }
+    drawn.forEach(addRow);
     const shown = rows.length > MAX_ROWS ? `, first ${MAX_ROWS} drawn` : '';
     status({ rows: `${plural(rows.length, 'row')}${shown}`, ms, note });
   }
@@ -224,7 +246,7 @@ export function initDemo({ onStatus }) {
       }
       const started = performance.now();
       const result = toResult(await pg.exec(sql, OPTIONS), performance.now() - started);
-      await nameTypes(pg, result);
+      await nameTypes(pg, result).catch(() => {}); // a type name is a nicety, never a failure
       draw(result, 'PGlite: PostgreSQL in this page');
     } catch (error) {
       drawError(error);
@@ -252,9 +274,8 @@ export function initDemo({ onStatus }) {
 
   for (const button of document.querySelectorAll('[data-table]')) {
     button.addEventListener('click', () => {
-      for (const other of document.querySelectorAll('[data-table]')) other.removeAttribute('aria-current');
-      button.setAttribute('aria-current', 'true');
       setSql(`select * from ${button.dataset.table} limit 200`);
+      button.setAttribute('aria-current', 'true');
       run();
     });
   }
@@ -293,7 +314,7 @@ export function initDemo({ onStatus }) {
     .then((saved) => {
       fallback = saved;
       Object.assign(typeNames, saved.types);
-      if (!database) draw(saved[SAMPLES[0].id], 'Saved result. Run starts PostgreSQL in this page');
+      if (!database) draw(saved[SAMPLES[0].id], 'Saved result. Run starts PostgreSQL in this page', true);
     })
     .catch(() => message('Ready.', 'Press Run to start PostgreSQL in this page.'));
 

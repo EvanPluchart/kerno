@@ -63,7 +63,7 @@ export function initMillion() {
       const row = document.createElement('div');
       row.className = 'm-row';
       for (const [, width, kind] of COLUMNS) {
-        const cell = document.createElement('span');
+        const cell = document.createElement('samp');
         cell.style.width = `${width}px`;
         if (kind) cell.className = kind;
         row.append(cell);
@@ -129,12 +129,26 @@ export function initMillion() {
     }
   }).observe(scroller);
 
+  // The grid scrolls on its own until the visitor selects it; only then does it take the wheel,
+  // and it gives the page back on Escape, on blur, or when the mouse leaves.
+  const hint = scroller.parentElement.querySelector('.m-hint');
   const takeOver = () => {
     drifting = false;
   };
-  for (const type of ['pointerdown', 'wheel', 'touchstart', 'keydown']) {
-    scroller.addEventListener(type, takeOver, { passive: true });
-  }
+  const live = (on) => {
+    scroller.classList.toggle('is-live', on);
+    hint.hidden = on;
+    if (on) takeOver();
+  };
+  hint.addEventListener('click', () => scroller.focus({ preventScroll: true }));
+  scroller.addEventListener('focus', () => live(true));
+  scroller.addEventListener('blur', () => live(false));
+  scroller.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') scroller.blur();
+  });
+  scroller.parentElement.addEventListener('pointerleave', (event) => {
+    if (event.pointerType === 'mouse') scroller.blur();
+  });
 
   document.querySelector('#m-jump').addEventListener('submit', (event) => {
     event.preventDefault();

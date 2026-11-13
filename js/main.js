@@ -73,7 +73,10 @@ if ('IntersectionObserver' in window) {
   const here = new IntersectionObserver(
     (entries) => {
       const entry = entries.find((candidate) => candidate.isIntersecting);
-      if (entry) $('#sb-section').textContent = entry.target.dataset.section;
+      if (!entry) return;
+      const name = entry.target.dataset.section;
+      $('#sb-section').textContent = name;
+      $('#sb-section').setAttribute('aria-label', `Jump to another section. You are in: ${name}`);
     },
     { rootMargin: '-45% 0px -45% 0px' },
   );

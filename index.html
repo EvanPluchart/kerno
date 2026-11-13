@@ -68,8 +68,7 @@
       <p class="statement">Kerno is a native, open-source client for PostgreSQL, MySQL and MariaDB on macOS and Linux, written in Rust. No query runs on the UI thread, so the window stays responsive while results stream in, and anything still running can be cancelled.</p>
     </div>
     <a class="tile lime action" href="https://github.com/EvanPluchart/kerno/releases/latest" data-reveal>
-      <span class="action-label">Download Kerno</span>
-      <span class="action-note">macOS and Linux, free</span>
+      <span class="action-label">Download for macOS or Linux</span>
       <svg class="arrow" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><path d="M6 16h20M17 7l9 9-9 9" fill="none" stroke="currentColor" stroke-width="3.5"/></svg>
     </a>
   </div>
@@ -100,7 +99,7 @@
             <button class="run" type="button" id="demo-run">Run <kbd><span class="mod">⌘</span>↵</kbd></button>
           </div>
           <div class="editor">
-            <div class="gutter" id="demo-gutter" aria-hidden="true">1</div>
+            <pre class="gutter" id="demo-gutter" aria-hidden="true">1</pre>
             <div class="code">
               <pre id="demo-paint" aria-hidden="true"></pre>
               <textarea id="demo-sql" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="SQL editor. Control or Command plus Enter runs the query."></textarea>
@@ -151,11 +150,11 @@
     <div class="frag"><img data-themed src="img/tour/navigator-dark.webp" width="500" height="380" alt="The context menu of a table in Kerno's navigator, with its Tools submenu open" loading="lazy" decoding="async"></div>
   </a>
 
-  <a class="tile cell s4 flip" href="img/full/production-dark.webp" data-shot="production" data-reveal>
+  <a class="tile cell s5 flip" href="img/full/production-dark.webp" data-shot="production" data-reveal>
     <div class="cell-text"><h3>Production asks first</h3><p>An environment gives a connection a colour and rules. On production the window's chrome turns red, and a statement shows its SQL and waits for you.</p></div>
-    <div class="frag"><img data-themed src="img/tour/production-dark.webp" width="560" height="200" alt="Kerno asking, under a red Production band, before it runs a statement on a production connection" loading="lazy" decoding="async"></div>
+    <div class="frag"><img data-themed src="img/tour/production-dark.webp" width="560" height="280" alt="Kerno asking, under a red Production band, before it runs a statement on a production connection" loading="lazy" decoding="async"></div>
   </a>
-  <a class="tile cell s8" href="img/full/edits-dark.webp" data-shot="edits" data-reveal>
+  <a class="tile cell s7" href="img/full/edits-dark.webp" data-shot="edits" data-reveal>
     <div class="cell-text"><h3>Edits wait until you apply them</h3><p>Change cells, add rows, delete rows: the server sees none of it yet. Review the exact SQL, then apply everything in one transaction or discard it. If the apply fails it rolls back and your edits stay.</p></div>
     <div class="frag"><img data-themed src="img/tour/edits-dark.webp" width="1010" height="280" alt="A table in Kerno with three pending changes highlighted, beside the Discard, Review SQL and Apply buttons" loading="lazy" decoding="async"></div>
   </a>
@@ -185,33 +184,32 @@
 
 <!-- ───────────── Performance ───────────── -->
 <section class="board" id="performance" data-section="Performance" aria-labelledby="h-perf">
-  <div class="tile s4 head" data-reveal>
+  <div class="tile s12 head" data-reveal>
     <h2 id="h-perf">Measured against a budget</h2>
-    <p>Each bar is a budget from the project's spec, and the filled part is what the bench measured on a release build on Apple Silicon. The method and every run are in <a href="https://github.com/EvanPluchart/kerno/blob/main/docs/BENCH.md">docs/BENCH.md</a>.</p>
+    <p><a href="https://github.com/EvanPluchart/kerno/blob/main/docs/BENCH.md">docs/BENCH.md</a> has the method and every run. Each bar below is a budget from the project's spec, and the filled part is what the bench measured: medians on a release build, on an Apple M3 Pro with local servers.</p>
   </div>
-  <!-- BENCH: the figures below come only from docs/BENCH.md. Until it is committed on main each
-       budget stays "pending" (no data-measured). To fill one: set data-measured, the figure text
-       and style="--fill: measured / budget". -->
-  <ul class="tile s8 budgets" data-ui data-reveal>
-    <li class="budget pending">
-      <p class="figure">Not measured yet</p>
-      <p class="what">Cold start to the first interactive frame. Budget: 400 ms.</p>
+  <!-- BENCH: every figure below is copied from docs/BENCH.md (commit 5df5a01 on main, the release
+       build of 97a05b8). To update one: the figure text, and style="--fill: measured / budget". -->
+  <ul class="budgets s12">
+    <li class="tile budget" style="--fill: 0.6975" data-reveal>
+      <p class="figure">279 ms</p>
       <div class="bar"><span class="fill"></span></div>
+      <p class="what">Cold start to the first interactive frame, median of 30 launches (235 to 698). Budget: 400 ms.</p>
     </li>
-    <li class="budget pending">
-      <p class="figure">Not measured yet</p>
-      <p class="what">Memory at idle with one connection and one query tab. Budget: 150 MB.</p>
+    <li class="tile budget" style="--fill: 0.9893" data-reveal>
+      <p class="figure">148.4 MB</p>
       <div class="bar"><span class="fill"></span></div>
+      <p class="what">Memory at idle with one connection and one query tab, in Kerno.app. Budget: 150 MB. The bare binary measures 150.5 MB, half a megabyte over.</p>
     </li>
-    <li class="budget pending">
-      <p class="figure">Not measured yet</p>
-      <p class="what">First rows on screen after the server starts sending. Budget: 150 ms.</p>
+    <li class="tile budget" style="--fill: 0.0207" data-reveal>
+      <p class="figure">3.1 ms</p>
       <div class="bar"><span class="fill"></span></div>
+      <p class="what">First rows on screen after a local PostgreSQL starts sending (2.4 ms with MySQL). Budget: 150 ms.</p>
     </li>
-    <li class="budget pending">
-      <p class="figure">Not measured yet</p>
-      <p class="what">Average frame while scrolling 1,000,000 rows. Budget: 16 ms.</p>
+    <li class="tile budget" style="--fill: 0.5219" data-reveal>
+      <p class="figure">8.35 ms</p>
       <div class="bar"><span class="fill"></span></div>
+      <p class="what">Average frame while scrolling 1,000,000 rows on a 120 Hz display. Budget: 16 ms.</p>
     </li>
   </ul>
 
@@ -220,10 +218,12 @@
       <div class="m-head" aria-hidden="true"></div>
       <div class="m-space"><div class="m-rows" aria-hidden="true"></div></div>
     </div>
+    <button class="btn primary m-hint" type="button">Scroll these rows</button>
   </div>
   <div class="tile s3 million-say" data-reveal>
     <h3>Scroll a million rows</h3>
-    <p>Kerno lays out only the rows and columns that are on screen, so a result scrolls the same whatever its size. This grid does the same thing in your browser, with 1,000,000 generated rows.</p>
+    <p>Kerno lays out only the rows and columns that are on screen, so a result scrolls the same whatever its size. This grid does the same thing in your browser, with 1,000,000 generated rows. Select it to scroll; Esc gives the page back.</p>
+    <p class="fine">In Kerno, a result of 1,000,000 rows and 20 columns fetched in full holds its values in 340 MB, 17 bytes per cell.</p>
     <dl class="readout">
       <div><dt>Top row</dt><dd id="m-top">1</dd></div>
       <div><dt>Rows in the page</dt><dd id="m-dom">0</dd></div>
@@ -321,7 +321,7 @@ cargo run --release -p kerno</code></pre><button class="copy" type="button">Copy
 <!-- The page's own status bar, as the app's: it takes the environment's colour. -->
 <div class="statusbar" id="statusbar" data-ui>
   <span class="st-conn"><i class="dot env-dot"></i><span class="js-conn">Shop (local)</span></span>
-  <span id="sb-section">Live demo</span>
+  <button type="button" id="sb-section" data-palette aria-haspopup="dialog" aria-label="Jump to another section. You are in: Live demo">Live demo</button>
   <span class="sb-fill"></span>
   <span id="sb-rows"></span>
   <span id="sb-ms"></span>

@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://evanpluchart.github.io/kerno/sitemap.xml

@@ -4,7 +4,7 @@ export const SAMPLES = [
   {
     id: 'latest',
     label: 'Latest orders',
-    hint: 'a join, newest first',
+    hint: 'join',
     sql: `select o.id, c.full_name, c.email, o.status, o.total, o.currency, o.placed_at
 from shop.orders o
 join shop.customers c on c.id = o.customer_id
@@ -14,7 +14,7 @@ limit 50`,
   {
     id: 'revenue',
     label: 'Revenue by country',
-    hint: 'an aggregate',
+    hint: 'aggregate',
     sql: `select c.country,
        count(*) as orders,
        sum(o.total) as revenue,
@@ -27,8 +27,8 @@ order by revenue desc`,
   },
   {
     id: 'types',
-    label: 'Arrays, JSON and NULL',
-    hint: 'how values are drawn',
+    label: 'Arrays, JSON, NULL',
+    hint: 'types',
     sql: `select id, name, price, stock, tags, specs
 from shop.products
 order by id`,
@@ -36,7 +36,7 @@ order by id`,
   {
     id: 'explain',
     label: 'Explain a join',
-    hint: 'the planner at work',
+    hint: 'plan',
     sql: `explain analyze
 select p.category, sum(i.quantity * i.unit_price) as sold
 from shop.order_items i
@@ -46,7 +46,7 @@ group by p.category`,
   {
     id: 'update',
     label: 'Raise some prices',
-    hint: 'a write: try it on Production',
+    hint: 'write',
     sql: `update shop.products
 set price = round(price * 1.10, 2)
 where category = 'lighting'
@@ -55,7 +55,7 @@ returning id, name, price`,
   {
     id: 'delete',
     label: 'Delete without WHERE',
-    hint: 'Kerno always asks first',
+    hint: 'asks first',
     sql: `delete from shop.order_items`,
   },
 ];
