@@ -3,7 +3,7 @@
 //! then the import, in one transaction on a session of its own.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -27,11 +27,11 @@ use gpui_kit::{
 use kerno_core::config::Engine;
 use kerno_core::export_file::Encoding;
 use kerno_core::import::{
-    CsvOptions, CsvPreview, ImportJob, Target as ImportTarget, import_csv, preview,
+    CsvOptions, CsvPreview, ImportJob, Target as ImportTarget, count_records, create_table_sql,
+    import_csv, preview,
 };
 use kerno_core::schema::{ColumnInfo, TableRef};
 use kerno_core::sql::CellValue;
-use kerno_core::table_draft::{ColumnDraft, TableDraft};
 use kerno_core::{Dialect, Error, Session, TypeKind};
 
 use crate::bridge;
@@ -351,8 +351,7 @@ impl ImportDialog {
         let reading = bridge::spawn_blocking(cx, move || {
             let preview =
                 preview(&path, &options, PREVIEW_ROWS).map_err(|error| error.to_string())?;
-            let records = count_records(&path, &options)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let records = count_records(&path, &options).map_err(|error| error.to_string())?;
             Ok(Read { preview, records })
         });
         self.reading = Some(cx.spawn(async move |this, cx| {
@@ -527,9 +526,7 @@ impl ImportDialog {
             ImportTarget::Existing(table) => (table, columns.to_vec()),
             ImportTarget::New { table, columns } => {
                 parts.extend(
-                    dialect
-                        .create_table_sql(&new_table(table, columns))
-                        .map_err(|error| error.to_string())?,
+                    create_table_sql(dialect, table, columns).map_err(|error| error.to_string())?,
                 );
                 // The kinds the values were guessed as decide how they are
                 // written, as for the table's own columns.
@@ -554,6 +551,7 @@ impl ImportDialog {
                         default: None,
                         generation: None,
                         on_update: None,
+                        invisible: false,
                         primary_key_position: None,
                         comment: None,
                         collation: None,
@@ -582,21 +580,7 @@ impl ImportDialog {
             .rows
             .iter()
             .take(SHOWN_ROWS)
-            .map(|row| {
-                let values: Vec<String> = targets
-                    .iter()
-                    .map(|(index, column)| {
-                        let value = match row.get(*index) {
-                            Some(text) if *text != job.options.null_text => {
-                                CellValue::Text(text.clone())
-                            }
-                            _ => CellValue::Null,
-                        };
-                        dialect.literal(&value, column)
-                    })
-                    .collect();
-                format!("({})", values.join(", "))
-            })
+            .map(|row| row_sql(dialect, row, &targets))
             .collect();
         let shown = rows.len() as u64;
         parts.push(format!(
@@ -998,7 +982,10 @@ impl ImportDialog {
                         h_flex()
                             .border_t_1()
                             .border_color(theme.border)
-                            .children(row.iter().map(|value| cell(value)))
+                            .children(row.iter().map(|value| match value {
+                                Some(text) => cell(text),
+                                None => cell("NULL").text_color(theme.muted_foreground),
+                            }))
                     })),
             )
             .into_any_element()
@@ -1010,6 +997,7 @@ impl ImportDialog {
         let read = self.preview();
         let sample = |index: usize| {
             read.and_then(|read| read.preview.rows.first()?.get(index).cloned())
+                .map(|value| value.unwrap_or_else(|| "NULL".into()))
                 .unwrap_or_default()
         };
         let headers: Vec<String> = read.map_or_else(Vec::new, |read| read.preview.headers.clone());
@@ -1172,41 +1160,6 @@ fn sniff(path: &Path) -> (Encoding, char) {
     (encoding, delimiter)
 }
 
-/// The records of a CSV file, header left out: line breaks outside quotes
-/// end a record, and blank lines are not records.
-// ponytail: the core's reader has no count; this follows its rules for
-// quotes and blank lines, reading UTF-16 by units. A core count would
-// replace it.
-fn count_records(path: &Path, options: &CsvOptions) -> io::Result<u64> {
-    let wide = options.encoding == Encoding::Utf16Le;
-    let mut bytes = BufReader::new(File::open(path)?).bytes();
-    let (mut records, mut quoted, mut content) = (0u64, false, false);
-    loop {
-        let unit = match bytes.next().transpose()? {
-            None => break,
-            Some(low) if wide => match bytes.next().transpose()? {
-                Some(high) => u16::from_le_bytes([low, high]),
-                None => u16::from(low),
-            },
-            Some(byte) => u16::from(byte),
-        };
-        match unit {
-            0x22 => {
-                quoted = !quoted;
-                content = true;
-            }
-            0x0a if !quoted => {
-                records += u64::from(content);
-                content = false;
-            }
-            0x0d | 0xfeff => {}
-            _ => content = true,
-        }
-    }
-    records += u64::from(content);
-    Ok(records.saturating_sub(u64::from(options.header && records > 0)))
-}
-
 /// A table name from a file name: `Orders 2024.csv` gives `orders_2024`.
 fn table_name_for(path: &Path) -> String {
     let stem = path
@@ -1220,31 +1173,25 @@ fn table_name_for(path: &Path) -> String {
     name.trim_matches('_').to_string()
 }
 
-/// The draft of a new table with nullable `columns` and nothing else, as
-/// the import creates it.
-// ponytail: the same as the private `new_table` of `kerno_core::import`;
-// a public one there would replace it.
-fn new_table(table: &TableRef, columns: &[(String, String)]) -> TableDraft {
-    TableDraft {
-        table: table.clone(),
-        comment: None,
-        columns: columns
-            .iter()
-            .map(|(name, data_type)| ColumnDraft {
-                original: None,
-                name: name.clone(),
-                data_type: data_type.clone(),
-                nullable: true,
-                default: None,
-                comment: None,
-                auto_increment: false,
-                on_update: None,
-            })
-            .collect(),
-        indexes: Vec::new(),
-        foreign_keys: Vec::new(),
-        primary_key: Vec::new(),
-    }
+/// `(v1, v2, …)` for the mapped fields of a previewed record, as the import
+/// writes them: NULL where the reader read NULL, so a quoted `""` stays the
+/// empty string.
+fn row_sql(
+    dialect: &dyn Dialect,
+    row: &[Option<String>],
+    targets: &[(usize, &ColumnInfo)],
+) -> String {
+    let values: Vec<String> = targets
+        .iter()
+        .map(|(index, column)| {
+            let value = match row.get(*index) {
+                Some(Some(text)) => CellValue::Text(text.clone()),
+                _ => CellValue::Null,
+            };
+            dialect.literal(&value, column)
+        })
+        .collect();
+    format!("({})", values.join(", "))
 }
 
 impl Drop for ImportDialog {
@@ -1428,33 +1375,38 @@ mod tests {
     }
 
     #[test]
-    fn records_are_counted_as_the_reader_reads_them() {
+    fn the_confirmation_writes_null_where_the_reader_reads_null() {
+        let column = |name: &str| ColumnInfo {
+            name: name.into(),
+            data_type: "text".into(),
+            kind: TypeKind::Text,
+            nullable: true,
+            default: None,
+            generation: None,
+            on_update: None,
+            invisible: false,
+            primary_key_position: None,
+            comment: None,
+            collation: None,
+            enum_values: Vec::new(),
+        };
         let dir = tempfile::tempdir().unwrap();
-        let text = "id,note\r\n1,\"two\nlines\"\r\n\r\n2,\"a \"\"quote\"\"\"\n3,last";
-        let path = file(&dir, "a.csv", text.as_bytes());
-        assert_eq!(
-            count_records(&path, &options(true, Encoding::Utf8)).unwrap(),
-            3
-        );
-        assert_eq!(
-            count_records(&path, &options(false, Encoding::Utf8)).unwrap(),
-            4
-        );
-        // UTF-16 with its byte order mark: the same records.
-        let wide: Vec<u8> = "\u{feff}id,n\u{e9}\n1,\"x\ny\"\n"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        let path = file(&dir, "b.csv", &wide);
-        assert_eq!(
-            count_records(&path, &options(true, Encoding::Utf16Le)).unwrap(),
-            1
-        );
-        let path = file(&dir, "c.csv", b"");
-        assert_eq!(
-            count_records(&path, &options(true, Encoding::Utf8)).unwrap(),
-            0
-        );
+        let path = file(&dir, "n.csv", b"a,b,c,d\n\"\",,NULL,\"NULL\"\n");
+        let (a, b, c, d) = (column("a"), column("b"), column("c"), column("d"));
+        let targets = [(0, &a), (1, &b), (2, &c), (3, &d)];
+        let dialect = kerno_postgres::PgDialect;
+        let rows = |null_text: &str| {
+            let options = CsvOptions {
+                null_text: null_text.into(),
+                ..options(true, Encoding::Utf8)
+            };
+            let read = preview(&path, &options, 10).unwrap();
+            row_sql(&dialect, &read.rows[0], &targets)
+        };
+        // `""` is the empty string; a bare field that reads the NULL text
+        // is NULL; a quoted one is text.
+        assert_eq!(rows(""), "('', NULL, 'NULL', 'NULL')");
+        assert_eq!(rows("NULL"), "('', '', NULL, 'NULL')");
     }
 
     #[test]

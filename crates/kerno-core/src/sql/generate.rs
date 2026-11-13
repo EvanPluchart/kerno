@@ -228,6 +228,7 @@ mod tests {
             default: None,
             generation: None,
             on_update: None,
+            invisible: false,
             primary_key_position: None,
             comment: None,
             collation: None,

@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use common::{engines, exec_ok, run};
 use kerno_core::schema::TableRef;
-use kerno_core::table_draft::{ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, changes};
+use kerno_core::table_draft::{
+    AutoIncrement, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, changes,
+};
 use kerno_core::{Engine, Session};
 
 /// Runs the `cleanup` statements, then `body`, then `cleanup` again whether
@@ -57,8 +59,9 @@ fn column(name: &str, data_type: &str, nullable: bool) -> ColumnDraft {
         nullable,
         default: None,
         comment: None,
-        auto_increment: false,
+        auto_increment: AutoIncrement::Off,
         on_update: None,
+        invisible: false,
     }
 }
 
@@ -366,4 +369,148 @@ async fn keep_on_update(session: Arc<dyn Session>, engine: Engine, database: Str
         .await,
         "1"
     );
+}
+
+#[tokio::test]
+async fn an_invisible_column_stays_invisible_after_an_edit() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        // INVISIBLE columns: MySQL 8.0.23, MariaDB 10.3.3.
+        let (mariadb, version) = (engine == Engine::MariaDb, session.server().version_number);
+        if (mariadb && version < (10, 3, 3)) || (!mariadb && version < (8, 0, 23)) {
+            println!(
+                "SKIPPED on {engine:?} {version:?}: no INVISIBLE columns before MySQL 8.0.23 / MariaDB 10.3.3"
+            );
+            continue;
+        }
+        let database = common::scratch_database("alter_invisible");
+        let cleanup = [format!("DROP DATABASE IF EXISTS {database}")];
+        cleaning_up(
+            &session,
+            &cleanup,
+            keep_invisible(session.clone(), database),
+        )
+        .await;
+    }
+}
+
+async fn keep_invisible(session: Arc<dyn Session>, database: String) {
+    for sql in [
+        format!("CREATE DATABASE {database}"),
+        format!(
+            "CREATE TABLE {database}.hidden (\
+               id int PRIMARY KEY, \
+               secret varchar(20) INVISIBLE, \
+               stamp TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP \
+                 ON UPDATE CURRENT_TIMESTAMP INVISIBLE)"
+        ),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    let extra = |column: &'static str| {
+        let (session, database) = (session.clone(), database.clone());
+        async move {
+            common::scalar(
+                &session,
+                &format!(
+                    "SELECT EXTRA FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = 'hidden' \
+                       AND COLUMN_NAME = '{column}'"
+                ),
+            )
+            .await
+            .to_ascii_uppercase()
+        }
+    };
+    println!("EXTRA of stamp: {:?}", extra("stamp").await);
+    let table = TableRef::new(database.clone(), "hidden");
+    let mut draft = read_back(&session, &table).await;
+    assert!(draft.columns[1].invisible && draft.columns[2].invisible);
+    assert_eq!(
+        draft.columns[2].on_update.as_deref(),
+        Some("CURRENT_TIMESTAMP")
+    );
+
+    // A comment on each, and a rename: the definitions are rewritten.
+    let structure = session.table_structure(&table).await.unwrap();
+    draft.columns[1].comment = Some("touched".into());
+    draft.columns[2].name = "stamped".into();
+    draft.columns[2].comment = Some("touched".into());
+    let statements = session
+        .dialect()
+        .alter_table_sql(&table, &changes(&table, &structure, &draft))
+        .unwrap();
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    assert_eq!(
+        statements[0].matches(" INVISIBLE").count(),
+        2,
+        "{statements:#?}"
+    );
+    apply(&session, &statements).await;
+
+    let after = read_back(&session, &table).await;
+    assert_eq!(after, saved(draft));
+    for column in ["secret", "stamped"] {
+        let extra = extra(column).await;
+        assert!(extra.contains("INVISIBLE"), "{column}: {extra}");
+    }
+    assert!(extra("stamped").await.contains("ON UPDATE"));
+    // Still left out of `SELECT *`.
+    exec_ok(
+        &session,
+        &format!("INSERT INTO {database}.hidden (id, secret) VALUES (1, 'x')"),
+    )
+    .await;
+    let rows = common::rows(&session, &format!("SELECT * FROM {database}.hidden")).await;
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
+async fn a_key_on_its_own_table_follows_a_rename_of_what_it_references() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let database = common::scratch_database("alter_self_key");
+        let cleanup = [format!("DROP DATABASE IF EXISTS {database}")];
+        cleaning_up(
+            &session,
+            &cleanup,
+            rename_referenced(session.clone(), database),
+        )
+        .await;
+    }
+}
+
+async fn rename_referenced(session: Arc<dyn Session>, database: String) {
+    for sql in [
+        format!("CREATE DATABASE {database}"),
+        format!(
+            "CREATE TABLE {database}.nodes (\
+               id int PRIMARY KEY, \
+               parent_id int, \
+               CONSTRAINT nodes_parent_fk FOREIGN KEY (parent_id) \
+                 REFERENCES {database}.nodes (id))"
+        ),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    let table = TableRef::new(database.clone(), "nodes");
+    let structure = session.table_structure(&table).await.unwrap();
+    let mut draft = TableDraft::from_structure(&table, &structure);
+    // As the form leaves it: the key still names `id`.
+    draft.columns[0].name = "node_id".into();
+    draft.primary_key = strings(&["node_id"]);
+    let statements = session
+        .dialect()
+        .alter_table_sql(&table, &changes(&table, &structure, &draft))
+        .unwrap();
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    apply(&session, &statements).await;
+
+    let after = read_back(&session, &table).await;
+    assert_eq!(after.foreign_keys.len(), 1, "{after:#?}");
+    assert_eq!(
+        after.foreign_keys[0].referenced_columns,
+        strings(&["node_id"])
+    );
+    assert_eq!(after.columns[0].name, "node_id");
 }

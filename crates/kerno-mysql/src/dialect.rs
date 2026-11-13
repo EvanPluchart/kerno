@@ -60,7 +60,8 @@ fn unsupported(what: &str) -> Error {
 impl MysqlDialect {
     /// The full definition of `column`, as `CREATE TABLE`, `ADD`, `MODIFY`
     /// and `CHANGE COLUMN` take it:
-    /// `name type [COLLATE c] NOT NULL|NULL [DEFAULT e] [AUTO_INCREMENT] [ON UPDATE e] [COMMENT '…']`.
+    /// `name type [COLLATE c] NOT NULL|NULL [DEFAULT e] [AUTO_INCREMENT] [ON UPDATE e] [INVISIBLE]
+    /// [COMMENT '…']`.
     ///
     /// `from` is the column on the server, for `MODIFY` and `CHANGE`: these
     /// replace the whole definition, so a collation other than the table's
@@ -91,7 +92,7 @@ impl MysqlDialect {
         } else {
             " NOT NULL"
         });
-        if column.auto_increment {
+        if column.auto_increment.is_on() {
             sql.push_str(" AUTO_INCREMENT");
         } else {
             if let Some(default) = present(&column.default) {
@@ -100,6 +101,9 @@ impl MysqlDialect {
             if let Some(on_update) = present(&column.on_update) {
                 sql.push_str(&format!(" ON UPDATE {on_update}"));
             }
+        }
+        if column.invisible {
+            sql.push_str(" INVISIBLE");
         }
         if let Some(comment) = present(&column.comment) {
             sql.push_str(&format!(" COMMENT {}", self.quote_string(comment)));
@@ -217,6 +221,17 @@ impl Dialect for MysqlDialect {
             TypeKind::Binary => "longblob",
             _ => "text",
         }
+    }
+
+    /// `TABLE_ROWS`: InnoDB's sampled estimate, which MySQL caches for
+    /// `information_schema_stats_expiry` seconds.
+    fn estimated_rows_sql(&self, table: &TableRef) -> String {
+        format!(
+            "SELECT TABLE_ROWS FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {}",
+            self.quote_string(&table.schema),
+            self.quote_string(&table.name)
+        )
     }
 
     /// Neither engine has `DEFAULT VALUES`; both accept empty lists.
@@ -481,6 +496,7 @@ impl Dialect for MysqlDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kerno_core::table_draft::AutoIncrement;
 
     fn mysql() -> MysqlDialect {
         MysqlDialect::new(Engine::MySql)
@@ -495,6 +511,7 @@ mod tests {
             default: None,
             generation: None,
             on_update: None,
+            invisible: false,
             primary_key_position: None,
             comment: None,
             collation: None,
@@ -946,8 +963,9 @@ mod tests {
             nullable,
             default: None,
             comment: None,
-            auto_increment: false,
+            auto_increment: AutoIncrement::Off,
             on_update: None,
+            invisible: false,
         }
     }
 
@@ -1138,6 +1156,30 @@ mod tests {
     }
 
     #[test]
+    fn an_invisible_column_is_written_back_invisible() {
+        let mut hidden = column(TypeKind::Text);
+        hidden.name = "secret".into();
+        hidden.data_type = "varchar(20)".into();
+        hidden.invisible = true;
+        let change = TableChange::AlterColumn {
+            name: "secret".into(),
+            from: hidden.clone(),
+            to: ColumnDraft {
+                comment: Some("hidden".into()),
+                ..ColumnDraft::from(&hidden)
+            },
+        };
+        for d in both() {
+            assert_eq!(
+                d.alter_table_sql(&t(), std::slice::from_ref(&change))
+                    .unwrap(),
+                strings(&["ALTER TABLE `shop`.`order items`\n    \
+                     MODIFY COLUMN `secret` varchar(20) NULL INVISIBLE COMMENT 'hidden'"])
+            );
+        }
+    }
+
+    #[test]
     fn a_generated_column_is_not_rewritten() {
         let mut total = column(TypeKind::Integer);
         total.name = "total".into();
@@ -1159,6 +1201,17 @@ mod tests {
                 ),
                 "changing the generated column `total` from the table form; \
                  write the ALTER TABLE statement instead"
+            );
+        }
+    }
+
+    #[test]
+    fn the_row_estimate_is_read_from_the_catalog() {
+        for d in both() {
+            assert_eq!(
+                d.estimated_rows_sql(&TableRef::new("shop", "it's")),
+                "SELECT TABLE_ROWS FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'shop' AND TABLE_NAME = 'it''s'"
             );
         }
     }

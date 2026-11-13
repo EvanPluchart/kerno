@@ -26,7 +26,7 @@ async fn databases_and_schemas() {
         .filter(|d| !d.is_system)
         .map(|d| d.name.as_str())
         // Other tests create and drop scratch databases meanwhile.
-        .filter(|name| !name.starts_with("kerno_test_"))
+        .filter(|name| !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_"))
         .collect();
     assert_eq!(user, ["kerno", "kerno_other", "postgres"]);
     let templates: Vec<_> = databases
@@ -60,10 +60,10 @@ async fn databases_and_schemas() {
         .filter(|s| !s.is_system)
         .map(|s| s.name.as_str())
         .collect();
-    // Other tests create scratch schemas; they all start with kerno_test_.
+    // Other tests create scratch schemas; they all start with kerno_test_ or kerno_ui_.
     let fixture: Vec<_> = user
         .iter()
-        .filter(|name| !name.starts_with("kerno_test_"))
+        .filter(|name| !name.starts_with("kerno_test_") && !name.starts_with("kerno_ui_"))
         .copied()
         .collect();
     assert_eq!(fixture, ["analytics", "public", "shop"]);
@@ -1139,4 +1139,26 @@ async fn completion_catalog_lists_the_user_schemas() {
         assert!(shop.routines.iter().any(|r| r == routine), "{routine}");
     }
     assert!(shop.relations.is_sorted_by(|a, b| a.name <= b.name));
+}
+
+#[tokio::test]
+async fn the_row_estimate_of_the_big_table_is_close_to_its_count() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let sql = session
+        .dialect()
+        .estimated_rows_sql(&TableRef::new("analytics", "big_table"));
+    let estimate: i64 = scalar(&session, &sql).await.parse().unwrap();
+    println!("estimated rows of analytics.big_table: {estimate}");
+    // -1: never analysed; the fixture analyses it, but a fresh server may not.
+    assert!(
+        estimate == -1 || (900_000..=1_100_000).contains(&estimate),
+        "{estimate}"
+    );
+    // No such table: no row.
+    let missing = session
+        .dialect()
+        .estimated_rows_sql(&TableRef::new("analytics", "no_such_table"));
+    assert!(rows(&session, &missing).await.is_empty());
 }

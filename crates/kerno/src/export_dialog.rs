@@ -19,12 +19,12 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, Styled as _, Task, TestSupportExt as _, Window, div,
     px,
 };
-use kerno_core::browse::{Filter, Page, page_sql};
+use kerno_core::browse::{Filter, select_sql};
 use kerno_core::export::{DelimitedOptions, ExportFormat, LineEnding};
 use kerno_core::export_file::{Encoding, ExportJob, ExportProgress, export_to_file};
 use kerno_core::format::byte_size;
-use kerno_core::schema::{TableRef, TableStructure};
-use kerno_core::{Dialect, Error, Session, exec};
+use kerno_core::schema::TableRef;
+use kerno_core::{Error, Session, exec};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge;
@@ -545,13 +545,16 @@ async fn run(
                 filter,
                 sort,
             } => {
+                // Every row the filter keeps, in the order the tab shows them.
                 let structure = session.table_structure(&table).await?;
-                all_rows_sql(
+                select_sql(
                     session.dialect(),
-                    &structure,
+                    &structure.columns,
                     &table,
                     &filter,
-                    sort.as_ref(),
+                    sort.as_ref()
+                        .map(|(column, descending)| (column.as_str(), *descending)),
+                    &structure.row_identity().unwrap_or_default(),
                 )?
             }
             Source::Query { sql } => {
@@ -579,36 +582,6 @@ async fn run(
     .await;
     session.close().await;
     outcome
-}
-
-/// The statement that reads every row of `table` that `filter` keeps, in
-/// the order a data tab shows them.
-fn all_rows_sql(
-    dialect: &dyn Dialect,
-    structure: &TableStructure,
-    table: &TableRef,
-    filter: &Filter,
-    sort: Option<&(String, bool)>,
-) -> kerno_core::Result<String> {
-    let identity = structure.row_identity().unwrap_or_default();
-    let sql = page_sql(
-        dialect,
-        &structure.columns,
-        Page {
-            table,
-            filter,
-            sort: sort.map(|(column, descending)| (column.as_str(), *descending)),
-            identity: &identity,
-            limit: 1,
-            offset: 0,
-        },
-    )?;
-    // ponytail: `page_sql` always ends with its LIMIT line; drop it. A core
-    // function writing the statement without a limit would replace this.
-    Ok(sql
-        .rsplit_once('\n')
-        .map_or(sql.as_str(), |(statement, _)| statement)
-        .to_string())
 }
 
 /// "123,000 rows · 14 MB".

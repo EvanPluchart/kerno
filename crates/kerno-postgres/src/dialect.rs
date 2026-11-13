@@ -98,6 +98,17 @@ impl Dialect for PgDialect {
         crate::plan::parse(output)
     }
 
+    /// `reltuples`, as the last `ANALYZE` or `VACUUM` left it.
+    fn estimated_rows_sql(&self, table: &TableRef) -> String {
+        format!(
+            "SELECT c.reltuples::bigint FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {} AND c.relname = {}",
+            self.quote_string(&table.schema),
+            self.quote_string(&table.name)
+        )
+    }
+
     /// `ALTER <kind> <name> RENAME TO` for every kind of object; indexes,
     /// like relations, are named within their schema.
     fn rename_sql(&self, object: &ObjectRef, new_name: &str) -> Result<String> {
@@ -222,6 +233,16 @@ mod tests {
         assert_eq!(d.quote_bytes(&[]), "decode('', 'hex')");
         assert_eq!(d.limit_offset(100, 0), "LIMIT 100");
         assert_eq!(d.limit_offset(100, 300), "LIMIT 100 OFFSET 300");
+    }
+
+    #[test]
+    fn the_row_estimate_is_read_from_the_catalog() {
+        assert_eq!(
+            PgDialect.estimated_rows_sql(&TableRef::new("shop", "it's")),
+            "SELECT c.reltuples::bigint FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'shop' AND c.relname = 'it''s'"
+        );
     }
 
     fn routine(kind: RoutineKind, identity_arguments: &str) -> ObjectRef {
@@ -384,8 +405,9 @@ mod tests {
                 nullable: false,
                 default: Some("now()".into()),
                 comment: None,
-                auto_increment: false,
+                auto_increment: kerno_core::table_draft::AutoIncrement::Off,
                 on_update: None,
+                invisible: false,
             }),
             TableChange::RenameTable {
                 to: "orders".into(),

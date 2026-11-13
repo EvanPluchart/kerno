@@ -473,6 +473,7 @@ async fn columns(
                 },
                 generation,
                 on_update: on_update(&extra),
+                invisible: extra.contains("INVISIBLE"),
                 // Filled in from the primary key's index.
                 primary_key_position: None,
                 comment: opt(row, 7),
@@ -537,7 +538,11 @@ fn now(text: &str) -> String {
 /// `ON UPDATE CURRENT_TIMESTAMP()`.
 fn on_update(extra: &str) -> Option<String> {
     let (_, rest) = extra.split_once("ON UPDATE ")?;
-    let expression = rest.split_whitespace().next()?;
+    // MariaDB separates the attributes with commas: `…(), INVISIBLE`.
+    let expression = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .filter(|expression| !expression.is_empty())?;
     Some(if is_now(expression) {
         now(expression)
     } else {
@@ -1047,6 +1052,10 @@ mod tests {
             ),
             // MariaDB 11.
             ("on update current_timestamp()", Some("CURRENT_TIMESTAMP")),
+            (
+                "on update current_timestamp(), INVISIBLE",
+                Some("CURRENT_TIMESTAMP"),
+            ),
             (
                 "on update current_timestamp(6)",
                 Some("CURRENT_TIMESTAMP(6)"),

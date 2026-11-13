@@ -23,7 +23,8 @@ use gpui_kit::{
 use kerno_core::config::Environment;
 use kerno_core::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
 use kerno_core::table_draft::{
-    ColumnDraft, ForeignKeyDraft, IndexDraft, REFERENTIAL_ACTIONS, TableChange, TableDraft, changes,
+    AutoIncrement, ColumnDraft, ForeignKeyDraft, IndexDraft, REFERENTIAL_ACTIONS, TableChange,
+    TableDraft, changes,
 };
 use kerno_core::{Engine, Error, Session, TxState, exec};
 
@@ -524,7 +525,7 @@ impl TableEditor {
             default,
             comment,
             nullable: column.nullable,
-            auto_increment: column.auto_increment,
+            auto_increment: column.auto_increment.is_on(),
             _subscriptions: subscriptions,
         });
         self.next_id
@@ -617,8 +618,10 @@ impl TableEditor {
                         nullable: row.nullable,
                         default: optional(&row.default),
                         comment: optional(&row.comment),
-                        auto_increment: row.auto_increment,
+                        // An identity turned off and on keeps its kind.
+                        auto_increment: AutoIncrement::new(row.auto_increment, original),
                         on_update,
+                        invisible: original.is_some_and(|info| info.invisible),
                     }
                 })
                 .collect(),
@@ -712,8 +715,9 @@ impl TableEditor {
             nullable: true,
             default: None,
             comment: None,
-            auto_increment: false,
+            auto_increment: AutoIncrement::Off,
             on_update: None,
+            invisible: false,
         };
         self.push_column(&empty, None, window, cx);
         if let Some(row) = self.columns.last() {

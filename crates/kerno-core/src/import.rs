@@ -20,7 +20,7 @@ use crate::result::TypeKind;
 use crate::schema::{ColumnInfo, ObjectRef, RelationKind, TableRef};
 use crate::sql::edits::CellValue;
 use crate::sql::params::is_number;
-use crate::table_draft::{ColumnDraft, TableDraft};
+use crate::table_draft::{AutoIncrement, ColumnDraft, TableDraft};
 
 /// How a CSV file is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +42,9 @@ pub struct CsvPreview {
     /// Column names: the header's, or `column_1`, `column_2`… One per
     /// column of the widest record read.
     pub headers: Vec<String>,
-    /// Records as read; NULL fields hold the NULL text.
-    pub rows: Vec<Vec<String>>,
+    /// Records as read; `None` for NULL: an unquoted field that reads the
+    /// NULL text (a quoted one is a value, even `""`).
+    pub rows: Vec<Vec<Option<String>>>,
     /// The kind each column's values look like (see [`guess_kind`]).
     pub guessed: Vec<TypeKind>,
 }
@@ -81,24 +82,37 @@ pub fn preview(path: &Path, options: &CsvOptions, rows: usize) -> Result<CsvPrev
             }
         })
         .collect();
-    let rows: Vec<Vec<String>> = records
-        .iter()
-        .map(|record| record.iter().map(text).collect())
-        .collect();
     let guessed = (0..width)
         .map(|index| {
-            let values: Vec<&str> = rows
+            let values: Vec<&str> = records
                 .iter()
-                .filter_map(|row| row.get(index).map(String::as_str))
+                .filter_map(|row| row.get(index)?.as_deref())
                 .collect();
             guess_kind(&values, &options.null_text)
         })
         .collect();
     Ok(CsvPreview {
         headers,
-        rows,
+        rows: records,
         guessed,
     })
+}
+
+/// The records of `path`, header left out, as an import reads them: the
+/// file is streamed, one record in memory at a time. Fails where the
+/// import would (a quote not closed, text not in the encoding). Reads the
+/// whole file: call it off the UI thread.
+pub fn count_records(path: &Path, options: &CsvOptions) -> Result<u64> {
+    let failed = |error| read_error(path, error);
+    let mut reader = CsvReader::open(path, options).map_err(failed)?;
+    if options.header {
+        reader.next_record().map_err(failed)?;
+    }
+    let mut records = 0;
+    while reader.next_record().map_err(failed)?.is_some() {
+        records += 1;
+    }
+    Ok(records)
 }
 
 /// A kind, and whether a value looks like it.
@@ -370,7 +384,7 @@ pub async fn import_csv(
     let dialect = session.dialect();
     let create = match &target {
         Target::Existing(_) => Vec::new(),
-        Target::New { table, columns } => dialect.create_table_sql(&new_table(table, columns))?,
+        Target::New { table, columns } => create_table_sql(dialect, table, columns)?,
     };
     // ponytail: PostgreSQL is the one engine here with transactional DDL;
     // make it a Dialect property when a third engine arrives.
@@ -521,6 +535,17 @@ fn refused(line: u64, error: &Error) -> ImportFailure {
     ImportFailure { line, message }
 }
 
+/// The statements that create `table` with nullable `columns` and nothing
+/// else, as an import into a new table does: `(name, SQL type)` per column
+/// (see [`Target::New`]).
+pub fn create_table_sql(
+    dialect: &dyn crate::Dialect,
+    table: &TableRef,
+    columns: &[(String, String)],
+) -> Result<Vec<String>> {
+    dialect.create_table_sql(&new_table(table, columns))
+}
+
 /// The draft of a table with nullable `columns` and nothing else.
 fn new_table(table: &TableRef, columns: &[(String, String)]) -> TableDraft {
     TableDraft {
@@ -535,8 +560,9 @@ fn new_table(table: &TableRef, columns: &[(String, String)]) -> TableDraft {
                 nullable: true,
                 default: None,
                 comment: None,
-                auto_increment: false,
+                auto_increment: AutoIncrement::Off,
                 on_update: None,
+                invisible: false,
             })
             .collect(),
         indexes: Vec::new(),
@@ -1054,7 +1080,9 @@ mod tests {
             ["id", "name", "column_3", "born", "column_5"]
         );
         assert_eq!(preview.rows.len(), 3);
-        assert_eq!(preview.rows[2], ["3", "Bob", "z", "NULL", "extra"]);
+        let mut third = some(&["3", "Bob", "z", "", "extra"]);
+        third[3] = None;
+        assert_eq!(preview.rows[2], third);
         assert_eq!(
             preview.guessed,
             [
@@ -1067,6 +1095,86 @@ mod tests {
         );
         let missing = super::preview(&dir.path().join("missing.csv"), &options, 3).unwrap_err();
         assert!(missing.to_string().contains("missing.csv"), "{missing}");
+    }
+
+    #[test]
+    fn preview_rows_follow_the_null_rule_of_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nulls.csv");
+        std::fs::write(&path, "a,b,c\n\"\",,\"NULL\"\nNULL,x,\n").unwrap();
+        // With an empty NULL text: `""` is the empty string, a bare empty
+        // field is NULL.
+        let header = |null_text| CsvOptions {
+            header: true,
+            ..options(',', null_text)
+        };
+        let rows = preview(&path, &header(""), 10).unwrap().rows;
+        assert_eq!(rows[0], [Some(String::new()), None, Some("NULL".into())]);
+        // With `NULL`: only the bare word is NULL.
+        let rows = preview(&path, &header("NULL"), 10).unwrap().rows;
+        assert_eq!(rows[0], some(&["", "", "NULL"]));
+        assert_eq!(rows[1], [None, Some("x".into()), Some(String::new())]);
+    }
+
+    #[test]
+    fn records_are_counted_as_the_reader_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let with_header = |header, encoding| CsvOptions {
+            header,
+            encoding,
+            ..options(',', "")
+        };
+        let text = "id,note\r\n1,\"two\nlines\"\r\n\r\n2,\"a \"\"quote\"\"\"\n3,last";
+        let path = file("a.csv", text.as_bytes());
+        assert_eq!(
+            count_records(&path, &with_header(true, Encoding::Utf8)).unwrap(),
+            3
+        );
+        assert_eq!(
+            count_records(&path, &with_header(false, Encoding::Utf8)).unwrap(),
+            4
+        );
+        // UTF-16 with its byte order mark: the same records.
+        let wide: Vec<u8> = "\u{feff}id,n\u{e9}\n1,\"x\ny\"\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let path = file("b.csv", &wide);
+        assert_eq!(
+            count_records(&path, &with_header(true, Encoding::Utf16Le)).unwrap(),
+            1
+        );
+        let path = file("c.csv", b"");
+        assert_eq!(
+            count_records(&path, &with_header(true, Encoding::Utf8)).unwrap(),
+            0
+        );
+        // What stops an import stops the count, with its line.
+        let path = file("d.csv", b"a\n1\n\"open\n");
+        let error = count_records(&path, &with_header(true, Encoding::Utf8)).unwrap_err();
+        assert!(error.to_string().contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn a_new_table_is_created_with_nullable_columns_only() {
+        let columns = [
+            ("id".to_string(), "bigint".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        assert_eq!(
+            create_table_sql(
+                &crate::dialect::test_support::AnsiDialect,
+                &TableRef::new("s", "t"),
+                &columns
+            )
+            .unwrap(),
+            ["CREATE TABLE \"s\".\"t\" (\n    \"id\" bigint,\n    \"name\" text\n)"]
+        );
     }
 
     #[test]

@@ -10,8 +10,11 @@ use std::sync::Arc;
 
 use common::{exec_ok, run};
 use kerno_core::Session;
+use kerno_core::schema::ColumnGeneration;
 use kerno_core::schema::TableRef;
-use kerno_core::table_draft::{ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, changes};
+use kerno_core::table_draft::{
+    AutoIncrement, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, changes,
+};
 
 /// Runs the `cleanup` statements, then `body`, then `cleanup` again whether
 /// `body` passed or panicked.
@@ -48,8 +51,9 @@ fn column(name: &str, data_type: &str, nullable: bool) -> ColumnDraft {
         nullable,
         default: None,
         comment: None,
-        auto_increment: false,
+        auto_increment: AutoIncrement::Off,
         on_update: None,
+        invisible: false,
     }
 }
 
@@ -197,7 +201,7 @@ async fn edit(session: Arc<dyn Session>, schema: String) {
             .collect::<Vec<_>>(),
         ["items_by_code"]
     );
-    assert!(draft.columns[7].auto_increment, "serial");
+    assert_eq!(draft.columns[7].auto_increment, AutoIncrement::On, "serial");
 
     let at = |draft: &mut TableDraft, name: &str| {
         draft
@@ -220,7 +224,7 @@ async fn edit(session: Arc<dyn Session>, schema: String) {
     draft.columns.remove(dropped);
     // A serial no longer: no default left.
     let serial = at(&mut draft, "serial_no");
-    draft.columns[serial].auto_increment = false;
+    draft.columns[serial].auto_increment = AutoIncrement::Off;
     draft.columns[serial].nullable = true;
     draft.columns.push(ColumnDraft {
         comment: Some("new one".into()),
@@ -247,4 +251,135 @@ async fn edit(session: Arc<dyn Session>, schema: String) {
 
     let articles = TableRef::new(schema.clone(), "articles");
     assert_eq!(read_back(&session, &articles).await, saved(draft));
+}
+
+#[tokio::test]
+async fn a_key_on_its_own_table_follows_a_rename_of_what_it_references() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("alter_self_key");
+    let cleanup = [format!("DROP SCHEMA IF EXISTS {schema} CASCADE")];
+    cleaning_up(
+        &session,
+        &cleanup,
+        rename_referenced(session.clone(), schema),
+    )
+    .await;
+}
+
+async fn rename_referenced(session: Arc<dyn Session>, schema: String) {
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE TABLE {schema}.nodes (\
+               id integer PRIMARY KEY, \
+               parent_id integer, \
+               CONSTRAINT nodes_parent_fk FOREIGN KEY (parent_id) \
+                 REFERENCES {schema}.nodes (id))"
+        ),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    let table = TableRef::new(schema.clone(), "nodes");
+    let structure = session.table_structure(&table).await.unwrap();
+    let mut draft = TableDraft::from_structure(&table, &structure);
+    // As the form leaves it: the key still names `id`.
+    draft.columns[0].name = "node_id".into();
+    draft.primary_key = strings(&["node_id"]);
+    // A key added again for another reason references the new name.
+    draft.foreign_keys[0].on_delete = "CASCADE".into();
+    let statements = session
+        .dialect()
+        .alter_table_sql(&table, &changes(&table, &structure, &draft))
+        .unwrap();
+    assert_eq!(statements.len(), 3, "{statements:#?}");
+    apply(&session, &statements).await;
+
+    let after = read_back(&session, &table).await;
+    assert_eq!(after.foreign_keys.len(), 1, "{after:#?}");
+    let key = &after.foreign_keys[0];
+    assert_eq!(key.referenced_columns, strings(&["node_id"]));
+    assert_eq!(key.on_delete, "CASCADE");
+    assert_eq!(after.columns[0].name, "node_id");
+}
+
+#[tokio::test]
+async fn an_identity_generated_always_stays_always() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("alter_identity");
+    let cleanup = [format!("DROP SCHEMA IF EXISTS {schema} CASCADE")];
+    cleaning_up(&session, &cleanup, keep_always(session.clone(), schema)).await;
+}
+
+async fn keep_always(session: Arc<dyn Session>, schema: String) {
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE TABLE {schema}.counted (\
+               id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+               note text)"
+        ),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    let table = TableRef::new(schema.clone(), "counted");
+    let structure = session.table_structure(&table).await.unwrap();
+    let original = structure.columns[0].clone();
+    let draft = read_back(&session, &table).await;
+    assert_eq!(draft.columns[0].auto_increment, AutoIncrement::Always);
+
+    // Turned off and on again, as the form does it: nothing to run.
+    let mut toggled = draft.clone();
+    toggled.columns[0].auto_increment = AutoIncrement::new(false, Some(&original));
+    toggled.columns[0].auto_increment = AutoIncrement::new(true, Some(&original));
+    assert_eq!(changes(&table, &structure, &toggled), vec![]);
+
+    // A comment on it: the identity is not touched.
+    let mut commented = draft.clone();
+    commented.columns[0].comment = Some("the key".into());
+    let statements = session
+        .dialect()
+        .alter_table_sql(&table, &changes(&table, &structure, &commented))
+        .unwrap();
+    assert_eq!(
+        statements,
+        [format!(
+            "COMMENT ON COLUMN \"{schema}\".\"counted\".\"id\" IS 'the key'"
+        )]
+    );
+    apply(&session, &statements).await;
+
+    // Turned off, then on again from the form: still ALWAYS.
+    let structure = session.table_structure(&table).await.unwrap();
+    let mut off = read_back(&session, &table).await;
+    off.columns[0].auto_increment = AutoIncrement::Off;
+    apply(
+        &session,
+        &session
+            .dialect()
+            .alter_table_sql(&table, &changes(&table, &structure, &off))
+            .unwrap(),
+    )
+    .await;
+    let structure = session.table_structure(&table).await.unwrap();
+    assert_eq!(structure.columns[0].generation, None);
+    let mut on = read_back(&session, &table).await;
+    on.columns[0].auto_increment = AutoIncrement::new(true, Some(&original));
+    apply(
+        &session,
+        &session
+            .dialect()
+            .alter_table_sql(&table, &changes(&table, &structure, &on))
+            .unwrap(),
+    )
+    .await;
+    let structure = session.table_structure(&table).await.unwrap();
+    assert_eq!(
+        structure.columns[0].generation,
+        Some(ColumnGeneration::IdentityAlways)
+    );
+    assert_eq!(structure.columns[0].comment.as_deref(), Some("the key"));
 }

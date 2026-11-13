@@ -35,10 +35,14 @@ async fn databases_and_no_schemas() {
     for engine in engines() {
         let session = common::session(engine).await;
         let databases = session.databases().await.unwrap();
-        // Other tests create scratch databases; they all start with kerno_test_.
+        // Other tests create scratch databases; they all start with kerno_test_ or kerno_ui_.
         let user: Vec<_> = databases
             .iter()
-            .filter(|d| !d.is_system && !d.name.starts_with("kerno_test_"))
+            .filter(|d| {
+                !d.is_system
+                    && !d.name.starts_with("kerno_test_")
+                    && !d.name.starts_with("kerno_ui_")
+            })
             .map(|d| d.name.as_str())
             .collect();
         assert_eq!(user, ["kerno", "kerno_analytics", "kerno_other"]);
@@ -1590,5 +1594,23 @@ async fn completion_catalog_lists_the_user_databases() {
                 "customer_orders"
             ]
         );
+    }
+}
+
+#[tokio::test]
+async fn the_row_estimate_of_the_big_table_is_of_its_order() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let sql = session
+            .dialect()
+            .estimated_rows_sql(&TableRef::new("kerno_analytics", "big_table"));
+        let estimate: u64 = scalar(&session, &sql).await.parse().unwrap();
+        println!("{engine:?} estimated rows of kerno_analytics.big_table: {estimate}");
+        // InnoDB samples pages: an estimate, of the right order.
+        assert!((100_000..=10_000_000).contains(&estimate), "{estimate}");
+        let missing = session
+            .dialect()
+            .estimated_rows_sql(&TableRef::new("kerno_analytics", "no_such_table"));
+        assert!(common::rows(&session, &missing).await.is_empty());
     }
 }

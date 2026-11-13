@@ -287,6 +287,9 @@ pub struct ColumnInfo {
     /// What the column is set to when its row is updated (MySQL and MariaDB
     /// `ON UPDATE CURRENT_TIMESTAMP`), as SQL; always `None` on PostgreSQL.
     pub on_update: Option<String>,
+    /// Left out of `SELECT *` (MySQL 8.0.23+ and MariaDB 10.3.3+
+    /// `INVISIBLE`); always `false` on PostgreSQL.
+    pub invisible: bool,
     /// Position in the primary key (1-based), when part of it.
     pub primary_key_position: Option<u32>,
     /// Comment.
@@ -477,6 +480,7 @@ mod tests {
             default: None,
             generation: None,
             on_update: None,
+            invisible: false,
             primary_key_position: pk,
             comment: None,
             collation: None,

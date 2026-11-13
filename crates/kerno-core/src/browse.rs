@@ -225,15 +225,38 @@ pub struct Page<'a> {
     pub offset: u64,
 }
 
-/// The `SELECT` that reads `page`.
+/// The `SELECT` that reads `page`: [`select_sql`] and its limit.
 pub fn page_sql(dialect: &dyn Dialect, columns: &[ColumnInfo], page: Page<'_>) -> Result<String> {
-    let mut sql = format!("SELECT * FROM {}", dialect.table_name(page.table));
-    if let Some(condition) = page.filter.where_sql(dialect, columns)? {
+    let mut sql = select_sql(
+        dialect,
+        columns,
+        page.table,
+        page.filter,
+        page.sort,
+        page.identity,
+    )?;
+    sql.push('\n');
+    sql.push_str(&dialect.limit_offset(page.limit, page.offset));
+    Ok(sql)
+}
+
+/// The `SELECT` that reads every row of `table` that `filter` keeps, in
+/// the order of its pages (see [`Page`]), without a limit.
+pub fn select_sql(
+    dialect: &dyn Dialect,
+    columns: &[ColumnInfo],
+    table: &TableRef,
+    filter: &Filter,
+    sort: Option<(&str, bool)>,
+    identity: &[String],
+) -> Result<String> {
+    let mut sql = format!("SELECT * FROM {}", dialect.table_name(table));
+    if let Some(condition) = filter.where_sql(dialect, columns)? {
         sql.push_str("\nWHERE ");
         sql.push_str(&condition);
     }
-    let mut order = Vec::with_capacity(page.identity.len() + 1);
-    if let Some((column, descending)) = page.sort {
+    let mut order = Vec::with_capacity(identity.len() + 1);
+    if let Some((column, descending)) = sort {
         let ident = dialect.quote_ident(column);
         order.push(if descending {
             format!("{ident} DESC")
@@ -242,20 +265,15 @@ pub fn page_sql(dialect: &dyn Dialect, columns: &[ColumnInfo], page: Page<'_>) -
         });
     }
     order.extend(
-        page.identity
+        identity
             .iter()
-            .filter(|column| {
-                page.sort
-                    .is_none_or(|(sorted, _)| sorted != column.as_str())
-            })
+            .filter(|column| sort.is_none_or(|(sorted, _)| sorted != column.as_str()))
             .map(|column| dialect.quote_ident(column)),
     );
     if !order.is_empty() {
         sql.push_str("\nORDER BY ");
         sql.push_str(&order.join(", "));
     }
-    sql.push('\n');
-    sql.push_str(&dialect.limit_offset(page.limit, page.offset));
     Ok(sql)
 }
 
@@ -288,6 +306,7 @@ mod tests {
             default: None,
             generation: None,
             on_update: None,
+            invisible: false,
             primary_key_position: None,
             comment: None,
             collation: None,
@@ -446,6 +465,23 @@ mod tests {
         assert_eq!(
             page_sql(&AnsiDialect, &columns(), page).unwrap(),
             "SELECT * FROM \"shop\".\"people\"\nLIMIT 100"
+        );
+        // Every row, in the same order, without the limit.
+        assert_eq!(
+            select_sql(
+                &AnsiDialect,
+                &columns(),
+                &table,
+                &filter,
+                Some(("full name", true)),
+                &identity
+            )
+            .unwrap(),
+            "SELECT * FROM \"shop\".\"people\"\nWHERE \"id\" = 3\nORDER BY \"full name\" DESC, \"id\""
+        );
+        assert_eq!(
+            select_sql(&AnsiDialect, &columns(), &table, &none, None, &[]).unwrap(),
+            "SELECT * FROM \"shop\".\"people\""
         );
         assert_eq!(
             count_sql(&AnsiDialect, &columns(), &table, &filter).unwrap(),

@@ -865,6 +865,7 @@ mod tests {
             default: None,
             generation: None,
             on_update: None,
+            invisible: false,
             primary_key_position: key.then_some(1),
             comment: None,
             collation: None,
