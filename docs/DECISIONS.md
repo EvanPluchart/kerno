@@ -931,3 +931,14 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **The settings body has one size** (400 px) and scrolls inside.
 - Driving the real app on this Mac: the keyboard layout is French, so a hotkey sent by position can be
   another shortcut (`cmd+a` arrives as Cmd+Q). The "app quit by itself" reports were that.
+
+## D-052 — Machine-load rules lifted by the owner while away (2026-11-13, about 21:05)
+
+- For Kerno only, and until the owner is back on the Mac: up to 4 subagents in parallel, cargo jobs and
+  test threads at their defaults (all cores), `nice` optional. An earlier message of the same evening had
+  allowed `CARGO_BUILD_JOBS=6` and `--test-threads=6`. `.cargo/config.toml`, the documented commands and
+  `scripts/check.sh` keep the strict values: they are what a contributor's machine gets.
+- Unchanged: only the `kerno-*` containers (never `studio-*` or `pim-*`), no push and nothing published,
+  secrets in the OS store, one Kerno instance driven at a time, the disk rules.
+- The benchmark still runs on a quiet machine (`scripts/bench.sh` refuses above a load of 4) with nothing
+  else compiling, so its numbers are honest.
