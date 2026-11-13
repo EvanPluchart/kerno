@@ -27,6 +27,11 @@ fn facts(app: &Fixture, cx: &mut TestAppContext) -> Facts {
     cx.update(|cx| app.workspace.read(cx).toolbar_facts(cx))
 }
 
+/// What a picker shows now.
+fn picker(app: &Fixture, cx: &mut TestAppContext, of: Item) -> String {
+    cx.update(|cx| app.workspace.read(cx).picker_text(of, cx))
+}
+
 /// Opens the list of a dropdown item.
 fn open_list(app: &Fixture, cx: &mut TestAppContext, id: &str) {
     app.click(cx, id.to_string());
@@ -63,6 +68,9 @@ fn every_item_is_there_and_greyed_with_its_reason_when_nothing_is_open(cx: &mut 
         .filter(|of| why_not(*of, now).is_none())
         .collect();
     assert_eq!(applying, [Item::NewConnection, Item::NewEditor]);
+    // No tab: nowhere to show.
+    assert_eq!(picker(&app, cx, Item::Connection), "No connection");
+    assert_eq!(picker(&app, cx, Item::Target), "No database");
 }
 
 #[gpui_kit::test]
@@ -432,4 +440,158 @@ fn a_narrow_window_puts_the_rightmost_items_under_more(cx: &mut TestAppContext) 
         );
     }
     assert!(app.has(cx, "toolbar-search") && !app.has(cx, "toolbar-more"));
+}
+
+#[gpui_kit::test]
+fn the_toolbar_follows_a_table_s_tab_and_acts_on_its_connection(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    // Two saved connections; only the first is open, the sidebar is on the
+    // second: an item that followed the sidebar would be greyed.
+    let storage = memory_storage();
+    let config = testing::config(Engine::Postgres);
+    let first = storage.save_connection(None, &config).unwrap();
+    let mut other = testing::config(Engine::Postgres);
+    other.name = "kerno_ui_toolbar_second".into();
+    let second = storage.save_connection(None, &other).unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    for id in [&first, &second] {
+        kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
+    }
+    let connections = app.connections.clone();
+    cx.update(|cx| connections.update(cx, |connections, cx| connections.connect(&first, cx)));
+    let status = |app: &Fixture, cx: &mut TestAppContext, id: &str| {
+        cx.update(|cx| app.connections.read(cx).status(id))
+    };
+    app.wait_until(cx, "the first connection", |app, cx| {
+        matches!(status(app, cx, &first), Status::Connected { .. })
+    });
+    let on_first = Target {
+        connection: first.clone(),
+        database: None,
+        schema: None,
+    };
+    let items = TableRef::new("shop", "customers");
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_data(
+                on_first.clone(),
+                items.clone(),
+                RelationKind::Table,
+                Filter::default(),
+                window,
+                cx,
+            );
+        })
+    });
+    let sidebar = cx.update(|cx| app.workspace.read(cx).sidebar());
+    let row = cx.update(|cx| {
+        app.connections
+            .read(cx)
+            .saved()
+            .iter()
+            .position(|saved| saved.id == second)
+            .unwrap()
+    });
+    app.click(cx, ("connection", row));
+    assert_eq!(
+        cx.update(|cx| sidebar.read(cx).selected(cx)),
+        Some(second.clone())
+    );
+    assert!(cx.update(|cx| app.workspace.read(cx).active_data_tab().is_some()));
+
+    // The pickers show the tab's place, greyed: only a query tab chooses.
+    let shop = format!("shop@{}", config.name);
+    assert_eq!(picker(&app, cx, Item::Connection), config.name);
+    assert_eq!(picker(&app, cx, Item::Target), shop);
+    for of in [Item::Connection, Item::Target] {
+        let (greyed, tooltip) = state(&app, cx, of);
+        assert!(greyed, "{of:?}");
+        assert!(tooltip.ends_with("(query tabs only)"), "{tooltip}");
+    }
+    assert!(state(&app, cx, Item::Connection).1.contains(&config.name));
+    // The connection items act on the tab's connection, open.
+    assert_eq!(
+        state(&app, cx, Item::Connect).1,
+        "Connect to the server (connected)"
+    );
+    for of in [
+        Item::Reconnect,
+        Item::Disconnect,
+        Item::ReadOnly,
+        Item::Dashboard,
+        Item::Tools,
+        Item::Search,
+    ] {
+        assert!(!state(&app, cx, of).0, "{of:?}");
+    }
+    open_list(&app, cx, "toolbar-tools");
+    assert!(menu_entry(&app, cx, "Back up…").is_some());
+    app.press(cx, &["escape"]);
+    app.click(cx, Item::Search.element_id());
+    assert!(app.has(cx, "quick-open"));
+    app.press(cx, &["escape"]);
+    app.click(cx, Item::Dashboard.element_id());
+    let admin = cx.update(|cx| app.workspace.read(cx).active_admin_tab().cloned());
+    let admin = admin.expect("the dashboard");
+    assert_eq!(
+        cx.update(|cx| admin.read(cx).target().connection.clone()),
+        first
+    );
+    // An admin tab shows its database.
+    assert_eq!(
+        picker(&app, cx, Item::Target),
+        format!("kerno@{}", config.name)
+    );
+    assert!(state(&app, cx, Item::Target).0);
+
+    // A structure tab, like the data tab.
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_structure(on_first.clone(), items, RelationKind::Table, window, cx);
+        })
+    });
+    assert_eq!(picker(&app, cx, Item::Target), shop);
+    assert!(state(&app, cx, Item::Connection).0);
+
+    // Reconnect reopens the tab's connection, not the sidebar's.
+    app.click(cx, Item::Reconnect.element_id());
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        matches!(status(app, cx, &first), Status::Connected { .. })
+    });
+    assert_eq!(status(&app, cx, &second), Status::Disconnected);
+
+    // The Tasks view is on no connection.
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_tasks(window, cx);
+        })
+    });
+    assert_eq!(picker(&app, cx, Item::Connection), "No connection");
+    assert_eq!(picker(&app, cx, Item::Target), "No database");
+
+    // A query tab on a closed connection: both rows say the same.
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_query(
+                "Query 1".into(),
+                "",
+                Some(Target {
+                    connection: second.clone(),
+                    database: None,
+                    schema: None,
+                }),
+                window,
+                cx,
+            );
+        })
+    });
+    assert_eq!(picker(&app, cx, Item::Target), "No database");
+    assert_eq!(
+        app.step(cx, |window, _| window.find("tab-database"))
+            .label(),
+        Some("No database")
+    );
 }

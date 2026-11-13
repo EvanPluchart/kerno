@@ -4989,7 +4989,7 @@ impl QueryTab {
                         .and_then(|meta| meta.database())
                 })
             })
-            .unwrap_or_else(|| "database".into());
+            .unwrap_or_else(|| "No database".into());
         let schema_label = self
             .target
             .as_ref()

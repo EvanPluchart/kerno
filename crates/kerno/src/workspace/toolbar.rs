@@ -27,7 +27,7 @@ use gpui_kit::{
 };
 use kerno_core::{Engine, TxState};
 
-use super::{Workspace, connection_target};
+use super::{OpenTab, Workspace, connection_target};
 use crate::actions;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::Status;
@@ -259,6 +259,9 @@ pub struct Facts {
     /// The active tab is a query tab: its transaction, whether a statement
     /// runs, and whether it runs on a connection.
     pub query: Option<QueryFacts>,
+    /// The active tab is about one object (a table's data or structure, a
+    /// table form, a server's administration): its place cannot change.
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +275,13 @@ pub struct QueryFacts {
 /// sidebar's connection menu and of the status bar's menus.
 pub fn why_not(item: Item, facts: Facts) -> Option<&'static str> {
     let no_query = facts.query.is_none().then_some("no query tab");
+    // The pickers show where any tab is; only a query tab's can change
+    // (the tab menu's words).
+    let picker = |query: Option<&'static str>| match facts.query {
+        Some(_) => query,
+        None if facts.fixed => Some("query tabs only"),
+        None => Some("no query tab"),
+    };
     let link = |open: Option<&'static str>| match facts.link {
         Link::None => Some("no connection"),
         Link::Open => open,
@@ -303,13 +313,12 @@ pub fn why_not(item: Item, facts: Facts) -> Option<&'static str> {
         ReadOnly | Tools => (facts.link == Link::None).then_some("no connection"),
         Commit => no_query.or_else(|| transaction(true)),
         Rollback => no_query.or_else(|| transaction(false)),
-        Mode | Log | Connection => no_query,
-        Target => no_query.or_else(|| {
-            if facts.query.is_some_and(|query| !query.target) {
-                Some("no connection")
-            } else {
-                link(None)
-            }
+        Mode | Log => no_query,
+        Connection => picker(None),
+        Target => picker(if facts.query.is_some_and(|query| !query.target) {
+            Some("no connection")
+        } else {
+            link(None)
         }),
     }
 }
@@ -353,7 +362,60 @@ impl Workspace {
                 target: tab.target().is_some(),
             }
         });
-        Facts { link, query }
+        let fixed = matches!(
+            self.tabs.get(self.active_tab),
+            Some(
+                OpenTab::Data(_)
+                    | OpenTab::Structure(_)
+                    | OpenTab::Admin(_)
+                    | OpenTab::TableEditor(_)
+            )
+        );
+        Facts { link, query, fixed }
+    }
+
+    /// Where the active tab works, whatever its kind; a table's tab is on
+    /// its table's schema (its database on MySQL).
+    fn shown_target(&self, cx: &App) -> Option<Target> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let mut target = tab.target(cx)?;
+        let table = match tab {
+            OpenTab::Data(tab) => Some(tab.read(cx).table().clone()),
+            OpenTab::Structure(tab) => Some(tab.read(cx).table().clone()),
+            OpenTab::TableEditor(tab) => tab.read(cx).table().cloned(),
+            _ => None,
+        };
+        if let Some(table) = table {
+            target.schema = Some(table.schema);
+        }
+        Some(target)
+    }
+
+    /// What a picker shows: the active tab's connection, or its
+    /// `schema@connection` (`database@connection` without a schema).
+    pub(crate) fn picker_text(&self, item: Item, cx: &App) -> String {
+        let target = self.shown_target(cx);
+        let connections = self.connections.read(cx);
+        let name = target
+            .as_ref()
+            .and_then(|target| connections.get(&target.connection))
+            .map(|saved| saved.config.name.clone());
+        if item == Connection {
+            return name.unwrap_or_else(|| "No connection".into());
+        }
+        let place = target.as_ref().and_then(|target| {
+            target.schema.clone().or_else(|| {
+                target.database.clone().or_else(|| {
+                    connections
+                        .meta_session(&target.connection)
+                        .and_then(|meta| meta.database())
+                })
+            })
+        });
+        match (place, name) {
+            (Some(place), Some(name)) => format!("{place}@{name}"),
+            _ => "No database".into(),
+        }
     }
 
     /// Does what an item says.
@@ -641,38 +703,15 @@ impl Workspace {
         reason: Option<&'static str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tab = self.active_query_tab().map(|tab| tab.read(cx));
-        let target = tab.and_then(|tab| tab.target().cloned());
-        let connections = self.connections.read(cx);
+        let text = self.picker_text(item, cx);
+        let target = self.shown_target(cx);
         let saved = target
             .as_ref()
-            .and_then(|target| connections.get(&target.connection));
-        let name = saved.map(|saved| saved.config.name.clone());
+            .and_then(|target| self.connections.read(cx).get(&target.connection));
         let engine = saved.map(|saved| saved.config.engine);
-        let text = match item {
-            Connection => name.clone().unwrap_or_else(|| "No connection".into()),
-            _ => {
-                let database = target.as_ref().and_then(|target| {
-                    target.database.clone().or_else(|| {
-                        connections
-                            .meta_session(&target.connection)
-                            .and_then(|meta| meta.database())
-                    })
-                });
-                match (
-                    target
-                        .as_ref()
-                        .and_then(|target| target.schema.clone())
-                        .or(database),
-                    &name,
-                ) {
-                    (Some(place), Some(name)) => format!("{place}@{name}"),
-                    _ => "No database".into(),
-                }
-            }
-        };
+        // The whole name, even when greyed: the button may cut it.
         let tip = match reason {
-            Some(reason) => format!("{} ({reason})", item.name()),
+            Some(reason) => format!("{}: {text} ({reason})", item.name()),
             None => format!("{}: {text}", item.name()),
         };
         let chrome = saved.and_then(|saved| crate::theme::environment_chrome(&saved.config, cx));
@@ -1071,6 +1110,7 @@ mod tests {
                 running,
                 target: true,
             }),
+            fixed: false,
         }
     }
 
@@ -1138,9 +1178,29 @@ mod tests {
                 running: false,
                 target: false,
             }),
+            fixed: false,
         };
         assert_eq!(why_not(Connection, no_target), None);
         assert_eq!(why_not(Target, no_target), Some("no connection"));
+        // A table's tab shows where it is, but only a query tab chooses;
+        // the connection items act on its connection.
+        let table_tab = Facts {
+            link: Link::Open,
+            query: None,
+            fixed: true,
+        };
+        assert_eq!(
+            reasons(table_tab),
+            [
+                (Connect, "connected"),
+                (Commit, "no query tab"),
+                (Rollback, "no query tab"),
+                (Mode, "no query tab"),
+                (Log, "no query tab"),
+                (Connection, "query tabs only"),
+                (Target, "query tabs only"),
+            ]
+        );
     }
 
     #[test]
@@ -1174,6 +1234,7 @@ mod tests {
             let facts = Facts {
                 link: Link::of(&status),
                 query: None,
+                fixed: false,
             };
             for (item, action) in [
                 (Connect, SidebarAction::Connect),
