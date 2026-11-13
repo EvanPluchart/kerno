@@ -12,6 +12,7 @@ pub mod export;
 pub mod export_file;
 pub mod format;
 pub mod import;
+pub mod maintenance;
 pub mod pending;
 pub mod plan;
 pub mod result;

@@ -446,11 +446,11 @@ impl Session for PgSession {
     }
 
     async fn cancel_session(&self, id: &str) -> Result<()> {
-        admin::signal(self, "pg_cancel_backend", id).await
+        admin::signal(self, self.dialect.cancel_session_sql(id)?, id).await
     }
 
     async fn terminate_session(&self, id: &str) -> Result<()> {
-        admin::signal(self, "pg_terminate_backend", id).await
+        admin::signal(self, self.dialect.terminate_session_sql(id)?, id).await
     }
 }
 

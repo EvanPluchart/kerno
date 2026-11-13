@@ -6,6 +6,7 @@
 //! order they came, then the new rows.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::RangeInclusive;
 
 use crate::error::{Error, Result};
 use crate::result::{ResultStore, TypeKind};
@@ -20,6 +21,32 @@ pub struct Pending {
     deleted: BTreeSet<usize>,
     /// New rows: a value per column, `Default` where none was given.
     inserted: Vec<Vec<CellValue>>,
+    /// The changes as they were before each step, last step last.
+    // ponytail: a whole copy per step, unbounded; pages are at most a few
+    // thousand rows. Store the inverse of each step if pages grow.
+    undo: Vec<Saved>,
+}
+
+/// The three collections of [`Pending`], as a step found them.
+type Saved = (
+    BTreeMap<(usize, usize), CellValue>,
+    BTreeSet<usize>,
+    Vec<Vec<CellValue>>,
+);
+
+/// The row whose values "Copy from the row above / below" takes for the
+/// selected `rows`, out of `total`: one row takes its neighbour's, a block
+/// takes its own first (last) row's, which fills the others. Ported from
+/// DBeaver's `ResultSetViewer.copyRowValues` (plugin ui.editors.data).
+pub fn neighbour(rows: &RangeInclusive<usize>, above: bool, total: usize) -> Option<usize> {
+    let (first, last) = (*rows.start(), *rows.end());
+    let source = match (first == last, above) {
+        (true, true) => first.checked_sub(1)?,
+        (true, false) => last + 1,
+        (false, true) => first,
+        (false, false) => last,
+    };
+    (source < total).then_some(source)
 }
 
 /// A fetched cell as a value to compare with or to copy.
@@ -58,6 +85,35 @@ impl Pending {
     /// Forgets every change.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    fn saved(&self) -> Saved {
+        (
+            self.cells.clone(),
+            self.deleted.clone(),
+            self.inserted.clone(),
+        )
+    }
+
+    /// Makes `change` one step that [`Pending::undo`] takes back whole (a
+    /// paste of a block, a discard). A step that changes nothing is none.
+    pub fn step(&mut self, change: impl FnOnce(&mut Self)) {
+        let before = self.saved();
+        let mut undo = std::mem::take(&mut self.undo);
+        change(self);
+        if (&self.cells, &self.deleted, &self.inserted) != (&before.0, &before.1, &before.2) {
+            undo.push(before);
+        }
+        self.undo = undo;
+    }
+
+    /// Takes the last step back. Returns whether there was one.
+    pub fn undo(&mut self) -> bool {
+        let Some((cells, deleted, inserted)) = self.undo.pop() else {
+            return false;
+        };
+        (self.cells, self.deleted, self.inserted) = (cells, deleted, inserted);
+        true
     }
 
     /// Gives a cell a new value. Giving a fetched cell the value it has
@@ -114,6 +170,53 @@ impl Pending {
         }
     }
 
+    /// Drops the pending value of a cell: a fetched cell shows what was
+    /// read again, a cell of a new row goes back to its default. Returns
+    /// whether it had one.
+    pub fn revert_cell(&mut self, fetched_rows: usize, row: usize, column: usize) -> bool {
+        if row < fetched_rows {
+            return self.cells.remove(&(row, column)).is_some();
+        }
+        match self
+            .inserted
+            .get_mut(row - fetched_rows)
+            .and_then(|new| new.get_mut(column))
+        {
+            Some(value) if *value != CellValue::Default => {
+                *value = CellValue::Default;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A cell as it shows: its pending value, else what was fetched.
+    fn shown(&self, store: &ResultStore, row: usize, column: usize) -> CellValue {
+        match self.value(store.row_count(), row, column) {
+            Some(pending) => pending.clone(),
+            None => fetched(store, row, column),
+        }
+    }
+
+    /// Gives each of `cells` (row, column) the value the cell of row `from`
+    /// in its column shows.
+    pub fn copy_cells(
+        &mut self,
+        store: &ResultStore,
+        from: usize,
+        cells: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        if from >= store.row_count() + self.inserted.len() {
+            return;
+        }
+        for (row, column) in cells {
+            if column < store.columns().len() {
+                let value = self.shown(store, from, column);
+                self.set(store, row, column, value);
+            }
+        }
+    }
+
     /// Takes a fetched row back to what was read: no edit, no deletion.
     pub fn revert(&mut self, row: usize) {
         self.deleted.remove(&row);
@@ -144,10 +247,8 @@ impl Pending {
             .map(|column| {
                 if generated.contains(&column) {
                     CellValue::Default
-                } else if let Some(pending) = self.value(fetched_rows, row, column) {
-                    pending.clone()
                 } else {
-                    fetched(store, row, column)
+                    self.shown(store, row, column)
                 }
             })
             .collect();
@@ -342,6 +443,89 @@ mod tests {
         pending.add_row(&store);
         pending.clear();
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn undo_takes_back_one_step_at_a_time() {
+        let store = store();
+        let mut pending = Pending::default();
+        assert!(!pending.undo());
+        // A step of several changes is taken back whole.
+        pending.step(|pending| {
+            pending.set(&store, 0, 1, text("bob"));
+            pending.set(&store, 1, 1, text("cy"));
+        });
+        pending.step(|pending| pending.delete(2, [0]));
+        // A step that changes nothing is no step.
+        pending.step(|pending| pending.set(&store, 1, 1, text("cy")));
+        let new = pending.add_row(&store);
+        pending.step(|pending| pending.set(&store, new, 1, text("dee")));
+        assert_eq!(pending.value(2, new, 1), Some(&text("dee")));
+        assert!(pending.undo());
+        // The row added outside a step stays; its value is gone.
+        assert_eq!(pending.value(2, new, 1), Some(&CellValue::Default));
+        // Back before the deletion, and before the row added since.
+        assert!(pending.undo());
+        assert!(!pending.is_deleted(0));
+        assert_eq!((pending.count(), pending.inserted()), (2, 0));
+        // A discard is a step too.
+        pending.step(Pending::clear);
+        assert!(pending.is_empty());
+        assert!(pending.undo());
+        assert_eq!(pending.value(2, 1, 1), Some(&text("cy")));
+        assert!(pending.undo());
+        assert_eq!(pending.value(2, 0, 1), None);
+        assert!(!pending.undo());
+    }
+
+    #[test]
+    fn a_cell_is_reverted_alone() {
+        let store = store();
+        let mut pending = Pending::default();
+        pending.set(&store, 0, 1, text("bob"));
+        pending.set(&store, 0, 2, CellValue::Default);
+        let new = pending.add_row(&store);
+        pending.set(&store, new, 1, text("dee"));
+        assert!(pending.revert_cell(2, 0, 1));
+        assert!(!pending.revert_cell(2, 0, 1));
+        assert_eq!(pending.value(2, 0, 2), Some(&CellValue::Default));
+        // A new row's cell goes back to its default; the row stays.
+        assert!(pending.revert_cell(2, new, 1));
+        assert!(!pending.revert_cell(2, new, 1));
+        assert!(!pending.revert_cell(2, 9, 1));
+        assert_eq!((pending.inserted(), pending.count()), (1, 2));
+    }
+
+    #[test]
+    fn values_are_copied_from_the_neighbour_row() {
+        // One row takes its neighbour's; a block takes its own first or
+        // last row's; nothing past either end.
+        assert_eq!(neighbour(&(3..=3), true, 5), Some(2));
+        assert_eq!(neighbour(&(3..=3), false, 5), Some(4));
+        assert_eq!(neighbour(&(0..=0), true, 5), None);
+        assert_eq!(neighbour(&(4..=4), false, 5), None);
+        assert_eq!(neighbour(&(1..=3), true, 5), Some(1));
+        assert_eq!(neighbour(&(1..=3), false, 5), Some(3));
+
+        let store = store();
+        let mut pending = Pending::default();
+        pending.set(&store, 0, 1, text("ann2"));
+        let new = pending.add_row(&store);
+        // What row 0 shows, pending edit included, NULL and bytes too.
+        pending.copy_cells(&store, 0, [(new, 1), (new, 2)]);
+        assert_eq!(pending.value(2, new, 1), Some(&text("ann2")));
+        assert_eq!(pending.value(2, new, 2), Some(&CellValue::Null));
+        pending.copy_cells(&store, 1, [(0, 2)]);
+        assert_eq!(
+            pending.value(2, 0, 2),
+            Some(&CellValue::Bytes(vec![0, 255]))
+        );
+        // A copy of what a row already holds is no edit.
+        pending.copy_cells(&store, 1, [(1, 2)]);
+        assert_eq!(pending.value(2, 1, 2), None);
+        // From a row that does not exist: nothing.
+        pending.copy_cells(&store, 9, [(0, 1)]);
+        assert_eq!(pending.value(2, 0, 1), Some(&text("ann2")));
     }
 
     #[test]

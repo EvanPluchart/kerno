@@ -2,6 +2,7 @@
 
 use crate::config::Engine;
 use crate::error::{Error, Result};
+use crate::maintenance::{Maintenance, MaintenanceSql};
 use crate::plan::Plan;
 use crate::result::TypeKind;
 use crate::schema::{ColumnGeneration, ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef};
@@ -108,6 +109,39 @@ pub trait Dialect: Send + Sync {
     /// or no row when the table is not found. PostgreSQL gives -1 for a
     /// table never analysed: count it exactly then.
     fn estimated_rows_sql(&self, table: &TableRef) -> String;
+
+    /// The statement [`crate::Session::cancel_session`] runs for the session
+    /// `id` (column 0 of [`crate::AdminView::Sessions`]): what the client
+    /// shows before running it. `Config` when `id` is not a session id.
+    fn cancel_session_sql(&self, id: &str) -> Result<String> {
+        let _ = id;
+        Err(Error::Unsupported("signalling other sessions".into()))
+    }
+
+    /// The statement [`crate::Session::terminate_session`] runs for the
+    /// session `id`, as [`Dialect::cancel_session_sql`].
+    fn terminate_session_sql(&self, id: &str) -> Result<String> {
+        let _ = id;
+        Err(Error::Unsupported("signalling other sessions".into()))
+    }
+
+    /// The statement of the maintenance `tool` for `target`. `Unsupported`
+    /// when the engine has no such tool for that kind of object. A tool on
+    /// [`ObjectRef::Database`] acts on the database the session is
+    /// connected to: run it on a session opened on that database.
+    fn maintenance_sql(&self, tool: &Maintenance, target: &ObjectRef) -> Result<MaintenanceSql> {
+        let _ = (tool, target);
+        Err(Error::Unsupported("maintenance tools".into()))
+    }
+
+    /// The tools [`Dialect::maintenance_sql`] writes for `target`, at their
+    /// default options, in menu order.
+    fn maintenance_tools(&self, target: &ObjectRef) -> Vec<Maintenance> {
+        Maintenance::all()
+            .into_iter()
+            .filter(|tool| self.maintenance_sql(tool, target).is_ok())
+            .collect()
+    }
 
     /// The statement that removes every row of `table`.
     fn truncate_sql(&self, table: &TableRef) -> String {

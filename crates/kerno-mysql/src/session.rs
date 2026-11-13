@@ -601,11 +601,11 @@ impl Session for MysqlSession {
     }
 
     async fn cancel_session(&self, id: &str) -> Result<()> {
-        admin::kill(self, "QUERY", id).await
+        admin::kill(self, self.dialect.cancel_session_sql(id)?).await
     }
 
     async fn terminate_session(&self, id: &str) -> Result<()> {
-        admin::kill(self, "CONNECTION", id).await
+        admin::kill(self, self.dialect.terminate_session_sql(id)?).await
     }
 }
 

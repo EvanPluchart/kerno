@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kerno_core::dialect::{Dialect, column_list, default_literal, foreign_key_sql, hex};
+use kerno_core::maintenance::{Maintenance, MaintenanceSql, TruncateOptions};
 use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ObjectRef, RelationKind, RoutineKind, TableRef,
 };
@@ -132,6 +133,13 @@ fn is_bit_string(text: &str) -> bool {
     text.bytes().all(|byte| matches!(byte, b'0' | b'1'))
 }
 
+/// A session id as `CONNECTION_ID()`: nothing else reaches the SQL.
+fn thread_id(id: &str) -> Result<u64> {
+    id.trim()
+        .parse()
+        .map_err(|_| Error::Config(format!("\"{id}\" is not a session id")))
+}
+
 impl Dialect for MysqlDialect {
     fn engine(&self) -> Engine {
         self.engine
@@ -223,6 +231,14 @@ impl Dialect for MysqlDialect {
         }
     }
 
+    fn cancel_session_sql(&self, id: &str) -> Result<String> {
+        Ok(format!("KILL QUERY {}", thread_id(id)?))
+    }
+
+    fn terminate_session_sql(&self, id: &str) -> Result<String> {
+        Ok(format!("KILL CONNECTION {}", thread_id(id)?))
+    }
+
     /// `TABLE_ROWS`: InnoDB's sampled estimate, which MySQL caches for
     /// `information_schema_stats_expiry` seconds.
     fn estimated_rows_sql(&self, table: &TableRef) -> String {
@@ -286,6 +302,46 @@ impl Dialect for MysqlDialect {
             )),
             ObjectRef::Type(_) => Err(unsupported("user-defined types")),
         }
+    }
+
+    /// Ported from DBeaver's MySQL tools (`ext.mysql/.../tasks/`
+    /// `MySQLToolTableAnalyze.java`, `MySQLToolTableCheck.java`,
+    /// `MySQLToolTableOptimize.java`, `MySQLToolTableRepair.java`,
+    /// `MySQLToolTableTruncate.java`). Each answers with rows (`Table`,
+    /// `Op`, `Msg_type`, `Msg_text`) but `TRUNCATE`, and each commits the
+    /// open transaction first. DBeaver's "force" truncate (foreign key
+    /// checks off around it) is left out.
+    fn maintenance_sql(&self, tool: &Maintenance, target: &ObjectRef) -> Result<MaintenanceSql> {
+        let ObjectRef::Relation(table, RelationKind::Table | RelationKind::PartitionedTable) =
+            target
+        else {
+            return Err(unsupported("this tool on this kind of object"));
+        };
+        let name = self.table_name(table);
+        let sql = match tool {
+            Maintenance::Analyze => format!("ANALYZE TABLE {name}"),
+            Maintenance::Check(None) => format!("CHECK TABLE {name}"),
+            Maintenance::Check(Some(option)) => format!("CHECK TABLE {name} {}", option.sql()),
+            Maintenance::Optimize => format!("OPTIMIZE TABLE {name}"),
+            Maintenance::Repair(o) => format!(
+                "REPAIR TABLE {name}{}{}{}",
+                if o.quick { " QUICK" } else { "" },
+                if o.extended { " EXTENDED" } else { "" },
+                if o.use_frm { " USE_FRM" } else { "" }
+            ),
+            Maintenance::Truncate(o) if *o == TruncateOptions::default() => {
+                self.truncate_sql(table)
+            }
+            Maintenance::Truncate(_) => {
+                return Err(unsupported("ONLY, RESTART IDENTITY and CASCADE"));
+            }
+            _ => return Err(unsupported("this tool")),
+        };
+        Ok(MaintenanceSql {
+            sql,
+            returns_rows: !matches!(tool, Maintenance::Truncate(_)),
+            autocommit: true,
+        })
     }
 
     fn drop_sql(&self, object: &ObjectRef) -> Result<String> {
@@ -941,6 +997,19 @@ mod tests {
     }
 
     #[test]
+    fn signals_name_a_thread_by_its_number_only() {
+        for d in both() {
+            assert_eq!(d.cancel_session_sql(" 42 ").unwrap(), "KILL QUERY 42");
+            assert_eq!(d.terminate_session_sql("7").unwrap(), "KILL CONNECTION 7");
+            for id in ["", "-1", "1; DROP DATABASE kerno"] {
+                let error = d.terminate_session_sql(id).unwrap_err();
+                assert!(matches!(error, Error::Config(_)), "{id}: {error:?}");
+                assert!(d.cancel_session_sql(id).is_err(), "{id}");
+            }
+        }
+    }
+
+    #[test]
     fn truncate_and_create_statements() {
         for d in both() {
             assert_eq!(d.truncate_sql(&t()), "TRUNCATE TABLE `shop`.`order items`");
@@ -1222,5 +1291,126 @@ mod tests {
             mysql().insert_defaults(&TableRef::new("shop", "t")),
             "INSERT INTO `shop`.`t` () VALUES ()"
         );
+    }
+
+    mod maintenance {
+        use super::*;
+        use kerno_core::maintenance::{CheckOption, RefreshOptions, RepairOptions, VacuumOptions};
+
+        const ODD: &str = "`shop`.`order ``items`";
+
+        fn table() -> ObjectRef {
+            ObjectRef::Relation(TableRef::new("shop", "order `items"), RelationKind::Table)
+        }
+
+        fn sql(d: &MysqlDialect, tool: Maintenance) -> String {
+            let out = d.maintenance_sql(&tool, &table()).unwrap();
+            assert_eq!(
+                out.returns_rows,
+                !matches!(tool, Maintenance::Truncate(_)),
+                "{}",
+                out.sql
+            );
+            assert!(out.autocommit, "{}", out.sql);
+            out.sql
+        }
+
+        #[test]
+        fn table_tools_and_their_options() {
+            for d in both() {
+                assert_eq!(
+                    sql(&d, Maintenance::Analyze),
+                    format!("ANALYZE TABLE {ODD}")
+                );
+                assert_eq!(
+                    sql(&d, Maintenance::Optimize),
+                    format!("OPTIMIZE TABLE {ODD}")
+                );
+                assert_eq!(
+                    sql(&d, Maintenance::Check(None)),
+                    format!("CHECK TABLE {ODD}")
+                );
+                let words = [
+                    "FOR UPGRADE",
+                    "QUICK",
+                    "FAST",
+                    "MEDIUM",
+                    "EXTENDED",
+                    "CHANGED",
+                ];
+                for (option, words) in CheckOption::ALL.into_iter().zip(words) {
+                    assert_eq!(
+                        sql(&d, Maintenance::Check(Some(option))),
+                        format!("CHECK TABLE {ODD} {words}")
+                    );
+                }
+                assert_eq!(
+                    sql(&d, Maintenance::Repair(RepairOptions::default())),
+                    format!("REPAIR TABLE {ODD}")
+                );
+                assert_eq!(
+                    sql(
+                        &d,
+                        Maintenance::Repair(RepairOptions {
+                            quick: true,
+                            extended: true,
+                            use_frm: true,
+                        })
+                    ),
+                    format!("REPAIR TABLE {ODD} QUICK EXTENDED USE_FRM")
+                );
+                assert_eq!(
+                    sql(&d, Maintenance::Truncate(TruncateOptions::default())),
+                    format!("TRUNCATE TABLE {ODD}")
+                );
+                let cascade = Maintenance::Truncate(TruncateOptions {
+                    cascade: true,
+                    ..TruncateOptions::default()
+                });
+                assert!(matches!(
+                    d.maintenance_sql(&cascade, &table()),
+                    Err(Error::Unsupported(_))
+                ));
+            }
+        }
+
+        #[test]
+        fn only_tables_have_tools() {
+            for d in both() {
+                let partitioned =
+                    ObjectRef::Relation(TableRef::new("shop", "p"), RelationKind::PartitionedTable);
+                for target in [table(), partitioned] {
+                    assert_eq!(
+                        d.maintenance_tools(&target),
+                        [
+                            Maintenance::Analyze,
+                            Maintenance::Truncate(TruncateOptions::default()),
+                            Maintenance::Check(None),
+                            Maintenance::Optimize,
+                            Maintenance::Repair(RepairOptions::default()),
+                        ]
+                    );
+                }
+                for nothing in [
+                    ObjectRef::Relation(t(), RelationKind::View),
+                    ObjectRef::Database("shop".into()),
+                    trigger(),
+                    routine(RoutineKind::Procedure),
+                ] {
+                    assert!(d.maintenance_tools(&nothing).is_empty(), "{nothing:?}");
+                }
+                // PostgreSQL's tools are refused with `Unsupported`.
+                for tool in [
+                    Maintenance::Vacuum(VacuumOptions::default()),
+                    Maintenance::RefreshMaterializedView(RefreshOptions::default()),
+                    Maintenance::EnableTrigger,
+                ] {
+                    assert!(matches!(
+                        d.maintenance_sql(&tool, &table()),
+                        Err(Error::Unsupported(_))
+                    ));
+                }
+            }
+        }
     }
 }

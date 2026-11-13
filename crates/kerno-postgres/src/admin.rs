@@ -124,21 +124,16 @@ ORDER BY s.category, s.name"
     }
 }
 
-/// Calls `pg_cancel_backend` or `pg_terminate_backend` on a session id.
-pub(crate) async fn signal(session: &PgSession, function: &str, id: &str) -> Result<()> {
-    let pid: i32 = id
-        .trim()
-        .parse()
-        .map_err(|_| Error::Config(format!("\"{id}\" is not a session id")))?;
-    let rows = session
-        .query(&format!("SELECT pg_catalog.{function}({pid})"))
-        .await?;
+/// Runs the statement `sql` (one of the dialect's signals) for `id`.
+pub(crate) async fn signal(session: &PgSession, sql: String, id: &str) -> Result<()> {
+    let rows = session.query(&sql).await?;
     // The functions return false when no such backend exists.
     if rows.first().and_then(|row| row.get(0)) == Some("t") {
         Ok(())
     } else {
         Err(Error::Db(Box::new(DbError::message(format!(
-            "session {pid} no longer exists"
+            "session {} no longer exists",
+            id.trim()
         )))))
     }
 }

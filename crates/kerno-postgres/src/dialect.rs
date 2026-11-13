@@ -1,6 +1,7 @@
 //! PostgreSQL's SQL dialect.
 
 use kerno_core::dialect::{Dialect, default_drop_sql, default_rename_sql, hex};
+use kerno_core::maintenance::{Maintenance, MaintenanceSql};
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::LexRules;
 use kerno_core::{Engine, Error, Plan, Result, TypeKind};
@@ -31,6 +32,13 @@ fn object_target(dialect: &PgDialect, object: &ObjectRef) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// A session id as `pg_stat_activity.pid`: nothing else reaches the SQL.
+fn backend_pid(id: &str) -> Result<i32> {
+    id.trim()
+        .parse()
+        .map_err(|_| Error::Config(format!("\"{id}\" is not a session id")))
 }
 
 impl Dialect for PgDialect {
@@ -98,6 +106,20 @@ impl Dialect for PgDialect {
         crate::plan::parse(output)
     }
 
+    fn cancel_session_sql(&self, id: &str) -> Result<String> {
+        Ok(format!(
+            "SELECT pg_catalog.pg_cancel_backend({})",
+            backend_pid(id)?
+        ))
+    }
+
+    fn terminate_session_sql(&self, id: &str) -> Result<String> {
+        Ok(format!(
+            "SELECT pg_catalog.pg_terminate_backend({})",
+            backend_pid(id)?
+        ))
+    }
+
     /// `reltuples`, as the last `ANALYZE` or `VACUUM` left it.
     fn estimated_rows_sql(&self, table: &TableRef) -> String {
         format!(
@@ -126,6 +148,93 @@ impl Dialect for PgDialect {
             Some(target) => Ok(format!("DROP {target}")),
             None => default_drop_sql(self, object),
         }
+    }
+
+    /// Ported from DBeaver's PostgreSQL tools (`ext.postgresql/.../tasks/`
+    /// `PostgreToolBaseVacuum.java`, `PostgreToolBaseAnalyze.java`,
+    /// `PostgreToolMViewRefresh.java`, `PostgreToolTableTruncate.java`,
+    /// `PostgreToolTableTriggerEnable.java`, `PostgreToolTableTriggerDisable.java`).
+    /// `VACUUM` and `ANALYZE` are always `VERBOSE`, as there: the server
+    /// reports through notices. Unlike there, `TRUNCATE` writes only the
+    /// options asked for (no `CONTINUE IDENTITY` / `RESTRICT`, the
+    /// defaults), `CONCURRENTLY` is offered, and views and foreign tables
+    /// get no `VACUUM` (the server skips them with a warning).
+    fn maintenance_sql(&self, tool: &Maintenance, target: &ObjectRef) -> Result<MaintenanceSql> {
+        use RelationKind::{ForeignTable, MaterializedView, PartitionedTable, Table};
+        let unsupported = || Error::Unsupported("this tool on this kind of object".into());
+        // ` s.t` for a relation of `kinds`; nothing for the database.
+        let on = |kinds: &[RelationKind]| match target {
+            ObjectRef::Relation(table, kind) if kinds.contains(kind) => {
+                Ok(format!(" {}", self.table_name(table)))
+            }
+            ObjectRef::Database(_) => Ok(String::new()),
+            _ => Err(unsupported()),
+        };
+        let sql = match (tool, target) {
+            (Maintenance::Vacuum(o), _) => {
+                let options: Vec<&str> = [
+                    (o.full, "FULL"),
+                    (o.freeze, "FREEZE"),
+                    (true, "VERBOSE"),
+                    (o.analyze, "ANALYZE"),
+                    (o.disable_page_skipping, "DISABLE_PAGE_SKIPPING"),
+                    (o.skip_locked, "SKIP_LOCKED"),
+                    (o.index_cleanup, "INDEX_CLEANUP"),
+                ]
+                .into_iter()
+                .filter_map(|(on, word)| on.then_some(word))
+                .collect();
+                let on = on(&[Table, PartitionedTable, MaterializedView])?;
+                format!("VACUUM ({}){on}", options.join(", "))
+            }
+            (Maintenance::Analyze, _) => format!(
+                "ANALYZE VERBOSE{}",
+                on(&[Table, PartitionedTable, ForeignTable, MaterializedView])?
+            ),
+            (
+                Maintenance::RefreshMaterializedView(o),
+                ObjectRef::Relation(view, MaterializedView),
+            ) => {
+                format!(
+                    "REFRESH MATERIALIZED VIEW {}{} WITH {}DATA",
+                    if o.concurrently { "CONCURRENTLY " } else { "" },
+                    self.table_name(view),
+                    if o.with_data { "" } else { "NO " }
+                )
+            }
+            (Maintenance::Truncate(o), ObjectRef::Relation(table, Table | PartitionedTable)) => {
+                format!(
+                    "TRUNCATE TABLE {}{}{}{}",
+                    if o.only { "ONLY " } else { "" },
+                    self.table_name(table),
+                    if o.restart_identity {
+                        " RESTART IDENTITY"
+                    } else {
+                        ""
+                    },
+                    if o.cascade { " CASCADE" } else { "" }
+                )
+            }
+            (
+                Maintenance::EnableTrigger | Maintenance::DisableTrigger,
+                ObjectRef::Trigger { table, name },
+            ) => format!(
+                "ALTER TABLE {} {} TRIGGER {}",
+                self.table_name(table),
+                if *tool == Maintenance::EnableTrigger {
+                    "ENABLE"
+                } else {
+                    "DISABLE"
+                },
+                self.quote_ident(name)
+            ),
+            _ => return Err(unsupported()),
+        };
+        Ok(MaintenanceSql {
+            sql,
+            returns_rows: false,
+            autocommit: matches!(tool, Maintenance::Vacuum(_)),
+        })
     }
 
     /// Views and routines are printed as `CREATE OR REPLACE` already
@@ -363,6 +472,24 @@ mod tests {
     }
 
     #[test]
+    fn signals_name_a_backend_by_its_number_only() {
+        let d = PgDialect;
+        assert_eq!(
+            d.cancel_session_sql(" 4242 ").unwrap(),
+            "SELECT pg_catalog.pg_cancel_backend(4242)"
+        );
+        assert_eq!(
+            d.terminate_session_sql("17").unwrap(),
+            "SELECT pg_catalog.pg_terminate_backend(17)"
+        );
+        for id in ["", "not a pid", "1); DROP TABLE x; --"] {
+            let error = d.cancel_session_sql(id).unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{id}: {error:?}");
+            assert!(d.terminate_session_sql(id).is_err(), "{id}");
+        }
+    }
+
+    #[test]
     fn truncate_and_create_statements() {
         let d = PgDialect;
         assert_eq!(
@@ -518,5 +645,199 @@ mod tests {
             d.explain("select 1", true),
             "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) select 1"
         );
+    }
+
+    mod maintenance {
+        use super::*;
+        use kerno_core::maintenance::{
+            RefreshOptions, RepairOptions, TruncateOptions, VacuumOptions,
+        };
+
+        fn odd() -> TableRef {
+            TableRef::new("shop", "order \"items\"")
+        }
+
+        const ODD: &str = "\"shop\".\"order \"\"items\"\"\"";
+
+        fn relation(kind: RelationKind) -> ObjectRef {
+            ObjectRef::Relation(odd(), kind)
+        }
+
+        fn sql(tool: Maintenance, target: &ObjectRef) -> String {
+            let out = PgDialect.maintenance_sql(&tool, target).unwrap();
+            assert!(!out.returns_rows, "{}", out.sql);
+            assert_eq!(
+                out.autocommit,
+                matches!(tool, Maintenance::Vacuum(_)),
+                "{}",
+                out.sql
+            );
+            out.sql
+        }
+
+        #[test]
+        fn vacuum_writes_each_option_in_order_and_is_always_verbose() {
+            let table = relation(RelationKind::Table);
+            let vacuum = |o| sql(Maintenance::Vacuum(o), &table);
+            assert_eq!(
+                vacuum(VacuumOptions::default()),
+                format!("VACUUM (VERBOSE) {ODD}")
+            );
+            assert_eq!(
+                vacuum(VacuumOptions {
+                    full: true,
+                    freeze: true,
+                    analyze: true,
+                    disable_page_skipping: true,
+                    skip_locked: true,
+                    index_cleanup: true,
+                }),
+                format!(
+                    "VACUUM (FULL, FREEZE, VERBOSE, ANALYZE, DISABLE_PAGE_SKIPPING, \
+                     SKIP_LOCKED, INDEX_CLEANUP) {ODD}"
+                )
+            );
+            assert_eq!(
+                vacuum(VacuumOptions {
+                    analyze: true,
+                    ..VacuumOptions::default()
+                }),
+                format!("VACUUM (VERBOSE, ANALYZE) {ODD}")
+            );
+            let database = ObjectRef::Database("any".into());
+            assert_eq!(
+                sql(Maintenance::Vacuum(VacuumOptions::default()), &database),
+                "VACUUM (VERBOSE)"
+            );
+            assert_eq!(sql(Maintenance::Analyze, &database), "ANALYZE VERBOSE");
+            assert_eq!(
+                sql(Maintenance::Analyze, &table),
+                format!("ANALYZE VERBOSE {ODD}")
+            );
+        }
+
+        #[test]
+        fn refresh_truncate_and_triggers() {
+            let view = relation(RelationKind::MaterializedView);
+            let refresh = |concurrently, with_data| {
+                sql(
+                    Maintenance::RefreshMaterializedView(RefreshOptions {
+                        concurrently,
+                        with_data,
+                    }),
+                    &view,
+                )
+            };
+            assert_eq!(
+                refresh(false, true),
+                format!("REFRESH MATERIALIZED VIEW {ODD} WITH DATA")
+            );
+            assert_eq!(
+                refresh(false, false),
+                format!("REFRESH MATERIALIZED VIEW {ODD} WITH NO DATA")
+            );
+            assert_eq!(
+                refresh(true, true),
+                format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {ODD} WITH DATA")
+            );
+
+            let table = relation(RelationKind::Table);
+            let truncate = |o| sql(Maintenance::Truncate(o), &table);
+            assert_eq!(
+                truncate(TruncateOptions::default()),
+                PgDialect.truncate_sql(&odd())
+            );
+            assert_eq!(
+                truncate(TruncateOptions {
+                    only: true,
+                    restart_identity: true,
+                    cascade: true,
+                }),
+                format!("TRUNCATE TABLE ONLY {ODD} RESTART IDENTITY CASCADE")
+            );
+            assert_eq!(
+                truncate(TruncateOptions {
+                    restart_identity: true,
+                    ..TruncateOptions::default()
+                }),
+                format!("TRUNCATE TABLE {ODD} RESTART IDENTITY")
+            );
+
+            let trigger = ObjectRef::Trigger {
+                table: odd(),
+                name: "audit \"it\"".into(),
+            };
+            assert_eq!(
+                sql(Maintenance::DisableTrigger, &trigger),
+                format!("ALTER TABLE {ODD} DISABLE TRIGGER \"audit \"\"it\"\"\"")
+            );
+            assert_eq!(
+                sql(Maintenance::EnableTrigger, &trigger),
+                format!("ALTER TABLE {ODD} ENABLE TRIGGER \"audit \"\"it\"\"\"")
+            );
+        }
+
+        #[test]
+        fn each_kind_of_object_lists_its_tools() {
+            let names = |target: &ObjectRef| -> Vec<&'static str> {
+                PgDialect
+                    .maintenance_tools(target)
+                    .iter()
+                    .map(|tool| match tool {
+                        Maintenance::Vacuum(_) => "vacuum",
+                        Maintenance::Analyze => "analyze",
+                        Maintenance::RefreshMaterializedView(_) => "refresh",
+                        Maintenance::Truncate(_) => "truncate",
+                        Maintenance::EnableTrigger => "enable",
+                        Maintenance::DisableTrigger => "disable",
+                        Maintenance::Check(_) => "check",
+                        Maintenance::Optimize => "optimize",
+                        Maintenance::Repair(_) => "repair",
+                    })
+                    .collect()
+            };
+            let table = ["vacuum", "analyze", "truncate"];
+            assert_eq!(names(&relation(RelationKind::Table)), table);
+            assert_eq!(names(&relation(RelationKind::PartitionedTable)), table);
+            assert_eq!(
+                names(&relation(RelationKind::MaterializedView)),
+                ["vacuum", "analyze", "refresh"]
+            );
+            assert_eq!(names(&relation(RelationKind::ForeignTable)), ["analyze"]);
+            assert!(names(&relation(RelationKind::View)).is_empty());
+            assert_eq!(
+                names(&ObjectRef::Database("kerno".into())),
+                ["vacuum", "analyze"]
+            );
+            assert_eq!(
+                names(&ObjectRef::Trigger {
+                    table: odd(),
+                    name: "t".into()
+                }),
+                ["enable", "disable"]
+            );
+            for nothing in [
+                ObjectRef::Schema("shop".into()),
+                ObjectRef::Sequence(odd()),
+                ObjectRef::Type(odd()),
+                ObjectRef::Index {
+                    table: odd(),
+                    name: "i".into(),
+                },
+            ] {
+                assert!(names(&nothing).is_empty(), "{nothing:?}");
+            }
+            // MySQL's tools are refused with `Unsupported`.
+            for tool in [
+                Maintenance::Check(None),
+                Maintenance::Optimize,
+                Maintenance::Repair(RepairOptions::default()),
+            ] {
+                assert!(matches!(
+                    PgDialect.maintenance_sql(&tool, &relation(RelationKind::Table)),
+                    Err(Error::Unsupported(_))
+                ));
+            }
+        }
     }
 }

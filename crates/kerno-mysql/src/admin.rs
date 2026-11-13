@@ -5,7 +5,7 @@
 //! views have one query per engine. All of them are written from the
 //! servers' documentation and checked against MySQL 8.4 and MariaDB 11.
 
-use kerno_core::{AdminView, Engine, Error, Result};
+use kerno_core::{AdminView, Engine, Result};
 
 use crate::introspect::SYSTEM_DATABASES;
 use crate::session::MysqlSession;
@@ -150,17 +150,10 @@ ORDER BY 1"
     }
 }
 
-/// Sends `KILL QUERY` or `KILL CONNECTION` for another session.
-pub(crate) async fn kill(session: &MysqlSession, what: &str, id: &str) -> Result<()> {
-    let id: u64 = id
-        .trim()
-        .parse()
-        .map_err(|_| Error::Config(format!("\"{id}\" is not a session id")))?;
+/// Sends the dialect's `KILL QUERY` or `KILL CONNECTION` statement.
+pub(crate) async fn kill(session: &MysqlSession, sql: String) -> Result<()> {
     // The server answers "Unknown thread id" when no such session exists.
-    session
-        .query(&format!("KILL {what} {id}"))
-        .await
-        .map(|_| ())
+    session.query(&sql).await.map(|_| ())
 }
 
 #[cfg(test)]
