@@ -77,13 +77,16 @@ impl CompletionProvider for SqlCompletion {
         Task::ready(Ok(CompletionResponse::Array(self.items(text, offset))))
     }
 
-    /// The list opens while a word is typed and after a dot. Any edit
+    /// The list opens while a word is typed and after a dot, unless the
+    /// settings turn that off. Any edit
     /// closes it first, so a space or a parenthesis leaves it closed.
-    fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
-        new_text
-            .chars()
-            .last()
-            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '`'))
+    fn is_completion_trigger(&self, _: usize, new_text: &str, cx: &mut App) -> bool {
+        // Off in the settings, the list opens only when asked (Ctrl+Space).
+        crate::state::AppState::get(cx).settings.auto_completion
+            && new_text
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '`'))
     }
 }
 

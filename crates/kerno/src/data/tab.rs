@@ -1415,8 +1415,7 @@ impl DataTab {
         self.apply_error.as_deref()
     }
 
-    /// The grid; for tests.
-    #[cfg(test)]
+    /// The grid, once rows are read.
     pub fn grid(&self) -> Option<Entity<TableState<Grid>>> {
         self.grid.clone()
     }
@@ -1944,7 +1943,11 @@ impl DataTab {
                 div()
                     .size_full()
                     .relative()
-                    .child(DataTable::new(table).xsmall().focus_ring(false))
+                    .child(
+                        DataTable::new(table)
+                            .with_size(crate::query::grid::table_size(cx))
+                            .focus_ring(false),
+                    )
                     .when(empty, |area| {
                         area.child(
                             div()

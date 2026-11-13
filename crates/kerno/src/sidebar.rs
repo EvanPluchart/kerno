@@ -552,8 +552,14 @@ impl Sidebar {
                 .confirm()
                 .ok_text("Delete")
                 .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                // The window ends what the connection's tabs hold first.
                 .on_ok(move |_, _, cx| {
-                    connections.update(cx, |connections, cx| connections.delete(&id, cx));
+                    let id = id.clone();
+                    connections.update(cx, |_, cx| {
+                        cx.emit(crate::connections::manager::ConnectionsEvent::DeleteRequested {
+                            id,
+                        })
+                    });
                     true
                 })
         });

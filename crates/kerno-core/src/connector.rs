@@ -144,7 +144,8 @@ impl Connector {
                     index + 1
                 )));
             }
-            tracing::debug!(statement = index + 1, sql, "bootstrap statement");
+            // The statement number only: Kerno never logs SQL text.
+            tracing::debug!(statement = index + 1, "bootstrap statement");
             if let Err(error) = exec::collect(session.clone(), sql).await {
                 if !self.config.ignore_init_errors {
                     return Err(Error::Connect(format!(

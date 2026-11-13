@@ -10852,3 +10852,666 @@ fn disconnect_others_and_a_folder_close_only_those_connections(cx: &mut TestAppC
     });
     assert!(open(&app, cx, 0));
 }
+
+// Secrets never reach the disk or the log (M10 Part 2) -------------------------
+
+/// The files under `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[gpui_kit::test]
+fn no_secret_is_written_to_the_data_directory_or_the_log(cx: &mut TestAppContext) {
+    const ROLE: &str = "kerno_ui_secrets";
+    const PASSWORD: &str = "kerno-ui-Pw-4f7c1e";
+    const WRONG: &str = "kerno-ui-Wrong-9b2d0a";
+    const PASSPHRASE: &str = "kerno-ui-Phrase-61e8c3";
+    // In a statement the user runs: the history keeps it redacted.
+    const LITERAL: &str = "kerno-ui-Literal-d05a7f";
+    // In a bootstrap statement: stored with the connection, never logged.
+    const BOOTSTRAP: &str = "kerno_ui_boot_3c9e51";
+    const MARKER: &str = "kerno-ui-log-marker";
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    // Declared first, dropped last: after the app's sessions.
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            &format!(
+                "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{ROLE}'"
+            ),
+            &format!("DROP ROLE IF EXISTS {ROLE}"),
+        ],
+        &[&format!("CREATE ROLE {ROLE} LOGIN PASSWORD '{PASSWORD}'")],
+    );
+    // The store and the logs in one data directory, as the app has them.
+    let data = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(data.path().to_path_buf());
+    let app = open(cx, Arc::new(Storage::open(&paths.database()).unwrap()));
+    // Kerno's own lines at their most verbose.
+    cx.update(|cx| {
+        crate::logging::init_with(
+            &paths.logs(),
+            tracing_subscriber::EnvFilter::new("warn,kerno=debug"),
+            cx,
+        )
+    })
+    .unwrap();
+
+    let save =
+        |app: &Fixture, cx: &mut TestAppContext, config: ConnectionConfig, secrets: Secrets| {
+            let before = cx.update(|cx| app.connections.read(cx).saved().len());
+            let connections = app.connections.clone();
+            cx.update(|cx| {
+                connections.update(cx, |connections, cx| {
+                    connections.save(None, config, secrets, None, false, cx)
+                })
+            });
+            app.wait_until(cx, "the save", |app, cx| {
+                cx.update(|cx| app.connections.read(cx).saved().len() == before + 1)
+            });
+            cx.update(|cx| app.connections.read(cx).saved()[before].id.clone())
+        };
+    let connect = |app: &Fixture, cx: &mut TestAppContext, id: &str| {
+        let connections = app.connections.clone();
+        cx.update(|cx| connections.update(cx, |connections, cx| connections.connect(id, cx)));
+    };
+    let as_role = |name: &str| ConnectionConfig {
+        name: name.into(),
+        user: ROLE.into(),
+        ..testing::config(Engine::Postgres)
+    };
+    let password = |secret: &str| Secrets {
+        password: Some(Secret::new(secret)),
+        ..Secrets::default()
+    };
+
+    // Connect with the password and run a statement holding one.
+    let config = ConnectionConfig {
+        init_sql: vec![format!("SET application_name = '{BOOTSTRAP}'")],
+        ..as_role("kerno_ui right")
+    };
+    let id = save(&app, cx, config, password(PASSWORD));
+    connect(&app, cx, &id);
+    app.wait_until(cx, "the connection", |app, cx| {
+        let status = app.status(cx, 0);
+        assert!(!matches!(status, Status::Failed { .. }), "{status:?}");
+        matches!(status, Status::Connected { .. })
+    });
+    let statement = format!("ALTER ROLE {ROLE} PASSWORD '{LITERAL}'");
+    app.run_in_new_tab(cx, &statement, "secondary-enter");
+    app.wait_until(cx, "the history", |app, _| {
+        !app.storage.history(None, "", 10).unwrap().is_empty()
+    });
+    assert_eq!(
+        app.storage.history(None, "", 10).unwrap()[0].sql,
+        format!("ALTER ROLE {ROLE} PASSWORD '***'")
+    );
+
+    // A wrong password fails; an SSH key passphrase is saved.
+    let id = save(&app, cx, as_role("kerno_ui wrong"), password(WRONG));
+    connect(&app, cx, &id);
+    app.wait_until(cx, "the refusal", |app, cx| {
+        matches!(app.status(cx, 1), Status::Failed { .. })
+    });
+    let tunnel = ConnectionConfig {
+        ssh: Some(testing::ssh(kerno_core::config::SshAuth::KeyFile {
+            path: "/nonexistent/kerno-ui/id_ed25519".into(),
+        })),
+        ..as_role("kerno_ui tunnel")
+    };
+    let passphrase = Secrets {
+        ssh_key_passphrase: Some(Secret::new(PASSPHRASE)),
+        ..password(PASSWORD)
+    };
+    save(&app, cx, tunnel, passphrase);
+
+    let export = tempfile::tempdir().unwrap();
+    let file = export.path().join("connections.json");
+    let (workspace, target) = (app.workspace.clone(), file.clone());
+    app.step(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.export_connections_to(target, window, cx)
+        });
+    });
+    app.wait_until(cx, "the export", |_, _| file.exists());
+
+    // Quit: the window goes, the log writer writes what it holds.
+    tracing::warn!(marker = MARKER, "end of the secrets test");
+    cx.update_window(app.window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(crate::logging::flush);
+
+    let contains = |bytes: &[u8], text: &str| {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    };
+    let mut files = files_under(data.path());
+    files.extend(files_under(app._data_dir.path()));
+    files.push(file);
+    assert!(files.contains(&paths.database()), "{files:?}");
+    let logs: Vec<_> = files
+        .iter()
+        .filter(|file| file.starts_with(paths.logs()))
+        .collect();
+    assert_eq!(logs.len(), 1, "{files:?}");
+    assert!(contains(&std::fs::read(logs[0]).unwrap(), MARKER));
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap();
+        for secret in [PASSWORD, WRONG, PASSPHRASE] {
+            assert!(!contains(&bytes, secret), "{secret} in {}", file.display());
+        }
+    }
+    // The statement's text stays in its tab, which is restored after a
+    // restart; the history and the log never get it.
+    let log = std::fs::read(logs[0]).unwrap();
+    for text in [LITERAL, BOOTSTRAP] {
+        assert!(!contains(&log, text), "{text} in the log");
+    }
+    let exported = std::fs::read(export.path().join("connections.json")).unwrap();
+    assert!(!contains(&exported, LITERAL));
+}
+
+// M10 Part 3 — settings, keymap, keyboard coverage; the last paths that ended
+// a connection's sessions without asking ---------------------------------------
+
+/// A scratch schema `schema` with a one-column `entries` table; its cleanup
+/// first ends the sessions a failed test left inside a transaction on it.
+fn entries_scratch(schema: &str) -> Scratch {
+    Scratch::new(
+        Engine::Postgres,
+        &[
+            &format!(
+                "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+                 WHERE query LIKE '%{schema}.entries values%' AND pid <> pg_backend_pid()"
+            ),
+            &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        ],
+        &[
+            &format!("CREATE SCHEMA {schema}"),
+            &format!("CREATE TABLE {schema}.entries (id int PRIMARY KEY)"),
+        ],
+    )
+}
+
+#[gpui_kit::test]
+fn deleting_an_open_connection_asks_about_its_transaction(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = entries_scratch("kerno_ui_delete_conn");
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let query = app.tab(cx);
+    app.open_transaction(cx, "insert into kerno_ui_delete_conn.entries values (1)");
+
+    // Confirmed in the alert, the deletion still asks about the transaction;
+    // Cancel keeps the connection, its session and its transaction.
+    let delete = |app: &Fixture, cx: &mut TestAppContext| {
+        app.right_click(cx, ("connection", 0usize), None);
+        app.click_label(cx, "Delete…");
+        app.click(cx, "ok");
+    };
+    delete(&app, cx);
+    assert!(app.has(cx, "end-question"));
+    assert!(app.shows_label(cx, "“Query 1”: a transaction is open."));
+    app.click(cx, "end-cancel");
+    assert!(!app.dialog_open(cx));
+    assert_eq!(app.storage.connections().unwrap().len(), 1);
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    assert_eq!(
+        cx.update(|cx| query.read(cx).tx_state()),
+        kerno_core::TxState::Open
+    );
+
+    // Rolled back, the connection goes.
+    delete(&app, cx);
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the deletion", |app, _| {
+        app.storage.connections().unwrap().is_empty()
+    });
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM kerno_ui_delete_conn.entries"
+        ),
+        "0"
+    );
+}
+
+#[gpui_kit::test]
+fn saving_an_open_connection_asks_before_it_reconnects(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = entries_scratch("kerno_ui_save_conn");
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let query = app.tab(cx);
+    app.open_transaction(cx, "insert into kerno_ui_save_conn.entries values (1)");
+
+    let save_and_connect = |app: &Fixture, cx: &mut TestAppContext| {
+        app.right_click(cx, ("connection", 0usize), None);
+        app.click_label(cx, "Edit…");
+        app.wait_until(cx, "the connection dialog", |app, cx| {
+            app.has(cx, "conn-save-connect")
+        });
+        app.click(cx, "conn-save-connect");
+        app.wait_until(cx, "the question", |app, cx| app.has(cx, "end-question"));
+    };
+    // Cancel: saved, but the connection, its session and its transaction stay.
+    save_and_connect(&app, cx);
+    app.click(cx, "end-cancel");
+    assert!(!app.dialog_open(cx));
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+    assert_eq!(
+        cx.update(|cx| query.read(cx).tx_state()),
+        kerno_core::TxState::Open
+    );
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM pg_stat_activity WHERE state LIKE 'idle in transaction%' \
+             AND query LIKE '%kerno_ui_save_conn.entries values%'"
+        ),
+        "1"
+    );
+
+    // Rolled back, it reconnects with the saved settings.
+    save_and_connect(&app, cx);
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+            && cx.update(|cx| query.read(cx).tx_state()) == kerno_core::TxState::Idle
+    });
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM kerno_ui_save_conn.entries"
+        ),
+        "0"
+    );
+}
+
+/// The settings as the app holds them now.
+fn settings_now(cx: &mut TestAppContext) -> Settings {
+    cx.update(|cx| AppState::get(cx).settings.clone())
+}
+
+#[gpui_kit::test]
+fn every_action_of_kerno_is_a_command(cx: &mut TestAppContext) {
+    let _app = open(cx, memory_storage());
+    let names: Vec<&str> = cx.update(|cx| cx.all_action_names().to_vec());
+    let commands: Vec<String> = actions::COMMANDS
+        .iter()
+        .map(|command| (command.action)().name().to_string())
+        .collect();
+    let missing: Vec<&&str> = names
+        .iter()
+        .filter(|name| name.starts_with("kerno::") && **name != "kerno::RunCommand")
+        .filter(|name| !commands.iter().any(|command| command == *name))
+        .collect();
+    assert_eq!(missing, Vec::<&&str>::new());
+}
+
+#[gpui_kit::test]
+fn commit_rollback_and_the_commit_mode_have_keys(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = entries_scratch("kerno_ui_tx_keys");
+    let count = || {
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM kerno_ui_tx_keys.entries",
+        )
+    };
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    let manual = |cx: &mut TestAppContext| cx.update(|cx| tab.read(cx).manual_commit());
+    // Ctrl+Alt+A switches the tab to manual commit, and back.
+    app.press(cx, &["ctrl-alt-a"]);
+    assert!(manual(cx));
+    app.press(cx, &["ctrl-alt-a"]);
+    assert!(!manual(cx));
+    app.press(cx, &["ctrl-alt-a"]);
+    app.type_text(cx, "insert into kerno_ui_tx_keys.entries values (1)");
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the open transaction", |app, cx| {
+        !app.running(cx) && app.tx_state(cx) == kerno_core::TxState::Open
+    });
+    // Ctrl+8 rolls it back.
+    app.press(cx, &["ctrl-8"]);
+    app.wait_until(cx, "the rollback", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle
+    });
+    assert_eq!(count(), "0");
+    // Ctrl+4 commits.
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the open transaction", |app, cx| {
+        !app.running(cx) && app.tx_state(cx) == kerno_core::TxState::Open
+    });
+    app.press(cx, &["ctrl-4"]);
+    app.wait_until(cx, "the commit", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle
+    });
+    assert_eq!(count(), "1");
+}
+
+#[gpui_kit::test]
+fn a_key_puts_the_keyboard_in_the_tree_filter(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+    let in_filter = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |window, cx| {
+            navigator.read(cx).filter_focused(window, cx)
+        })
+    };
+    assert!(!in_filter(&app, cx));
+    app.press(cx, &["secondary-alt-f"]);
+    assert!(in_filter(&app, cx));
+    // What is typed filters the tree.
+    app.type_text(cx, "shop");
+    assert!(app.tree(cx).iter().any(|row| row.trim() == "shop"));
+}
+
+#[gpui_kit::test]
+fn open_table_finds_a_table_by_name_and_opens_its_rows_or_structure(cx: &mut TestAppContext) {
+    for (engine, schema) in [(Engine::Postgres, "shop"), (Engine::MySql, "kerno")] {
+        if !testing::available(engine) {
+            continue;
+        }
+        let app = connected(cx, engine);
+        // A query tab whose statement Cmd+Enter must not run.
+        app.press(cx, &["secondary-t"]);
+        app.type_text(cx, "select 1");
+        let query = app.tab(cx);
+        let open_table = |app: &Fixture, cx: &mut TestAppContext, keys: &str| {
+            app.press(cx, &["secondary-p"]);
+            assert!(app.has(cx, "quick-open"), "{engine:?}");
+            app.wait_until(cx, "the tables", |app, cx| {
+                app.shows_label(cx, "Enter opens the rows, Cmd+Enter the structure.")
+            });
+            app.type_text(cx, "custom");
+            assert!(
+                app.shows_label(cx, &format!("{schema}.customers")),
+                "{engine:?}"
+            );
+            app.press(cx, &[keys]);
+            assert!(!app.dialog_open(cx), "{engine:?}");
+        };
+        // Enter: the rows.
+        open_table(&app, cx, "enter");
+        let data = cx.update(|cx| app.workspace.read(cx).active_data_tab().cloned());
+        assert!(data.is_some(), "{engine:?}");
+        assert_eq!(app.titles(cx), ["Query 1", "customers"], "{engine:?}");
+        app.wait_until(cx, "the rows", |app, cx| {
+            app.data_state(cx).starts_with("Rows 1–")
+        });
+        // Cmd+Enter: the structure, and no statement runs anywhere.
+        open_table(&app, cx, "secondary-enter");
+        let structure = cx.update(|cx| app.workspace.read(cx).active_structure_tab().cloned());
+        assert!(structure.is_some(), "{engine:?}");
+        assert_eq!(app.titles(cx).len(), 3, "{engine:?}");
+        assert_eq!(
+            cx.update(|cx| query.read(cx).outcomes(cx)),
+            Vec::<String>::new(),
+            "{engine:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn a_key_opens_the_rows_or_structure_of_the_table_at_the_cursor(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    new_tab_with_catalog(&app, cx);
+    app.type_text(cx, "select * from shop.customers");
+    app.press(cx, &["f4"]);
+    assert!(cx.update(|cx| app.workspace.read(cx).active_data_tab().is_some()));
+    assert_eq!(app.titles(cx)[1], "customers");
+    app.click(cx, ("tab-title", 0usize));
+    app.press(cx, &["shift-f4"]);
+    assert!(cx.update(|cx| app.workspace.read(cx).active_structure_tab().is_some()));
+}
+
+#[gpui_kit::test]
+fn soft_wrap_is_toggled_by_its_key_in_every_editor(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t", "secondary-t"]);
+    let tabs: Vec<_> = (0..2usize)
+        .map(|index| {
+            app.click(cx, ("tab-title", index));
+            app.tab(cx)
+        })
+        .collect();
+    let wrapped = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            tabs.iter()
+                .map(|tab| tab.read(cx).editor_options().0)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(wrapped(cx), [false, false]);
+    app.press(cx, &["ctrl-alt-shift-w"]);
+    assert!(settings_now(cx).soft_wrap);
+    assert_eq!(wrapped(cx), [true, true]);
+    app.dispatch(cx, actions::ToggleSoftWrap);
+    assert_eq!(wrapped(cx), [false, false]);
+}
+
+#[gpui_kit::test]
+fn completion_opens_on_demand_even_when_it_does_not_open_by_itself(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.auto_completion = false));
+    new_tab_with_catalog(&app, cx);
+    app.type_text(cx, "select * from shop.cust");
+    assert!(!completion_menu(&app, cx).0, "off: typing opens nothing");
+    app.press(cx, &["ctrl-space"]);
+    let (open, items) = completion_menu(&app, cx);
+    assert!(open);
+    assert_eq!(items[0], "customers");
+    app.press(cx, &["escape"]);
+    assert!(!completion_menu(&app, cx).0);
+    app.press(cx, &["secondary-i"]);
+    assert!(completion_menu(&app, cx).0);
+}
+
+#[gpui_kit::test]
+fn fetch_keys_page_a_result_and_zoom_keys_size_the_grid(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(
+        cx,
+        "select g from generate_series(1, 2500) g",
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.outcomes(cx) == ["1000 rows, more"]
+    });
+    // DBeaver's Ctrl+Alt+N and Ctrl+Shift+= (reported as `+`).
+    app.press(cx, &["ctrl-alt-n"]);
+    app.wait_until(cx, "the second page", |app, cx| {
+        app.outcomes(cx) == ["2000 rows, more"]
+    });
+    app.press(cx, &["ctrl-+"]);
+    app.wait_until(cx, "the rest", |app, cx| app.outcomes(cx) == ["2500 rows"]);
+
+    // In the grid, Cmd+= and Cmd+- change the text size; Cmd+0 resets it.
+    app.press(cx, &["cmd-alt-t"]);
+    let size = |cx: &mut TestAppContext| settings_now(cx).grid_font_size;
+    let usual = Settings::default().grid_font_size;
+    app.press(cx, &["secondary-="]);
+    assert_eq!(size(cx), usual + 1.0);
+    app.press(cx, &["secondary-=", "secondary-="]);
+    assert_eq!(size(cx), usual + 3.0);
+    app.press(cx, &["secondary--"]);
+    assert_eq!(size(cx), usual + 2.0);
+    app.press(cx, &["secondary-0"]);
+    assert_eq!(size(cx), usual);
+    // Copy as CSV, from the palette's command.
+    app.press(cx, &["secondary-a"]);
+    app.dispatch(cx, actions::CopyAsCsv);
+    let copied = app.clipboard(cx).unwrap_or_default();
+    assert!(copied.starts_with("g\r\n1\r\n2\r\n"), "{copied:?}");
+}
+
+#[gpui_kit::test]
+fn settings_apply_at_once_and_are_stored(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    app.press(cx, &["secondary-,"]);
+    assert!(app.has(cx, "settings"));
+
+    // Fonts: the interface size follows, and survives a theme switch.
+    app.click(cx, ("settings-section", 1usize));
+    app.click(cx, "ui-font-larger");
+    app.click(cx, "editor-font-larger");
+    let sizes =
+        |cx: &mut TestAppContext| cx.update(|cx| (cx.theme().font_size, cx.theme().mono_font_size));
+    assert_eq!(sizes(cx), (px(14.), px(13.5)));
+    cx.update(|cx| crate::theme::apply(Appearance::Dark, None, cx));
+    assert_eq!(sizes(cx), (px(14.), px(13.5)));
+    app.click(cx, "ui-font-reset");
+    assert_eq!(sizes(cx).0, px(13.));
+
+    // Editor: the open editor follows.
+    app.click(cx, ("settings-section", 2usize));
+    app.click(cx, "settings-soft-wrap");
+    app.click(cx, "settings-line-numbers");
+    app.click(cx, "tab-size-4");
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).editor_options()),
+        (true, false, 4)
+    );
+
+    // Grid: page size and NULL text.
+    app.click(cx, ("settings-section", 3usize));
+    app.click(cx, "settings-page-size");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "250");
+    app.click(cx, "settings-null-text");
+    app.press(cx, &["secondary-a", "backspace"]);
+    assert_eq!(settings_now(cx).null_text, "NULL", "a blank box keeps NULL");
+    app.type_text(cx, "(null)");
+    app.click(cx, "settings-time-zone");
+
+    // Confirmations and tools.
+    app.click(cx, ("settings-section", 4usize));
+    app.click(cx, "settings-confirm-destructive");
+    app.click(cx, ("settings-section", 5usize));
+    app.click(cx, "settings-tool-pg_dump");
+    app.type_text(cx, "/opt/pg/bin/pg_dump");
+
+    let now = settings_now(cx);
+    assert_eq!(
+        (now.page_size, now.null_text.as_str(), now.show_time_zone),
+        (250, "(null)", false)
+    );
+    assert!(!now.confirm_destructive);
+    assert_eq!(
+        now.tool_paths.get("pg_dump"),
+        Some(&std::path::PathBuf::from("/opt/pg/bin/pg_dump"))
+    );
+    app.wait_until(cx, "the stored settings", |app, _| {
+        Settings::load(&app.storage) == now
+    });
+
+    // "Open keymap file" makes the file with an example that changes
+    // nothing, and keeps one that exists (the headless platform cannot show
+    // a file in the file manager: the writing half is called here).
+    assert!(app.has(cx, "open-keymap-file"));
+    let keymap = cx.update(|cx| AppState::get(cx).paths.keymap());
+    assert!(!keymap.exists());
+    crate::settings_view::write_keymap_example(&keymap).unwrap();
+    let problems = cx.update(|cx| actions::bind_keys(&keymap, cx));
+    assert_eq!(problems, Vec::<String>::new());
+    std::fs::write(&keymap, r#"{"bindings": {"about": "f1"}}"#).unwrap();
+    crate::settings_view::write_keymap_example(&keymap).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&keymap).unwrap(),
+        r#"{"bindings": {"about": "f1"}}"#
+    );
+}
+
+#[gpui_kit::test]
+fn a_bad_keymap_file_is_reported_and_the_defaults_stay(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("keymap.json");
+    std::fs::write(
+        &file,
+        "{ \"bindings\": { \"new_query_tab\": \"secondary-entr\" ",
+    )
+    .unwrap();
+    let problems = cx.update(|cx| actions::bind_keys(&file, cx));
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("not valid JSON"), "{problems:?}");
+    std::fs::write(
+        &file,
+        r#"{"bindings": {"new_query_tab": "secondary-entr", "no_such": "f2"}}"#,
+    )
+    .unwrap();
+    let problems = cx.update(|cx| actions::bind_keys(&file, cx));
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    // The app goes on with its keys.
+    app.press(cx, &["secondary-t"]);
+    assert_eq!(app.titles(cx), ["Query 1"]);
+}
+
+#[gpui_kit::test]
+fn result_tabs_and_selected_connection_commands_from_the_palette(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.run_in_new_tab(cx, "select 1 as a; select 2 as b", "secondary-shift-enter");
+    app.wait_until(cx, "the script", |app, cx| {
+        app.outcomes(cx).len() == 2 && !app.running(cx)
+    });
+    let tab = app.tab(cx);
+    let shown = |cx: &mut TestAppContext| cx.update(|cx| tab.read(cx).active_result());
+    let start = shown(cx);
+    app.dispatch(cx, actions::NextResultTab);
+    assert_eq!(shown(cx), (start + 1) % 2);
+    app.dispatch(cx, actions::PreviousResultTab);
+    assert_eq!(shown(cx), start);
+
+    // Duplicate and delete the connection selected in the sidebar.
+    app.click(cx, ("connection", 0usize));
+    app.dispatch(cx, actions::DuplicateConnection);
+    app.wait_until(cx, "the copy", |app, _| {
+        app.storage.connections().unwrap().len() == 2
+    });
+    app.click(cx, ("connection", 1usize));
+    app.dispatch(cx, actions::DeleteConnection);
+    app.click(cx, "ok");
+    app.wait_until(cx, "the deletion", |app, _| {
+        app.storage.connections().unwrap().len() == 1
+    });
+}

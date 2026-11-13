@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 
+use gpui_kit::base::input::ShowCompletions;
 use gpui_kit::{Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, OperatingSystem};
 use serde::Deserialize;
 
@@ -200,8 +201,58 @@ gpui_kit::actions!(
         About,
         /// Quits Kerno.
         Quit,
+        /// Lists the tables and views of the active connection, to open one.
+        QuickOpen,
+        /// Puts the keyboard in the schema tree's filter.
+        FocusNavigatorFilter,
+        /// Saves a copy of the connection selected in the sidebar.
+        DuplicateConnection,
+        /// Deletes the connection selected in the sidebar, after asking.
+        DeleteConnection,
+        /// Shows the next result tab of the active query tab.
+        NextResultTab,
+        /// Shows the previous result tab of the active query tab.
+        PreviousResultTab,
+        /// Fetches the next page of the result on screen.
+        FetchMoreRows,
+        /// Fetches every remaining row of the result on screen.
+        FetchAllRows,
+        /// Copies the selected cells as CSV.
+        CopyAsCsv,
+        /// Copies the selected cells as JSON.
+        CopyAsJson,
+        /// Copies the selected cells as a Markdown table.
+        CopyAsMarkdown,
+        /// Copies the selected cells as SQL INSERT statements.
+        CopyAsSqlInsert,
+        /// Shows the selected cell's whole value.
+        ViewCellValue,
+        /// Wraps long lines in the SQL editors, or stops.
+        ToggleSoftWrap,
+        /// Makes the text of the grids larger.
+        GridZoomIn,
+        /// Makes the text of the grids smaller.
+        GridZoomOut,
+        /// Gives the grids their usual text size.
+        GridZoomReset,
+        /// Opens the rows of the table or view named at the editor's cursor.
+        OpenTableAtCursor,
+        /// Opens the structure of the table or view named at the cursor.
+        OpenStructureAtCursor,
+        /// Opens the keymap file, made with an example first when missing.
+        OpenKeymapFile,
     ]
 );
+
+/// A command run from the menu bar by its id: the menu item of a command
+/// whose keys work only in one part of the window (the tree, the connection
+/// list, a grid) carries this instead of the command's action, so the menu
+/// does not take those keys (Backspace, Enter, Escape, Cmd+C) everywhere.
+#[derive(Clone, PartialEq, Eq, Deserialize, gpui_kit::Action)]
+#[action(namespace = kerno, no_json)]
+pub struct RunCommand {
+    pub id: String,
+}
 
 /// One command of the app.
 pub struct Command {
@@ -315,6 +366,23 @@ pub const COMMANDS: &[Command] = &[
         ["close", "navigator", "objects"],
         CollapseSchemaTree
     ),
+    command!(
+        "focus_navigator_filter",
+        "Filter the Schema Tree",
+        "Connections",
+        ["secondary-alt-f"],
+        ["search", "find", "navigator", "objects"],
+        FocusNavigatorFilter
+    ),
+    // DBeaver's Open Database Object (Ctrl+Shift+D), as editors' Quick Open.
+    command!(
+        "quick_open",
+        "Open Table…",
+        "Connections",
+        ["secondary-p"],
+        ["quick open", "go to", "find table", "view", "jump"],
+        QuickOpen
+    ),
     // The keys of the schema tree and of the connection list, DBeaver's
     // defaults (Ctrl is Cmd on macOS); they work while that list has the focus.
     command!(
@@ -396,6 +464,24 @@ pub const COMMANDS: &[Command] = &[
         ["f4"],
         ["settings", "properties"],
         EditConnection,
+        "ConnectionList"
+    ),
+    command!(
+        "duplicate_connection",
+        "Duplicate Selected Connection",
+        "Connections",
+        [],
+        ["copy", "clone"],
+        DuplicateConnection,
+        "ConnectionList"
+    ),
+    command!(
+        "delete_connection",
+        "Delete Selected Connection…",
+        "Connections",
+        ["backspace", "delete"],
+        ["remove"],
+        DeleteConnection,
         "ConnectionList"
     ),
     command!(
@@ -558,6 +644,71 @@ pub const COMMANDS: &[Command] = &[
         CloseResultTab,
         "QueryTab"
     ),
+    command!(
+        "next_result_tab",
+        "Next Result Tab",
+        "Query",
+        [],
+        ["results", "messages"],
+        NextResultTab
+    ),
+    command!(
+        "previous_result_tab",
+        "Previous Result Tab",
+        "Query",
+        [],
+        ["results", "messages"],
+        PreviousResultTab
+    ),
+    // DBeaver's fetch keys (Ctrl+Alt+N, Ctrl+Shift+=, which keyboards
+    // report as `+`).
+    command!(
+        "fetch_more_rows",
+        "Fetch More Rows",
+        "Query",
+        ["ctrl-alt-n"],
+        ["next page", "load more", "results"],
+        FetchMoreRows,
+        "QueryTab"
+    ),
+    command!(
+        "fetch_all_rows",
+        "Fetch All Rows",
+        "Query",
+        ["ctrl-+"],
+        ["every row", "load all", "results"],
+        FetchAllRows,
+        "QueryTab"
+    ),
+    // Completion while the list is closed: DBeaver's Ctrl+Space, which
+    // macOS may keep for the input sources, and Cmd+I as other Mac editors.
+    command!(
+        "show_completions",
+        "Show Completions",
+        "Editor",
+        ["ctrl-space", "secondary-i"],
+        ["content assist", "autocomplete", "suggest", "proposals"],
+        ShowCompletions,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "open_table_at_cursor",
+        "Open Rows of the Table at the Cursor",
+        "Editor",
+        ["f4"],
+        ["data", "declaration", "go to"],
+        OpenTableAtCursor,
+        "QueryTab > mode == editor"
+    ),
+    command!(
+        "open_structure_at_cursor",
+        "Open Structure of the Table at the Cursor",
+        "Editor",
+        ["shift-f4"],
+        ["columns", "ddl", "declaration"],
+        OpenStructureAtCursor,
+        "QueryTab > mode == editor"
+    ),
     // DBeaver toggles the panel with Ctrl+T, which is New Query Tab on Linux.
     command!(
         "toggle_results_panel",
@@ -689,6 +840,76 @@ pub const COMMANDS: &[Command] = &[
         "DataTable"
     ),
     command!(
+        "copy_as_csv",
+        "Copy Selection as CSV",
+        "Data",
+        [],
+        ["clipboard", "comma"],
+        CopyAsCsv
+    ),
+    command!(
+        "copy_as_json",
+        "Copy Selection as JSON",
+        "Data",
+        [],
+        ["clipboard", "objects"],
+        CopyAsJson
+    ),
+    command!(
+        "copy_as_markdown",
+        "Copy Selection as Markdown",
+        "Data",
+        [],
+        ["clipboard", "table"],
+        CopyAsMarkdown
+    ),
+    command!(
+        "copy_as_sql_insert",
+        "Copy Selection as SQL INSERT",
+        "Data",
+        [],
+        ["clipboard", "statements"],
+        CopyAsSqlInsert
+    ),
+    command!(
+        "view_cell_value",
+        "View Value of the Selected Cell",
+        "Data",
+        ["shift-enter"],
+        ["viewer", "json", "text", "hex", "long"],
+        ViewCellValue,
+        "DataTable"
+    ),
+    // DBeaver's Alt+0 / Alt+9 (`resultset.zoomIn` / `zoomOut`), after the
+    // Cmd keys a Mac keyboard reaches.
+    command!(
+        "grid_zoom_in",
+        "Grid: Larger Text",
+        "Data",
+        ["secondary-=", "alt-0"],
+        ["zoom", "font size", "bigger"],
+        GridZoomIn,
+        "DataTable"
+    ),
+    command!(
+        "grid_zoom_out",
+        "Grid: Smaller Text",
+        "Data",
+        ["secondary--", "alt-9"],
+        ["zoom", "font size", "smaller"],
+        GridZoomOut,
+        "DataTable"
+    ),
+    command!(
+        "grid_zoom_reset",
+        "Grid: Usual Text Size",
+        "Data",
+        ["secondary-0"],
+        ["zoom", "font size", "reset"],
+        GridZoomReset,
+        "DataTable"
+    ),
+    command!(
         "apply_changes",
         "Review and Apply Pending Changes",
         "Data",
@@ -761,6 +982,15 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-shift-i"],
         ["beautify", "pretty", "indent"],
         FormatSql
+    ),
+    // DBeaver's Ctrl+Alt+Shift+W (`word.wrap`).
+    command!(
+        "toggle_soft_wrap",
+        "Toggle Soft Wrap",
+        "Editor",
+        ["ctrl-alt-shift-w"],
+        ["word wrap", "long lines"],
+        ToggleSoftWrap
     ),
     command!(
         "explain_statement",
@@ -858,11 +1088,13 @@ pub const COMMANDS: &[Command] = &[
         ["reveal", "finder", "file manager"],
         RevealTabFile
     ),
+    // DBeaver's Ctrl+4 and Ctrl+8 (`core.commit`, `core.rollback`; Ctrl on
+    // macOS too).
     command!(
         "commit_transaction",
         "Commit Transaction",
         "Query",
-        [],
+        ["ctrl-4"],
         ["end", "save"],
         CommitTransaction
     ),
@@ -870,7 +1102,7 @@ pub const COMMANDS: &[Command] = &[
         "rollback_transaction",
         "Roll Back Transaction",
         "Query",
-        [],
+        ["ctrl-8"],
         ["rollback", "undo", "abort"],
         RollbackTransaction
     ),
@@ -878,7 +1110,7 @@ pub const COMMANDS: &[Command] = &[
         "toggle_commit_mode",
         "Switch Between Auto-Commit and Manual Commit",
         "Query",
-        [],
+        ["ctrl-alt-a"],
         ["transaction", "autocommit"],
         ToggleCommitMode
     ),
@@ -1033,6 +1265,14 @@ pub const COMMANDS: &[Command] = &[
         OpenSettings
     ),
     command!(
+        "open_keymap_file",
+        "Open Keymap File",
+        "Kerno",
+        [],
+        ["shortcuts", "keys", "bindings", "keyboard"],
+        OpenKeymapFile
+    ),
+    command!(
         "about",
         "About Kerno",
         "Kerno",
@@ -1170,6 +1410,36 @@ fn is_shortcut(stroke: &str) -> bool {
     key.chars().count() == 1 || NAMED.contains(&key) || function_key
 }
 
+/// What "Open Keymap File" writes when there is no keymap file yet: valid
+/// JSON whose `about` and `commands` are ignored, with no binding changed,
+/// and every command id with its name and default shortcuts to copy from.
+pub fn keymap_example() -> String {
+    let commands: serde_json::Map<String, serde_json::Value> = COMMANDS
+        .iter()
+        .map(|command| {
+            let keys = if command.keys.is_empty() {
+                "no shortcut".to_string()
+            } else {
+                command.keys.join(", ")
+            };
+            let text = format!("{} ({keys})", command.label);
+            (command.id.to_string(), serde_json::Value::String(text))
+        })
+        .collect();
+    let example = serde_json::json!({
+        "about": [
+            "Kerno's keymap. Each entry of \"bindings\" replaces the shortcuts of one command:",
+            "one shortcut, a list of shortcuts, or null to leave the command without one.",
+            "\"secondary\" is Cmd on macOS and Ctrl elsewhere; a sequence is keys separated by spaces.",
+            "Example: \"new_query_tab\": \"secondary-shift-t\", \"close_tab\": [\"secondary-w\", \"ctrl-f4\"], \"toggle_sidebar\": null",
+            "The commands and their default shortcuts are listed below. Changes apply when Kerno starts again."
+        ],
+        "bindings": {},
+        "commands": commands,
+    });
+    serde_json::to_string_pretty(&example).unwrap_or_default() + "\n"
+}
+
 /// Binds every command's shortcut, applying the user's keymap file when it
 /// exists. Returns what was wrong with that file, for the app to show.
 pub fn bind_keys(keymap_file: &Path, cx: &mut App) -> Vec<String> {
@@ -1204,6 +1474,17 @@ fn bind(bindings: &[(String, &'static str)], cx: &mut App) {
             Err(error) => tracing::warn!(%error, key, command = id, "shortcut not bound"),
         }
     }
+    // Cmd+Enter in Open Table opens the structure (`quick_open.rs`): a key of
+    // that dialog, as Enter and the arrows are the list's own.
+    key_bindings.push(KeyBinding::new(
+        if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        },
+        gpui_kit::base::actions::Confirm { secondary: true },
+        Some("QuickOpen"),
+    ));
     cx.bind_keys(key_bindings);
 }
 
@@ -1420,6 +1701,68 @@ mod tests {
                     assert_ne!(unparse(key), unparse(editor), "{id} takes the editor's key");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_command_can_be_rebound_or_unbound() {
+        for command in COMMANDS {
+            let id = command.id;
+            let (bindings, problems) =
+                effective_bindings(&format!(r#"{{"bindings": {{"{id}": null}}}}"#));
+            assert_eq!(problems, Vec::<String>::new(), "{id}");
+            assert_eq!(keys_of(&bindings, id), Vec::<String>::new(), "{id}");
+            let (bindings, problems) = effective_bindings(&format!(
+                r#"{{"bindings": {{"{id}": ["ctrl-alt-shift-f12", "f13"]}}}}"#
+            ));
+            assert_eq!(problems, Vec::<String>::new(), "{id}");
+            assert_eq!(
+                keys_of(&bindings, id),
+                ["ctrl-alt-shift-f12", "f13"],
+                "{id}"
+            );
+            // The others keep their defaults.
+            assert_eq!(
+                bindings.len(),
+                effective_bindings("").0.len() + 2 - command.keys.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_keymap_example_changes_nothing_and_lists_every_command() {
+        let example = keymap_example();
+        let (bindings, problems) = effective_bindings(&example);
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(bindings, effective_bindings("").0);
+        for command in COMMANDS {
+            assert!(
+                example.contains(&format!("\"{}\"", command.id)),
+                "{}",
+                command.id
+            );
+        }
+        assert!(example.contains("\"secondary-k\"") || example.contains("secondary-k"));
+    }
+
+    #[test]
+    fn the_new_commands_have_their_keys() {
+        let (bindings, _) = effective_bindings("");
+        for (id, keys) in [
+            ("commit_transaction", &["ctrl-4"][..]),
+            ("rollback_transaction", &["ctrl-8"]),
+            ("toggle_commit_mode", &["ctrl-alt-a"]),
+            ("quick_open", &["secondary-p"]),
+            ("focus_navigator_filter", &["secondary-alt-f"]),
+            ("toggle_soft_wrap", &["ctrl-alt-shift-w"]),
+            ("show_completions", &["ctrl-space", "secondary-i"]),
+            ("fetch_more_rows", &["ctrl-alt-n"]),
+            ("fetch_all_rows", &["ctrl-+"]),
+            ("grid_zoom_in", &["secondary-=", "alt-0"]),
+            ("grid_zoom_out", &["secondary--", "alt-9"]),
+            ("grid_zoom_reset", &["secondary-0"]),
+        ] {
+            assert_eq!(keys_of(&bindings, id), keys, "{id}");
         }
     }
 

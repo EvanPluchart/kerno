@@ -105,6 +105,12 @@ pub enum ConnectionsEvent {
     NeedsInput { id: String, request: InputRequest },
     /// Saving, deleting or importing failed.
     Failed { message: String },
+    /// The user confirmed the deletion of a connection: the window ends
+    /// what its tabs hold (asking first), then calls `delete`.
+    DeleteRequested { id: String },
+    /// An open connection was saved with "connect": its new settings need a
+    /// new session, which the window opens once what its tabs hold is ended.
+    ReconnectRequested { id: String },
 }
 
 /// The outcome of "Test connection".
@@ -299,9 +305,13 @@ impl Connections {
                     cx.emit(ConnectionsEvent::ListChanged);
                     cx.notify();
                     if connect {
-                        // Changed settings only apply to a new connection.
-                        this.disconnect(&id, cx);
-                        this.connect(&id, cx);
+                        // Changed settings only apply to a new connection;
+                        // an open one is closed by the window, which asks
+                        // about what its tabs hold first.
+                        match this.status(&id) {
+                            Status::Disconnected | Status::Failed { .. } => this.connect(&id, cx),
+                            _ => cx.emit(ConnectionsEvent::ReconnectRequested { id }),
+                        }
                     }
                 }
                 Err(error) => this.fail(format!("The connection could not be saved: {error}"), cx),

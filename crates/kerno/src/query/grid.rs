@@ -41,6 +41,42 @@ const SORT_INLINE_ROWS: usize = 20_000;
 /// "Fit width" measures the cells of this many rows.
 const FIT_ROWS: usize = 1_000;
 
+/// The text size of the grids (Settings ▸ Grid, and the zoom keys).
+pub fn text_size(cx: &App) -> Pixels {
+    px(crate::state::AppState::get(cx).settings.grid_font_size)
+}
+
+/// The size a grid's table takes for its text: the kit's smallest rows
+/// until the text needs taller ones.
+pub fn table_size(cx: &App) -> gpui_kit::component::Size {
+    let height = (crate::state::AppState::get(cx).settings.grid_font_size * 2.0).round();
+    if height <= 26.0 {
+        gpui_kit::component::Size::XSmall
+    } else {
+        gpui_kit::component::Size::Size(px(height))
+    }
+}
+
+/// A timestamp's text without its offset (`+02`, `-05:30`, `Z`), when the
+/// settings hide time zones.
+fn without_zone(text: &str) -> &str {
+    if let Some(utc) = text.strip_suffix('Z') {
+        return utc;
+    }
+    match text.rfind(['+', '-']) {
+        Some(at)
+            if at > 10
+                && text[..at].contains(':')
+                && text[at + 1..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ':') =>
+        {
+            &text[..at]
+        }
+        _ => text,
+    }
+}
+
 /// How a selection is written to the clipboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
@@ -827,6 +863,26 @@ impl Grid {
         self.store.row_count()
     }
 
+    /// Shows the whole value of the selected cell, as its menu's "View
+    /// value" does.
+    pub fn view_selected_value(
+        table: &Entity<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some((row, column)) = table.read(cx).selected_cell() {
+            Self::run(
+                table,
+                None,
+                GridAction::ViewValue,
+                Some(row),
+                column,
+                window,
+                cx,
+            );
+        }
+    }
+
     /// Whether the server has, or may have, rows that were not asked for.
     pub fn has_more(&self) -> bool {
         !self.complete && self.demand.is_some() && self.store.row_count() as u64 >= self.requested
@@ -1538,6 +1594,7 @@ impl TableDelegate for Grid {
                 let grid = table.delegate_mut();
                 if grid.sort == Some((source, descending)) {
                     grid.order = Some(order.into());
+                    crate::bench::sorted(cx);
                     grid.sorting = None;
                     cx.notify();
                 }
@@ -1561,6 +1618,7 @@ impl TableDelegate for Grid {
             theme.foreground,
         );
         let rem = window.rem_size();
+        let cell_size = text_size(cx) / rem;
         let width = |text: String, family: SharedString, size: f32| {
             let run = TextRun {
                 len: text.len(),
@@ -1576,8 +1634,8 @@ impl TableDelegate for Grid {
                 .width
         };
         // The name, the gap, the type and the sort arrow with its padding.
-        let header = width(described.name.clone(), sans, 0.875)
-            + width(described.type_name.clone(), mono.clone(), 0.75)
+        let header = width(described.name.clone(), sans, cell_size)
+            + width(described.type_name.clone(), mono.clone(), cell_size * 0.85)
             + px(8.)
             + rem * 0.75
             + px(4.);
@@ -1595,7 +1653,7 @@ impl TableDelegate for Grid {
             })
             .max_by_key(|text| text.chars().count())
             .unwrap_or_default();
-        let cells = width(longest, mono, 0.875);
+        let cells = width(longest, mono, cell_size);
         Some(header.max(cells).min(px(600.)))
     }
 
@@ -1635,11 +1693,13 @@ impl TableDelegate for Grid {
         };
         let described = &self.store.columns()[source];
         let table = cx.entity();
+        let size = text_size(cx);
         h_flex()
             .id(("column-header", column))
             .test_support()
             .w_full()
             .gap_2()
+            .text_size(size)
             .child(
                 div()
                     .truncate()
@@ -1648,7 +1708,7 @@ impl TableDelegate for Grid {
             .child(
                 div()
                     .flex_none()
-                    .text_xs()
+                    .text_size(size * 0.85)
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from(described.type_name.clone())),
             )
@@ -1701,11 +1761,13 @@ impl TableDelegate for Grid {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        crate::bench::cell();
         let theme = cx.theme();
+        let size = text_size(cx);
         let cell = div()
             .w_full()
             .truncate()
-            .text_sm()
+            .text_size(size)
             .font_family(theme.mono_font_family.clone());
         let fetched = self.store.row_count();
         let Some(source) = self.source_column(column) else {
@@ -1716,7 +1778,7 @@ impl TableDelegate for Grid {
                 _ => ((row + 1).to_string(), theme.muted_foreground),
             };
             return cell
-                .text_xs()
+                .text_size(size * 0.85)
                 .text_color(color)
                 .child(SharedString::from(label))
                 .into_any_element();
@@ -1739,7 +1801,7 @@ impl TableDelegate for Grid {
                 .child(
                     Input::new(&editing.input)
                         .xsmall()
-                        .text_sm()
+                        .text_size(size)
                         .appearance(false)
                         .font_family(theme.mono_font_family.clone()),
                 )
@@ -1755,9 +1817,16 @@ impl TableDelegate for Grid {
             MAX_CELL_CHARS,
         );
         let table = cx.entity();
+        let settings = &crate::state::AppState::get(cx).settings;
         let text = if pending == Some(&CellValue::Default) {
             // The server gives the value when the row is written.
             SharedString::from("default")
+        } else if shown.style == CellStyle::Null {
+            SharedString::from(settings.null_text.clone())
+        } else if !settings.show_time_zone
+            && self.store.columns()[source].kind == TypeKind::DateTimeTz
+        {
+            SharedString::from(without_zone(&shown.text).to_string())
         } else if shown.truncated {
             SharedString::from(format!("{}…", shown.text))
         } else {
@@ -1824,6 +1893,21 @@ impl TableDelegate for Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_loses_only_its_offset() {
+        assert_eq!(
+            without_zone("2024-05-01 10:00:00+02"),
+            "2024-05-01 10:00:00"
+        );
+        assert_eq!(
+            without_zone("2024-05-01 10:00:00.123-05:30"),
+            "2024-05-01 10:00:00.123"
+        );
+        assert_eq!(without_zone("2024-05-01T10:00:00Z"), "2024-05-01T10:00:00");
+        assert_eq!(without_zone("2024-05-01 10:00:00"), "2024-05-01 10:00:00");
+        assert_eq!(without_zone("2024-05-01"), "2024-05-01");
+    }
 
     fn labels(entries: &[Entry]) -> Vec<String> {
         entries

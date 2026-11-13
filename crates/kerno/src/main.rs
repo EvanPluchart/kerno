@@ -3,6 +3,7 @@
 mod actions;
 mod admin;
 mod backup_dialog;
+mod bench;
 mod brand;
 mod bridge;
 mod connections;
@@ -15,7 +16,9 @@ mod logging;
 mod maintenance_dialog;
 mod navigator;
 mod query;
+mod quick_open;
 mod settings;
+mod settings_view;
 mod sidebar;
 mod sql_confirm;
 mod state;
@@ -46,6 +49,7 @@ use crate::theme::Appearance;
 use crate::workspace::Workspace;
 
 fn main() {
+    bench::init();
     // Kerno's own files are read on another thread while the platform
     // starts up, so the first frame has the saved tabs and the right theme
     // without the UI thread ever touching the disk.
@@ -124,7 +128,9 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
             .with(kerno_postgres::PostgresDriver)
             .with(kerno_mysql::MysqlDriver);
         let connections = cx.new(|_| Connections::new(connections, drivers, user_known_hosts));
-        let workspace = cx.new(|cx| Workspace::new(connections, tabs, active_tab, window, cx));
+        let workspace =
+            cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
+        bench::begin(&workspace, &connections, window, cx);
         workspace.focus_handle(cx).focus(window, cx);
         for problem in keymap_problems {
             window.push_notification(format!("{}: {problem}", keymap_file.display()), cx);
@@ -135,56 +141,113 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The native menu bar.
+/// A menu item running the command `id`, named as in the palette. The
+/// commands whose keys work only in the tree, the connection list or a grid
+/// go through `RunCommand`, so the menu does not take those keys
+/// (Backspace, Enter, Escape, Cmd+C) everywhere; the others show their keys.
+fn command(id: &str) -> MenuItem {
+    let found = actions::COMMANDS
+        .iter()
+        .find(|command| command.id == id)
+        .unwrap_or_else(|| panic!("no command {id}"));
+    let local = matches!(
+        found.context,
+        Some("Navigator" | "ConnectionList" | "DataTable")
+    );
+    MenuItem::Action {
+        name: found.label.into(),
+        action: if local {
+            Box::new(actions::RunCommand { id: id.to_string() })
+        } else {
+            (found.action)()
+        },
+        os_action: None,
+        checked: false,
+        disabled: false,
+    }
+}
+
+fn menu(name: &str, items: Vec<MenuItem>) -> Menu {
+    Menu {
+        name: name.to_string().into(),
+        items,
+        disabled: false,
+    }
+}
+
+/// The native menu bar: every command of `actions::COMMANDS` is in it.
 fn menus() -> Vec<Menu> {
+    let separator = MenuItem::separator;
     vec![
-        Menu {
-            name: "Kerno".into(),
-            items: vec![
+        menu(
+            "Kerno",
+            vec![
                 MenuItem::action("About Kerno", About),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
+                command("open_keymap_file"),
+                separator(),
                 MenuItem::action("Quit Kerno", Quit),
             ],
-            disabled: false,
-        },
-        Menu {
-            name: "File".into(),
-            items: vec![
+        ),
+        menu(
+            "File",
+            vec![
                 MenuItem::action("New Query Tab", NewQueryTab),
                 MenuItem::action("New Connection…", NewConnection),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Open SQL File…", OpenSqlFile),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::action("Save As…", SaveFileAs),
-                MenuItem::separator(),
+                command("copy_tab_file_path"),
+                command("reveal_tab_file"),
+                separator(),
                 MenuItem::action("Export…", ExportData),
                 MenuItem::action("Import CSV…", ImportCsv),
                 MenuItem::action("Back Up Database…", BackupDatabase),
                 MenuItem::action("Restore Database…", RestoreDatabase),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Import Connections…", ImportConnections),
                 MenuItem::action("Export Connections…", ExportConnections),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Close Tab", CloseTab),
             ],
-            disabled: false,
-        },
-        Menu {
-            name: "Edit".into(),
-            items: vec![
+        ),
+        menu(
+            "Edit",
+            vec![
                 MenuItem::action("Find…", FindInEditor),
                 MenuItem::action("Replace…", ReplaceInEditor),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Toggle Line Comment", ToggleComment),
                 MenuItem::action("Format SQL", FormatSql),
+                command("show_completions"),
+                command("toggle_soft_wrap"),
+                separator(),
+                command("open_table_at_cursor"),
+                command("open_structure_at_cursor"),
             ],
-            disabled: false,
-        },
-        Menu {
-            name: "Query".into(),
-            items: vec![
+        ),
+        menu(
+            "View",
+            vec![
+                MenuItem::action("Command Palette…", OpenCommandPalette),
+                command("quick_open"),
+                MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                command("focus_navigator_filter"),
+                separator(),
+                MenuItem::action("Follow System Appearance", UseSystemTheme),
+                MenuItem::action("Light Appearance", UseLightTheme),
+                MenuItem::action("Dark Appearance", UseDarkTheme),
+                separator(),
+                command("grid_zoom_in"),
+                command("grid_zoom_out"),
+                command("grid_zoom_reset"),
+            ],
+        ),
+        menu(
+            "Query",
+            vec![
                 MenuItem::action("Run Statement", RunStatement),
                 MenuItem::action(
                     "Run Statement in New Result Tab",
@@ -193,56 +256,178 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Run Script From the Cursor", actions::RunFromCursor),
                 MenuItem::action("Run All Statements", RunAll),
                 MenuItem::action("Count Rows of Statement", actions::CountStatementRows),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Explain Statement", ExplainStatement),
                 MenuItem::action("Explain Analyze", ExplainAnalyze),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Go to Next Statement", actions::NextStatement),
                 MenuItem::action("Go to Previous Statement", actions::PreviousStatement),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Toggle Results Panel", actions::ToggleResultsPanel),
                 MenuItem::action("Maximize Results Panel", actions::MaximizeResultsPanel),
                 MenuItem::action("Focus Results / Editor", actions::SwitchResultsFocus),
-                MenuItem::separator(),
+                command("next_result_tab"),
+                command("previous_result_tab"),
+                command("toggle_pinned_result"),
+                command("close_result_tab"),
+                command("fetch_more_rows"),
+                command("fetch_all_rows"),
+                separator(),
                 MenuItem::action("Cancel Running Statement", CancelQuery),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Query History", ShowHistory),
                 MenuItem::action("Saved Queries", ShowSavedQueries),
                 MenuItem::action("Save Query…", SaveQuery),
             ],
-            disabled: false,
-        },
+        ),
+        menu(
+            "Data",
+            vec![
+                command("refresh_data"),
+                command("add_row"),
+                command("duplicate_rows"),
+                command("delete_rows"),
+                command("set_null"),
+                command("set_default"),
+                command("copy_from_row_above"),
+                command("copy_from_row_below"),
+                command("revert_cells"),
+                command("undo_change"),
+                separator(),
+                command("apply_changes"),
+                command("discard_changes"),
+                separator(),
+                command("copy_with_column_names"),
+                command("copy_as_csv"),
+                command("copy_as_json"),
+                command("copy_as_markdown"),
+                command("copy_as_sql_insert"),
+                command("view_cell_value"),
+            ],
+        ),
         // The connection of the active tab, as DBeaver's Database menu.
-        Menu {
-            name: "Database".into(),
-            items: vec![
+        menu(
+            "Database",
+            vec![
                 MenuItem::action("Disconnect", actions::DisconnectTabConnection),
                 MenuItem::action("Reconnect", actions::ReconnectTabConnection),
                 MenuItem::action("Disconnect Others", actions::DisconnectOtherConnections),
                 MenuItem::action("Disconnect All", actions::DisconnectAll),
-                MenuItem::separator(),
+                command("edit_tab_connection"),
+                separator(),
                 MenuItem::action("Read-Only Connection", actions::ToggleReadOnly),
-                MenuItem::separator(),
+                separator(),
                 MenuItem::action("Commit Transaction", actions::CommitTransaction),
                 MenuItem::action("Roll Back Transaction", actions::RollbackTransaction),
                 MenuItem::action(
                     "Switch Between Auto-Commit and Manual Commit",
                     actions::ToggleCommitMode,
                 ),
+                separator(),
+                command("open_admin"),
+                command("maintenance_tools"),
+                separator(),
+                MenuItem::submenu(menu(
+                    "Connections",
+                    vec![
+                        command("open_connection"),
+                        command("edit_connection"),
+                        command("duplicate_connection"),
+                        command("delete_connection"),
+                        separator(),
+                        command("new_connection_folder"),
+                        command("refresh_connections"),
+                        command("collapse_connection_folders"),
+                    ],
+                )),
+                MenuItem::submenu(menu(
+                    "Schema Tree",
+                    vec![
+                        command("refresh_schema_tree"),
+                        command("collapse_schema_tree"),
+                        separator(),
+                        command("edit_object"),
+                        command("rename_object"),
+                        command("drop_object"),
+                        command("refresh_object"),
+                        command("copy_object_name"),
+                        command("copy_qualified_name"),
+                        command("new_query_on_object"),
+                        command("set_default_schema"),
+                    ],
+                )),
             ],
-            disabled: false,
-        },
-        Menu {
-            name: "View".into(),
-            items: vec![
-                MenuItem::action("Command Palette…", OpenCommandPalette),
-                MenuItem::action("Toggle Sidebar", ToggleSidebar),
-                MenuItem::separator(),
-                MenuItem::action("Follow System Appearance", UseSystemTheme),
-                MenuItem::action("Light Appearance", UseLightTheme),
-                MenuItem::action("Dark Appearance", UseDarkTheme),
+        ),
+        menu(
+            "Window",
+            vec![
+                command("next_tab"),
+                command("previous_tab"),
+                separator(),
+                command("rename_tab"),
+                command("duplicate_tab"),
+                command("reopen_closed_tab"),
+                separator(),
+                command("close_other_tabs"),
+                command("close_tabs_to_the_left"),
+                command("close_tabs_to_the_right"),
+                command("close_all_tabs"),
             ],
-            disabled: false,
-        },
+        ),
+        menu(
+            "Help",
+            vec![
+                command("open_command_palette"),
+                command("open_keymap_file"),
+                separator(),
+                command("about"),
+            ],
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ids of the commands the menu items run, through the submenus,
+    /// and whether each is run by its own action (its keys shown).
+    fn ids(items: &[MenuItem], found: &mut Vec<(String, bool)>) {
+        for item in items {
+            match item {
+                MenuItem::Action { action, .. } => {
+                    match action.as_any().downcast_ref::<actions::RunCommand>() {
+                        Some(run) => found.push((run.id.clone(), false)),
+                        None => found.extend(
+                            actions::COMMANDS
+                                .iter()
+                                .filter(|command| (command.action)().name() == action.name())
+                                .map(|command| (command.id.to_string(), true)),
+                        ),
+                    }
+                }
+                MenuItem::Submenu(menu) => ids(&menu.items, found),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_is_in_a_menu() {
+        let mut found = Vec::new();
+        for menu in menus() {
+            ids(&menu.items, &mut found);
+        }
+        let missing: Vec<&str> = actions::COMMANDS
+            .iter()
+            .map(|command| command.id)
+            .filter(|id| !found.iter().any(|(found, _)| found == id))
+            .collect();
+        assert_eq!(missing, Vec::<&str>::new());
+        // Backspace drops in the tree only: the menu does not take it.
+        assert!(found.contains(&("drop_object".to_string(), false)));
+        assert!(found.contains(&("revert_cells".to_string(), false)));
+        assert!(found.contains(&("commit_transaction".to_string(), true)));
+        assert!(found.contains(&("quick_open".to_string(), true)));
+    }
 }

@@ -663,3 +663,23 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   closes every session it handed out; tabs and dialogs close theirs explicitly. A test counts a scratch
   role's sessions after each kind of owner goes away, on PostgreSQL and MySQL (`1aa6f04`,
   `every_owner_of_a_session_closes_it_when_it_goes_away`).
+
+## D-037 — Editor text is the user's document; secrets are what Kerno is given to keep
+
+- Passwords and passphrases of connections live only in the OS secret store; a test reads every file of
+  the data directory, the exported connections and the log after a session and finds none
+  (`no_secret_is_written_to_the_data_directory_or_the_log`). That test found one leak, fixed with it:
+  bootstrap statements were logged with their text at debug level; the log now carries their number only.
+- A password written as a literal in a statement (`ALTER ROLE … PASSWORD '…'`) is masked in the history
+  and never logged, but stays in the unsaved text of its tab, which is stored so tabs come back after a
+  restart (§4 C1). That text is the user's document, as a `.sql` file would be: masking it would change
+  what they wrote, and not restoring tabs that hold such a statement would lose work without warning.
+
+## D-038 — Maintenance tools run in their dialog, on a session of their own
+
+- DBeaver runs them as tasks with their own log; the first plan ran them in a query tab. They run in the
+  dialog instead: a tab's session may be inside a transaction, where `VACUUM` cannot run and where
+  `TRUNCATE` would wait for a commit; the options, the confirmation, the cancel and the server's status
+  rows or notices belong together; and a session opened on the object's database serves a database node
+  other than the tab's. The session is closed when the statement ends, and closing the dialog cancels it.
+

@@ -190,6 +190,20 @@ impl Navigator {
         self.connection.as_deref()
     }
 
+    /// Puts the keyboard in the filter field, its text selected.
+    pub fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter.update(cx, |filter, cx| {
+            filter.focus(window, cx);
+            filter.select_all(window, cx);
+        });
+    }
+
+    /// Whether the filter field has the keyboard; for tests.
+    #[cfg(test)]
+    pub fn filter_focused(&self, window: &Window, cx: &App) -> bool {
+        gpui_kit::Focusable::focus_handle(self.filter.read(cx), cx).is_focused(window)
+    }
+
     /// Where the window writes the active query tab's target.
     pub fn tab_target(&self) -> Rc<RefCell<Option<Target>>> {
         self.tab_target.clone()

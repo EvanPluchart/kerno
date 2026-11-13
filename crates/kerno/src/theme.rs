@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
-use gpui_kit::{App, ElementId, Hsla, Window, rgb};
+use gpui_kit::{App, ElementId, Hsla, Window, px, rgb};
 use kerno_core::{ConnectionConfig, Environment};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,28 @@ pub fn apply(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) 
         Appearance::Light => Theme::change(ThemeMode::Light, window, cx),
         Appearance::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
+    // A switch loads the theme file's sizes: the settings' go back on top.
+    apply_fonts(cx);
+}
+
+/// Gives the interface and the SQL editors the text sizes of the settings
+/// (the editors read the theme's monospace size; the grids read theirs from
+/// the settings).
+pub fn apply_fonts(cx: &mut App) {
+    let Some((ui, code)) = cx
+        .try_global::<crate::state::AppState>()
+        .map(|state| (state.settings.ui_font_size, state.settings.editor_font_size))
+    else {
+        return;
+    };
+    let theme = cx.theme();
+    if theme.font_size == px(ui) && theme.mono_font_size == px(code) {
+        return;
+    }
+    Theme::update(cx, |theme| {
+        theme.font_size = px(ui);
+        theme.mono_font_size = px(code);
+    });
 }
 
 /// Night, the brand's dark surface (`assets/brand/BRAND.md`): the reversed

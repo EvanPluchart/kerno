@@ -1,8 +1,54 @@
 # Roadmap
 
-What Kerno does not do in v1, and why. Milestone 10 (`docs/plans/M10.md` Part 7) completes this file with
-the items CLAUDE.md §4 puts out of v1, ordered, with how the driver trait extends to each, and the limits
-found on the way.
+What Kerno does not do in v1, in the order it would be built, and how the driver trait
+([ARCHITECTURE.md](ARCHITECTURE.md)) extends to each item. The rows of the DBeaver inventory that were moved
+out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
+
+## Beyond v1, in order
+
+1. **ERD diagrams** (NAV-58, OBJ-20, CM-47). Built from `Session::table_structure`, which already returns
+   columns, keys and foreign keys in both directions. No trait change: a layout and a canvas view in the app,
+   fed by the structure of the tables of a schema.
+2. **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22). Reads `table_structure` and `ddl` from two sessions,
+   diffs the engine-neutral `TableStructure` values in `kerno-core`, and writes the migration with the
+   dialect's `alter_table_sql` and `create_table_sql`. No new trait method; the diff is core code with unit
+   tests.
+3. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
+   row identity the table view already computes, and merges the two streams. Applying differences reuses the
+   pending-edit SQL and its transactional apply. No trait change.
+4. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
+   `LIMIT/OFFSET`; its output is SQL text in a query tab. No trait change.
+5. **SQLite** as the first engine beyond v1 (it needs no server). A new `Engine` variant and a
+   `kerno-sqlite` crate following the walkthrough in ARCHITECTURE.md. It stresses the trait where PostgreSQL
+   and MySQL do not: there is no host, port, user or tunnel (`ConnectParams` and the connection form gain a
+   file-path variant), `has_schemas` is false, cancel is an interrupt of the running statement, and
+   `admin_query` returns `None` for the views it has no equivalent of.
+6. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
+   brings its own `Dialect` (quoting, `LIMIT` or `TOP`/`FETCH`, `explain`, `parse_plan`), its introspection
+   queries, a `TypeKind` mapping and a cancel mechanism. Where a feature has no equivalent, the provided
+   `Dialect` defaults refuse and the UI hides the entry (as it does for engines without schemas). If a new
+   engine needs a capability the trait cannot express, add a method with a refusing default rather than a
+   branch on the engine name in the UI.
+7. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-21, TOOL-23). Built on `execute` and
+   the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
+8. **AI assistant** (TOOL-24). Not before the owner decides how to square it with "nothing leaves the
+   machine": it would be opt-in, per connection, and either local or an explicit endpoint the user
+   configures. It reads `completion_catalog` and the structure for context, and anything it proposes runs
+   through the same guards (read-only, confirmation, production) as typed SQL. No trait change.
+9. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
+   migrations) and never carries secrets: those stay in the OS secret store. Opt-in, with a visible account.
+10. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
+    session capability, so it waits for a use for it.
+
+## Limits found on the way
+
+- **AppImage for Linux.** `scripts/bundle-linux.sh` produces a tarball (binary, `.desktop` file, icons,
+  licences). An AppImage needs `appimagetool` and a desktop-integration step that the build image does not
+  carry; it comes with the first public release.
+- **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
+  (arm64 here); amd64 is built by CI's `ubuntu-24.04` runner. Cross-building locally would run under
+  emulation.
+- **RSA SSH key files** are refused (RUSTSEC-2023-0071, D-013); agent-held RSA keys work.
 
 ## From the DBeaver inventory
 
@@ -12,7 +58,7 @@ proposed were accepted here on 2026-11-13; their reasons are in the last section
 
 ### Outside v1 (CLAUDE.md §4, last paragraph)
 
-Milestone 10 (`docs/plans/M10.md` Part 7) orders these with how the driver trait extends to each.
+The order and the driver-trait extension of each are in "Beyond v1, in order" above.
 
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
@@ -172,12 +218,3 @@ The owner can pull any row back by naming its ID.
 | CM-51 | Generate SQL ▸ MERGE, INSERT ON CONFLICT, UPDATE FROM, DELETE USING | PG, My | See NAV-51, NAV-52 |
 | CM-74 | New Index / Constraint from selection | PG, My | See NAV-43 |
 | CM-112 | View / Format ▸, Hints, Logical structure | PG, My | See RES-32, RES-33, RES-71 |
-
-## Packaging
-
-- **AppImage for Linux.** `scripts/bundle-linux.sh` produces a tarball (binary, `.desktop` file, icons,
-  licences). An AppImage needs `appimagetool` and a desktop-integration step that the build image does not
-  carry; it comes with the first public release.
-- **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
-  (arm64 here); amd64 is built by CI's `ubuntu-24.04` runner. Cross-building locally would run under
-  emulation.

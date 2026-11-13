@@ -21,6 +21,14 @@ impl Global for LogWriter {}
 
 /// Starts logging into `directory`.
 pub fn init(directory: &Path, cx: &mut App) -> anyhow::Result<()> {
+    // KERNO_LOG overrides the level, e.g. KERNO_LOG=kerno=debug.
+    let filter =
+        EnvFilter::try_from_env("KERNO_LOG").unwrap_or_else(|_| EnvFilter::new("warn,kerno=info"));
+    init_with(directory, filter, cx)
+}
+
+/// [`init`] with this filter.
+pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::Result<()> {
     std::fs::create_dir_all(directory)?;
     // Logs name hosts, databases and users: the directory is the user's alone.
     #[cfg(unix)]
@@ -35,9 +43,6 @@ pub fn init(directory: &Path, cx: &mut App) -> anyhow::Result<()> {
         .max_log_files(KEPT_FILES)
         .build(directory)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
-    // KERNO_LOG overrides the level, e.g. KERNO_LOG=kerno=debug.
-    let filter =
-        EnvFilter::try_from_env("KERNO_LOG").unwrap_or_else(|_| EnvFilter::new("warn,kerno=info"));
     tracing_subscriber::registry()
         .with(filter)
         .with(
@@ -48,4 +53,10 @@ pub fn init(directory: &Path, cx: &mut App) -> anyhow::Result<()> {
         .try_init()?;
     cx.set_global(LogWriter(guard));
     Ok(())
+}
+
+/// Writes the lines not written yet and stops logging, as quitting does.
+#[cfg(test)]
+pub fn flush(cx: &mut App) {
+    cx.remove_global::<LogWriter>();
 }

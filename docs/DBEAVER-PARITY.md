@@ -121,7 +121,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-41 | Transaction mode menu | Auto-commit, manual commit, smart commit and isolation level for the active session | core `DataSourceTransactionModeContributor` | PG, My | **done**: Per-tab auto / manual mode; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
 | CON-42 | Smart commit mode | Switches to manual mode when a modifying statement runs, back to auto after commit | ui.editors.connection `action_menu_transaction_smart_auto_commit` | PG, My | **roadmap**: Off by default in DBeaver; manual mode per tab covers the need |
 | CON-43 | Commit / Rollback | Ends the transaction of the active session | core `core.commit` (Ctrl+4), `core.rollback` (Ctrl+8) | PG, My | **done**: Toolbar Commit / Rollback; `manual_commit_keeps_changes_in_a_transaction_until_it_is_ended` |
-| CON-44 | Commit / Rollback shortcuts | Keys for commit and rollback | core key bindings of `core.commit` / `core.rollback` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (commit, rollback, toggle commit mode commands) |
+| CON-44 | Commit / Rollback shortcuts | Keys for commit and rollback | core key bindings of `core.commit` / `core.rollback` | PG, My | **done**: Commit (Ctrl+4), Roll back (Ctrl+8), toggle commit mode (Ctrl+Alt+A). `commit_rollback_and_the_commit_mode_have_keys` |
 | CON-45 | Transaction log | Statements run in the current transaction, with time and result | core `core.txn.log` | PG, My | **gap**: G14 |
 | CON-46 | Pending transactions | Every connection with an open transaction, across the app | core `core.txn.pending` | PG, My | **roadmap**: Kerno shows the open transaction per tab in the status bar; a cross-app list is rarely needed |
 | CON-47 | Connection type colour on editors | Editor area and toolbars tinted with the connection type colour | ui `CSSUtils.markConnectionTypeColor` | PG, My | **done**: a stripe in the connection's colour on its tabs and on the status bar (no tinted toolbar). `tabs_and_the_status_bar_carry_the_connection_colour` |
@@ -149,7 +149,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-13 | System Info folder | PostgreSQL settings; MySQL status, variables, engines, charsets, collations | ext.postgresql (`PostgreSetting`), ext.mysql (`MySQLInformation`) | PG, My | **done** (settings): the Settings sub-tab of the administration tab; `roles_and_their_grants_sizes_and_settings_are_listed`; status variables: TOOL-17 |
 | NAV-14 | Lazy loading and Refresh (F5) | Children read on expand; Refresh re-reads the node | core `org.eclipse.ui.file.refresh` in the navigator popup | PG, My | **done**: Refresh entry; `refresh_reloads_the_nearest_node_that_owns_its_children` |
 | NAV-15 | Filter field | Filters the tree by name | ui.navigator `DatabaseNavigatorTree` filter; `core.navigator.filter.focus` | PG, My | **done**: `the_filter_narrows_the_tree_and_clearing_it_restores_it`, `the_filter_keeps_what_matches_and_the_way_to_it` |
-| NAV-16 | Focus navigator filter command | Keyboard command that jumps to the filter field | ui.navigator `core.navigator.filter.focus` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (focus navigator filter) |
+| NAV-16 | Focus navigator filter command | Keyboard command that jumps to the filter field | ui.navigator `core.navigator.filter.focus` | PG, My | **done**: Cmd+Alt+F. `a_key_puts_the_keyboard_in_the_tree_filter` |
 | NAV-17 | Filter by object type | Filter applies to connections, containers or tables | ui.navigator `navigator.filter.object.type` | PG, My | **roadmap**: The filter keeps matches and their path; type scoping is rarely used |
 | NAV-18 | Show connected only | Hides disconnected connections | ui.navigator `navigator.filter.connected` | PG, My | **roadmap**: Small list of connections in a client; folders (CTX Part 1) organise them |
 | NAV-19 | Object filters: hide, show only selected, configure, toggle, clear | Persistent include / exclude masks per connection | core `core.object.filter.add.exclude` / `.include` / `.config` / `.toggle` / `.clear` | PG, My | **gap**: G11 |
@@ -170,7 +170,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-34 | Multiple selection | Several objects selected for drop, export, generate | ui.navigator tree (SWT multi-select) | PG, My | **roadmap**: Single selection covers daily use; multi-object actions multiply confirmation flows |
 | NAV-35 | Drag an object into the SQL editor | Drops the object name at the cursor | ui.navigator `NavigatorUtils` drag source | PG, My | **roadmap**: Completion inserts names; drag between GPUI views needs a custom drop target in the editor |
 | NAV-36 | Set as default (Ctrl+Shift+A) | Makes a schema or database the active one of the connection | ui.navigator `core.navigator.set.default` | PG, My | **done**: Cmd+Shift+A points the active query tab at the schema; `set_as_default_points_the_active_tab_at_the_schema`, `navigator_keys_run_the_actions_of_the_selected_node` |
-| NAV-37 | Open Database Object (Ctrl+Shift+D) | Search dialog over all objects of the connections | core `core.object.goto` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (Quick open Cmd+P; relations only) |
+| NAV-37 | Open Database Object (Ctrl+Shift+D) | Search dialog over all objects of the connections | core `core.object.goto` | PG, My | **done**: Open Table (Cmd+P), tables and views only; other object kinds through the tree filter. `open_table_finds_a_table_by_name_and_opens_its_rows_or_structure` |
 | NAV-38 | Bookmarks | Bookmark a node and jump back to it | core `core.navigator.bookmark.add` / `.navigate` | PG, My | **roadmap**: Workspace / project feature (Eclipse resources) |
 | NAV-39 | Browse from here | New navigator view rooted at a node | ui.navigator `core.navigator.open.browser` | PG, My | **roadmap**: Eclipse view plumbing |
 | NAV-40 | Projects, active project, resources, scripts folder | Workspace projects and their files | ui.navigator `core.project.*`, `core.resource.*` | PG, My | **roadmap**: Eclipse workspace / project resources (left out by the brief) |
@@ -234,11 +234,11 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | SQL-34 | Format SQL (Ctrl+Shift+F) | Formats the selection or the script | ui.editors.sql `text.content.format` | PG, My | **done**: `format_sql` (Cmd+Shift+I); `format_sql_rewrites_the_selection_or_everything_as_one_undo_step` |
 | SQL-35 | Format ▸ Upper case / Lower case | Changes the case of the selection | ui.editors.sql `SQLEditorBase` format menu (Eclipse upperCase / lowerCase) | PG, My | **gap**: G15 |
 | SQL-36 | Format ▸ Morph to delimited list, trim spaces | Text transforms of the selection | ui.editors.sql `morph.delimited.list`, `trim.spaces` | PG, My | **roadmap**: Text utilities, not SQL client features |
-| SQL-37 | Toggle word wrap | Soft wrap in the editor | ui.editors.sql `word.wrap` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (soft wrap) |
+| SQL-37 | Toggle word wrap | Soft wrap in the editor | ui.editors.sql `word.wrap` | PG, My | **done**: `soft_wrap_is_toggled_by_its_key_in_every_editor` |
 | SQL-38 | Auto-activated completion | Proposals while typing, tables, columns, joins | ui.editors.sql pref `ENABLE_AUTO_ACTIVATION` (true) | PG, My | **done**: `completion_proposes_tables_columns_and_joins`, `typing_in_the_editor_opens_completion_and_enter_accepts_it` |
-| SQL-39 | Content assist on demand (Ctrl+Space) | Opens the proposal list | ui.editors.sql `SQLEditorContributor` content assist | PG, My | **planned**: `docs/plans/M5.md` (left over from Part 2: Ctrl+Space) |
+| SQL-39 | Content assist on demand (Ctrl+Space) | Opens the proposal list | ui.editors.sql `SQLEditorContributor` content assist | PG, My | **done**: Ctrl+Space or Cmd+I. `completion_opens_on_demand_even_when_it_does_not_open_by_itself` |
 | SQL-40 | Templates | Short names expanded to statements | ui.editors.sql `assist.templates` | PG, My | **roadmap**: Saved queries cover reusable SQL |
-| SQL-41 | Open declaration (F4 / Ctrl+click) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **gap**: G15 |
+| SQL-41 | Open declaration (F4 / Ctrl+click) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **done**: F4 opens the rows, Shift+F4 the structure, of the table at the cursor (no Ctrl+click). `a_key_opens_the_rows_or_structure_of_the_table_at_the_cursor` |
 | SQL-42 | Bracket and quote auto-closing | Closes brackets, quotes and comments | ui.editors.sql prefs `SQLEDITOR_CLOSE_*` (true) | PG, My | **done, untested** (gap of kind test, G18): The kit's editor closes brackets (M5 done list); no test (G18) |
 | SQL-43 | Go to / select to matching bracket | Jumps between brackets | ui.editors.sql `gotoMatchingBracket`, `selectToMatchingBracket` | PG, My | **roadmap**: Editor-kit feature; low use |
 | SQL-44 | Foldings | Collapse blocks of the script | ui.editors.sql `FoldingsEnabled`, `ExpandAllFoldings` | PG, My | **roadmap**: Depends on the kit's editor |
@@ -276,7 +276,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-17 | Go to row (Ctrl+G), go to column (Ctrl+Shift+G) | Jumps to a row number or a column | ui.editors.data `grid.gotoRow`, `grid.gotoColumn` | PG, My | **gap**: G6 |
 | RES-18 | First / previous / next / last row | Moves the current row | ui.editors.data `row.first` / `.previous` / `.next` / `.last` | PG, My | **gap**: G3 (record mode navigation) |
 | RES-19 | Fetch next page / fetch all | Reads more rows or all rows | ui.editors.data `core.resultset.fetch.page`, `.fetch.all` | PG, My | **done**: `fetch-more`, `fetch-all`; `a_large_result_arrives_a_page_at_a_time` |
-| RES-20 | Fetch keys (Ctrl+Alt+N, Ctrl+Shift+=) | Shortcuts for fetching | ui.editors.data key bindings | PG, My | **planned**: `docs/plans/M10.md` Part 3 (fetch more / all commands) |
+| RES-20 | Fetch keys (Ctrl+Alt+N, Ctrl+Shift+=) | Shortcuts for fetching | ui.editors.data key bindings | PG, My | **done**: `fetch_keys_page_a_result_and_zoom_keys_size_the_grid` |
 | RES-21 | Fetch next segment on scroll | Reaching the end reads the next page (default on) | ui.editors.data pref `RESULT_SET_AUTO_FETCH_NEXT_SEGMENT` (true) | PG, My | **done, untested** (gap of kind test, G18): `Grid::load_more` on reaching the end; no test scrolls to it (G18) |
 | RES-22 | Fetch size | Rows per page, default 200, editable in the result status bar | model pref `RESULT_SET_MAX_ROWS` (200); `ResultSetViewer` status bar field | PG, My | **done**: Setting `page_size` (1,000 per CLAUDE.md §2); `settings_round_trip_and_default`, `rows_that_cannot_be_addressed_are_read_only_and_say_why` (pages of 100) |
 | RES-23 | Calculate total row count | Counts the rows of the result on request | ui.editors.data `core.resultset.count` | PG, My | **gap**: G5 (table data counts after each page; M6 Part 2 adds "Count exactly"; query results have no count) |
@@ -291,7 +291,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | RES-32 | View / Format ▸ display format, transformers, binary format | How values are shown (UI, editable, native; hex / text / base64) | ui.editors.data `fillColumnViewMenu` | PG, My | **roadmap**: Kerno shows server text and hex for binary (CLAUDE.md §4.D2); formats are a preference set |
 | RES-33 | Row colours by value, colorize data types | Colour rows matching a value; colour by type | ui.editors.data `grid.selectRowColor`, `ColorizeDataTypesToggleAction` | PG, My | **roadmap**: Visual nicety |
 | RES-34 | Boolean as checkbox, click toggles | Booleans drawn as checkboxes and toggled by click (default on) | ui.editors.data prefs `RESULT_SET_SHOW_BOOLEAN_AS_CHECKBOX`, `RESULT_SET_CLICK_TOGGLE_BOOLEAN` | PG, My | **planned**: `docs/plans/M6.md` Part 1 (boolean and enum cells edited from a list) |
-| RES-35 | Zoom in / out | Grid font size | ui.editors.data `core.resultset.zoomIn` / `zoomOut` | PG, My | **planned**: `docs/plans/M10.md` Part 3 (grid font size) |
+| RES-35 | Zoom in / out | Grid font size | ui.editors.data `core.resultset.zoomIn` / `zoomOut` | PG, My | **done**: grid text larger / smaller / usual. `fetch_keys_page_a_result_and_zoom_keys_size_the_grid` |
 | RES-36 | Hide / show columns | Hide columns, show hidden ones | ui.editors.data `grid.hideColumns`, `grid.showColumns` | PG, My | **done**: Header menu; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
 | RES-37 | Pin / unpin columns | Keeps columns on the left while scrolling | ui.editors.data `SpreadsheetPresentation` pin action | PG, My | **done**: Header menu; `the_grid_sorts_copies_and_rearranges_what_it_shows` |
 | RES-38 | Columns width: fit values / fit screen | Resizes columns to their content or the view | ui.editors.data `grid.columnsFitValue`, `.columnsFitScreen` | PG, My | **done**: Fit width and Fit all widths in the header and cell menus; `a_header_copies_orders_filters_and_fits_its_column`, `the_menu_of_a_column_header_orders_filters_and_fits` |
@@ -552,8 +552,8 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | CM-98 | Format ▸ Format SQL, upper / lower case, toggle line / block comment, word wrap | Text commands | ui.editors.sql `SQLEditorBase.editorContextMenuAboutToShow` | PG, My | **planned**: `docs/plans/CTX.md` Part 2 (Format SQL, Toggle comment); case and block comment: G15 |
 | CM-99 | Cut, Copy, Paste, Select all, Undo, Redo | Standard text entries | Eclipse text editor context menu | PG, My | **done**: Cut, Copy, Paste, Select all, Undo, Redo in the editor menu; `the_editor_answers_a_right_click_with_its_commands`, `the_editor_menu_is_enabled_as_the_toolbar_is` |
 | CM-100 | Copy Advanced, Copy selected query | Copy variants | ui.editors.sql `popup:…EditorContext?after=group.copy` | PG, My | **gap**: G15 (Copy selected query); advanced copy on the roadmap (SQL-49) |
-| CM-101 | Open Declaration (F4) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **gap**: G15 |
-| CM-102 | Content assist proposals | Opens completion | ui.editors.sql `ACTION_CONTENT_ASSIST_PROPOSAL` | PG, My | **planned**: `docs/plans/M5.md` (Ctrl+Space left over) |
+| CM-101 | Open Declaration (F4) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **done**: as SQL-41, also in the editor menu. `a_key_opens_the_rows_or_structure_of_the_table_at_the_cursor` |
+| CM-102 | Content assist proposals | Opens completion | ui.editors.sql `ACTION_CONTENT_ASSIST_PROPOSAL` | PG, My | **done**: `completion_opens_on_demand_even_when_it_does_not_open_by_itself` |
 
 ### Result grid cell
 
@@ -612,8 +612,8 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
-| CM-131 | Active connection / schema selector | Switch the editor's target | core / ui.navigator `ui.tools.select.connection`, `.schema` (toolbar) | PG, My | **planned**: `docs/plans/CTX.md` Part 2 (connection and database items) |
-| CM-132 | Transaction mode, Commit, Rollback | Transaction controls | core `menu.txn`, `commit.menu`, `rollback.menu` | PG, My | **planned**: `docs/plans/CTX.md` Part 2 (transaction item) |
+| CM-131 | Active connection / schema selector | Switch the editor's target | core / ui.navigator `ui.tools.select.connection`, `.schema` (toolbar) | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
+| CM-132 | Transaction mode, Commit, Rollback | Transaction controls | core `menu.txn`, `commit.menu`, `rollback.menu` | PG, My | **done**: `the_status_bar_menus_open_inside_the_window`, `closing_rolls_back_and_discards_only_once_confirmed` |
 | CM-133 | Transaction log, pending transactions | Transaction monitor entries | core `menu.txn.log` (`core.txn.log`, `core.txn.pending`) | PG, My | **gap**: G14 (log); pending list on the roadmap (CON-46) |
 
 ## Summary
@@ -622,13 +622,13 @@ Counts per status and per area (recounted from the rows above on 2026-11-13, HEA
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
-| Connections | 33 | 1 | 1 | 1 | 15 | 51 |
-| Navigator | 34 | 0 | 2 | 5 | 18 | 59 |
-| SQL editor | 28 | 3 | 2 | 5 | 16 | 54 |
-| Results and data editing | 36 | 2 | 3 | 16 | 15 | 72 |
+| Connections | 34 | 1 | 0 | 1 | 15 | 51 |
+| Navigator | 36 | 0 | 0 | 5 | 18 | 59 |
+| SQL editor | 31 | 3 | 0 | 4 | 16 | 54 |
+| Results and data editing | 38 | 2 | 1 | 16 | 15 | 72 |
 | Object editors (structure) | 13 | 0 | 0 | 2 | 6 | 21 |
 | Tools and administration | 11 | 0 | 0 | 2 | 15 | 28 |
-| Context menus | 90 | 0 | 8 | 24 | 11 | 133 |
-| **All** | **245** | **6** | **16** | **55** | **96** | **418** |
+| Context menus | 94 | 0 | 5 | 23 | 11 | 133 |
+| **All** | **257** | **6** | **6** | **53** | **96** | **418** |
 
 Two rows became gaps that no plan part holds: CM-09 (Paste in the sidebar's empty-area menu, which Duplicate covers) and CM-15 (Refresh on a folder). They are to be added to `PARITY-GAPS.md` or accepted by the owner as covered. NAV-48 and CM-33 stay gaps with what is missing named in the row.

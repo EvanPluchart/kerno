@@ -14,6 +14,7 @@ use gpui_kit::base::input::Diagnostic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     CompletionProvider, Editor, EditorState, Input, InputEvent, InputState, Position, RopeExt as _,
+    TabSize,
 };
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -33,6 +34,7 @@ use gpui_kit::{
     Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::Environment;
+use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, find_params, format_sql, split_statements,
     statement_at,
@@ -316,6 +318,8 @@ pub struct QueryTab {
     /// Source mode: the text replaces an object of this schema (MySQL
     /// database), and "Apply source" runs all of it.
     source: Option<String>,
+    /// The settings the editor follows: soft wrap, line numbers, tab size.
+    editor_options: (bool, bool, u8),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -344,14 +348,21 @@ impl QueryTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let sql = sql.to_string();
+        let editor_options = Self::editor_settings(cx);
+        let (soft_wrap, line_numbers, tab_size) = editor_options;
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("sql")
-                .line_number(true)
-                .soft_wrap(false)
+                .line_number(line_numbers)
+                .soft_wrap(soft_wrap)
+                .tab_size(TabSize {
+                    tab_size: tab_size.into(),
+                    hard_tabs: false,
+                })
                 .default_value(sql)
                 .placeholder("Write SQL here")
         });
+        let settings = cx.observe_global_in::<AppState>(window, Self::follow_settings);
         editor.update(cx, |editor, _| {
             editor
                 .lsp_mut()
@@ -418,10 +429,45 @@ impl QueryTab {
             catalog: SharedCatalog::default(),
             catalog_load: None,
             source: None,
-            _subscriptions: vec![subscription, edits],
+            editor_options,
+            _subscriptions: vec![subscription, edits, settings],
         };
         tab.follow_connection(cx);
         tab
+    }
+
+    /// Soft wrap, line numbers and tab size, as the settings have them.
+    fn editor_settings(cx: &App) -> (bool, bool, u8) {
+        let settings = &AppState::get(cx).settings;
+        (settings.soft_wrap, settings.line_numbers, settings.tab_size)
+    }
+
+    /// The editor takes a changed setting at once.
+    fn follow_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = Self::editor_settings(cx);
+        if wanted == self.editor_options {
+            return;
+        }
+        self.editor_options = wanted;
+        let (soft_wrap, line_numbers, tab_size) = wanted;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap(soft_wrap, window, cx);
+            editor.set_line_number(line_numbers, window, cx);
+            editor.set_tab_size(
+                TabSize {
+                    tab_size: tab_size.into(),
+                    hard_tabs: false,
+                },
+                cx,
+            );
+        });
+    }
+
+    /// Whether the editor wraps long lines, shows line numbers, and its tab
+    /// size; for tests.
+    #[cfg(test)]
+    pub fn editor_options(&self) -> (bool, bool, u8) {
+        self.editor_options
     }
 
     /// The tab's title.
@@ -619,8 +665,7 @@ impl QueryTab {
             .map_or(0, |diagnostics| diagnostics.len())
     }
 
-    /// The grid of a result; for tests.
-    #[cfg(test)]
+    /// The grid of a result; for tests and the bench mode.
     pub fn grid_of(&self, result: usize) -> Option<Entity<TableState<Grid>>> {
         self.results.get(result).and_then(ResultPane::grid)
     }
@@ -1773,6 +1818,7 @@ impl QueryTab {
                 let starting = {
                     let (session, sql) = (session.clone(), sent.clone());
                     cx.update(|_, cx| {
+                        crate::bench::sent(cx);
                         // `exec::run` spawns the statement: it needs the runtime.
                         bridge::spawn(
                             cx,
@@ -1791,6 +1837,7 @@ impl QueryTab {
                     let keep_going = this.update_in(cx, |this, window, cx| {
                         match event {
                             ExecEvent::Columns(columns) => {
+                                crate::bench::columns(cx);
                                 let grid = Grid::new(
                                     ResultStore::new(columns),
                                     demand.clone(),
@@ -1802,6 +1849,7 @@ impl QueryTab {
                                 this.receiving = pane;
                             }
                             ExecEvent::Rows(batch) => {
+                                crate::bench::rows(window, cx);
                                 if let Some(id) = pane
                                     && let Some(grid) = this.pane_grid(id)
                                 {
@@ -1860,6 +1908,7 @@ impl QueryTab {
                             },
                             ExecEvent::Notice(notice) => this.notices.push(notice),
                             ExecEvent::Finished(Ok(())) => {
+                                crate::bench::complete(cx);
                                 // Some statements end quietly when cancelled
                                 // (MySQL's SLEEP returns early): it was still a
                                 // cancellation, and the script stops there.
@@ -2312,6 +2361,96 @@ impl QueryTab {
                 cx.notify();
             });
         }
+    }
+
+    /// The grid of the result on screen, when it holds rows.
+    pub fn active_grid(&self) -> Option<Entity<TableState<Grid>>> {
+        self.results
+            .get(self.active_result)
+            .and_then(ResultPane::grid)
+    }
+
+    /// Fetches the next page of the result on screen, or all its remaining
+    /// rows: the footer's buttons, and DBeaver's keys.
+    pub fn fetch(&mut self, all: bool, cx: &mut Context<Self>) {
+        let Some(grid) = self
+            .active_grid()
+            .filter(|grid| Grid::has_more(grid.read(cx).delegate()))
+        else {
+            return;
+        };
+        self.activity = Activity::Running {
+            index: 0,
+            total: 1,
+            since: Instant::now(),
+        };
+        grid.update(cx, |grid, cx| {
+            if all {
+                grid.delegate_mut().fetch_all();
+            } else {
+                grid.delegate_mut().fetch_more();
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Shows the next result tab (the server's messages are the last one),
+    /// or the previous, round the ends.
+    pub fn cycle_result(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.results.len() + usize::from(!self.notices.is_empty());
+        if count == 0 {
+            return;
+        }
+        let current = self.active_result.min(count - 1);
+        self.active_result = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        cx.notify();
+    }
+
+    /// The table or view named where the editor's cursor is, found in the
+    /// completion catalog: a qualified name, or the first of the search path
+    /// that has it.
+    pub fn relation_at_cursor(&self, cx: &App) -> Option<(TableRef, RelationKind)> {
+        let editor = self.editor.read(cx);
+        let text = editor.value().to_string();
+        let cursor = editor.cursor().min(text.len());
+        let is_name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | '`' | '$');
+        let start = text[..cursor].rfind(|c: char| !is_name(c)).map_or(0, |at| {
+            at + text[at..].chars().next().map_or(1, char::len_utf8)
+        });
+        let end = text[cursor..]
+            .find(|c: char| !is_name(c))
+            .map_or(text.len(), |at| cursor + at);
+        let word = text.get(start..end)?.replace(['"', '`'], "");
+        let (schema, name) = match word.rsplit_once('.') {
+            Some((schema, name)) => (Some(schema.rsplit('.').next().unwrap_or(schema)), name),
+            None => (None, word.as_str()),
+        };
+        let catalog = self.catalog.borrow();
+        let same = |a: &str, b: &str| a == b || a.eq_ignore_ascii_case(b);
+        let schemas: Vec<&kerno_core::sql::CatalogSchema> = match schema {
+            Some(schema) => catalog
+                .schemas
+                .iter()
+                .filter(|s| same(&s.name, schema))
+                .collect(),
+            None => catalog
+                .search_path
+                .iter()
+                .filter_map(|path| catalog.schemas.iter().find(|s| s.name == *path))
+                .collect(),
+        };
+        schemas.into_iter().find_map(|found| {
+            found
+                .relations
+                .iter()
+                .find(|relation| same(&relation.name, name))
+                .map(|relation| (TableRef::new(&found.name, &relation.name), relation.kind))
+        })
     }
 
     // Result tabs ---------------------------------------------------------------
@@ -3088,7 +3227,7 @@ impl QueryTab {
         match &pane.outcome {
             // Striped by the grid itself (`Grid::render_tr`).
             Outcome::Rows(grid) => DataTable::new(grid)
-                .xsmall()
+                .with_size(super::grid::table_size(cx))
                 .focus_ring(false)
                 .into_any_element(),
             Outcome::Done => div()
@@ -3395,43 +3534,20 @@ impl QueryTab {
                     .text_xs()
                     .text_color(muted)
                     .child(SharedString::from(summary))
-                    .when_some(grid.filter(|_| has_more), |this, grid| {
-                        let all = grid.clone();
+                    .when(grid.is_some() && has_more, |this| {
                         this.child(
                             Button::new("fetch-more")
                                 .ghost()
                                 .xsmall()
                                 .label("Fetch more")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.activity = Activity::Running {
-                                        index: 0,
-                                        total: 1,
-                                        since: Instant::now(),
-                                    };
-                                    grid.update(cx, |grid, cx| {
-                                        grid.delegate_mut().fetch_more();
-                                        cx.notify();
-                                    });
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.fetch(false, cx))),
                         )
                         .child(
                             Button::new("fetch-all")
                                 .ghost()
                                 .xsmall()
                                 .label("Fetch all")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.activity = Activity::Running {
-                                        index: 0,
-                                        total: 1,
-                                        since: Instant::now(),
-                                    };
-                                    all.update(cx, |grid, cx| {
-                                        grid.delegate_mut().fetch_all();
-                                        cx.notify();
-                                    });
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.fetch(true, cx))),
                         )
                     })
                     .when(exportable, |this| {
@@ -3550,6 +3666,10 @@ impl Render for QueryTab {
                     .h_full()
                     .bordered(false)
                     .appearance(false)
+                    // `>=` stays two signs unless ligatures are chosen.
+                    .when(!AppState::get(cx).settings.ligatures, |editor| {
+                        editor.font_features(gpui_kit::FontFeatures::disable_ligatures())
+                    })
                     .context_menu(|menu, _, _| menu),
             );
         let results = div()

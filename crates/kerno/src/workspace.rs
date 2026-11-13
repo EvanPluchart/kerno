@@ -7,12 +7,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
@@ -62,7 +60,6 @@ use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
-use crate::settings::TableDoubleClick;
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
@@ -1394,7 +1391,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_appearance(appearance: Appearance, window: &mut Window, cx: &mut App) {
+    pub(crate) fn set_appearance(appearance: Appearance, window: &mut Window, cx: &mut App) {
         // An explicit choice ends a theme pinned for this run.
         cx.update_global::<AppState, _>(|state, _| state.appearance_override = None);
         AppState::update_settings(cx, |settings| settings.appearance = appearance);
@@ -1419,69 +1416,7 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_dialog(cx, |dialog, _, _| {
-            dialog
-                .title("Settings")
-                .w(px(440.))
-                .content(|content, _, cx| {
-                    let current = AppState::get(cx).appearance();
-                    let selected = Appearance::ALL.iter().position(|a| *a == current);
-                    let double_click = AppState::get(cx).settings.table_double_click;
-                    let opens = TableDoubleClick::ALL
-                        .iter()
-                        .position(|choice| *choice == double_click);
-                    content.child(
-                        v_flex()
-                            .gap_2()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Appearance"))
-                            .child(
-                                RadioGroup::new("appearance")
-                                    .children(Appearance::ALL.map(Appearance::label))
-                                    .selected_index(selected)
-                                    .on_change(|index, window, cx| {
-                                        if let Some(appearance) = Appearance::ALL.get(*index) {
-                                            Workspace::set_appearance(*appearance, window, cx);
-                                        }
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .pt_2()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Double click on a table or view in the tree"),
-                            )
-                            .child(
-                                RadioGroup::new("table-double-click")
-                                    .children(TableDoubleClick::ALL.map(TableDoubleClick::label))
-                                    .selected_index(opens)
-                                    .on_change(|index, _, cx| {
-                                        if let Some(choice) = TableDoubleClick::ALL.get(*index) {
-                                            AppState::update_settings(cx, |settings| {
-                                                settings.table_double_click = *choice
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(div().pt_2().font_weight(FontWeight::MEDIUM).child("Tabs"))
-                            .child(
-                                Checkbox::new("confirm-close-tab")
-                                    .label(
-                                        "Ask before closing a tab with pending changes, unsaved \
-                                         text or a changed table form (an open transaction \
-                                         always asks)",
-                                    )
-                                    .checked(AppState::get(cx).settings.confirm_close_tab)
-                                    .on_click(|checked, window, cx| {
-                                        let checked = *checked;
-                                        AppState::update_settings(cx, |settings| {
-                                            settings.confirm_close_tab = checked
-                                        });
-                                        window.refresh();
-                                    }),
-                            ),
-                    )
-                })
-        });
+        crate::settings_view::SettingsView::open(window, cx);
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
@@ -1676,7 +1611,7 @@ impl Workspace {
     }
 
     /// Opens a tab holding `sql` and gives it the keyboard.
-    fn open_query(
+    pub fn open_query(
         &mut self,
         title: String,
         sql: &str,
@@ -2425,6 +2360,10 @@ impl Workspace {
             ConnectionsEvent::NeedsInput { id, request } => {
                 self.ask(id.clone(), request.clone(), window, cx)
             }
+            ConnectionsEvent::DeleteRequested { id } => {
+                self.delete_connection(id.clone(), window, cx)
+            }
+            ConnectionsEvent::ReconnectRequested { id } => self.reconnect(id.clone(), window, cx),
         }
         cx.notify();
     }
@@ -3115,6 +3054,21 @@ impl Workspace {
         self.end_then(action, tabs, then, window, cx);
     }
 
+    /// Deletes the connection `id` once what its tabs hold is ended, after
+    /// the alert that confirmed the deletion has closed.
+    fn delete_connection(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let action = format!("Delete “{}”", self.connection_name(&id, cx));
+        let tabs = self.tabs_on(std::slice::from_ref(&id), cx);
+        let then: Then = Box::new(move |this, _, cx| {
+            this.connections
+                .update(cx, |connections, cx| connections.delete(&id, cx))
+        });
+        let workspace = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let _ = workspace.update(cx, |this, cx| this.end_then(action, tabs, then, window, cx));
+        });
+    }
+
     /// Saves the read-only flag of a connection; an open one reconnects, so
     /// what its tabs hold is ended first, the same way (CON-12).
     fn set_read_only(
@@ -3437,6 +3391,199 @@ impl Workspace {
     }
 }
 
+// Keyboard coverage: commands that reach the tree, the sidebar, the grids
+// and the editor from the palette, the menu bar and their keys -------------
+
+impl Workspace {
+    /// Registers the handlers of these commands on the window's root.
+    fn more_actions(
+        &self,
+        root: gpui_kit::Stateful<gpui_kit::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
+        use crate::query::grid::CopyFormat;
+        root.on_action(cx.listener(|_, command: &actions::RunCommand, window, cx| {
+            if let Some(found) = actions::COMMANDS
+                .iter()
+                .find(|found| found.id == command.id)
+            {
+                window.dispatch_action((found.action)(), cx);
+            }
+        }))
+        .on_action(cx.listener(Self::quick_open))
+        .on_action(
+            cx.listener(|this, _: &actions::FocusNavigatorFilter, window, cx| {
+                if !AppState::get(cx).settings.sidebar_visible {
+                    AppState::update_settings(cx, |settings| settings.sidebar_visible = true);
+                }
+                let navigator = this.sidebar.read(cx).navigator().clone();
+                navigator.update(cx, |navigator, cx| navigator.focus_filter(window, cx));
+                cx.notify();
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::DuplicateConnection, window, cx| {
+                this.on_selected_connection(SidebarAction::Duplicate, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::DeleteConnection, window, cx| {
+                this.on_selected_connection(SidebarAction::Delete, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::NextResultTab, window, cx| {
+            this.on_query(window, cx, |tab, _, cx| tab.cycle_result(true, cx))
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::PreviousResultTab, window, cx| {
+                this.on_query(window, cx, |tab, _, cx| tab.cycle_result(false, cx))
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::FetchMoreRows, window, cx| {
+            this.on_query(window, cx, |tab, _, cx| tab.fetch(false, cx))
+        }))
+        .on_action(cx.listener(|this, _: &actions::FetchAllRows, window, cx| {
+            this.on_query(window, cx, |tab, _, cx| tab.fetch(true, cx))
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::CopyAsCsv, _, cx| this.copy_as(CopyFormat::Csv, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::CopyAsJson, _, cx| this.copy_as(CopyFormat::Json, cx)),
+        )
+        .on_action(cx.listener(|this, _: &actions::CopyAsMarkdown, _, cx| {
+            this.copy_as(CopyFormat::Markdown, cx)
+        }))
+        .on_action(cx.listener(|this, _: &actions::CopyAsSqlInsert, _, cx| {
+            this.copy_as(CopyFormat::SqlInsert, cx)
+        }))
+        .on_action(cx.listener(|this, _: &actions::ViewCellValue, window, cx| {
+            if let Some(grid) = this.active_grid(cx) {
+                crate::query::grid::Grid::view_selected_value(&grid, window, cx);
+            }
+        }))
+        .on_action(cx.listener(|_, _: &actions::ToggleSoftWrap, _, cx| {
+            AppState::update_settings(cx, |settings| settings.soft_wrap = !settings.soft_wrap);
+        }))
+        .on_action(cx.listener(|_, _: &actions::GridZoomIn, window, cx| {
+            crate::settings_view::zoom_grid(Some(1.0), window, cx)
+        }))
+        .on_action(cx.listener(|_, _: &actions::GridZoomOut, window, cx| {
+            crate::settings_view::zoom_grid(Some(-1.0), window, cx)
+        }))
+        .on_action(cx.listener(|_, _: &actions::GridZoomReset, window, cx| {
+            crate::settings_view::zoom_grid(None, window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::OpenTableAtCursor, window, cx| {
+                this.open_at_cursor(false, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::OpenStructureAtCursor, window, cx| {
+                this.open_at_cursor(true, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|_, _: &actions::OpenKeymapFile, window, cx| {
+            crate::settings_view::open_keymap_file(window, cx)
+        }))
+    }
+
+    /// Open Table (Cmd+P) on the active tab's connection, or the one
+    /// selected in the sidebar.
+    fn quick_open(&mut self, _: &actions::QuickOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.command_connection(cx) else {
+            window.push_notification(
+                Notification::warning(
+                    "Open table: open a tab on a connection, or select one in the sidebar.",
+                ),
+                cx,
+            );
+            return;
+        };
+        let Some(session) = self.connections.read(cx).meta_session(&id) else {
+            let text = format!(
+                "Open table: connect “{}” first.",
+                self.connection_name(&id, cx)
+            );
+            window.push_notification(Notification::warning(SharedString::from(text)), cx);
+            return;
+        };
+        crate::quick_open::open(cx.entity(), id, session, window, cx);
+    }
+
+    /// Runs a sidebar action on the connection selected in the sidebar.
+    fn on_selected_connection(
+        &mut self,
+        action: SidebarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.sidebar.read(cx).selected().map(str::to_string) else {
+            window.push_notification(
+                Notification::warning("Select a connection in the sidebar first."),
+                cx,
+            );
+            return;
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.perform(&Subject::Connection(id), action, window, cx)
+        });
+    }
+
+    /// Copies the selection of the grid on screen in `format`.
+    fn copy_as(&mut self, format: crate::query::grid::CopyFormat, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_data_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.copy_selection(format, cx));
+        } else if let Some(tab) = self.active_query_tab().cloned() {
+            tab.update(cx, |tab, cx| tab.copy_selection(Some(format), cx));
+        }
+    }
+
+    /// The grid on screen: the active table's rows, or the active result.
+    fn active_grid(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<gpui_kit::component::table::TableState<crate::query::grid::Grid>>> {
+        self.active_data_tab()
+            .and_then(|tab| tab.read(cx).grid())
+            .or_else(|| {
+                self.active_query_tab()
+                    .and_then(|tab| tab.read(cx).active_grid())
+            })
+    }
+
+    /// Opens the rows (or the structure) of the table named at the active
+    /// editor's cursor.
+    fn open_at_cursor(&mut self, structure: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_query_tab().cloned() else {
+            return;
+        };
+        let (found, target) = {
+            let tab = tab.read(cx);
+            (tab.relation_at_cursor(cx), tab.target().cloned())
+        };
+        let (Some((table, kind)), Some(target)) = (found, target) else {
+            window.push_notification(
+                Notification::warning(
+                    "No table or view of this tab's connection is named at the cursor.",
+                ),
+                cx,
+            );
+            return;
+        };
+        let target = Target {
+            schema: None,
+            ..target
+        };
+        if structure {
+            self.open_structure(target, table, kind, window, cx);
+        } else {
+            self.open_data(target, table, kind, Filter::default(), window, cx);
+        }
+    }
+}
+
 /// Where a tab runs on a connection: its own database and schema.
 fn connection_target(id: &str) -> Target {
     Target {
@@ -3736,6 +3883,7 @@ impl Render for Workspace {
                 this.sidebar
                     .update(cx, |sidebar, cx| sidebar.open_selected(cx))
             }))
+            .map(|root| self.more_actions(root, cx))
             .size_full()
             .bg(background)
             .text_color(foreground)
