@@ -23,11 +23,11 @@ Community; its look follows the calm, dense style of modern editors. Licensed un
 
 | Dark | Light |
 | ---- | ----- |
-| ![Query editor and results grid, dark](docs/screenshots/query-results-dark.png) | ![Query editor and results grid, light](docs/screenshots/query-results-light.png) |
-| ![Table data with pending edits, dark](docs/screenshots/table-data-pending-edits-dark.png) | ![Table data with pending edits, light](docs/screenshots/table-data-pending-edits-light.png) |
-| ![Structure editor, dark](docs/screenshots/structure-editor-dark.png) | ![Structure editor, light](docs/screenshots/structure-editor-light.png) |
-| ![EXPLAIN plan, dark](docs/screenshots/explain-plan-dark.png) | ![EXPLAIN plan, light](docs/screenshots/explain-plan-light.png) |
-| ![New connection dialog, dark](docs/screenshots/new-connection-dark.png) | ![New connection dialog, light](docs/screenshots/new-connection-light.png) |
+| ![Query editor and results grid, dark](docs/screenshots/final/query-results-dark.png) | ![Query editor and results grid, light](docs/screenshots/final/query-results-light.png) |
+| ![Table data with pending edits, dark](docs/screenshots/final/table-data-pending-edits-dark.png) | ![Table data with pending edits, light](docs/screenshots/final/table-data-pending-edits-light.png) |
+| ![Structure editor, dark](docs/screenshots/final/structure-editor-dark.png) | ![Structure editor, light](docs/screenshots/final/structure-editor-light.png) |
+| ![EXPLAIN plan, dark](docs/screenshots/final/explain-plan-dark.png) | ![EXPLAIN plan, light](docs/screenshots/final/explain-plan-light.png) |
+| ![New connection dialog, dark](docs/screenshots/final/new-connection-dark.png) | ![New connection dialog, light](docs/screenshots/final/new-connection-light.png) |
 | ![Backup wizard, dark](docs/screenshots/final/backup-settings-dark.png) | ![Backup wizard, light](docs/screenshots/final/backup-settings-light.png) |
 | ![A production connection, dark](docs/screenshots/final/chrome-production-dark.png) | ![A production connection, light](docs/screenshots/final/chrome-production-light.png) |
 
