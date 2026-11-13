@@ -783,3 +783,30 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   together prompt once; "no such secret" is remembered, an error is not (a refused keychain prompt can be
   tried again). A secret added outside Kerno while it runs is seen at the next start.
 - **F4 on a folder renames it** until "Edit folder…" exists (Part 9c), which then takes the key.
+
+## D-044 — Environments: what the built-ins do, and what is always on
+
+- **Production confirms every run from the editor, reads too**, as DBeaver's production connection type
+  does (`confirmExecute`); writes are then asked a second time (CLAUDE.md §1). A read was not asked before:
+  it is one rule of the built-in, editable in Settings → Environments. Re-reading a result (filter, order,
+  auto-refresh) never asks.
+- **"Confirm data edits" is always on** and shown locked: every apply already shows its SQL and asks
+  (CLAUDE.md §1), whatever the environment.
+- **Built-in is derived from the id** (`local`, `staging`, `production`), not stored: a hand-edited store
+  cannot make production deletable or lose it.
+- **An idle transaction is rolled back only after it wrote something**, as DBeaver's monitor does; one
+  that only read is left alone. The user gets a message in the tab and a notification naming the rule.
+- **Text on a tinted surface** is the theme's colour when it reads at 4.5:1, else black or white; the
+  toolbar wash is lightened until muted text still reads. A property test covers arbitrary colours.
+
+## D-045 — The update check uses the system's `curl`
+
+- The owner allowed one network request (CLAUDE.md §1, §3 item 12): the releases page of
+  `github.com/EvanPluchart/kerno`, at launch and every 6 hours, redirect not followed, nothing else sent,
+  with an off switch. Kerno has no HTTP client, and adding one (and its TLS stack) for a single request is
+  more code to audit than calling the `curl` every macOS and nearly every Linux already has, with fixed
+  arguments. Recto and Vigie, whose rules this follows, also use the system's client. No `curl`: no check.
+- The checksum from the release's `SHA256SUMS` catches a damaged or truncated download, not a compromised
+  release; signing is the real answer and stays the owner's (it needs their identity).
+- No GitHub Actions: the checks run locally (`scripts/check.sh`); a release is built locally
+  (`scripts/release.sh`), and publishing it stays the owner's.
