@@ -52,13 +52,12 @@ For every feature of §4, in this order:
 
 ## Open points
 
-- The reliability of the test suite is being worked on (in progress): the rules are in `plans/README.md`, "Reliability
-  of the suite". One test, `every_owner_of_a_session_closes_it_when_it_goes_away`, failed about once in forty full
-  runs and now prints what it saw when it does; the full run with the containers up has to pass repeatedly before
-  the goal is verified (GOAL criterion 1).
-- Still open for the goal: the fourth list of visual defects (`plans/M10.md` Part 15), a clean performance
-  measurement on an idle machine with `docs/BENCH.md` (criterion 5), the final screenshots in
-  `docs/screenshots/final/` (criterion 7), and the final verification of every criterion of `docs/GOAL.md`.
+- The reliability of the test suite: the rules are in `plans/README.md`, "Reliability of the suite". One test,
+  `every_owner_of_a_session_closes_it_when_it_goes_away`, failed about once in forty full runs before the cancel
+  fix (`a4bcda5`) and has not failed in the thirty-odd full runs since; it prints what it saw if it ever does.
+- Nothing is open for the goal: the final verification of every criterion of `docs/GOAL.md` is in
+  `docs/PROGRESS.md` ("Final verification"), with what remains short of ideal (the bare binary's idle RSS 0.5 MB
+  over the target, the update check never run for real).
 - The checks run locally: `scripts/check.sh`, and `scripts/release.sh` for a release (criterion 8).
 
 - `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not
