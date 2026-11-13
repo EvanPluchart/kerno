@@ -743,3 +743,20 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   changed: Kerno compares before setting, or its editor observer would loop.
 - The status bar's summary answers a right-click with "New connection…" or "Disconnect all" (as it says
   "Not connected" or "N connections open") and Copy; the messages count with "Show messages" and Copy.
+
+## D-042 — Owner's test of 2026-11-13: how the ten items are built
+
+- The ten items the owner added to CLAUDE.md §3 are planned in `docs/plans/M10.md` Part 9 and later, in
+  the owner's order (1, 2, 5, 8, 9; then 6 and 7; then 3, 4, 10), before the final screenshots.
+- **One tree.** `Navigator` becomes the sidebar's single tree (folders and connections as roots, one browse
+  state per connection); `Sidebar` keeps its menus and actions and becomes the frame around it. Collapsing
+  a connection never disconnects it.
+- **One `unsafe` call.** The Dock icon of the bare binary on macOS needs
+  `NSApplication::setApplicationIconImage`, which is `unsafe` in objc2-app-kit and has no safe route in
+  GPUI. The workspace lint goes from `forbid` to `deny` and that one function expects it, with its safety
+  argument written down. Nothing else may use `unsafe`.
+- **Folders' looks live with the folders**, in the settings JSON (no SQL migration); a custom image is
+  copied, downscaled to 32 px, into `folder-icons/` of the data directory.
+- **Connection failures are classified from their text** by one pure function in `kerno-core`
+  (`error::explain`): headline, next step, raw message. The markers are the SQLSTATEs, the MySQL error
+  numbers and the OS error numbers, which do not follow the user's language.
