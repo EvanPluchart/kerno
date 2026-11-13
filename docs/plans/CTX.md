@@ -96,6 +96,12 @@ Files: `crates/kerno/src/workspace.rs`, `query/tab.rs`, `data/tab.rs`, `structur
    that has a menu), unit tests of the entry lists, close-others / close-to-the-right / close-all with the
    confirmation, rename stored and restored, reopen closed tab.
 
+**Part 2 is done** (with M5 Part 4, the close confirmation). Left for later parts: the native menu bar in
+`main.rs` does not list the new commands (M10 Part 3); the toolbar's connection / database dropdowns in
+`query/tab.rs` and the sidebar's Disconnect still act while a transaction is open, while the status bar
+refuses — make them all go through the same check (ask, roll back, then switch); a UI test for closing a
+changed table form; rollback on close tested on MySQL / MariaDB.
+
 ## Part 3 — Grid menus (results and table data) — `opus`
 
 Files: `crates/kerno/src/query/grid.rs`, `query/tab.rs`, `data/tab.rs`, `ui_tests.rs`.
