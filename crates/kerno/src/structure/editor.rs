@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -1788,6 +1789,7 @@ fn hint(text: &'static str, cx: &App) -> impl IntoElement {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(text)
+        .test_text(text)
 }
 
 /// Runs `statements` in order; on PostgreSQL in one transaction, rolled

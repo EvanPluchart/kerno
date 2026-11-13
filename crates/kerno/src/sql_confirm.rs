@@ -308,7 +308,8 @@ impl Render for ConfirmView {
             .child(
                 div()
                     .text_sm()
-                    .child(SharedString::from(self.confirmation.explanation.clone())),
+                    .child(SharedString::from(self.confirmation.explanation.clone()))
+                    .test_text(self.confirmation.explanation.clone()),
             )
             .children(field)
             .children(list)

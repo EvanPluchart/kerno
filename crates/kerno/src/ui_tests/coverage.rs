@@ -394,6 +394,62 @@ fn an_import_is_cancelled_from_its_dialog_and_keeps_nothing(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn an_import_into_a_new_table_says_when_the_table_is_created_first(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_imp_new";
+        let (cleanup, create) = scratch_schema(engine, schema);
+        let _scratch = Scratch::new(engine, &[&cleanup], &[&create]);
+        let tables = || {
+            on_server(
+                engine,
+                &format!(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_schema = '{schema}'"
+                ),
+            )
+        };
+        let app = connected(cx, engine);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fresh.csv");
+        std::fs::write(&file, "id,name\n1,a\n2,b\n").unwrap();
+        let dialog = app
+            .import_dialog(cx, schema, None)
+            .expect("the import dialog");
+        app.import_file(cx, &dialog, &file);
+        app.start_import(cx, &dialog);
+        assert_eq!(
+            app.label_of(cx, "sql-title"),
+            format!("Import 2 rows into {schema}.fresh"),
+            "{engine:?}"
+        );
+        let first = "The table is created first, on its own: MySQL and MariaDB commit a \
+                     CREATE TABLE at once. Then the rows are inserted in one transaction. \
+                     If a row fails, none is kept and the new table is dropped.";
+        let together = "The table is created and the rows inserted in one transaction: \
+                        all of them, or none.";
+        let mysql = engine != Engine::Postgres;
+        assert_eq!(
+            super::tool_wizards::paints(&app, cx, first),
+            mysql,
+            "{engine:?}"
+        );
+        assert_eq!(
+            super::tool_wizards::paints(&app, cx, together),
+            !mysql,
+            "{engine:?}"
+        );
+        // Cancelled there, nothing ran: no table is left behind.
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview"), "{engine:?}");
+        assert_eq!(cx.update(|cx| dialog.read(cx).state(cx)), "mapping");
+        assert_eq!(tables(), "0", "{engine:?}");
+    }
+}
+
+#[gpui_kit::test]
 fn sql_keywords_strings_and_comments_are_highlighted(cx: &mut TestAppContext) {
     use gpui_kit::component::Rope;
     use gpui_kit::component::highlighter::SyntaxHighlighter;

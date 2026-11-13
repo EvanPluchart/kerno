@@ -38,6 +38,7 @@ use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
+mod alter_form;
 mod brackets;
 mod connection_feedback;
 mod coverage;
@@ -7166,6 +7167,13 @@ fn create_entries_open_templates_that_run_once_named(cx: &mut TestAppContext) {
         } else {
             &["kerno_ui_g10_create"]
         };
+        let view = (
+            "Views",
+            Action::CreateView,
+            "SELECT count(*) FROM information_schema.views \
+             WHERE table_schema = 'kerno_ui_g10_create' AND table_name = 'new_view'"
+                .to_string(),
+        );
         // Folder, entry, and how the server counts what it made.
         let made: Vec<(&str, Action, String)> = if pg {
             let proc = |name: &str| {
@@ -7175,6 +7183,7 @@ fn create_entries_open_templates_that_run_once_named(cx: &mut TestAppContext) {
                 )
             };
             vec![
+                view,
                 ("Functions", Action::CreateFunction, proc("new_function")),
                 ("Procedures", Action::CreateProcedure, proc("new_procedure")),
                 (
@@ -7201,6 +7210,7 @@ fn create_entries_open_templates_that_run_once_named(cx: &mut TestAppContext) {
                 )
             };
             vec![
+                view,
                 ("Routines", Action::CreateFunction, routine("new_function")),
                 (
                     "Routines",
@@ -7231,6 +7241,14 @@ fn create_entries_open_templates_that_run_once_named(cx: &mut TestAppContext) {
                 app.titles(cx).len() == index + 1
             });
             assert_eq!(on_server(engine, &count), "0", "{engine:?} {action:?}");
+            // The view's template is in the schema of its folder.
+            if action == Action::CreateView {
+                let sql = app.active_query(cx).1;
+                assert!(
+                    sql.starts_with("CREATE VIEW") && sql.contains("kerno_ui_g10_create"),
+                    "{engine:?}: {sql}"
+                );
+            }
             // A trigger made from the schema's folder names its table.
             if app.active_query(cx).1.contains("table_name") {
                 app.edit_query(cx, "table_name", "t");
