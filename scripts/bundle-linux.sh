@@ -43,6 +43,7 @@ GenericName=Database Client
 Comment=A fast, native database client for PostgreSQL and MySQL
 Exec=kerno
 Icon=kerno
+StartupWMClass=kerno
 Terminal=false
 Categories=Development;Database;
 Keywords=database;sql;postgresql;mysql;mariadb;

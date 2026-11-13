@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     AnyElement, App, AssetSource, DevicePixels, Global, ImageCacheError, ImageSource, Img,
@@ -28,26 +29,55 @@ gpui_kit::assets::icon_assets!(
     [
         Bookmark,
         Boxes,
+        Briefcase,
+        Building2,
         CalendarClock,
         Clock,
+        Cloud,
         Columns3,
         Database,
         Eye,
+        FlaskConical,
         Folder,
+        House,
         KeyRound,
         Layers,
         Link2,
         ListOrdered,
         Puzzle,
         RefreshCw,
+        Server,
         Shapes,
         ShieldCheck,
         SquareFunction,
+        Star,
         Table,
         Workflow,
         Zap,
     ]
 );
+
+/// The glyphs a folder can be drawn with, by the key its look stores; the
+/// first is the plain folder's (no key stored).
+pub const FOLDER_GLYPHS: [(&str, IconName); 8] = [
+    ("folder", IconName::Folder),
+    ("briefcase", IconName::Briefcase),
+    ("building", IconName::Building2),
+    ("house", IconName::House),
+    ("flask", IconName::FlaskConical),
+    ("server", IconName::Server),
+    ("cloud", IconName::Cloud),
+    ("star", IconName::Star),
+];
+
+/// The glyph of a folder's look; the folder glyph for none or an unknown
+/// key.
+pub fn folder_glyph(key: Option<&str>) -> IconName {
+    FOLDER_GLYPHS
+        .iter()
+        .find(|(name, _)| Some(*name) == key)
+        .map_or(IconName::Folder, |(_, glyph)| *glyph)
+}
 
 /// Kerno's assets: the engine logos, Kerno's brand files and the schema
 /// tree's glyphs, then everything the UI kit bundles.
@@ -174,14 +204,16 @@ mod tests {
             let bytes = Assets.load(path).unwrap().expect(path);
             assert!(bytes.windows(4).any(|window| window == b"<svg"), "{path}");
         }
-        // So is every glyph of the schema tree.
-        use gpui_kit::assets::IconName;
+        // So is every glyph of the schema tree, and of folders.
         for glyph in [
             IconName::Database,
             IconName::Table,
             IconName::SquareFunction,
             IconName::Zap,
-        ] {
+        ]
+        .into_iter()
+        .chain(FOLDER_GLYPHS.map(|(_, glyph)| glyph))
+        {
             let path = glyph.path();
             assert!(TreeGlyphs.load(&path).unwrap().is_some(), "{path}");
         }

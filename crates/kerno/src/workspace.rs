@@ -24,7 +24,9 @@ use gpui_kit::{
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
     SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
-use kerno_core::config::{ConnectionConfig, Secret, export_connections, import_connections};
+use kerno_core::config::{
+    ConnectionConfig, Secret, export_connections_with_folders, import_connections_file,
+};
 
 use crate::actions::{
     self, About, AddRow, ApplyChanges, BackupDatabase, CancelQuery, CloseAllTabs, CloseOtherTabs,
@@ -1533,7 +1535,7 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        crate::settings_view::SettingsView::open(window, cx);
+        crate::settings_view::SettingsView::open(self.connections.clone(), window, cx);
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
@@ -2839,9 +2841,11 @@ impl Workspace {
             .map(|saved| saved.config.clone())
             .collect();
         let count = configs.len();
+        // Folders travel with their colour and glyph, never their picture.
+        let folders = AppState::get(cx).settings.folder_looks.clone();
         let target = path.clone();
         let writing = bridge::spawn_blocking(cx, move || {
-            let json = export_connections(&configs)?;
+            let json = export_connections_with_folders(&configs, &folders)?;
             std::fs::write(&target, json).map_err(|error| {
                 kerno_core::Error::io(format!("writing {}", target.display()), error)
             })
@@ -2902,14 +2906,17 @@ impl Workspace {
             let json = std::fs::read_to_string(&source).map_err(|error| {
                 kerno_core::Error::io(format!("reading {}", source.display()), error)
             })?;
-            import_connections(&json)
+            import_connections_file(&json)
         });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(configs) => {
-                    let count = configs.len();
-                    this.connections.update(cx, |connections, cx| connections.import(configs, cx));
+                Ok(file) => {
+                    let count = file.connections.len();
+                    this.connections.update(cx, |connections, cx| {
+                        connections.import(file.connections, cx);
+                        connections.import_folder_looks(file.folders, cx);
+                    });
                     window.push_notification(
                         Notification::success(SharedString::from(format!(
                             "Imported {count} connection{}. Enter their passwords when you connect.",
@@ -2987,16 +2994,15 @@ impl Workspace {
                 }),
             )
             .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                // The connection's tag as a dot, then its engine's logo; a
-                // production connection's title is tinted instead.
+                // The connection's tag as a dot, then its engine's logo; the
+                // title takes the colour of its environment, when it has one.
                 let config = self.connection_config(tab.connection(cx).as_deref(), cx);
                 let dot = config
                     .as_ref()
                     .and_then(|config| theme::connection_color(config, cx));
-                let production = config.as_ref().is_some_and(|config| {
-                    config.environment == kerno_core::Environment::Production
-                });
-                let danger = theme.danger;
+                let chrome = config
+                    .as_ref()
+                    .and_then(|config| theme::environment_chrome(config, cx));
                 Tab::new()
                     .when_some(config.as_ref(), |tab, config| {
                         tab.prefix(
@@ -3040,22 +3046,20 @@ impl Workspace {
                             .map(|title| marked(title, index))
                             .test_support()
                             .context_menu(self.menu(MenuOf::Tab(index), cx))
-                            .map(|title| {
+                            .map(|title| match chrome {
                                 // The kit's tab paints its own background, so
                                 // the tint goes on the title.
-                                if production {
-                                    title.child(
-                                        div()
-                                            .id(("tab-production", index))
-                                            .test_support()
-                                            .px_1()
-                                            .rounded_sm()
-                                            .bg(danger.opacity(0.12))
-                                            .child(tab.label(cx)),
-                                    )
-                                } else {
-                                    title.child(tab.label(cx))
-                                }
+                                Some(chrome) => title.child(
+                                    div()
+                                        .id(("tab-env", index))
+                                        .test_support()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(chrome.bar)
+                                        .text_color(chrome.bar_text)
+                                        .child(tab.label(cx)),
+                                ),
+                                None => title.child(tab.label(cx)),
                             }),
                     )
                     .suffix(
@@ -3129,18 +3133,7 @@ impl Workspace {
                 None,
             )];
         };
-        // Production is named in red whatever its tag colour.
-        let production = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|tab| tab.connection(cx))
-            .and_then(|id| self.connections.read(cx).get(&id).cloned())
-            .is_some_and(|saved| saved.config.environment == kerno_core::Environment::Production);
-        let mut items = vec![(
-            StatusItem::Connection,
-            connection,
-            production.then_some(theme.danger),
-        )];
+        let mut items = vec![(StatusItem::Connection, connection, None)];
         items.extend(database.map(|database| (StatusItem::Database, database, None)));
         if read_only {
             items.push((
@@ -3266,20 +3259,18 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// What the environment of the active tab's connection paints on the
+    /// chrome; `None` when it tints nothing.
+    pub fn active_chrome(&self, cx: &App) -> Option<theme::EnvironmentChrome> {
+        let connection = self.tabs.get(self.active_tab)?.connection(cx)?;
+        theme::environment_chrome(&self.connection_config(Some(connection.as_str()), cx)?, cx)
+    }
+
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, warning) = (theme.muted_foreground, theme.warning);
         let memory_only = !AppState::get(cx).secrets.is_persistent();
-        // A production connection tints the whole bar.
-        let production = self
-            .connection_config(
-                self.tabs
-                    .get(self.active_tab)
-                    .and_then(|tab| tab.connection(cx))
-                    .as_deref(),
-                cx,
-            )
-            .is_some_and(|config| config.environment == kerno_core::Environment::Production);
+        let chrome = self.active_chrome(cx);
         h_flex()
             .id("status-bar")
             .test_support()
@@ -3289,13 +3280,12 @@ impl Workspace {
             .justify_between()
             .border_t_1()
             .border_color(theme.status_bar_border)
-            .bg(if production {
-                theme.status_bar.blend(theme.danger.opacity(0.12))
-            } else {
-                theme.status_bar
-            })
+            // The environment of the active tab's connection tints the bar;
+            // its text then takes the one colour that reads on it (each item
+            // says what it is in words).
+            .bg(chrome.map_or(theme.status_bar, |chrome| chrome.bar))
             .text_xs()
-            .text_color(theme.muted_foreground)
+            .text_color(chrome.map_or(theme.muted_foreground, |chrome| chrome.bar_text))
             .child(
                 h_flex()
                     .gap_3()
@@ -3303,7 +3293,11 @@ impl Workspace {
                         self.status_items(cx)
                             .into_iter()
                             .map(|(item, text, color)| {
-                                self.render_status_item(item, text, color.unwrap_or(muted), cx)
+                                let color = match chrome {
+                                    Some(chrome) => chrome.bar_text,
+                                    None => color.unwrap_or(muted),
+                                };
+                                self.render_status_item(item, text, color, cx)
                             }),
                     ),
             )
@@ -4345,10 +4339,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collapse_schema_tree))
             .on_action(cx.listener(|this, _: &EditObject, window, cx| {
                 let navigator = this.sidebar.read(cx).navigator().clone();
-                // F4 on a connection edits it; on a folder, renames it.
+                // F4 on a connection edits it; on a folder, opens Edit folder….
                 let edit = match navigator.read(cx).selected_subject(cx) {
                     Some(subject @ Subject::Connection(_)) => Some((subject, SidebarAction::Edit)),
-                    Some(subject) => Some((subject, SidebarAction::Rename)),
+                    Some(subject) => Some((subject, SidebarAction::EditFolder)),
                     None => None,
                 };
                 match edit {

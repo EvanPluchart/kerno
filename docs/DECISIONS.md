@@ -833,3 +833,21 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **A PostgreSQL client older than the server blocks Start** with the reason (`pg_dump` would refuse);
   another MySQL / MariaDB version only warns.
 - The old `tool_paths` setting is turned into added folders once.
+
+## D-047 — Folder looks and the app icon: what was decided while building them
+
+- **A folder's picture is untrusted input.** Only `.png`, `.jpg`, `.jpeg`, `.svg`; at most 2 MB read
+  whatever the file claims; decoding capped at 4096 px a side and 128 MB; done off the UI thread; a
+  decoder that panics counts as an unreadable file. SVG goes through `resvg` with a resolver that never
+  reads another file (GPUI's default would follow an `<image href>` to any path). The copy is a 32 px PNG
+  named from a hash of its content, in `folder-icons/` of the data directory; the name is never taken from
+  the picked path.
+- **Unused pictures are removed** after each change, off the UI thread: only files named the way Kerno
+  names them, and only those older than the change, so a picture just picked in an open dialog stays.
+- **Looks follow their folders** through rename and move; when deleting a folder merges a child into an
+  existing folder of the same name, the existing folder's look wins. Export carries colour and glyph, never
+  the picture; import drops any picture name and fills only folders with no look yet.
+- **F4 on a folder opens "Edit folder…"**; F2 stays Rename.
+- **The Dock icon is set at every start**, inside `Kerno.app` too (setting it twice is harmless). The one
+  `unsafe` call is in `crates/kerno/src/app_icon.rs`, as D-042 allowed; nothing else in the workspace uses
+  `unsafe`. Linux: `app_id` / `WM_CLASS` `kerno`, `StartupWMClass` in the desktop entry, the X11 window icon.

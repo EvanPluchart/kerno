@@ -23,6 +23,17 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+# Folder icons the user picks, and the window icon on Linux. Both crates are
+# already in the lock through GPUI; no feature here pulls a new crate.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts"] }
+
+# The Dock icon of the bare binary (crates/kerno/src/app_icon.rs); already in
+# the lock through GPUI.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

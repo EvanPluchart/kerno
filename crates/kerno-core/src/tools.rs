@@ -88,6 +88,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 use crate::config::{ConnectParams, Engine, Secret, TlsConfig, TlsMode};
@@ -96,13 +97,16 @@ use crate::schema::TableRef;
 use crate::ssh::Tunnel;
 
 /// A client tool Kerno runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Tool {
     /// `pg_dump`.
     PgDump,
-    /// `pg_restore`, for custom-format dumps.
+    /// `pg_dumpall`, for the global backup (roles, tablespaces, every
+    /// database).
+    PgDumpall,
+    /// `pg_restore`, for custom, directory and tar archives.
     PgRestore,
-    /// `psql`, for plain SQL dumps.
+    /// `psql`, for plain SQL dumps and scripts.
     Psql,
     /// `mysqldump`, or MariaDB's `mariadb-dump`.
     MysqlDump,
@@ -115,10 +119,501 @@ impl Tool {
     pub fn names(self) -> &'static [&'static str] {
         match self {
             Self::PgDump => &["pg_dump"],
+            Self::PgDumpall => &["pg_dumpall"],
             Self::PgRestore => &["pg_restore"],
             Self::Psql => &["psql"],
             Self::MysqlDump => &["mysqldump", "mariadb-dump"],
             Self::Mysql => &["mysql", "mariadb"],
+        }
+    }
+
+    /// The name messages use: the first binary name.
+    pub fn name(self) -> &'static str {
+        self.names()[0]
+    }
+
+    /// The engines whose client ships the tool.
+    pub fn family(self) -> ClientFamily {
+        match self {
+            Self::PgDump | Self::PgDumpall | Self::PgRestore | Self::Psql => ClientFamily::Postgres,
+            Self::MysqlDump | Self::Mysql => ClientFamily::MySql,
+        }
+    }
+}
+
+/// The client tools of one kind of engine, installed together in one
+/// folder (DBeaver's "local client", `DBPNativeClientLocation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientFamily {
+    /// `pg_dump`, `pg_dumpall`, `pg_restore`, `psql`.
+    Postgres,
+    /// `mysqldump`, `mysql` and MariaDB's `mariadb-dump`, `mariadb`.
+    MySql,
+}
+
+impl ClientFamily {
+    /// Both families, in the order the settings list them.
+    pub const ALL: [ClientFamily; 2] = [Self::Postgres, Self::MySql];
+
+    /// The family whose tools reach `engine`.
+    pub fn of(engine: Engine) -> Self {
+        match engine {
+            Engine::Postgres => Self::Postgres,
+            Engine::MySql | Engine::MariaDb => Self::MySql,
+        }
+    }
+
+    /// Its tools; the first one present in a folder identifies the install
+    /// and gives its version.
+    pub fn tools(self) -> &'static [Tool] {
+        match self {
+            Self::Postgres => &[Tool::PgDump, Tool::Psql, Tool::PgRestore, Tool::PgDumpall],
+            Self::MySql => &[Tool::MysqlDump, Tool::Mysql],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::MySql => "MySQL and MariaDB",
+        }
+    }
+
+    /// How the client is usually installed, for a message that says none
+    /// was found.
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::Postgres => {
+                "with “brew install libpq” on macOS, or the postgresql-client package of the \
+                 Linux distribution"
+            }
+            Self::MySql => {
+                "with “brew install mysql-client” (or “mariadb”) on macOS, or the \
+                 default-mysql-client or mariadb-client package of the Linux distribution"
+            }
+        }
+    }
+}
+
+/// Where an install was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientSource {
+    /// A folder the user added (or chose for a connection).
+    Added,
+    /// A Homebrew formula (`Cellar/<formula>/<version>/bin`).
+    Homebrew,
+    /// A version of Postgres.app.
+    PostgresApp,
+    /// An EnterpriseDB installer (`/Library/PostgreSQL/<n>/bin`).
+    Edb,
+    /// A distribution package (`/usr/lib/postgresql/<n>/bin`).
+    Linux,
+    /// A folder of `$PATH` or of [`FALLBACK_DIRS`].
+    Path,
+}
+
+impl ClientSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Homebrew => "Homebrew",
+            Self::PostgresApp => "Postgres.app",
+            Self::Edb => "EDB installer",
+            Self::Linux => "system package",
+            Self::Path => "PATH",
+        }
+    }
+}
+
+/// One installed client: a folder holding the tools of a family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInstall {
+    pub family: ClientFamily,
+    /// The folder, links resolved: the real folder of its first tool.
+    pub dir: PathBuf,
+    pub source: ClientSource,
+    /// The version of its first tool; `None` when it does not run.
+    pub version: Option<ToolVersion>,
+    /// Each tool present, with its binary in `dir`.
+    pub tools: Vec<(Tool, PathBuf)>,
+}
+
+impl ClientInstall {
+    /// The binary of `tool`, when this install has it.
+    pub fn path(&self, tool: Tool) -> Option<&Path> {
+        self.tools
+            .iter()
+            .find(|(present, _)| *present == tool)
+            .map(|(_, path)| path.as_path())
+    }
+
+    /// `PostgreSQL 18.6 · Homebrew` or `MariaDB 11.8.3 · PATH`.
+    pub fn label(&self) -> String {
+        let product = match (&self.version, self.family) {
+            (Some(version), _) if version.mariadb => "MariaDB",
+            (_, ClientFamily::Postgres) => "PostgreSQL",
+            (_, ClientFamily::MySql) => "MySQL",
+        };
+        let version = self.version.as_ref().map_or("version unknown".into(), |v| {
+            let (major, minor, patch) = v.number;
+            if self.family == ClientFamily::Postgres {
+                format!("{major}.{minor}")
+            } else {
+                format!("{major}.{minor}.{patch}")
+            }
+        });
+        format!("{product} {version} · {}", self.source.label())
+    }
+}
+
+/// Where [`detect_clients`] looks, injectable for tests.
+#[derive(Debug, Clone, Default)]
+pub struct ClientRoots {
+    /// `$PATH`.
+    pub path_var: Option<std::ffi::OsString>,
+    /// Homebrew prefixes (`/opt/homebrew`, `/usr/local`): their `Cellar`.
+    pub homebrew: Vec<PathBuf>,
+    /// `/Applications/Postgres.app/Contents/Versions`.
+    pub postgres_app: Vec<PathBuf>,
+    /// `/Library/PostgreSQL`.
+    pub edb: Vec<PathBuf>,
+    /// `/usr/lib/postgresql`.
+    pub linux: Vec<PathBuf>,
+    /// Folders looked at after `$PATH` ([`FALLBACK_DIRS`]).
+    pub fallbacks: Vec<PathBuf>,
+    /// Folders the user added or chose, looked at first.
+    pub added: Vec<PathBuf>,
+}
+
+impl ClientRoots {
+    /// The usual places on this computer, plus `added`.
+    pub fn system(added: Vec<PathBuf>) -> Self {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect();
+        Self {
+            path_var: std::env::var_os("PATH"),
+            homebrew: paths(&["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"]),
+            postgres_app: paths(&["/Applications/Postgres.app/Contents/Versions"]),
+            edb: paths(&["/Library/PostgreSQL"]),
+            linux: paths(&["/usr/lib/postgresql"]),
+            fallbacks: paths(&FALLBACK_DIRS),
+            added,
+        }
+    }
+}
+
+/// The Homebrew formulas that hold client tools, by name or prefix.
+const HOMEBREW_FORMULAS: [&str; 5] = ["libpq", "postgresql", "mysql-client", "mysql", "mariadb"];
+
+/// Every client installed (DBeaver's `findLocalClients` of
+/// `PostgreDataSourceProvider` and `MySQLDataSourceProvider`, which look in
+/// the PostgreSQL and Postgres.app folders and in `$PATH`), widened to each
+/// Homebrew Cellar version: one entry per real folder (links resolved, a
+/// folder reached twice kept once, where it is first found), each with the
+/// version of its first tool. Sorted by family, newest version first, then
+/// by folder. Blocking: it reads the file system and runs `--version`.
+pub fn detect_clients(roots: &ClientRoots) -> Vec<ClientInstall> {
+    let mut candidates: Vec<(PathBuf, ClientSource)> = Vec::new();
+    let mut push_all = |dirs: Vec<PathBuf>, source| {
+        candidates.extend(dirs.into_iter().map(|dir| (dir, source)));
+    };
+    push_all(roots.added.clone(), ClientSource::Added);
+    for prefix in &roots.homebrew {
+        let formulas = subdirs(&prefix.join("Cellar"))
+            .into_iter()
+            .filter(|formula| {
+                formula.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    HOMEBREW_FORMULAS.iter().any(|known| {
+                        name == *known
+                            || name
+                                .strip_prefix(known)
+                                .is_some_and(|rest| rest.starts_with('@'))
+                    })
+                })
+            });
+        let versions = formulas.flat_map(|formula| subdirs(&formula));
+        push_all(
+            versions.map(|version| version.join("bin")).collect(),
+            ClientSource::Homebrew,
+        );
+    }
+    for (roots, source) in [
+        (&roots.postgres_app, ClientSource::PostgresApp),
+        (&roots.edb, ClientSource::Edb),
+        (&roots.linux, ClientSource::Linux),
+    ] {
+        for root in roots {
+            push_all(
+                subdirs(root)
+                    .into_iter()
+                    .map(|dir| dir.join("bin"))
+                    .collect(),
+                source,
+            );
+        }
+    }
+    let path = roots
+        .path_var
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(roots.fallbacks.iter().cloned())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+    push_all(path, ClientSource::Path);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for (dir, source) in candidates {
+        for family in ClientFamily::ALL {
+            let Some(key) = family.tools().iter().find_map(|tool| tool_in(&dir, *tool)) else {
+                continue;
+            };
+            // The real folder of the first tool: `/opt/homebrew/bin/pg_dump`
+            // is a link into `Cellar/postgresql@14/…/bin`.
+            let real = std::fs::canonicalize(&key).unwrap_or(key);
+            let Some(real_dir) = real.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            if !seen.insert((family, real_dir.clone())) {
+                continue;
+            }
+            let tools: Vec<(Tool, PathBuf)> = family
+                .tools()
+                .iter()
+                .filter_map(|tool| tool_in(&real_dir, *tool).map(|path| (*tool, path)))
+                .collect();
+            let Some((_, first)) = tools.first() else {
+                continue;
+            };
+            found.push(ClientInstall {
+                family,
+                version: version(first),
+                dir: real_dir,
+                source,
+                tools,
+            });
+        }
+    }
+    found.sort_by(|a, b| {
+        let number = |install: &ClientInstall| install.version.as_ref().map(|v| v.number);
+        a.family
+            .cmp(&b.family)
+            .then_with(|| number(b).cmp(&number(a)))
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
+    found
+}
+
+/// The folders inside `dir`, sorted; none when it cannot be read.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// The binary of `tool` in `dir`, by the first of its names present.
+fn tool_in(dir: &Path, tool: Tool) -> Option<PathBuf> {
+    tool.names()
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| is_executable(path))
+}
+
+/// Probes one folder chosen by the user: the install it holds for
+/// `family`, or `None` when it holds none of the family's tools. Blocking.
+pub fn probe_client(dir: &Path, family: ClientFamily) -> Option<ClientInstall> {
+    let roots = ClientRoots {
+        added: vec![dir.to_path_buf()],
+        ..ClientRoots::default()
+    };
+    detect_clients(&roots)
+        .into_iter()
+        .find(|install| install.family == family)
+}
+
+/// Why no client can be used for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientMissing {
+    pub family: ClientFamily,
+}
+
+impl ClientMissing {
+    /// What happened and what to do, in words.
+    pub fn text(&self) -> String {
+        let family = self.family;
+        format!(
+            "No {} client was found: Kerno looked in Homebrew, Postgres.app, the EDB and Linux \
+             package folders, $PATH, {} and the folders added in Settings ▸ Local clients. It is \
+             usually installed {}. Then add its folder in Settings ▸ Local clients.",
+            family.label(),
+            FALLBACK_DIRS.join(", "),
+            family.install_hint()
+        )
+    }
+}
+
+/// What a connection asks of [`client_for`].
+#[derive(Debug, Clone, Copy)]
+pub struct ClientWanted<'a> {
+    pub engine: Engine,
+    /// The connection's own choice (Advanced tab, or the wizard's "Local
+    /// client…").
+    pub connection_dir: Option<&'a Path>,
+    /// The default of the family (Settings ▸ Local clients).
+    pub default_dir: Option<&'a Path>,
+}
+
+/// The client [`client_for`] chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientPick<'a> {
+    pub install: &'a ClientInstall,
+    /// A folder asked for (by the connection, or as the default) that is
+    /// neither a detected install nor a folder the user added: never run,
+    /// the next choice was taken instead.
+    pub ignored: Option<PathBuf>,
+}
+
+/// The client a connection uses: its own folder, else the family's
+/// default, else the newest install found (of the server's own flavour
+/// first: MariaDB's client for a MariaDB server).
+///
+/// A folder is used only when it is one of `detected` ([`detect_clients`],
+/// whose [`ClientRoots::added`] are the folders the user added in Settings
+/// ▸ Local clients or with the wizard's Browse…): a folder stored with a
+/// connection or in saved settings could otherwise run programs someone
+/// else chose. One that is not is reported in [`ClientPick::ignored`].
+pub fn client_for<'a>(
+    detected: &'a [ClientInstall],
+    wanted: &ClientWanted,
+) -> std::result::Result<ClientPick<'a>, ClientMissing> {
+    let family = ClientFamily::of(wanted.engine);
+    let in_family = || {
+        detected
+            .iter()
+            .filter(move |install| install.family == family)
+    };
+    let mut ignored = None;
+    for dir in [wanted.connection_dir, wanted.default_dir]
+        .into_iter()
+        .flatten()
+    {
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        match in_family().find(|install| install.dir == real || install.dir == dir) {
+            Some(install) => return Ok(ClientPick { install, ignored }),
+            None => {
+                ignored.get_or_insert_with(|| dir.to_path_buf());
+            }
+        }
+    }
+    let mariadb = wanted.engine == Engine::MariaDb;
+    in_family()
+        .max_by(|a, b| {
+            let rank = |install: &ClientInstall| {
+                (
+                    install
+                        .version
+                        .as_ref()
+                        .is_some_and(|version| version.mariadb == mariadb),
+                    install.version.as_ref().map(|version| version.number),
+                )
+            };
+            // Ties keep the first (detection order): `max_by` keeps the last.
+            rank(a).cmp(&rank(b)).then(std::cmp::Ordering::Greater)
+        })
+        .map(|install| ClientPick { install, ignored })
+        .ok_or(ClientMissing { family })
+}
+
+/// Whether a client suits a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compatibility {
+    Ok,
+    /// PostgreSQL: `pg_dump` and `pg_dumpall` refuse a server of a newer
+    /// major version than theirs.
+    ClientOlder {
+        client_major: u32,
+        server_major: u32,
+    },
+    /// MySQL / MariaDB: another major version, or the other product's
+    /// client; it usually works, so it is only a warning.
+    OtherVersion {
+        client_major: u32,
+        server_major: u32,
+    },
+    /// The client's version could not be read.
+    Unknown,
+}
+
+impl Compatibility {
+    /// Whether the tool would refuse to run.
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::ClientOlder { .. })
+    }
+
+    /// The warning to show before running, if any.
+    pub fn warning(self, engine: Engine) -> Option<String> {
+        match self {
+            Self::Ok => None,
+            Self::ClientOlder {
+                client_major,
+                server_major,
+            } => Some(format!(
+                "This client is PostgreSQL {client_major}, older than the server \
+                 (PostgreSQL {server_major}): pg_dump refuses a server newer than itself. \
+                 Choose a client {server_major} or newer with “Local client…”."
+            )),
+            Self::OtherVersion {
+                client_major,
+                server_major,
+            } => Some(format!(
+                "This client is version {client_major} and the server {} {server_major}: it \
+                 usually works; if the tool fails, choose a client of the server's version with \
+                 “Local client…”.",
+                engine.label()
+            )),
+            Self::Unknown => Some(
+                "The client's version could not be read: it may not run. Choose another with \
+                 “Local client…”."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// Whether `client` suits a server of `engine` at `server_version`.
+pub fn compatibility(
+    client: Option<&ToolVersion>,
+    engine: Engine,
+    server_version: (u32, u32, u32),
+) -> Compatibility {
+    let Some(client) = client else {
+        return Compatibility::Unknown;
+    };
+    let (client_major, server_major) = (client.number.0, server_version.0);
+    match engine {
+        Engine::Postgres if client_major < server_major => Compatibility::ClientOlder {
+            client_major,
+            server_major,
+        },
+        Engine::Postgres => Compatibility::Ok,
+        Engine::MySql | Engine::MariaDb => {
+            let same_product = client.mariadb == (engine == Engine::MariaDb);
+            if same_product && client_major == server_major {
+                Compatibility::Ok
+            } else {
+                Compatibility::OtherVersion {
+                    client_major,
+                    server_major,
+                }
+            }
         }
     }
 }
@@ -179,79 +674,6 @@ fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// The tool that writes a backup of `engine`.
-pub fn backup_tool(engine: Engine) -> Tool {
-    match engine {
-        Engine::Postgres => Tool::PgDump,
-        Engine::MySql | Engine::MariaDb => Tool::MysqlDump,
-    }
-}
-
-/// The tool that restores a backup of `engine` written in `format`.
-pub fn restore_tool(engine: Engine, format: BackupFormat) -> Tool {
-    match (engine, format) {
-        (Engine::Postgres, BackupFormat::Sql) => Tool::Psql,
-        (Engine::Postgres, BackupFormat::Custom) => Tool::PgRestore,
-        (Engine::MySql | Engine::MariaDb, _) => Tool::Mysql,
-    }
-}
-
-/// How a backup is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BackupFormat {
-    /// A plain SQL script (every engine).
-    #[default]
-    Sql,
-    /// PostgreSQL's compressed custom format (`pg_dump -Fc`), restored with
-    /// `pg_restore`.
-    Custom,
-}
-
-/// What a backup contains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BackupContent {
-    /// Definitions and data.
-    #[default]
-    All,
-    /// Definitions only.
-    SchemaOnly,
-    /// Data only.
-    DataOnly,
-}
-
-/// What to back up and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupOptions {
-    /// The database to back up.
-    pub database: String,
-    /// The file written.
-    pub output: PathBuf,
-    /// Its format.
-    pub format: BackupFormat,
-    /// Definitions, data, or both.
-    pub content: BackupContent,
-    /// Only these tables; every table when empty. On MySQL they must be in
-    /// `database`.
-    pub tables: Vec<TableRef>,
-}
-
-/// What to restore and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestoreOptions {
-    /// The database restored into.
-    pub database: String,
-    /// The backup file.
-    pub input: PathBuf,
-    /// Its format.
-    pub format: BackupFormat,
-    /// Run the client commands a SQL file holds (see the module
-    /// documentation): only for a file the user trusts.
-    pub allow_client_commands: bool,
-    /// The restore tool's version, from [`version`]. `None` (unknown) means
-    /// the file is scanned instead of relying on the tool's own sandbox.
-    pub tool_version: Option<ToolVersion>,
 }
 
 /// A tool's version, as `--version` prints it.
@@ -430,67 +852,945 @@ fn quote(text: &str) -> String {
     }
 }
 
-/// The command that backs up `options.database` with the dump tool at
-/// `tool_path` (`pg_dump`, or `mysqldump` / `mariadb-dump`).
+/// The tool that writes a backup of `engine`.
+pub fn backup_tool(engine: Engine) -> Tool {
+    match engine {
+        Engine::Postgres => Tool::PgDump,
+        Engine::MySql | Engine::MariaDb => Tool::MysqlDump,
+    }
+}
+
+/// The tool that restores a backup of `engine` written in `format`.
+pub fn restore_tool(engine: Engine, format: BackupFormat) -> Tool {
+    match (engine, format) {
+        (Engine::Postgres, BackupFormat::Sql) => Tool::Psql,
+        (Engine::Postgres, _) => Tool::PgRestore,
+        (Engine::MySql | Engine::MariaDb, _) => Tool::Mysql,
+    }
+}
+
+/// The tool that runs a SQL script on `engine`.
+pub fn script_tool(engine: Engine) -> Tool {
+    restore_tool(engine, BackupFormat::Sql)
+}
+
+/// How a backup is written (DBeaver's `PostgreBackupRestoreSettings.ExportFormat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupFormat {
+    /// A plain SQL script (every engine), run by `psql` / `mysql`.
+    #[default]
+    Sql,
+    /// PostgreSQL's compressed custom archive (`pg_dump -Fc`).
+    Custom,
+    /// PostgreSQL's directory archive (`-Fd`), one file per table; the
+    /// only one `pg_dump --jobs` writes.
+    Directory,
+    /// PostgreSQL's tar archive (`-Ft`).
+    Tar,
+}
+
+impl BackupFormat {
+    /// PostgreSQL's formats, in DBeaver's order.
+    pub const POSTGRES: [BackupFormat; 4] = [Self::Sql, Self::Custom, Self::Directory, Self::Tar];
+
+    /// `pg_dump --format`'s letter.
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Sql => "p",
+            Self::Custom => "c",
+            Self::Directory => "d",
+            Self::Tar => "t",
+        }
+    }
+
+    /// The extension of the file written; none for a directory.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::Custom => "dump",
+            Self::Directory => "",
+            Self::Tar => "tar",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sql => "Plain SQL",
+            Self::Custom => "Custom",
+            Self::Directory => "Directory",
+            Self::Tar => "Tar",
+        }
+    }
+}
+
+/// What a backup contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupContent {
+    /// Definitions and data.
+    #[default]
+    All,
+    /// Definitions only.
+    SchemaOnly,
+    /// Data only.
+    DataOnly,
+}
+
+/// `pg_dump`'s own options (DBeaver's `PostgreDatabaseBackupSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PgBackup {
+    /// `--compress=0..9`; the format's default when `None`.
+    pub compression: Option<u8>,
+    /// `--encoding`; the server's when `None`.
+    pub encoding: Option<String>,
+    /// `--inserts`: INSERT statements instead of COPY.
+    pub inserts: bool,
+    /// `--no-privileges`.
+    pub no_privileges: bool,
+    /// `--no-owner`.
+    pub no_owner: bool,
+    /// `--clean`: DROP statements before each CREATE.
+    pub clean: bool,
+    /// `--if-exists` (with `clean`).
+    pub if_exists: bool,
+    /// `--create`: CREATE DATABASE and a reconnect to it.
+    pub create: bool,
+    /// `--jobs`: parallel dump, directory format only.
+    pub jobs: Option<u32>,
+}
+
+/// How `mysqldump` keeps the dump consistent (DBeaver's `DumpMethod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DumpMethod {
+    /// `--single-transaction`: a consistent snapshot of InnoDB tables, no
+    /// lock.
+    #[default]
+    SingleTransaction,
+    /// `--lock-all-tables`: a global read lock for the whole dump.
+    LockAllTables,
+    /// `--skip-lock-tables`: no lock, no snapshot.
+    NoLocks,
+}
+
+impl DumpMethod {
+    pub const ALL: [DumpMethod; 3] = [Self::SingleTransaction, Self::LockAllTables, Self::NoLocks];
+
+    fn option(self) -> &'static str {
+        match self {
+            Self::SingleTransaction => "--single-transaction",
+            Self::LockAllTables => "--lock-all-tables",
+            Self::NoLocks => "--skip-lock-tables",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SingleTransaction => "Single transaction",
+            Self::LockAllTables => "Lock all tables",
+            Self::NoLocks => "No locks",
+        }
+    }
+}
+
+/// `mysqldump`'s own options (DBeaver's `MySQLExportSettings`), at the
+/// tool's defaults except `routines` and `hex_blob`, on as Kerno always
+/// had them (a binary column dumped raw can spell a client command that
+/// the restore check then refuses).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MySqlBackup {
+    pub method: DumpMethod,
+    /// `--routines`: procedures and functions.
+    pub routines: bool,
+    /// `--events`.
+    pub events: bool,
+    /// `--skip-triggers` when off.
+    pub triggers: bool,
+    /// `--skip-extended-insert` when off: one INSERT per row.
+    pub extended_inserts: bool,
+    /// `--skip-add-drop-table` when off.
+    pub add_drop_table: bool,
+    /// `--skip-disable-keys` when off.
+    pub disable_keys: bool,
+    /// `--hex-blob`.
+    pub hex_blob: bool,
+    /// `--skip-comments` when off.
+    pub comments: bool,
+}
+
+impl Default for MySqlBackup {
+    fn default() -> Self {
+        Self {
+            method: DumpMethod::default(),
+            routines: true,
+            events: false,
+            triggers: true,
+            extended_inserts: true,
+            add_drop_table: true,
+            disable_keys: true,
+            hex_blob: true,
+            comments: true,
+        }
+    }
+}
+
+/// The options of the engine's dump tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", rename_all = "lowercase")]
+pub enum EngineBackup {
+    Postgres(PgBackup),
+    #[serde(rename = "mysql")]
+    MySql(MySqlBackup),
+}
+
+/// The default name of a backup file, without its extension (DBeaver's
+/// `dump-${database}-${timestamp}`).
+pub const DEFAULT_FILE_PATTERN: &str = "${database}-${timestamp}";
+
+/// A backup of one database: the settings of the backup wizard, which a
+/// saved task keeps. The file is `output_folder` / `file_pattern` with its
+/// variables filled ([`file_name`]) and the format's extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupOptions {
+    /// The database to back up.
+    pub database: String,
+    /// The format (MySQL and MariaDB: SQL only).
+    #[serde(default)]
+    pub format: BackupFormat,
+    /// Definitions, data, or both.
+    #[serde(default)]
+    pub content: BackupContent,
+    /// PostgreSQL: only these schemas (`--schema`). Empty with `tables`
+    /// empty: the whole database.
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    /// Only these tables (`--table`, or after the database on MySQL, where
+    /// they must be in `database`). pg_dump ignores `--schema` once a
+    /// `--table` is given: both at once are refused.
+    #[serde(default)]
+    pub tables: Vec<TableRef>,
+    /// The dump tool's own options.
+    pub engine: EngineBackup,
+    /// The folder the file is written to.
+    #[serde(default)]
+    pub output_folder: PathBuf,
+    /// The file name, with variables ([`file_name`]).
+    #[serde(default = "default_pattern")]
+    pub file_pattern: String,
+    /// More arguments, split as a shell would ([`extra_args`]).
+    #[serde(default)]
+    pub extra_args: String,
+    /// Another user for this tool (DBeaver's "override credentials"); its
+    /// password is asked at each run and never kept here.
+    #[serde(default)]
+    pub auth_user: Option<String>,
+}
+
+fn default_pattern() -> String {
+    DEFAULT_FILE_PATTERN.into()
+}
+
+impl BackupOptions {
+    /// A whole-database backup at the defaults of `engine`'s tool (DBeaver
+    /// starts PostgreSQL backups in the custom format).
+    pub fn new(engine: Engine, database: impl Into<String>) -> Self {
+        let (format, tool) = match engine {
+            Engine::Postgres => (
+                BackupFormat::Custom,
+                EngineBackup::Postgres(PgBackup::default()),
+            ),
+            Engine::MySql | Engine::MariaDb => (
+                BackupFormat::Sql,
+                EngineBackup::MySql(MySqlBackup::default()),
+            ),
+        };
+        Self {
+            database: database.into(),
+            format,
+            content: BackupContent::All,
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            engine: tool,
+            output_folder: PathBuf::new(),
+            file_pattern: default_pattern(),
+            extra_args: String::new(),
+            auth_user: None,
+        }
+    }
+}
+
+/// `pg_dumpall`'s options (DBeaver's `PostgreBackupAllSettings`): the
+/// global backup of a whole server. It only reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlobalBackupOptions {
+    /// `--encoding`; the server's when `None`.
+    pub encoding: Option<String>,
+    /// `--schema-only`.
+    pub schema_only: bool,
+    /// `--globals-only`: roles and tablespaces, no database.
+    pub globals_only: bool,
+    /// `--roles-only`.
+    pub roles_only: bool,
+    /// `--tablespaces-only`.
+    pub tablespaces_only: bool,
+    /// `--no-privileges`.
+    pub no_privileges: bool,
+    /// `--no-owner`.
+    pub no_owner: bool,
+    /// Off: `--no-role-passwords` (DBeaver leaves the passwords out by
+    /// default).
+    pub role_passwords: bool,
+    /// `--exclude-database`, each name matched literally.
+    pub exclude_databases: Vec<String>,
+    pub output_folder: PathBuf,
+    pub file_pattern: String,
+    pub extra_args: String,
+    pub auth_user: Option<String>,
+}
+
+impl Default for GlobalBackupOptions {
+    fn default() -> Self {
+        Self {
+            encoding: None,
+            schema_only: false,
+            globals_only: false,
+            roles_only: false,
+            tablespaces_only: false,
+            no_privileges: false,
+            no_owner: false,
+            role_passwords: false,
+            exclude_databases: Vec::new(),
+            output_folder: PathBuf::new(),
+            file_pattern: "${host}-${timestamp}".into(),
+            extra_args: String::new(),
+            auth_user: None,
+        }
+    }
+}
+
+/// What to restore and where (DBeaver's `PostgreDatabaseRestoreSettings`,
+/// and MySQL's script import). The settings of the restore wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreOptions {
+    /// The database restored into.
+    pub database: String,
+    /// The backup file (a folder for the directory format).
+    pub input: PathBuf,
+    /// Its format, as [`guess_format`] reads it.
+    #[serde(default)]
+    pub format: BackupFormat,
+    /// pg_restore `--clean`: drop each object before creating it.
+    #[serde(default)]
+    pub clean: bool,
+    /// pg_restore `--if-exists` (with `clean`).
+    #[serde(default)]
+    pub if_exists: bool,
+    /// pg_restore `--create`: create the database named in the archive
+    /// (dropped first with `clean`) and restore into it, not into
+    /// `database`, which is only where pg_restore connects first.
+    #[serde(default)]
+    pub create: bool,
+    /// pg_restore `--no-owner`.
+    #[serde(default)]
+    pub no_owner: bool,
+    /// pg_restore `--no-privileges`.
+    #[serde(default)]
+    pub no_privileges: bool,
+    /// pg_restore `--jobs` (custom and directory archives; not in one
+    /// transaction).
+    #[serde(default)]
+    pub jobs: Option<u32>,
+    /// PostgreSQL: all or nothing (`--single-transaction`).
+    #[serde(default)]
+    pub single_transaction: bool,
+    /// MySQL / MariaDB: `SET SESSION FOREIGN_KEY_CHECKS=0` first.
+    #[serde(default)]
+    pub disable_foreign_keys: bool,
+    #[serde(default)]
+    pub extra_args: String,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    /// Run the client commands a SQL file holds (see the module
+    /// documentation): only for a file the user trusts, asked at each run.
+    #[serde(skip)]
+    pub allow_client_commands: bool,
+    /// The restore tool's version, from [`version`]. `None` (unknown) means
+    /// the file is scanned instead of relying on the tool's own sandbox.
+    #[serde(skip)]
+    pub tool_version: Option<ToolVersion>,
+}
+
+impl RestoreOptions {
+    /// A restore of `input` into `database` at Kerno's defaults: PostgreSQL
+    /// restores in one transaction.
+    pub fn new(
+        engine: Engine,
+        database: impl Into<String>,
+        input: impl Into<PathBuf>,
+        format: BackupFormat,
+    ) -> Self {
+        Self {
+            database: database.into(),
+            input: input.into(),
+            format,
+            clean: false,
+            if_exists: false,
+            create: false,
+            no_owner: false,
+            no_privileges: false,
+            jobs: None,
+            single_transaction: engine == Engine::Postgres,
+            disable_foreign_keys: false,
+            extra_args: String::new(),
+            auth_user: None,
+            allow_client_commands: false,
+            tool_version: None,
+        }
+    }
+}
+
+/// How much `mysql` says while running a script (DBeaver's
+/// `MySQLScriptExecuteSettings.LogLevel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptLogLevel {
+    #[default]
+    Normal,
+    /// `--verbose`. (DBeaver's third level, `--debug-info`, makes a
+    /// client built without debugging exit with an error: not offered.)
+    Verbose,
+}
+
+impl ScriptLogLevel {
+    pub const ALL: [ScriptLogLevel; 2] = [Self::Normal, Self::Verbose];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Verbose => "Verbose",
+        }
+    }
+}
+
+/// A SQL file run by the engine's client (DBeaver's "Execute script":
+/// `PostgreScriptExecuteSettings`, `MySQLScriptExecuteSettings`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptOptions {
+    /// The database the script runs in.
+    pub database: String,
+    /// The script.
+    pub input: PathBuf,
+    /// MySQL / MariaDB only.
+    #[serde(default)]
+    pub log_level: ScriptLogLevel,
+    /// MySQL / MariaDB: `--no-beep`.
+    #[serde(default = "yes")]
+    pub no_beep: bool,
+    /// MySQL / MariaDB: foreign-key checks off for the session.
+    #[serde(default)]
+    pub disable_foreign_keys: bool,
+    #[serde(default)]
+    pub extra_args: String,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    #[serde(skip)]
+    pub allow_client_commands: bool,
+    #[serde(skip)]
+    pub tool_version: Option<ToolVersion>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl ScriptOptions {
+    pub fn new(engine: Engine, database: impl Into<String>, input: impl Into<PathBuf>) -> Self {
+        Self {
+            database: database.into(),
+            input: input.into(),
+            log_level: ScriptLogLevel::Normal,
+            no_beep: engine != Engine::Postgres,
+            disable_foreign_keys: false,
+            extra_args: String::new(),
+            auth_user: None,
+            allow_client_commands: false,
+            tool_version: None,
+        }
+    }
+}
+
+/// The values a file name pattern's variables take (DBeaver's
+/// `NativeToolUtils.ALL_VARIABLES`).
+#[derive(Debug, Clone, Default)]
+pub struct NameVars {
+    pub host: String,
+    pub database: String,
+    /// The first schema backed up, or the database (DBeaver's rule).
+    pub schema: Option<String>,
+    /// The first table backed up.
+    pub table: Option<String>,
+    /// The connection's environment (DBeaver's `${connection.type}`).
+    pub environment: String,
+    pub now: Stamp,
+}
+
+/// A local date and time, to the minute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stamp {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+}
+
+impl Stamp {
+    /// Now, in the computer's time zone, read through SQLite's
+    /// `localtime` (the standard library has no time zones); UTC if that
+    /// fails.
+    pub fn now() -> Self {
+        let read = || -> rusqlite::Result<String> {
+            rusqlite::Connection::open_in_memory()?.query_row(
+                "SELECT strftime('%Y %m %d %H %M', 'now', 'localtime')",
+                [],
+                |row| row.get(0),
+            )
+        };
+        let text = read().unwrap_or_default();
+        let mut parts = text.split(' ').map(|part| part.parse::<u32>().unwrap_or(0));
+        let mut next = || parts.next().unwrap_or(0);
+        Self {
+            year: i32::try_from(next()).unwrap_or(1970),
+            month: next(),
+            day: next(),
+            hour: next(),
+            minute: next(),
+        }
+    }
+}
+
+/// `pattern` with its variables filled, as DBeaver's `resolveVars`:
+/// `${host}`, `${database}`, `${schema}`, `${table}` (`null` when none),
+/// `${date}` (yyyyMMdd), `${timestamp}` (yyyyMMddHHmm), `${year}`,
+/// `${month}`, `${day}`, `${hour}`, `${minute}`, `${connection.type}`. An
+/// unknown variable stays as written. A value cannot leave the folder:
+/// `/`, `\` and a leading `.` become `_`. Refused when the name itself
+/// holds a `/` or is empty.
+pub fn file_name(pattern: &str, vars: &NameVars) -> Result<String> {
+    let safe = |value: &str| {
+        let mut value = value.replace(['/', '\\', '\0'], "_");
+        if value.starts_with('.') {
+            value.replace_range(..1, "_");
+        }
+        value
+    };
+    let now = &vars.now;
+    let mut out = String::new();
+    let mut rest = pattern;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let name = &after[..end];
+        let value = match name {
+            "host" => Some(vars.host.clone()),
+            "database" => Some(vars.database.clone()),
+            "schema" => Some(vars.schema.clone().unwrap_or_else(|| vars.database.clone())),
+            "table" => Some(vars.table.clone().unwrap_or_else(|| "null".into())),
+            "connection.type" => Some(vars.environment.clone()),
+            "date" => Some(format!("{:04}{:02}{:02}", now.year, now.month, now.day)),
+            "timestamp" => Some(format!(
+                "{:04}{:02}{:02}{:02}{:02}",
+                now.year, now.month, now.day, now.hour, now.minute
+            )),
+            "year" => Some(format!("{:04}", now.year)),
+            "month" => Some(format!("{:02}", now.month)),
+            "day" => Some(format!("{:02}", now.day)),
+            "hour" => Some(format!("{:02}", now.hour)),
+            "minute" => Some(format!("{:02}", now.minute)),
+            _ => None,
+        };
+        match value {
+            Some(value) => out.push_str(&safe(&value)),
+            None => out.push_str(&rest[start..start + 3 + end]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if out.trim().is_empty() || out.contains('/') || out == "." || out == ".." {
+        return Err(Error::Config(format!(
+            "“{pattern}” does not make a file name: it is empty or holds a “/”"
+        )));
+    }
+    Ok(out)
+}
+
+/// The file a backup writes: the folder, the pattern filled, and the
+/// format's extension (none for a directory archive).
+pub fn output_path(
+    folder: &Path,
+    pattern: &str,
+    format: BackupFormat,
+    vars: &NameVars,
+) -> Result<PathBuf> {
+    let name = file_name(pattern, vars)?;
+    let extension = format.extension();
+    let name = if extension.is_empty() || name.ends_with(&format!(".{extension}")) {
+        name
+    } else {
+        format!("{name}.{extension}")
+    };
+    Ok(folder.join(name))
+}
+
+/// The extra arguments typed for a tool, split as a POSIX shell splits
+/// words (spaces separate; `'…'` keeps everything; `"…"` and `\` escape),
+/// and checked (DBeaver's `addExtraCommandArgs`, which only splits on
+/// spaces). Refused, with the reason:
+///
+/// - arguments that are not options (`name`): a positional database name
+///   or connection string would replace the database Kerno passes, and
+///   with it the server the password is sent to; write `--name=value`;
+/// - options that choose the server, the port, the user, the database or
+///   the TLS settings, or that carry or ask for a password: they belong to
+///   the connection, and the password, given through the environment,
+///   would go to whatever server they name;
+/// - options that undo the restore protections or run something else:
+///   `--set`/`--variable`, `--command`, `--file`, `--output`, `--log-file`
+///   (psql); `--commands`, `--local-infile`, `--binary-mode`, `--sandbox`,
+///   `--init-command`, `--execute`, `--pager`, `--tee`, `--result-file`,
+///   `--system-command`, option files, plugins and authentication (mysql).
+///
+/// A long option is compared after MySQL's `--skip-`, `--enable-`,
+/// `--disable-`, `--loose-` and `--maximum-` prefixes are removed and `_`
+/// read as `-`; an abbreviation (`--ho` for `--host`) is refused like the
+/// option it abbreviates. A short-option cluster is refused when it holds
+/// any of the refused letters.
+pub fn extra_args(text: &str, family: ClientFamily) -> Result<Vec<String>> {
+    let words = split_words(text)?;
+    for word in &words {
+        if let Some(reason) = refused_arg(word, family) {
+            return Err(Error::Config(format!(
+                "“{word}” is not allowed here: {reason}"
+            )));
+        }
+    }
+    Ok(words)
+}
+
+/// Shell-style word splitting; an unclosed quote is refused.
+fn split_words(text: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if let Some(done) = word.take() {
+                    words.push(done);
+                }
+            }
+            '\'' => {
+                let current = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => current.push(c),
+                        None => return Err(Error::Config("a ' quote is not closed".into())),
+                    }
+                }
+            }
+            '"' => {
+                let current = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c @ ('"' | '\\' | '$' | '`')) => current.push(c),
+                            Some(c) => {
+                                current.push('\\');
+                                current.push(c);
+                            }
+                            None => return Err(Error::Config("a \" quote is not closed".into())),
+                        },
+                        Some(c) => current.push(c),
+                        None => return Err(Error::Config("a \" quote is not closed".into())),
+                    }
+                }
+            }
+            '\\' => {
+                let current = word.get_or_insert_with(String::new);
+                if let Some(c) = chars.next() {
+                    current.push(c);
+                }
+            }
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Ok(words)
+}
+
+/// Long options refused, whole names (an abbreviation of one is refused
+/// too), and name prefixes refused as families (`ssl…`).
+const PG_REFUSED_OPTIONS: &[&str] = &[
+    "host", "port", "username", "dbname", "database", "password", "file", "command", "set",
+    "variable", "output", "log-file", "service",
+];
+const MYSQL_REFUSED_OPTIONS: &[&str] = &[
+    "host",
+    "port",
+    "user",
+    "password",
+    "password1",
+    "password2",
+    "password3",
+    "socket",
+    "protocol",
+    "pipe",
+    "shared-memory-base-name",
+    "bind-address",
+    "dns-srv-name",
+    "login-path",
+    "plugin-dir",
+    "default-auth",
+    "cleartext-plugin",
+    "server-public-key-path",
+    "get-server-public-key",
+    "commands",
+    "local-infile",
+    "load-data-local-dir",
+    "binary-mode",
+    "sandbox",
+    "init-command",
+    "init-command-add",
+    "execute",
+    "pager",
+    "tee",
+    "result-file",
+    "system-command",
+    "database",
+];
+const MYSQL_REFUSED_FAMILIES: &[&str] = &[
+    "ssl",
+    "tls",
+    "defaults",
+    "authentication",
+    "plugin",
+    "fido",
+    "oci",
+    "webauthn",
+];
+const PG_REFUSED_FAMILIES: &[&str] = &["ssl"];
+/// Short options refused: PostgreSQL's `-h -p -U -d -l -W -f -c -v -o -L`
+/// and MySQL's `-h -P -u -p -S -D -e -r`.
+const PG_REFUSED_LETTERS: &str = "hpUdlWfcvoL";
+const MYSQL_REFUSED_LETTERS: &str = "hPupSDer";
+
+fn refused_arg(word: &str, family: ClientFamily) -> Option<&'static str> {
+    let connection = "the server, the user, the database, the TLS settings and the password are \
+                      the connection's own";
+    let (refused, families, short) = match family {
+        ClientFamily::Postgres => (PG_REFUSED_OPTIONS, PG_REFUSED_FAMILIES, PG_REFUSED_LETTERS),
+        ClientFamily::MySql => (
+            MYSQL_REFUSED_OPTIONS,
+            MYSQL_REFUSED_FAMILIES,
+            MYSQL_REFUSED_LETTERS,
+        ),
+    };
+    if let Some(long) = word.strip_prefix("--") {
+        let name = long
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut name = name.replace('_', "-");
+        if family == ClientFamily::MySql {
+            // MySQL reads them stacked (`--loose-skip-sandbox`).
+            const PREFIXES: [&str; 5] = ["skip-", "enable-", "disable-", "loose-", "maximum-"];
+            while let Some(rest) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) {
+                name = rest.to_string();
+            }
+        }
+        if name.is_empty() {
+            return Some("“--” would make the next words positional");
+        }
+        let abbreviates = refused
+            .iter()
+            .any(|option| option.starts_with(name.as_str()));
+        let in_family = families.iter().any(|prefix| name.starts_with(prefix));
+        return (abbreviates || in_family).then_some(connection);
+    }
+    if let Some(cluster) = word.strip_prefix('-') {
+        return (cluster.is_empty() || cluster.chars().any(|c| short.contains(c)))
+            .then_some(connection);
+    }
+    Some(
+        "write options as --name=value: a word alone would be read as the database or a connection string",
+    )
+}
+
+/// Refuses an option the engine (`engine`) or the format does not have.
+fn refuse(condition: bool, what: &str) -> Result<()> {
+    if condition {
+        Err(Error::Unsupported(what.into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// The user for the tool: the override, else the connection's.
+fn with_user(params: &ConnectParams, auth_user: &Option<String>) -> ConnectParams {
+    let mut params = params.clone();
+    if let Some(user) = auth_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        params.user = user.to_string();
+    }
+    params
+}
+
+/// A PostgreSQL identifier quoted for a `--schema` / `--table` pattern,
+/// which then matches literally.
+fn pg_pattern(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The command that backs up `options.database` to `output` with the dump
+/// tool at `tool_path` (`pg_dump`, or `mysqldump` / `mariadb-dump`).
+/// Options the engine or the format does not have are refused (ported
+/// from DBeaver's `PostgreDatabaseBackupHandler.fillProcessParameters` and
+/// `MySQLDatabaseExportHandler.fillProcessParameters`).
 pub fn backup_command(
     tool_path: &Path,
     params: &ConnectParams,
     options: &BackupOptions,
+    output: &Path,
 ) -> Result<ToolCommand> {
-    let mut command = connection_command(tool_path, params);
+    let extra = extra_args(&options.extra_args, ClientFamily::of(params.engine))?;
+    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user));
     let args = &mut command.args;
-    match params.engine {
-        Engine::Postgres => {
+    match (params.engine, &options.engine) {
+        (Engine::Postgres, EngineBackup::Postgres(pg)) => {
+            refuse(
+                !options.schemas.is_empty() && !options.tables.is_empty(),
+                "pg_dump ignores the schemas once tables are named: name the tables only",
+            )?;
+            refuse(
+                pg.jobs.is_some() && options.format != BackupFormat::Directory,
+                "parallel jobs need the directory format",
+            )?;
+            refuse(
+                pg.compression.is_some() && options.format == BackupFormat::Tar,
+                "the tar format is not compressed",
+            )?;
+            refuse(
+                pg.compression.is_some_and(|level| level > 9),
+                "compression goes from 0 to 9",
+            )?;
+            refuse(
+                pg.if_exists && !pg.clean,
+                "“if exists” goes with the DROP statements",
+            )?;
+            refuse(
+                pg.clean && options.content == BackupContent::DataOnly,
+                "DROP statements need the definitions",
+            )?;
             args.push("--verbose".into());
             args.push(format!("--dbname={}", pg_dbname(&options.database)));
-            args.push(format!("--file={}", options.output.display()));
-            args.push(
-                match options.format {
-                    BackupFormat::Sql => "--format=plain",
-                    BackupFormat::Custom => "--format=custom",
-                }
-                .into(),
-            );
+            args.push(format!("--file={}", output.display()));
+            args.push(format!("--format={}", options.format.letter()));
+            if let Some(level) = pg.compression {
+                args.push(format!("--compress={level}"));
+            }
+            if let Some(encoding) = pg.encoding.as_deref().filter(|e| !e.is_empty()) {
+                args.push(format!("--encoding={encoding}"));
+            }
+            if let Some(jobs) = pg.jobs {
+                args.push(format!("--jobs={jobs}"));
+            }
             match options.content {
                 BackupContent::All => {}
                 BackupContent::SchemaOnly => args.push("--schema-only".into()),
                 BackupContent::DataOnly => args.push("--data-only".into()),
             }
-            if !options.tables.is_empty() {
-                // `--table` takes a pattern; quoted parts match literally.
-                // A pattern that matches nothing fails instead of dumping nothing.
-                args.push("--strict-names".into());
-                for table in &options.tables {
-                    let ident = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-                    args.push(format!(
-                        "--table={}.{}",
-                        ident(&table.schema),
-                        ident(&table.name)
-                    ));
+            for (on, flag) in [
+                (pg.inserts, "--inserts"),
+                (pg.no_privileges, "--no-privileges"),
+                (pg.no_owner, "--no-owner"),
+                (pg.clean, "--clean"),
+                (pg.if_exists, "--if-exists"),
+                (pg.create, "--create"),
+            ] {
+                if on {
+                    args.push(flag.into());
                 }
             }
-        }
-        Engine::MySql | Engine::MariaDb => {
-            if options.format == BackupFormat::Custom {
-                return Err(Error::Unsupported(
-                    "MySQL backups are SQL scripts; the custom format is PostgreSQL's".into(),
+            if !options.schemas.is_empty() || !options.tables.is_empty() {
+                // A pattern that matches nothing fails instead of dumping
+                // nothing.
+                args.push("--strict-names".into());
+            }
+            for schema in &options.schemas {
+                args.push(format!("--schema={}", pg_pattern(schema)));
+            }
+            for table in &options.tables {
+                args.push(format!(
+                    "--table={}.{}",
+                    pg_pattern(&table.schema),
+                    pg_pattern(&table.name)
                 ));
             }
+            args.extend(extra);
+        }
+        (Engine::MySql | Engine::MariaDb, EngineBackup::MySql(my)) => {
+            refuse(
+                options.format != BackupFormat::Sql,
+                "MySQL and MariaDB backups are SQL scripts; the other formats are PostgreSQL's",
+            )?;
+            refuse(
+                !options.schemas.is_empty(),
+                "a MySQL backup is of one database: name its tables",
+            )?;
             args.push("--verbose".into());
-            args.push("--single-transaction".into());
-            // Binary columns as hex literals: raw bytes could spell a
-            // client command for the restore check (see `check_script`).
-            args.push("--hex-blob".into());
+            args.push(my.method.option().into());
+            // mysqldump 8.0 asks MySQL's column statistics by default,
+            // which MariaDB does not have (DBeaver adds the same option).
+            if params.engine == Engine::MariaDb && !is_mariadb_client(tool_path) {
+                args.push("--column-statistics=0".into());
+            }
             match options.content {
-                BackupContent::All => args.push("--routines".into()),
-                BackupContent::SchemaOnly => {
-                    args.extend(["--no-data".into(), "--routines".into()]);
-                }
-                BackupContent::DataOnly => {
-                    args.extend(["--no-create-info".into(), "--skip-triggers".into()]);
+                BackupContent::All => {}
+                BackupContent::SchemaOnly => args.push("--no-data".into()),
+                BackupContent::DataOnly => args.push("--no-create-info".into()),
+            }
+            let has_definitions = options.content != BackupContent::DataOnly;
+            for (on, flag) in [
+                (my.routines && has_definitions, "--routines"),
+                (my.events && has_definitions, "--events"),
+                (!my.triggers || !has_definitions, "--skip-triggers"),
+                (!my.extended_inserts, "--skip-extended-insert"),
+                (!my.add_drop_table, "--skip-add-drop-table"),
+                (!my.disable_keys, "--skip-disable-keys"),
+                (my.hex_blob, "--hex-blob"),
+                (!my.comments, "--skip-comments"),
+            ] {
+                if on {
+                    args.push(flag.into());
                 }
             }
-            args.push(format!("--result-file={}", options.output.display()));
+            args.push(format!("--result-file={}", output.display()));
+            args.extend(extra);
             // The database and the tables are positional: a leading '-'
             // would be read as an option.
             args.push(positional(&options.database)?);
@@ -504,13 +1804,75 @@ pub fn backup_command(
                 args.push(positional(&table.name)?);
             }
         }
+        (engine, _) => {
+            return Err(Error::Unsupported(format!(
+                "these are another engine's backup options, not {}'s",
+                engine.label()
+            )));
+        }
     }
+    Ok(command)
+}
+
+/// The command that backs up a whole PostgreSQL server with `pg_dumpall`
+/// to `output` (ported from DBeaver's
+/// `PostgreDatabaseBackupAllHandler.fillProcessParameters`).
+pub fn global_backup_command(
+    tool_path: &Path,
+    params: &ConnectParams,
+    options: &GlobalBackupOptions,
+    output: &Path,
+) -> Result<ToolCommand> {
+    refuse(
+        params.engine != Engine::Postgres,
+        "the global backup is PostgreSQL's pg_dumpall",
+    )?;
+    let only = [
+        options.globals_only,
+        options.roles_only,
+        options.tablespaces_only,
+    ];
+    refuse(
+        only.iter().filter(|on| **on).count() > 1,
+        "globals only, roles only and tablespaces only exclude each other",
+    )?;
+    refuse(
+        only.contains(&true) && !options.exclude_databases.is_empty(),
+        "excluded databases go with a backup of the databases, not of the globals only",
+    )?;
+    let extra = extra_args(&options.extra_args, ClientFamily::Postgres)?;
+    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user));
+    let args = &mut command.args;
+    args.push("--verbose".into());
+    if let Some(encoding) = options.encoding.as_deref().filter(|e| !e.is_empty()) {
+        args.push(format!("--encoding={encoding}"));
+    }
+    for (on, flag) in [
+        (options.schema_only, "--schema-only"),
+        (options.globals_only, "--globals-only"),
+        (options.roles_only, "--roles-only"),
+        (options.tablespaces_only, "--tablespaces-only"),
+        (options.no_privileges, "--no-privileges"),
+        (options.no_owner, "--no-owner"),
+        (!options.role_passwords, "--no-role-passwords"),
+    ] {
+        if on {
+            args.push(flag.into());
+        }
+    }
+    args.push(format!("--file={}", output.display()));
+    for database in &options.exclude_databases {
+        args.push(format!("--exclude-database={}", pg_pattern(database)));
+    }
+    args.extend(extra);
     Ok(command)
 }
 
 /// The command that restores `options.input` into `options.database` with
 /// the tool at `tool_path` (see [`restore_tool`]). Refused on a read-only
-/// connection. A SQL file is kept from running client commands as the
+/// connection, and for options the format's tool does not have (ported
+/// from DBeaver's `PostgreDatabaseRestoreHandler`, whose options apply to
+/// archives only). A SQL file is kept from running client commands as the
 /// module documentation says: by the tool's option, or by a check that
 /// [`run`] makes before starting the tool.
 pub fn restore_command(
@@ -523,51 +1885,263 @@ pub fn restore_command(
             "restoring a backup writes to the database".into(),
         ));
     }
+    let family = ClientFamily::of(params.engine);
+    let extra = extra_args(&options.extra_args, family)?;
+    let archive_only = options.clean
+        || options.if_exists
+        || options.create
+        || options.no_owner
+        || options.no_privileges
+        || options.jobs.is_some();
+    let params = with_user(params, &options.auth_user);
+    match (params.engine, options.format) {
+        (Engine::Postgres, BackupFormat::Sql) => {
+            refuse(
+                archive_only,
+                "a SQL script runs as it is: clean, create, owner, privileges and jobs are \
+                 pg_restore's options, for archives",
+            )?;
+            refuse(
+                options.disable_foreign_keys,
+                "foreign-key checks off is MySQL's",
+            )?;
+            let mut command = sql_script_command(
+                tool_path,
+                &params,
+                &SqlScript {
+                    database: &options.database,
+                    input: &options.input,
+                    allow_client_commands: options.allow_client_commands,
+                    tool_version: options.tool_version.as_ref(),
+                },
+            );
+            if options.single_transaction {
+                let at = command
+                    .args
+                    .iter()
+                    .position(|arg| arg.starts_with("--file="))
+                    .unwrap_or(command.args.len());
+                command.args.insert(at, "--single-transaction".into());
+            }
+            command.args.extend(extra);
+            Ok(command)
+        }
+        (Engine::Postgres, format) => {
+            refuse(
+                options.if_exists && !options.clean,
+                "“if exists” goes with clean",
+            )?;
+            refuse(
+                options.single_transaction && options.jobs.is_some(),
+                "parallel jobs cannot run in one transaction",
+            )?;
+            refuse(
+                options.single_transaction && options.create,
+                "pg_restore cannot create the database in one transaction",
+            )?;
+            refuse(
+                options.jobs.is_some() && format == BackupFormat::Tar,
+                "parallel jobs read custom and directory archives only",
+            )?;
+            refuse(
+                options.disable_foreign_keys,
+                "foreign-key checks off is MySQL's",
+            )?;
+            let mut command = connection_command(tool_path, &params);
+            let args = &mut command.args;
+            args.push("--verbose".into());
+            args.push(format!("--dbname={}", pg_dbname(&options.database)));
+            args.push(format!("--format={}", format.letter()));
+            if let Some(jobs) = options.jobs {
+                args.push(format!("--jobs={jobs}"));
+            }
+            for (on, flag) in [
+                (options.clean, "--clean"),
+                (options.if_exists, "--if-exists"),
+                (options.create, "--create"),
+                (options.no_owner, "--no-owner"),
+                (options.no_privileges, "--no-privileges"),
+                (options.single_transaction, "--single-transaction"),
+            ] {
+                if on {
+                    args.push(flag.into());
+                }
+            }
+            args.extend(extra);
+            args.push(options.input.display().to_string());
+            Ok(command)
+        }
+        (Engine::MySql | Engine::MariaDb, BackupFormat::Sql) => {
+            refuse(
+                archive_only || options.single_transaction,
+                "these are pg_restore's options; mysql runs the file statement by statement",
+            )?;
+            let mut command = sql_script_command(
+                tool_path,
+                &params,
+                &SqlScript {
+                    database: &options.database,
+                    input: &options.input,
+                    allow_client_commands: options.allow_client_commands,
+                    tool_version: options.tool_version.as_ref(),
+                },
+            );
+            if options.disable_foreign_keys {
+                command.args.push(FOREIGN_KEYS_OFF.into());
+            }
+            command.args.extend(extra);
+            Ok(command)
+        }
+        (Engine::MySql | Engine::MariaDb, _) => Err(Error::Unsupported(
+            "MySQL backups are SQL scripts; the archive formats are PostgreSQL's".into(),
+        )),
+    }
+}
+
+/// `mysql`'s option that turns foreign-key checks off for the session
+/// (DBeaver's `MySQLScriptExecuteHandler`).
+const FOREIGN_KEYS_OFF: &str = "--init-command=SET SESSION FOREIGN_KEY_CHECKS=0";
+
+/// The command that runs the SQL script `options.input` in
+/// `options.database` with `psql` or `mysql` (DBeaver's "Execute script",
+/// `PostgreScriptExecuteHandler` and `MySQLScriptExecuteHandler`): the
+/// restore of a SQL file without a transaction, with the same protections
+/// (refused on a read-only connection, client commands kept off).
+pub fn script_command(
+    tool_path: &Path,
+    params: &ConnectParams,
+    options: &ScriptOptions,
+) -> Result<ToolCommand> {
+    if params.read_only {
+        return Err(Error::ReadOnly("a script can write to the database".into()));
+    }
+    let family = ClientFamily::of(params.engine);
+    let extra = extra_args(&options.extra_args, family)?;
+    let mysql_only = options.log_level != ScriptLogLevel::Normal
+        || options.no_beep
+        || options.disable_foreign_keys;
+    refuse(
+        params.engine == Engine::Postgres && mysql_only,
+        "the log level, the beep and the foreign-key checks are mysql's options",
+    )?;
+    let params = with_user(params, &options.auth_user);
+    let mut command = sql_script_command(
+        tool_path,
+        &params,
+        &SqlScript {
+            database: &options.database,
+            input: &options.input,
+            allow_client_commands: options.allow_client_commands,
+            tool_version: options.tool_version.as_ref(),
+        },
+    );
+    let args = &mut command.args;
+    match params.engine {
+        Engine::Postgres => {
+            // psql writes the statement that failed (DBeaver's
+            // `--echo-errors`, from PostgreSQL 9.5).
+            let at = args
+                .iter()
+                .position(|arg| arg.starts_with("--file="))
+                .unwrap_or(args.len());
+            args.insert(at, "--echo-errors".into());
+        }
+        Engine::MySql | Engine::MariaDb => {
+            for (on, flag) in [
+                (options.log_level == ScriptLogLevel::Verbose, "--verbose"),
+                (options.no_beep, "--no-beep"),
+                (options.disable_foreign_keys, FOREIGN_KEYS_OFF),
+            ] {
+                if on {
+                    args.push(flag.into());
+                }
+            }
+        }
+    }
+    args.extend(extra);
+    Ok(command)
+}
+
+/// A SQL file for [`sql_script_command`].
+struct SqlScript<'a> {
+    database: &'a str,
+    input: &'a Path,
+    allow_client_commands: bool,
+    tool_version: Option<&'a ToolVersion>,
+}
+
+/// `psql` or `mysql` reading a SQL file, its client commands kept off by
+/// the client's sandbox or by the check [`run`] makes first.
+fn sql_script_command(tool_path: &Path, params: &ConnectParams, script: &SqlScript) -> ToolCommand {
     let mut command = connection_command(tool_path, params);
     let check = |tool| {
-        (!options.allow_client_commands).then(|| ScriptCheck {
+        (!script.allow_client_commands).then(|| ScriptCheck {
             tool,
-            path: options.input.clone(),
-            version: options.tool_version.clone(),
+            path: script.input.to_path_buf(),
+            version: script.tool_version.cloned(),
         })
     };
     let args = &mut command.args;
-    match (params.engine, options.format) {
-        (Engine::Postgres, BackupFormat::Sql) => {
+    match params.engine {
+        Engine::Postgres => {
             // ~/.psqlrc could turn ON_ERROR_STOP off or run its own commands.
             args.push("--no-psqlrc".into());
-            args.push(format!("--dbname={}", pg_dbname(&options.database)));
+            args.push(format!("--dbname={}", pg_dbname(script.database)));
             // Without ON_ERROR_STOP psql goes on after a failed statement
             // and exits 0.
             args.push("--set=ON_ERROR_STOP=1".into());
-            args.push("--single-transaction".into());
-            args.push(format!("--file={}", options.input.display()));
+            args.push(format!("--file={}", script.input.display()));
             command.script_check = check(Tool::Psql);
         }
-        (Engine::Postgres, BackupFormat::Custom) => {
-            args.push("--verbose".into());
-            args.push(format!("--dbname={}", pg_dbname(&options.database)));
-            args.push("--single-transaction".into());
-            args.push(options.input.display().to_string());
-        }
-        (Engine::MySql | Engine::MariaDb, BackupFormat::Sql) => {
-            args.push(format!("--database={}", options.database));
+        Engine::MySql | Engine::MariaDb => {
+            args.push(format!("--database={}", script.database));
             // LOAD DATA LOCAL INFILE would send a file of this computer.
             args.push("--local-infile=0".into());
-            let sandbox = options.tool_version.as_ref().and_then(sandbox_option);
-            match sandbox.filter(|_| !options.allow_client_commands) {
+            let sandbox = script.tool_version.and_then(sandbox_option);
+            match sandbox.filter(|_| !script.allow_client_commands) {
                 Some(sandbox) => args.extend(sandbox.iter().map(|option| option.to_string())),
                 None => command.script_check = check(Tool::Mysql),
             }
-            command.stdin = Some(options.input.clone());
-        }
-        (Engine::MySql | Engine::MariaDb, BackupFormat::Custom) => {
-            return Err(Error::Unsupported(
-                "MySQL backups are SQL scripts; the custom format is PostgreSQL's".into(),
-            ));
+            command.stdin = Some(script.input.to_path_buf());
         }
     }
-    Ok(command)
+    command
+}
+
+/// The format of a backup to restore: a folder holding `toc.dat` is a
+/// directory archive, a file starting with `PGDMP` a custom archive, one
+/// with `ustar` at byte 257 a tar archive (pg_dump's tar has `toc.dat`
+/// first), anything else a SQL script. Blocking.
+pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFormat, String> {
+    let format = if path.is_dir() {
+        if path.join("toc.dat").is_file() {
+            BackupFormat::Directory
+        } else {
+            return Err(format!(
+                "{} is a folder without toc.dat: not a pg_dump directory archive.",
+                path.display()
+            ));
+        }
+    } else {
+        let mut start = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(262).read_to_end(&mut start))
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if start.starts_with(b"PGDMP") {
+            BackupFormat::Custom
+        } else if start.get(257..262) == Some(b"ustar") {
+            BackupFormat::Tar
+        } else {
+            BackupFormat::Sql
+        }
+    };
+    if format != BackupFormat::Sql && engine != Engine::Postgres {
+        return Err(format!(
+            "{} is a PostgreSQL archive: MySQL and MariaDB restore SQL files.",
+            path.display()
+        ));
+    }
+    Ok(format)
 }
 
 /// The program with the arguments and environment that say which server to
@@ -1258,6 +2832,79 @@ fn scan(
     }
 }
 
+/// What a saved task runs: one wizard's tool and its settings (DBeaver's
+/// `TaskImpl` type and properties, `org.jkiss.dbeaver.registry.task`).
+/// None of the four structs holds a password: an authentication override
+/// keeps its user only, and its password is asked at each run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "settings", rename_all = "snake_case")]
+pub enum TaskSettings {
+    Backup(BackupOptions),
+    GlobalBackup(GlobalBackupOptions),
+    Restore(RestoreOptions),
+    ExecuteScript(ScriptOptions),
+}
+
+impl TaskSettings {
+    /// The stored name of the kind.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Backup(_) => "backup",
+            Self::GlobalBackup(_) => "global_backup",
+            Self::Restore(_) => "restore",
+            Self::ExecuteScript(_) => "execute_script",
+        }
+    }
+
+    /// The kind, as the Tasks view shows it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Backup(_) => "Backup",
+            Self::GlobalBackup(_) => "Global backup",
+            Self::Restore(_) => "Restore",
+            Self::ExecuteScript(_) => "Execute script",
+        }
+    }
+
+    /// The database the task works on; `None` for a whole server.
+    pub fn database(&self) -> Option<&str> {
+        match self {
+            Self::Backup(options) => Some(&options.database),
+            Self::Restore(options) => Some(&options.database),
+            Self::ExecuteScript(options) => Some(&options.database),
+            Self::GlobalBackup(_) => None,
+        }
+    }
+
+    /// The user of the authentication override, whose password is asked at
+    /// each run.
+    pub fn auth_user(&self) -> Option<&str> {
+        match self {
+            Self::Backup(options) => options.auth_user.as_deref(),
+            Self::GlobalBackup(options) => options.auth_user.as_deref(),
+            Self::Restore(options) => options.auth_user.as_deref(),
+            Self::ExecuteScript(options) => options.auth_user.as_deref(),
+        }
+    }
+
+    /// Whether a run writes to the database: it is confirmed each time.
+    pub fn writes(&self) -> bool {
+        matches!(self, Self::Restore(_) | Self::ExecuteScript(_))
+    }
+
+    /// Refuses what a task must not keep: extra arguments the tool refuses,
+    /// a password among them ([`extra_args`]).
+    pub fn check(&self, engine: Engine) -> Result<()> {
+        let extra = match self {
+            Self::Backup(options) => &options.extra_args,
+            Self::GlobalBackup(options) => &options.extra_args,
+            Self::Restore(options) => &options.extra_args,
+            Self::ExecuteScript(options) => &options.extra_args,
+        };
+        extra_args(extra, ClientFamily::of(engine)).map(drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,24 +2929,36 @@ mod tests {
         }
     }
 
+    const OUT: &str = "/tmp/out dir/shop.sql";
+
+    /// A PostgreSQL plain-SQL backup of `database`.
     fn backup(database: &str) -> BackupOptions {
         BackupOptions {
-            database: database.into(),
-            output: "/tmp/out dir/shop.sql".into(),
             format: BackupFormat::Sql,
-            content: BackupContent::All,
-            tables: Vec::new(),
+            ..BackupOptions::new(Engine::Postgres, database)
         }
     }
 
+    fn my_backup(database: &str) -> BackupOptions {
+        BackupOptions::new(Engine::MySql, database)
+    }
+
+    /// The backup command, written to [`OUT`].
+    fn dump(tool: &Path, params: &ConnectParams, options: &BackupOptions) -> Result<ToolCommand> {
+        backup_command(tool, params, options, Path::new(OUT))
+    }
+
     fn restore(format: BackupFormat) -> RestoreOptions {
-        RestoreOptions {
-            database: "shop_copy".into(),
-            input: "/backups/shop.dump".into(),
-            format,
-            allow_client_commands: false,
-            tool_version: None,
-        }
+        RestoreOptions::new(Engine::Postgres, "shop_copy", "/backups/shop.dump", format)
+    }
+
+    fn my_restore() -> RestoreOptions {
+        RestoreOptions::new(
+            Engine::MySql,
+            "shop_copy",
+            "/backups/shop.dump",
+            BackupFormat::Sql,
+        )
     }
 
     fn assert_no_secret(command: &ToolCommand) {
@@ -1310,12 +2969,12 @@ mod tests {
     #[test]
     fn pg_dump_command_lines() {
         let pg_dump = Path::new("/opt/homebrew/bin/pg_dump");
-        let command = backup_command(pg_dump, &params(Engine::Postgres), &backup("shop")).unwrap();
+        let command = dump(pg_dump, &params(Engine::Postgres), &backup("shop")).unwrap();
         assert_eq!(
             command.display(),
             "PGSSLMODE=prefer PGPASSWORD=••• /opt/homebrew/bin/pg_dump --no-password \
              --host=db.example.com --port=6543 --username=ada --verbose --dbname=shop \
-             '--file=/tmp/out dir/shop.sql' --format=plain"
+             '--file=/tmp/out dir/shop.sql' --format=p"
         );
         assert_eq!(
             command
@@ -1342,13 +3001,13 @@ mod tests {
             ],
             ..backup("shop")
         };
-        let command = backup_command(pg_dump, &params, &options).unwrap();
+        let command = dump(pg_dump, &params, &options).unwrap();
         assert_eq!(
             command.display(),
             "PGSSLMODE=verify-full PGSSLROOTCERT=/certs/ca.pem PGSSLCERT=/certs/client.pem \
              PGSSLKEY=/certs/client.key PGPASSWORD=••• /opt/homebrew/bin/pg_dump --no-password \
              --host=db.example.com --port=6543 --username=ada --verbose --dbname=shop \
-             '--file=/tmp/out dir/shop.sql' --format=custom --schema-only --strict-names \
+             '--file=/tmp/out dir/shop.sql' --format=c --schema-only --strict-names \
              '--table=\"public\".\"orders\"' '--table=\"Sales\".\"odd\"\"name\"'"
         );
 
@@ -1356,7 +3015,7 @@ mod tests {
             content: BackupContent::DataOnly,
             ..backup("a=b host=evil")
         };
-        let command = backup_command(pg_dump, &params, &options).unwrap();
+        let command = dump(pg_dump, &params, &options).unwrap();
         assert!(
             command.args.contains(&"--data-only".to_string()),
             "{:?}",
@@ -1405,7 +3064,7 @@ mod tests {
             command.display(),
             "PGSSLMODE=prefer PGPASSWORD=••• /usr/bin/pg_restore --no-password \
              --host=db.example.com --port=6543 --username=ada --verbose --dbname=shop_copy \
-             --single-transaction /backups/shop.dump"
+             --format=c --single-transaction /backups/shop.dump"
         );
         // A custom-format archive holds no client script.
         assert_eq!(command.script_check, None);
@@ -1413,20 +3072,20 @@ mod tests {
 
     #[test]
     fn mysql_command_lines() {
-        let dump = Path::new("/usr/bin/mysqldump");
+        let mysqldump = Path::new("/usr/bin/mysqldump");
         let options = BackupOptions {
             tables: vec![
                 TableRef::new("shop", "orders"),
                 TableRef::new("shop", "items"),
             ],
-            ..backup("shop")
+            ..my_backup("shop")
         };
-        let command = backup_command(dump, &params(Engine::MySql), &options).unwrap();
+        let command = dump(mysqldump, &params(Engine::MySql), &options).unwrap();
         assert_eq!(
             command.display(),
             "MYSQL_PWD=••• /usr/bin/mysqldump --no-defaults --protocol=TCP --host=db.example.com \
-             --port=6543 --user=ada --ssl-mode=PREFERRED --verbose --single-transaction --hex-blob \
-             --routines '--result-file=/tmp/out dir/shop.sql' shop orders items"
+             --port=6543 --user=ada --ssl-mode=PREFERRED --verbose --single-transaction --routines \
+             --hex-blob '--result-file=/tmp/out dir/shop.sql' shop orders items"
         );
         assert_no_secret(&command);
 
@@ -1438,26 +3097,26 @@ mod tests {
         };
         let options = BackupOptions {
             content: BackupContent::DataOnly,
-            ..backup("shop")
+            ..my_backup("shop")
         };
-        let command =
-            backup_command(Path::new("/usr/bin/mariadb-dump"), &params_maria, &options).unwrap();
+        let command = dump(Path::new("/usr/bin/mariadb-dump"), &params_maria, &options).unwrap();
         assert_eq!(
             command.display(),
             "MYSQL_PWD=••• /usr/bin/mariadb-dump --no-defaults --protocol=TCP \
              --host=db.example.com --port=6543 --user=ada --ssl --ssl-verify-server-cert \
-             --ssl-ca=/certs/ca.pem --verbose --single-transaction --hex-blob --no-create-info \
-             --skip-triggers '--result-file=/tmp/out dir/shop.sql' shop"
+             --ssl-ca=/certs/ca.pem --verbose --single-transaction --no-create-info \
+             --skip-triggers --hex-blob '--result-file=/tmp/out dir/shop.sql' shop"
         );
 
         let options = BackupOptions {
             content: BackupContent::SchemaOnly,
-            ..backup("shop")
+            ..my_backup("shop")
         };
-        let command = backup_command(dump, &params(Engine::MySql), &options).unwrap();
+        let command = dump(mysqldump, &params(Engine::MySql), &options).unwrap();
         assert!(command.args.ends_with(&[
             "--no-data".into(),
             "--routines".into(),
+            "--hex-blob".into(),
             "--result-file=/tmp/out dir/shop.sql".into(),
             "shop".into()
         ]));
@@ -1465,7 +3124,7 @@ mod tests {
         let command = restore_command(
             Path::new("/usr/bin/mysql"),
             &params(Engine::MySql),
-            &restore(BackupFormat::Sql),
+            &my_restore(),
         )
         .unwrap();
         assert_eq!(
@@ -1584,7 +3243,7 @@ mod tests {
             let options = RestoreOptions {
                 tool_version: parse_version(version),
                 allow_client_commands: allow,
-                ..restore(BackupFormat::Sql)
+                ..my_restore()
             };
             restore_command(Path::new("/usr/bin/mysql"), &params(engine), &options).unwrap()
         };
@@ -2100,10 +3759,10 @@ mod tests {
     #[test]
     fn mysql_tls_options_follow_the_binary_not_the_server() {
         let maria_server = params(Engine::MariaDb);
-        let command = backup_command(
+        let command = dump(
             Path::new("/usr/bin/mysqldump"),
             &maria_server,
-            &backup("shop"),
+            &my_backup("shop"),
         )
         .unwrap();
         assert!(command.args.contains(&"--ssl-mode=PREFERRED".into()));
@@ -2115,7 +3774,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let mut verify = params(Engine::MySql);
         verify.tls.mode = TlsMode::Require;
-        let command = backup_command(&link, &verify, &backup("shop")).unwrap();
+        let command = dump(&link, &verify, &my_backup("shop")).unwrap();
         assert!(
             command
                 .args
@@ -2132,10 +3791,10 @@ mod tests {
         let path = Path::new("/usr/bin/tool");
         let custom = BackupOptions {
             format: BackupFormat::Custom,
-            ..backup("shop")
+            ..my_backup("shop")
         };
         assert!(matches!(
-            backup_command(path, &params(Engine::MySql), &custom),
+            dump(path, &params(Engine::MySql), &custom),
             Err(Error::Unsupported(_))
         ));
         assert!(matches!(
@@ -2147,15 +3806,15 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         assert!(matches!(
-            backup_command(path, &params(Engine::MySql), &backup("-evil")),
+            dump(path, &params(Engine::MySql), &my_backup("-evil")),
             Err(Error::Config(_))
         ));
         let other_db = BackupOptions {
             tables: vec![TableRef::new("other", "t")],
-            ..backup("shop")
+            ..my_backup("shop")
         };
         assert!(matches!(
-            backup_command(path, &params(Engine::MySql), &other_db),
+            dump(path, &params(Engine::MySql), &other_db),
             Err(Error::Config(_))
         ));
         let mut read_only = params(Engine::Postgres);
@@ -2165,19 +3824,1089 @@ mod tests {
             Err(Error::ReadOnly(_))
         ));
         // Backing up a read-only connection is fine.
-        assert!(backup_command(path, &read_only, &backup("shop")).is_ok());
+        assert!(dump(path, &read_only, &backup("shop")).is_ok());
     }
 
     #[test]
     fn no_password_means_no_password_variable() {
         let mut params = params(Engine::Postgres);
         params.password = None;
-        let command = backup_command(Path::new("/x/pg_dump"), &params, &backup("shop")).unwrap();
+        let command = dump(Path::new("/x/pg_dump"), &params, &backup("shop")).unwrap();
         assert!(command.password.is_none());
         assert!(!command.display().contains("PGPASSWORD"));
         params.password = Some(Secret::new(""));
-        let command = backup_command(Path::new("/x/pg_dump"), &params, &backup("shop")).unwrap();
+        let command = dump(Path::new("/x/pg_dump"), &params, &backup("shop")).unwrap();
         assert!(command.password.is_none());
+    }
+
+    /// The arguments after the connection's own.
+    fn own_args(command: &ToolCommand) -> Vec<String> {
+        let skip = command
+            .args
+            .iter()
+            .position(|arg| arg.starts_with("--ssl-mode=") || arg.starts_with("--username="))
+            .map_or(0, |at| at + 1);
+        command.args[skip..].to_vec()
+    }
+
+    fn pg_with(change: impl FnOnce(&mut BackupOptions, &mut PgBackup)) -> Result<ToolCommand> {
+        let mut options = BackupOptions::new(Engine::Postgres, "shop");
+        let mut pg = PgBackup::default();
+        change(&mut options, &mut pg);
+        options.engine = EngineBackup::Postgres(pg);
+        dump(Path::new("/x/pg_dump"), &params(Engine::Postgres), &options)
+    }
+
+    #[test]
+    fn each_pg_dump_option_gives_its_argument() {
+        let base = own_args(&pg_with(|_, _| {}).unwrap());
+        assert_eq!(
+            base,
+            [
+                "--verbose",
+                "--dbname=shop",
+                "--file=/tmp/out dir/shop.sql",
+                "--format=c"
+            ]
+        );
+        type Change = fn(&mut BackupOptions, &mut PgBackup);
+        let cases: [(Change, &[&str]); 16] = [
+            (|o, _| o.format = BackupFormat::Sql, &["--format=p"]),
+            (|o, _| o.format = BackupFormat::Directory, &["--format=d"]),
+            (|o, _| o.format = BackupFormat::Tar, &["--format=t"]),
+            (|_, p| p.compression = Some(7), &["--compress=7"]),
+            (
+                |_, p| p.encoding = Some("UTF8".into()),
+                &["--encoding=UTF8"],
+            ),
+            (
+                |o, p| {
+                    o.format = BackupFormat::Directory;
+                    p.jobs = Some(4)
+                },
+                &["--format=d", "--jobs=4"],
+            ),
+            (
+                |o, _| o.content = BackupContent::SchemaOnly,
+                &["--schema-only"],
+            ),
+            (|o, _| o.content = BackupContent::DataOnly, &["--data-only"]),
+            (|_, p| p.inserts = true, &["--inserts"]),
+            (|_, p| p.no_privileges = true, &["--no-privileges"]),
+            (|_, p| p.no_owner = true, &["--no-owner"]),
+            (|_, p| p.clean = true, &["--clean"]),
+            (
+                |_, p| {
+                    p.clean = true;
+                    p.if_exists = true
+                },
+                &["--clean", "--if-exists"],
+            ),
+            (|_, p| p.create = true, &["--create"]),
+            (
+                |o, _| o.schemas = vec!["shop".into(), "Odd\"One".into()],
+                &[
+                    "--strict-names",
+                    "--schema=\"shop\"",
+                    "--schema=\"Odd\"\"One\"",
+                ],
+            ),
+            (
+                |o, _| o.extra_args = "--exclude-table-data='shop.\"big table\"' -Z9".into(),
+                &["--exclude-table-data=shop.\"big table\"", "-Z9"],
+            ),
+        ];
+        for (change, added) in cases {
+            let args = own_args(&pg_with(change).unwrap());
+            let new: Vec<&str> = args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !base.iter().any(|b| b == arg))
+                .collect();
+            assert_eq!(new, added, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn pg_dump_refuses_what_it_cannot_do() {
+        type Change = fn(&mut BackupOptions, &mut PgBackup);
+        let refused: [(Change, &str); 6] = [
+            (|_, p| p.jobs = Some(2), "directory format"),
+            (
+                |o, p| {
+                    o.format = BackupFormat::Tar;
+                    p.compression = Some(5)
+                },
+                "tar format",
+            ),
+            (|_, p| p.compression = Some(12), "0 to 9"),
+            (|_, p| p.if_exists = true, "DROP statements"),
+            (
+                |o, p| {
+                    o.content = BackupContent::DataOnly;
+                    p.clean = true
+                },
+                "definitions",
+            ),
+            (
+                |o, _| {
+                    o.schemas = vec!["shop".into()];
+                    o.tables = vec![TableRef::new("shop", "orders")]
+                },
+                "name the tables only",
+            ),
+        ];
+        for (change, why) in refused {
+            match pg_with(change) {
+                Err(Error::Unsupported(text)) => assert!(text.contains(why), "{text}"),
+                other => panic!("{why}: {other:?}"),
+            }
+        }
+        // MySQL's options on a PostgreSQL connection, and the reverse.
+        let mysql = my_backup("shop");
+        assert!(matches!(
+            dump(Path::new("/x/pg_dump"), &params(Engine::Postgres), &mysql),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            dump(
+                Path::new("/x/mysqldump"),
+                &params(Engine::MySql),
+                &backup("shop")
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn each_mysqldump_option_gives_its_argument() {
+        let run = |change: fn(&mut BackupOptions, &mut MySqlBackup)| {
+            let mut options = my_backup("shop");
+            let mut my = MySqlBackup::default();
+            change(&mut options, &mut my);
+            options.engine = EngineBackup::MySql(my);
+            own_args(&dump(Path::new("/x/mysqldump"), &params(Engine::MySql), &options).unwrap())
+        };
+        let base = run(|_, _| {});
+        assert_eq!(
+            base,
+            [
+                "--verbose",
+                "--single-transaction",
+                "--routines",
+                "--hex-blob",
+                "--result-file=/tmp/out dir/shop.sql",
+                "shop"
+            ]
+        );
+        type Change = fn(&mut BackupOptions, &mut MySqlBackup);
+        let cases: [(Change, &[&str], &[&str]); 13] = [
+            (
+                |_, m| m.method = DumpMethod::LockAllTables,
+                &["--lock-all-tables"],
+                &["--single-transaction"],
+            ),
+            (
+                |_, m| m.method = DumpMethod::NoLocks,
+                &["--skip-lock-tables"],
+                &["--single-transaction"],
+            ),
+            (|_, m| m.routines = false, &[], &["--routines"]),
+            (|_, m| m.events = true, &["--events"], &[]),
+            (|_, m| m.triggers = false, &["--skip-triggers"], &[]),
+            (
+                |_, m| m.extended_inserts = false,
+                &["--skip-extended-insert"],
+                &[],
+            ),
+            (
+                |_, m| m.add_drop_table = false,
+                &["--skip-add-drop-table"],
+                &[],
+            ),
+            (|_, m| m.disable_keys = false, &["--skip-disable-keys"], &[]),
+            (|_, m| m.hex_blob = false, &[], &["--hex-blob"]),
+            (|_, m| m.comments = false, &["--skip-comments"], &[]),
+            (
+                |o, _| o.content = BackupContent::SchemaOnly,
+                &["--no-data"],
+                &[],
+            ),
+            (
+                |o, _| o.content = BackupContent::DataOnly,
+                &["--no-create-info", "--skip-triggers"],
+                &["--routines"],
+            ),
+            (
+                |o, _| {
+                    o.tables = vec![TableRef::new("shop", "orders")];
+                    o.extra_args = "--ignore-table=shop.logs".into()
+                },
+                &["--ignore-table=shop.logs", "orders"],
+                &[],
+            ),
+        ];
+        for (change, added, removed) in cases {
+            let args = run(change);
+            let new: Vec<&str> = args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !base.iter().any(|b| b == arg))
+                .collect();
+            let gone: Vec<&str> = base
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !args.iter().any(|a| a == arg))
+                .collect();
+            assert_eq!(
+                (new.as_slice(), gone.as_slice()),
+                (added, removed),
+                "{args:?}"
+            );
+        }
+        // Extra arguments come before the database and its tables.
+        let args = run(|o, _| {
+            o.tables = vec![TableRef::new("shop", "orders")];
+            o.extra_args = "--where=id<10".into()
+        });
+        assert!(args.ends_with(&["--where=id<10".into(), "shop".into(), "orders".into()]));
+        // MySQL's mysqldump on a MariaDB server: no column statistics.
+        let command = dump(
+            Path::new("/x/mysqldump"),
+            &params(Engine::MariaDb),
+            &my_backup("shop"),
+        )
+        .unwrap();
+        assert!(command.args.contains(&"--column-statistics=0".into()));
+    }
+
+    #[test]
+    fn each_pg_dumpall_option_gives_its_argument() {
+        let run = |change: fn(&mut GlobalBackupOptions)| {
+            let mut options = GlobalBackupOptions::default();
+            change(&mut options);
+            global_backup_command(
+                Path::new("/x/pg_dumpall"),
+                &params(Engine::Postgres),
+                &options,
+                Path::new("/b/all.sql"),
+            )
+        };
+        let base = own_args(&run(|_| {}).unwrap());
+        assert_eq!(
+            base,
+            ["--verbose", "--no-role-passwords", "--file=/b/all.sql"]
+        );
+        type Change = fn(&mut GlobalBackupOptions);
+        let cases: [(Change, &[&str], &[&str]); 9] = [
+            (
+                |o| o.encoding = Some("LATIN1".into()),
+                &["--encoding=LATIN1"],
+                &[],
+            ),
+            (|o| o.schema_only = true, &["--schema-only"], &[]),
+            (|o| o.globals_only = true, &["--globals-only"], &[]),
+            (|o| o.roles_only = true, &["--roles-only"], &[]),
+            (|o| o.tablespaces_only = true, &["--tablespaces-only"], &[]),
+            (|o| o.no_privileges = true, &["--no-privileges"], &[]),
+            (|o| o.no_owner = true, &["--no-owner"], &[]),
+            (|o| o.role_passwords = true, &[], &["--no-role-passwords"]),
+            (
+                |o| o.exclude_databases = vec!["kerno_other".into()],
+                &["--exclude-database=\"kerno_other\""],
+                &[],
+            ),
+        ];
+        for (change, added, removed) in cases {
+            let args = own_args(&run(change).unwrap());
+            let new: Vec<&str> = args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !base.iter().any(|b| b == arg))
+                .collect();
+            let gone: Vec<&str> = base
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !args.iter().any(|a| a == arg))
+                .collect();
+            assert_eq!(
+                (new.as_slice(), gone.as_slice()),
+                (added, removed),
+                "{args:?}"
+            );
+        }
+        for change in [
+            (|o: &mut GlobalBackupOptions| {
+                o.globals_only = true;
+                o.roles_only = true
+            }) as Change,
+            |o| {
+                o.roles_only = true;
+                o.exclude_databases = vec!["x".into()]
+            },
+        ] {
+            assert!(matches!(run(change), Err(Error::Unsupported(_))));
+        }
+        assert!(matches!(
+            global_backup_command(
+                Path::new("/x/pg_dumpall"),
+                &params(Engine::MySql),
+                &GlobalBackupOptions::default(),
+                Path::new("/b/all.sql"),
+            ),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn each_restore_option_gives_its_argument() {
+        let pg_restore = |change: fn(&mut RestoreOptions)| {
+            let mut options = restore(BackupFormat::Custom);
+            options.single_transaction = false;
+            change(&mut options);
+            restore_command(
+                Path::new("/x/pg_restore"),
+                &params(Engine::Postgres),
+                &options,
+            )
+        };
+        let base = own_args(&pg_restore(|_| {}).unwrap());
+        assert_eq!(
+            base,
+            [
+                "--verbose",
+                "--dbname=shop_copy",
+                "--format=c",
+                "/backups/shop.dump"
+            ]
+        );
+        type Change = fn(&mut RestoreOptions);
+        let cases: [(Change, &[&str]); 9] = [
+            (|o| o.format = BackupFormat::Directory, &["--format=d"]),
+            (|o| o.format = BackupFormat::Tar, &["--format=t"]),
+            (|o| o.clean = true, &["--clean"]),
+            (
+                |o| {
+                    o.clean = true;
+                    o.if_exists = true
+                },
+                &["--clean", "--if-exists"],
+            ),
+            (|o| o.create = true, &["--create"]),
+            (|o| o.no_owner = true, &["--no-owner"]),
+            (|o| o.no_privileges = true, &["--no-privileges"]),
+            (|o| o.jobs = Some(3), &["--jobs=3"]),
+            (|o| o.single_transaction = true, &["--single-transaction"]),
+        ];
+        for (change, added) in cases {
+            let args = own_args(&pg_restore(change).unwrap());
+            let new: Vec<&str> = args
+                .iter()
+                .map(String::as_str)
+                .filter(|arg| !base.iter().any(|b| b == arg))
+                .collect();
+            assert_eq!(new, added, "{args:?}");
+            assert_eq!(args.last().map(String::as_str), Some("/backups/shop.dump"));
+        }
+        let refused: [(Change, &str); 5] = [
+            (|o| o.if_exists = true, "goes with clean"),
+            (
+                |o| {
+                    o.jobs = Some(2);
+                    o.single_transaction = true
+                },
+                "one transaction",
+            ),
+            (
+                |o| {
+                    o.create = true;
+                    o.single_transaction = true
+                },
+                "in one transaction",
+            ),
+            (
+                |o| {
+                    o.format = BackupFormat::Tar;
+                    o.jobs = Some(2)
+                },
+                "custom and directory",
+            ),
+            (|o| o.disable_foreign_keys = true, "MySQL's"),
+        ];
+        for (change, why) in refused {
+            match pg_restore(change) {
+                Err(Error::Unsupported(text)) => assert!(text.contains(why), "{text}"),
+                other => panic!("{why}: {other:?}"),
+            }
+        }
+
+        // psql runs a script as it is: pg_restore's options are refused,
+        // the transaction is an option.
+        let psql = |change: fn(&mut RestoreOptions)| {
+            let mut options = restore(BackupFormat::Sql);
+            change(&mut options);
+            restore_command(Path::new("/x/psql"), &params(Engine::Postgres), &options)
+        };
+        let args = psql(|o| o.single_transaction = false).unwrap().args;
+        assert!(!args.contains(&"--single-transaction".into()));
+        for change in [
+            (|o: &mut RestoreOptions| o.clean = true) as Change,
+            |o| o.no_owner = true,
+            |o| o.jobs = Some(2),
+        ] {
+            assert!(matches!(psql(change), Err(Error::Unsupported(_))));
+        }
+
+        // mysql: foreign-key checks off; PostgreSQL's options refused.
+        let mysql = |change: fn(&mut RestoreOptions)| {
+            let mut options = my_restore();
+            change(&mut options);
+            restore_command(Path::new("/x/mysql"), &params(Engine::MySql), &options)
+        };
+        let args = mysql(|o| o.disable_foreign_keys = true).unwrap().args;
+        assert!(args.ends_with(&["--init-command=SET SESSION FOREIGN_KEY_CHECKS=0".into()]));
+        for change in [
+            (|o: &mut RestoreOptions| o.single_transaction = true) as Change,
+            |o| o.no_owner = true,
+        ] {
+            assert!(matches!(mysql(change), Err(Error::Unsupported(_))));
+        }
+    }
+
+    #[test]
+    fn a_script_runs_like_a_restore_without_a_transaction() {
+        let pg = script_command(
+            Path::new("/x/psql"),
+            &params(Engine::Postgres),
+            &ScriptOptions::new(Engine::Postgres, "shop", "/s/fix.sql"),
+        )
+        .unwrap();
+        assert_eq!(
+            own_args(&pg),
+            [
+                "--no-psqlrc",
+                "--dbname=shop",
+                "--set=ON_ERROR_STOP=1",
+                "--echo-errors",
+                "--file=/s/fix.sql"
+            ]
+        );
+        assert!(pg.script_check.is_some(), "client commands are checked");
+        let mut mysql_only = ScriptOptions::new(Engine::Postgres, "shop", "/s/fix.sql");
+        mysql_only.disable_foreign_keys = true;
+        assert!(matches!(
+            script_command(Path::new("/x/psql"), &params(Engine::Postgres), &mysql_only),
+            Err(Error::Unsupported(_))
+        ));
+
+        let my = |change: fn(&mut ScriptOptions)| {
+            let mut options = ScriptOptions::new(Engine::MySql, "shop", "/s/fix.sql");
+            change(&mut options);
+            own_args(
+                &script_command(Path::new("/x/mysql"), &params(Engine::MySql), &options).unwrap(),
+            )
+        };
+        assert_eq!(
+            my(|_| {}),
+            ["--database=shop", "--local-infile=0", "--no-beep"]
+        );
+        assert!(my(|o| o.no_beep = false).ends_with(&["--local-infile=0".into()]));
+        assert!(my(|o| o.log_level = ScriptLogLevel::Verbose).contains(&"--verbose".into()));
+        assert!(
+            my(|o| o.disable_foreign_keys = true)
+                .contains(&"--init-command=SET SESSION FOREIGN_KEY_CHECKS=0".into())
+        );
+        let mut read_only = params(Engine::MySql);
+        read_only.read_only = true;
+        assert!(matches!(
+            script_command(
+                Path::new("/x/mysql"),
+                &read_only,
+                &ScriptOptions::new(Engine::MySql, "shop", "/s/fix.sql")
+            ),
+            Err(Error::ReadOnly(_))
+        ));
+    }
+
+    #[test]
+    fn extra_arguments_are_split_like_a_shell() {
+        let split = |text: &str| extra_args(text, ClientFamily::Postgres).unwrap();
+        assert!(split("  ").is_empty());
+        assert_eq!(
+            split(r#"--exclude-table='a b' --exclude-table="c\"d" --exclude-schema=e\ f"#),
+            [
+                "--exclude-table=a b",
+                "--exclude-table=c\"d",
+                "--exclude-schema=e f"
+            ]
+        );
+        assert!(extra_args("--exclude-table='open", ClientFamily::Postgres).is_err());
+        assert!(extra_args("--exclude-table=\"open", ClientFamily::Postgres).is_err());
+    }
+
+    #[test]
+    fn extra_arguments_that_change_the_route_or_carry_a_password_are_refused() {
+        let pg_refused = [
+            "--host=evil",
+            "--ho=evil",
+            "--port=1",
+            "--username=root",
+            "--dbname=host=evil",
+            "--password",
+            "--set=ON_ERROR_STOP=0",
+            "--variable=x=1",
+            "--command=SELECT 1",
+            "--file=/tmp/x",
+            "--output=|sh",
+            "--log-file=/tmp/x",
+            "--service=other",
+            "--sslmode=disable",
+            "-h",
+            "-hevil",
+            "-p5432",
+            "-Uroot",
+            "-dpostgres",
+            "-W",
+            "-vx",
+            "-c",
+            "-o|sh",
+            "-",
+            "--",
+            "postgres://u:p@evil/db",
+            "host=evil",
+            "orders",
+        ];
+        for arg in pg_refused {
+            assert!(
+                extra_args(arg, ClientFamily::Postgres).is_err(),
+                "{arg} is refused"
+            );
+        }
+        let mysql_refused = [
+            "--host=evil",
+            "--HOST=evil",
+            "--pass=x",
+            "--password=x",
+            "--user=root",
+            "--socket=/tmp/s",
+            "--protocol=SOCKET",
+            "--defaults-file=/tmp/my.cnf",
+            "--defaults-extra-file=/tmp/my.cnf",
+            "--login-path=x",
+            "--plugin-dir=/tmp",
+            "--default-auth=x",
+            "--enable-cleartext-plugin",
+            "--ssl-mode=DISABLED",
+            "--skip-ssl",
+            "--tls-version=TLSv1",
+            "--commands=ON",
+            "--local-infile=1",
+            "--local_infile=1",
+            "--loose-local-infile=1",
+            "--loose-enable-local-infile",
+            "--loose-skip-binary-mode",
+            "--loose-skip-sandbox",
+            "--loose-skip-ssl",
+            "--skip-binary-mode",
+            "--skip-sandbox",
+            "--init-command=SELECT 1",
+            "--execute=SELECT 1",
+            "--pager=sh",
+            "--tee=/tmp/x",
+            "--result-file=/tmp/x",
+            "--system-command=ON",
+            "--database=other",
+            "-hevil",
+            "-P3306",
+            "-uroot",
+            "-psecret",
+            "-Sx",
+            "-Dother",
+            "-e",
+            "kerno",
+        ];
+        for arg in mysql_refused {
+            assert!(
+                extra_args(arg, ClientFamily::MySql).is_err(),
+                "{arg} is refused"
+            );
+        }
+        // Options that only shape the output pass.
+        for (family, arg) in [
+            (ClientFamily::Postgres, "--exclude-table=logs"),
+            (ClientFamily::Postgres, "--no-comments"),
+            (ClientFamily::Postgres, "--section=pre-data"),
+            (ClientFamily::Postgres, "--serializable-deferrable"),
+            (ClientFamily::Postgres, "-Z9"),
+            (ClientFamily::MySql, "--skip-comments"),
+            (ClientFamily::MySql, "--compress"),
+            (ClientFamily::MySql, "--set-gtid-purged=OFF"),
+            (ClientFamily::MySql, "--default-character-set=utf8mb4"),
+            (ClientFamily::MySql, "--where=id<10"),
+        ] {
+            assert!(extra_args(arg, family).is_ok(), "{arg} passes");
+        }
+        // A refused argument refuses the whole command.
+        let options = BackupOptions {
+            extra_args: "--no-comments --host=evil".into(),
+            ..backup("shop")
+        };
+        let refused = dump(Path::new("/x/pg_dump"), &params(Engine::Postgres), &options);
+        assert!(
+            matches!(&refused, Err(Error::Config(text)) if text.contains("“--host=evil”")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn another_user_runs_the_tool_and_no_secret_is_kept() {
+        let options = BackupOptions {
+            auth_user: Some("backup_role".into()),
+            ..backup("shop")
+        };
+        let command = dump(Path::new("/x/pg_dump"), &params(Engine::Postgres), &options).unwrap();
+        assert!(command.args.contains(&"--username=backup_role".into()));
+        let restore = RestoreOptions {
+            auth_user: Some("loader".into()),
+            allow_client_commands: true,
+            ..my_restore()
+        };
+        let command =
+            restore_command(Path::new("/x/mysql"), &params(Engine::MySql), &restore).unwrap();
+        assert!(command.args.contains(&"--user=loader".into()));
+        // The settings a task keeps: the user, never a password; the
+        // per-run opt-in is not kept either.
+        let json = serde_json::to_string(&restore).unwrap();
+        assert!(
+            json.contains("loader") && !json.contains(PASSWORD),
+            "{json}"
+        );
+        let back: RestoreOptions = serde_json::from_str(&json).unwrap();
+        assert!(!back.allow_client_commands);
+        assert_eq!(back.auth_user.as_deref(), Some("loader"));
+        let json = serde_json::to_string(&options).unwrap();
+        let back: BackupOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, options);
+        for json in [
+            serde_json::to_string(&GlobalBackupOptions::default()).unwrap(),
+            serde_json::to_string(&ScriptOptions::new(Engine::MySql, "d", "/f")).unwrap(),
+        ] {
+            assert!(!json.to_lowercase().contains("password\""), "{json}");
+        }
+    }
+
+    #[test]
+    fn file_names_fill_the_variables() {
+        let vars = NameVars {
+            host: "db.example.com".into(),
+            database: "shop".into(),
+            schema: Some("sales".into()),
+            table: None,
+            environment: "production".into(),
+            now: Stamp {
+                year: 2026,
+                month: 3,
+                day: 9,
+                hour: 7,
+                minute: 5,
+            },
+        };
+        let name = |pattern: &str| file_name(pattern, &vars).unwrap();
+        assert_eq!(name("${database}-${timestamp}"), "shop-202603090705");
+        assert_eq!(
+            name("${host}_${schema}_${table}_${date}_${connection.type}"),
+            "db.example.com_sales_null_20260309_production"
+        );
+        assert_eq!(name("${year}-${month}"), "2026-03");
+        assert_eq!(name("${day}${hour}${minute}"), "090705");
+        assert_eq!(name("${unknown}-${database"), "${unknown}-${database");
+        // A value cannot leave the folder.
+        let odd = NameVars {
+            database: "../etc/passwd".into(),
+            ..vars.clone()
+        };
+        assert_eq!(file_name("${database}", &odd).unwrap(), "_._etc_passwd");
+        let schema_less = NameVars {
+            schema: None,
+            ..vars.clone()
+        };
+        assert_eq!(file_name("${schema}", &schema_less).unwrap(), "shop");
+        assert!(file_name("a/${database}", &vars).is_err());
+        assert!(file_name("  ", &vars).is_err());
+        // The format's extension follows the pattern.
+        let folder = Path::new("/backups");
+        let path = |format| output_path(folder, DEFAULT_FILE_PATTERN, format, &vars).unwrap();
+        assert_eq!(
+            path(BackupFormat::Custom),
+            Path::new("/backups/shop-202603090705.dump")
+        );
+        assert_eq!(
+            path(BackupFormat::Sql),
+            Path::new("/backups/shop-202603090705.sql")
+        );
+        assert_eq!(
+            path(BackupFormat::Tar),
+            Path::new("/backups/shop-202603090705.tar")
+        );
+        assert_eq!(
+            path(BackupFormat::Directory),
+            Path::new("/backups/shop-202603090705")
+        );
+        assert_eq!(
+            output_path(folder, "shop.sql", BackupFormat::Sql, &vars).unwrap(),
+            Path::new("/backups/shop.sql")
+        );
+        let now = Stamp::now();
+        assert!(now.year >= 2026 && (1..=12).contains(&now.month), "{now:?}");
+    }
+
+    #[test]
+    fn archives_are_told_from_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("a.dump");
+        std::fs::write(&custom, b"PGDMP\x01\x0e\x00").unwrap();
+        let script = dir.path().join("a.sql");
+        std::fs::write(&script, b"SELECT 1;\n").unwrap();
+        let tiny = dir.path().join("tiny.sql");
+        std::fs::write(&tiny, b"PG").unwrap();
+        let tar = dir.path().join("a.tar");
+        let mut header = vec![0u8; 512];
+        header[..7].copy_from_slice(b"toc.dat");
+        header[257..262].copy_from_slice(b"ustar");
+        std::fs::write(&tar, &header).unwrap();
+        let archive = dir.path().join("archive");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("toc.dat"), b"PGDMP").unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        for (path, format) in [
+            (&custom, BackupFormat::Custom),
+            (&script, BackupFormat::Sql),
+            (&tiny, BackupFormat::Sql),
+            (&tar, BackupFormat::Tar),
+            (&archive, BackupFormat::Directory),
+        ] {
+            assert_eq!(guess_format(path, Engine::Postgres), Ok(format), "{path:?}");
+        }
+        assert!(
+            guess_format(&empty, Engine::Postgres)
+                .unwrap_err()
+                .contains("without toc.dat")
+        );
+        for path in [&custom, &tar, &archive] {
+            assert!(
+                guess_format(path, Engine::MySql)
+                    .unwrap_err()
+                    .contains("PostgreSQL archive")
+            );
+        }
+        assert_eq!(guess_format(&script, Engine::MySql), Ok(BackupFormat::Sql));
+        assert!(
+            guess_format(&dir.path().join("absent"), Engine::Postgres)
+                .unwrap_err()
+                .contains("could not read")
+        );
+        // Each format goes to its tool.
+        assert_eq!(
+            restore_tool(Engine::Postgres, BackupFormat::Sql),
+            Tool::Psql
+        );
+        for format in [
+            BackupFormat::Custom,
+            BackupFormat::Directory,
+            BackupFormat::Tar,
+        ] {
+            assert_eq!(restore_tool(Engine::Postgres, format), Tool::PgRestore);
+        }
+        assert_eq!(
+            restore_tool(Engine::MariaDb, BackupFormat::Sql),
+            Tool::Mysql
+        );
+    }
+
+    /// A fake tool in `dir` that prints `version` for `--version`.
+    fn versioned_tool(dir: &Path, name: &str, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A fake client install: every tool of the family, at `version`.
+    fn fake_install(dir: &Path, family: ClientFamily, version: &str) {
+        for tool in family.tools() {
+            versioned_tool(dir, tool.name(), version);
+        }
+    }
+
+    #[test]
+    fn clients_are_detected_once_per_real_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let cellar = root.join("brew/Cellar");
+        let pg14 = cellar.join("postgresql@14/14.24_1/bin");
+        let pg18 = cellar.join("postgresql@18/18.6_1/bin");
+        let libpq = cellar.join("libpq/18.6_2/bin");
+        let mysql = cellar.join("mysql-client/26.10.0/bin");
+        fake_install(&pg14, ClientFamily::Postgres, "pg_dump (PostgreSQL) 14.24");
+        fake_install(&pg18, ClientFamily::Postgres, "pg_dump (PostgreSQL) 18.6");
+        fake_install(&libpq, ClientFamily::Postgres, "pg_dump (PostgreSQL) 18.6");
+        fake_install(
+            &mysql,
+            ClientFamily::MySql,
+            "mysqldump  Ver 26.10.0 for macos27.0 on arm64 (Homebrew)",
+        );
+        // Not a client formula: never looked at.
+        versioned_tool(
+            &cellar.join("redis/7.0/bin"),
+            "pg_dump",
+            "pg_dump (PostgreSQL) 99.0",
+        );
+        // Homebrew's link farm in $PATH points into the Cellar.
+        let bin = root.join("brew/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(pg14.join("pg_dump"), bin.join("pg_dump")).unwrap();
+        std::os::unix::fs::symlink(pg14.join("psql"), bin.join("psql")).unwrap();
+        // Postgres.app and EDB versions.
+        let app = root.join("Postgres.app/Contents/Versions");
+        fake_install(
+            &app.join("16/bin"),
+            ClientFamily::Postgres,
+            "pg_dump (PostgreSQL) 16.4",
+        );
+        let edb = root.join("Library/PostgreSQL");
+        fake_install(
+            &edb.join("15/bin"),
+            ClientFamily::Postgres,
+            "pg_dump (PostgreSQL) 15.8",
+        );
+        // A MariaDB client added by hand, with only `mariadb-dump`.
+        let added = root.join("opt/mariadb/bin");
+        versioned_tool(
+            &added,
+            "mariadb-dump",
+            "mariadb-dump from 11.8.3-MariaDB, client 10.19",
+        );
+        // A folder with nothing.
+        let nothing = root.join("empty");
+        std::fs::create_dir_all(&nothing).unwrap();
+
+        let roots = ClientRoots {
+            path_var: Some(std::env::join_paths([&bin, &nothing, &bin]).unwrap()),
+            homebrew: vec![root.join("brew")],
+            postgres_app: vec![app],
+            edb: vec![edb],
+            linux: vec![root.join("usr/lib/postgresql")],
+            fallbacks: vec![pg18.clone()],
+            added: vec![added.clone()],
+        };
+        let found = detect_clients(&roots);
+        type Row = (ClientFamily, PathBuf, ClientSource, Option<(u32, u32, u32)>);
+        let summary: Vec<Row> = found
+            .iter()
+            .map(|install| {
+                (
+                    install.family,
+                    install.dir.clone(),
+                    install.source,
+                    install.version.as_ref().map(|v| v.number),
+                )
+            })
+            .collect();
+        use ClientFamily::{MySql, Postgres};
+        assert_eq!(
+            summary,
+            [
+                // 18.6 twice: the folder decides, libpq first.
+                (
+                    Postgres,
+                    libpq.clone(),
+                    ClientSource::Homebrew,
+                    Some((18, 6, 0))
+                ),
+                (
+                    Postgres,
+                    pg18.clone(),
+                    ClientSource::Homebrew,
+                    Some((18, 6, 0))
+                ),
+                (
+                    Postgres,
+                    root.join("Postgres.app/Contents/Versions/16/bin"),
+                    ClientSource::PostgresApp,
+                    Some((16, 4, 0))
+                ),
+                (
+                    Postgres,
+                    root.join("Library/PostgreSQL/15/bin"),
+                    ClientSource::Edb,
+                    Some((15, 8, 0))
+                ),
+                // Reached through $PATH too, kept once, as found first.
+                (
+                    Postgres,
+                    pg14.clone(),
+                    ClientSource::Homebrew,
+                    Some((14, 24, 0))
+                ),
+                (
+                    MySql,
+                    mysql.clone(),
+                    ClientSource::Homebrew,
+                    Some((26, 10, 0))
+                ),
+                (MySql, added.clone(), ClientSource::Added, Some((11, 8, 3))),
+            ]
+        );
+        // Every tool of an install comes from its own folder.
+        let pg14_install = &found[4];
+        assert_eq!(
+            pg14_install.path(Tool::PgDumpall),
+            Some(pg14.join("pg_dumpall").as_path())
+        );
+        assert_eq!(
+            found[6].path(Tool::MysqlDump),
+            Some(added.join("mariadb-dump").as_path())
+        );
+        assert_eq!(found[6].path(Tool::Mysql), None);
+        assert!(found[6].version.as_ref().unwrap().mariadb);
+        assert_eq!(found[0].label(), "PostgreSQL 18.6 · Homebrew");
+        assert_eq!(found[6].label(), "MariaDB 11.8.3 · added");
+
+        // A folder probed alone.
+        assert_eq!(
+            probe_client(&bin, Postgres).map(|install| install.dir),
+            Some(pg14.clone())
+        );
+        assert_eq!(probe_client(&nothing, Postgres), None);
+        assert_eq!(probe_client(&added, Postgres), None);
+
+        // The connection's folder, else the default, else the newest.
+        let pick = |engine, connection: Option<&Path>, default: Option<&Path>| {
+            client_for(
+                &found,
+                &ClientWanted {
+                    engine,
+                    connection_dir: connection,
+                    default_dir: default,
+                },
+            )
+            .map(|pick| (pick.install.dir.clone(), pick.ignored))
+        };
+        assert_eq!(
+            pick(Engine::Postgres, None, None),
+            Ok((libpq.clone(), None))
+        );
+        assert_eq!(
+            pick(Engine::Postgres, None, Some(&pg14)),
+            Ok((pg14.clone(), None))
+        );
+        assert_eq!(
+            pick(
+                Engine::Postgres,
+                Some(&bin.join("..").join("Cellar/postgresql@18/18.6_1/bin")),
+                Some(&pg14)
+            ),
+            Ok((pg18.clone(), None))
+        );
+        // A folder neither detected nor added is never used, even when it
+        // holds tools: the default, else the newest, and it is reported.
+        let elsewhere = root.join("elsewhere/bin");
+        fake_install(&elsewhere, Postgres, "pg_dump (PostgreSQL) 99.0");
+        assert_eq!(
+            pick(Engine::Postgres, Some(&elsewhere), Some(&pg14)),
+            Ok((pg14.clone(), Some(elsewhere.clone())))
+        );
+        assert_eq!(
+            pick(Engine::Postgres, Some(&nothing), None),
+            Ok((libpq.clone(), Some(nothing.clone())))
+        );
+        // MariaDB's own client for a MariaDB server, MySQL's for MySQL.
+        assert_eq!(pick(Engine::MariaDb, None, None), Ok((added.clone(), None)));
+        assert_eq!(pick(Engine::MySql, None, None), Ok((mysql.clone(), None)));
+        let postgres_only: Vec<ClientInstall> = found
+            .iter()
+            .filter(|install| install.family == Postgres)
+            .cloned()
+            .collect();
+        assert_eq!(
+            client_for(
+                &postgres_only,
+                &ClientWanted {
+                    engine: Engine::MySql,
+                    connection_dir: None,
+                    default_dir: None
+                }
+            ),
+            Err(ClientMissing { family: MySql })
+        );
+        assert!(
+            ClientMissing { family: MySql }
+                .text()
+                .contains("brew install mysql-client")
+        );
+    }
+
+    #[test]
+    fn a_client_older_than_a_postgresql_server_is_refused() {
+        let v = |text: &str| parse_version(text).unwrap();
+        let pg14 = v("pg_dump (PostgreSQL) 14.24");
+        let pg18 = v("pg_dump (PostgreSQL) 18.6");
+        assert_eq!(
+            compatibility(Some(&pg14), Engine::Postgres, (17, 2, 0)),
+            Compatibility::ClientOlder {
+                client_major: 14,
+                server_major: 17
+            }
+        );
+        assert!(compatibility(Some(&pg14), Engine::Postgres, (17, 2, 0)).blocks());
+        assert_eq!(
+            compatibility(Some(&pg18), Engine::Postgres, (17, 2, 0)),
+            Compatibility::Ok
+        );
+        assert_eq!(
+            compatibility(Some(&pg14), Engine::Postgres, (14, 0, 0)),
+            Compatibility::Ok
+        );
+        // MySQL and MariaDB: another version only warns.
+        let mysql26 = v("mysqldump  Ver 26.10.0 for macos27.0");
+        let maria = v("mariadb-dump from 11.8.3-MariaDB, client 10.19");
+        let other = compatibility(Some(&mysql26), Engine::MySql, (8, 4, 3));
+        assert_eq!(
+            other,
+            Compatibility::OtherVersion {
+                client_major: 26,
+                server_major: 8
+            }
+        );
+        assert!(!other.blocks() && other.warning(Engine::MySql).is_some());
+        assert_eq!(
+            compatibility(Some(&maria), Engine::MariaDb, (11, 4, 0)),
+            Compatibility::Ok
+        );
+        assert_eq!(
+            compatibility(Some(&maria), Engine::MariaDb, (11, 8, 0)),
+            Compatibility::Ok
+        );
+        assert!(matches!(
+            compatibility(Some(&maria), Engine::MySql, (11, 8, 0)),
+            Compatibility::OtherVersion { .. }
+        ));
+        assert_eq!(
+            compatibility(None, Engine::Postgres, (17, 0, 0)),
+            Compatibility::Unknown
+        );
+        assert!(
+            Compatibility::ClientOlder {
+                client_major: 14,
+                server_major: 17
+            }
+            .warning(Engine::Postgres)
+            .unwrap()
+            .contains("older than the server")
+        );
     }
 
     #[test]
@@ -2408,5 +5137,50 @@ mod tests {
             .status()
             .unwrap();
         assert!(!alive.success(), "process {pid} still runs");
+    }
+
+    #[test]
+    fn task_settings_round_trip_without_a_password_and_refuse_one_in_extra_arguments() {
+        let mut backup = BackupOptions::new(Engine::Postgres, "shop");
+        backup.auth_user = Some("backup_user".into());
+        backup.tables = vec![TableRef::new("shop", "orders")];
+        let mut restore = RestoreOptions::new(Engine::MySql, "shop", "/b/shop.sql", BackupFormat::Sql);
+        restore.allow_client_commands = true;
+        let tasks = [
+            TaskSettings::Backup(backup),
+            TaskSettings::GlobalBackup(GlobalBackupOptions::default()),
+            TaskSettings::Restore(restore),
+            TaskSettings::ExecuteScript(ScriptOptions::new(Engine::Postgres, "shop", "/s.sql")),
+        ];
+        for task in &tasks {
+            let json = serde_json::to_string(task).unwrap();
+            assert!(json.contains(&format!("\"kind\":\"{}\"", task.kind())), "{json}");
+            // No field holds a password (`role_passwords` is a switch).
+            assert!(!json.contains("password\":") && !json.contains(PASSWORD), "{json}");
+            let back: TaskSettings = serde_json::from_str(&json).unwrap();
+            // The opt-in to a file's client commands is asked at each run.
+            match (task, &back) {
+                (TaskSettings::Restore(saved), TaskSettings::Restore(read)) => {
+                    assert!(saved.allow_client_commands && !read.allow_client_commands);
+                    assert_eq!(read.input, saved.input);
+                }
+                _ => assert_eq!(&back, task),
+            }
+        }
+        assert_eq!(tasks[0].auth_user(), Some("backup_user"));
+        assert_eq!(tasks[0].database(), Some("shop"));
+        assert_eq!(tasks[1].database(), None);
+        assert!(!tasks[0].writes() && !tasks[1].writes());
+        assert!(tasks[2].writes() && tasks[3].writes());
+
+        // A password typed among the extra arguments is never kept.
+        let mut leaky = BackupOptions::new(Engine::Postgres, "shop");
+        leaky.extra_args = format!("--password={PASSWORD}");
+        assert!(TaskSettings::Backup(leaky.clone()).check(Engine::Postgres).is_err());
+        leaky.extra_args = "--lock-wait-timeout=5000".into();
+        assert!(TaskSettings::Backup(leaky).check(Engine::Postgres).is_ok());
+        let mut script = ScriptOptions::new(Engine::MySql, "shop", "/s.sql");
+        script.extra_args = format!("--password={PASSWORD}");
+        assert!(TaskSettings::ExecuteScript(script).check(Engine::MySql).is_err());
     }
 }

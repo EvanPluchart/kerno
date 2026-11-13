@@ -2,6 +2,7 @@
 
 mod actions;
 mod admin;
+mod app_icon;
 mod backup_dialog;
 mod bench;
 mod brand;
@@ -10,9 +11,12 @@ mod connections;
 mod data;
 mod database_dialog;
 mod engine_logo;
+mod environments_view;
 mod export_dialog;
+mod folder_dialog;
 mod import_dialog;
 mod library;
+mod local_clients_view;
 mod logging;
 mod maintenance_dialog;
 mod navigator;
@@ -86,6 +90,8 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     AppState::init(&startup, pinned, cx);
     theme::init(AppState::get(cx).appearance(), cx)?;
 
+    #[cfg(target_os = "macos")]
+    app_icon::set_dock_icon();
     let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.set_menus(menus());
@@ -110,6 +116,11 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
             cx,
         ))),
         window_min_size: Some(size(px(720.), px(440.))),
+        // Linux: the desktop entry's `StartupWMClass` matches it, so the
+        // window takes the installed icon; X11 also gets the icon itself.
+        app_id: Some("kerno".into()),
+        #[cfg(target_os = "linux")]
+        icon: app_icon::window_icon(),
         ..TitleBar::window_options()
     };
     let Startup {

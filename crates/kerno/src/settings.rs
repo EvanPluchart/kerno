@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use kerno_core::config::FolderLook;
+use kerno_core::environment::{self, EnvironmentDef};
 use kerno_core::storage::Storage;
+use kerno_core::tools::ClientFamily;
 use serde::{Deserialize, Serialize};
 
 use crate::theme::Appearance;
@@ -56,13 +59,22 @@ pub struct Settings {
     pub connection_folders: BTreeSet<String>,
     /// Connection folders shown closed in the sidebar.
     pub collapsed_folders: BTreeSet<String>,
+    /// How folders are drawn (colour, glyph, picture), by path; a folder
+    /// without an entry is plain.
+    pub folder_looks: BTreeMap<String, FolderLook>,
     /// Ask before closing a tab that holds pending changes, unsaved text or
     /// a changed table form. An open transaction always asks.
     pub confirm_close_tab: bool,
-    /// The client tool binaries chosen by the user for backup and restore,
-    /// by tool name (`pg_dump`, `psql`, `pg_restore`, `mysqldump`, `mysql`);
-    /// the others are looked for where they are usually installed.
+    /// Before local clients: one binary per tool name. Read once, its
+    /// folders become [`Settings::client_folders`], then it is empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_paths: BTreeMap<String, PathBuf>,
+    /// Client folders the user added (Settings ▸ Local clients), looked at
+    /// before the usual install places.
+    pub client_folders: Vec<PathBuf>,
+    /// The client each engine family uses unless a connection names its
+    /// own; the newest found when absent.
+    pub default_clients: BTreeMap<ClientFamily, PathBuf>,
     /// Text size of the interface, in points.
     pub ui_font_size: f32,
     /// Text size of the SQL editors.
@@ -91,6 +103,9 @@ pub struct Settings {
     /// The administration's sessions list leaves out idle (PostgreSQL) and
     /// sleeping (MySQL, MariaDB) sessions.
     pub hide_idle_sessions: bool,
+    /// The environments connections can be in: the three built-ins, edited
+    /// or not, then the user's own.
+    pub environments: Vec<EnvironmentDef>,
 }
 
 /// The sizes the settings allow, in points.
@@ -109,8 +124,11 @@ impl Default for Settings {
             table_double_click: TableDoubleClick::Data,
             connection_folders: BTreeSet::new(),
             collapsed_folders: BTreeSet::new(),
+            folder_looks: BTreeMap::new(),
             confirm_close_tab: true,
             tool_paths: BTreeMap::new(),
+            client_folders: Vec::new(),
+            default_clients: BTreeMap::new(),
             ui_font_size: 13.0,
             editor_font_size: 12.5,
             grid_font_size: 11.5,
@@ -124,6 +142,7 @@ impl Default for Settings {
             link_with_editor: false,
             selection_stats: true,
             hide_idle_sessions: false,
+            environments: environment::builtin_environments(),
         }
     }
 }
@@ -171,6 +190,16 @@ impl Settings {
         if self.null_text.trim().is_empty() {
             self.null_text = default.null_text;
         }
+        // The binaries chosen before local clients: their folders.
+        for path in std::mem::take(&mut self.tool_paths).into_values() {
+            if let Some(dir) = path.parent().map(PathBuf::from)
+                && !self.client_folders.contains(&dir)
+            {
+                self.client_folders.push(dir);
+            }
+        }
+        // The built-ins are never lost, whatever was stored.
+        self.environments = environment::with_builtins(std::mem::take(&mut self.environments));
         self
     }
 
@@ -196,8 +225,19 @@ mod tests {
             table_double_click: TableDoubleClick::Structure,
             connection_folders: ["Work".to_string(), "Work/Clients".to_string()].into(),
             collapsed_folders: ["Work/Clients".to_string()].into(),
+            folder_looks: [(
+                "Work".to_string(),
+                FolderLook {
+                    color: Some("blue".into()),
+                    glyph: Some("briefcase".into()),
+                    image: Some("00000000000000aa.png".into()),
+                },
+            )]
+            .into(),
             confirm_close_tab: false,
-            tool_paths: [("pg_dump".to_string(), PathBuf::from("/opt/pg/bin/pg_dump"))].into(),
+            tool_paths: BTreeMap::new(),
+            client_folders: vec![PathBuf::from("/opt/pg/bin")],
+            default_clients: [(ClientFamily::Postgres, PathBuf::from("/opt/pg/bin"))].into(),
             ui_font_size: 15.0,
             editor_font_size: 14.0,
             grid_font_size: 13.0,
@@ -211,9 +251,46 @@ mod tests {
             link_with_editor: true,
             selection_stats: false,
             hide_idle_sessions: true,
+            environments: {
+                let mut environments = environment::builtin_environments();
+                environments[2].rules.confirm_execute = false;
+                environments.push(EnvironmentDef {
+                    id: "qa".into(),
+                    name: "QA".into(),
+                    color_light: Some("#1D6FB8".into()),
+                    color_dark: Some("#5AA9F0".into()),
+                    tint: environment::Tint::Soft,
+                    rules: Default::default(),
+                });
+                environments
+            },
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);
+    }
+
+    #[test]
+    fn the_tool_binaries_chosen_before_become_client_folders() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .set_setting(
+                KEY,
+                &serde_json::json!({"tool_paths": {
+                    "pg_dump": "/opt/pg/bin/pg_dump",
+                    "psql": "/opt/pg/bin/psql",
+                    "mysqldump": "/opt/my/bin/mysqldump"
+                }}),
+            )
+            .unwrap();
+        let loaded = Settings::load(&storage);
+        assert!(loaded.tool_paths.is_empty());
+        assert_eq!(
+            loaded.client_folders,
+            [PathBuf::from("/opt/my/bin"), PathBuf::from("/opt/pg/bin")]
+        );
+        loaded.save(&storage).unwrap();
+        let stored: serde_json::Value = storage.setting(KEY).unwrap().unwrap();
+        assert!(stored.get("tool_paths").is_none(), "{stored}");
     }
 
     #[test]
@@ -236,6 +313,29 @@ mod tests {
         assert_eq!(loaded.grid_font_size, 11.5);
         assert_eq!(loaded.null_text, "NULL");
         assert!(loaded.line_numbers && loaded.auto_completion && !loaded.ligatures);
+        // Settings stored before environments were the user's: the
+        // built-ins, so production still asks twice.
+        assert_eq!(loaded.environments, environment::builtin_environments());
+    }
+
+    #[test]
+    fn a_built_in_environment_left_out_of_the_store_comes_back() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .set_setting(
+                KEY,
+                &serde_json::json!({"environments": [
+                    {"id": "staging", "name": "Pre-prod", "tint": "strong"},
+                    {"id": "qa", "name": "QA"}
+                ]}),
+            )
+            .unwrap();
+        let loaded = Settings::load(&storage);
+        let ids: Vec<&str> = loaded.environments.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["local", "staging", "production", "qa"]);
+        // The user's edit of a built-in is kept.
+        assert_eq!(loaded.environments[1].name, "Pre-prod");
+        assert!(loaded.environments[2].rules.confirm_writes_twice);
     }
 
     #[test]

@@ -163,12 +163,11 @@ async fn round_trips(session: Arc<dyn Session>, dir: PathBuf) {
             &dir.join("pg_dump"),
             &params,
             &BackupOptions {
-                database: "kerno_other".into(),
-                output: path.clone(),
                 format,
                 content: BackupContent::All,
-                tables: Vec::new(),
+                ..BackupOptions::new(Engine::Postgres, "kerno_other")
             },
+            &path,
         )
         .unwrap();
         let log = run_ok(backup).await;
@@ -180,13 +179,7 @@ async fn round_trips(session: Arc<dyn Session>, dir: PathBuf) {
         let restore = tools::restore_command(
             &dir.join(tool.names()[0]),
             &params,
-            &RestoreOptions {
-                database: SCRATCH.into(),
-                input: path,
-                format,
-                allow_client_commands: false,
-                tool_version: None,
-            },
+            &RestoreOptions::new(Engine::Postgres, SCRATCH, path, format),
         )
         .unwrap();
         // psql reads a script, checked before it starts; pg_restore does not.
@@ -240,12 +233,11 @@ async fn pg_dump_through_the_ssh_tunnel_with_verify_full() {
         &dir.join("pg_dump"),
         &params,
         &BackupOptions {
-            database: "kerno_other".into(),
-            output: output.clone(),
             format: BackupFormat::Sql,
             content: BackupContent::SchemaOnly,
-            tables: Vec::new(),
+            ..BackupOptions::new(Engine::Postgres, "kerno_other")
         },
+        &output,
     )
     .unwrap();
     assert!(
@@ -286,12 +278,11 @@ async fn an_older_pg_dump_fails_with_its_reason() {
         &pg_dump,
         &testing::params(Engine::Postgres),
         &BackupOptions {
-            database: "kerno_other".into(),
-            output: files.path().join("never.sql"),
             format: BackupFormat::Sql,
             content: BackupContent::SchemaOnly,
-            tables: Vec::new(),
+            ..BackupOptions::new(Engine::Postgres, "kerno_other")
         },
+        &files.path().join("never.sql"),
     )
     .unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
@@ -388,12 +379,11 @@ async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
             &dir.join("pg_dump"),
             &params,
             &BackupOptions {
-                database: database.into(),
-                output: output.to_path_buf(),
                 format: BackupFormat::Sql,
                 content: BackupContent::All,
-                tables: Vec::new(),
+                ..BackupOptions::new(Engine::Postgres, database)
             },
+            output,
         )
         .unwrap()
     };
@@ -409,11 +399,9 @@ async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
         &psql,
         &params,
         &RestoreOptions {
-            database: COPY.into(),
-            input: path.clone(),
-            format: BackupFormat::Sql,
             allow_client_commands: false,
             tool_version: tools::version(&psql),
+            ..RestoreOptions::new(Engine::Postgres, COPY, path.clone(), BackupFormat::Sql)
         },
     )
     .unwrap();
@@ -508,11 +496,14 @@ async fn a_plain_file_with_client_commands_runs_nothing() {
     ]) {
         std::fs::write(&input, &text).unwrap();
         let options = RestoreOptions {
-            database: "kerno_test_never".into(),
-            input: input.clone(),
-            format: BackupFormat::Sql,
             allow_client_commands: false,
             tool_version: version,
+            ..RestoreOptions::new(
+                Engine::Postgres,
+                "kerno_test_never",
+                input.clone(),
+                BackupFormat::Sql,
+            )
         };
         let command =
             tools::restore_command(&psql, &testing::params(Engine::Postgres), &options).unwrap();

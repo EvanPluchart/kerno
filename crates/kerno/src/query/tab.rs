@@ -36,8 +36,8 @@ use kerno_core::browse::{
     Filter, Operator, Query, Source as QuerySource, and_where, count_from, described, distinct_sql,
     one_of_sql, select_from,
 };
-use kerno_core::config::Environment;
 use kerno_core::editable::{self, Editable, ReadOnly, Source as EditSource};
+use kerno_core::environment;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{
     CellValue, RowChange, RowSql, StatementClass, StatementKind, TxCommand, apply_edits,
@@ -404,6 +404,9 @@ pub struct QueryTab {
     auto_refresh_stopped: Option<&'static str>,
     /// The frames around the bracket at the cursor and its match.
     brackets: input::RangeDecorationCollection,
+    /// The rollback of a transaction left idle, armed for the length of
+    /// its log and the environment's period (see `watch_idle_transaction`).
+    idle_rollback: Option<((usize, u32), Task<()>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -484,11 +487,12 @@ impl QueryTab {
                 }
             },
         );
-        // The connection's commit mode: manual on production unless chosen.
+        // The connection's commit mode: its own, else its environment's.
+        let environments = &AppState::get(cx).settings.environments;
         let manual_commit = target
             .as_ref()
             .and_then(|target| connections.read(cx).get(&target.connection))
-            .is_some_and(|saved| saved.config.starts_in_manual_commit());
+            .is_some_and(|saved| saved.config.starts_in_manual_commit(environments));
         let result_filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(
                 "Filter the result on the server: a SQL condition, for example total > 100",
@@ -549,8 +553,15 @@ impl QueryTab {
             auto_refresh: None,
             auto_refresh_stopped: None,
             brackets,
+            idle_rollback: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
+        // Every change of the tab may start, restart or stop the wait for
+        // an idle transaction to end.
+        let idle = cx.observe_in(&cx.entity(), window, |this: &mut Self, _, window, cx| {
+            this.watch_idle_transaction(window, cx)
+        });
+        tab._subscriptions.push(idle);
         tab.follow_connection(cx);
         tab
     }
@@ -857,10 +868,11 @@ impl QueryTab {
         }
         let connection = |target: &Option<Target>| target.as_ref().map(|t| t.connection.clone());
         if connection(&self.target) != connection(&target) && self.tx_state() == TxState::Idle {
+            let environments = &AppState::get(cx).settings.environments;
             self.manual_commit = target
                 .as_ref()
                 .and_then(|target| self.connections.read(cx).get(&target.connection))
-                .is_some_and(|saved| saved.config.starts_in_manual_commit());
+                .is_some_and(|saved| saved.config.starts_in_manual_commit(environments));
         }
         self.stop(cx);
         self.pending = None;
@@ -1671,7 +1683,7 @@ impl QueryTab {
             .map(|statement| find_params(&statement.sql, rules))
             .collect();
         if params.iter().all(Vec::is_empty) {
-            self.execute(statements, window, cx);
+            self.execute(statements, true, window, cx);
         } else {
             self.ask_params(statements, params, window, cx);
         }
@@ -1692,7 +1704,7 @@ impl QueryTab {
             .and_then(|target| self.connections.read(cx).meta_session(&target.connection))
         else {
             // No connection to run on: the run says so.
-            self.execute(statements, window, cx);
+            self.execute(statements, true, window, cx);
             return;
         };
         // A named or numbered parameter is one value for the whole run; a
@@ -1754,7 +1766,7 @@ impl QueryTab {
                     .collect();
                 view.update(cx, |this, cx| {
                     this.param_values.extend(typed);
-                    this.execute(bound, window, cx);
+                    this.execute(bound, true, window, cx);
                 });
                 // Back to the editor once the prompt is gone, so the
                 // keyboard keeps working without a click.
@@ -1765,8 +1777,15 @@ impl QueryTab {
     }
 
     /// Runs `statements` one after the other, stopping at the first that
-    /// fails.
-    fn execute(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
+    /// fails. `from_editor`: the user ran them (not a result read again),
+    /// and an environment that confirms every run asks first.
+    fn execute(
+        &mut self,
+        statements: Vec<Statement>,
+        from_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.free_to_run(window, cx) {
             return;
         }
@@ -1802,22 +1821,28 @@ impl QueryTab {
             return;
         }
         // Statements that destroy something are shown and confirmed first;
-        // on a production connection, so is anything that writes.
-        let production = saved.config.environment == Environment::Production;
-        let ask_destructive = AppState::get(cx).settings.confirm_destructive;
-        let to_confirm: Vec<&Statement> = statements
+        // so is anything that writes where the environment asks twice, and
+        // every statement run from the editor where it confirms each run.
+        let settings = &AppState::get(cx).settings;
+        let asks =
+            &environment::environment(&settings.environments, &saved.config.environment).rules;
+        let ask_destructive = settings.confirm_destructive;
+        let ask_all = from_editor && asks.confirm_execute;
+        let to_confirm: Vec<(&Statement, &StatementClass)> = statements
             .iter()
             .zip(&classes)
             .filter(|(_, class)| {
-                (class.destructive && ask_destructive) || (production && class.writes)
+                ask_all
+                    || (class.destructive && ask_destructive)
+                    || (asks.confirm_writes_twice && class.writes)
             })
-            .map(|(statement, _)| statement)
             .collect();
         if to_confirm.is_empty() {
             self.start(statements, false, window, cx);
             return;
         }
         let destructive = classes.iter().any(|class| class.destructive);
+        let writes = to_confirm.iter().any(|(_, class)| class.writes);
         let confirmation = Confirmation {
             title: match to_confirm.len() {
                 1 => "Run this statement?".to_string(),
@@ -1827,20 +1852,23 @@ impl QueryTab {
                 "It removes data or objects for good (a DROP, a TRUNCATE, an ALTER that drops, or a DELETE \
                  or UPDATE without a WHERE). This cannot be undone."
                     .to_string()
-            } else {
+            } else if writes {
                 "It changes the database.".to_string()
+            } else {
+                "This connection's environment asks before every statement runs.".to_string()
             },
             statement: ConfirmStatement::Fixed(
                 to_confirm
                     .iter()
-                    .map(|statement| statement.sql.as_str())
+                    .map(|(statement, _)| statement.sql.as_str())
                     .collect::<Vec<_>>()
                     .join(";\n\n"),
             ),
             action: "Run",
             destructive,
             connection: name,
-            environment: saved.config.environment,
+            environment: saved.config.environment.clone(),
+            writes,
         };
         let view = cx.entity();
         sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
@@ -2001,7 +2029,7 @@ impl QueryTab {
             self.start(statements, true, window, cx);
             return;
         };
-        let (name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let (name, environment) = (saved.config.name.clone(), saved.config.environment.clone());
         let classes: Vec<StatementClass> = statements
             .iter()
             .map(|statement| classify(&statement.sql, rules))
@@ -2040,6 +2068,7 @@ impl QueryTab {
             destructive,
             connection: name,
             environment,
+            writes: true,
         };
         let view = cx.entity();
         sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
@@ -2627,6 +2656,126 @@ impl QueryTab {
     pub fn set_manual_commit(&mut self, manual: bool, cx: &mut Context<Self>) {
         self.manual_commit = manual;
         cx.notify();
+    }
+
+    /// The period after which the environment rolls back this tab's open
+    /// transaction: in manual commit, while nothing runs, once a statement
+    /// of the transaction changed something (DBeaver's condition, ported
+    /// from `org.jkiss.dbeaver.model/.../runtime/jobs/DataSourceMonitorJob.java`:
+    /// a transaction that only read is left alone).
+    fn idle_period(&self, cx: &App) -> Option<u32> {
+        if !self.manual_commit || self.running() || self.tx_state() == TxState::Idle {
+            return None;
+        }
+        let rules = self.lex_rules(cx);
+        if !self
+            .tx_log
+            .iter()
+            .any(|entry| classify(&entry.sql, rules).writes)
+        {
+            return None;
+        }
+        let saved = self
+            .connections
+            .read(cx)
+            .get(&self.target.as_ref()?.connection)?;
+        let environments = &AppState::get(cx).settings.environments;
+        environment::environment(environments, &saved.config.environment)
+            .rules
+            .close_idle_transactions
+            .filter(|seconds| *seconds > 0)
+    }
+
+    /// Arms the rollback of an idle transaction when one is due, restarts
+    /// it after each statement (the log grows), and drops it when the
+    /// transaction ends or a statement runs.
+    fn watch_idle_transaction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let due = self
+            .idle_period(cx)
+            .map(|period| (self.tx_log.len(), period));
+        if self.idle_rollback.as_ref().map(|(armed, _)| *armed) == due {
+            return;
+        }
+        self.idle_rollback = due.map(|armed| {
+            let wait = Duration::from_secs(armed.1.into());
+            let rollback = cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.end_idle_transaction(armed, window, cx)
+                });
+            });
+            (armed, rollback)
+        });
+    }
+
+    /// Rolls back the transaction left idle for the environment's period,
+    /// and says so in the tab and in a notification (DBeaver's
+    /// `EndIdleTransactionsJob` rolls back too).
+    fn end_idle_transaction(
+        &mut self,
+        armed: (usize, u32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A statement ran meanwhile: its own wait is armed.
+        if self
+            .idle_period(cx)
+            .map(|period| (self.tx_log.len(), period))
+            != Some(armed)
+        {
+            return;
+        }
+        let environment = self
+            .target
+            .as_ref()
+            .and_then(|target| self.connections.read(cx).get(&target.connection))
+            .map(|saved| {
+                let environments = &AppState::get(cx).settings.environments;
+                environment::environment(environments, &saved.config.environment)
+                    .name
+                    .clone()
+            })
+            .unwrap_or_default();
+        let idle = match armed.1 {
+            seconds if seconds % 60 == 0 => {
+                let minutes = seconds / 60;
+                format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+            }
+            seconds => format!("{seconds} second{}", if seconds == 1 { "" } else { "s" }),
+        };
+        let message = format!(
+            "The transaction was left idle for {idle}: it was rolled back, as the {environment} \
+             environment asks, and nothing of it was committed."
+        );
+        let ending = self.finish_transaction(false, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = ending.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(()) => {
+                    this.notices.push(Notice {
+                        severity: "Warning".into(),
+                        message: message.clone(),
+                        code: None,
+                        detail: None,
+                    });
+                    // The messages, after the results.
+                    this.active_result = this.results.len();
+                    this.show_results();
+                    window.push_notification(
+                        Notification::warning(SharedString::from(format!(
+                            "“{}”: {message}",
+                            this.title
+                        ))),
+                        cx,
+                    );
+                    cx.notify();
+                }
+                Err(error) => {
+                    window.push_notification(Notification::error(SharedString::from(error)), cx)
+                }
+            });
+        })
+        .detach();
     }
 
     /// Commits or rolls back the tab's open transaction.
@@ -3264,7 +3413,9 @@ impl QueryTab {
             .target
             .as_ref()
             .and_then(|target| self.connections.read(cx).get(&target.connection));
-        let environment = saved.map_or(Environment::Local, |saved| saved.config.environment);
+        let environment = saved
+            .map(|saved| saved.config.environment.clone())
+            .unwrap_or_default();
         let connection = saved
             .map(|saved| saved.config.name.clone())
             .unwrap_or_default();
@@ -3303,6 +3454,7 @@ impl QueryTab {
                     .any(|change| matches!(change, RowChange::Delete { .. })),
                 connection,
                 environment,
+                writes: true,
             },
             window,
             cx,
@@ -3625,7 +3777,7 @@ impl QueryTab {
         self.close_results(&[id], cx);
         self.explain_mode = None;
         self.keep_results = true;
-        self.execute(vec![Statement { sql, origin: None }], window, cx);
+        self.execute(vec![Statement { sql, origin: None }], false, window, cx);
     }
 
     /// The menu of the result tab of pane `id`, built when it opens.
@@ -4053,7 +4205,7 @@ impl QueryTab {
         self.close_results(&[id], cx);
         self.explain_mode = None;
         self.keep_results = true;
-        self.execute(vec![Statement { sql, origin: None }], window, cx);
+        self.execute(vec![Statement { sql, origin: None }], false, window, cx);
     }
 
     /// The order a header asked of a result not wholly fetched: a column
@@ -4767,6 +4919,7 @@ impl QueryTab {
             .as_ref()
             .map_or(TxState::Idle, |session| session.tx_state());
         let view = cx.entity();
+        let chrome = saved.and_then(|saved| crate::theme::environment_chrome(&saved.config, cx));
 
         h_flex()
             .flex_none()
@@ -4775,6 +4928,7 @@ impl QueryTab {
             .gap_1()
             .border_b_1()
             .border_color(theme.border)
+            .when_some(chrome, |this, chrome| this.bg(chrome.wash))
             .child(
                 Button::new("tab-connection")
                     .ghost()
@@ -5947,22 +6101,38 @@ impl Render for QueryTab {
                 }
             }))
             .child(self.render_results(cx));
+        // The environment's colour frames the editor and the results.
+        let chrome = self
+            .target
+            .as_ref()
+            .and_then(|target| self.connections.read(cx).get(&target.connection))
+            .and_then(|saved| crate::theme::environment_chrome(&saved.config, cx));
+        let area = div().flex_1().min_h_0().map(|area| match panels {
+            Panels::Editor => area.child(editor),
+            Panels::Results => area.child(results),
+            Panels::Both => area.child(
+                v_resizable("query-split")
+                    .child(resizable_panel().child(editor))
+                    .child(resizable_panel().child(results)),
+            ),
+        });
         v_flex()
             .id("query-tab")
             .key_context("QueryTab")
             .test_support()
             .size_full()
             .child(self.render_toolbar(cx))
-            .child(div().flex_1().min_h_0().map(|area| {
-                match panels {
-                    Panels::Editor => area.child(editor),
-                    Panels::Results => area.child(results),
-                    Panels::Both => area.child(
-                        v_resizable("query-split")
-                            .child(resizable_panel().child(editor))
-                            .child(resizable_panel().child(results)),
-                    ),
-                }
-            }))
+            .child(match chrome {
+                Some(chrome) => v_flex()
+                    .id("env-frame")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .border_2()
+                    .border_color(chrome.frame)
+                    .child(area)
+                    .into_any_element(),
+                None => area.into_any_element(),
+            })
     }
 }

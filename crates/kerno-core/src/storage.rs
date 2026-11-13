@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use crate::config::ConnectionConfig;
 use crate::error::{Error, Result};
 use crate::sql::{LexRules, TokenKind, lex};
+use crate::tools::TaskSettings;
 
 /// Schema migrations, applied in order. `PRAGMA user_version` records how
 /// many have run. Never edit an entry that has shipped: add a new one.
@@ -64,6 +65,21 @@ const MIGRATIONS: &[&str] = &[
          filter  TEXT NOT NULL,
          used_at INTEGER NOT NULL,
          PRIMARY KEY (key, filter)
+     );",
+    // 3: saved tasks (the tool wizards' settings, run again on demand). No
+    // foreign key to `connections`: a task outlives its connection and says
+    // it cannot run.
+    "CREATE TABLE tasks (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         name          TEXT NOT NULL,
+         description   TEXT NOT NULL DEFAULT '',
+         connection_id TEXT NOT NULL,
+         kind          TEXT NOT NULL,
+         settings      TEXT NOT NULL,
+         created_at    INTEGER NOT NULL,
+         last_run_at   INTEGER,
+         last_status   TEXT,
+         last_log      TEXT NOT NULL DEFAULT ''
      );",
 ];
 
@@ -144,6 +160,45 @@ pub struct SavedQuery {
     pub name: String,
     /// The SQL text.
     pub sql: String,
+}
+
+/// Lines of a task run's log kept: the last ones.
+pub const TASK_LOG_LINES: usize = 5_000;
+
+/// A saved task (DBeaver's `TaskImpl`): a tool's settings, run again on
+/// demand. No scheduler, as in DBeaver Community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedTask {
+    /// Row id; 0 for a task not stored yet.
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// The connection it runs on, looked up at each run.
+    pub connection_id: String,
+    /// The tool and its settings, with no secret.
+    pub settings: TaskSettings,
+    pub created_at_ms: i64,
+    pub last_run_at_ms: Option<i64>,
+    pub last_status: Option<HistoryStatus>,
+    /// The last run's command and output, secrets redacted.
+    pub last_log: String,
+}
+
+impl SavedTask {
+    /// A task not stored yet.
+    pub fn new(name: impl Into<String>, connection_id: impl Into<String>, settings: TaskSettings) -> Self {
+        Self {
+            id: 0,
+            name: name.into(),
+            description: String::new(),
+            connection_id: connection_id.into(),
+            settings,
+            created_at_ms: 0,
+            last_run_at_ms: None,
+            last_status: None,
+            last_log: String::new(),
+        }
+    }
 }
 
 /// Kerno's SQLite store.
@@ -544,6 +599,118 @@ impl Storage {
                 .collect::<rusqlite::Result<Vec<String>>>()
         })
     }
+
+    // Tasks -----------------------------------------------------------------
+    // After DBeaver's `TaskManagerImpl` (Apache-2.0,
+    // `org.jkiss.dbeaver.registry.task`): create, update, delete, and the
+    // last run kept with the task (DBeaver keeps every run in files; Kerno
+    // keeps the last one).
+
+    /// The saved tasks, by name.
+    pub fn tasks(&self) -> Result<Vec<SavedTask>> {
+        type Row = (i64, String, String, String, String, i64, Option<i64>, Option<String>, String);
+        let rows = self.with(|c| {
+            c.prepare(
+                "SELECT id, name, description, connection_id, settings, created_at, last_run_at,
+                        last_status, last_log
+                 FROM tasks ORDER BY name COLLATE NOCASE, id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<Row>>>()
+        })?;
+        rows.into_iter()
+            .map(
+                |(id, name, description, connection_id, json, created, run, status, log)| {
+                    let settings = serde_json::from_str(&json).map_err(|error| {
+                        Error::Storage(format!("stored task “{name}” is unreadable: {error}"))
+                    })?;
+                    Ok(SavedTask {
+                        id,
+                        name,
+                        description,
+                        connection_id,
+                        settings,
+                        created_at_ms: created,
+                        last_run_at_ms: run,
+                        last_status: status.as_deref().map(HistoryStatus::parse),
+                        last_log: log,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Stores a task: a new one when its id is 0, else its name,
+    /// description, connection and settings (its last run is kept).
+    /// Returns its id.
+    pub fn save_task(&self, task: &SavedTask) -> Result<i64> {
+        let json = serde_json::to_string(&task.settings)
+            .map_err(|error| Error::Storage(format!("could not encode the task: {error}")))?;
+        let kind = task.settings.kind();
+        if task.id == 0 {
+            return self.with(|c| {
+                c.execute(
+                    "INSERT INTO tasks (name, description, connection_id, kind, settings, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![task.name, task.description, task.connection_id, kind, json, now_ms()],
+                )?;
+                Ok(c.last_insert_rowid())
+            });
+        }
+        let updated = self.with(|c| {
+            c.execute(
+                "UPDATE tasks SET name = ?2, description = ?3, connection_id = ?4, kind = ?5,
+                     settings = ?6
+                 WHERE id = ?1",
+                params![task.id, task.name, task.description, task.connection_id, kind, json],
+            )
+        })?;
+        if updated == 0 {
+            return Err(Error::Storage(format!("no saved task has id {}", task.id)));
+        }
+        Ok(task.id)
+    }
+
+    pub fn delete_task(&self, id: i64) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM tasks WHERE id = ?1", [id]))
+            .map(drop)
+    }
+
+    /// Keeps how the task's last run ended and its log: the last
+    /// [`TASK_LOG_LINES`] lines, each through [`redact_secrets`] with the
+    /// `rules` of its engine.
+    pub fn record_task_run(
+        &self,
+        id: i64,
+        status: HistoryStatus,
+        log: &[String],
+        rules: LexRules,
+    ) -> Result<()> {
+        let kept = &log[log.len().saturating_sub(TASK_LOG_LINES)..];
+        let log: Vec<String> = kept
+            .iter()
+            .map(|line| redact_secrets(line, rules))
+            .collect();
+        self.with(|c| {
+            c.execute(
+                "UPDATE tasks SET last_run_at = ?2, last_status = ?3, last_log = ?4 WHERE id = ?1",
+                params![id, now_ms(), status.as_str(), log.join("\n")],
+            )
+        })
+        .map(drop)
+    }
 }
 
 /// Creates an empty file only its owner can read or write.
@@ -800,6 +967,11 @@ impl AppPaths {
     /// Directory of the rotating log files.
     pub fn logs(&self) -> PathBuf {
         self.data_dir.join("logs")
+    }
+
+    /// The pictures folders are drawn with, as Kerno copied them.
+    pub fn folder_icons(&self) -> PathBuf {
+        self.data_dir.join("folder-icons")
     }
 
     /// The user's keymap override.
@@ -1249,5 +1421,127 @@ mod tests {
         );
         assert_eq!(paths.logs(), PathBuf::from("/tmp/kerno-x/logs"));
         assert_eq!(paths.keymap(), PathBuf::from("/tmp/kerno-x/keymap.json"));
+    }
+
+    fn backup_task(name: &str, connection: &str) -> SavedTask {
+        let options = crate::tools::BackupOptions::new(Engine::Postgres, "shop");
+        SavedTask::new(name, connection, TaskSettings::Backup(options))
+    }
+
+    #[test]
+    fn tasks_are_saved_listed_updated_run_and_deleted() {
+        let storage = Storage::in_memory().unwrap();
+        let first = storage.save_task(&backup_task("nightly", "c1")).unwrap();
+        let mut script = SavedTask::new(
+            "Apply fixes",
+            "c2",
+            TaskSettings::ExecuteScript(crate::tools::ScriptOptions::new(
+                Engine::MySql,
+                "shop",
+                "/fixes.sql",
+            )),
+        );
+        script.description = "the hotfix script".into();
+        let second = storage.save_task(&script).unwrap();
+        let tasks = storage.tasks().unwrap();
+        // By name, case aside.
+        assert_eq!(
+            tasks.iter().map(|task| task.name.as_str()).collect::<Vec<_>>(),
+            ["Apply fixes", "nightly"]
+        );
+        assert_eq!(tasks[0].id, second);
+        assert_eq!(tasks[0].settings, script.settings);
+        assert_eq!(tasks[0].description, "the hotfix script");
+        assert!(tasks[1].created_at_ms > 0 && tasks[1].last_run_at_ms.is_none());
+
+        // Renamed and edited; the id stays.
+        let mut renamed = tasks[1].clone();
+        renamed.name = "Nightly backup".into();
+        let crate::tools::TaskSettings::Backup(options) = &mut renamed.settings else {
+            unreachable!()
+        };
+        options.file_pattern = "shop-${date}".into();
+        assert_eq!(storage.save_task(&renamed).unwrap(), first);
+        let stored = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        assert_eq!(stored.name, "Nightly backup");
+        assert_eq!(stored.settings, renamed.settings);
+        let mut missing = renamed.clone();
+        missing.id = 999;
+        assert!(storage.save_task(&missing).is_err());
+
+        // A run keeps its status and the last lines of its log, without
+        // a password.
+        let mut log: Vec<String> = (0..TASK_LOG_LINES + 10).map(|n| format!("line {n}")).collect();
+        log.push("psql:fix.sql:3: ALTER ROLE app PASSWORD 'hunter2';".into());
+        storage
+            .record_task_run(first, HistoryStatus::Error, &log, LexRules::POSTGRES)
+            .unwrap();
+        let run = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        assert_eq!(run.last_status, Some(HistoryStatus::Error));
+        assert!(run.last_run_at_ms.is_some());
+        let lines: Vec<&str> = run.last_log.lines().collect();
+        assert_eq!(lines.len(), TASK_LOG_LINES);
+        assert_eq!(lines[0], "line 11");
+        assert!(!run.last_log.contains("hunter2"), "{}", lines.last().unwrap());
+        assert!(run.last_log.ends_with("PASSWORD '***';"));
+        // Saving the task again keeps its last run.
+        storage.save_task(&renamed).unwrap();
+        let kept = storage.tasks().unwrap().into_iter().find(|t| t.id == first).unwrap();
+        assert_eq!(kept.last_status, Some(HistoryStatus::Error));
+
+        // Deleting a connection keeps its tasks: they say they cannot run.
+        let connection = storage.save_connection(None, &config("c")).unwrap();
+        storage.save_task(&backup_task("orphan", &connection)).unwrap();
+        storage.delete_connection(&connection).unwrap();
+        assert!(storage.tasks().unwrap().iter().any(|t| t.connection_id == connection));
+
+        storage.delete_task(first).unwrap();
+        assert!(storage.tasks().unwrap().iter().all(|t| t.id != first));
+    }
+
+    #[test]
+    fn a_store_at_version_2_gains_the_tasks_table_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        {
+            let mut raw = Connection::open(&path).unwrap();
+            let tx = raw.transaction().unwrap();
+            for migration in &MIGRATIONS[..2] {
+                tx.execute_batch(migration).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 2).unwrap();
+            tx.execute(
+                "INSERT INTO connections (id, position, config, created_at, updated_at)
+                 VALUES ('kept', 1, ?1, 1, 1)",
+                [serde_json::to_string(&config("kept")).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO filter_history (key, filter, used_at) VALUES ('t', 'id = 1', 1)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.connections().unwrap()[0].config.name, "kept");
+        assert_eq!(storage.filters("t").unwrap(), ["id = 1"]);
+        assert!(storage.tasks().unwrap().is_empty());
+        let version: i64 = storage
+            .with(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(storage.save_task(&backup_task("first", "kept")).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_user_mapping_password_is_redacted() {
+        let sql = "CREATE USER MAPPING FOR CURRENT_USER SERVER kerno_fdw \
+                   OPTIONS (user 'kerno', password 'hunter2')";
+        assert_eq!(
+            redact_secrets(sql, LexRules::POSTGRES),
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER kerno_fdw \
+             OPTIONS (user 'kerno', password '***')"
+        );
     }
 }

@@ -298,7 +298,7 @@ fn an_import_on_production_is_confirmed_twice(cx: &mut TestAppContext) {
         )
     };
     let mut config = testing::config(Engine::Postgres);
-    config.environment = kerno_core::config::Environment::Production;
+    config.environment = kerno_core::environment::PRODUCTION.into();
     let app = connected_as(cx, config);
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("t.csv");

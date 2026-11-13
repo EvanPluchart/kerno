@@ -5,15 +5,15 @@
 //! All network, storage and secret-store work runs off the UI thread; this
 //! entity only holds state and reacts to results.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::{App, Context, EventEmitter, Task};
 use kerno_core::config::{
-    ConnectionConfig, Engine, Secret, Secrets, SshAuth, all_folders, folder_name, folder_path,
-    in_folder, parent_folder, rebase_folder,
+    ConnectionConfig, Engine, FolderLook, Secret, Secrets, SshAuth, all_folders, folder_name,
+    folder_path, in_folder, parent_folder, rebase_folder,
 };
 use kerno_core::connector::{Connector, HostKeyStore};
 use kerno_core::secrets::{self, SecretStore};
@@ -519,8 +519,44 @@ impl Connections {
     /// Removes the folder at `path`. What it holds, connections and
     /// folders, moves up to its parent.
     pub fn delete_folder(&mut self, path: &str, cx: &mut Context<Self>) {
+        // Its own look goes first: rebased, it would land on its parent.
+        AppState::update_settings(cx, |settings| {
+            settings.folder_looks.remove(path);
+        });
         let parent = parent_folder(path).map(str::to_string);
         self.rebase(path, parent.as_deref(), cx);
+        prune_folder_icons(cx);
+    }
+
+    /// Sets how the folder at `path` is drawn (a look that sets nothing
+    /// makes it plain), and removes the pictures no folder uses any more.
+    pub fn set_folder_look(&mut self, path: &str, look: FolderLook, cx: &mut Context<Self>) {
+        let path = path.to_string();
+        AppState::update_settings(cx, move |settings| {
+            if look.is_empty() {
+                settings.folder_looks.remove(&path);
+            } else {
+                settings.folder_looks.insert(path, look);
+            }
+        });
+        prune_folder_icons(cx);
+    }
+
+    /// Gives the folders of an imported file their looks, only to the ones
+    /// that have none.
+    pub fn import_folder_looks(
+        &mut self,
+        looks: std::collections::BTreeMap<String, FolderLook>,
+        cx: &mut Context<Self>,
+    ) {
+        if looks.is_empty() {
+            return;
+        }
+        AppState::update_settings(cx, move |settings| {
+            for (path, look) in looks {
+                settings.folder_looks.entry(path).or_insert(look);
+            }
+        });
     }
 
     /// Moves everything inside `from` (included) under `to`.
@@ -537,6 +573,17 @@ impl Connections {
         AppState::update_settings(cx, |settings| {
             rebased(&mut settings.connection_folders);
             rebased(&mut settings.collapsed_folders);
+            // Looks follow their folders; a folder moved onto one that
+            // exists (a deletion) leaves the existing one's look alone.
+            let (moved, kept) = std::mem::take(&mut settings.folder_looks)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(path, _)| in_folder(path, from));
+            settings.folder_looks = kept.into_iter().collect();
+            for (path, look) in moved {
+                if let Some(path) = rebase_folder(&path, from, to) {
+                    settings.folder_looks.entry(path).or_insert(look);
+                }
+            }
         });
         let mut changed = Vec::new();
         for connection in &mut self.saved {
@@ -630,6 +677,25 @@ impl Connections {
             Some(filter) => filters.insert(key.to_string(), filter),
             None => filters.remove(key),
         };
+        let changed = vec![connection.clone()];
+        self.store(changed, cx);
+    }
+
+    /// Sets (or with `None` removes) the folder of the client tools a
+    /// connection uses, and saves it with the connection's settings.
+    pub fn set_client_dir(
+        &mut self,
+        id: &str,
+        dir: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.saved.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        if connection.config.client_dir == dir {
+            return;
+        }
+        connection.config.client_dir = dir;
         let changed = vec![connection.clone()];
         self.store(changed, cx);
     }
@@ -1025,6 +1091,27 @@ fn close_all(meta: Option<Arc<dyn Session>>, opened: &Opened, cx: &App) {
 /// The folder a connection is in, tidied; `None` at the top level.
 pub fn folder_of(config: &ConnectionConfig) -> Option<String> {
     config.group.as_deref().and_then(folder_path)
+}
+
+/// Removes, off the UI thread, the folder pictures no look uses, those of
+/// a dialog that was cancelled too. A picture written after this call is
+/// kept: a dialog open now may be about to use it.
+fn prune_folder_icons(cx: &mut App) {
+    let state = AppState::get(cx);
+    let dir = state.paths.folder_icons();
+    let used: HashSet<String> = state
+        .settings
+        .folder_looks
+        .values()
+        .filter_map(|look| look.image.clone())
+        .collect();
+    let now = SystemTime::now();
+    bridge::spawn_blocking(cx, move || {
+        if let Err(error) = crate::folder_dialog::remove_unused_icons(&dir, &used, now) {
+            tracing::warn!(%error, "unused folder pictures could not be removed");
+        }
+    })
+    .detach();
 }
 
 /// Keeps a folder a connection leaves, so it does not vanish once empty.

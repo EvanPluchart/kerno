@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kerno_core::config::{
-    ConnectionConfig, Engine, Environment, ObjectFilter, Secret, Secrets, SshAuth, SshConfig,
-    TlsConfig, TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
+    ConnectionConfig, Engine, ObjectFilter, Secret, Secrets, SshAuth, SshConfig, TlsConfig,
+    TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
 };
 use kerno_core::sql::{LexRules, split_statements};
 
@@ -73,7 +73,8 @@ pub struct ConnectionForm {
     pub name: String,
     pub group: String,
     pub color: Option<String>,
-    pub environment: Environment,
+    /// Id of the environment.
+    pub environment: String,
     pub host: String,
     pub port: String,
     pub user: String,
@@ -106,11 +107,14 @@ pub struct ConnectionForm {
     pub ignore_init_errors: bool,
     /// Not edited here (the tree's Filter ▸ menu does): kept as it was.
     pub navigator_filters: BTreeMap<String, ObjectFilter>,
+    /// The folder of the client tools; the default when `None` (Advanced
+    /// tab).
+    pub client_dir: Option<std::path::PathBuf>,
 }
 
 /// The commit modes the dialog offers, with their labels.
 pub const COMMIT_MODES: [(Option<bool>, &str); 3] = [
-    (None, "From the environment (production: manual)"),
+    (None, "From the environment"),
     (Some(true), "Auto-commit"),
     (Some(false), "Manual commit"),
 ];
@@ -150,7 +154,7 @@ impl ConnectionForm {
             name: config.name.clone(),
             group: config.group.clone().unwrap_or_default(),
             color: config.color.clone(),
-            environment: config.environment,
+            environment: config.environment.clone(),
             host: config.host.clone(),
             port: config.port.to_string(),
             user: config.user.clone(),
@@ -188,6 +192,7 @@ impl ConnectionForm {
                 .join("\n"),
             ignore_init_errors: config.ignore_init_errors,
             navigator_filters: config.navigator_filters.clone(),
+            client_dir: config.client_dir.clone(),
         }
     }
 
@@ -428,7 +433,7 @@ impl ConnectionForm {
             tls,
             ssh,
             read_only: self.read_only,
-            environment: self.environment,
+            environment: self.environment.clone(),
             color: self.color.clone(),
             group: kerno_core::config::folder_path(&self.group),
             save_password: self.save_password,
@@ -441,6 +446,7 @@ impl ConnectionForm {
             init_sql,
             ignore_init_errors: self.ignore_init_errors,
             navigator_filters: self.navigator_filters.clone(),
+            client_dir: self.client_dir.clone(),
         };
         // Secrets are kept exactly as typed (a password may start or end
         // with a space), and only the ones the chosen methods use.
@@ -696,7 +702,7 @@ mod tests {
         config.name = "Billing".into();
         config.group = Some("Work".into());
         config.color = Some("purple".into());
-        config.environment = Environment::Production;
+        config.environment = kerno_core::environment::PRODUCTION.into();
         config.database = Some("billing".into());
         config.read_only = true;
         config.save_password = false;

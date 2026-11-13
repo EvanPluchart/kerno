@@ -24,6 +24,7 @@ use kerno_core::storage::SavedConnection;
 use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
 use crate::connections::manager::{Connections, Status, folder_of};
+use crate::folder_dialog::{self, Target};
 use crate::navigator::view::Navigator;
 use crate::state::AppState;
 
@@ -52,6 +53,8 @@ pub enum SidebarAction {
     LinkWithEditor(bool),
     NewConnectionHere,
     NewSubfolder,
+    /// A folder's name, colour and icon.
+    EditFolder,
     Rename,
     Delete,
     Connect,
@@ -89,6 +92,7 @@ impl SidebarAction {
             Self::LinkWithEditor(_) => "Link with editor",
             Self::NewConnectionHere => "New connection here…",
             Self::NewSubfolder => "New subfolder…",
+            Self::EditFolder => "Edit folder…",
             Self::Rename => "Rename…",
             Self::Delete => "Delete…",
             Self::Connect => "Connect",
@@ -161,6 +165,7 @@ pub fn menu(
             Separator,
             Item(Disconnect, none_open),
             Separator,
+            enabled(EditFolder),
             enabled(Rename),
             Separator,
             enabled(Delete),
@@ -408,11 +413,10 @@ impl Sidebar {
                 if let Some(parent) = &parent {
                     set_collapsed(parent, false, cx);
                 }
-                ask_name("New folder", String::new(), window, cx, move |name, cx| {
-                    connections
-                        .update(cx, |c, cx| c.create_folder(parent.as_deref(), name, cx))
-                        .map(drop)
-                });
+                folder_dialog::open(connections, Target::New(parent), window, cx);
+            }
+            (Subject::Folder(path), EditFolder) => {
+                folder_dialog::open(connections, Target::Edit(path.clone()), window, cx);
             }
             (Subject::List, ImportConnections) => cx.emit(SidebarEvent::ImportConnections),
             // The list is read again, and every tree being browsed.
@@ -933,6 +937,7 @@ mod tests {
                 "—",
                 "Disconnect (none open)",
                 "—",
+                "Edit folder…",
                 "Rename…",
                 "—",
                 "Delete…",

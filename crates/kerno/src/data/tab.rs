@@ -24,7 +24,6 @@ use gpui_kit::{
 use kerno_core::browse::{
     Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql,
 };
-use kerno_core::config::Environment;
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
@@ -1598,7 +1597,9 @@ impl DataTab {
             return;
         }
         let saved = self.connections.read(cx).get(&self.target.connection);
-        let environment = saved.map_or(Environment::Local, |saved| saved.config.environment);
+        let environment = saved
+            .map(|saved| saved.config.environment.clone())
+            .unwrap_or_default();
         let count = self.pending_count(cx);
         let view = cx.entity();
         let run = statements.clone();
@@ -1625,6 +1626,7 @@ impl DataTab {
                     .any(|change| matches!(change, RowChange::Delete { .. })),
                 connection: self.connection_name(cx),
                 environment,
+                writes: true,
             },
             window,
             cx,
@@ -1748,6 +1750,12 @@ impl DataTab {
         }
     }
 
+    /// What the connection's environment paints on the tab.
+    fn chrome(&self, cx: &App) -> Option<crate::theme::EnvironmentChrome> {
+        let saved = self.connections.read(cx).get(&self.target.connection)?;
+        crate::theme::environment_chrome(&saved.config, cx)
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let engine = self
@@ -1762,6 +1770,7 @@ impl DataTab {
         let action = |id: &'static str, label: &'static str, tip: &'static str| {
             Button::new(id).ghost().small().label(label).tooltip(tip)
         };
+        let chrome = self.chrome(cx);
         h_flex()
             .flex_none()
             .px_2()
@@ -1769,6 +1778,7 @@ impl DataTab {
             .gap_1()
             .border_b_1()
             .border_color(theme.border)
+            .when_some(chrome, |this, chrome| this.bg(chrome.wash))
             .children(
                 engine.map(|engine| div().flex_none().child(engine_logo(engine, px(14.), cx))),
             )
@@ -2554,7 +2564,23 @@ impl Render for DataTab {
                     .border_color(border)
                     .child(SharedString::from(error))
             }))
-            .child(div().flex_1().min_h_0().child(self.render_rows(cx)))
+            .child(match self.chrome(cx) {
+                // The environment's colour frames the grid.
+                Some(chrome) => div()
+                    .id("env-frame")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .border_2()
+                    .border_color(chrome.frame)
+                    .child(self.render_rows(cx))
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_rows(cx))
+                    .into_any_element(),
+            })
             .child(self.render_footer(cx))
     }
 }

@@ -39,7 +39,9 @@ pub struct SchemaInfo {
 }
 
 /// A table-like object, addressed by schema and name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct TableRef {
     /// PostgreSQL schema or MySQL database.
     pub schema: String,

@@ -21,7 +21,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use kerno_core::Error;
-use kerno_core::config::{Engine, Environment, Secrets, TlsMode};
+use kerno_core::config::{Engine, Secrets, TlsMode};
+use kerno_core::environment;
 use kerno_core::error::{Explained, explain};
 use kerno_core::ssh::SshError;
 use kerno_core::storage::SavedConnection;
@@ -126,6 +127,8 @@ pub struct ConnectionDialog {
     databases: DatabaseList,
     /// Lists the databases once the fields settle; replaced on each change.
     listing: Option<Task<()>>,
+    /// Probing the client folder chosen on the Advanced tab.
+    choosing_client: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -183,6 +186,13 @@ impl ConnectionDialog {
             ),
             None => (None, ConnectionForm::new(Engine::Postgres)),
         };
+        if editing.is_none() {
+            // A new connection starts as its environment says.
+            let environments = &AppState::get(cx).settings.environments;
+            form.read_only = environment::environment(environments, &form.environment)
+                .rules
+                .read_only;
+        }
         if let Some(folder) = folder {
             form.group = folder;
         }
@@ -293,6 +303,7 @@ impl ConnectionDialog {
             running_test: None,
             databases: DatabaseList::Unknown,
             listing: None,
+            choosing_client: None,
             _subscriptions: subscriptions,
         }
     }
@@ -540,6 +551,61 @@ impl ConnectionDialog {
     /// A labelled field with its error, if any, underneath.
     /// The existing folders, to fill the folder field. A new folder is
     /// typed there (`Work/Clients`).
+    /// The environments of the settings, each with its colour; picking one
+    /// for a new connection also sets its read-only default.
+    fn environment_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let environments = AppState::get(cx).settings.environments.clone();
+        let dark = cx.theme().is_dark();
+        let known = environments
+            .iter()
+            .any(|def| def.id == self.form.environment);
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(environments.into_iter().enumerate().map(|(index, def)| {
+                        let selected = def.id == self.form.environment;
+                        let dot = def.color(dark).map(|color| {
+                            div()
+                                .flex_none()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(gpui_kit::rgb(color))
+                        });
+                        theme::chip(("conn-env", index), selected)
+                            .small()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .children(dot)
+                                    .child(SharedString::from(def.name.clone())),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.form.environment = def.id.clone();
+                                if this.editing.is_none() {
+                                    this.form.read_only = def.rules.read_only;
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .when(!known, |this| {
+                this.child(
+                    div()
+                        .id("conn-env-unknown")
+                        .test_support()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(SharedString::from(format!(
+                            "Unknown environment “{}”: its rules are local's until you pick one.",
+                            self.form.environment
+                        ))),
+                )
+            })
+    }
+
     fn folder_picker(&self, cx: &App) -> impl IntoElement {
         let folders = self.connections.read(cx).folders(cx);
         let input = self.inputs.group.clone();
@@ -749,36 +815,20 @@ impl ConnectionDialog {
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let memory_only = !AppState::get(cx).secrets.is_persistent();
-        let environment = Environment::ALL
-            .iter()
-            .position(|e| *e == self.form.environment);
         let swatch = |key: Option<&'static str>, cx: &mut Context<Self>| {
-            let selected = self.form.color.as_deref() == key;
-            let color = key.and_then(|key| theme::tag_color(key, cx));
-            div()
-                .id(SharedString::from(format!(
-                    "color-{}",
-                    key.unwrap_or("none")
-                )))
-                .size(px(20.))
-                .rounded_full()
-                .border_2()
-                .border_color(if selected {
-                    cx.theme().ring
-                } else {
-                    cx.theme().border
-                })
-                .when_some(color, |this, color| this.bg(color))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
+            let id = SharedString::from(format!("color-{}", key.unwrap_or("none")));
+            theme::swatch(id, key, self.form.color.as_deref() == key, cx).on_click(cx.listener(
+                move |this, _, _, cx| {
                     this.form.color = key.map(str::to_string);
                     cx.notify();
-                }))
+                },
+            ))
         };
         let mut swatches = vec![swatch(None, cx)];
         for (key, _, _) in theme::TAG_COLORS {
             swatches.push(swatch(Some(key), cx));
         }
+        let environments = self.environment_picker(cx).into_any_element();
         let theme = cx.theme();
 
         v_flex()
@@ -830,22 +880,7 @@ impl ConnectionDialog {
                     .gap_6()
                     .items_start()
                     .child(self.field("Colour", None, h_flex().gap_1().children(swatches), cx))
-                    .child(
-                        self.field(
-                            "Environment",
-                            None,
-                            RadioGroup::horizontal("conn-environment")
-                                .children(Environment::ALL.map(Environment::label))
-                                .selected_index(environment)
-                                .on_click(cx.listener(|this, index: &usize, _, cx| {
-                                    if let Some(environment) = Environment::ALL.get(*index) {
-                                        this.form.environment = *environment;
-                                        cx.notify();
-                                    }
-                                })),
-                            cx,
-                        ),
-                    ),
+                    .child(self.field("Environment", None, environments, cx)),
             )
             .child(
                 h_flex()
@@ -1144,6 +1179,12 @@ impl ConnectionDialog {
                     })),
             )
             .child(self.field(
+                "Local client (backup, restore and scripts run its tools)",
+                None,
+                self.render_local_client(cx),
+                cx,
+            ))
+            .child(self.field(
                 "Driver options, one key=value per line",
                 Some(Field::Options),
                 Textarea::new(&self.inputs.options),
@@ -1158,6 +1199,97 @@ impl ConnectionDialog {
                         Engine::MySql | Engine::MariaDb => "connect_timeout is understood by the driver; any other option is a session variable set at session start (sql_mode, time_zone, …).",
                     }),
             )
+    }
+
+    /// The connection's client folder, or the default; a folder chosen
+    /// here must hold the engine's tools, and is added to Settings ▸ Local
+    /// clients (a client is only run from a folder listed there).
+    fn render_local_client(&self, cx: &mut Context<Self>) -> AnyElement {
+        let chosen = self.form.client_dir.clone();
+        h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .id("conn-client-dir")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .child(SharedString::from(chosen.as_ref().map_or_else(
+                        || "Default (Settings ▸ Local clients)".to_string(),
+                        |dir| dir.display().to_string(),
+                    ))),
+            )
+            .child(
+                Button::new("conn-client-choose")
+                    .small()
+                    .outline()
+                    .label("Choose folder…")
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_client(window, cx))),
+            )
+            .child(
+                Button::new("conn-client-default")
+                    .small()
+                    .ghost()
+                    .label("Use the default")
+                    .disabled(chosen.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.form.client_dir = None;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn choose_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picking = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Use this client".into()),
+        });
+        let family = kerno_core::tools::ClientFamily::of(self.form.engine);
+        self.choosing_client = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picking.await else {
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            let probing = this.update(cx, |_, cx| {
+                let dir = dir.clone();
+                crate::bridge::spawn_blocking(cx, move || {
+                    kerno_core::tools::probe_client(&dir, family).is_some()
+                })
+            });
+            let Ok(probing) = probing else {
+                return;
+            };
+            let found = probing.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if found {
+                    AppState::update_settings(cx, |settings| {
+                        if !settings.client_folders.contains(&dir) {
+                            settings.client_folders.push(dir.clone());
+                        }
+                    });
+                    this.form.client_dir = Some(dir);
+                } else {
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::warning(
+                            SharedString::from(format!(
+                                "{} holds no {} client tool: it was not chosen.",
+                                dir.display(),
+                                family.label()
+                            )),
+                        ),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn render_test(&self, cx: &mut Context<Self>) -> AnyElement {

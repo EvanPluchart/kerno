@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::{self, EnvironmentDef};
 use crate::error::{Error, Result};
 
 /// A database engine Kerno can talk to.
@@ -188,34 +189,6 @@ fn default_keepalive() -> u16 {
     30
 }
 
-/// What kind of system a connection points at. `Production` makes every
-/// write ask for a second confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Environment {
-    /// A developer machine.
-    #[default]
-    Local,
-    /// A shared pre-production system.
-    Staging,
-    /// Live data.
-    Production,
-}
-
-impl Environment {
-    /// Every environment, safest first.
-    pub const ALL: [Environment; 3] = [Self::Local, Self::Staging, Self::Production];
-
-    /// Name shown to the user.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Local => "Local",
-            Self::Staging => "Staging",
-            Self::Production => "Production",
-        }
-    }
-}
-
 /// A saved connection, without its secrets. This is what is stored on disk
 /// and what import/export writes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,9 +215,10 @@ pub struct ConnectionConfig {
     /// Block writes in the client and open sessions read-only on the server.
     #[serde(default)]
     pub read_only: bool,
-    /// Environment tag.
-    #[serde(default)]
-    pub environment: Environment,
+    /// Id of the connection's environment (see [`crate::environment`]):
+    /// `local`, `staging`, `production` or one the user added.
+    #[serde(default = "default_environment")]
+    pub environment: String,
     /// Colour tag: a key of the theme's connection tag colours.
     #[serde(default)]
     pub color: Option<String>,
@@ -279,10 +253,18 @@ pub struct ConnectionConfig {
     /// (`tables`, `views`, `functions`, …). Exported with the connection.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub navigator_filters: BTreeMap<String, ObjectFilter>,
+    /// The folder of the client tools (`pg_dump`, `mysqldump`…) this
+    /// connection uses; Settings ▸ Local clients' default when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_dir: Option<std::path::PathBuf>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_environment() -> String {
+    environment::LOCAL.to_string()
 }
 
 /// The objects of one kind the schema tree shows: DBeaver's object filter
@@ -404,7 +386,7 @@ impl ConnectionConfig {
             tls: TlsConfig::default(),
             ssh: None,
             read_only: false,
-            environment: Environment::default(),
+            environment: default_environment(),
             color: None,
             group: None,
             save_password: true,
@@ -414,13 +396,15 @@ impl ConnectionConfig {
             init_sql: Vec::new(),
             ignore_init_errors: false,
             navigator_filters: BTreeMap::new(),
+            client_dir: None,
         }
     }
 
-    /// Whether query tabs of this connection start in manual commit.
-    pub fn starts_in_manual_commit(&self) -> bool {
-        self.auto_commit
-            .map_or(self.environment == Environment::Production, |auto| !auto)
+    /// Whether query tabs of this connection start in manual commit: its
+    /// own choice, else its environment's rule.
+    pub fn starts_in_manual_commit(&self, environments: &[EnvironmentDef]) -> bool {
+        let rules = &environment::environment(environments, &self.environment).rules;
+        self.auto_commit.map_or(!rules.auto_commit, |auto| !auto)
     }
 
     /// Checks the settings are complete enough to try a connection.
@@ -798,6 +782,10 @@ pub struct ConnectionsFile {
     pub kerno_connections: u32,
     /// The connections.
     pub connections: Vec<ConnectionConfig>,
+    /// The looks of their folders, by path: colour and glyph, never a
+    /// custom image (a file of this computer). Older files have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub folders: BTreeMap<String, FolderLook>,
 }
 
 /// Version written in [`ConnectionsFile::kerno_connections`].
@@ -806,6 +794,15 @@ const CONNECTIONS_FILE_VERSION: u32 = 1;
 /// Serializes connections for export. Passwords and passphrases are not
 /// part of [`ConnectionConfig`], so the result cannot contain any.
 pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
+    export_connections_with_folders(connections, &BTreeMap::new())
+}
+
+/// [`export_connections`] with the looks of the folders (see
+/// [`ConnectionsFile::folders`]).
+pub fn export_connections_with_folders(
+    connections: &[ConnectionConfig],
+    folders: &BTreeMap<String, FolderLook>,
+) -> Result<String> {
     // The one free-form part of a connection is its options: refuse to
     // write a file if any of them is named like a secret.
     for connection in connections {
@@ -813,9 +810,19 @@ pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
             Error::Config(format!("connection \"{}\": {error}", connection.name))
         })?;
     }
+    // The client folder is this computer's choice: never exported.
+    let connections = connections
+        .iter()
+        .cloned()
+        .map(|mut connection| {
+            connection.client_dir = None;
+            connection
+        })
+        .collect();
     serde_json::to_string_pretty(&ConnectionsFile {
         kerno_connections: CONNECTIONS_FILE_VERSION,
-        connections: connections.to_vec(),
+        connections,
+        folders: shared_looks(folders),
     })
     .map_err(|error| Error::Config(format!("could not encode the connections: {error}")))
 }
@@ -823,6 +830,11 @@ pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
 /// Reads an exported connections file. Every connection is validated; one
 /// bad entry rejects the file, naming it, rather than importing part of it.
 pub fn import_connections(json: &str) -> Result<Vec<ConnectionConfig>> {
+    Ok(import_connections_file(json)?.connections)
+}
+
+/// [`import_connections`] with the looks of the folders the file carries.
+pub fn import_connections_file(json: &str) -> Result<ConnectionsFile> {
     let file: ConnectionsFile = serde_json::from_str(json)
         .map_err(|error| Error::Config(format!("this is not a Kerno connections file: {error}")))?;
     if file.kerno_connections > CONNECTIONS_FILE_VERSION {
@@ -840,7 +852,37 @@ pub fn import_connections(json: &str) -> Result<Vec<ConnectionConfig>> {
             ))
         })?;
     }
-    Ok(file.connections)
+    // A file could otherwise point backups at programs someone else chose:
+    // the client folder is always this computer's own choice.
+    let connections = file
+        .connections
+        .into_iter()
+        .map(|mut connection| {
+            connection.client_dir = None;
+            connection
+        })
+        .collect();
+    Ok(ConnectionsFile {
+        connections,
+        folders: shared_looks(&file.folders),
+        ..file
+    })
+}
+
+/// The looks of folders as a connections file carries them: paths tidied,
+/// no image (a file name on one computer only, never taken from a file),
+/// and no look that sets nothing.
+fn shared_looks(folders: &BTreeMap<String, FolderLook>) -> BTreeMap<String, FolderLook> {
+    folders
+        .iter()
+        .filter_map(|(path, look)| {
+            let look = FolderLook {
+                image: None,
+                ..look.clone()
+            };
+            Some((folder_path(path)?, look)).filter(|(_, look)| !look.is_empty())
+        })
+        .collect()
 }
 
 // Folders ---------------------------------------------------------------------
@@ -895,6 +937,32 @@ pub fn in_folder(path: &str, folder: &str) -> bool {
 pub fn rebase_folder(path: &str, from: &str, to: Option<&str>) -> Option<String> {
     let rest = path.strip_prefix(from).unwrap_or_default();
     folder_path(&format!("{}/{rest}", to.unwrap_or_default()))
+}
+
+/// How a folder is drawn in the sidebar: a colour of the connection palette,
+/// a built-in glyph, or a picture the user chose. The app keeps the looks in
+/// its settings, by folder path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FolderLook {
+    /// A key of the connection tag colours (`blue`, `red`…).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// A built-in glyph (`briefcase`, `server`…); the folder glyph when
+    /// `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glyph: Option<String>,
+    /// A picture, by the name Kerno gave its copy in the folder icons
+    /// directory; drawn instead of the glyph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+impl FolderLook {
+    /// Whether the look sets nothing: the plain folder.
+    pub fn is_empty(&self) -> bool {
+        self.color.is_none() && self.glyph.is_none() && self.image.is_none()
+    }
 }
 
 /// Every folder of `paths`, their parents included, sorted, once each.
@@ -1174,25 +1242,64 @@ mod tests {
         assert_eq!(config.auto_commit, None);
         assert_eq!(config.default_schema, None);
         assert!(config.init_sql.is_empty() && !config.ignore_init_errors);
-        assert!(!config.starts_in_manual_commit());
+        assert!(!config.starts_in_manual_commit(&environment::builtin_environments()));
     }
 
     #[test]
     fn the_commit_mode_follows_the_environment_unless_chosen() {
+        let mut environments = environment::builtin_environments();
+        environments.push(environment::EnvironmentDef {
+            id: "qa".into(),
+            name: "QA".into(),
+            color_light: None,
+            color_dark: None,
+            tint: environment::Tint::None,
+            rules: environment::EnvironmentRules {
+                auto_commit: false,
+                ..Default::default()
+            },
+        });
         let mut config = ConnectionConfig::new(Engine::Postgres);
         for (environment, manual) in [
-            (Environment::Local, false),
-            (Environment::Staging, false),
-            (Environment::Production, true),
+            ("local", false),
+            ("staging", false),
+            ("production", true),
+            ("qa", true),
+            // An environment that no longer exists: local's rules.
+            ("gone", false),
         ] {
-            config.environment = environment;
+            config.environment = environment.into();
             config.auto_commit = None;
-            assert_eq!(config.starts_in_manual_commit(), manual, "{environment:?}");
+            assert_eq!(
+                config.starts_in_manual_commit(&environments),
+                manual,
+                "{environment}"
+            );
             config.auto_commit = Some(true);
-            assert!(!config.starts_in_manual_commit(), "{environment:?}");
+            assert!(
+                !config.starts_in_manual_commit(&environments),
+                "{environment}"
+            );
             config.auto_commit = Some(false);
-            assert!(config.starts_in_manual_commit(), "{environment:?}");
+            assert!(
+                config.starts_in_manual_commit(&environments),
+                "{environment}"
+            );
         }
+    }
+
+    /// Stores and exports written when the environment was a fixed list
+    /// hold its lowercase name, which is the built-in's id.
+    #[test]
+    fn an_old_connection_keeps_its_environment_by_id() {
+        let mut stored = serde_json::to_value(ConnectionConfig::new(Engine::MySql)).unwrap();
+        stored["environment"] = "production".into();
+        let config: ConnectionConfig = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(config.environment, environment::PRODUCTION);
+        assert!(config.starts_in_manual_commit(&environment::builtin_environments()));
+        stored.as_object_mut().unwrap().remove("environment");
+        let config: ConnectionConfig = serde_json::from_value(stored).unwrap();
+        assert_eq!(config.environment, environment::LOCAL);
     }
 
     #[test]
@@ -1371,10 +1478,29 @@ mod tests {
     }
 
     #[test]
+    fn an_imported_connection_never_chooses_a_local_client() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Shop".into();
+        config.client_dir = Some("/opt/homebrew/opt/libpq/bin".into());
+        // Kept where the app stores it, on this computer...
+        let stored = serde_json::to_string(&config).unwrap();
+        assert!(stored.contains("client_dir"), "{stored}");
+        // ...never in an exported file.
+        let exported = export_connections(std::slice::from_ref(&config)).unwrap();
+        assert!(!exported.contains("client_dir"), "{exported}");
+        // A file that names one has it cleared.
+        let hostile = r#"{"kerno_connections": 1, "connections": [{
+            "name": "Shop", "engine": "postgres", "host": "db", "port": 5432,
+            "user": "ada", "client_dir": "/tmp/evil"}]}"#;
+        let imported = import_connections(hostile).unwrap();
+        assert_eq!(imported[0].client_dir, None);
+    }
+
+    #[test]
     fn connections_export_and_import_without_secrets() {
         let mut first = ConnectionConfig::new(Engine::Postgres);
         first.name = "Shop".into();
-        first.environment = Environment::Production;
+        first.environment = environment::PRODUCTION.into();
         first.color = Some("red".into());
         // A nested folder travels as it is stored.
         first.group = Some("Work/Clients".into());
@@ -1413,6 +1539,65 @@ mod tests {
             import_connections(&export_connections(&[]).unwrap()).unwrap(),
             []
         );
+    }
+
+    #[test]
+    fn exported_folders_carry_colour_and_glyph_but_no_image() {
+        let mut connection = ConnectionConfig::new(Engine::Postgres);
+        connection.name = "Shop".into();
+        connection.group = Some("Work/Clients".into());
+        let look = |color: Option<&str>, glyph: Option<&str>, image: Option<&str>| FolderLook {
+            color: color.map(str::to_string),
+            glyph: glyph.map(str::to_string),
+            image: image.map(str::to_string),
+        };
+        let folders = BTreeMap::from([
+            (
+                "Work".to_string(),
+                look(
+                    Some("blue"),
+                    Some("briefcase"),
+                    Some("0123456789abcdef.png"),
+                ),
+            ),
+            // Only an image: nothing of it travels.
+            (
+                "Work/Clients".to_string(),
+                look(None, None, Some("fedcba9876543210.png")),
+            ),
+        ]);
+        let exported =
+            export_connections_with_folders(std::slice::from_ref(&connection), &folders).unwrap();
+        assert!(!exported.contains(".png"), "{exported}");
+        let file = import_connections_file(&exported).unwrap();
+        assert_eq!(file.connections, [connection.clone()]);
+        assert_eq!(
+            file.folders,
+            BTreeMap::from([(
+                "Work".to_string(),
+                look(Some("blue"), Some("briefcase"), None)
+            )])
+        );
+
+        // A file that names an image file has it dropped, and its paths are
+        // tidied.
+        let hostile = r#"{"kerno_connections": 1, "connections": [], "folders": {
+            " Work / x ": {"color": "red", "image": "../../secret.png"},
+            "Empty": {}}}"#;
+        assert_eq!(
+            import_connections_file(hostile).unwrap().folders,
+            BTreeMap::from([("Work/x".to_string(), look(Some("red"), None, None))])
+        );
+        // Older files have no looks; without any, none is written.
+        let plain = export_connections(std::slice::from_ref(&connection)).unwrap();
+        assert!(!plain.contains("\"folders\""), "{plain}");
+        assert_eq!(
+            import_connections_file(&plain).unwrap().folders,
+            BTreeMap::new()
+        );
+        // A look without anything set is the default one.
+        assert!(FolderLook::default().is_empty());
+        assert!(!look(None, Some("star"), None).is_empty());
     }
 
     #[test]

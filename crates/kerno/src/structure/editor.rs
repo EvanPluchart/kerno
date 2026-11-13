@@ -20,7 +20,6 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
     div, px,
 };
-use kerno_core::config::Environment;
 use kerno_core::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
 use kerno_core::table_draft::{
     AutoIncrement, ColumnDraft, ForeignKeyDraft, IndexDraft, REFERENTIAL_ACTIONS, TableChange,
@@ -913,7 +912,9 @@ impl TableEditor {
             return;
         }
         let saved = self.connections.read(cx).get(&self.target.connection);
-        let environment = saved.map_or(Environment::Local, |saved| saved.config.environment);
+        let environment = saved
+            .map(|saved| saved.config.environment.clone())
+            .unwrap_or_default();
         let engine = saved.map_or(Engine::Postgres, |saved| saved.config.engine);
         let explanation = match engine {
             Engine::Postgres => "These statements run in one transaction: all of them take \
@@ -945,6 +946,7 @@ impl TableEditor {
                 destructive,
                 connection: self.connection_name(cx),
                 environment,
+                writes: true,
             },
             window,
             cx,

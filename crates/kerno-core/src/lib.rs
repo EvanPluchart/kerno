@@ -8,6 +8,7 @@ pub mod connector;
 pub mod dialect;
 pub mod driver;
 pub mod editable;
+pub mod environment;
 pub mod error;
 pub mod exec;
 pub mod export;
@@ -30,8 +31,8 @@ pub mod testing;
 pub mod tools;
 
 pub use config::{
-    ConnectParams, ConnectionConfig, Engine, Environment, Secret, Secrets, SshAuth, SshConfig,
-    TlsConfig, TlsMode,
+    ConnectParams, ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshConfig, TlsConfig,
+    TlsMode,
 };
 pub use connector::{Connector, HostKeyStore};
 pub use dialect::Dialect;

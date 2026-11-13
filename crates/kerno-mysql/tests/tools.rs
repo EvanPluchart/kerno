@@ -83,12 +83,11 @@ async fn copy(engine: Engine, dump: PathBuf, client: PathBuf) {
         &dump,
         &params,
         &BackupOptions {
-            database: "kerno_other".into(),
-            output: path.clone(),
             format: BackupFormat::Sql,
             content: BackupContent::All,
-            tables: Vec::new(),
+            ..BackupOptions::new(Engine::MySql, "kerno_other")
         },
+        &path,
     )
     .unwrap();
     run_ok(backup).await;
@@ -98,11 +97,9 @@ async fn copy(engine: Engine, dump: PathBuf, client: PathBuf) {
         &client,
         &params,
         &RestoreOptions {
-            database: SCRATCH.into(),
-            input: path,
-            format: BackupFormat::Sql,
             allow_client_commands: false,
             tool_version: tools::version(&client),
+            ..RestoreOptions::new(Engine::MySql, SCRATCH, path, BackupFormat::Sql)
         },
     )
     .unwrap();
@@ -237,12 +234,11 @@ async fn genuine_round_trip(
             &dump,
             &params,
             &BackupOptions {
-                database: database.into(),
-                output: output.to_path_buf(),
                 format: BackupFormat::Sql,
                 content: BackupContent::All,
-                tables: Vec::new(),
+                ..BackupOptions::new(Engine::MySql, database)
             },
+            output,
         )
         .unwrap()
     };
@@ -284,11 +280,9 @@ async fn genuine_round_trip(
             &client,
             &params,
             &RestoreOptions {
-                database: copy.into(),
-                input: input.to_path_buf(),
-                format: BackupFormat::Sql,
                 allow_client_commands: false,
                 tool_version,
+                ..RestoreOptions::new(Engine::MySql, copy, input.to_path_buf(), BackupFormat::Sql)
             },
         )
         .unwrap()
@@ -390,11 +384,14 @@ async fn a_file_with_client_commands_runs_nothing() {
         ] {
             std::fs::write(&input, &text).unwrap();
             let options = RestoreOptions {
-                database: database.clone(),
-                input: input.clone(),
-                format: BackupFormat::Sql,
                 allow_client_commands: false,
                 tool_version: None,
+                ..RestoreOptions::new(
+                    Engine::MySql,
+                    database.clone(),
+                    input.clone(),
+                    BackupFormat::Sql,
+                )
             };
             let params = testing::params(engine);
             let restore = tools::restore_command(&client, &params, &options).unwrap();

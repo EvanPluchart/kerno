@@ -1,6 +1,7 @@
 //! The confirmation every statement that changes or destroys something
 //! goes through: it shows the exact SQL before running it, and asks a
-//! second time on a production connection.
+//! second time when the connection's environment says so (production does,
+//! with no setup: CLAUDE.md §1).
 
 use std::rc::Rc;
 
@@ -13,7 +14,9 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
     SharedString, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
-use kerno_core::config::Environment;
+use kerno_core::environment;
+
+use crate::state::AppState;
 
 /// Writes the statement for a typed name, or says why there is none.
 pub type BuildStatement = dyn Fn(&str) -> Result<String, String>;
@@ -70,15 +73,21 @@ pub struct Confirmation {
     pub destructive: bool,
     /// The connection it runs on.
     pub connection: String,
-    pub environment: Environment,
+    /// Id of the connection's environment: its rules say whether a write
+    /// asks twice.
+    pub environment: String,
+    /// Whether the statement writes: only a write asks a second time (a
+    /// read confirmed because its environment confirms every run does not).
+    pub writes: bool,
 }
 
 struct ConfirmView {
     confirmation: Confirmation,
     name: Option<Entity<InputState>>,
     list: Option<Entity<TextareaState>>,
-    /// On production, the first click on the action arms it and the second
-    /// runs it.
+    /// The environment's name when it asks twice: the first click on the
+    /// action arms it and the second runs it.
+    twice: Option<String>,
     armed: bool,
     run: Rc<Run>,
     _subscriptions: Vec<Subscription>,
@@ -144,10 +153,15 @@ impl ConfirmView {
             subscriptions
                 .push(cx.subscribe(list, move |this, _, event, cx| disarm(this, event, cx)));
         }
+        let environments = &AppState::get(cx).settings.environments;
+        let environment = environment::environment(environments, &confirmation.environment);
+        let twice = (confirmation.writes && environment.rules.confirm_writes_twice)
+            .then(|| environment.name.clone());
         Self {
             confirmation,
             name,
             list,
+            twice,
             armed: false,
             run,
             _subscriptions: subscriptions,
@@ -188,7 +202,7 @@ impl ConfirmView {
         let Ok(sql) = self.statement(cx) else {
             return;
         };
-        if self.confirmation.environment == Environment::Production && !self.armed {
+        if self.twice.is_some() && !self.armed {
             self.armed = true;
             cx.notify();
             return;
@@ -202,11 +216,9 @@ impl Render for ConfirmView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let statement = self.statement(cx);
-        let production = self.confirmation.environment == Environment::Production;
-        let label = if self.armed {
-            "Run on production"
-        } else {
-            self.confirmation.action
+        let label = match &self.twice {
+            Some(environment) if self.armed => SharedString::from(format!("Run on {environment}")),
+            _ => SharedString::from(self.confirmation.action),
         };
         let labelled = |label: &'static str, field: gpui_kit::AnyElement| {
             v_flex()
@@ -270,21 +282,27 @@ impl Render for ConfirmView {
                             .child(SharedString::from(reason.clone())),
                     }),
             )
-            .when(production, |this| {
+            .when_some(self.twice.as_ref(), |this, environment| {
+                // The id names the rule's oldest case, production.
                 this.child(
                     div()
                         .id("sql-production")
                         .test_support()
                         .text_sm()
-                        .text_color(if self.armed { theme.danger } else { theme.warning })
+                        .text_color(if self.armed {
+                            theme.danger
+                        } else {
+                            theme.warning
+                        })
                         .child(SharedString::from(if self.armed {
                             format!(
-                                "“{}” is a production connection. Click again to run this on production.",
+                                "“{}” is a {environment} connection. Click again to run this on \
+                                 {environment}.",
                                 self.confirmation.connection
                             )
                         } else {
                             format!(
-                                "“{}” is a production connection: you will be asked twice.",
+                                "“{}” is a {environment} connection: you will be asked twice.",
                                 self.confirmation.connection
                             )
                         })),

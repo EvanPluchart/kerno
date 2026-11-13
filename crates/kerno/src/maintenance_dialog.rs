@@ -20,7 +20,6 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
     TestSupportExt as _, Window, div, px,
 };
-use kerno_core::config::Environment;
 use kerno_core::exec::{self, ExecEvent, RowLimit};
 use kerno_core::maintenance::{CheckOption, Maintenance};
 use kerno_core::schema::ObjectRef;
@@ -184,7 +183,7 @@ pub struct MaintenanceDialog {
     opening: Opening,
     /// The connection's name and environment, as the confirmation shows them.
     connection_name: String,
-    environment: Environment,
+    environment: String,
     /// The session whose dialect writes the statements (the connection's own).
     dialect_of: Option<Arc<dyn Session>>,
     step: Step,
@@ -231,7 +230,7 @@ impl MaintenanceDialog {
         let manager = connections.read(cx);
         let (connection_name, environment) = manager
             .get(&opening.connection)
-            .map(|saved| (saved.config.name.clone(), saved.config.environment))
+            .map(|saved| (saved.config.name.clone(), saved.config.environment.clone()))
             .unwrap_or_default();
         let dialect_of = manager.meta_session(&opening.connection);
         Self {
@@ -331,7 +330,8 @@ impl MaintenanceDialog {
                 action: label(tool),
                 destructive,
                 connection: self.connection_name.clone(),
-                environment: self.environment,
+                environment: self.environment.clone(),
+                writes: true,
             },
             window,
             cx,

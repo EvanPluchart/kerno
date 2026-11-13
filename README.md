@@ -27,8 +27,10 @@ Community; its look follows the calm, dense style of modern editors. Licensed un
 
 The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs/FEATURES.md). In short:
 
-- Connections with SSL/TLS modes, SSH tunnels, a read-only flag and an environment tag; passwords live in
-  the OS secret store.
+- Connections with SSL/TLS modes, SSH tunnels and a read-only flag; passwords live in the OS secret store.
+  Each connection is in an environment (local, staging, production or one of your own) whose colour tints
+  the window around it and whose rules apply: commit mode, confirmations, read-only default, idle
+  transactions rolled back.
 - A lazy schema navigator, a SQL editor with schema-aware completion, a streamed results grid, EXPLAIN as a
   plan tree, per-tab transactions, query history and saved queries.
 - A table data view with inline editing, SQL review and one-transaction apply; structure views and a form

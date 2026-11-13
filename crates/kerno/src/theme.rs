@@ -9,8 +9,12 @@ use std::borrow::Cow;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
-use gpui_kit::{App, ElementId, Hsla, Window, px, rgb};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    App, Div, ElementId, Hsla, InteractiveElement as _, Stateful, Styled as _, Window, div, px, rgb,
+};
 use kerno_core::ConnectionConfig;
+use kerno_core::environment::{self, Tint};
 use serde::{Deserialize, Serialize};
 
 /// The theme file: surface levels, text levels, accent, semantic colours,
@@ -150,11 +154,164 @@ pub fn tag_color(key: &str, cx: &App) -> Option<Hsla> {
         .map(|(_, light, dark_value)| rgb(if dark { *dark_value } else { *light }).into())
 }
 
+/// A round swatch of the tag colour `key` (`None`: no colour), ringed when
+/// selected: one choice of the colour rows of the connection and folder
+/// dialogs. The caller adds what a click does.
+pub fn swatch(
+    id: impl Into<ElementId>,
+    key: Option<&str>,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    div()
+        .id(id)
+        .size(px(20.))
+        .rounded_full()
+        .border_2()
+        .border_color(if selected { theme.ring } else { theme.border })
+        .when_some(key.and_then(|key| tag_color(key, cx)), |this, color| {
+            this.bg(color)
+        })
+        .cursor_pointer()
+}
+
 /// The colour tag of a connection, drawn as a small dot wherever it is
 /// named (its sidebar row, its tabs, the status bar). `None` when it has no
 /// tag: no marker then, the environment is shown its own way.
 pub fn connection_color(config: &ConnectionConfig, cx: &App) -> Option<Hsla> {
     config.color.as_deref().and_then(|key| tag_color(key, cx))
+}
+
+/// WCAG 2 relative luminance of `0xRRGGBB`.
+pub fn luminance(rgb: u32) -> f64 {
+    let channel = |shift: u32| {
+        let value = ((rgb >> shift) & 0xFF) as f64 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// WCAG 2 contrast ratio of two `0xRRGGBB` colours.
+pub fn contrast(a: u32, b: u32) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `color` laid over `surface` at `amount` (0 to 1), channel by channel.
+pub fn mix(surface: u32, color: u32, amount: f64) -> u32 {
+    let amount = amount.clamp(0.0, 1.0);
+    [16, 8, 0].iter().fold(0, |rgb, shift| {
+        let (s, c) = (
+            ((surface >> shift) & 0xFF) as f64,
+            ((color >> shift) & 0xFF) as f64,
+        );
+        rgb | (((s + (c - s) * amount).round() as u32) << shift)
+    })
+}
+
+/// Text for `surface`: `preferred` (the theme's) when it reaches WCAG AA
+/// (4.5:1), else black or white, whichever contrasts more (one of them
+/// always reaches 4.58:1).
+pub fn text_on(surface: u32, preferred: u32) -> u32 {
+    if contrast(preferred, surface) >= 4.5 {
+        preferred
+    } else if contrast(0x000000, surface) >= contrast(0xFFFFFF, surface) {
+        0x000000
+    } else {
+        0xFFFFFF
+    }
+}
+
+/// The colours an environment gives the chrome, as `0xRRGGBB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeColors {
+    /// The colour itself: the frame around the editor and the grid.
+    pub frame: u32,
+    /// The status bar and the tab titles: the colour over the status bar's
+    /// surface, at its tint's strength.
+    pub bar: u32,
+    /// Text on `bar`.
+    pub bar_text: u32,
+    /// The tab's toolbar: a wash light enough that the theme's text and
+    /// muted text stay readable on it.
+    pub wash: u32,
+}
+
+/// The chrome colours of an environment of colour `color` and `tint`, over
+/// a theme whose status bar, background, text and muted text are given.
+/// `None` when the tint is none.
+pub fn chrome_colors(
+    tint: Tint,
+    color: u32,
+    status_bar: u32,
+    background: u32,
+    foreground: u32,
+    muted: u32,
+) -> Option<ChromeColors> {
+    // How much of the colour the bar and the toolbar take.
+    let (bar, wash) = match tint {
+        Tint::None => return None,
+        Tint::Soft => (0.3, 0.08),
+        Tint::Strong => (1.0, 0.16),
+    };
+    let bar = mix(status_bar, color, bar);
+    // Lighter until the theme's text reads on it: the toolbar's buttons
+    // keep their own colours.
+    let wash = (0..=(wash * 100.0) as u32)
+        .rev()
+        .map(|percent| mix(background, color, f64::from(percent) / 100.0))
+        .find(|wash| contrast(foreground, *wash) >= 4.5 && contrast(muted, *wash) >= 4.5)
+        .unwrap_or(background);
+    Some(ChromeColors {
+        frame: color,
+        bar,
+        bar_text: text_on(bar, foreground),
+        wash,
+    })
+}
+
+/// `0xRRGGBB` of a theme colour (its alpha left out).
+fn rgb_of(color: Hsla) -> u32 {
+    let color = color.to_rgb();
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
+}
+
+/// What a connection's environment paints on the chrome around it, in the
+/// current theme.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnvironmentChrome {
+    pub frame: Hsla,
+    pub bar: Hsla,
+    pub bar_text: Hsla,
+    pub wash: Hsla,
+}
+
+/// The chrome of `config`'s environment; `None` for an environment that
+/// tints nothing (local, by default) or has no colour for this theme.
+pub fn environment_chrome(config: &ConnectionConfig, cx: &App) -> Option<EnvironmentChrome> {
+    let state = cx.try_global::<crate::state::AppState>()?;
+    let def = environment::environment(&state.settings.environments, &config.environment);
+    let theme = cx.theme();
+    let colors = chrome_colors(
+        def.tint,
+        def.color(theme.is_dark())?,
+        rgb_of(theme.status_bar),
+        rgb_of(theme.background),
+        rgb_of(theme.foreground),
+        rgb_of(theme.muted_foreground),
+    )?;
+    Some(EnvironmentChrome {
+        frame: rgb(colors.frame).into(),
+        bar: rgb(colors.bar).into(),
+        bar_text: rgb(colors.bar_text).into(),
+        wash: rgb(colors.wash).into(),
+    })
 }
 
 #[cfg(test)]
@@ -195,25 +352,18 @@ mod tests {
         }
     }
 
-    /// `#RRGGBB` or `#RRGGBBAA` to linear-light relative luminance (WCAG 2).
-    fn luminance(hex: &str) -> f64 {
-        let hex = hex.trim_start_matches('#');
-        assert!(hex.len() == 6 || hex.len() == 8, "not a hex colour: {hex}");
-        let channel = |index: usize| {
-            let value = u8::from_str_radix(&hex[index..index + 2], 16).unwrap() as f64 / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    /// `#RRGGBB` or `#RRGGBBAA` (alpha left out) as `0xRRGGBB`.
+    fn hex(color: &str) -> u32 {
+        let digits = color.trim_start_matches('#');
+        assert!(
+            digits.len() == 6 || digits.len() == 8,
+            "not a hex colour: {color}"
+        );
+        u32::from_str_radix(&digits[..6], 16).unwrap()
     }
 
     fn contrast(a: &str, b: &str) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        let (lighter, darker) = if a > b { (a, b) } else { (b, a) };
-        (lighter + 0.05) / (darker + 0.05)
+        super::contrast(hex(a), hex(b))
     }
 
     fn themes() -> Vec<ThemeEntry> {
@@ -548,6 +698,115 @@ mod tests {
         assert!((contrast("#FFFFFF", "#FFFFFF") - 1.0).abs() < 0.01);
         // #767676 on white is the classic 4.54:1 boundary grey.
         assert!((contrast("#767676", "#FFFFFF") - 4.54).abs() < 0.01);
+    }
+
+    /// The chrome colours of `color` and `tint` over `theme`.
+    fn chrome_in(theme: &ThemeEntry, tint: Tint, color: u32) -> Option<ChromeColors> {
+        let c = |key: &str| hex(&theme.colors[key]);
+        chrome_colors(
+            tint,
+            color,
+            c("status_bar.background"),
+            c("background"),
+            c("foreground"),
+            c("muted.foreground"),
+        )
+    }
+
+    /// The tinted chrome of the built-in environments reads in both themes:
+    /// text on the status bar and the tab titles, the theme's text and
+    /// muted text on the toolbar (4.5:1); the frame stands out from the
+    /// surfaces around it (3:1). Local tints nothing.
+    #[test]
+    fn the_built_in_environments_chrome_meets_wcag_aa() {
+        let builtins = environment::builtin_environments();
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let dark = theme.mode == "dark";
+            for def in &builtins {
+                let Some(color) = def.color(dark) else {
+                    assert_eq!(def.tint, Tint::None, "{} has no colour", def.id);
+                    continue;
+                };
+                let chrome = chrome_in(&theme, def.tint, color).expect("a tinted environment");
+                let mut check = |what: &str, ratio: f64, floor: f64| {
+                    if ratio < floor {
+                        failures.push(format!("{} {}: {what} {ratio:.2}:1", theme.name, def.id));
+                    }
+                };
+                check(
+                    "text on the bar",
+                    super::contrast(chrome.bar_text, chrome.bar),
+                    4.5,
+                );
+                for key in ["foreground", "muted.foreground"] {
+                    let text = hex(&theme.colors[key]);
+                    check(key, super::contrast(text, chrome.wash), 4.5);
+                }
+                for surface in ["background", "status_bar.background"] {
+                    let surface = hex(&theme.colors[surface]);
+                    check("the frame", super::contrast(chrome.frame, surface), 3.0);
+                }
+            }
+            let local = environment::environment(&builtins, environment::LOCAL);
+            assert_eq!(chrome_in(&theme, local.tint, 0xFF0000), None);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Whatever colour the user picks, text on the tinted chrome reaches
+    /// 4.5:1 in both themes and both tints: the colour is blended, then the
+    /// text is picked (or the toolbar's wash lightened) by contrast.
+    #[test]
+    fn any_environment_colour_keeps_text_readable() {
+        // Every corner and edge of the cube, then a spread of the rest.
+        let mut colors: Vec<u32> = (0..64u32)
+            .map(|i| {
+                let level = |bits: u32| [0x00, 0x55, 0xAA, 0xFF][bits as usize];
+                (level(i & 3) << 16) | (level((i >> 2) & 3) << 8) | level(i >> 4)
+            })
+            .collect();
+        let mut seed: u32 = 0x2545_F491;
+        for _ in 0..4000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            colors.push(seed >> 8);
+        }
+        for theme in themes() {
+            let (foreground, muted) = (
+                hex(&theme.colors["foreground"]),
+                hex(&theme.colors["muted.foreground"]),
+            );
+            for tint in [Tint::Soft, Tint::Strong] {
+                for &color in &colors {
+                    let chrome = chrome_in(&theme, tint, color).unwrap();
+                    let ratio = super::contrast(chrome.bar_text, chrome.bar);
+                    assert!(
+                        ratio >= 4.5,
+                        "{} {tint:?} #{color:06X}: bar {ratio:.2}",
+                        theme.name
+                    );
+                    for text in [foreground, muted] {
+                        let ratio = super::contrast(text, chrome.wash);
+                        assert!(
+                            ratio >= 4.5,
+                            "{} {tint:?} #{color:06X}: toolbar {ratio:.2}",
+                            theme.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixing_and_picking_text_work_on_known_values() {
+        assert_eq!(mix(0xFFFFFF, 0x000000, 0.0), 0xFFFFFF);
+        assert_eq!(mix(0xFFFFFF, 0x000000, 1.0), 0x000000);
+        assert_eq!(mix(0x000000, 0xFF8000, 0.5), 0x804000);
+        assert_eq!(text_on(0xFFFFFF, 0x16191D), 0x16191D);
+        // Grey text on a mid red: white or black, whichever reads.
+        assert_eq!(text_on(0xC62F3D, 0x5B6470), 0xFFFFFF);
+        assert_eq!(text_on(0xF26D78, 0xE6E9ED), 0x000000);
     }
 
     #[test]

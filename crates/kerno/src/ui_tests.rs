@@ -41,8 +41,11 @@ use crate::{actions, bridge};
 mod brackets;
 mod connection_feedback;
 mod coverage;
+mod environments;
+mod folders;
 mod menus;
 mod sidebar_tree;
+mod tool_wizards;
 
 struct Fixture {
     window: WindowHandle<Root>,
@@ -2264,7 +2267,7 @@ fn production_asks_twice_and_read_only_refuses(cx: &mut TestAppContext) {
 
         // Production: the first click only arms the button.
         let mut config = testing::config(engine);
-        config.environment = kerno_core::config::Environment::Production;
+        config.environment = kerno_core::environment::PRODUCTION.into();
         let app = connected_as(cx, config);
         open_scratch(&app, cx);
         app.act(cx, Action::Drop, &invoices);
@@ -3990,7 +3993,7 @@ fn statements_that_destroy_or_write_are_guarded(cx: &mut TestAppContext) {
         ],
     );
     let mut config = testing::config(Engine::MySql);
-    config.environment = kerno_core::config::Environment::Production;
+    config.environment = kerno_core::environment::PRODUCTION.into();
     // Production tabs start in manual commit; this test is about confirming.
     config.auto_commit = Some(true);
     let app = connected_as(cx, config);
@@ -4013,12 +4016,15 @@ fn statements_that_destroy_or_write_are_guarded(cx: &mut TestAppContext) {
     app.wait_until(cx, "the insert", |app, cx| {
         app.outcomes(cx) == ["done, 1 affected"]
     });
-    // Reading is never questioned.
+    // Production confirms every run (its environment's rule), but a read
+    // is asked once: only writes ask twice.
     app.run_in_new_tab(
         cx,
         "select count(*) from kerno_ui_guard.items",
         "secondary-enter",
     );
+    assert!(app.has(cx, "sql-preview") && !app.has(cx, "sql-production"));
+    app.click(cx, "sql-confirm");
     app.wait_until(cx, "the count", |app, cx| app.outcomes(cx) == ["1 rows"]);
 }
 
@@ -5755,7 +5761,7 @@ fn production_asks_twice_before_a_table_is_altered(cx: &mut TestAppContext) {
     let create = format!("CREATE TABLE {schema}.t (id INT PRIMARY KEY, a INT)");
     let _scratch = Scratch::new(engine, &[&drop_schema], &[&create_schema, &create]);
     let mut config = testing::config(engine);
-    config.environment = kerno_core::config::Environment::Production;
+    config.environment = kerno_core::environment::PRODUCTION.into();
     let app = connected_as(cx, config);
     app.open_structure(cx, schema, "t", RelationKind::Table);
     app.wait_for_structure(cx);
@@ -7915,569 +7921,6 @@ fn a_read_only_connection_sends_no_signal(cx: &mut TestAppContext) {
     app.press(cx, &["escape"]);
 }
 
-// Backup and restore ----------------------------------------------------------
-
-/// A stand-in for a client tool, chosen as its path by the test: a shell
-/// script that prints `version` for `--version` and otherwise runs `body`.
-fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join(name);
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\n{body}\n"
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-impl Fixture {
-    /// Opens the backup of `database`, or the restore of a file into it.
-    fn backup_dialog(
-        &self,
-        cx: &mut TestAppContext,
-        database: &str,
-        restore: bool,
-    ) -> Option<Entity<crate::backup_dialog::BackupDialog>> {
-        let target = self.target(cx, Some(database));
-        let workspace = self.workspace.clone();
-        self.step(cx, move |window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                workspace.backup_restore(target, restore, window, cx)
-            })
-        })
-    }
-
-    /// Waits until the dialog's state starts with one of `ends`.
-    fn wait_backup(
-        &self,
-        cx: &mut TestAppContext,
-        dialog: &Entity<crate::backup_dialog::BackupDialog>,
-        ends: &[&str],
-    ) -> String {
-        self.wait_until(cx, &format!("the dialog to show {ends:?}"), |_, cx| {
-            let state = cx.update(|cx| dialog.read(cx).state(cx));
-            ends.iter().any(|end| state.starts_with(end))
-        });
-        cx.update(|cx| dialog.read(cx).state(cx))
-    }
-
-    /// Makes `path` the binary of the tool `name` (`pg_dump`, `psql`…).
-    fn use_tool(&self, cx: &mut TestAppContext, name: &str, path: &Path) {
-        let (name, path) = (name.to_string(), path.to_path_buf());
-        cx.update(|cx| {
-            AppState::update_settings(cx, |settings| {
-                settings.tool_paths.insert(name, path);
-            })
-        });
-    }
-
-    /// Chooses `path` in the open prompt the last click opened.
-    fn answer_open_prompt(&self, cx: &mut TestAppContext, path: &Path) {
-        let path = path.to_path_buf();
-        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
-        cx.run_until_parked();
-    }
-}
-
-#[gpui_kit::test]
-fn a_backup_tool_is_found_or_chosen_and_its_output_streams(cx: &mut TestAppContext) {
-    if !testing::available(Engine::Postgres) {
-        return;
-    }
-    let app = connected(cx, Engine::Postgres);
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("nowhere/pg_dump");
-    app.use_tool(cx, "pg_dump", &missing);
-
-    // The tree's database offers it; a missing tool says so, and how it is
-    // installed, and offers nothing but the path chooser.
-    app.wait_until(cx, "the databases", |app, cx| {
-        app.tree(cx).contains(&row(0, "kerno_other"))
-    });
-    app.act(cx, Action::Backup, &["kerno_other"]);
-    assert!(app.has(cx, "backup-dialog"));
-    app.click(cx, "backup-close");
-    assert!(!app.has(cx, "backup-dialog"));
-
-    let dialog = app
-        .backup_dialog(cx, "kerno_other", false)
-        .expect("the backup dialog");
-    let state = app.wait_backup(cx, &dialog, &["no tool", "ready"]);
-    assert!(
-        state.contains(&format!("{} does not run", missing.display()))
-            && state.contains("brew install libpq"),
-        "{state}"
-    );
-    assert!(app.has(cx, "backup-choose-tool"));
-    assert!(!app.has(cx, "backup-start") && !app.has(cx, "backup-command"));
-
-    // Too old for the server: refused, with its version.
-    let old = fake_tool(
-        dir.path(),
-        "pg_dump-9",
-        "pg_dump (PostgreSQL) 9.6.24",
-        "exit 0",
-    );
-    app.click(cx, "backup-choose-tool");
-    app.answer_open_prompt(cx, &old);
-    let state = app.wait_backup(cx, &dialog, &["no tool", "ready"]);
-    assert!(
-        state.contains("is pg_dump (PostgreSQL) 9.6.24, older than this PostgreSQL")
-            && state.contains("refuses a server newer than itself"),
-        "{state}"
-    );
-
-    // A recent one: the command it will run, with no secret in it.
-    let partial = fake_tool(
-        dir.path(),
-        "pg_dump-99",
-        "pg_dump (PostgreSQL) 99.0",
-        r#"echo "pg_dump: dumping contents of table public.notes"
-[ -n "$PGPASSWORD" ] && echo "the password came through the environment"
-echo "pg_dump: warning: a stand-in" >&2
-for arg in "$@"; do case $arg in --file=*) echo partial > "${arg#--file=}";; esac; done
-exit 3"#,
-    );
-    app.click(cx, "backup-choose-tool");
-    app.answer_open_prompt(cx, &partial);
-    let state = app.wait_backup(cx, &dialog, &["no tool", "ready"]);
-    assert!(state.starts_with("ready: "), "{state}");
-    for part in [
-        "PGPASSWORD=•••",
-        partial.to_str().unwrap(),
-        "--dbname=kerno_other",
-        "--format=plain",
-    ] {
-        assert!(state.contains(part), "{part}: {state}");
-    }
-    assert!(!state.contains(testing::DB_PASSWORD), "{state}");
-    assert_eq!(
-        cx.update(|cx| AppState::get(cx)
-            .settings
-            .tool_paths
-            .get("pg_dump")
-            .cloned()),
-        Some(partial.clone()),
-        "the chosen path is remembered"
-    );
-    // The command follows the options.
-    app.click(cx, ("backup-format", 1usize));
-    app.click(cx, ("backup-content", 1usize));
-    app.click(cx, "backup-tables");
-    app.type_text(cx, "public.notes");
-    let state = cx.update(|cx| dialog.read(cx).state(cx));
-    for part in [
-        "--format=custom",
-        "--schema-only",
-        r#"'--table="public"."notes"'"#,
-        ".dump",
-    ] {
-        assert!(state.contains(part), "{part}: {state}");
-    }
-
-    // It runs once the file is chosen; its lines stream into the log, and
-    // a failure removes the file it left.
-    let failed = dir.path().join("failed.dump");
-    app.click(cx, "backup-start");
-    let chosen = failed.clone();
-    cx.simulate_new_path_selection(move |_| Some(chosen));
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert!(
-        state.contains("pg_dump-99 failed (exit status 3)")
-            && state.contains("The incomplete file was removed"),
-        "{state}"
-    );
-    assert!(!failed.exists());
-    let log = cx.update(|cx| dialog.read(cx).log());
-    for line in [
-        "pg_dump: dumping contents of table public.notes",
-        "the password came through the environment",
-        "pg_dump: warning: a stand-in",
-    ] {
-        assert!(log.iter().any(|shown| shown == line), "{line}: {log:?}");
-    }
-    assert!(app.has(cx, "backup-log") && app.has(cx, "backup-copy-log"));
-    assert!(!app.has(cx, "backup-reveal"));
-
-    // A tool that fails before writing anything leaves an earlier backup
-    // the save prompt offered to replace as it was.
-    let earlier = dir.path().join("earlier.dump");
-    std::fs::write(&earlier, "an earlier backup\n").unwrap();
-    let refused = fake_tool(
-        dir.path(),
-        "pg_dump-refused",
-        "pg_dump (PostgreSQL) 99.0",
-        r#"echo "pg_dump: error: connection refused" >&2
-exit 1"#,
-    );
-    app.click(cx, "backup-back");
-    app.click(cx, "backup-choose-tool");
-    app.answer_open_prompt(cx, &refused);
-    app.wait_backup(cx, &dialog, &["ready"]);
-    app.click(cx, "backup-choose-file");
-    let chosen = earlier.clone();
-    cx.simulate_new_path_selection(move |_| Some(chosen));
-    cx.run_until_parked();
-    app.click(cx, "backup-start");
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert_eq!(state, "failed: pg_dump-refused failed (exit status 1).");
-    assert_eq!(
-        std::fs::read_to_string(&earlier).unwrap(),
-        "an earlier backup\n"
-    );
-
-    // A tool that succeeds: the file, its size, and where it is.
-    let works = fake_tool(
-        dir.path(),
-        "pg_dump-ok",
-        "pg_dump (PostgreSQL) 99.0",
-        r#"for arg in "$@"; do case $arg in --file=*) echo dumped > "${arg#--file=}";; esac; done
-echo done"#,
-    );
-    app.click(cx, "backup-back");
-    app.click(cx, "backup-choose-tool");
-    app.answer_open_prompt(cx, &works);
-    app.wait_backup(cx, &dialog, &["ready"]);
-    app.click(cx, "backup-start");
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert!(
-        state.starts_with("done: pg_dump-ok finished (exit status 0). Backed up kerno_other to ")
-            && state.contains("earlier.dump"),
-        "{state}"
-    );
-    assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "dumped\n");
-    assert!(app.has(cx, "backup-reveal"));
-    app.click(cx, "backup-close");
-}
-
-#[gpui_kit::test]
-fn a_database_is_backed_up_and_restored_with_the_real_tools(cx: &mut TestAppContext) {
-    for (engine, scratch) in [
-        (Engine::Postgres, "kerno_ui_restore_pg"),
-        (Engine::MySql, "kerno_ui_restore_my"),
-    ] {
-        if !testing::available(engine) {
-            return;
-        }
-        let drop = match engine {
-            Engine::Postgres => format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"),
-            _ => format!("DROP DATABASE IF EXISTS {scratch}"),
-        };
-        let _scratch = Scratch::new(engine, &[&drop], &[&format!("CREATE DATABASE {scratch}")]);
-        let app = connected(cx, engine);
-        let dir = tempfile::tempdir().unwrap();
-
-        let dialog = app
-            .backup_dialog(cx, "kerno_other", false)
-            .expect("the backup dialog");
-        let state = app.wait_backup(cx, &dialog, &["no tool", "ready"]);
-        if state.starts_with("no tool") {
-            eprintln!("SKIPPED ({engine:?}): no usable client tool: {state}");
-            continue;
-        }
-        let file = dir.path().join("other.sql");
-        app.click(cx, "backup-start");
-        let chosen = file.clone();
-        cx.simulate_new_path_selection(move |_| Some(chosen));
-        let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-        assert!(state.starts_with("done: "), "{engine:?}: {state}");
-        assert!(
-            !cx.update(|cx| dialog.read(cx).log()).is_empty(),
-            "--verbose says what it does"
-        );
-        app.click(cx, "backup-close");
-
-        // The scratch database's empty Tables folder, open in the tree.
-        let tables: Vec<&str> = match engine {
-            Engine::Postgres => vec![scratch, "public", "Tables"],
-            _ => vec![scratch, "Tables"],
-        };
-        app.open_path(cx, &tables);
-        app.toggle(cx, &tables);
-        let notes = [tables.as_slice(), &["notes"]].concat();
-        assert!(!app.shows(cx, &notes));
-
-        // Restored into the scratch database, after the confirmation.
-        let dialog = app
-            .backup_dialog(cx, scratch, true)
-            .expect("the restore dialog");
-        app.wait_backup(cx, &dialog, &["choose a file"]);
-        app.click(cx, "restore-choose-file");
-        app.answer_open_prompt(cx, &file);
-        let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
-        assert!(state.starts_with("ready: "), "{engine:?}: {state}");
-        app.click(cx, "restore-start");
-        assert!(app.has(cx, "sql-preview"), "the command is shown first");
-        app.click(cx, "sql-confirm");
-        let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-        assert!(state.starts_with("done: "), "{engine:?}: {state}");
-        let count = match engine {
-            Engine::Postgres => on_database(engine, Some(scratch), "SELECT count(*) FROM notes"),
-            _ => on_server(engine, &format!("SELECT count(*) FROM {scratch}.notes")),
-        };
-        assert_eq!(count, "2", "{engine:?}");
-        app.click(cx, "backup-close");
-        // The tree reads the database again (on PostgreSQL its schemas
-        // come back closed: they are opened again on the way).
-        app.wait_until(cx, "the restored table in the tree", |app, cx| {
-            for depth in 1..=tables.len() {
-                let part = &tables[..depth];
-                if app.shows(cx, part) && !app.is_open(cx, part) {
-                    app.toggle(cx, part);
-                }
-            }
-            app.shows(cx, &notes)
-        });
-    }
-}
-
-#[gpui_kit::test]
-fn a_file_with_client_commands_is_refused_until_explicitly_allowed(cx: &mut TestAppContext) {
-    if !testing::available(Engine::Postgres) {
-        return;
-    }
-    let app = connected(cx, Engine::Postgres);
-    let dir = tempfile::tempdir().unwrap();
-    let (pwned, started) = (dir.path().join("pwned"), dir.path().join("started"));
-    // The "psql" leaves a mark if it ever starts.
-    let psql = fake_tool(
-        dir.path(),
-        "psql",
-        "psql (PostgreSQL) 99.0",
-        &format!("touch {}", started.display()),
-    );
-    app.use_tool(cx, "psql", &psql);
-    let hostile = dir.path().join("hostile.sql");
-    std::fs::write(
-        &hostile,
-        format!("SELECT 1;\n\\! touch {}\n", pwned.display()),
-    )
-    .unwrap();
-    let clean = dir.path().join("clean.sql");
-    std::fs::write(&clean, "SELECT 1;\n").unwrap();
-
-    // Never run: the database need not exist.
-    let dialog = app
-        .backup_dialog(cx, "kerno_ui_restore_never", true)
-        .expect("the restore dialog");
-    app.wait_backup(cx, &dialog, &["choose a file"]);
-    app.click(cx, "restore-choose-file");
-    app.answer_open_prompt(cx, &hostile);
-    let state = app.wait_backup(cx, &dialog, &["refused", "ready", "file", "no tool"]);
-    assert_eq!(state, "refused: line 2: \\!");
-    assert!(app.has(cx, "restore-refusal") && app.has(cx, "restore-allow-commands"));
-    app.click(cx, "restore-start");
-    assert!(!app.has(cx, "sql-preview"), "a refused file is not offered");
-    let checked = |cx: &mut TestAppContext| {
-        cx.update(|cx| dialog.read(cx).pending_command(cx))
-            .expect("a command")
-            .script_check
-            .is_some()
-    };
-    assert!(
-        checked(cx),
-        "the file is checked again when the tool starts"
-    );
-
-    // The opt-in: unchecked at first, then the command runs the file as is.
-    app.click(cx, "restore-allow-commands");
-    let state = cx.update(|cx| dialog.read(cx).state(cx));
-    assert!(state.starts_with("ready: "), "{state}");
-    assert!(!checked(cx));
-
-    // Another file, then the first again: the opt-in starts over.
-    app.click(cx, "restore-choose-file");
-    app.answer_open_prompt(cx, &clean);
-    let state = app.wait_backup(cx, &dialog, &["refused", "ready", "file"]);
-    assert!(state.starts_with("ready: ") && checked(cx), "{state}");
-    app.click(cx, "restore-choose-file");
-    app.answer_open_prompt(cx, &hostile);
-    assert_eq!(
-        app.wait_backup(cx, &dialog, &["refused", "ready", "file"]),
-        "refused: line 2: \\!"
-    );
-
-    // A pg_dump --create file switches databases: refused too.
-    let create = dir.path().join("create.sql");
-    std::fs::write(
-        &create,
-        "CREATE DATABASE other;\n\\connect other\nSELECT 1;\n",
-    )
-    .unwrap();
-    app.click(cx, "restore-choose-file");
-    app.answer_open_prompt(cx, &create);
-    assert_eq!(
-        app.wait_backup(cx, &dialog, &["refused", "ready", "file"]),
-        "refused: line 2: \\connect"
-    );
-    app.click(cx, "backup-close");
-    assert!(!pwned.exists() && !started.exists(), "nothing ran");
-}
-
-#[gpui_kit::test]
-fn a_restore_asks_twice_on_production_and_is_refused_on_read_only(cx: &mut TestAppContext) {
-    if !testing::available(Engine::Postgres) {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let ran = dir.path().join("ran");
-    let psql = fake_tool(
-        dir.path(),
-        "psql",
-        "psql (PostgreSQL) 99.0",
-        &format!("touch {}\necho restored", ran.display()),
-    );
-    let file = dir.path().join("clean.sql");
-    std::fs::write(&file, "SELECT 1;\n").unwrap();
-
-    // Read-only: no restore at all; a backup reads only.
-    let mut config = testing::config(Engine::Postgres);
-    config.read_only = true;
-    let app = connected_as(cx, config);
-    assert!(app.backup_dialog(cx, "kerno_other", true).is_none());
-    assert!(!app.has(cx, "backup-dialog"));
-    assert!(app.backup_dialog(cx, "kerno_other", false).is_some());
-    app.click(cx, "backup-close");
-    app.wait_until(cx, "the tree", |app, cx| {
-        app.tree(cx).contains(&row(0, "kerno_other"))
-    });
-    assert_eq!(
-        app.why_not(cx, Action::Restore, &["kerno_other"]),
-        Some("read-only connection")
-    );
-    assert_eq!(app.why_not(cx, Action::Backup, &["kerno_other"]), None);
-
-    // Production: the first click only arms the button.
-    let mut config = testing::config(Engine::Postgres);
-    config.environment = kerno_core::config::Environment::Production;
-    let app = connected_as(cx, config);
-    app.use_tool(cx, "psql", &psql);
-    let dialog = app
-        .backup_dialog(cx, "kerno_ui_restore_never", true)
-        .expect("the restore dialog");
-    app.wait_backup(cx, &dialog, &["choose a file"]);
-    app.click(cx, "restore-choose-file");
-    app.answer_open_prompt(cx, &file);
-    app.wait_backup(cx, &dialog, &["ready"]);
-    app.click(cx, "restore-start");
-    assert!(app.has(cx, "sql-preview") && app.has(cx, "sql-production"));
-    app.click(cx, "sql-confirm");
-    assert!(app.has(cx, "sql-preview") && !ran.exists(), "armed only");
-    app.click(cx, "sql-confirm");
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert!(
-        state.starts_with("done: psql finished (exit status 0). Restored ")
-            && state.contains("into kerno_ui_restore_never"),
-        "{state}"
-    );
-    assert!(ran.exists());
-    assert_eq!(cx.update(|cx| dialog.read(cx).log()), ["restored"]);
-}
-
-#[gpui_kit::test]
-fn a_running_tool_is_cancelled(cx: &mut TestAppContext) {
-    if !testing::available(Engine::MySql) {
-        return;
-    }
-    let app = connected(cx, Engine::MySql);
-    let dir = tempfile::tempdir().unwrap();
-    let dump = fake_tool(
-        dir.path(),
-        "mysqldump",
-        "mysqldump  Ver 9.4.0 for macos15 on arm64 (Homebrew)",
-        r#"for arg in "$@"; do case $arg in --result-file=*) echo partial > "${arg#--result-file=}";; esac; done
-echo "-- started"
-exec sleep 60"#,
-    );
-    app.use_tool(cx, "mysqldump", &dump);
-    let dialog = app
-        .backup_dialog(cx, "kerno_other", false)
-        .expect("the backup dialog");
-    let state = app.wait_backup(cx, &dialog, &["ready", "no tool"]);
-    assert!(
-        state.contains("--result-file=") && state.contains(" kerno_other"),
-        "{state}"
-    );
-    let file = dir.path().join("cut.sql");
-    app.click(cx, "backup-start");
-    let chosen = file.clone();
-    cx.simulate_new_path_selection(move |_| Some(chosen));
-    app.wait_until(cx, "the first line", |_, cx| {
-        cx.update(|cx| dialog.read(cx).log()) == ["-- started"]
-    });
-    assert_eq!(cx.update(|cx| dialog.read(cx).state(cx)), "running");
-    app.click(cx, "backup-cancel");
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert!(
-        state.contains("Cancelled: mysqldump was stopped.")
-            && state.contains("The incomplete file was removed"),
-        "{state}"
-    );
-    assert!(!file.exists());
-}
-
-#[gpui_kit::test]
-fn a_backup_goes_through_the_ssh_tunnel(cx: &mut TestAppContext) {
-    if !testing::available(Engine::Postgres) || !testing::ssh_available() {
-        return;
-    }
-    let storage = memory_storage();
-    let mut config = testing::config(Engine::Postgres);
-    config.host = testing::service_name(Engine::Postgres).into();
-    config.port = 5432;
-    config.ssh = Some(testing::ssh(kerno_core::config::SshAuth::Password));
-    let id = storage.save_connection(None, &config).unwrap();
-    let app = open(cx, storage);
-    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
-    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
-    app.step(cx, |window, cx| {
-        window.double_click(("connection", 0usize), cx)
-    });
-    app.wait_until(cx, "the host key question", |app, cx| app.has(cx, "ok"));
-    app.click(cx, "ok");
-    app.wait_until(cx, "the connection", |app, cx| {
-        assert!(
-            !matches!(app.status(cx, 0), Status::Failed { .. }),
-            "{:?}",
-            app.status(cx, 0)
-        );
-        matches!(app.status(cx, 0), Status::Connected { .. })
-    });
-
-    let dialog = app
-        .backup_dialog(cx, "kerno_other", false)
-        .expect("the backup dialog");
-    let state = app.wait_backup(cx, &dialog, &["ready", "no tool", "blocked"]);
-    if state.starts_with("no tool") {
-        eprintln!("SKIPPED: no usable pg_dump: {state}");
-        return;
-    }
-    assert!(
-        state.contains("PGHOSTADDR=127.0.0.1")
-            && state.contains("--host=kerno-postgres --port=<SSH tunnel>"),
-        "{state}"
-    );
-    app.click(cx, ("backup-content", 1usize));
-    let file = dir_file("tunnel.sql");
-    app.click(cx, "backup-start");
-    let chosen = file.1.clone();
-    cx.simulate_new_path_selection(move |_| Some(chosen));
-    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
-    assert!(state.starts_with("done: "), "{state}");
-    let dump = std::fs::read_to_string(&file.1).unwrap();
-    assert!(dump.contains("CREATE TABLE public.notes"), "{dump}");
-}
-
-/// A path in a new temporary directory, kept alive with it.
-fn dir_file(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(name);
-    (dir, path)
-}
-
 // Brand (M10 part 5) ---------------------------------------------------------
 
 #[gpui_kit::test]
@@ -8515,17 +7958,17 @@ fn a_production_connection_starts_its_tabs_in_manual_commit(cx: &mut TestAppCont
     if !testing::available(Engine::Postgres) {
         return;
     }
-    use kerno_core::config::Environment::{Local, Production};
+    use kerno_core::environment::{LOCAL, PRODUCTION};
     let storage = memory_storage();
     let cases = [
-        (Production, None, true),
-        (Production, Some(true), false),
-        (Local, None, false),
-        (Local, Some(false), true),
+        (PRODUCTION, None, true),
+        (PRODUCTION, Some(true), false),
+        (LOCAL, None, false),
+        (LOCAL, Some(false), true),
     ];
     for (environment, auto_commit, _) in cases {
         let config = ConnectionConfig {
-            environment,
+            environment: environment.into(),
             auto_commit,
             ..testing::config(Engine::Postgres)
         };
@@ -10361,7 +9804,7 @@ fn the_tools_menu_and_command_open_the_dialog_and_read_only_or_production_guard_
 
     // Production: the confirmation asks twice.
     let mut config = testing::config(Engine::Postgres);
-    config.environment = kerno_core::config::Environment::Production;
+    config.environment = kerno_core::environment::PRODUCTION.into();
     let app = connected_as(cx, config);
     app.open_path(cx, &table);
     let dialog = app
@@ -10819,7 +10262,7 @@ fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) 
     };
     let production = ConnectionConfig {
         name: "production".into(),
-        environment: kerno_core::Environment::Production,
+        environment: kerno_core::environment::PRODUCTION.into(),
         ..testing::config(Engine::Postgres)
     };
     let tagged_id = storage.save_connection(None, &tagged).unwrap();
@@ -10852,16 +10295,16 @@ fn tabs_and_the_status_bar_carry_the_connection_colour(cx: &mut TestAppContext) 
         .unwrap();
     let app = open(cx, storage);
     // A dot for a tagged connection only, the engine's logo on each tab of
-    // a connection, nothing on a tab without one; production's title is
-    // tinted instead.
+    // a connection, nothing on a tab without one; production's title takes
+    // its environment's colour instead.
     assert!(app.has(cx, ("tab-dot", 0usize)));
     assert!(!app.has(cx, ("tab-dot", 1usize)));
     assert!(!app.has(cx, ("tab-dot", 2usize)));
     assert!(app.has(cx, ("tab-logo", 0usize)));
     assert!(app.has(cx, ("tab-logo", 1usize)));
     assert!(!app.has(cx, ("tab-logo", 2usize)));
-    assert!(app.has(cx, ("tab-production", 1usize)));
-    assert!(!app.has(cx, ("tab-production", 0usize)));
+    assert!(app.has(cx, ("tab-env", 1usize)));
+    assert!(!app.has(cx, ("tab-env", 0usize)));
     // The dot's colour is the tag's; without a tag there is none.
     cx.update(|cx| {
         assert_eq!(
@@ -11646,12 +11089,11 @@ fn settings_apply_at_once_and_are_stored(cx: &mut TestAppContext) {
     app.type_text(cx, "(null)");
     app.click(cx, "settings-time-zone");
 
-    // Confirmations and tools.
+    // Confirmations, and the local clients (tested in tool_wizards.rs).
     app.click(cx, ("settings-section", 4usize));
     app.click(cx, "settings-confirm-destructive");
     app.click(cx, ("settings-section", 5usize));
-    app.click(cx, "settings-tool-pg_dump");
-    app.type_text(cx, "/opt/pg/bin/pg_dump");
+    assert!(app.has(cx, "local-clients") && app.has(cx, "local-clients-add"));
 
     let now = settings_now(cx);
     assert_eq!(
@@ -11659,10 +11101,6 @@ fn settings_apply_at_once_and_are_stored(cx: &mut TestAppContext) {
         (250, "(null)", false)
     );
     assert!(!now.confirm_destructive);
-    assert_eq!(
-        now.tool_paths.get("pg_dump"),
-        Some(&std::path::PathBuf::from("/opt/pg/bin/pg_dump"))
-    );
     app.wait_until(cx, "the stored settings", |app, _| {
         Settings::load(&app.storage) == now
     });
@@ -13291,11 +12729,34 @@ fn a_table_is_backed_up_alone_from_the_tree(cx: &mut TestAppContext) {
             app.tree_row_of(cx, &whole).is_some()
         });
         app.act(cx, Action::Backup, &path);
-        // Once the tool is found (or said missing).
-        app.wait_until(cx, "the dialog's options", |app, cx| {
-            app.has(cx, "backup-only-tables") || app.has(cx, "backup-choose-tool")
+        // The wizard opens on its settings, once the client is found (or
+        // said missing), with the table alone in the command.
+        let painted = |app: &Fixture, cx: &mut TestAppContext| -> Vec<String> {
+            app.step(cx, |window, _| {
+                gpui_kit::base::test_support::texts(window)
+                    .into_iter()
+                    .map(|text| text.text().to_string())
+                    .collect()
+            })
+        };
+        app.wait_until(cx, "the wizard's settings", |app, cx| {
+            app.has(cx, "backup-command")
+                || (app.has(cx, "backup-tool")
+                    && !painted(app, cx)
+                        .iter()
+                        .any(|text| text.starts_with("Looking for the local clients")))
         });
-        let found = app.has(cx, "backup-only-tables");
+        let found = app.has(cx, "backup-command");
+        if found {
+            let command = painted(&app, cx)
+                .into_iter()
+                .find(|text| text.contains("--verbose"))
+                .unwrap_or_default();
+            assert!(
+                command.contains("orders") && !command.contains("--schema"),
+                "{engine:?}: {command}"
+            );
+        }
         app.click(cx, "backup-close");
         if !found {
             continue;
@@ -13331,7 +12792,9 @@ fn a_table_is_backed_up_alone_from_the_tree(cx: &mut TestAppContext) {
             command.args
         );
         assert!(state.contains("order items"), "{engine:?}: {state}");
-        app.click(cx, "backup-all-tables");
+        // Back to the objects: a complete backup again.
+        app.click(cx, "wizard-back");
+        app.click(cx, "backup-complete");
         let command = cx
             .update(|cx| dialog.read(cx).pending_command(cx))
             .expect("a command");

@@ -3,7 +3,7 @@
 //! refreshes, and offers each row's actions.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -24,10 +24,10 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
-    WeakEntity, Window, div, px,
+    WeakEntity, Window, div, img, px,
 };
 use kerno_core::browse::Filter;
-use kerno_core::config::{ObjectFilter, exact_mask, parent_folder};
+use kerno_core::config::{FolderLook, ObjectFilter, exact_mask, parent_folder};
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
@@ -48,8 +48,9 @@ use super::model::{
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status, folder_of};
 use crate::database_dialog;
-use crate::engine_logo::engine_logo;
+use crate::engine_logo::{engine_logo, folder_glyph};
 use crate::export_dialog::{self, Source};
+use crate::folder_dialog::is_icon_name;
 use crate::maintenance_dialog::{self, MaintenanceDialog};
 use crate::sidebar::{DraggedConnection, Sidebar, Subject, set_collapsed};
 use crate::sql_confirm::{self, Confirmation, Statement};
@@ -168,9 +169,9 @@ pub struct Navigator {
     filter: Entity<InputState>,
     /// The filter's text, lowercase.
     filter_text: String,
-    /// The folders made and the folders closed (settings) the tree was last
-    /// built with.
-    folders_seen: (BTreeSet<String>, BTreeSet<String>),
+    /// The folders made, closed and their looks (settings) the tree was
+    /// last built with.
+    folders_seen: FolderSettings,
     /// Where the active query tab runs, kept up to date by the window: what
     /// "Set as default for this tab" changes.
     tab_target: Rc<RefCell<Option<Target>>>,
@@ -1161,7 +1162,8 @@ impl Navigator {
             connections.get(&connection)?,
             connections.meta_session(&connection)?,
         );
-        let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let (connection_name, environment) =
+            (saved.config.name.clone(), saved.config.environment.clone());
         let view = cx.entity();
         let form = database_dialog::open(meta, window, cx, move |sql, window, cx| {
             let (view, connection) = (view.clone(), connection.clone());
@@ -1173,7 +1175,8 @@ impl Navigator {
                     action: "Create database",
                     destructive: false,
                     connection: connection_name.clone(),
-                    environment,
+                    environment: environment.clone(),
+                    writes: true,
                 },
                 window,
                 cx,
@@ -1701,7 +1704,8 @@ impl Navigator {
         if self.unavailable(connection, action, node, cx).is_some() {
             return;
         }
-        let (connection_name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let (connection_name, environment) =
+            (saved.config.name.clone(), saved.config.environment.clone());
         let object = match &node.kind {
             NodeKind::Object(object) => Some(object.clone()),
             _ => None,
@@ -2033,6 +2037,7 @@ impl Navigator {
                 destructive,
                 connection: connection_name,
                 environment,
+                writes: true,
             },
             window,
             cx,
@@ -2534,23 +2539,7 @@ impl Navigator {
         };
         let id = entry.item().id.clone();
         match model::parse_row(&id) {
-            Some(RowId::Folder(path)) => {
-                let index_in = self
-                    .connections
-                    .read(cx)
-                    .folders(cx)
-                    .iter()
-                    .position(|folder| folder == path)
-                    .unwrap_or_default();
-                self.render_folder(
-                    view,
-                    row(("conn-folder", index_in).into()),
-                    index,
-                    entry,
-                    path,
-                    cx,
-                )
-            }
+            Some(RowId::Folder(path)) => self.render_folder(view, row, index, entry, path, cx),
             Some(RowId::Connection(connection)) => {
                 let saved = self.connections.read(cx).saved();
                 let Some(at) = saved.iter().position(|saved| saved.id == connection) else {
@@ -2629,16 +2618,69 @@ impl Navigator {
         })
     }
 
+    /// A folder's row: its look's picture, or its glyph in its colour (a
+    /// small dot beside a picture), never a bar. Its place in the list of
+    /// folders names its row and its look for tests.
     fn render_folder(
         &self,
         view: &Entity<Self>,
-        row: ListItem,
+        row: impl Fn(ElementId) -> ListItem,
         index: usize,
         entry: &TreeEntry,
         path: &str,
         cx: &App,
     ) -> ListItem {
+        let at = self
+            .connections
+            .read(cx)
+            .folders(cx)
+            .iter()
+            .position(|folder| folder == path)
+            .unwrap_or_default();
         let theme = cx.theme();
+        let state = AppState::get(cx);
+        let look = state
+            .settings
+            .folder_looks
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        let color = look
+            .color
+            .as_deref()
+            .and_then(|key| theme::tag_color(key, cx));
+        let picture = look
+            .image
+            .filter(|file| is_icon_name(file))
+            .map(|file| state.paths.folder_icons().join(file));
+        let icon = match &picture {
+            Some(picture) => div()
+                .id(("folder-picture", at))
+                .test_support()
+                .flex_none()
+                .child(img(picture.clone()).size(px(16.)))
+                .into_any_element(),
+            None => div()
+                .id(("folder-glyph", at))
+                .test_support()
+                .flex_none()
+                .child(
+                    Icon::new(folder_glyph(look.glyph.as_deref()))
+                        .size_3p5()
+                        .text_color(color.unwrap_or(theme.muted_foreground)),
+                )
+                .into_any_element(),
+        };
+        let dot = color.filter(|_| picture.is_some()).map(|color| {
+            div()
+                .id(("folder-dot", at))
+                .test_support()
+                .flex_none()
+                .size(px(6.))
+                .rounded_full()
+                .bg(color)
+        });
+        let row = row(("conn-folder", at).into());
         let count = self.connections.read(cx).count_in(path);
         let (connections, target) = (self.connections.clone(), path.to_string());
         let chevron_id = ElementId::from(("folder-chevron", index));
@@ -2655,12 +2697,7 @@ impl Navigator {
                     .min_w_0()
                     .gap_1p5()
                     .child(Self::chevron(view, chevron_id, index, entry, cx))
-                    .child(
-                        Icon::new(Glyph::Folder)
-                            .size_3p5()
-                            .flex_none()
-                            .text_color(theme.muted_foreground),
-                    )
+                    .child(icon)
                     .child(
                         div()
                             .flex_1()
@@ -2668,6 +2705,7 @@ impl Navigator {
                             .truncate()
                             .child(entry.item().label.clone()),
                     )
+                    .children(dot)
                     .when(count > 0, |this| {
                         this.child(
                             div()
@@ -2993,12 +3031,21 @@ fn name_of(node: &Node) -> String {
 /// The height of every row of the tree.
 const ROW_HEIGHT: f32 = 24.;
 
-/// The folders made and the folders closed, as the settings hold them.
-fn folder_settings(cx: &App) -> (BTreeSet<String>, BTreeSet<String>) {
+/// The folders made, the folders closed and their looks.
+type FolderSettings = (
+    BTreeSet<String>,
+    BTreeSet<String>,
+    BTreeMap<String, FolderLook>,
+);
+
+/// The folders made, the folders closed and their looks, as the settings
+/// hold them.
+fn folder_settings(cx: &App) -> FolderSettings {
     let settings = &AppState::get(cx).settings;
     (
         settings.connection_folders.clone(),
         settings.collapsed_folders.clone(),
+        settings.folder_looks.clone(),
     )
 }
 

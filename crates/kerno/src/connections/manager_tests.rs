@@ -3,12 +3,14 @@
 //! Tests that need a container print `SKIPPED` and return when it is down.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
-use kerno_core::config::{ConnectionConfig, Engine, Secret, Secrets, SshAuth};
+use kerno_core::config::{ConnectionConfig, Engine, FolderLook, Secret, Secrets, SshAuth};
 use kerno_core::secrets::{MemorySecretStore, SecretStore, load_secrets};
 use kerno_core::storage::{AppPaths, Storage};
 use kerno_core::{exec, testing};
@@ -772,4 +774,133 @@ fn folders_are_made_renamed_and_removed_with_what_they_hold(cx: &mut TestAppCont
         folders(cx),
         ["Archive", "Clients", "Import", "Import/Old", "Workshop"]
     );
+}
+
+/// A look with a colour, a glyph and a picture, each optional.
+fn look(color: Option<&str>, glyph: Option<&str>, image: Option<&str>) -> FolderLook {
+    FolderLook {
+        color: color.map(str::to_string),
+        glyph: glyph.map(str::to_string),
+        image: image.map(str::to_string),
+    }
+}
+
+impl Fixture {
+    fn looks(&self, cx: &mut TestAppContext) -> BTreeMap<String, FolderLook> {
+        cx.update(|cx| AppState::get(cx).settings.folder_looks.clone())
+    }
+
+    /// Makes the folder `name` in `parent` and gives it `look`, writing its
+    /// picture first, as the dialog does.
+    fn folder_with(
+        &self,
+        cx: &mut TestAppContext,
+        parent: Option<&str>,
+        name: &str,
+        look: FolderLook,
+    ) {
+        if let Some(picture) = &look.image {
+            self.icons(cx, &[picture]);
+        }
+        cx.update(|cx| {
+            self.connections.update(cx, |c, cx| {
+                let path = c.create_folder(parent, name, cx).unwrap();
+                c.set_folder_look(&path, look, cx);
+            })
+        });
+    }
+
+    /// The folder pictures directory, with the files `names` in it.
+    fn icons(&self, cx: &mut TestAppContext, names: &[&str]) -> PathBuf {
+        let dir = cx.update(|cx| AppState::get(cx).paths.folder_icons());
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            std::fs::write(dir.join(name), b"picture").unwrap();
+        }
+        dir
+    }
+}
+
+const PICTURE_A: &str = "00000000000000aa.png";
+const PICTURE_B: &str = "00000000000000bb.png";
+
+#[gpui_kit::test]
+fn renaming_a_folder_keeps_its_look(cx: &mut TestAppContext) {
+    let app = fixture(cx);
+    app.folder_with(
+        cx,
+        None,
+        "Work",
+        look(Some("blue"), Some("briefcase"), None),
+    );
+    app.folder_with(
+        cx,
+        Some("Work"),
+        "Clients",
+        look(None, None, Some(PICTURE_A)),
+    );
+    app.folder_with(cx, None, "Plain", FolderLook::default());
+
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.rename_folder("Work", "Job", cx))
+    })
+    .unwrap();
+    let expected = BTreeMap::from([
+        (
+            "Job".to_string(),
+            look(Some("blue"), Some("briefcase"), None),
+        ),
+        ("Job/Clients".to_string(), look(None, None, Some(PICTURE_A))),
+    ]);
+    // A plain look is no entry at all.
+    assert_eq!(app.looks(cx), expected);
+    wait_until(cx, "the looks to be stored", |_| {
+        Settings::load(&app.storage).folder_looks == expected
+    });
+    // The picture still in use stays.
+    assert!(app.icons(cx, &[]).join(PICTURE_A).exists());
+}
+
+#[gpui_kit::test]
+fn deleting_a_folder_drops_its_look_and_its_unused_image(cx: &mut TestAppContext) {
+    let app = fixture(cx);
+    app.folder_with(cx, None, "Clients", look(Some("red"), None, None));
+    app.folder_with(
+        cx,
+        None,
+        "Work",
+        look(None, Some("server"), Some(PICTURE_A)),
+    );
+    app.folder_with(
+        cx,
+        Some("Work"),
+        "Clients",
+        look(Some("green"), None, Some(PICTURE_B)),
+    );
+    app.folder_with(cx, Some("Work"), "Archive", look(None, Some("star"), None));
+    // A third picture was picked in a dialog that was cancelled; a file
+    // Kerno did not name is never touched.
+    let stray = "00000000000000cc.png";
+    let dir = app.icons(cx, &[stray, "notes.txt"]);
+    assert!(dir.join(PICTURE_A).exists() && dir.join(PICTURE_B).exists());
+
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.delete_folder("Work", cx))
+    });
+    // Its own look goes; what was inside moves up with its look, unless a
+    // folder of that name was there already: that one keeps its own.
+    let expected = BTreeMap::from([
+        ("Archive".to_string(), look(None, Some("star"), None)),
+        ("Clients".to_string(), look(Some("red"), None, None)),
+    ]);
+    assert_eq!(app.looks(cx), expected);
+    wait_until(cx, "the unused pictures to be removed", |_| {
+        !dir.join(PICTURE_A).exists() && !dir.join(PICTURE_B).exists() && !dir.join(stray).exists()
+    });
+    assert!(dir.join("notes.txt").exists());
+    wait_until(cx, "the looks to be stored", |_| {
+        Settings::load(&app.storage).folder_looks == expected
+    });
 }

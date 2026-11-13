@@ -316,89 +316,19 @@ Found and fixed on the way:
   first; connection failures are told in plain words with the raw message below; the connection dialog
   lists the server's databases; each secret is read from the OS store once per run and the macOS bundle
   can be signed with a stable identity. Workspace: 976 tests green.
+- Owner's test, wave 2 and part of wave 3 (D-044, D-046, D-047): environments are the user's (model in
+  `kerno-core/src/environment.rs`, Settings → Environments, rules enforced, the chrome takes the
+  environment's colour); backup, global backup, restore and execute script are step wizards with the tools'
+  real options, and local clients are detected, listed and chosen (Settings → Local clients); folders have a
+  colour and an icon; the bare binary shows the app icon. Workspace: 1,030 tests green, `cargo deny` clean.
+- The owner added items 11 to 13 (main toolbar, update check, no GitHub Actions): `plans/M10.md` Parts 12
+  to 14.
 
 Still open:
 
-- Owner's test, waves 2 and 3: environments and their colour on the chrome (items 6, 7), DBeaver's tools
-  system (item 10: wizards and local clients, then the Tools submenu and saved tasks), folder colour and
-  icon and the app icon of the bare binary (items 3, 4).
-
-- Milestone 5: tab-close confirmations (`plans/M5.md` Part 4), Ctrl+Space and catalog leftovers.
-- Milestone 6: editing comfort (`plans/M6.md` Part 1: lists for enum and boolean cells, paste, Delete,
-  Cmd+Z), counting very large tables (Part 2; the estimate statement exists).
-- Milestone 7: two tests of `plans/M7.md` Part 1c item 4; captures. Milestone 8: the backup and restore
-  dialog (Part 3, app half), the administration tab (Part 4), three UI tests left over from the dialogs;
-  captures.
-- Context menus on the tabs bar, the editor, the status bar and the extended grid menus
-  (`plans/CTX.md` Parts 2 and 3); `plans/PARITY-GAPS.md` G2 to G18; milestone 9 (performance, BENCH) and 10
-  (polish, icon, README, final captures, Docker image `kerno-linux-build` to remove).
-
-## 2026-11-13 — Menus on every surface, tree, maintenance, administration, backup, brand, connection settings
-
-Committed since `fc0ade2` (HEAD `f982e77`, 22 commits). One line per commit or group:
-
-- `5864bc9`: context menus on tabs, the editor and the status bar; closing a tab asks once for what it
-  would lose (CTX Part 2, M5 Part 4). `c086743` notes what it left.
-- `d7a0f70`: the tree lists a table's constraints, foreign keys, references and triggers; create templates
-  for the other folders; rename and drop a column; drop with cascade (G10). `7c6755f` notes what it left.
-- `521e23c`: cell and header menus of the grids, paste and filters from a cell (CTX Part 3, M6 Part 1).
-  `4f20be0` notes what it left.
-- `7ac5318`: maintenance tools per engine in core (vacuum, analyze, refresh, truncate options, trigger
-  switch; analyze, check, optimize, repair), session signals as dialect SQL, undo of pending changes (G12
-  core half). `3c6c179`: disk checks and the two-subagent rule in the plans.
-- `d4be8c4`: the administration tab (sessions, roles and grants, sizes, settings) and the keys for
-  editing table data (G2, M8 Part 4).
-- `b324aba`, `fd688e9`, `9b3e1ae`, `ca0434d`: Kerno identity, icons and colours; the theme carries the brand;
-  lockup in About and the README, mark in the empty state; M10 Part 5 becomes the brand part (D-032).
-- `514c0ba`: back up and restore a database with the installed client tools (M8 Part 3 app half).
-- `45b7470`, `c6d0aa7`: commit mode per connection, default schema and bootstrap statements; one test
-  process at a time (G13; D-033, D-035). `68033d6`, `d46bc23`: bootstrap statements reduced to a small
-  grammar after two security reviews (D-034).
-- `5f38692`: what the first real-app pass found (menus in submenus, sessions held only while shown, tab
-  strip, administration and export polish, a missing table says so).
-- `1aa6f04`: run on a closed connection, results in new tabs, run from the cursor, count rows, results
-  panel keys (G4); every session closed with its owner (D-036); a second pass of visual fixes.
-- `7c17a81`, `f982e77`: screens recaptured with the brand colours; second list of visual defects; what the
-  session and running work left.
-- Not committed at the time of writing: the maintenance dialog (G12 app half, `maintenance_dialog.rs`) and
-  work on CON-12, CON-33, CON-34, CON-47 and the questions asked before a transaction ends.
-
-`docs/DBEAVER-PARITY.md` recounted: 238 done, 6 done untested, 17 planned, 61 gap, 96 roadmap (418 rows).
-No full test run was made while writing this entry; test names in the docs were checked to exist by
-searching the code, not by running them.
-
-## 2026-11-13 (later) — Settings, keymap, grid, results, parity closed
-
-Committed since `f982e77` (HEAD `409c4fc`). One line per commit or group:
-
-- `6596d9d`: parity, features, decisions and progress brought up to `fc0ade2`-`f982e77` (D-033 to D-036).
-- `2388fd5`: maintenance tools dialog (G12 app half); one question before a session ends (disconnect,
-  reconnect, disconnect others / all, read-only toggle, moving a tab); tabs and the status bar carry the
-  connection's colour; the keyboard returns after dialogs and the palette.
-- `89cdd60`: settings view (appearance, fonts, editor, grid, confirmations, tool paths), the keymap file,
-  Open Table (Cmd+P), a palette command and a menu entry for every action, new keys (commit, roll back,
-  fetch more / all, completion on demand, grid text size); the secrets test over the data directory and the
-  log (D-037); bench mode `KERNO_BENCH` and `scripts/bench.sh` (M9 Part 1); README, CONTRIBUTING,
-  ARCHITECTURE and ROADMAP rewritten from the code.
-- `2b0f3bf`: Generate SQL from rows, CALL / Execute on routines, block comment, case change, copy statement,
-  Link with editor, editor submenus (G7, G15, G10 leftovers); engine logos drawn at their size and result
-  batches without slack: 1M rows x 20 columns hold 340 MB (M9 Part 2).
-- `1844bb2`: record view, selection figures, value panel editing, Go to Row / Column, row-number menu,
-  Aggregate and Columns panels (G3, G6, G9); transaction log, lock manager, hide idle sessions, properties,
-  Create database options, object filters, back up one table (G11, G14, G16, G17, CM-58).
-- `e13ec36`: filter, order and count a query result on the server, estimated and exact counts, distinct
-  values, filter history, auto-refresh (G5, M6 Part 2); properties on F4, console on the selected node, Lock
-  Manager from the connection menu; tests for what had none (G18).
-- `409c4fc`: result columns carry their origin; a result of one table is edited like table data through
-  the shared module `query/edit.rs` (G8); `sqlparser` removed (D-010). `DBEAVER-PARITY.md` has no gap left:
-  322 rows done, 96 on the roadmap (418).
-- Docs of this pass: `FEATURES.md` walks CLAUDE.md §4 item by item with tests and screenshots, and lists
-  what has no test or no screenshot; `ROADMAP.md` checked against the 96 roadmap rows (all present, each
-  with its reason); `ARCHITECTURE.md` describes origins, editable results, the command table, settings and
-  bench mode; the README shortcut table follows `actions.rs`.
-
-Still open:
-
+- Owner's test, what is left: the Tools submenu and saved tasks (item 10, second half), the main toolbar
+  (item 11), the update check (item 12), local check and release scripts in place of GitHub Actions
+  (item 13).
 - One test still fails about once in forty full runs:
   `every_owner_of_a_session_closes_it_when_it_goes_away` saw two MySQL sessions of its own user, both idle in
   a transaction, right after connecting (expected one, in none). Not reproduced in 18 more runs; the test

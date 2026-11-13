@@ -429,7 +429,7 @@ impl StructureTab {
         ) else {
             return;
         };
-        let environment = saved.config.environment;
+        let environment = saved.config.environment.clone();
         let connection = saved.config.name.clone();
         let current = self
             .structure
@@ -460,6 +460,7 @@ impl StructureTab {
                 destructive: false,
                 connection,
                 environment,
+                writes: true,
             },
             window,
             cx,

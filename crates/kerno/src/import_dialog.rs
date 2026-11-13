@@ -613,7 +613,7 @@ impl ImportDialog {
         ) else {
             return;
         };
-        let (name, environment) = (saved.config.name.clone(), saved.config.environment);
+        let (name, environment) = (saved.config.name.clone(), saved.config.environment.clone());
         let sql = match self.statements(meta.dialect(), &job, &columns) {
             Ok(sql) => sql,
             Err(problem) => {
@@ -652,6 +652,7 @@ impl ImportDialog {
                 destructive: false,
                 connection: name,
                 environment,
+                writes: true,
             },
             window,
             cx,

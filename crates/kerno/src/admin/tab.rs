@@ -764,7 +764,7 @@ impl AdminTab {
             .connections
             .read(cx)
             .get(&self.target.connection)
-            .map(|saved| saved.config.environment)
+            .map(|saved| saved.config.environment.clone())
             .unwrap_or_default();
         let view = cx.entity();
         sql_confirm::open(
@@ -776,6 +776,7 @@ impl AdminTab {
                 destructive: signal == Signal::Terminate,
                 connection: self.connection_name(cx),
                 environment,
+                writes: true,
             },
             window,
             cx,

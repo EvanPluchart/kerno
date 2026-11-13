@@ -14,8 +14,10 @@ use gpui_kit::{
     IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription,
     TestSupportExt as _, Window, div, px,
 };
-use kerno_core::tools::Tool;
 
+use crate::connections::manager::Connections;
+use crate::environments_view::EnvironmentsView;
+use crate::local_clients_view::LocalClientsView;
 use crate::settings::{CODE_FONT_SIZES, PAGE_SIZES, Settings, TableDoubleClick, UI_FONT_SIZES};
 use crate::state::AppState;
 use crate::theme::{self, Appearance};
@@ -23,32 +25,24 @@ use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub(crate) enum Section {
     Appearance,
     Fonts,
     Editor,
     Grid,
     Confirmations,
     Tools,
+    Environments,
 }
 
-const SECTIONS: [(Section, &str); 6] = [
+pub(crate) const SECTIONS: [(Section, &str); 7] = [
     (Section::Appearance, "Appearance"),
     (Section::Fonts, "Fonts"),
     (Section::Editor, "Editor"),
     (Section::Grid, "Grid"),
     (Section::Confirmations, "Confirmations"),
-    (Section::Tools, "Tools"),
-];
-
-/// The client tools whose binary can be chosen, by the name the backup
-/// dialog stores them under.
-const TOOLS: [Tool; 5] = [
-    Tool::PgDump,
-    Tool::PgRestore,
-    Tool::Psql,
-    Tool::MysqlDump,
-    Tool::Mysql,
+    (Section::Tools, "Local clients"),
+    (Section::Environments, "Environments"),
 ];
 
 /// One text size the settings hold.
@@ -151,26 +145,27 @@ pub struct SettingsView {
     section: Section,
     page_size: Entity<InputState>,
     null_text: Entity<InputState>,
-    tools: Vec<(&'static str, Entity<InputState>)>,
+    local_clients: Entity<LocalClientsView>,
+    environments: Entity<EnvironmentsView>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
     /// Opens the settings in a dialog.
-    pub fn open(window: &mut Window, cx: &mut App) {
-        let view = cx.new(|cx| Self::new(window, cx));
+    pub fn open(connections: Entity<Connections>, window: &mut Window, cx: &mut App) {
+        let view = cx.new(|cx| Self::new(connections, window, cx));
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
             dialog
                 .title("Settings")
-                .w(px(600.))
+                .w(px(720.))
                 // Enter in a field does not close the settings.
                 .on_ok(|_, _, _| false)
                 .content(move |content, _, _| content.child(view.clone()))
         });
     }
 
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(connections: Entity<Connections>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = AppState::get(cx).settings.clone();
         let text = |value: String,
                     placeholder: &'static str,
@@ -184,7 +179,7 @@ impl SettingsView {
         };
         let page_size = text(settings.page_size.to_string(), "1000", window, cx);
         let null_text = text(settings.null_text.clone(), "NULL", window, cx);
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             cx.subscribe(&page_size, |_, input, event: &InputEvent, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
@@ -212,45 +207,14 @@ impl SettingsView {
                 }
             }),
         ];
-        let tools: Vec<(&'static str, Entity<InputState>)> = TOOLS
-            .iter()
-            .map(|tool| {
-                let name = tool.names()[0];
-                let value = settings
-                    .tool_paths
-                    .get(name)
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default();
-                let input = text(
-                    value,
-                    "Found on the PATH or in the usual folders",
-                    window,
-                    cx,
-                );
-                subscriptions.push(cx.subscribe(
-                    &input,
-                    move |_, input, event: &InputEvent, cx| {
-                        if !matches!(event, InputEvent::Change) {
-                            return;
-                        }
-                        let path = input.read(cx).value().trim().to_string();
-                        AppState::update_settings(cx, |settings| {
-                            if path.is_empty() {
-                                settings.tool_paths.remove(name);
-                            } else {
-                                settings.tool_paths.insert(name.to_string(), path.into());
-                            }
-                        });
-                    },
-                ));
-                (name, input)
-            })
-            .collect();
+        let local_clients = cx.new(LocalClientsView::new);
+        let environments = cx.new(|cx| EnvironmentsView::new(connections, window, cx));
         Self {
             section: Section::Appearance,
             page_size,
             null_text,
-            tools,
+            local_clients,
+            environments,
             _subscriptions: subscriptions,
         }
     }
@@ -470,33 +434,12 @@ impl SettingsView {
                     |settings, on| settings.confirm_close_tab = on,
                 ))
                 .child(note(
-                    "A production connection asks twice before any write, whatever is chosen here.",
+                    "An environment can ask more (Settings → Environments): production asks \
+                     twice before any write, whatever is chosen here.",
                 ))
                 .into_any_element(),
-            Section::Tools => v_flex()
-                .gap_2()
-                .children(self.tools.iter().map(|(name, input)| {
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(110.))
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .child(*name),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("settings-tool-{name}")))
-                                .test_support()
-                                .flex_1()
-                                .child(Input::new(input).small()),
-                        )
-                }))
-                .child(note(
-                    "Backup and restore run these binaries. Left empty, Kerno looks for them on \
-                     the PATH and in the usual install folders.",
-                ))
-                .into_any_element(),
+            Section::Tools => self.local_clients.clone().into_any_element(),
+            Section::Environments => self.environments.clone().into_any_element(),
         }
     }
 }
