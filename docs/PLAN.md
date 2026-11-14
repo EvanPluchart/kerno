@@ -16,7 +16,7 @@ checks ran and passed; the evidence is in `PROGRESS.md`.
 | 8  | Import, export, backup, administration (§4 G, H)                           | done (import cancel, production confirmation and the per-engine sentence tested; tool wizards, local clients and saved tasks, `bcea39f`, `d67e131`) |
 | 9  | Performance pass, `docs/BENCH.md`                                          | done (bench mode and `scripts/bench.sh`; `docs/BENCH.md` on the final code: start-up 279 ms, idle RSS 148.4 MB bundled / 150.5 MB bare, first rows 2 to 7 ms, scroll 8.35 ms, 1M × 20 in 340 MB) |
 | 10 | Polish: UX pass with screenshots, icon, states, keyboard, settings, packaging, Linux build, README, docs | done (four visual passes, the owner's test of 2026-11-13 in thirteen items, 98 final captures in light and dark, local check and release scripts, bundles, docs; the final verification is in `docs/PROGRESS.md`) |
-| 11 | v1.1: what competitors' users ask for (CLAUDE.md §4 J, goal in `docs/GOAL-2.md`) | doing (plan in `docs/plans/M11.md`: 15 implementation parts in three waves, then captures, bench, release) |
+| 11 | v1.1: what competitors' users ask for (CLAUDE.md §4 J, goal in `docs/GOAL-2.md`) | done (J1 to J19 in fifteen parts, `docs/plans/M11.md`; captures, bench, check and release on the final code; the verification is in `docs/PROGRESS.md`; idle memory is on the 150 MB line, see there) |
 | —  | Owner feedback of 2026-11-13: context menus and DBeaver parity (`plans/CTX.md`, `plans/PARITY-GAPS.md`) | done: CTX Parts 0 to 3 and PARITY-GAPS G1 to G17 are delivered; `DBEAVER-PARITY.md` has 330 rows done and 93 on the roadmap, none left as a gap; the debt of tests (G18) is closed except the rows `FEATURES.md` still marks "no test" |
 | —  | Owner's test of 2026-11-13, afternoon (`CLAUDE.md` §3 items 1 to 13; `plans/M10.md` Parts 9 to 14) | built: one sidebar tree, dots instead of bars, plain-words connection errors, the server's databases and the default one first, secrets read once per run, user environments that tint the chrome, folder colours and icons, the app icon of the bare binary, tool wizards with local clients, the Tools submenu, foreign data wrappers and saved tasks, the main toolbar with isolation levels, the update check and verified install, the local checks and release scripts (`scripts/check.sh`, `scripts/release.sh`); decisions D-042 to D-050; the first look at the new screens produced the list of Part 15 |
 
@@ -56,9 +56,10 @@ For every feature of §4, in this order:
 - The reliability of the test suite: the rules are in `plans/README.md`, "Reliability of the suite". One test,
   `every_owner_of_a_session_closes_it_when_it_goes_away`, failed about once in forty full runs before the cancel
   fix (`a4bcda5`) and has not failed in the thirty-odd full runs since; it prints what it saw if it ever does.
-- Nothing is open for the goal: the final verification of every criterion of `docs/GOAL.md` is in
-  `docs/PROGRESS.md` ("Final verification"), with what remains short of ideal (the bare binary's idle RSS 0.5 MB
-  over the target, the update check never run for real).
+- Nothing is open for either goal: the final verifications of `docs/GOAL.md` and of `docs/GOAL-2.md` (v1.1)
+  are in `docs/PROGRESS.md`, each with what remains short of ideal. After v1.1 the main one is idle memory:
+  149.9 MB at the median in `Kerno.app` against a target of 150, 152.1 MB for the bare binary; the 16 MB that
+  could be returned needs a second `unsafe` call, the owner's decision (`docs/BENCH.md`).
 - The checks run locally: `scripts/check.sh`, and `scripts/release.sh` for a release (criterion 8).
 
 - `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not

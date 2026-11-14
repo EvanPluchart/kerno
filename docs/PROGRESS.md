@@ -380,3 +380,84 @@ Still open (none blocks a criterion):
 - The update check has never made its real request and the install has never run for real: the repository
   does not exist and nothing is published (the owner's to do).
 - A few final captures still show a sidebar folder with a test name (`kerno_ui_demo_folder`).
+
+## 2026-11-14 — Milestone 11: v1.1, what competitors' users ask for (CLAUDE.md §4 J)
+
+Plan: `docs/plans/M11.md` (fifteen implementation parts in three waves, each with a "Done:" note, then the
+final part). Up to four agents in one working tree (D-052, D-055); the main session reviewed each part,
+committed checkpoints, and ran the final checks. Decisions D-054 to D-073.
+
+- **J1–J9** (`1f5161b`, `c52e5df`, `7a1cf9f`): Tab accepts a completion; SSH through the system OpenSSH
+  (config aliases, jump hosts, agents, RSA and encrypted key files through an askpass that only answers
+  OpenSSH's own question, D-056); passwords from a command, AWS RDS IAM, 1Password, `~/.pgpass` and
+  `~/.my.cnf` (D-060); `kerno <url>` and one running instance (D-059); edits on rows keyed by uuid, citext,
+  enum, composite and binary keys, JSON round-trips, SQL expressions as pending values (D-054); find and
+  "matching rows only" over the fetched rows, the layout remembered per table, the Unix time hint (D-058);
+  occurrences, folding verified, zoom, formatter options and format on save (D-057); column order on MySQL
+  and MariaDB; the four benches and a reconnect that really reconnects (D-062).
+- **J10–J16** (`c52e5df`, `7a1cf9f`, `cbca394`, `71d3146`): the tab list and three tab layouts, stacked
+  results (D-061); XLSX export and the export/import of connections, folders, environments and tasks with
+  no secret (D-065); copying tables with their data to another connection (D-063); one script on several
+  connections, each with its own rules (D-064); Linux packages for x86_64 and arm64, glibc 2.31 (D-066).
+- **J17–J19** (`8cde8f0`, `a207c11`): the opt-in AI assistant with one gated sender and the exact payload
+  shown (D-068); the ER diagram with SVG, PNG and Mermaid export (D-069); vim mode (D-070).
+- **Security reviews during the milestone**, each fixed before the next commit: the askpass could be asked
+  a look-alike question by a jump host (D-055); an imported connections file could attach a stored
+  password, an SSH password or a key passphrase to another server (D-065); an imported password command
+  does not run until confirmed (D-060).
+- **Review follow-ups and visual passes** (`d115fd7`, `b34bd15`): seven follow-ups (D-071), ten visual
+  defects found on the first captures (D-072), three on the second (D-073).
+
+## Final verification of `docs/GOAL-2.md` (2026-11-14, final code `b34bd15`)
+
+1. **J1 to J19 work end to end** on PostgreSQL 17, MySQL 8.4 and MariaDB 11 where they apply. Each item
+   has unit tests, integration tests against the `kerno-*` containers and UI tests for its surfaces
+   (`docs/FEATURES.md`, section J, names every one; all cited names exist). `scripts/check.sh` sets
+   `KERNO_REQUIRE_CONTAINERS=1`: no test is skipped. Nothing is behind a flag except the AI assistant and
+   vim mode, both off until the user turns them on. One row of section J is `partial`: code folding works
+   from the gutter and "Unfold all", and the kit offers no call to fold from the keyboard (D-057).
+2. **The named tests exist and ran.** J2 through a real jump host (`kerno-ssh-jump`) with the Jump host
+   field and with `ProxyJump` under an alias, and with an RSA key file (`crates/kerno-core/tests/openssh.rs`,
+   15 tests). J3 with a fake `aws` on a temporary PATH and a `.pgpass` and a `.my.cnf` in a temporary HOME
+   (`tests/password_sources.rs` of both drivers, `crates/kerno-core/tests/password.rs`). J17 against a fake
+   OpenAI-compatible server on 127.0.0.1 (`crates/kerno-core/tests/ai.rs`, `ui_tests/ai.rs`): no connection
+   while the assistant is off, the body equal to the preview byte for byte, no cell value without the
+   "include sample rows" tick.
+3. **`docs/BENCH.md`** has the four J9 measurements with their method, and the earlier targets
+   re-measured on the final code: cold start 264 ms (target 400), first rows 3 to 6 ms (150), scroll
+   8.4 ms a frame (16), 1M × 20 in 340 MB. **Idle memory is on the line**: 149.9 MB at the median in
+   `Kerno.app` (149.5 to 150.4 over nine runs, target 150), 152.1 MB for the bare binary. See "Still
+   open" below.
+4. **`scripts/release.sh`** builds the macOS bundle and, for x86_64 and arm64, a tarball, a `.deb` and an
+   AppImage, with `SHA256SUMS`; `scripts/check-linux-packages.sh` starts each Linux package in Ubuntu 20.04
+   (the floor, glibc 2.31) and Debian 13: RELEASE_RESULT. The floor is in the README.
+5. **`scripts/check.sh`** on the final code: `cargo fmt --all --check`, `cargo clippy --workspace
+   --all-targets -- -D warnings`, `cargo deny check` (no ignored advisory) and the whole suite with the
+   containers: all passed, 1,402 tests, 0 failed (2 ignored: two timing measurements, slow in a debug build).
+6. **Docs**: `docs/FEATURES.md` lists J1 to J19 with status, tests and captures; the `v11-*` captures of
+   `docs/screenshots/final/` exist in light and dark and each was looked at (172 files in all; D-073 says which
+   states have none and why); `docs/ROADMAP.md` and `docs/DECISIONS.md` no longer contradict §4 J (ERD, AI, jump
+   hosts, stacked results, column order, RSA key files, AppImage and amd64 corrected); the six "Not now"
+   items are in the roadmap with their reasons.
+7. **README** covers the new features, SSH through OpenSSH, the password sources, the AI assistant and
+   what it sends, and the Linux packages; `docs/PLAN.md`, this file and `docs/DECISIONS.md` (to D-073) are
+   current; every J group has its commits (list above).
+8. **Local only**: `git remote -v` is empty, no tag, nothing pushed or published. At the end no Kerno
+   instance, container, watcher or browser of this session runs (END_STATE).
+
+Still open (for the owner):
+
+- **Idle memory has no margin.** v1.1 added about 1.6 MB (a larger binary). The app meets 150 MB at the
+  median only; the bare binary is 2.1 MB over. The one large thing left is a 16.2 MB block the system
+  allocator keeps after the SQL highlighter compiled its query; returning it takes one
+  `malloc_zone_pressure_relief` call, a second `unsafe` in a workspace that allows one (D-042): three lines
+  if the owner agrees, and idle memory would be near 134 MB.
+- **Never run for real**: the update check and install (no repository), AWS RDS IAM and 1Password (a fake
+  `aws` in the tests), a remote AI endpoint (a fake on 127.0.0.1), an AppImage through FUSE and a window
+  opening from the Linux packages (containers have no display: the check is `kerno --version`).
+- **Small gaps noted in the parts**: Fold / Fold all from the keyboard; `ciw` plus typed text undoes in two
+  steps in vim mode (the kit's undo grouping is private); AI "Stop" drops the answer but the request ends
+  on its own (no cancel in the HTTP client); the copy wizard has no "Save as task"; no drag to reorder
+  tabs or columns (buttons and menus do it).
+- The version is still 0.1.0 (D-073): nothing was published yet.
+

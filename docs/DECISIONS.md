@@ -1551,9 +1551,10 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Captures of v1.1** are the `v11-*` files of `docs/screenshots/final/`, light and dark, all looked at.
   Three passes: the first found ten visual defects (D-072), the second three more (the active side tab now has
   the strip's underline, the copy wizard's first column, plain punctuation in the AI suggestions), the third
-  confirmed them. Not captured: the import preview and the Execute script progress, whose file is chosen in a
-  native panel the GUI driver cannot reach, and states that need a broken server ("reconnecting…"). Their
-  rows in `docs/FEATURES.md` say `no screenshot` and name the UI tests that draw them.
+  confirmed them, and a fourth took the screens behind a file panel (the import preview and its passwords
+  step, the Execute script progress) by driving the panel's own window. Not captured: states that need a
+  broken server ("reconnecting…") and the zoom, which has no screen of its own; their rows in
+  `docs/FEATURES.md` say `no screenshot` and name the UI tests that draw them.
 - **The first bench run of the final pass was thrown away**: a compile ran beside it. The published numbers
   come from a second run on the final code with nothing else running (`docs/BENCH.md` says which commit).
 - **A second full `scripts/check.sh` after the last code change** is the one the final verification quotes.
