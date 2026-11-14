@@ -64,7 +64,9 @@ servers.
   monochrome variant only where the vendor provides one, for small sizes and dark backgrounds.
 - Nothing leaves the machine: no telemetry, no analytics, no crash upload. One exception, the owner's
   (2026-11-13): the update check of §3 item 12, one request to GitHub's releases page, which sends nothing
-  else and can be turned off.
+  else and can be turned off. A second, a triage decision of 2026-11-14 made under the owner's delegation
+  (the owner can veto it): the opt-in AI assistant of §4 J17, only to the endpoint the user configured, only
+  when they ask.
 
 ### Machine hygiene (the owner's Mac froze once — strict)
 
@@ -310,9 +312,90 @@ procedures, sequences, enums/types, extensions, users/roles, sessions), DDL gene
 1. Command palette, settings view (theme, fonts, editor, grid page size, confirmations), keymap override file.
 2. macOS app bundle and Linux build (see §5); app data in the platform dirs; logs with secrets redacted.
 
-Everything else (ERD diagrams, schema compare, data compare, visual query builder, SQLite and the other
-engines, AI assistant, cloud sync) goes to `docs/ROADMAP.md`, ordered, with how the driver trait extends to
-each. Not in v1.
+Everything else (schema compare, data compare, visual query builder, SQLite and the other engines, cloud
+sync) goes to `docs/ROADMAP.md`, ordered, with how the driver trait extends to each. Not in v1. ERD diagrams
+and the AI assistant moved to J (v1.1).
+
+### J. v1.1: what competitors' users ask for (owner, 2026-11-14)
+
+The owner's rule: to stand out, do what DBeaver's and Beekeeper's users ask for. `docs/COMPETITOR-ISSUES.md` is
+the triage, `docs/research/` the evidence (issue numbers and votes); quote the issue numbers in plans and tests.
+Where an item contradicts an earlier deferral in `docs/ROADMAP.md` or a decision in `docs/DECISIONS.md`, J wins:
+update those lines. Order: J1-J9, then J10-J16, then J17-J19.
+
+1. **Tab accepts a completion** (Enter still does), as a setting that defaults on. If the kit's completion
+   menu ignores Tab, fix it in Kerno's fork or wrapper, not by forking the whole kit.
+2. **SSH through the system OpenSSH.** A connection can tunnel through `ssh` itself (`ssh -N -L` on a free
+   local port, or `-W` through a pipe), so it gets everything OpenSSH does: `~/.ssh/config` hosts, ProxyJump and
+   bastion chains, IdentityAgent (1Password, Secretive), RSA and every key type, known_hosts. The dialog lists
+   the `Host` aliases of `~/.ssh/config` (and its `Include`s) to pick from, and has a "Jump host" field for
+   users without a config. The built-in client stays for password authentication and machines without `ssh`.
+   Errors keep §3's plain-words rule ("The key in ~/.ssh/id_rsa needs a passphrase: load it with ssh-add or
+   enter it here"). Tests against `kerno-ssh`, including a jump through a second SSH container you add, named `kerno-ssh-jump`.
+3. **Password command and cloud auth.** A connection can get its password from a command: program and
+   arguments as a list, run without a shell, with a timeout, its output used for this connect only, never
+   stored or logged. Presets: AWS RDS IAM (`aws rds generate-db-auth-token` with profile, region, host, port,
+   user; TLS forced) and `op read`. PostgreSQL connections read `~/.pgpass` (and `PGPASSFILE`) when no
+   password is stored; MySQL/MariaDB read `~/.my.cnf` `[client]`. Say in the dialog where the password came
+   from.
+4. **`kerno <url>`**: `postgres://`, `postgresql://`, `mysql://`, `mariadb://` URLs on the command line open a
+   connection (an existing one if it matches, else an unsaved one the user can save). Same parser as pasting
+   a URL in the dialog. If an instance runs, the URL goes to it instead of opening a second one.
+5. **Editing reliability.** Integration tests that edit, insert and delete rows keyed by uuid, citext, enum,
+   composite and binary (`bytea`, `BINARY(16)`) keys, and JSON/JSONB round-trips, on all three engines. A
+   pending value can be a SQL expression (`now()`, `DEFAULT`, `gen_random_uuid()`): explicit toggle in the cell
+   editor, shown differently from a literal, and in the SQL preview unquoted.
+6. **Grid**: a quick filter and find over the fetched rows (⌘F when the grid has focus: matches highlighted,
+   next/previous, "show matching rows only"); sort, hidden columns and column widths remembered per table;
+   integers that look like Unix timestamps get a hint with the date in the value viewer.
+7. **Editor**: highlight every occurrence of the word or selection under the cursor and select them all (⌘⇧L,
+   DBeaver's ⌥J equivalent); code folding verified (on by default in the kit: test it, fix if broken, update the
+   roadmap); ⌘+/⌘-/⌘0 and ⌘-wheel zoom the editor and the grid; formatter options (keyword case, indent width,
+   comma position, line width) and format on save for `.sql` files.
+8. **Reorder columns** on MySQL/MariaDB in the structure editor (drag or move up/down, `MODIFY … AFTER` /
+   `FIRST`, previewed). On PostgreSQL say why it is not possible in plain words.
+9. **Benchmarks for what competitors fail** (§5, `docs/BENCH.md`): scroll a 300-column table (frame time < 16
+   ms); a database with 200 schemas and 1,200 tables (first level < 300 ms, expanding a 1,200-table schema <
+   500 ms); importing a 200 MB `.sql` file (UI stays responsive, progress, cancel); reconnect after the network
+   drops and returns (`docker network disconnect`/`connect` on a `kerno-*` container; usable again < 5 s
+   after the network is back).
+10. **Tabs**: an overflow menu listing every open tab; a setting for several rows of tabs or a vertical tab
+    list on the side.
+11. **Several results in one tab**: a setting to stack the result sets of a multi-statement run in one
+    scrolling panel (each with its own header: statement, row count, time) instead of one tab per result.
+12. **XLSX export** from tables and results, streamed, with a header row and typed cells (numbers, dates,
+    booleans), through a maintained MIT/Apache crate.
+13. **Copy tables with their data to another connection** (DBeaver's data transfer): pick tables, target
+    connection and schema, create or append, type mapping shown and editable (PostgreSQL ↔ MySQL/MariaDB for
+    the common types; refuse clearly what does not map), batched in transactions, progress, cancel, report.
+    Production targets go through the environment's confirmations.
+14. **Run one script on several connections**: pick connections or a folder; one result tab per connection;
+    stop or continue on error; each target's environment rules apply (production asks).
+15. **Export and import connections, folders, environments and saved tasks** as a JSON file without any
+    secret; import asks for passwords or links to the keychain entries if they exist.
+16. **Linux packages**: x86_64 and arm64 tarballs, `.deb` and AppImage from `scripts/release.sh` (built in
+    the arm64 container; x86_64 by cross-compiling with `--target x86_64-unknown-linux-gnu` and a cross linker,
+    never a release build under emulation; emulation only for the start check), all in `SHA256SUMS`. Document the oldest glibc they
+    run on and test the packages in a container of that distribution. No publishing.
+17. **AI assistant, opt-in, local first.** Off until the user turns it on in Settings → AI. Talks to an
+    OpenAI-compatible endpoint the user sets (default suggestions: Ollama `http://localhost:11434`, LM Studio);
+    a remote endpoint gets a warning and its key goes to the keychain. Actions: write SQL from a sentence
+    (inserted in the editor, never run by itself), explain a query or a plan, explain an error and propose a
+    fix. Context sent: the current database's schema names, tables and columns only; never row data unless the
+    user ticks "include sample rows" for that request. A "What is sent" view shows the exact payload. This is
+    the second exception to §1's network rule (triage decision of 2026-11-14, made under the owner's
+    delegation; the owner can veto it): only to the endpoint the user configured, only when they ask.
+18. **ER diagram**: of a schema or of the selected tables, from the catalog: tables with columns and keys,
+    foreign-key edges, automatic layout, pan and zoom, click a table to open it, export SVG, PNG and Mermaid.
+    Read-only in v1.1.
+19. **Vim mode**, opt-in in Settings → Editor: normal, insert and visual modes; motions (`h j k l w b e 0 ^ $ gg
+    G f t %`), operators (`d c y` with motions, `dd yy cc`, `p P x u ⌃r .`), counts, `/` search, `:w` saves the
+    file and `:q` closes the tab. Isolated so that with vim mode off nothing changes, and arrows always work
+    (Beekeeper's vim mode broke them, #1621, #1636). Unit tests for each motion and operator.
+
+Each J item: a plan in `docs/plans/M11.md`, unit and integration tests (UI tests where it has a surface),
+a light and dark capture in `docs/screenshots/final/` where it has a screen, its line in `docs/FEATURES.md`,
+and a context-menu or palette entry where it fits §3.
 
 ## 5. Quality bars (measure, write numbers to `docs/BENCH.md`)
 
@@ -366,6 +449,7 @@ each. Not in v1.
   9. Performance pass and `docs/BENCH.md`.
   10. Polish: UX/UI pass on every screen with screenshots, icon, empty/error/loading states, keyboard
       coverage, settings, packaging, Linux container build, README, docs.
+  11. v1.1, what competitors' users ask for (§4 J), goal in `docs/GOAL-2.md`.
 - Keep `docs/PLAN.md` (milestones and status), `docs/PROGRESS.md` (log), `docs/DECISIONS.md` (choices and
   why) current. Update them before each commit.
 - Model budget (owner request): the main session plans, reviews and integrates; subagents implement.
