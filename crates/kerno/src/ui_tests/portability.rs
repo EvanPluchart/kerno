@@ -193,7 +193,10 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
     // first one's id is offered, naming where it would go, but not chosen:
     // this data directory does not know that connection yet.
     let link = other.label_of(fresh, ("import-linked", 0usize));
-    assert!(link.contains("sent to kerno@127.0.0.1:55432"), "{link}");
+    assert!(
+        link.contains("database password → kerno@127.0.0.1:55432"),
+        "{link}"
+    );
     other.click(fresh, ("import-linked", 0usize));
     assert!(
         other
@@ -327,8 +330,8 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
     other.click(fresh, "import-next");
     other.click(fresh, "import-confirm");
     other.wait_until(fresh, "the import", |app, cx| app.has(cx, "import-done"));
-    assert!(!secrets::has_password(store.as_ref(), &linked_id).unwrap());
-    assert!(secrets::has_password(store.as_ref(), STRANGER).unwrap());
+    assert!(!secrets::has_secrets(store.as_ref(), &linked_id).unwrap());
+    assert!(secrets::has_secrets(store.as_ref(), STRANGER).unwrap());
     let stored = other.storage.connections().unwrap();
     assert_eq!(stored[0].config.host, "kerno-ui-elsewhere.invalid");
     assert_eq!(
@@ -399,4 +402,72 @@ fn an_export_holds_only_what_was_ticked(cx: &mut TestAppContext) {
     assert!(text.contains("kerno-ui-used"), "{text}");
     assert!(!text.contains("kerno-ui-unused"), "{text}");
     assert!(!text.contains("kerno_ui task"), "{text}");
+}
+
+/// Security review of J15: the secrets of a connection id are one set. A
+/// file that keeps a connection's id but moves its tunnel to another SSH
+/// host starts on "Ask", and the import removes the SSH password and the
+/// key passphrase with the database password; the same server keeps them
+/// all.
+#[gpui_kit::test]
+fn a_tunnel_moved_to_another_ssh_host_loses_every_saved_secret(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let mut config = testing::config(Engine::Postgres);
+    config.name = "kerno_ui tunnel".into();
+    config.ssh = Some(testing::ssh(kerno_core::config::SshAuth::KeyFile {
+        path: "/nonexistent/kerno-ui/id_ed25519".into(),
+    }));
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    let store = app.secret_store(cx);
+    let all = Secrets {
+        password: Some(Secret::new(testing::DB_PASSWORD)),
+        ssh_password: Some(Secret::new(SSH_SECRET)),
+        ssh_key_passphrase: Some(Secret::new(PASSPHRASE)),
+    };
+    secrets::save_secrets(store.as_ref(), &id, &all).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("out.json");
+    let (workspace, target) = (app.workspace.clone(), file.clone());
+    app.step(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.export_connections_to(target, window, cx)
+        })
+    });
+    app.wait_until(cx, "the export", |app, cx| app.has(cx, "portable-done"));
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let import =
+        |app: &Fixture, cx: &mut TestAppContext, change: &dyn Fn(&mut serde_json::Value)| {
+            let mut changed = json.clone();
+            change(&mut changed["connections"][0]);
+            let path = dir.path().join("changed.json");
+            std::fs::write(&path, changed.to_string()).unwrap();
+            let preview = app.import_preview(cx, path);
+            let summary = app.summary(cx, &preview);
+            app.click(cx, "import-next");
+            if app.has(cx, "import-confirm") {
+                app.click(cx, "import-confirm");
+            }
+            app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
+            app.click(cx, "import-close");
+            summary
+        };
+
+    // The same server, renamed: linked by default, every secret kept.
+    let summary = import(&app, cx, &|connection| {
+        connection["name"] = "kerno_ui tunnel renamed".into()
+    });
+    assert!(summary.contains("Replace Linked"), "{summary}");
+    assert_eq!(secrets::load_secrets(store.as_ref(), &id).unwrap(), all);
+
+    // Another SSH host: "Ask" by default, and nothing is left to read.
+    let summary = import(&app, cx, &|connection| {
+        connection["ssh"]["host"] = "kerno-ui-attacker.invalid".into()
+    });
+    assert!(summary.contains("Replace Ask moved"), "{summary}");
+    assert_eq!(
+        secrets::load_secrets(store.as_ref(), &id).unwrap(),
+        Secrets::default()
+    );
 }

@@ -29,6 +29,9 @@ directories.workspace = true
 uuid.workspace = true
 keyring.workspace = true
 rust_xlsxwriter.workspace = true
+# The AI assistant's HTTP client (J17, D-0xx): rustls with ring and webpki-roots,
+# both already in the tree; no gzip, no native-tls, no second crypto backend.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # Already in the tree through rust_xlsxwriter.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 

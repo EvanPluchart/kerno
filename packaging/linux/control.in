@@ -1,0 +1,15 @@
+Package: kerno
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Evan Pluchart
+Installed-Size: @SIZE@
+Depends: @DEPENDS@
+Suggests: postgresql-client, default-mysql-client | mariadb-client
+Section: database
+Priority: optional
+Homepage: https://github.com/EvanPluchart/kerno
+Description: fast, native database client for PostgreSQL and MySQL
+ Kerno is an open-source database client written in Rust with GPUI. It
+ browses schemas, runs and explains SQL, edits table data in transactions,
+ and exports, imports, backs up and restores, for PostgreSQL, MySQL and
+ MariaDB. Backup and restore use the client tools suggested here.

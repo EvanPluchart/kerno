@@ -256,11 +256,16 @@ pub fn save_secrets(store: &dyn SecretStore, connection_id: &str, secrets: &Secr
     Ok(())
 }
 
-/// Whether the store holds a database password for the connection: one
-/// read of one key (a cached store asks the keychain at most once), and
-/// only the answer leaves this function.
-pub fn has_password(store: &dyn SecretStore, connection_id: &str) -> Result<bool> {
-    Ok(store.get(&key(connection_id, KINDS[0]))?.is_some())
+/// Whether the store holds any secret of the connection (its password, SSH
+/// password or key passphrase): each key read at most once by a cached
+/// store, and only the answer leaves this function.
+pub fn has_secrets(store: &dyn SecretStore, connection_id: &str) -> Result<bool> {
+    for kind in KINDS {
+        if store.get(&key(connection_id, kind))?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Stores the database password of a connection, leaving its SSH secrets
@@ -315,16 +320,17 @@ mod tests {
     }
 
     #[test]
-    fn a_password_alone_is_looked_up_and_stored() {
+    fn secrets_are_looked_up_and_a_password_stored_alone() {
         let store = MemorySecretStore::default();
         let ssh = Secrets {
             ssh_key_passphrase: Some(Secret::new("pp")),
             ..Secrets::default()
         };
+        assert!(!has_secrets(&store, "c").unwrap());
+        // A passphrase alone counts: it would follow the connection's id.
         save_secrets(&store, "c", &ssh).unwrap();
-        assert!(!has_password(&store, "c").unwrap());
+        assert!(has_secrets(&store, "c").unwrap());
         save_password(&store, "c", &Secret::new("pw")).unwrap();
-        assert!(has_password(&store, "c").unwrap());
         let loaded = load_secrets(&store, "c").unwrap();
         assert_eq!(loaded.password, Some(Secret::new("pw")));
         assert_eq!(loaded.ssh_key_passphrase, Some(Secret::new("pp")));

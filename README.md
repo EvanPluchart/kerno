@@ -124,9 +124,11 @@ edited, and the saved tasks. The environments your connections use always go wit
 password, passphrase or key, no local client folder and no folder picture. **Import Connections…** first lists
 what the file adds, replaces (same id; same name for a task) or leaves as it is, then asks for each connection
 written where its password comes from: **Enter now** (kept in the secret store), **Ask when connecting**, or,
-when the secret store already holds an entry under that connection's id (the same computer, another data
-directory), **Linked to the keychain entry**, without showing it. A connection that would now point at another
-server is never linked by itself. Files written by earlier versions still import.
+when the secret store already holds secrets under that connection's id, **Use the keychain's saved secrets**
+(the database password and the SSH password or key passphrase, all or none), which names where each will be
+sent and never shows them. A saved password is linked automatically only to a connection this copy of Kerno
+already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
+unlinked cannot read any of the old secrets. Files written by earlier versions still import.
 
 ## Install
 

@@ -424,6 +424,9 @@ struct Password {
     secret: Option<Secret>,
     /// Written under a new id (see [`ImportSetup::import`]).
     fresh_id: bool,
+    /// Every secret under the id (password, SSH password, key passphrase)
+    /// is removed first: the connection is not linked to them.
+    forget: bool,
 }
 
 enum Step {
@@ -479,12 +482,12 @@ pub fn open_import(
         let file = import_connections_file(&json)?;
         let tasks = storage.tasks()?;
         let plan = plan_import(&file, &saved, &environments, &tasks);
-        // One read of one key per connection; only the answer is kept.
+        // Whether any secret is filed under the id; only the answer is kept.
         let linked = file
             .connections
             .iter()
             .map(|connection| match &connection.id {
-                Some(id) => secrets::has_password(store.as_ref(), id),
+                Some(id) => secrets::has_secrets(store.as_ref(), id),
                 None => Ok(false),
             })
             .collect::<kerno_core::Result<Vec<bool>>>()?;
@@ -637,17 +640,17 @@ impl ImportSetup {
 
     /// Writes what the preview listed.
     pub fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.password_rows();
+        let shown = self.password_rows();
         let mut passwords: BTreeMap<usize, Password> = BTreeMap::new();
-        for &index in &rows {
-            let row = &self.rows[index];
-            // A new connection whose id has an entry shares the entry with
-            // another data directory: unless linked, it gets an id of its
-            // own, and that entry is left alone.
-            let fresh_id = row.linked && self.plan.connections[index] == ImportAction::Add;
+        for (index, row) in self.rows.iter().enumerate() {
+            // Not linked, the store's secrets under the id must not be
+            // used: a new connection gets an id of its own (the entry stays
+            // with whoever has it), a replaced one has them removed. This
+            // holds for the connections the step does not show too, whose
+            // SSH secrets would otherwise follow.
+            let unlinked = row.linked && row.choice != Choice::Linked;
             let secret = match row.choice {
-                Choice::Linked => continue,
-                Choice::EnterNow => {
+                Choice::EnterNow if shown.contains(&index) => {
                     let typed = row.password.read(cx).value().to_string();
                     if typed.is_empty() {
                         self.problem = Some(format!(
@@ -659,10 +662,18 @@ impl ImportSetup {
                     }
                     Some(Secret::new(typed))
                 }
-                Choice::Ask if row.linked => None,
-                Choice::Ask => continue,
+                _ if unlinked => None,
+                _ => continue,
             };
-            passwords.insert(index, Password { secret, fresh_id });
+            let fresh_id = unlinked && self.plan.connections[index] == ImportAction::Add;
+            passwords.insert(
+                index,
+                Password {
+                    secret,
+                    fresh_id,
+                    forget: unlinked && !fresh_id,
+                },
+            );
         }
         let state = AppState::get(cx);
         let (storage, store) = (state.storage.clone(), state.secrets.clone());
@@ -720,12 +731,16 @@ impl ImportSetup {
                     _ => continue,
                 };
                 written += 1;
-                match password.map(|password| &password.secret) {
-                    Some(Some(secret)) => secrets::save_password(store.as_ref(), &id, secret)?,
-                    // Asked at connect: the entry of the connection it
-                    // replaces would otherwise be used. A fresh id has none.
-                    Some(None) if !fresh_id => secrets::delete_secrets(store.as_ref(), &id)?,
-                    _ => {}
+                if let Some(password) = password {
+                    // The secrets of the connection it replaces, all of
+                    // them, would otherwise go to its new server. A fresh
+                    // id has none.
+                    if password.forget {
+                        secrets::delete_secrets(store.as_ref(), &id)?;
+                    }
+                    if let Some(secret) = &password.secret {
+                        secrets::save_password(store.as_ref(), &id, secret)?;
+                    }
                 }
             }
             let tasks_written = tasks.len();
@@ -1038,12 +1053,11 @@ impl ImportSetup {
                 (Choice::Ask, "Ask when connecting".to_string()),
             ];
             if row.linked {
-                let target = server(&self.file.connections[index].config);
                 choices.insert(
                     0,
                     (
                         Choice::Linked,
-                        format!("Use the keychain's saved password (sent to {target})"),
+                        link_label(&self.file.connections[index].config),
                     ),
                 );
             }
@@ -1158,6 +1172,25 @@ fn server(config: &ConnectionConfig) -> String {
     text
 }
 
+/// The link choice, naming where the saved secrets will go: all of them or
+/// none.
+fn link_label(config: &ConnectionConfig) -> String {
+    let database = format!("{}@{}:{}", config.user, config.host, config.port);
+    match &config.ssh {
+        None => format!("Use the keychain's saved secrets (database password → {database})"),
+        Some(ssh) => {
+            let mut tunnel = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
+            if let Some(jump) = ssh.jump.as_deref().filter(|jump| !jump.is_empty()) {
+                tunnel.push_str(&format!(" via {jump}"));
+            }
+            format!(
+                "Use the keychain's saved secrets (database password → {database}; SSH password \
+                 and key passphrase → {tunnel})"
+            )
+        }
+    }
+}
+
 /// The first choice of the Passwords step for a connection of the file.
 /// The secret store's entry under its id is linked by default only when
 /// this data directory has that connection and the file keeps it on the
@@ -1243,5 +1276,77 @@ mod tests {
         assert_eq!(default_choice(true, Some(&known), &renamed), Choice::Linked);
         assert_eq!(default_choice(true, Some(&known), &elsewhere), Choice::Ask);
         assert_eq!(default_choice(false, Some(&known), &renamed), Choice::Ask);
+        // Through a tunnel: any change of the SSH side is another server,
+        // the key file included (its passphrase would follow).
+        let tunnel = kerno_core::SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "ops".into(),
+            auth: kerno_core::SshAuth::KeyFile {
+                path: "/keys/id_ed25519".into(),
+            },
+            keepalive_secs: 30,
+            client: kerno_core::SshClient::Builtin,
+            jump: None,
+        };
+        let tunnelled = ConnectionConfig {
+            ssh: Some(tunnel.clone()),
+            ..known.clone()
+        };
+        assert_eq!(
+            default_choice(true, Some(&tunnelled), &tunnelled),
+            Choice::Linked
+        );
+        for changed in [
+            kerno_core::SshConfig {
+                host: "attacker.example".into(),
+                ..tunnel.clone()
+            },
+            kerno_core::SshConfig {
+                user: "root".into(),
+                ..tunnel.clone()
+            },
+            kerno_core::SshConfig {
+                port: 2222,
+                ..tunnel.clone()
+            },
+            kerno_core::SshConfig {
+                jump: Some("evil@jump".into()),
+                ..tunnel.clone()
+            },
+            kerno_core::SshConfig {
+                client: kerno_core::SshClient::OpenSsh,
+                ..tunnel.clone()
+            },
+            kerno_core::SshConfig {
+                auth: kerno_core::SshAuth::KeyFile {
+                    path: "/tmp/other".into(),
+                },
+                ..tunnel.clone()
+            },
+        ] {
+            let moved = ConnectionConfig {
+                ssh: Some(changed.clone()),
+                ..known.clone()
+            };
+            assert_eq!(
+                default_choice(true, Some(&tunnelled), &moved),
+                Choice::Ask,
+                "{changed:?}"
+            );
+        }
+        // The link names every destination.
+        let label = link_label(&ConnectionConfig {
+            ssh: Some(kerno_core::SshConfig {
+                jump: Some("j@jump".into()),
+                ..tunnel
+            }),
+            ..known.clone()
+        });
+        assert!(
+            label.contains("database password → postgres@db.example.com:5432")
+                && label.contains("key passphrase → ops@bastion:22 via j@jump"),
+            "{label}"
+        );
     }
 }

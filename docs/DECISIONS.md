@@ -1316,8 +1316,17 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   import; a task whose connection is gone is left out and counted. Tasks match by name.
 - **Import never writes the secret store behind the user's back**: it bypasses `Connections::save` (which
   rewrote every secret of the id, deleting a linked entry) and writes storage directly, then reloads the
-  list. Only "Enter now" (`secrets::save_password`) and "Ask when connecting" over an existing entry
-  (`delete_secrets`) touch the store. The lookup is `secrets::has_password`: one key per connection, through
-  the cached store. A replaced connection whose engine, host, port, user or tunnel changes
-  (`reaches_another_server`) defaults to "Ask when connecting": a file reusing a known id cannot collect its
-  password. `Connections::import` is removed (no caller left).
+  list. Only "Enter now" (`secrets::save_password`) and a replaced connection left unlinked over an existing
+  entry (`delete_secrets`) touch the store. The lookup is `secrets::has_secrets` (any of the three keys, so an
+  SSH passphrase counts too), through the cached store. A saved password is linked automatically only to a connection this copy of Kerno already
+  has, pointing at the same server (`portability::default_choice`: existing, and not `reaches_another_server`,
+  which compares engine, host, port, user and the whole tunnel); a new connection whose id has an entry, or a
+  replace towards another server, starts on "Ask when connecting", and linking is an explicit choice whose
+  label names the server (security review). A new connection not linked gets a fresh id (its tasks follow),
+  so the entry of the data directory it came from is never deleted or overwritten. A replace keeps this
+  computer's `client_dir`. The secrets of an id are one set (password, SSH password, key passphrase): the
+  link offers all of them, its label naming each destination (database `user@host:port`, SSH
+  `user@host:port` and jumps); "same server" includes the whole tunnel (client, host, port, user, jumps, key
+  file). Unlinked, a replaced connection loses all three before "Enter now" stores the new password, and a new
+  one gets a fresh id, so no old SSH secret can reach another SSH server (second security review).
+  `Connections::import` is removed (no caller left).
