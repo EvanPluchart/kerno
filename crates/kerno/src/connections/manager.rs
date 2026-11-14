@@ -12,10 +12,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::{App, Context, EventEmitter, Task};
 use kerno_core::config::{
-    ConnectionConfig, Engine, FolderLook, Secret, Secrets, SshAuth, all_folders, folder_name,
-    folder_path, in_folder, parent_folder, rebase_folder,
+    ConnectionConfig, Engine, FolderLook, ParsedUrl, Secret, Secrets, SshAuth, all_folders,
+    folder_name, folder_path, in_folder, parent_folder, rebase_folder,
 };
 use kerno_core::connector::{Connector, HostKeyStore};
+use kerno_core::password::{PasswordEnv, PasswordOrigin};
 use kerno_core::secrets::{self, SecretStore};
 use kerno_core::ssh::SshError;
 use kerno_core::storage::{SavedConnection, Storage};
@@ -120,6 +121,9 @@ pub struct TestReport {
     pub version: String,
     /// Round-trip time of one ping on the established connection.
     pub latency: Duration,
+    /// Where the password came from ("Password from ~/.pgpass"), or why a
+    /// password file was not used; `None` when no password was sent.
+    pub password: Option<String>,
 }
 
 /// The live half of a connection.
@@ -141,6 +145,8 @@ struct Runtime {
     opened: Opened,
     attempt: Option<Task<()>>,
     keep_alive: Option<Task<()>>,
+    /// Where the open connection's password came from, in words (J3).
+    password_origin: Option<String>,
 }
 
 /// The saved connections and their live state.
@@ -153,8 +159,14 @@ pub struct Connections {
     user_known_hosts: Option<PathBuf>,
     /// The system's OpenSSH, when there is one.
     openssh: Option<kerno_core::openssh::OpenSshEnv>,
+    /// Where password files and commands are looked for (J3).
+    password_env: Option<PasswordEnv>,
     /// The last write of moved or renamed connections.
     writing: Option<Task<()>>,
+    /// Connections opened from a URL (`kerno <url>`) and not saved: listed
+    /// in `saved` for this run, never written to storage or the secret
+    /// store until the user saves them.
+    unsaved: HashSet<String>,
 }
 
 impl EventEmitter<ConnectionsEvent> for Connections {}
@@ -181,8 +193,57 @@ impl Connections {
             runtime: HashMap::new(),
             user_known_hosts,
             openssh: None,
+            password_env: None,
             writing: None,
+            unsaved: HashSet::new(),
         }
+    }
+
+    /// Opens what a connection URL names (`kerno <url>`): the saved
+    /// connection to the same server and database if there is one, with
+    /// its own secrets; otherwise an unsaved one, kept for this run only,
+    /// with the URL's password in memory. Connects it; returns its id.
+    pub fn open_url(&mut self, url: &ParsedUrl, cx: &mut Context<Self>) -> String {
+        let (unsaved, secrets) = kerno_core::instance::unsaved_connection(url);
+        let found = self
+            .saved
+            .iter()
+            .find(|saved| kerno_core::instance::same_target(&saved.config, &unsaved.config));
+        let id = match found {
+            Some(saved) => saved.id.clone(),
+            None => {
+                let id = unsaved.id.clone();
+                self.runtime.entry(id.clone()).or_default().secrets = Some(secrets);
+                self.unsaved.insert(id.clone());
+                self.saved.push(unsaved);
+                cx.emit(ConnectionsEvent::ListChanged);
+                cx.notify();
+                id
+            }
+        };
+        self.connect(&id, cx);
+        id
+    }
+
+    /// Whether a connection was opened from a URL and is not saved.
+    pub fn is_unsaved(&self, id: &str) -> bool {
+        self.unsaved.contains(id)
+    }
+
+    /// Sets where password files and commands are looked for (J3).
+    pub fn set_password_env(&mut self, env: Option<PasswordEnv>) {
+        self.password_env = env;
+    }
+
+    /// Where password files and commands are looked for.
+    pub fn password_env(&self) -> Option<&PasswordEnv> {
+        self.password_env.as_ref()
+    }
+
+    /// Where the password of an open connection came from, in words
+    /// ("Password from the command `aws`"); `None` when none was sent.
+    pub fn password_origin(&self, id: &str) -> Option<String> {
+        self.runtime.get(id)?.password_origin.clone()
     }
 
     /// Sets where the system's OpenSSH is (`None`: not found).
@@ -209,6 +270,7 @@ impl Connections {
             learn_into: Some(kerno_file),
             trusted_fingerprint,
             openssh: self.openssh.clone(),
+            password: self.password_env.clone(),
         }
     }
 
@@ -298,12 +360,15 @@ impl Connections {
     ) {
         let state = AppState::get(cx);
         let (storage, store) = (state.storage.clone(), state.secrets.clone());
-        let persisted = persist(storage, store, id, config.clone(), secrets.clone());
+        // An unsaved connection is stored under the id it has.
+        let insert = id.as_deref().is_some_and(|id| self.unsaved.contains(id));
+        let persisted = persist(storage, store, id, insert, config.clone(), secrets.clone());
         let saving = bridge::spawn_blocking(cx, persisted);
         cx.spawn(async move |this, cx| {
             let outcome = saving.await;
             let _ = this.update(cx, |this, cx| match outcome {
                 Ok(id) => {
+                    this.unsaved.remove(&id);
                     match this.saved.iter_mut().find(|connection| connection.id == id) {
                         Some(connection) => connection.config = config,
                         None => this.saved.push(SavedConnection {
@@ -388,6 +453,7 @@ impl Connections {
                 Ok(()) => {
                     this.saved.retain(|connection| connection.id != deleted_id);
                     this.runtime.remove(&deleted_id);
+                    this.unsaved.remove(&deleted_id);
                     cx.emit(ConnectionsEvent::ListChanged);
                     cx.notify();
                 }
@@ -435,7 +501,14 @@ impl Connections {
             let outcome = reading.await;
             let _ = this.update(cx, |this, cx| match outcome {
                 Ok(saved) => {
+                    // The unsaved connections are not in storage: kept.
+                    let unsaved: Vec<SavedConnection> = this
+                        .saved
+                        .drain(..)
+                        .filter(|connection| this.unsaved.contains(&connection.id))
+                        .collect();
                     this.saved = saved;
+                    this.saved.extend(unsaved);
                     cx.emit(ConnectionsEvent::ListChanged);
                     cx.notify();
                 }
@@ -718,9 +791,11 @@ impl Connections {
     /// Shows connections already changed in memory, and writes their
     /// settings (never their secrets) in the background. If that fails,
     /// the list is read back from storage.
-    fn store(&mut self, changed: Vec<SavedConnection>, cx: &mut Context<Self>) {
+    fn store(&mut self, mut changed: Vec<SavedConnection>, cx: &mut Context<Self>) {
         cx.emit(ConnectionsEvent::ListChanged);
         cx.notify();
+        // An unsaved connection changes in memory only.
+        changed.retain(|connection| !self.unsaved.contains(&connection.id));
         if changed.is_empty() {
             return;
         }
@@ -804,7 +879,10 @@ impl Connections {
             };
             // A password the user chose not to save is asked for up front
             // rather than discovered through a failed login.
-            if !config.save_password && secrets.password.is_none() {
+            if !config.save_password
+                && config.password_source.is_stored()
+                && secrets.password.is_none()
+            {
                 let _ = this.update(cx, |this, cx| {
                     this.runtime
                         .entry(connection_id.clone())
@@ -860,7 +938,15 @@ impl Connections {
             Ok((connector, meta)) => {
                 let version = meta.server().version.clone();
                 let keep_alive = self.watch(id, cx);
+                let persistent = AppState::get(cx).secrets.is_persistent();
                 let runtime = self.runtime.entry(id.to_string()).or_default();
+                let asked = runtime.typed_secret || !config.save_password;
+                runtime.password_origin = origin_text(
+                    connector.password_origin().as_ref(),
+                    connector.password_warning().as_deref(),
+                    asked,
+                    persistent,
+                );
                 runtime.connector = Some(connector);
                 runtime.meta = Some(meta);
                 runtime.keep_alive = Some(keep_alive);
@@ -988,6 +1074,7 @@ impl Connections {
         runtime.attempt = None;
         runtime.keep_alive = None;
         runtime.connector = None;
+        runtime.password_origin = None;
         let meta = runtime.meta.take();
         close_all(meta, &runtime.opened, cx);
         self.set_status(id, Status::Disconnected, cx);
@@ -1021,6 +1108,7 @@ impl Connections {
         if let Some(runtime) = self.runtime.get_mut(id) {
             runtime.keep_alive = None;
             runtime.connector = None;
+            runtime.password_origin = None;
             // Gone with the server, or left half-open: closed either way.
             close_all(runtime.meta.take(), &runtime.opened, cx);
             runtime.status = Some(Status::Disconnected);
@@ -1041,7 +1129,9 @@ impl Connections {
     ) -> Task<kerno_core::Result<TestReport>> {
         let driver = self.drivers.get(config.engine);
         let host_keys = self.host_keys(trusted_fingerprint, cx);
+        let persistent = AppState::get(cx).secrets.is_persistent();
         bridge::spawn(cx, async move {
+            let asked = !config.save_password;
             let connector = Connector::open(driver?, config, secrets, &host_keys).await?;
             let session = connector.session(None).await?;
             let started = Instant::now();
@@ -1049,7 +1139,17 @@ impl Connections {
             let latency = started.elapsed();
             let version = session.server().version.clone();
             session.close().await;
-            Ok(TestReport { version, latency })
+            let password = origin_text(
+                connector.password_origin().as_ref(),
+                connector.password_warning().as_deref(),
+                asked,
+                persistent,
+            );
+            Ok(TestReport {
+                version,
+                latency,
+                password,
+            })
         })
     }
 
@@ -1082,6 +1182,25 @@ impl Connections {
             Ok(databases?.into_iter().map(|info| info.name).collect())
         })
     }
+}
+
+/// Where a connection's password came from, in the words of the dialog and
+/// the navigator (J3): `asked` when the user typed it for this run, a
+/// password file that was ignored when no password was sent.
+pub fn origin_text(
+    origin: Option<&PasswordOrigin>,
+    ignored: Option<&str>,
+    asked: bool,
+    persistent: bool,
+) -> Option<String> {
+    Some(match origin {
+        None => ignored?.to_string(),
+        Some(PasswordOrigin::Given) if asked => "Password asked".to_string(),
+        Some(PasswordOrigin::Given) if persistent => "Password from the keychain".to_string(),
+        Some(PasswordOrigin::Given) => "Password remembered until Kerno quits".to_string(),
+        Some(PasswordOrigin::File(file)) => format!("Password from {file}"),
+        Some(PasswordOrigin::Command(name)) => format!("Password from the command `{name}`"),
+    })
 }
 
 /// Closes `meta` and every session in `opened` still open, off the UI thread.
@@ -1138,16 +1257,21 @@ fn keep_folder(folder: Option<String>, cx: &mut App) {
     }
 }
 
-/// Writes a connection and its secrets; returns its id.
+/// Writes a connection and its secrets; returns its id. With `insert`, the
+/// connection is new to storage and keeps its id.
 fn persist(
     storage: Arc<Storage>,
     store: Arc<dyn SecretStore>,
     id: Option<String>,
+    insert: bool,
     config: ConnectionConfig,
     secrets: Secrets,
 ) -> impl FnOnce() -> kerno_core::Result<String> {
     move || {
-        let id = storage.save_connection(id.as_deref(), &config)?;
+        let id = match (insert, id) {
+            (true, Some(id)) => storage.add_connection(&id, &config).map(|()| id)?,
+            (_, id) => storage.save_connection(id.as_deref(), &config)?,
+        };
         if config.save_password {
             secrets::save_secrets(store.as_ref(), &id, &secrets)?;
         } else {

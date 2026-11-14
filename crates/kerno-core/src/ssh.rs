@@ -432,6 +432,15 @@ impl Tunnel {
         }
     }
 
+    /// The private directory of an OpenSSH tunnel, which the command line
+    /// of each of its `ssh` processes names; `None` with the built-in client.
+    pub fn openssh_dir(&self) -> Option<&std::path::Path> {
+        match &self.route {
+            Route::Builtin(_) => None,
+            Route::OpenSsh(forward) => Some(forward.dir()),
+        }
+    }
+
     /// A mark to pass to [`Tunnel::forward_failure`] after a connection
     /// through the tunnel failed.
     pub fn forward_mark(&self) -> u64 {

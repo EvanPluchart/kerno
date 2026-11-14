@@ -214,7 +214,7 @@ The owner can pull any row back by naming its ID.
 
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
-| OBJ-07 | Column order | My | Noted as not editable in M7; MySQL-only |
+| OBJ-07 | Column order | My | Done in M11 (J8, D-062) on MySQL and MariaDB; PostgreSQL cannot |
 | OBJ-09 | Edit trigger source | PG, My | PostgreSQL trigger bodies are functions (editable); MySQL triggers are re-created from Show DDL |
 | OBJ-11 | Sequence editor | PG | Show DDL gives the definition; current value is a query away |
 | OBJ-18 | Dependencies page | PG | See NAV-09 |

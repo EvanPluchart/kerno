@@ -8,7 +8,7 @@ use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
@@ -23,8 +23,8 @@ use gpui_kit::{
 };
 use kerno_core::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
 use kerno_core::table_draft::{
-    AutoIncrement, ColumnDraft, ForeignKeyDraft, IndexDraft, REFERENTIAL_ACTIONS, TableChange,
-    TableDraft, changes,
+    AutoIncrement, CANNOT_MOVE_COLUMNS, ColumnDraft, ForeignKeyDraft, IndexDraft,
+    REFERENTIAL_ACTIONS, TableChange, TableDraft, changes,
 };
 use kerno_core::{Engine, Error, Session, TxState, exec};
 
@@ -784,12 +784,28 @@ impl TableEditor {
         cx.notify();
     }
 
-    /// Moves a column of a new table one place up (`-1`) or down (`1`).
+    /// Why columns cannot be moved here: an existing PostgreSQL table.
+    pub fn reorder_refused(&self, cx: &App) -> Option<&'static str> {
+        (self.table.is_some() && self.engine(cx) == Engine::Postgres).then_some(CANNOT_MOVE_COLUMNS)
+    }
+
+    fn engine(&self, cx: &App) -> Engine {
+        self.connections
+            .read(cx)
+            .get(&self.target.connection)
+            .map_or(Engine::Postgres, |saved| saved.config.engine)
+    }
+
+    /// Moves a column one place up (`-1`) or down (`1`): in a new table, or
+    /// in an existing one where the server can (Beekeeper #1341).
     pub fn move_column(&mut self, index: usize, by: isize, cx: &mut Context<Self>) {
         let Some(to) = index.checked_add_signed(by) else {
             return;
         };
-        if self.table.is_none() && to < self.columns.len() && index < self.columns.len() {
+        if self.reorder_refused(cx).is_none()
+            && to < self.columns.len()
+            && index < self.columns.len()
+        {
             self.columns.swap(index, to);
             cx.notify();
         }
@@ -1166,11 +1182,8 @@ impl TableEditor {
     fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let creating = self.table.is_none();
-        let engine = self
-            .connections
-            .read(cx)
-            .get(&self.target.connection)
-            .map_or(Engine::Postgres, |saved| saved.config.engine);
+        let engine = self.engine(cx);
+        let refused = self.reorder_refused(cx);
         let draft = self.draft(cx);
         let view = cx.entity();
         let count = self.columns.len();
@@ -1213,8 +1226,35 @@ impl TableEditor {
                 )),
                 (false, None) => None,
             };
+            let menu = {
+                let view = view.clone();
+                move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                    let item = |label: &'static str, enabled: bool, by: Option<isize>| {
+                        let view = view.clone();
+                        PopupMenuItem::new(label)
+                            .disabled(!enabled)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| match by {
+                                    Some(by) => this.move_column(index, by, cx),
+                                    None => this.remove_column(index, cx),
+                                })
+                            })
+                    };
+                    menu.item(item("Move up", refused.is_none() && index > 0, Some(-1)))
+                        .item(item(
+                            "Move down",
+                            refused.is_none() && index + 1 < count,
+                            Some(1),
+                        ))
+                        .separator()
+                        .item(item("Remove column", true, None))
+                }
+            };
             h_flex()
+                .id(("column-row", index))
+                .test_support()
                 .gap_1()
+                .context_menu(menu)
                 // Removing a row is the first thing on it, next to its name.
                 .child(
                     Button::new(("column-remove", index))
@@ -1224,30 +1264,28 @@ impl TableEditor {
                         .tooltip("Remove column")
                         .on_click(cx.listener(move |this, _, _, cx| this.remove_column(index, cx))),
                 )
-                .when(creating, |line| {
-                    line.child(
-                        Button::new(("column-up", index))
-                            .ghost()
-                            .xsmall()
-                            .label("↑")
-                            .tooltip("Move up")
-                            .disabled(index == 0)
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.move_column(index, -1, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new(("column-down", index))
-                            .ghost()
-                            .xsmall()
-                            .label("↓")
-                            .tooltip("Move down")
-                            .disabled(index + 1 == count)
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.move_column(index, 1, cx)),
-                            ),
-                    )
-                })
+                .child(
+                    Button::new(("column-up", index))
+                        .ghost()
+                        .xsmall()
+                        .label("↑")
+                        .tooltip(refused.unwrap_or("Move up"))
+                        .disabled(refused.is_some() || index == 0)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.move_column(index, -1, cx)),
+                        ),
+                )
+                .child(
+                    Button::new(("column-down", index))
+                        .ghost()
+                        .xsmall()
+                        .label("↓")
+                        .tooltip(refused.unwrap_or("Move down"))
+                        .disabled(refused.is_some() || index + 1 == count)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.move_column(index, 1, cx)),
+                        ),
+                )
                 .child(
                     div().flex_none().w(px(150.)).child(
                         Input::new(&row.name)
@@ -1346,7 +1384,7 @@ impl TableEditor {
                         .child(SharedString::from(text))
                 }))
         });
-        let mover = if creating { 48. } else { 0. };
+        let mover = 48.;
         v_flex()
             .gap_1()
             .child(section_title("Columns", cx))
@@ -1364,7 +1402,9 @@ impl TableEditor {
             .children(rows)
             .when(!creating, |section| {
                 section.child(hint(
-                    "Columns keep their order on the server; new ones are added at the end.",
+                    refused.unwrap_or(
+                        "↑ and ↓ move a column; the server rewrites the table to put it there.",
+                    ),
                     cx,
                 ))
             })

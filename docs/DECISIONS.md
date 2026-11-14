@@ -535,7 +535,8 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   commits at once, so the confirmation says a failure leaves earlier statements applied.
 - What the form does not show must not be lost by an edit: `ColumnInfo::on_update`, `INVISIBLE` and the
   identity kind (ALWAYS or BY DEFAULT) are carried by the draft and written back; a foreign key on its own
-  table follows a rename of the column it references. Column order of an existing table cannot be edited.
+  table follows a rename of the column it references. Column order of an existing table cannot be edited
+  (since M11, on MySQL and MariaDB it can: D-062).
 - Editing a view, function or procedure opens its definition as a replace script in a query tab
   ("source mode"); Apply source shows the whole script and asks. PostgreSQL replaces in place (a materialized
   view by drop and create inside one transaction), MariaDB uses `CREATE OR REPLACE`, MySQL drops then
@@ -987,12 +988,13 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **One set of zoom commands.** Part 2 added Zoom In / Out / Reset beside the grid's older "Grid: Larger /
   Smaller Text"; both did the same thing after J7 (editor and grids together). The grid's three commands and
   their Alt+0 / Alt+9 keys are removed; ⌘= / ⌘- / ⌘0 work from anywhere.
-- **Known limit of the OpenSSH askpass (D-056).** The destination's `ssh` runs with password and
-  keyboard-interactive authentication off, so a server cannot ask a question that looks like the key's
-  passphrase prompt. `-J` gives no way to pass those options to the jump host's own `ssh`: a jump host the
-  user trusted and that turned hostile could send such a prompt and receive the passphrase of the key file
-  (not the key). Same exposure as typing into a terminal `ssh`. Closing it needs a `ProxyCommand` built by
-  Kerno instead of `-J`; noted for a later pass.
+- **The askpass cannot be asked a spoofed question (D-056, hardened after review).** `-J` hands `-F` on
+  to the jump host's own `ssh` but not the `-o` options, so a jump host could have sent a
+  keyboard-interactive prompt worded like the key's passphrase question and received the passphrase. Every
+  tunnel now starts `ssh` with its own configuration file (in the tunnel's private directory): no
+  keyboard-interactive, no password, `BatchMode no`, then `Include` of the user's file and of
+  `/etc/ssh/ssh_config` (first value wins, so they cannot be overridden). The passphrase is given only to
+  OpenSSH's exact question for exactly the connection's key (or its 100-character cut).
 
 ## D-056 — SSH through the system OpenSSH (M11 Part 1, J2)
 
@@ -1030,8 +1032,8 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   is called the jump host. A forward the server refuses shows only in ssh's messages after the driver failed:
   `Connector::session` turns it into `SshError::Forward`.
 - **Detection**: `ssh` on `PATH`, then `/usr/bin`, `/opt/homebrew/bin`, `/usr/local/bin` (a GUI app's `PATH`
-  is short). `KERNO_SSH_CONFIG` is passed as `-F`; otherwise ssh reads its own files (`-F` would drop
-  `/etc/ssh/ssh_config`). The dialog lists the `Host` names of that file and its `Include`s (relative to the
+  is short). `KERNO_SSH_CONFIG` replaces `~/.ssh/config` as the user's file; either is read through the
+  tunnel's own `-F` file, which includes it and then `/etc/ssh/ssh_config` (D-055). The dialog lists the `Host` names of that file and its `Include`s (relative to the
   including file, `~` expanded, globs in the file name, depth 8, `Match` blocks skipped), read off the UI thread.
 - **Tests** pass their own `-F` file (`testing::openssh`) with its own known_hosts, `IdentityAgent none` and
   `IdentitiesOnly yes`, so the developer's `~/.ssh` is never read; the core tests' askpass is the
@@ -1112,3 +1114,109 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Unix time hint** (Beekeeper #941): an integer column's value from 2000-01-01 to 2100-01-01 in seconds,
   milliseconds or microseconds; Howard Hinnant's `civil_from_days` written out, no date crate; shown in the
   value viewer and in the value panel (a table's cells open the panel).
+
+## D-059 — `kerno <url>` (M11 Part 6, J4): arguments, unsaved connections, one instance
+
+- **Order at the top of `main`**: the OpenSSH askpass answer first (`ssh` runs Kerno with its prompt as the
+  argument), then the arguments (std only: `--version`/`-V`, `--help`/`-h`, one URL; `-psn_…` from the Finder
+  ignored; anything else exits 2 with a message that never holds the URL), then the bench modes, then the
+  hand-off of a URL to the running instance, then the data. `--version` and `--help` touch no display, GPU,
+  keychain, data directory or network.
+- **Matching**: engine (MySQL and MariaDB count as one: one protocol, and `mysql://` is common for MariaDB),
+  host (ASCII case ignored), port, user and database (empty is none); a saved connection through SSH never
+  matches (its host is seen from the tunnel). The matched connection connects with its own secrets: a password
+  in the URL is not used for it. Unsaved connections are matched too, so the same URL twice is one connection.
+- **Unsaved connection**: listed in `Connections::saved` with a new uuid and a set of unsaved ids, so the
+  tree, tabs and menus need nothing new; `store()` (rename, move, read-only, filters) keeps them in memory,
+  `reload()` keeps them, `save_password` is off so nothing reaches the keychain and a URL without a password
+  is asked for. "Save connection…" opens the connection dialog (save password on) and `save` inserts it under
+  the same id (`Storage::add_connection`), so its tabs, history and live session go on. Its query history is
+  stored under that id as any history is; never saved, those rows stay unreachable (no cleanup at quit).
+  Tabs on it are stored as other tabs and come back on a connection that is gone, as after a deletion.
+- **One instance**: `instance.sock` (0600) in the data directory in use, so `KERNO_DATA_DIR` runs, tests and
+  bench never meet the user's instance. A connect refused means a crash left the file: it is replaced; a live
+  socket is never taken over (a plain second `kerno` opens its own window without listening, as before). The
+  peer writes one line (newlines refused in the argument); the listener reads at most 64 KiB within 2 s on a
+  thread of its own and hands lines to the window through a channel; the window opens the URL, selects it in
+  the tree and comes to the front. Only the redacted URL (`instance::redact_url`) is logged.
+  macOS refuses socket options (EINVAL) on an accepted socket whose peer already closed, the usual case for
+  a one-line hand-off: the read timeout's error is ignored, otherwise every line was lost.
+
+## D-060 — Password sources (M11 Part 7, J3)
+
+- **Where**: resolved by `Connector::session` (`kerno-core/src/password.rs`), per session, never in the app:
+  the command's output never reaches `Runtime.secrets`, so it cannot be saved to the keychain, duplicated or
+  shown in the dialog. A command's output is reused for new sessions for 10 minutes, then the command runs
+  again (an RDS token lasts 15 minutes; `op` would otherwise prompt for every tab). `.pgpass` is matched with
+  the session's database (libpq's default: the user's name).
+- **Environment**: `PasswordEnv { path, home, pgpassfile }` built once in `main` and handed to the connector
+  through `HostKeyStore.password`, as Part 1 did with OpenSSH; `None` (the drivers' other tests, the tools'
+  dialog) reads no file and runs no command. The program is looked up there (PATH, then Homebrew and the
+  system's directories), never through the process's own `PATH`; the child gets that `PATH` and `HOME`.
+- **Model**: `PasswordSource` (`stored`, `command`, `rds-iam`, `one-password`) on `ConnectionConfig`, plus
+  `password_command_unconfirmed`, which every import sets for a non-stored source whatever the file says and
+  export never writes; the core refuses to run an unconfirmed command (test, Run now and connect alike).
+  The dialog's "Keychain" and "Ask each time" are `save_password`; the command sources keep it on (SSH
+  secrets are still saved).
+- **Files**: `.pgpass` with group or other access is ignored (libpq); `.my.cnf` world-writable is ignored
+  (MySQL), its `[client]` `password`, last one wins, `!include` not followed. An ignored file turns the
+  server's "password required" into an error that names the file and the `chmod`, instead of a prompt.
+- **MySQL**: `enable_cleartext_plugin` is on whenever the session uses TLS, off otherwise: RDS IAM needs
+  `mysql_clear_password`, and a password then never leaves in clear.
+- Not done: the backup / restore / script tools' `params_for` (`backup_dialog.rs`) still takes the stored
+  password only; a command-sourced connection needs `password::resolve` there (one call).
+
+## D-061 — Tab layouts and stacked results (M11 Part 8, J10 and J11)
+
+- **Tab layouts**: `Settings::tab_layout` (`SingleRow`, `Rows`, `Vertical`). One row stays the kit's
+  `TabBar`; the rows are the kit's `Tab` in a wrapping container (each in a wrapper of its own id: a lone kit
+  tab takes its index 0 as its id) capped at four rows of 32 px; the side list is the kit's `ListItem` (the
+  active row in `list.active`, the owner's rule: no bar) in a nested `h_resizable`, so the workspace's own
+  panels never change count. The three draw one `tab_parts` (same ids, menus, tint), and every layout's
+  scroll container takes `tab_scroll`, so "scroll to the active tab" works in each (an untracked handle would
+  ask for an animation frame forever). The layout is part of what the reveal remembers. No drag to reorder:
+  the strip has none.
+- **List of every tab**: the kit's own `TabBar::menu` was not used (its items come from `Tab::label`, which
+  Kerno's tabs do not set, and it has no filter). A controlled `Popover` (`all_tabs_open`, so the palette can
+  open it) with `ListItem`s; past 15 tabs a filter whose focus handle the popover tracks.
+- **Stacked results**: a way of drawing the same `results`, not new data; switching back gives the tabs. A
+  gpui `list` with a `ListState` on the tab (the tail is spliced as results arrive, a new run resets it), so
+  only results in view are laid out (50 results: the 50th is not drawn). A grid is `min(rows, 12) + 1` rows
+  tall plus the scrollbar and the find bar, or what its lower edge was dragged to (on the pane). The filter,
+  edit bar and footer are the focused result's, above and below the list. Focus follows a mouse *up* in a
+  result: moved on mouse down, the first click on a button of a result without the focus was lost (the cause
+  was not found; it is not the re-render alone); on mouse up it works. A cell's menu opens on mouse down, so
+  its entries give their own result the focus first: they never act on another result.
+- **Errors**: a script still stops at its first failure (`statements_run_and_their_rows_fill_the_grid`), and
+  the error still gets the focus as in tabs; stacked, it shows in place under the results before it, which
+  stay in view; the list scrolls to the error when it is out of view.
+- **Open in its own tab** shows the results in tabs, that one on screen, until the next run (`unstacked`);
+  nothing runs again. The results menu's toggle is the setting itself (all tabs), appended to the result
+  menu in `query/tab.rs` rather than to `tabs::result_menu`, whose entries the unit tests list.
+- **Find bar over a server sort** (Part 4 follow-up): carried as the widths are (`next_find` →
+  `carried_find` → `find::restore` on the first grid of the run).
+
+## D-062 — Column moves and the J9 benchmarks (M11 Part 5, J8 and J9)
+
+- **Moves**: `TableChange::MoveColumn { name, from, to, after }`, after the other column changes, in the
+  table's new order; the fewest (`table_draft::out_of_place`: all but a longest increasing run). A move
+  carries the column's whole definition: on MySQL and MariaDB it replaces that column's `ADD`, `CHANGE`,
+  `MODIFY` or `RENAME` clause (the server cannot `MODIFY` a column added or renamed in the same statement)
+  and ends with `FIRST` / `AFTER x`. One `ALTER TABLE` still: the server places positioned columns in clause
+  order, each after a column already placed, by its new name (checked on MySQL 8.4 and MariaDB 11).
+- **Generated columns** are written again (`GENERATED ALWAYS AS (expr) STORED|VIRTUAL`, `NOT NULL` only when
+  set: MariaDB refuses `NULL` there) only when moved or renamed unchanged; an alter of one is still refused.
+  Renaming a column that a generated column uses is the server's refusal, not Kerno's.
+- **PostgreSQL**: the default dialect refuses `MoveColumn` with `CANNOT_MOVE_COLUMNS`; the form disables the
+  arrows and the menu entries of an existing table with that sentence. No recreate-the-table path (v1.1).
+- **Script progress**: `tools::run` feeds a `stdin` file itself (a pipe and a task, counted in
+  `ToolCommand::sent`) instead of handing the child the file; `psql` reads `--file=-`, plain-SQL restore
+  included, so its error lines say `<stdin>` instead of the file name.
+- **Bench**: `BackupDialog::run_unconfirmed` runs a script without its confirmation, for `KERNO_BENCH=import`
+  only, on its scratch database. The navigator's `row_of`, `id_at`, `rows_under` and `set_open` are no
+  longer test-only (the bench uses them). `--indicative` lifts the load limit of `scripts/bench.sh` and marks
+  every output as such; never for published numbers.
+- **Reconnect**: OrbStack keeps a container's published port and the client's TCP connection through
+  `docker network disconnect` / `connect`: the statement in flight waits and finishes as the network comes
+  back, so Kerno's own reconnect (keep-alive every 30 s, one attempt, a ping without a timeout) is not
+  exercised by the bench and was not changed.

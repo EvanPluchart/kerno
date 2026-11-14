@@ -174,6 +174,9 @@ async fn dial(
         // Statements run through the text protocol only.
         .stmt_cache_size(0)
         .connect_attribute("program_name", "Kerno")
+        // AWS RDS IAM tokens (J3) go through `mysql_clear_password`, which
+        // the server may ask for: allowed only inside TLS.
+        .enable_cleartext_plugin(tls.is_some())
         .ssl_opts(tls);
 
     match tokio::time::timeout(timeout, Conn::new(opts)).await {

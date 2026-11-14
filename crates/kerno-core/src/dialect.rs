@@ -632,6 +632,11 @@ fn default_alter_table_sql<D: Dialect + ?Sized>(
             TableChange::AddForeignKey(key) => {
                 statements.push(alter(format!("ADD {}", foreign_key_sql(dialect, key))));
             }
+            TableChange::MoveColumn { .. } => {
+                return Err(Error::Unsupported(
+                    crate::table_draft::CANNOT_MOVE_COLUMNS.into(),
+                ));
+            }
         }
     }
     Ok(statements)

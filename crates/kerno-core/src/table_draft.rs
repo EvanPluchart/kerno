@@ -110,6 +110,13 @@ pub struct ForeignKeyDraft {
     pub on_delete: String,
 }
 
+/// Why the column order of an existing PostgreSQL table cannot change: the
+/// editor's reason and the default dialect's refusal of
+/// [`TableChange::MoveColumn`].
+pub const CANNOT_MOVE_COLUMNS: &str = "PostgreSQL cannot move a column: its position is fixed \
+                                       when the column is created. Recreate the table, or use a \
+                                       view, to change the order.";
+
 /// What a foreign key may do when the referenced row is updated or deleted.
 pub const REFERENTIAL_ACTIONS: [&str; 5] = [
     "NO ACTION",
@@ -155,6 +162,22 @@ pub enum TableChange {
         from: ColumnInfo,
         /// The column as it should be.
         to: ColumnDraft,
+    },
+    /// Put a column right after `after`, or first when `None` (MySQL and
+    /// MariaDB: `FIRST` / `AFTER`). Comes after the other column changes, in
+    /// the table's new order; it carries the column's whole definition,
+    /// which the statement that moves it rewrites (it also replaces that
+    /// column's [`TableChange::AddColumn`], [`TableChange::RenameColumn`] or
+    /// [`TableChange::AlterColumn`] there). See [`CANNOT_MOVE_COLUMNS`].
+    MoveColumn {
+        /// Column name, renamed if it is.
+        name: String,
+        /// The column on the server; `None` for one this change set adds.
+        from: Option<ColumnInfo>,
+        /// The column as it should be.
+        to: ColumnDraft,
+        /// The column it follows; `None` for first.
+        after: Option<String>,
     },
     /// Add a primary key on these columns.
     AddPrimaryKey(Vec<String>),
@@ -390,8 +413,8 @@ pub fn present(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
 }
 
-/// Whether the column must be altered to become `to`.
-fn column_differs(from: &ColumnDraft, to: &ColumnDraft) -> bool {
+/// Whether the column must be altered to become `to` (its name aside).
+pub fn column_differs(from: &ColumnDraft, to: &ColumnDraft) -> bool {
     !from
         .data_type
         .trim()
@@ -407,8 +430,9 @@ fn column_differs(from: &ColumnDraft, to: &ColumnDraft) -> bool {
 /// What must change, in order, to turn the table `original` (with
 /// `structure`) into `draft`: foreign keys, indexes and the primary key are
 /// dropped first; then columns are dropped, renamed, added and altered;
-/// then the primary key, indexes and foreign keys are added; the comment
-/// and the table name come last. A renamed or redefined index or foreign
+/// then columns out of place are moved (as few as possible: see
+/// [`out_of_place`]); then the primary key, indexes and foreign keys are
+/// added; the comment and the table name come last. A renamed or redefined index or foreign
 /// key is dropped and added again. A draft equal to the structure gives no
 /// change.
 pub fn changes(
@@ -532,6 +556,34 @@ pub fn changes(
         }
     }
 
+    // Added columns land at the end: where the draft puts a column
+    // elsewhere, it moves (Beekeeper #1341).
+    let order: Vec<usize> = structure
+        .columns
+        .iter()
+        .filter_map(|column| {
+            draft
+                .columns
+                .iter()
+                .position(|d| d.original.as_ref() == Some(&column.name))
+        })
+        .chain((0..draft.columns.len()).filter(|&at| existing_column(&draft.columns[at]).is_none()))
+        .collect();
+    for at in out_of_place(&order) {
+        let column = &draft.columns[at];
+        out.push(TableChange::MoveColumn {
+            name: column.name.clone(),
+            from: existing_column(column).cloned(),
+            to: ColumnDraft {
+                original: None,
+                ..column.clone()
+            },
+            after: at
+                .checked_sub(1)
+                .map(|before| draft.columns[before].name.clone()),
+        });
+    }
+
     if primary_key_changed && !draft.primary_key.is_empty() {
         out.push(TableChange::AddPrimaryKey(draft.primary_key.clone()));
     }
@@ -556,6 +608,36 @@ pub fn changes(
         });
     }
     out
+}
+
+/// The target positions, in increasing order, of the items that must move
+/// for `order` (the target position of each item, listed in the current
+/// order) to become `0..n`: all but those of a longest increasing run,
+/// which stay put. Moving the others in target order, each right after its
+/// new predecessor (or first), gives the target order.
+pub fn out_of_place(order: &[usize]) -> Vec<usize> {
+    // Patience sorting: `tails[k]` ends the best run of length k + 1 seen
+    // so far (an index into `order`), `previous` links a run backwards.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous = vec![None; order.len()];
+    for (at, &value) in order.iter().enumerate() {
+        let length = tails.partition_point(|&tail| order[tail] < value);
+        previous[at] = length.checked_sub(1).map(|before| tails[before]);
+        if length == tails.len() {
+            tails.push(at);
+        } else {
+            tails[length] = at;
+        }
+    }
+    let mut staying = vec![false; order.len()];
+    let mut link = tails.last().copied();
+    while let Some(at) = link {
+        staying[order[at]] = true;
+        link = previous[at];
+    }
+    (0..order.len())
+        .filter(|&target| !staying[target])
+        .collect()
 }
 
 #[cfg(test)]
@@ -1032,6 +1114,141 @@ mod tests {
             AutoIncrement::On
         );
         assert_eq!(AutoIncrement::new(true, None), AutoIncrement::On);
+    }
+
+    /// Every permutation of up to six items: the moves, applied one after
+    /// another (each right after its new predecessor), give the target
+    /// order, and there are as few as possible (Beekeeper #1341).
+    #[test]
+    fn the_fewest_moves_put_every_column_in_place() {
+        fn permutations(items: Vec<usize>) -> Vec<Vec<usize>> {
+            if items.len() <= 1 {
+                return vec![items];
+            }
+            let mut all = Vec::new();
+            for at in 0..items.len() {
+                let mut rest = items.clone();
+                let first = rest.remove(at);
+                for mut tail in permutations(rest) {
+                    tail.insert(0, first);
+                    all.push(tail);
+                }
+            }
+            all
+        }
+        // Longest increasing run, by brute force.
+        fn longest(order: &[usize]) -> usize {
+            let mut best = vec![1; order.len()];
+            for at in 0..order.len() {
+                for before in 0..at {
+                    if order[before] < order[at] {
+                        best[at] = best[at].max(best[before] + 1);
+                    }
+                }
+            }
+            best.into_iter().max().unwrap_or(0)
+        }
+        for n in 0..=6 {
+            for order in permutations((0..n).collect()) {
+                let moves = out_of_place(&order);
+                assert_eq!(moves.len(), n - longest(&order), "{order:?}");
+                let mut now = order.clone();
+                for target in moves {
+                    now.retain(|&item| item != target);
+                    let at = match target.checked_sub(1) {
+                        Some(before) => now.iter().position(|&i| i == before).unwrap() + 1,
+                        None => 0,
+                    };
+                    now.insert(at, target);
+                }
+                assert_eq!(now, (0..n).collect::<Vec<_>>(), "{order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_column_out_of_place_moves_after_its_new_neighbour() {
+        let structure = structure();
+        let mut draft = TableDraft::from_structure(&t(), &structure);
+        // `note` up to second place: one move, the others stay.
+        let note = draft.columns.remove(3);
+        draft.columns.insert(1, note);
+        assert_eq!(
+            changes(&t(), &structure, &draft),
+            vec![TableChange::MoveColumn {
+                name: "note".into(),
+                from: Some(structure.columns[3].clone()),
+                to: ColumnDraft {
+                    original: None,
+                    ..draft.columns[1].clone()
+                },
+                after: Some("id".into()),
+            }]
+        );
+        // First place, renamed and retyped: the move carries the column
+        // as it will be, after its rename and alter.
+        let mut draft = TableDraft::from_structure(&t(), &structure);
+        let mut note = draft.columns.remove(3);
+        note.name = "remark".into();
+        note.data_type = "varchar(200)".into();
+        draft.columns.insert(0, note.clone());
+        let changes = changes(&t(), &structure, &draft);
+        assert_eq!(
+            changes.last(),
+            Some(&TableChange::MoveColumn {
+                name: "remark".into(),
+                from: Some(structure.columns[3].clone()),
+                to: ColumnDraft {
+                    original: None,
+                    ..note
+                },
+                after: None,
+            })
+        );
+        assert!(matches!(changes[0], TableChange::RenameColumn { .. }));
+        assert!(matches!(changes[1], TableChange::AlterColumn { .. }));
+        assert_eq!(changes.len(), 3);
+    }
+
+    #[test]
+    fn an_added_column_moves_only_when_it_is_not_last() {
+        let structure = structure();
+        let code = ColumnDraft {
+            original: None,
+            name: "code".into(),
+            data_type: "text".into(),
+            nullable: true,
+            default: None,
+            comment: None,
+            auto_increment: AutoIncrement::Off,
+            on_update: None,
+            invisible: false,
+        };
+        let mut draft = TableDraft::from_structure(&t(), &structure);
+        draft.columns.push(code.clone());
+        assert_eq!(
+            changes(&t(), &structure, &draft),
+            vec![TableChange::AddColumn(code.clone())]
+        );
+        // Between `email` and `customer_id`, with `id` dropped.
+        let mut draft = TableDraft::from_structure(&t(), &structure);
+        draft.columns.remove(0);
+        draft.primary_key.clear();
+        draft.columns.insert(1, code.clone());
+        assert_eq!(
+            changes(&t(), &structure, &draft),
+            vec![
+                TableChange::DropPrimaryKey("t_pkey".into()),
+                TableChange::DropColumn("id".into()),
+                TableChange::AddColumn(code.clone()),
+                TableChange::MoveColumn {
+                    name: "code".into(),
+                    from: None,
+                    to: code,
+                    after: Some("email".into()),
+                },
+            ]
+        );
     }
 
     #[test]

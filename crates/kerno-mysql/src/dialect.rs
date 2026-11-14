@@ -11,7 +11,9 @@ use kerno_core::schema::{
 };
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{CellValue, LexRules};
-use kerno_core::table_draft::{ColumnDraft, IndexDraft, TableChange, TableDraft, present};
+use kerno_core::table_draft::{
+    ColumnDraft, IndexDraft, TableChange, TableDraft, column_differs, present,
+};
 use kerno_core::{Engine, Error, Plan, Result, TypeKind};
 
 /// The MySQL / MariaDB dialect. The two engines differ only in how a plan
@@ -69,20 +71,31 @@ impl MysqlDialect {
     /// `from` is the column on the server, for `MODIFY` and `CHANGE`: these
     /// replace the whole definition, so a collation other than the table's
     /// is carried over while the type stays, and a generated column is
-    /// refused (its expression would be lost).
+    /// refused unless it stays as it is (its expression is not in the
+    /// form): then it is written with its expression, to be moved.
     fn column_sql(&self, column: &ColumnDraft, from: Option<&ColumnInfo>) -> Result<String> {
         let data_type = column.data_type.trim();
         let mut sql = format!("{} {data_type}", self.quote_ident(&column.name));
+        let mut generated = None;
         if let Some(from) = from {
-            if matches!(
-                from.generation,
-                Some(ColumnGeneration::Stored(_) | ColumnGeneration::Virtual(_))
-            ) {
-                return Err(unsupported(&format!(
-                    "changing the generated column {} from the table form; \
-                     write the ALTER TABLE statement instead",
-                    self.quote_ident(&from.name)
-                )));
+            if let Some(
+                ColumnGeneration::Stored(expression) | ColumnGeneration::Virtual(expression),
+            ) = &from.generation
+            {
+                // Its expression is not in the form: only a column moved or
+                // renamed as it is can be written again.
+                if column_differs(&ColumnDraft::from(from), column) {
+                    return Err(unsupported(&format!(
+                        "changing the generated column {} from the table form; \
+                         write the ALTER TABLE statement instead",
+                        self.quote_ident(&from.name)
+                    )));
+                }
+                let kind = match from.generation {
+                    Some(ColumnGeneration::Stored(_)) => "STORED",
+                    _ => "VIRTUAL",
+                };
+                generated = Some(format!(" GENERATED ALWAYS AS ({expression}) {kind}"));
             }
             if let Some(collation) = &from.collation
                 && from.data_type.eq_ignore_ascii_case(data_type)
@@ -90,19 +103,28 @@ impl MysqlDialect {
                 sql.push_str(&format!(" COLLATE {collation}"));
             }
         }
-        sql.push_str(if column.nullable {
-            " NULL"
-        } else {
-            " NOT NULL"
-        });
-        if column.auto_increment.is_on() {
-            sql.push_str(" AUTO_INCREMENT");
-        } else {
-            if let Some(default) = present(&column.default) {
-                sql.push_str(&format!(" DEFAULT {default}"));
+        if let Some(generated) = generated {
+            sql.push_str(&generated);
+            // MariaDB refuses NULL / NOT NULL on a generated column, and
+            // only MySQL can make one NOT NULL.
+            if !column.nullable {
+                sql.push_str(" NOT NULL");
             }
-            if let Some(on_update) = present(&column.on_update) {
-                sql.push_str(&format!(" ON UPDATE {on_update}"));
+        } else {
+            sql.push_str(if column.nullable {
+                " NULL"
+            } else {
+                " NOT NULL"
+            });
+            if column.auto_increment.is_on() {
+                sql.push_str(" AUTO_INCREMENT");
+            } else {
+                if let Some(default) = present(&column.default) {
+                    sql.push_str(&format!(" DEFAULT {default}"));
+                }
+                if let Some(on_update) = present(&column.on_update) {
+                    sql.push_str(&format!(" ON UPDATE {on_update}"));
+                }
             }
         }
         if column.invisible {
@@ -613,7 +635,10 @@ WHERE s.SCHEMA_NAME = {name}"
     /// same name in one statement.
     ///
     /// A column both renamed and altered is one `CHANGE COLUMN`: in a single
-    /// statement neither name can be modified after `RENAME COLUMN`.
+    /// statement neither name can be modified after `RENAME COLUMN`. A
+    /// moved column has its one clause where it moves, ending with `FIRST`
+    /// or `AFTER`: the server places such columns in the order of the
+    /// clauses, each after a column already placed, by its new name.
     fn alter_table_sql(&self, table: &TableRef, changes: &[TableChange]) -> Result<Vec<String>> {
         let name = self.table_name(table);
         let q = |ident: &str| self.quote_ident(ident);
@@ -626,6 +651,11 @@ WHERE s.SCHEMA_NAME = {name}"
         let is_renamed = |column: &str| {
             changes.iter().any(
                 |change| matches!(change, TableChange::RenameColumn { to, .. } if to == column),
+            )
+        };
+        let is_moved = |column: &str| {
+            changes.iter().any(
+                |change| matches!(change, TableChange::MoveColumn { name, .. } if name == column),
             )
         };
 
@@ -650,6 +680,10 @@ WHERE s.SCHEMA_NAME = {name}"
                 TableChange::DropColumn(column) => {
                     clauses.push(format!("DROP COLUMN {}", q(column)));
                 }
+                TableChange::RenameColumn { to, .. }
+                | TableChange::AlterColumn { name: to, .. }
+                    if is_moved(to) => {}
+                TableChange::AddColumn(column) if is_moved(&column.name) => {}
                 TableChange::RenameColumn { from, to } => clauses.push(match altered(to) {
                     Some((column, draft)) => format!(
                         "CHANGE COLUMN {} {}",
@@ -668,6 +702,25 @@ WHERE s.SCHEMA_NAME = {name}"
                             self.column_sql(to, Some(from))?
                         ));
                     }
+                }
+                TableChange::MoveColumn {
+                    name,
+                    from,
+                    to,
+                    after,
+                } => {
+                    let place = after.as_ref().map_or_else(
+                        || "FIRST".to_string(),
+                        |after| format!("AFTER {}", q(after)),
+                    );
+                    let definition = self.column_sql(to, from.as_ref())?;
+                    clauses.push(match from {
+                        None => format!("ADD COLUMN {definition} {place}"),
+                        Some(from) if &from.name != name => {
+                            format!("CHANGE COLUMN {} {definition} {place}", q(&from.name))
+                        }
+                        Some(_) => format!("MODIFY COLUMN {definition} {place}"),
+                    });
                 }
                 TableChange::AddPrimaryKey(columns) => {
                     clauses.push(format!("ADD PRIMARY KEY {}", column_list(self, columns)));
@@ -1474,6 +1527,67 @@ mod tests {
                 ),
                 "changing the generated column `total` from the table form; \
                  write the ALTER TABLE statement instead"
+            );
+        }
+    }
+
+    /// Beekeeper #1341: a moved column is rewritten whole where it moves;
+    /// a renamed, altered or added one keeps a single clause.
+    #[test]
+    fn moved_columns_are_written_with_their_place() {
+        let mut id = column(TypeKind::Integer);
+        id.name = "id".into();
+        id.data_type = "int".into();
+        id.nullable = false;
+        id.generation = Some(ColumnGeneration::AutoIncrement);
+        let mut code = column(TypeKind::Text);
+        code.name = "code".into();
+        code.data_type = "varchar(10)".into();
+        code.collation = Some("utf8mb4_bin".into());
+        code.comment = Some("it's".into());
+        let mut total = column(TypeKind::Integer);
+        total.name = "total".into();
+        total.data_type = "int".into();
+        total.generation = Some(ColumnGeneration::Virtual("(`a` + `b`)".into()));
+        let moved = |from: &ColumnInfo, name: &str, after: Option<&str>| TableChange::MoveColumn {
+            name: name.into(),
+            from: Some(from.clone()),
+            to: ColumnDraft {
+                original: None,
+                name: name.into(),
+                ..ColumnDraft::from(from)
+            },
+            after: after.map(str::to_string),
+        };
+        let added = draft_column("n", "int", true);
+        let changes = [
+            TableChange::RenameColumn {
+                from: "code".into(),
+                to: "kode".into(),
+            },
+            TableChange::AddColumn(added.clone()),
+            moved(&id, "id", Some("total")),
+            moved(&code, "kode", None),
+            moved(&total, "total", Some("kode")),
+            TableChange::MoveColumn {
+                name: "n".into(),
+                from: None,
+                to: added,
+                after: Some("id".into()),
+            },
+        ];
+        for d in both() {
+            assert_eq!(
+                d.alter_table_sql(&t(), &changes).unwrap(),
+                vec![
+                    "ALTER TABLE `shop`.`order items`\n    \
+                     MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT AFTER `total`,\n    \
+                     CHANGE COLUMN `code` `kode` varchar(10) COLLATE utf8mb4_bin NULL \
+                     COMMENT 'it''s' FIRST,\n    \
+                     MODIFY COLUMN `total` int GENERATED ALWAYS AS ((`a` + `b`)) VIRTUAL \
+                     AFTER `kode`,\n    \
+                     ADD COLUMN `n` int NULL AFTER `id`"
+                ]
             );
         }
     }

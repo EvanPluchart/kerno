@@ -18,7 +18,9 @@ use gpui_kit::{
 use crate::connections::manager::Connections;
 use crate::environments_view::EnvironmentsView;
 use crate::local_clients_view::LocalClientsView;
-use crate::settings::{CODE_FONT_SIZES, PAGE_SIZES, Settings, TableDoubleClick, UI_FONT_SIZES};
+use crate::settings::{
+    CODE_FONT_SIZES, PAGE_SIZES, Settings, TabLayout, TableDoubleClick, UI_FONT_SIZES,
+};
 use crate::state::AppState;
 use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
@@ -453,6 +455,25 @@ impl SettingsView {
                                 }
                             }),
                     )
+                    // J10 (DBeaver #7114, #23248).
+                    .child(Self::heading("Open tabs"))
+                    .child(
+                        RadioGroup::new("settings-tab-layout")
+                            .children(TabLayout::ALL.map(TabLayout::label))
+                            .selected_index(
+                                TabLayout::ALL
+                                    .iter()
+                                    .position(|layout| *layout == settings.tab_layout),
+                            )
+                            .on_change(|index, window, cx| {
+                                if let Some(layout) = TabLayout::ALL.get(*index) {
+                                    AppState::update_settings(cx, |settings| {
+                                        settings.tab_layout = *layout
+                                    });
+                                    window.refresh();
+                                }
+                            }),
+                    )
                     .into_any_element()
             }
             Section::Fonts => v_flex()
@@ -560,6 +581,13 @@ impl SettingsView {
                         "Show the time zone of timestamps that have one",
                         settings.show_time_zone,
                         |settings, on| settings.show_time_zone = on,
+                    ))
+                    // J11 (DBeaver #6861).
+                    .child(Self::toggle(
+                        "settings-stack-results",
+                        "Show the results of a script one under the other in one panel",
+                        settings.stack_results,
+                        |settings, on| settings.stack_results = on,
                     ))
                     .into_any_element()
             }

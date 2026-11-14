@@ -21,6 +21,7 @@ mod local_clients_view;
 mod logging;
 mod maintenance_dialog;
 mod navigator;
+mod open_url;
 mod query;
 mod quick_open;
 mod settings;
@@ -37,11 +38,17 @@ mod ui_tests;
 mod update;
 mod workspace;
 
+use std::io::Write as _;
+use std::os::unix::net::UnixListener;
+
 use gpui_kit::component::{TitleBar, WindowExt as _};
 use gpui_kit::{
     App, AppContext as _, Bounds, Focusable as _, Menu, MenuItem, WindowBounds, WindowOptions, px,
     size,
 };
+use kerno_core::config::{Secret, parse_connection_url};
+use kerno_core::instance::{self, Invocation};
+use kerno_core::storage::AppPaths;
 
 use crate::actions::{
     About, BackupDatabase, CancelQuery, CloseTab, ExplainAnalyze, ExplainStatement,
@@ -56,16 +63,71 @@ use crate::state::{AppState, Startup};
 use crate::theme::Appearance;
 use crate::workspace::Workspace;
 
+/// What `kerno --help` prints.
+const USAGE: &str = "\
+Kerno, a fast, native database client.
+
+Usage: kerno [URL]
+       kerno --version
+       kerno --help
+
+URL opens a connection: postgres://, postgresql://, mysql:// or mariadb://,
+for example `kerno postgres://ada@localhost:5432/shop`. A saved connection to
+the same engine, host, port, user and database is used when there is one;
+otherwise the connection opens unsaved, and its menu offers \"Save
+connection…\". When Kerno is already running, the URL opens in its window.
+
+Leave the password out of the URL: other programs of your user can read a
+command line (`ps`). Kerno asks for it when the server wants one.
+";
+
+// The order matters: `ssh` runs Kerno with its prompt as the argument, so
+// the askpass answer comes before the arguments are read; `--version` and
+// `--help` exit before anything needs a display, a GPU, the keychain, the
+// data directory or the network (Linux packages are checked that way in
+// containers); bench modes start after them; a URL goes to the running
+// instance before this one reads its data.
 fn main() {
     // Run by `ssh` to ask a question for an OpenSSH tunnel: answer, end.
     if let Some(code) = kerno_core::openssh::answer_askpass() {
         std::process::exit(code);
     }
+    let url = match instance::parse_args(std::env::args().skip(1)) {
+        Invocation::Run => None,
+        Invocation::Open(url) => Some(url),
+        Invocation::Version => {
+            let _ = writeln!(std::io::stdout(), "kerno {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Invocation::Help => {
+            let _ = write!(std::io::stdout(), "{USAGE}");
+            return;
+        }
+        Invocation::Invalid(message) => {
+            eprintln!("kerno: {message}\nTry `kerno --help`.");
+            std::process::exit(2);
+        }
+    };
     bench::init();
+    // One running instance: it opens the URL and comes to the front.
+    if let Some(url) = &url
+        && let Ok(paths) = AppPaths::locate()
+        && instance::send(&instance::socket_path(&paths.data_dir), url.expose()).is_ok()
+    {
+        return;
+    }
     // Kerno's own files are read on another thread while the platform
     // starts up, so the first frame has the saved tabs and the right theme
-    // without the UI thread ever touching the disk.
-    let startup = std::thread::spawn(Startup::load);
+    // without the UI thread ever touching the disk. The instance socket
+    // lives in the data directory in use (a `KERNO_DATA_DIR` run has its
+    // own).
+    let startup = std::thread::spawn(|| {
+        Startup::load().map(|startup| {
+            let socket = instance::socket_path(&startup.paths.data_dir);
+            let listener = instance::listen(&socket);
+            (startup, listener)
+        })
+    });
 
     gpui_kit::application()
         .with_assets(engine_logo::Assets)
@@ -75,7 +137,7 @@ fn main() {
                 .join()
                 .map_err(|_| anyhow::anyhow!("reading Kerno's data panicked"))
                 .and_then(|startup| startup)
-                .and_then(|startup| start(startup, cx));
+                .and_then(|(startup, listener)| start(startup, listener, url, cx));
             if let Err(error) = started {
                 eprintln!("Kerno could not start: {error:#}");
                 cx.quit();
@@ -83,8 +145,19 @@ fn main() {
         });
 }
 
-fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
+fn start(
+    startup: Startup,
+    listener: std::io::Result<Option<UnixListener>>,
+    url: Option<Secret>,
+    cx: &mut App,
+) -> anyhow::Result<()> {
     logging::init(&startup.paths.logs(), cx)?;
+    // Without the socket this window still works; later URLs open a window
+    // of their own.
+    let listener = listener.unwrap_or_else(|error| {
+        tracing::warn!(%error, "the instance socket could not be opened");
+        None
+    });
 
     bridge::init(cx)?;
     // KERNO_APPEARANCE=light|dark pins the theme for one run; screenshots
@@ -175,11 +248,30 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
         let connections = cx.new(|_| {
             let mut connections = Connections::new(connections, drivers, user_known_hosts);
             connections.set_openssh(openssh);
+            // Password files and commands (J3): the user's PATH (plus
+            // Homebrew's), HOME and PGPASSFILE, read once here.
+            connections.set_password_env(Some(kerno_core::password::PasswordEnv::detect(
+                std::env::var_os("PATH").as_deref(),
+                std::env::var_os("HOME").map(std::path::PathBuf::from),
+                std::env::var_os("PGPASSFILE").map(std::path::PathBuf::from),
+            )));
             connections
         });
         let workspace =
             cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
         bench::begin(&workspace, &connections, window, cx);
+        if let Some(listener) = listener {
+            open_url::listen(listener, &workspace, &connections, window, cx);
+        }
+        if let Some(url) = url.as_ref().and_then(|url| {
+            tracing::info!(url = %instance::redact_url(url.expose()), "opening a URL");
+            parse_connection_url(url.expose()).ok()
+        }) {
+            let (workspace, connections) = (workspace.clone(), connections.clone());
+            window.defer(cx, move |window, cx| {
+                open_url::open(&workspace, &connections, &url, window, cx)
+            });
+        }
         workspace.update(cx, |workspace, cx| {
             workspace.start_update_checks(window, cx)
         });
@@ -305,6 +397,12 @@ fn menus() -> Vec<Menu> {
                 command("zoom_in"),
                 command("zoom_out"),
                 command("zoom_reset"),
+                separator(),
+                command("tabs_on_one_row"),
+                command("tabs_on_several_rows"),
+                command("tabs_at_the_side"),
+                command("show_all_tabs"),
+                command("toggle_stacked_results"),
             ],
         ),
         menu(

@@ -146,7 +146,7 @@ fn the_filter_matches_connection_names_and_objects(cx: &mut TestAppContext) {
         return;
     }
     let idle = ConnectionConfig {
-        name: "kerno_ui_idle".into(),
+        name: "kerno_ui_dormant".into(),
         ..testing::config(Engine::MySql)
     };
     let app = Fixture::saved(cx, &[testing::config(Engine::Postgres), idle]);
@@ -165,7 +165,7 @@ fn the_filter_matches_connection_names_and_objects(cx: &mut TestAppContext) {
     };
 
     // A connection's name.
-    filter(&app, cx, "IDLE");
+    filter(&app, cx, "DORMANT");
     assert!(app.has(cx, ("connection", 1usize)));
     assert!(!app.has(cx, ("connection", 0usize)));
 

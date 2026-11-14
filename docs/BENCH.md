@@ -88,11 +88,65 @@ The start-up needs many runs to be read: with five, one slow launch moves the me
 milliseconds. The slow launches (the maximum of each row) are the first ones after other work on the
 machine.
 
+## Cases competitors fail (CLAUDE.md §4 J9)
+
+What users of other clients report as slow or stuck, measured the same way (`KERNO_BENCH` modes, a scratch
+data directory, the in-memory secret store, the update check off). Each step runs alone with
+`scripts/bench.sh --only wide|navigator|import|reconnect`, or with every other measure when `--only` is left
+out. The steps create their scratch objects, `kerno_bench_*` databases on `kerno-postgres` and `kerno-mysql`,
+and drop them, pass or fail (an exit trap, after Kerno quit); the reconnect step runs a server of its own.
+
+**The numbers below are indicative**: one run of each step with `--indicative`, on a machine where three
+other agents were compiling and testing (1-minute load 5 to 21, the script's limit is 4), release build of
+commit `1f5161b` plus the uncommitted M11 work. The final numbers are taken on a quiet machine (M11 Part 16)
+and replace this table.
+
+| Case (demand) | Target | Indicative | Verdict |
+|---|---|---|---|
+| Scroll a 300-column table (Beekeeper #752) | average frame < 16 ms | PostgreSQL 8.36 ms down, 8.36 ms across; MySQL 8.34 ms down, 8.57 ms across | met |
+| Open a database of 200 schemas (Beekeeper #135) | < 300 ms to the frame showing them | PostgreSQL 23 ms; MySQL (a database of 1,200 tables, to its folders) 38 ms | met |
+| Open a schema of 1,200 tables (Beekeeper #135) | < 500 ms to the frame showing them | PostgreSQL 247 ms (schema, its objects read) + 4 ms (Tables); MySQL 6 ms (Tables) | met |
+| Run a 200 MB `.sql` file (Beekeeper #702, #2325) | UI responsive, progress, cancel | 15.3 s, 13.3 MB/s; frames 8.33 ms on average, longest 10.9 ms; cancelled at 30 %: stopped in 114 ms | met |
+| Network drops 10 s and returns (DBeaver #6903) | usable < 5 s after the network is back | the statement in flight finished 112 ms *before* `docker network connect` returned; no failed run | met |
+
+- **wide** (`KERNO_BENCH=scroll` on another table): `kerno_bench_wide.wide`, 300 columns plus a key ×
+  20,000 rows: PostgreSQL cycles int, bigint, numeric, text, timestamp and boolean; MySQL int, bigint,
+  decimal, varchar(20), date and TEXT (300 VARCHAR(255) would pass the 65,535-byte row limit). The scroll
+  mode fetches everything (20,000 × 301 cells: 274 ms and 74.5 MB on PostgreSQL, 246 ms and 84.0 MB on MySQL)
+  and scrolls 10 s down (17 rows a frame) and 3 s across, one column a frame, both ways; the longest single
+  interval was 25 ms (PostgreSQL, down) and 72 ms (MySQL, across), one frame each.
+- **navigator** (`KERNO_BENCH=navigator`): `kerno_bench_many` holds 200 schemas `s001`–`s200`, `s001` with
+  1,200 tables of five columns (MySQL: the database itself holds the 1,200 tables), created statement by
+  statement so the shared server's lock table stays small. The connection opens on `kerno`; the bench opens
+  `kerno_bench_many` under it (a session in that database first), then `s001`, then its Tables folder, and
+  times each from the call that opens the row to the frame that draws the first row below it. A schema's
+  objects are read when the schema opens (one catalog query per kind), so its Tables folder then opens
+  from memory.
+- **import** (`KERNO_BENCH=import`): `scripts/bench.sh` writes a 200,057,575-byte file of `INSERT`s, 1,000
+  rows each, for `kerno_bench_import.items`; the Execute script wizard runs it with `psql` (Homebrew's,
+  found as the user's would be), the bench calling the step its confirmation would. `psql` now reads the
+  file from its standard input, which Kerno feeds and counts: the wizard shows a bar and "x of y sent
+  (n %)". The mode asks for a frame after every frame and records the intervals: what a frozen UI would
+  show as long ones. The first 0.24 s is the scan of the file for client commands, before `psql` starts.
+  A second run cancels at 30 % of the file and times the stop (the client killed, the feeding stopped).
+  The MySQL side of this step is not measured (same code path, `mysql` reads its standard input).
+- **reconnect** (`KERNO_BENCH=reconnect`): a dedicated server, `kerno-bench-pg` (postgres:17) on its own
+  network `kerno-bench-net`, host port 55440, created and removed by the step; the shared containers are
+  never touched. The app runs `SELECT 1` in a query tab every 500 ms; once one succeeded the script runs
+  `docker network disconnect`, waits 10 s, `docker network connect` and notes the wall clock; the app reports
+  the wall clock of the first statement that succeeds after one was held up (more than 2 s) or failed, and
+  the step prints the difference. With OrbStack (Docker 29.8) the published port comes back with the
+  network and the client's TCP connection survives: the statement sent during the outage waits and
+  completes as the network returns, before the `docker` command itself does, so the difference is
+  negative. Kerno's own reconnect (a keep-alive every 30 s, then one new connection) never had to act; the
+  connection's status stayed "Connected". `docker pause` was not needed.
+
 ## Reproducing
 
 ```sh
 scripts/test-env.sh up          # the kerno-* containers
 scripts/bench.sh 5 30           # on a quiet machine, the Kerno window left visible
+scripts/bench.sh 5 --only wide  # one step alone: core, wide, navigator, import, reconnect
 scripts/bundle-macos.sh         # then, for the bundled idle figure, the first_rows step on
                                 # dist/Kerno.app/Contents/MacOS/kerno (KERNO_BENCH=first_rows, see bench.sh)
 ```

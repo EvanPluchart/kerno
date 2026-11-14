@@ -77,6 +77,36 @@ command line; a server key you choose to trust is added to your known_hosts. `KE
 Kerno pass another configuration file to `ssh` (`-F`). The **built-in** client needs no `ssh` and is the one for
 a password login; it takes Ed25519 and ECDSA key files and the keys of an SSH agent, not RSA key files.
 
+## Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf
+
+The connection dialog's **Password from** list says where the database password comes from. **Keychain**
+(the default) keeps it in the system secret store; left empty, Kerno reads `~/.pgpass` (or `PGPASSFILE`) for
+PostgreSQL and the `password` of the `[client]` group of `~/.my.cnf` for MySQL and MariaDB, as their own tools
+do (`!include` lines of `.my.cnf` are not followed). A `.pgpass` that other users can read, or a `.my.cnf`
+anyone can change, is ignored, and the error says so. **Ask each time** asks at every connect. **Command**
+runs a program of yours and uses what it prints (one trailing newline removed): no shell, one argument per
+line, `${host}`, `${port}`, `${user}` and `${database}` replaced inside the arguments, at most 120 s.
+**AWS RDS IAM** runs `aws rds generate-db-auth-token` with the connection's host, port and user, your region
+and optional profile, and needs TLS (the SSL mode moves to `require`). **1Password** runs `op read
+op://vault/item/field`. A command's output is used for that connect only, never stored or logged, and runs
+again for new sessions after ten minutes (an RDS token lasts fifteen); "Run now" checks it and shows only the
+length of what it printed. Programs are found on your `PATH` and in `/opt/homebrew/bin`, `/usr/local/bin`,
+`/usr/bin` and `/bin`. A test or a connection says where its password came from ("Password from ~/.pgpass").
+An exported connections file carries the command but no password; on import a command does not run until you
+have read it in the connection's settings and clicked "I trust this command".
+
+## Open a connection from the shell
+
+`kerno postgres://ada@db.example.com:5432/shop` opens that connection (`postgresql://`, `mysql://` and
+`mariadb://` too; `sslmode` and other parameters as in the connection dialog). A saved connection to the same
+engine, host, port, user and database is used when there is one; otherwise the connection opens **unsaved**:
+marked in the sidebar, kept for this run only, its password in memory, never in the keychain, until "Save
+connection…" in its menu stores it. When Kerno is already running, the URL opens in its window, which comes to
+the front. `kerno --version` and `kerno --help` print and exit.
+
+Leave the password out of the URL: other programs running as your user can read a command line (`ps`). Without
+one, Kerno asks for it when the server wants it.
+
 ## Install
 
 There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and

@@ -14,11 +14,29 @@
 //!   reports memory, and sorts the result by its second column.
 //! - `KERNO_BENCH=scroll`: the same up to fetch all, then scrolls the grid
 //!   top to bottom for 10 s and across its columns for 3 s, one step per
-//!   frame.
+//!   frame (with a 300-column table: `scripts/bench.sh --only wide`).
+//!
+//! Cases competitors fail (CLAUDE.md §4 J9), each connecting first:
+//!
+//! - `KERNO_BENCH=navigator`: expands `KERNO_BENCH_DATABASE` in the
+//!   navigator, then `KERNO_BENCH_SCHEMA` (none on MySQL, where the database
+//!   is the schema) and its Tables folder: time from each click to the
+//!   frame that shows the rows below it.
+//! - `KERNO_BENCH=import`: runs the SQL file `KERNO_BENCH_FILE` in
+//!   `KERNO_BENCH_DATABASE` with the Execute script tool, recording the
+//!   interval between frames (one asked for after every frame) and the
+//!   bytes sent; with `KERNO_BENCH_CANCEL_AT` (a percentage) it cancels
+//!   there and times the stop.
+//! - `KERNO_BENCH=reconnect`: runs `KERNO_BENCH_SQL` in a query tab every
+//!   500 ms; prints a `ready` line once one succeeded, then waits for a run
+//!   held up or failed for more than 2 s (the network went away) and
+//!   reports, as wall-clock milliseconds, when the next one succeeded.
 //!
 //! Bench modes refuse to run without `KERNO_DATA_DIR` and
 //! `KERNO_SECRET_STORE=memory`: they never touch the user's data or keychain.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -40,6 +58,9 @@ enum Mode {
     Startup,
     FirstRows,
     Scroll,
+    Navigator,
+    Import,
+    Reconnect,
 }
 
 impl Mode {
@@ -48,6 +69,9 @@ impl Mode {
             Mode::Startup => "startup",
             Mode::FirstRows => "first_rows",
             Mode::Scroll => "scroll",
+            Mode::Navigator => "navigator",
+            Mode::Import => "import",
+            Mode::Reconnect => "reconnect",
         }
     }
 }
@@ -82,6 +106,9 @@ pub fn init() {
         "startup" => Mode::Startup,
         "first_rows" => Mode::FirstRows,
         "scroll" => Mode::Scroll,
+        "navigator" => Mode::Navigator,
+        "import" => Mode::Import,
+        "reconnect" => Mode::Reconnect,
         other => refuse(&format!("unknown KERNO_BENCH mode {other:?}")),
     };
     if let Err(why) = scratch_only() {
@@ -231,11 +258,17 @@ pub fn begin(
                 cx.quit();
             });
         }),
-        Mode::FirstRows | Mode::Scroll => {
+        _ => {
             let (workspace, connections) = (workspace.clone(), connections.clone());
             window
                 .spawn(cx, async move |cx| {
-                    if let Err(error) = run(mode, workspace, connections, cx).await {
+                    let outcome = match mode {
+                        Mode::Navigator => navigator(workspace, connections, cx).await,
+                        Mode::Import => import(connections, cx).await,
+                        Mode::Reconnect => reconnect(workspace, connections, cx).await,
+                        _ => run(mode, workspace, connections, cx).await,
+                    };
+                    if let Err(error) = outcome {
                         let _ = cx.update(|_, cx| fail(mode, &format!("{error:#}"), cx));
                     }
                 })
@@ -313,18 +346,15 @@ fn marks(cx: &App) -> &Marks {
     &cx.global::<Bench>().0
 }
 
-async fn run(
-    mode: Mode,
-    workspace: Entity<Workspace>,
-    connections: Entity<Connections>,
+/// Puts the bench password in the in-memory store and connects the saved
+/// connection `name`; its id once connected.
+async fn connect(
+    name: &str,
+    connections: &Entity<Connections>,
     cx: &mut gpui_kit::AsyncWindowContext,
-) -> anyhow::Result<()> {
-    let name = env("KERNO_BENCH_CONNECTION")?;
-    let sql = env("KERNO_BENCH_SQL")?;
+) -> anyhow::Result<String> {
     // Read once, put in the in-memory store, never printed or logged.
     let password = std::env::var("KERNO_BENCH_PASSWORD").ok().map(Secret::new);
-
-    // Connect, then let the navigator settle before anything is timed.
     let id = cx.update(|_, cx| {
         let saved = connections.read(cx).saved();
         let id = saved
@@ -347,6 +377,18 @@ async fn run(
         _ => Ok(false),
     })
     .await?;
+    Ok(id)
+}
+
+async fn run(
+    mode: Mode,
+    workspace: Entity<Workspace>,
+    connections: Entity<Connections>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let name = env("KERNO_BENCH_CONNECTION")?;
+    let sql = env("KERNO_BENCH_SQL")?;
+    let id = connect(&name, &connections, cx).await?;
     let target = Target {
         connection: id,
         database: None,
@@ -461,6 +503,306 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Intervals between frames, one asked for after each frame, until `stop`.
+#[derive(Default)]
+struct Frames {
+    last: Option<Instant>,
+    intervals: Vec<f64>,
+    stop: bool,
+}
+
+fn record_frames(frames: Rc<RefCell<Frames>>, window: &mut Window) {
+    window.on_next_frame(move |window, _| {
+        {
+            let mut frames = frames.borrow_mut();
+            if frames.stop {
+                return;
+            }
+            let now = Instant::now();
+            if let Some(last) = frames.last {
+                frames.intervals.push(ms(now - last));
+            }
+            frames.last = Some(now);
+        }
+        window.refresh();
+        record_frames(frames, window);
+    });
+}
+
+/// Milliseconds since the Unix epoch: the bench script notes the moment
+/// the network is back on the same clock.
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
+}
+
+/// `KERNO_BENCH=navigator`: see the module documentation.
+async fn navigator(
+    workspace: Entity<Workspace>,
+    connections: Entity<Connections>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let name = env("KERNO_BENCH_CONNECTION")?;
+    let database = env("KERNO_BENCH_DATABASE")?;
+    let schema = std::env::var("KERNO_BENCH_SCHEMA").ok();
+    let table = env("KERNO_BENCH_TABLE")?;
+    let navigator = cx.update(|_, cx| workspace.read(cx).navigator(cx))?;
+    let id = connect(&name, &connections, cx).await?;
+    cx.update(|_, cx| navigator.update(cx, |navigator, cx| navigator.open_connection(&id, cx)))?;
+    let shown = |path: &[&str], cx: &mut gpui_kit::AsyncWindowContext| {
+        cx.update(|_, cx| navigator.read(cx).row_of(path, cx))
+    };
+    until(cx, |_, cx| {
+        Ok(navigator.read(cx).row_of(&[&database], cx).is_some())
+    })
+    .await?;
+    cx.background_executor().timer(Duration::from_secs(1)).await;
+    anyhow::ensure!(cx.update(|window, _| window.is_visible())?, HIDDEN);
+
+    // Opens the row at `path` and times the frame that shows `child`
+    // under it.
+    let mut open = async |path: Vec<&str>, child: &str| -> anyhow::Result<f64> {
+        let row = shown(&path, cx)?.ok_or_else(|| anyhow::anyhow!("no row {path:?}"))?;
+        let clicked = Instant::now();
+        cx.update(|_, cx| {
+            navigator.update(cx, |navigator, cx| {
+                let id = navigator.id_at(row, cx);
+                navigator.set_open(&id, true, cx)
+            })
+        })?;
+        let below: Vec<&str> = path.iter().copied().chain([child]).collect();
+        until(cx, |window, cx| {
+            anyhow::ensure!(window.is_visible(), HIDDEN);
+            Ok(navigator.read(cx).row_of(&below, cx).is_some())
+        })
+        .await?;
+        let drawn = Rc::new(std::cell::Cell::new(None));
+        let mark = drawn.clone();
+        cx.update(|window, _| {
+            window.on_next_frame(move |_, _| mark.set(Some(Instant::now())));
+            window.refresh();
+        })?;
+        until(cx, |_, _| Ok(drawn.get().is_some())).await?;
+        Ok(between(Some(clicked), drawn.get()).unwrap_or_default())
+    };
+    let report_line = match &schema {
+        Some(schema) => {
+            let database_ms = open(vec![&database], schema).await?;
+            let schema_ms = open(vec![&database, schema], "Tables").await?;
+            let tables_ms = open(vec![&database, schema, "Tables"], &table).await?;
+            json!({
+                "bench": "navigator",
+                "connection": name,
+                "database_ms": database_ms,
+                "schema_ms": schema_ms,
+                "tables_ms": tables_ms,
+            })
+        }
+        None => {
+            let database_ms = open(vec![&database], "Tables").await?;
+            let tables_ms = open(vec![&database, "Tables"], &table).await?;
+            json!({
+                "bench": "navigator",
+                "connection": name,
+                "database_ms": database_ms,
+                "tables_ms": tables_ms,
+            })
+        }
+    };
+    report(report_line);
+    cx.update(|_, cx| cx.quit())?;
+    Ok(())
+}
+
+/// `KERNO_BENCH=import`: see the module documentation.
+async fn import(
+    connections: Entity<Connections>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let name = env("KERNO_BENCH_CONNECTION")?;
+    let database = env("KERNO_BENCH_DATABASE")?;
+    let file = std::path::PathBuf::from(env("KERNO_BENCH_FILE")?);
+    let cancel_at: Option<f64> = match std::env::var("KERNO_BENCH_CANCEL_AT") {
+        Ok(text) => Some(text.parse()?),
+        Err(_) => None,
+    };
+    let id = connect(&name, &connections, cx).await?;
+    let target = Target {
+        connection: id,
+        database: Some(database),
+        schema: None,
+    };
+    let dialog = cx
+        .update(|window, cx| {
+            crate::backup_dialog::open(
+                connections.clone(),
+                target,
+                crate::backup_dialog::Mode::ExecuteScript,
+                window,
+                cx,
+                |_, _, _, _| {},
+            )
+        })?
+        .ok_or_else(|| anyhow::anyhow!("the Execute script wizard did not open"))?;
+    cx.update(|window, cx| dialog.update(cx, |dialog, cx| dialog.load_input(file, window, cx)))?;
+    // The client found and the file read, it starts.
+    let waiting = Instant::now();
+    loop {
+        let started = cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.run_unconfirmed(window, cx))
+        })?;
+        match started {
+            Ok(()) => break,
+            Err(why) if waiting.elapsed() > Duration::from_secs(60) => {
+                anyhow::bail!("the script did not start: {why}")
+            }
+            Err(_) => {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await
+            }
+        }
+    }
+    let started = Instant::now();
+    let frames = Rc::new(RefCell::new(Frames::default()));
+    cx.update(|window, _| record_frames(frames.clone(), window))?;
+    let (mut first_byte, mut cancelled) = (None, None);
+    let (success, text, sent, total) = loop {
+        let (fed, ended) = cx.update(|window, cx| {
+            anyhow::ensure!(window.is_visible(), HIDDEN);
+            let dialog = dialog.read(cx);
+            Ok((
+                dialog.fed(),
+                dialog.ended().map(|(ok, text)| (ok, text.to_string())),
+            ))
+        })??;
+        let (sent, total) = fed.unwrap_or_default();
+        if first_byte.is_none() && sent > 0 {
+            first_byte = Some(started.elapsed());
+        }
+        if let Some((success, text)) = ended {
+            break (success, text, sent, total);
+        }
+        if let Some(at) = cancel_at
+            && cancelled.is_none()
+            && total > 0
+            && sent as f64 >= total as f64 * at / 100.0
+        {
+            cx.update(|_, cx| dialog.update(cx, |dialog, cx| dialog.cancel(cx)))?;
+            cancelled = Some((Instant::now(), sent));
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
+    };
+    let ended = Instant::now();
+    frames.borrow_mut().stop = true;
+    let interval = Summary::of(&mut frames.borrow_mut().intervals);
+    let feeding = first_byte.map(|first| (ended - started).saturating_sub(first));
+    report(json!({
+        "bench": "import",
+        "connection": name,
+        "success": success,
+        "outcome": text,
+        "file_bytes": total,
+        "sent_bytes": sent,
+        "total_ms": ms(ended - started),
+        // Reading the file for client commands, before the client starts.
+        "check_ms": first_byte.map(ms),
+        "mb_per_s": feeding
+            .filter(|_| cancelled.is_none())
+            .map(|feeding| (sent as f64 / 1e6 / feeding.as_secs_f64() * 10.0).round() / 10.0),
+        "cancelled_at_bytes": cancelled.map(|(_, sent)| sent),
+        "cancel_ms": cancelled.map(|(at, _)| ms(ended - at)),
+        "frames": interval.count,
+        "interval_ms": interval.json(),
+    }));
+    cx.update(|_, cx| cx.quit())?;
+    Ok(())
+}
+
+/// `KERNO_BENCH=reconnect`: see the module documentation.
+async fn reconnect(
+    workspace: Entity<Workspace>,
+    connections: Entity<Connections>,
+    cx: &mut gpui_kit::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    const EVERY: Duration = Duration::from_millis(500);
+    const HELD: Duration = Duration::from_secs(2);
+    let name = env("KERNO_BENCH_CONNECTION")?;
+    let sql = env("KERNO_BENCH_SQL")?;
+    let id = connect(&name, &connections, cx).await?;
+    let target = Target {
+        connection: id.clone(),
+        database: None,
+        schema: None,
+    };
+    let tab = cx.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_query("Bench".into(), &sql, Some(target), window, cx)
+        })
+    })?;
+    let (mut ready, mut outage, mut failures, mut longest) = (false, None, 0, Duration::ZERO);
+    let mut statuses: Vec<String> = Vec::new();
+    loop {
+        // One run: started, then ended with a new result (its duration
+        // changes) or an error (no rows on screen).
+        let before = cx.update(|_, cx| tab.read(cx).status(cx).elapsed)?;
+        let started = Instant::now();
+        cx.update(|window, cx| tab.update(cx, |tab, cx| tab.run(Scope::All, window, cx)))?;
+        let success = loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            let (status, connection) =
+                cx.update(|_, cx| (tab.read(cx).status(cx), connections.read(cx).status(&id)))?;
+            let connection = format!("{connection:?}");
+            let connection = connection.split([' ', '{', '(']).next().unwrap_or_default();
+            if statuses
+                .last()
+                .is_none_or(|last| !last.ends_with(connection))
+            {
+                statuses.push(format!("{} {connection}", epoch_ms()));
+            }
+            if ready && outage.is_none() && started.elapsed() > HELD {
+                outage = Some(epoch_ms());
+            }
+            if !status.running && (status.elapsed != before || status.rows.is_none()) {
+                break status.rows == Some(1) && status.elapsed != before;
+            }
+        };
+        longest = longest.max(started.elapsed());
+        match (success, ready, outage) {
+            (true, false, _) => {
+                ready = true;
+                report(json!({"bench": "reconnect", "phase": "ready"}));
+            }
+            (true, true, Some(outage)) => {
+                report(json!({
+                    "bench": "reconnect",
+                    "connection": name,
+                    "recovered_epoch_ms": epoch_ms(),
+                    "outage_seen_epoch_ms": outage,
+                    "longest_run_ms": ms(longest),
+                    "failed_runs": failures,
+                    "statuses": statuses,
+                }));
+                cx.update(|_, cx| cx.quit())?;
+                return Ok(());
+            }
+            (false, true, _) => {
+                failures += 1;
+                outage.get_or_insert_with(epoch_ms);
+            }
+            _ => {}
+        }
+        cx.background_executor()
+            .timer(EVERY.saturating_sub(started.elapsed()))
+            .await;
+    }
 }
 
 /// Frame samples of one scroll pass.

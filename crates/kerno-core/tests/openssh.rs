@@ -518,8 +518,12 @@ async fn nothing_is_left_after_the_tunnel_is_dropped() {
     );
     let config = through(Engine::Postgres, ssh);
     let tunnel = setup.open(&config, None, None).await.expect("tunnel");
-    let marker = setup.fixture.config.display().to_string();
-    // The tunnel's `ssh` and the jump host's both name the test's file.
+    let marker = tunnel
+        .openssh_dir()
+        .expect("an OpenSSH tunnel")
+        .display()
+        .to_string();
+    // The tunnel's `ssh` and the jump host's both name the tunnel's directory.
     let running = processes(&marker);
     assert!(running.len() >= 2, "ssh and its jump host run: {running:?}");
     let socket = running
@@ -620,7 +624,11 @@ async fn a_tunnel_whose_ssh_died_says_it_is_closed() {
     let config = through(Engine::Postgres, ssh);
     let tunnel = setup.open(&config, None, None).await.expect("tunnel");
     assert!(!tunnel.is_closed());
-    let marker = setup.fixture.config.display().to_string();
+    let marker = tunnel
+        .openssh_dir()
+        .expect("an OpenSSH tunnel")
+        .display()
+        .to_string();
     let output = std::process::Command::new("ps")
         .args(["axww", "-o", "pid=,command="])
         .output()

@@ -234,7 +234,9 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
     };
     let ssh_user = ssh.map(|ssh| ssh.user.as_str()).unwrap_or_default();
 
-    let (kind, headline, next_step) = if let Some(ssh_text) = raw.split_once("SSH tunnel: ") {
+    let (kind, headline, next_step) = if let Some(words) = password_words(raw) {
+        words
+    } else if let Some(ssh_text) = raw.split_once("SSH tunnel: ") {
         let ssh_text = ssh_text.1;
         if let Some(stderr) = ssh_text.strip_prefix("OpenSSH: ") {
             openssh_words(stderr, config)
@@ -335,10 +337,23 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
             "Check the SSL mode and the CA, certificate and key files on the SSL tab.".to_string(),
         )
     } else if any(raw, &AUTHENTICATION) {
+        use crate::config::PasswordSource;
+        let next = match &config.password_source {
+            PasswordSource::Stored => "Check the user name and the password.",
+            PasswordSource::RdsIam { .. } => {
+                "Check that this database user may log in with IAM (rds_iam on PostgreSQL, \
+                 AWSAuthenticationPlugin on MySQL) and that the AWS profile's policy allows \
+                 rds-db:connect."
+            }
+            _ => {
+                "Check the user name, and that the password command prints this user's \
+                  password (Run now on the General tab)."
+            }
+        };
         (
             FailureKind::Authentication,
             format!("The server refused the login of user “{user}”."),
-            "Check the user name and the password.".to_string(),
+            next.to_string(),
         )
     } else if any(raw, &NO_DATABASE) {
         let headline = match config.database.as_deref().filter(|name| !name.is_empty()) {
@@ -377,6 +392,63 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
         next_step,
         raw: raw.to_string(),
     }
+}
+
+/// A password command that failed, or a password file that was ignored
+/// (J3), in plain words.
+fn password_words(raw: &str) -> Option<(FailureKind, String, String)> {
+    use crate::password::{COMMAND_MARKER, IGNORED, UNCONFIRMED};
+    if raw.contains(UNCONFIRMED) {
+        return Some((
+            FailureKind::Other,
+            "This connection's password command came from an imported file.".to_string(),
+            "Open the connection's settings, check the command and confirm it: it does not run \
+             before."
+                .to_string(),
+        ));
+    }
+    if let Some((_, rest)) = raw.split_once(COMMAND_MARKER) {
+        let (name, what) = rest.split_once("` ")?;
+        let (headline, next) = if what.starts_with("was not found") {
+            (
+                format!("The password command “{name}” was not found."),
+                "Install it, or give the full path of the program.",
+            )
+        } else if what.starts_with("did not finish") {
+            (
+                format!("The password command “{name}” did not finish in time."),
+                "Run it in a terminal: it may be waiting for input or a sign-in (op signin, aws \
+                 sso login). Raise its timeout if it is only slow.",
+            )
+        } else if what.starts_with("printed nothing") {
+            (
+                format!("The password command “{name}” printed nothing."),
+                "It must print the password on its output.",
+            )
+        } else {
+            (
+                format!("The password command “{name}” failed."),
+                "Its message is below. Run it in a terminal to fix it (for AWS, check the \
+                 profile and the region; for 1Password, sign in with op signin).",
+            )
+        };
+        return Some((FailureKind::Authentication, headline, next.to_string()));
+    }
+    if !raw.contains("The server asks for a password") {
+        return None;
+    }
+    let (file, why) = raw.split_once(IGNORED)?;
+    let file = file.rsplit(": ").next().unwrap_or(file);
+    let why = why.split(" The server asks").next().unwrap_or(why);
+    let mut next = why.to_string();
+    if let Some(first) = next.get(..1) {
+        next.replace_range(..1, &first.to_uppercase());
+    }
+    Some((
+        FailureKind::Authentication,
+        format!("The server asks for a password, and {file} was ignored."),
+        format!("{next} Or save the password with the connection."),
+    ))
 }
 
 /// What an OpenSSH tunnel says when `ssh` neither connected nor gave up.
@@ -935,5 +1007,84 @@ mod tests {
         assert_eq!(explained.headline, "The connection failed.");
         assert_eq!(explained.next_step, "");
         assert_eq!(explained.raw, "something odd happened");
+    }
+
+    /// J3: a failing password command, an ignored password file and an
+    /// imported command are told in plain words, with what to do; a refused
+    /// login names the command instead of a typed password.
+    #[test]
+    fn password_sources_are_explained() {
+        use crate::config::PasswordSource;
+        let config = config();
+        let failed = explain(
+            "could not connect: the password command `aws` failed (exit status 255): Unable \
+             to locate credentials",
+            &config,
+        );
+        assert_eq!(failed.headline, "The password command “aws” failed.");
+        assert!(failed.next_step.contains("profile"), "{failed:?}");
+        assert!(failed.raw.contains("Unable to locate credentials"));
+        let slow = explain(
+            "could not connect: the password command `op` did not finish in 10 s",
+            &config,
+        );
+        assert_eq!(
+            slow.headline,
+            "The password command “op” did not finish in time."
+        );
+        let missing = explain(
+            "could not connect: the password command `vault` was not found (looked in /bin)",
+            &config,
+        );
+        assert_eq!(
+            missing.headline,
+            "The password command “vault” was not found."
+        );
+        let ignored = explain(
+            "could not connect: ~/.pgpass was ignored: other users can read it (permissions \
+             0644); run chmod 600 ~/.pgpass. The server asks for a password and none was given.",
+            &config,
+        );
+        assert_eq!(ignored.kind, FailureKind::Authentication);
+        assert_eq!(
+            ignored.headline,
+            "The server asks for a password, and ~/.pgpass was ignored."
+        );
+        assert!(
+            ignored.next_step.starts_with("Other users can read it"),
+            "{ignored:?}"
+        );
+        let imported = explain(
+            &format!(
+                "invalid connection settings: {}: open the settings",
+                crate::password::UNCONFIRMED
+            ),
+            &config,
+        );
+        assert!(imported.headline.contains("imported file"), "{imported:?}");
+        let refused = "could not connect: password authentication failed for user \"evan\" [28P01]";
+        let rds = ConnectionConfig {
+            password_source: PasswordSource::RdsIam {
+                profile: None,
+                region: "us-east-1".into(),
+            },
+            ..config.clone()
+        };
+        assert!(explain(refused, &rds).next_step.contains("rds_iam"));
+        let command = ConnectionConfig {
+            password_source: PasswordSource::OnePassword {
+                reference: "op://a/b/c".into(),
+            },
+            ..config.clone()
+        };
+        assert!(
+            explain(refused, &command)
+                .next_step
+                .contains("password command")
+        );
+        assert_eq!(
+            explain(refused, &config).next_step,
+            "Check the user name and the password."
+        );
     }
 }

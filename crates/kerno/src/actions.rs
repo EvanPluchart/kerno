@@ -344,6 +344,17 @@ gpui_kit::actions!(
         ZoomOut,
         /// Gives the SQL editors and the grids their usual text size.
         ZoomReset,
+        /// Lays the open tabs out on one row that scrolls (J10).
+        TabsOnOneRow,
+        /// Lays the open tabs out on as many rows as they need (J10).
+        TabsOnSeveralRows,
+        /// Lists the open tabs at the left of the tab on screen (J10).
+        TabsAtTheSide,
+        /// Lists every open tab, to pick one (J10).
+        ShowAllTabs,
+        /// Shows the results of a script one under the other, or in result
+        /// tabs again (J11).
+        ToggleStackedResults,
     ]
 );
 
@@ -1315,6 +1326,49 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-0"],
         ["font size", "usual size", "reset"],
         ZoomReset
+    ),
+    // J10: the tabs on one row, on several, or listed at the side
+    // (DBeaver #7114, #23248), and the list of every open tab.
+    command!(
+        "tabs_on_one_row",
+        "Tabs on One Row",
+        "View",
+        [],
+        ["tab layout", "strip", "single row"],
+        TabsOnOneRow
+    ),
+    command!(
+        "tabs_on_several_rows",
+        "Tabs on Several Rows",
+        "View",
+        [],
+        ["tab layout", "wrap", "multi-row", "multiple rows"],
+        TabsOnSeveralRows
+    ),
+    command!(
+        "tabs_at_the_side",
+        "Tabs Listed at the Side",
+        "View",
+        [],
+        ["tab layout", "vertical tabs", "list", "sidebar"],
+        TabsAtTheSide
+    ),
+    command!(
+        "show_all_tabs",
+        "Show All Open Tabs…",
+        "View",
+        [],
+        ["tabs", "overflow", "switch", "list", "editors"],
+        ShowAllTabs
+    ),
+    // J11: the result sets of a script in one panel (DBeaver #6861).
+    command!(
+        "toggle_stacked_results",
+        "Stack Results in One Panel",
+        "View",
+        [],
+        ["results", "single panel", "one tab", "multiple result sets"],
+        ToggleStackedResults
     ),
     // DBeaver's `copy.query`.
     command!(

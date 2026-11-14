@@ -280,6 +280,57 @@ pub struct ConnectionConfig {
     /// connection uses; Settings ▸ Local clients' default when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_dir: Option<std::path::PathBuf>,
+    /// Where the database password comes from (J3).
+    #[serde(default, skip_serializing_if = "PasswordSource::is_stored")]
+    pub password_source: PasswordSource,
+    /// The password command came from an imported file and the user has not
+    /// confirmed it yet: it does not run until they do (see
+    /// [`crate::password`]). Set by every import, never exported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub password_command_unconfirmed: bool,
+}
+
+/// Where a connection's database password comes from (J3). The command
+/// sources run a program without a shell; its output is the password of
+/// that connect only, never stored (see [`crate::password`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PasswordSource {
+    /// The OS secret store, or asked at connect ([`ConnectionConfig::save_password`]);
+    /// with none, `~/.pgpass` (PostgreSQL) or `~/.my.cnf` (MySQL, MariaDB).
+    #[default]
+    Stored,
+    /// A program and its arguments; `${host}`, `${port}`, `${user}` and
+    /// `${database}` in an argument are replaced by the connection's values.
+    Command {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default = "default_command_timeout")]
+        timeout_secs: u16,
+    },
+    /// An AWS RDS IAM token (`aws rds generate-db-auth-token`). Needs TLS.
+    RdsIam {
+        #[serde(default)]
+        profile: Option<String>,
+        region: String,
+    },
+    /// A 1Password secret reference (`op read op://vault/item/field`).
+    OnePassword { reference: String },
+}
+
+/// Seconds a password command may take.
+pub const DEFAULT_COMMAND_TIMEOUT: u16 = 10;
+
+fn default_command_timeout() -> u16 {
+    DEFAULT_COMMAND_TIMEOUT
+}
+
+impl PasswordSource {
+    /// Whether the password is the stored or asked one (no program runs).
+    pub fn is_stored(&self) -> bool {
+        *self == Self::Stored
+    }
 }
 
 fn default_true() -> bool {
@@ -420,6 +471,8 @@ impl ConnectionConfig {
             ignore_init_errors: false,
             navigator_filters: BTreeMap::new(),
             client_dir: None,
+            password_source: PasswordSource::Stored,
+            password_command_unconfirmed: false,
         }
     }
 
@@ -517,6 +570,67 @@ impl ConnectionConfig {
                         ""
                     }
                 )));
+            }
+        }
+        self.validate_password_source()
+    }
+
+    /// The password source's own rules (J3).
+    fn validate_password_source(&self) -> Result<()> {
+        let refuse = |message: &str| Err(Error::Config(message.into()));
+        // What the user confirms must be what runs: no line breaks, control
+        // characters or bidi overrides, which only a hand-made file can hold.
+        let words: Vec<&str> = match &self.password_source {
+            PasswordSource::Stored => Vec::new(),
+            PasswordSource::Command { program, args, .. } => std::iter::once(program.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect(),
+            PasswordSource::RdsIam { profile, region } => {
+                vec![profile.as_deref().unwrap_or_default(), region.as_str()]
+            }
+            PasswordSource::OnePassword { reference } => vec![reference.as_str()],
+        };
+        let hidden = |c: char| {
+            c.is_control()
+                || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        };
+        if words.iter().any(|word| word.chars().any(hidden)) {
+            return refuse(
+                "the password command holds a line break or an invisible control character: \
+                 each argument must be plain text",
+            );
+        }
+        match &self.password_source {
+            PasswordSource::Stored => {}
+            PasswordSource::Command {
+                program,
+                timeout_secs,
+                ..
+            } => {
+                if program.trim().is_empty() {
+                    return refuse("the password command needs a program");
+                }
+                if !(1..=120).contains(timeout_secs) {
+                    return refuse("the password command's timeout is between 1 and 120 seconds");
+                }
+            }
+            PasswordSource::RdsIam { region, .. } => {
+                if region.trim().is_empty() {
+                    return refuse("AWS RDS IAM needs the region of the database (us-east-1, …)");
+                }
+                if matches!(self.tls.mode, TlsMode::Disable | TlsMode::Prefer) {
+                    return refuse(
+                        "AWS RDS IAM sends its token over TLS only: choose require or a \
+                         verifying SSL mode",
+                    );
+                }
+            }
+            PasswordSource::OnePassword { reference } => {
+                if !reference.trim().starts_with("op://") {
+                    return refuse(
+                        "a 1Password reference starts with op:// (op://vault/item/field)",
+                    );
+                }
             }
         }
         Ok(())
@@ -884,6 +998,8 @@ pub fn export_connections_with_folders(
         .cloned()
         .map(|mut connection| {
             connection.client_dir = None;
+            // Confirmation is this computer's: an importer confirms again.
+            connection.password_command_unconfirmed = false;
             connection
         })
         .collect();
@@ -927,6 +1043,9 @@ pub fn import_connections_file(json: &str) -> Result<ConnectionsFile> {
         .into_iter()
         .map(|mut connection| {
             connection.client_dir = None;
+            // A password command from a file runs only once the user has
+            // seen it and confirmed it, whatever the file says.
+            connection.password_command_unconfirmed = !connection.password_source.is_stored();
             connection
         })
         .collect();
@@ -1633,6 +1752,64 @@ mod tests {
             "user": "ada", "client_dir": "/tmp/evil"}]}"#;
         let imported = import_connections(hostile).unwrap();
         assert_eq!(imported[0].client_dir, None);
+    }
+
+    /// J3: a password source travels in a connections file (it holds no
+    /// secret), but a command from a file is unconfirmed whatever the file
+    /// says, and the confirmation is never exported.
+    #[test]
+    fn an_imported_password_command_waits_for_confirmation() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Shop".into();
+        config.password_source = PasswordSource::Command {
+            program: "vault".into(),
+            args: vec!["read".into(), "${host}".into()],
+            timeout_secs: 15,
+        };
+        // Stored as it is on this computer.
+        let stored: ConnectionConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(stored, config);
+        let exported = export_connections(std::slice::from_ref(&config)).unwrap();
+        assert!(exported.contains("vault"), "{exported}");
+        assert!(!exported.contains("unconfirmed"), "{exported}");
+        let imported = import_connections(&exported).unwrap();
+        assert_eq!(imported[0].password_source, config.password_source);
+        assert!(imported[0].password_command_unconfirmed);
+        // A file claiming it was confirmed is not believed.
+        let hostile = r#"{"kerno_connections": 1, "connections": [{
+            "name": "Shop", "engine": "postgres", "host": "db", "port": 5432, "user": "ada",
+            "password_source": {"kind": "one-password", "reference": "op://Private/bank/pw"},
+            "password_command_unconfirmed": false}]}"#;
+        assert!(import_connections(hostile).unwrap()[0].password_command_unconfirmed);
+        // A line break or a bidi override would show one command and run
+        // another: refused, so such a file is not imported.
+        for trick in ["read\nrm -rf ~", "a\u{202e}b", "\u{7}"] {
+            let mut tricked = config.clone();
+            tricked.password_source = PasswordSource::Command {
+                program: "vault".into(),
+                args: vec![trick.into()],
+                timeout_secs: 10,
+            };
+            assert!(tricked.validate().is_err(), "{trick:?}");
+            let file = serde_json::to_string(&ConnectionsFile {
+                kerno_connections: 1,
+                connections: vec![tricked],
+                folders: BTreeMap::new(),
+            })
+            .unwrap();
+            assert!(import_connections(&file).is_err(), "{trick:?}");
+        }
+        // Stored passwords need nothing, and older files have no source.
+        let plain = ConnectionConfig {
+            name: "Plain".into(),
+            ..ConnectionConfig::new(Engine::MySql)
+        };
+        let exported = export_connections(std::slice::from_ref(&plain)).unwrap();
+        assert!(!exported.contains("password_source"), "{exported}");
+        let imported = import_connections(&exported).unwrap();
+        assert_eq!(imported[0].password_source, PasswordSource::Stored);
+        assert!(!imported[0].password_command_unconfirmed);
     }
 
     #[test]

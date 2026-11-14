@@ -341,6 +341,22 @@ impl Storage {
         }
     }
 
+    /// Stores a new connection under an id it already has (one opened from
+    /// a URL and used before it was saved: its tabs and history keep it).
+    pub fn add_connection(&self, id: &str, config: &ConnectionConfig) -> Result<()> {
+        let json = serde_json::to_string(config)
+            .map_err(|error| Error::Storage(format!("could not encode the connection: {error}")))?;
+        let now = now_ms();
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO connections (id, position, config, created_at, updated_at)
+                 VALUES (?1, (SELECT COALESCE(MAX(position), 0) + 1 FROM connections), ?2, ?3, ?3)",
+                params![id, json, now],
+            )
+        })?;
+        Ok(())
+    }
+
     /// Removes a connection with its history, its saved queries and its
     /// tables' layouts. The
     /// caller removes its secrets from the secret store.

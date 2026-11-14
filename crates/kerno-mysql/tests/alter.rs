@@ -514,3 +514,130 @@ async fn rename_referenced(session: Arc<dyn Session>, database: String) {
     );
     assert_eq!(after.columns[0].name, "node_id");
 }
+
+/// Beekeeper #1341: columns are put in a new order in the same statement as
+/// a rename, an add and a drop, and every moved column keeps its whole
+/// definition: type, charset and collation, nullability, default,
+/// `AUTO_INCREMENT`, `ON UPDATE`, generated expression, comment.
+#[tokio::test]
+async fn columns_are_reordered_and_keep_their_definitions() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let database = common::scratch_database("alter_reorder");
+        let cleanup = [format!("DROP DATABASE IF EXISTS {database}")];
+        cleaning_up(&session, &cleanup, reorder(session.clone(), database)).await;
+    }
+}
+
+async fn reorder(session: Arc<dyn Session>, database: String) {
+    exec_ok(&session, &format!("CREATE DATABASE {database}")).await;
+    exec_ok(
+        &session,
+        &format!(
+            "CREATE TABLE {database}.items (\
+               id int NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+               code varchar(20) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL \
+                 DEFAULT 'x' COMMENT 'the code', \
+               a int NOT NULL DEFAULT 1, \
+               b int, \
+               total int GENERATED ALWAYS AS (a * 2 + b) STORED COMMENT 'sum', \
+               half int GENERATED ALWAYS AS (a DIV 2) VIRTUAL, \
+               stamped timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP \
+                 ON UPDATE CURRENT_TIMESTAMP, \
+               gone text)"
+        ),
+    )
+    .await;
+    exec_ok(
+        &session,
+        &format!("INSERT INTO {database}.items (code, a, b) VALUES ('k', 4, 3)"),
+    )
+    .await;
+    let table = TableRef::new(database.clone(), "items");
+    let before = session.table_structure(&table).await.unwrap();
+    let mut draft = TableDraft::from_structure(&table, &before);
+    let take = |draft: &mut TableDraft, name: &str| {
+        let at = draft.columns.iter().position(|c| c.name == name).unwrap();
+        draft.columns.remove(at)
+    };
+    // The generated `total` first, `id` after `b`, `gone` dropped, `code`
+    // renamed and `added` after it (the server cannot rename a column a
+    // generated one uses).
+    let total = take(&mut draft, "total");
+    draft.columns.insert(0, total);
+    take(&mut draft, "gone");
+    let code = draft.columns.iter_mut().find(|c| c.name == "code").unwrap();
+    code.name = "kode".into();
+    let id = take(&mut draft, "id");
+    let b = draft.columns.iter().position(|c| c.name == "b").unwrap();
+    draft.columns.insert(b + 1, id);
+    let code = draft.columns.iter().position(|c| c.name == "kode").unwrap();
+    draft
+        .columns
+        .insert(code + 1, column("added", "varchar(5)", true));
+    let order = ["total", "kode", "added", "a", "b", "id", "half", "stamped"];
+    assert_eq!(
+        draft
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        order
+    );
+
+    let changes = changes(&table, &before, &draft);
+    let moves = changes
+        .iter()
+        .filter(|change| {
+            matches!(
+                change,
+                kerno_core::table_draft::TableChange::MoveColumn { .. }
+            )
+        })
+        .count();
+    assert_eq!(moves, 3, "{changes:#?}");
+    let statements = session.dialect().alter_table_sql(&table, &changes).unwrap();
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    apply(&session, &statements).await;
+
+    let after = session.table_structure(&table).await.unwrap();
+    assert_eq!(
+        after
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        order
+    );
+    // Every column kept is what it was, but for the new name.
+    for was in before.columns.iter().filter(|c| c.name != "gone") {
+        let name = if was.name == "code" {
+            "kode"
+        } else {
+            &was.name
+        };
+        let now = after.columns.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(
+            kerno_core::schema::ColumnInfo {
+                name: was.name.clone(),
+                ..now.clone()
+            },
+            *was,
+            "{name}"
+        );
+    }
+    assert_eq!(read_back(&session, &table).await, saved(draft));
+    // The rows too, generated values included.
+    assert_eq!(
+        common::rows(
+            &session,
+            &format!("SELECT total, kode, a, b, id, half FROM {database}.items")
+        )
+        .await,
+        vec![
+            ["11", "k", "4", "3", "1", "2"]
+                .map(|v| Some(v.to_string()))
+                .to_vec()
+        ]
+    );
+}

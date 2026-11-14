@@ -27,7 +27,7 @@ use kerno_core::error::{Explained, explain};
 use kerno_core::ssh::SshError;
 use kerno_core::storage::SavedConnection;
 
-use super::form::{COMMIT_MODES, ConnectionForm, Field, FieldError, SshAuthKind};
+use super::form::{COMMIT_MODES, ConnectionForm, Field, FieldError, PasswordChoice, SshAuthKind};
 use super::manager::{Connections, TestReport};
 use crate::engine_logo::engine_logo;
 use crate::state::AppState;
@@ -109,6 +109,21 @@ struct Inputs {
     ssh_agent_socket: Entity<InputState>,
     ssh_keepalive: Entity<InputState>,
     ssh_jump: Entity<InputState>,
+    command_program: Entity<InputState>,
+    command_args: Entity<TextareaState>,
+    command_timeout: Entity<InputState>,
+    rds_profile: Entity<InputState>,
+    rds_region: Entity<InputState>,
+    op_reference: Entity<InputState>,
+}
+
+/// What "Run now" of the password command last found: the length of its
+/// output, never the output.
+enum RunState {
+    NotRun,
+    Running,
+    Printed(usize),
+    Failed(Explained),
 }
 
 /// The dialog's view.
@@ -134,6 +149,9 @@ pub struct ConnectionDialog {
     ssh_aliases: Vec<String>,
     /// Reading them, off the UI thread.
     loading_aliases: Option<Task<()>>,
+    /// "Run now" of the password command (J3).
+    run: RunState,
+    running_command: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -250,6 +268,14 @@ impl ConnectionDialog {
         let ssh_agent_socket = text(&form.ssh_agent_socket, "SSH_AUTH_SOCK when empty");
         let ssh_keepalive = text(&form.ssh_keepalive, "30");
         let default_schema = text(&form.default_schema, "public");
+        let command_program = text(
+            &form.command_program,
+            "vault, /usr/local/bin/get-db-password",
+        );
+        let command_timeout = text(&form.command_timeout, "10");
+        let rds_profile = text(&form.rds_profile, "default profile when empty");
+        let rds_region = text(&form.rds_region, "us-east-1");
+        let op_reference = text(&form.op_reference, "op://vault/item/password");
         let mut secret = |value: &str| {
             let value = value.to_string();
             cx.new(|cx| {
@@ -267,6 +293,15 @@ impl ConnectionDialog {
                 .auto_grow(4, 10)
                 .placeholder("application_name=kerno")
                 .default_value(options_text)
+        });
+        let args_text = form.command_args.clone();
+        let command_args = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 6)
+                .placeholder(
+                    "One argument per line; ${host} ${port} ${user} ${database} are replaced",
+                )
+                .default_value(args_text)
         });
         let init_text = form.init_sql.clone();
         let init_sql = cx.new(|cx| {
@@ -324,6 +359,12 @@ impl ConnectionDialog {
                 ssh_agent_socket,
                 ssh_keepalive,
                 ssh_jump,
+                command_program,
+                command_args,
+                command_timeout,
+                rds_profile,
+                rds_region,
+                op_reference,
             },
             section: Section::General,
             errors: Vec::new(),
@@ -333,6 +374,8 @@ impl ConnectionDialog {
             databases: DatabaseList::Unknown,
             listing: None,
             choosing_client: None,
+            run: RunState::NotRun,
+            running_command: None,
             ssh_aliases: Vec::new(),
             loading_aliases: openssh.and_then(|env| {
                 let file = env.aliases_from?;
@@ -447,6 +490,12 @@ impl ConnectionDialog {
             ssh_agent_socket: value(&i.ssh_agent_socket),
             ssh_keepalive: value(&i.ssh_keepalive),
             ssh_jump: value(&i.ssh_jump),
+            command_program: value(&i.command_program),
+            command_args: i.command_args.read(cx).value().to_string(),
+            command_timeout: value(&i.command_timeout),
+            rds_profile: value(&i.rds_profile),
+            rds_region: value(&i.rds_region),
+            op_reference: value(&i.op_reference),
             ..self.form.clone()
         }
     }
@@ -895,7 +944,7 @@ impl ConnectionDialog {
             swatches.push(swatch(Some(key), cx));
         }
         let environments = self.environment_picker(cx).into_any_element();
-        let theme = cx.theme();
+        let password = self.render_password(!memory_only, cx);
 
         v_flex()
             .gap_3()
@@ -975,40 +1024,22 @@ impl ConnectionDialog {
                         Input::new(&self.inputs.user).id("conn-user"),
                         cx,
                     )))
-                    .child(
-                        div().flex_1().child(
-                            self.field(
-                                "Password",
-                                None,
-                                Input::new(&self.inputs.password)
-                                    .id("conn-password")
-                                    .mask_toggle(),
-                                cx,
+                    .when(!self.form.password_choice.runs_a_command(), |this| {
+                        this.child(
+                            div().flex_1().child(
+                                self.field(
+                                    "Password",
+                                    None,
+                                    Input::new(&self.inputs.password)
+                                        .id("conn-password")
+                                        .mask_toggle(),
+                                    cx,
+                                ),
                             ),
-                        ),
-                    ),
+                        )
+                    }),
             )
-            .child(
-                Checkbox::new("conn-save-password")
-                    .label(if memory_only {
-                        "Remember passwords until Kerno quits (no system secret store in use)"
-                    } else {
-                        "Save passwords in the system keychain"
-                    })
-                    .checked(self.form.save_password)
-                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        this.form.save_password = *checked;
-                        cx.notify();
-                    })),
-            )
-            .when(!self.form.save_password, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Kerno will ask for the password each time it connects."),
-                )
-            })
+            .child(password)
             .child(
                 self.field(
                     "Database",
@@ -1038,6 +1069,236 @@ impl ConnectionDialog {
                         cx.notify();
                     })),
             )
+    }
+
+    /// Where the password comes from (J3), as DBeaver's Authentication
+    /// list: the choice beside the fields of each, the command line as it
+    /// will run with "Run now", and its confirmation when it came from an
+    /// imported file. Kept to a few lines: the General tab is tall already.
+    fn render_password(&self, persistent: bool, cx: &mut Context<Self>) -> AnyElement {
+        let choice = self.form.password_choice;
+        let view = cx.entity();
+        let picker = Button::new("conn-password-source")
+            .outline()
+            .label(choice.label(persistent))
+            .dropdown_caret(true)
+            .tooltip("Where the password comes from")
+            .dropdown_menu(move |mut menu: PopupMenu, _, _| {
+                for option in PasswordChoice::ALL {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option.label(persistent))
+                            .checked(option == choice)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.form.set_password_choice(option);
+                                    this.run = RunState::NotRun;
+                                    cx.notify();
+                                })
+                            }),
+                    );
+                }
+                menu
+            });
+        let theme = cx.theme();
+        let (muted, warning, success) = (theme.muted_foreground, theme.warning, theme.success);
+        let mono = theme.mono_font_family.clone();
+        let note = |id: &'static str, text: String, color| {
+            div()
+                .id(id)
+                .test_support()
+                .text_xs()
+                .text_color(color)
+                .child(text.clone())
+                .test_text(text)
+        };
+        let file = match self.form.engine {
+            Engine::Postgres => "~/.pgpass",
+            Engine::MySql | Engine::MariaDb => "~/.my.cnf",
+        };
+        let fields = match choice {
+            PasswordChoice::Keychain => note(
+                "conn-password-hint",
+                format!(
+                    "Left empty, Kerno reads {file}, as the {} tools do.",
+                    self.form.engine.label()
+                ),
+                muted,
+            )
+            .into_any_element(),
+            PasswordChoice::Ask => note(
+                "conn-password-hint",
+                "Kerno will ask for the password each time it connects.".into(),
+                muted,
+            )
+            .into_any_element(),
+            PasswordChoice::Command => h_flex()
+                .gap_2()
+                .flex_1()
+                .child(
+                    Input::new(&self.inputs.command_program)
+                        .id("conn-password-program")
+                        .flex_1(),
+                )
+                .child(
+                    div().w(px(72.)).child(
+                        Input::new(&self.inputs.command_timeout)
+                            .id("conn-password-timeout")
+                            .suffix("s"),
+                    ),
+                )
+                .into_any_element(),
+            PasswordChoice::RdsIam => h_flex()
+                .gap_2()
+                .flex_1()
+                .child(
+                    Input::new(&self.inputs.rds_region)
+                        .id("conn-rds-region")
+                        .flex_1(),
+                )
+                .child(
+                    Input::new(&self.inputs.rds_profile)
+                        .id("conn-rds-profile")
+                        .flex_1(),
+                )
+                .into_any_element(),
+            PasswordChoice::OnePassword => Input::new(&self.inputs.op_reference)
+                .id("conn-op-reference")
+                .flex_1()
+                .into_any_element(),
+        };
+        let errors = [
+            Field::PasswordSource,
+            Field::PasswordProgram,
+            Field::PasswordTimeout,
+            Field::RdsRegion,
+            Field::OpReference,
+        ]
+        .into_iter()
+        .find_map(|field| self.error_for(field));
+        let mut block = v_flex().gap_1().child(self.field(
+            "Password from",
+            None,
+            h_flex().gap_2().child(picker).child(fields),
+            cx,
+        ));
+        if choice == PasswordChoice::Command {
+            block = block.child(Textarea::new(&self.inputs.command_args));
+        }
+        if let Some(message) = errors {
+            block = block.child(
+                div()
+                    .id("conn-field-error")
+                    .test_support()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(message),
+            );
+        }
+        if !choice.runs_a_command() {
+            return block.into_any_element();
+        }
+        let form = self.read_form(cx);
+        let line = format!("Runs: {}", form.command_display().unwrap_or_default());
+        let unconfirmed = form.command_unconfirmed;
+        let running = matches!(self.run, RunState::Running);
+        let printed = match &self.run {
+            RunState::Printed(length) => Some(note(
+                "conn-password-run-result",
+                format!(
+                    "printed {length} character{} (not shown)",
+                    if *length == 1 { "" } else { "s" }
+                ),
+                success,
+            )),
+            _ => None,
+        };
+        // The whole line, wrapped, never cut: it is what the user confirms.
+        block = block
+            .child(
+                div()
+                    .id("conn-password-command-line")
+                    .test_support()
+                    .w_full()
+                    .text_xs()
+                    .font_family(mono)
+                    .child(line.clone())
+                    .test_text(line),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("conn-password-run")
+                            .outline()
+                            .xsmall()
+                            .label("Run now")
+                            .loading(running)
+                            .disabled(running || unconfirmed)
+                            .on_click(cx.listener(|this, _, _, cx| this.run_command(cx))),
+                    )
+                    .children(printed),
+            );
+        if let RunState::Failed(explained) = &self.run {
+            block = block.child(render_failure("conn-password-run-failed", explained, cx));
+        }
+        if unconfirmed {
+            block = block.child(
+                h_flex()
+                    .id("conn-password-unconfirmed")
+                    .test_support()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(warning)
+                            .child("From an imported file: it runs only once you confirm it."),
+                    )
+                    .child(
+                        Button::new("conn-password-confirm")
+                            .outline()
+                            .xsmall()
+                            .label("I trust this command")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.form.command_unconfirmed = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        block.into_any_element()
+    }
+
+    /// Runs the password command once and reports how long its output is
+    /// (the output itself is dropped at once, off the UI thread).
+    fn run_command(&mut self, cx: &mut Context<Self>) {
+        let Some((config, _)) = self.validated(cx) else {
+            return;
+        };
+        let env = self.connections.read(cx).password_env().cloned();
+        let tested = config.clone();
+        self.run = RunState::Running;
+        let running = crate::bridge::spawn(cx, async move {
+            // The core's own path: an unconfirmed command does not run.
+            let resolved = kerno_core::password::resolve(&config, None, None, env.as_ref()).await?;
+            Ok::<_, Error>(
+                resolved
+                    .password
+                    .map_or(0, |printed| printed.expose().chars().count()),
+            )
+        });
+        self.running_command = Some(cx.spawn(async move |this, cx| {
+            let outcome = running.await;
+            let _ = this.update(cx, |this, cx| {
+                this.run = match outcome {
+                    Ok(length) => RunState::Printed(length),
+                    Err(error) => RunState::Failed(explain(&error.to_string(), &tested)),
+                };
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn render_tls(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1455,16 +1716,29 @@ impl ConnectionDialog {
                 .text_color(theme.muted_foreground)
                 .child("Connecting…")
                 .into_any_element(),
-            TestState::Passed(report) => div()
-                .id("conn-test-passed")
-                .test_support()
-                .text_sm()
-                .text_color(theme.success)
-                .child(SharedString::from(format!(
-                    "Connected to {} · {} ms round trip",
-                    short_version(&report.version),
-                    report.latency.as_millis().max(1)
-                )))
+            TestState::Passed(report) => v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .id("conn-test-passed")
+                        .test_support()
+                        .text_sm()
+                        .text_color(theme.success)
+                        .child(SharedString::from(format!(
+                            "Connected to {} · {} ms round trip",
+                            short_version(&report.version),
+                            report.latency.as_millis().max(1)
+                        ))),
+                )
+                .children(report.password.clone().map(|origin| {
+                    div()
+                        .id("conn-test-password")
+                        .test_support()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(origin.clone()))
+                        .test_text(origin)
+                }))
                 .into_any_element(),
             TestState::Failed(explained) => {
                 render_failure("conn-test-failed", explained, cx).into_any_element()
@@ -1514,7 +1788,15 @@ impl ConnectionDialog {
 /// The section a field is shown in.
 fn section_of(field: Field) -> Section {
     match field {
-        Field::Url | Field::Host | Field::Port | Field::User => Section::General,
+        Field::Url
+        | Field::Host
+        | Field::Port
+        | Field::User
+        | Field::PasswordSource
+        | Field::PasswordProgram
+        | Field::PasswordTimeout
+        | Field::RdsRegion
+        | Field::OpReference => Section::General,
         Field::CaFile | Field::CertFile | Field::KeyFile => Section::Tls,
         Field::SshHost
         | Field::SshPort

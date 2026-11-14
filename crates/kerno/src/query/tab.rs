@@ -1,6 +1,7 @@
 //! A query tab: a SQL editor bound to a connection, and what its
 //! statements returned.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -27,10 +28,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Task, TestSupportExt as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, DragMoveEvent, EmptyView, Entity,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, ParentElement as _, Pixels, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    TestSupportExt as _, Window, div, list, px,
 };
 use kerno_core::browse::{
     Filter, Operator, Query, Source as QuerySource, and_where, count_from, described, distinct_sql,
@@ -57,7 +59,8 @@ use super::comment;
 use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::distinct;
 use super::edit;
-use super::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner};
+use super::find;
+use super::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner, table_size};
 use super::occurrences::Occurrences;
 use super::params;
 use super::plan_view;
@@ -211,6 +214,8 @@ pub struct ResultPane {
     name: Option<String>,
     /// Kept by the next runs until unpinned or closed.
     pinned: bool,
+    /// The height its grid was dragged to among stacked results (J11).
+    stack_height: Option<Pixels>,
     /// How the result of a SELECT is read again on the server.
     pub requery: Option<Requery>,
     /// Rows of the whole result, once counted.
@@ -322,6 +327,14 @@ pub enum Activity {
     },
 }
 
+/// Rows a stacked result shows before its grid scrolls (J11).
+const STACK_ROWS: usize = 12;
+/// The height of a stacked result's header.
+const STACK_HEADER: Pixels = px(28.);
+
+/// The lower edge of a stacked result's grid being dragged: its pane.
+struct StackResize(u64);
+
 pub struct QueryTab {
     title: SharedString,
     editor: Entity<EditorState>,
@@ -396,6 +409,17 @@ pub struct QueryTab {
     /// run being prepared, and by the run in progress.
     next_widths: HashMap<String, gpui_kit::Pixels>,
     widths: HashMap<String, gpui_kit::Pixels>,
+    /// The find bar of the result being read again, carried as its widths
+    /// are (by the run being prepared, then the run in progress).
+    next_find: Option<find::Carried>,
+    carried_find: Option<find::Carried>,
+    /// "Open in its own tab" showed the results in tabs while they are
+    /// stacked (J11): until the next run.
+    unstacked: bool,
+    /// The stacked results, virtual: only those in view are laid out.
+    stack_list: ListState,
+    /// The panes (and `u64::MAX` for the messages) the list holds.
+    stack_items: RefCell<Vec<u64>>,
     /// The filter of the result on screen, and the pane it shows.
     result_filter: Entity<InputState>,
     result_filter_for: Option<u64>,
@@ -564,6 +588,11 @@ impl QueryTab {
             next_requery: None,
             next_widths: HashMap::new(),
             widths: HashMap::new(),
+            next_find: None,
+            carried_find: None,
+            unstacked: false,
+            stack_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            stack_items: RefCell::new(Vec::new()),
             requery: None,
             result_filter,
             result_filter_for: None,
@@ -2066,6 +2095,7 @@ impl QueryTab {
             elapsed,
             name: None,
             pinned: false,
+            stack_height: None,
             requery: self.requery.clone(),
             total: None,
             editable: None,
@@ -2193,6 +2223,8 @@ impl QueryTab {
         self.generation += 1;
         self.requery = self.next_requery.take();
         self.widths = std::mem::take(&mut self.next_widths);
+        self.carried_find = self.next_find.take();
+        self.unstacked = false;
         self.clear_results();
         self.notices.clear();
         // The first result of this run is shown; the editor and the
@@ -3054,21 +3086,28 @@ impl QueryTab {
         let sql = statement.to_string();
         let mut grid = grid.with_widths(self.widths.clone()).with_owner(Owner {
             act: Rc::new(move |action, row, column, window, cx| {
-                let _ = view.update(cx, |this, cx| match action {
-                    GridAction::Export => {
-                        this.export_statement(sql.clone(), window, cx);
+                let _ = view.update(cx, |this, cx| {
+                    // Among stacked results, the menu of a cell acts on its
+                    // own result, which takes the focus (J11).
+                    this.focus_stacked(id, cx);
+                    match action {
+                        GridAction::Export => {
+                            this.export_statement(sql.clone(), window, cx);
+                        }
+                        GridAction::Paste
+                        | GridAction::EditCell
+                        | GridAction::SetNull
+                        | GridAction::SetDefault
+                        | GridAction::CopyFromRow(_)
+                        | GridAction::DuplicateRow
+                        | GridAction::DeleteRow
+                        | GridAction::RevertRow
+                        | GridAction::AddRow
+                        | GridAction::Generate(_) => {
+                            this.edit_result(action, row, column, window, cx)
+                        }
+                        action => this.result_action(id, action, row, column, window, cx),
                     }
-                    GridAction::Paste
-                    | GridAction::EditCell
-                    | GridAction::SetNull
-                    | GridAction::SetDefault
-                    | GridAction::CopyFromRow(_)
-                    | GridAction::DuplicateRow
-                    | GridAction::DeleteRow
-                    | GridAction::RevertRow
-                    | GridAction::AddRow
-                    | GridAction::Generate(_) => this.edit_result(action, row, column, window, cx),
-                    action => this.result_action(id, action, row, column, window, cx),
                 });
             }),
             related: None,
@@ -3146,6 +3185,10 @@ impl QueryTab {
                 }
             },
         );
+        // The find bar of the result this one reads again stays open.
+        if let Some(carried) = self.carried_find.take() {
+            find::restore(&table, carried, window, cx);
+        }
         let id = self.push_pane(
             statement.to_string(),
             Outcome::Rows(table.clone()),
@@ -3963,6 +4006,8 @@ impl QueryTab {
                 return menu;
             };
             let view = view.clone();
+            let stacked = view.read(cx).stacked(cx);
+            let toggle = view.clone();
             tabs::fill_menu(
                 menu,
                 tabs::result_menu(facts),
@@ -3975,6 +4020,15 @@ impl QueryTab {
                 }),
                 window,
                 cx,
+            )
+            // The results of a script in one panel, or one tab each (J11).
+            .separator()
+            .item(
+                PopupMenuItem::new("Stack results in one panel")
+                    .checked(stacked)
+                    .on_click(move |_, window, cx| {
+                        toggle.update(cx, |this, cx| this.stack_results(!stacked, window, cx))
+                    }),
             )
         }
     }
@@ -4362,11 +4416,12 @@ impl QueryTab {
                 return;
             }
         };
-        // Read again, the result keeps its column widths.
+        // Read again, the result keeps its column widths and its find bar.
         self.next_widths = self
             .pane_grid(id)
             .map(|grid| Grid::widths(grid.read(cx)))
             .unwrap_or_default();
+        self.next_find = self.pane_grid(id).and_then(|grid| find::carried(&grid, cx));
         self.next_requery = Some(Requery {
             filter,
             sort,
@@ -5764,15 +5819,370 @@ impl QueryTab {
             }))
     }
 
-    fn render_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (border, muted, warning, mono) = {
+    // Stacked results (J11, DBeaver #6861) -----------------------------------
+
+    /// Shows the results of a run one under the other (`on`), or one result
+    /// tab each, in every query tab (Settings ▸ Grid, the results menu, the
+    /// palette).
+    pub fn set_stacked(on: bool, window: &mut Window, cx: &mut App) {
+        AppState::update_settings(cx, |settings| settings.stack_results = on);
+        window.refresh();
+    }
+
+    /// Whether this tab shows its results stacked.
+    pub fn stacked(&self, cx: &App) -> bool {
+        AppState::get(cx).settings.stack_results && !self.unstacked
+    }
+
+    /// Stacks the results or puts them back in tabs, from this tab, which
+    /// follows the setting again after "Open in its own tab".
+    pub fn stack_results(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.unstacked = false;
+        self.revealed_result = None;
+        Self::set_stacked(on, window, cx);
+        cx.notify();
+    }
+
+    /// Shows stacked result `id` in its own result tab: the results are in
+    /// tabs until the next run, nothing runs again.
+    fn unstack(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.pane_index(id) {
+            self.active_result = index;
+            self.unstacked = true;
+            self.revealed_result = None;
+            cx.notify();
+        }
+    }
+
+    /// The stacked result a click went to has the focus: the find, the
+    /// copy, the value viewer, the filter and the footer act on it.
+    fn focus_stacked(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.pane_index(id)
+            && index != self.active_result
+        {
+            self.active_result = index;
+            // Clicked, so in view: the list stays where it is.
+            self.revealed_result = Some(id);
+            cx.notify();
+        }
+    }
+
+    /// How tall a stacked grid is: as many rows as it holds, up to
+    /// [`STACK_ROWS`], or what its lower edge was dragged to.
+    fn stacked_grid_height(
+        &self,
+        pane: &ResultPane,
+        grid: &Entity<TableState<Grid>>,
+        cx: &App,
+    ) -> Pixels {
+        let row = table_size(cx).table_row_height();
+        if let Some(height) = pane.stack_height {
+            return height.max(row * 3.);
+        }
+        let rows = grid.read(cx).delegate().row_count().clamp(1, STACK_ROWS);
+        let find = if find::carried(grid, cx).is_some() {
+            px(36.)
+        } else {
+            px(0.)
+        };
+        // The header row, the rows, room for the horizontal scrollbar.
+        row * (rows + 1) as f32 + px(14.) + find
+    }
+
+    /// Every result of the run in one scrolling panel: per result a header
+    /// and its grid (or its status line), the messages last. The filter, the
+    /// edit bar and the footer are those of the result that has the focus.
+    fn render_stacked(&self, cx: &mut Context<Self>) -> AnyElement {
+        let keys: Vec<u64> = self
+            .results
+            .iter()
+            .map(|pane| pane.id)
+            .chain((!self.notices.is_empty()).then_some(u64::MAX))
+            .collect();
+        {
+            // What came at the end is measured; the rest keeps its place. A
+            // new run starts at the top.
+            let mut shown = self.stack_items.borrow_mut();
+            if *shown != keys {
+                let common = shown.iter().zip(&keys).take_while(|(a, b)| a == b).count();
+                if common == 0 {
+                    self.stack_list.reset(keys.len());
+                } else {
+                    self.stack_list
+                        .splice(common..shown.len(), keys.len() - common);
+                }
+                *shown = keys;
+            }
+        }
+        let (filter_bar, edit_bar, footer) = match self.results.get(self.active_result) {
+            Some(pane) => {
+                let (filter, edit, footer) = self.render_result_bars(pane, cx);
+                (filter, edit, Some(footer))
+            }
+            None => (None, None, None),
+        };
+        v_flex()
+            .size_full()
+            .children(filter_bar)
+            .children(edit_bar)
+            .child(
+                div()
+                    .id("stacked-results")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        list(
+                            self.stack_list.clone(),
+                            cx.processor(|this, index: usize, _, cx| {
+                                this.render_stacked_item(index, cx)
+                            }),
+                        )
+                        .size_full(),
+                    ),
+            )
+            .children(footer)
+            .into_any_element()
+    }
+
+    /// One item of the stacked results: a result, or the messages.
+    fn render_stacked_item(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let (border, muted, danger, warning, mono, active_bg, header_bg) = {
             let theme = cx.theme();
             (
                 theme.border,
                 theme.muted_foreground,
+                theme.danger,
                 theme.warning,
                 theme.mono_font_family.clone(),
+                theme.list_active,
+                theme.tab_bar,
             )
+        };
+        let header = |id: gpui_kit::ElementId| {
+            h_flex()
+                .id(id)
+                .test_support()
+                .flex_none()
+                .h(STACK_HEADER)
+                .px_2()
+                .gap_2()
+                .text_xs()
+                .border_b_1()
+                .border_color(border)
+        };
+        let Some(pane) = self.results.get(index) else {
+            return v_flex()
+                .id("stacked-messages")
+                .test_support()
+                .w_full()
+                .child(
+                    header("stacked-messages-header".into())
+                        .bg(header_bg)
+                        .child(SharedString::from(format!(
+                            "Messages ({})",
+                            self.notices.len()
+                        ))),
+                )
+                .child(
+                    div()
+                        .id("stacked-messages-body")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .child(self.render_messages(cx)),
+                )
+                .into_any_element();
+        };
+        let id = pane.id;
+        let active = index == self.active_result;
+        let grid = pane.grid();
+        let facts = match (&pane.outcome, &grid) {
+            (_, Some(grid)) => {
+                let grid = grid.read(cx).delegate();
+                let rows = plan_view::number(grid.row_count() as f64);
+                let rows = if grid.is_complete() {
+                    format!("{rows} rows")
+                } else {
+                    format!("first {rows} rows")
+                };
+                Some(rows)
+            }
+            (Outcome::Done, _) => pane.rows_affected.map(|rows| format!("{rows} affected")),
+            _ => None,
+        };
+        let exportable = self.exportable(pane, cx);
+        let bar = header(("stacked-header", index).into())
+            .bg(if active { active_bg } else { header_bg })
+            .context_menu(self.result_menu(id, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .child(SharedString::from(self.result_label(index))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(mono)
+                    .text_color(muted)
+                    .child(SharedString::from(one_line(
+                        pane.statement.lines().next().unwrap_or_default(),
+                    ))),
+            )
+            .children(facts.map(|facts| {
+                div()
+                    .id(("stacked-facts", index))
+                    .test_support()
+                    .flex_none()
+                    .text_color(muted)
+                    .child(SharedString::from(facts))
+            }))
+            .children(pane.elapsed.map(|elapsed| {
+                div()
+                    .flex_none()
+                    .text_color(muted)
+                    .child(SharedString::from(duration_text(elapsed)))
+            }))
+            .when_some(grid.clone(), |bar, grid| {
+                bar.child(
+                    Button::new(("stacked-copy", index))
+                        .ghost()
+                        .xsmall()
+                        .label("Copy")
+                        .tooltip("Copy every fetched row, with the column names")
+                        .on_click(move |_, _, cx| {
+                            grid.update(cx, |table, cx| {
+                                table.delegate_mut().select_all();
+                                Grid::copy(table, Some(CopyFormat::TsvWithHeader), None, cx);
+                                cx.notify();
+                            });
+                        }),
+                )
+            })
+            .when(exportable, |bar| {
+                bar.child(
+                    Button::new(("stacked-export", index))
+                        .ghost()
+                        .xsmall()
+                        .label("Export…")
+                        .tooltip("Run the statement again and write all its rows to a file")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let statement = this
+                                .pane_index(id)
+                                .map(|index| this.results[index].statement.clone());
+                            if let Some(statement) = statement {
+                                this.export_statement(statement, window, cx);
+                            }
+                        })),
+                )
+            })
+            .child(
+                Button::new(("stacked-own-tab", index))
+                    .ghost()
+                    .xsmall()
+                    .label("Open in its own tab")
+                    .tooltip("Show the results in tabs, this one on screen, until the next run")
+                    .on_click(cx.listener(move |this, _, _, cx| this.unstack(id, cx))),
+            );
+        let status = |text: String, color: Option<gpui_kit::Hsla>| {
+            div()
+                .id(("stacked-status", index))
+                .test_support()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .when_some(color, |line, color| line.text_color(color))
+                .child(SharedString::from(text))
+        };
+        let body = match (&pane.outcome, grid) {
+            (_, Some(grid)) => {
+                let height = self.stacked_grid_height(pane, &grid, cx);
+                v_flex()
+                    .child(
+                        div()
+                            .id(("stacked-grid", index))
+                            .test_support()
+                            .w_full()
+                            .h(height)
+                            .child(super::grid_view::render(&grid, cx)),
+                    )
+                    // Its lower edge drags to make it taller or shorter.
+                    .child(
+                        div()
+                            .id(("stacked-resize", index))
+                            .test_support()
+                            .h(px(5.))
+                            .w_full()
+                            .border_b_1()
+                            .border_color(border)
+                            .cursor_row_resize()
+                            .hover(|edge| edge.bg(border))
+                            .on_drag(StackResize(id), |_, _, _, cx| cx.new(|_| EmptyView)),
+                    )
+                    .into_any_element()
+            }
+            (Outcome::Plan { .. }, None) => div()
+                .h(px(320.))
+                .child(self.render_pane(pane, cx))
+                .into_any_element(),
+            (Outcome::Done, None) => status(
+                match pane.rows_affected {
+                    Some(1) => "Done. 1 row affected.".to_string(),
+                    Some(rows) => format!("Done. {rows} rows affected."),
+                    None => "Done.".to_string(),
+                },
+                None,
+            )
+            .into_any_element(),
+            (Outcome::Cancelled, None) => status(
+                "Cancelled. Rows that had arrived are kept in their result.".into(),
+                Some(warning),
+            )
+            .into_any_element(),
+            (Outcome::Failed(failure), None) => {
+                let mut text = match &failure.code {
+                    Some(code) => format!("{} [{code}]", failure.message),
+                    None => failure.message.clone(),
+                };
+                for (label, value) in [("Detail", &failure.detail), ("Hint", &failure.hint)] {
+                    if let Some(value) = value {
+                        text.push_str(&format!("\n{label}: {value}"));
+                    }
+                }
+                status(text, Some(danger)).into_any_element()
+            }
+            (Outcome::Rows(_), None) => div().into_any_element(),
+        };
+        v_flex()
+            .id(("stacked-result", index))
+            .test_support()
+            .w_full()
+            .border_b_1()
+            .border_color(border)
+            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| this.focus_stacked(id, cx)))
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<StackResize>, _, cx| {
+                    if event.drag(cx).0 != id {
+                        return;
+                    }
+                    let height = event.event.position.y - event.bounds.top() - STACK_HEADER;
+                    if let Some(index) = this.pane_index(id) {
+                        this.results[index].stack_height = Some(height.min(px(2000.)));
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(bar)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_results(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (muted, warning) = {
+            let theme = cx.theme();
+            (theme.muted_foreground, theme.warning)
         };
         // The server's messages get a tab of their own after the results.
         let messages = !self.notices.is_empty();
@@ -5883,6 +6293,34 @@ impl QueryTab {
                         .child(SharedString::from(text)),
                 );
         };
+        let (filter_bar, edit_bar, footer) = self.render_result_bars(pane, cx);
+        v_flex()
+            .size_full()
+            .child(tabs)
+            .children(filter_bar)
+            .children(edit_bar)
+            .child(div().flex_1().min_h_0().child(self.render_pane(pane, cx)))
+            .child(footer)
+    }
+
+    /// What goes around the result on screen: the filter read again by the
+    /// server, the bar of the rows that take changes, and the footer
+    /// (counts, fetch, export, the statement and its time). The same for a
+    /// result tab and for the result that has the focus among stacked ones.
+    fn render_result_bars(
+        &self,
+        pane: &ResultPane,
+        cx: &mut Context<Self>,
+    ) -> (Option<AnyElement>, Option<AnyElement>, AnyElement) {
+        let (border, muted, warning, mono) = {
+            let theme = cx.theme();
+            (
+                theme.border,
+                theme.muted_foreground,
+                theme.warning,
+                theme.mono_font_family.clone(),
+            )
+        };
         // What the footer says about the result on screen.
         let (summary, has_more, complete, order) = match &pane.outcome {
             Outcome::Rows(grid) => {
@@ -5932,141 +6370,133 @@ impl QueryTab {
             Some(Err(why)) => Some(SharedString::from(why.to_string())),
             _ => None,
         };
-        v_flex()
-            .size_full()
-            .child(tabs)
-            .children(filter_bar)
-            .children(edit_bar)
-            .child(div().flex_1().min_h_0().child(self.render_pane(pane, cx)))
-            .child(
-                h_flex()
-                    .id("result-footer")
+        let footer = h_flex()
+            .id("result-footer")
+            .test_support()
+            .flex_none()
+            .h(px(26.))
+            .px_3()
+            .gap_3()
+            .border_t_1()
+            .border_color(border)
+            .text_xs()
+            .text_color(muted)
+            .child({
+                let summary = SharedString::from(summary);
+                div()
+                    .id("result-summary")
                     .test_support()
-                    .flex_none()
-                    .h(px(26.))
-                    .px_3()
-                    .gap_3()
-                    .border_t_1()
-                    .border_color(border)
-                    .text_xs()
-                    .text_color(muted)
-                    .child({
-                        let summary = SharedString::from(summary);
-                        div()
-                            .id("result-summary")
-                            .test_support()
-                            .aria_label(summary.clone())
-                            .child(summary)
-                    })
-                    .children(
-                        order.map(|order| div().id("result-order").test_support().child(order)),
-                    )
-                    .when(
-                        requery.is_some()
-                            && grid.is_some()
-                            && !complete
-                            && pane.total.is_none()
-                            && self.side.is_none(),
-                        |this| {
-                            this.child(
-                                Button::new("result-count")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Count")
-                                    .tooltip("Count every row of the result on the server")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.count_result(window, cx)
-                                    })),
-                            )
-                        },
-                    )
-                    .when(self.side.is_some(), |this| {
-                        this.child("reading…").child(
-                            Button::new("result-side-cancel")
-                                .ghost()
-                                .xsmall()
-                                .label("Cancel")
-                                .tooltip("Stop the statement")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-                        )
-                    })
-                    .when(requery.is_some(), |this| {
-                        this.child(auto_refresh_button(
-                            "result-auto-refresh",
-                            self.auto_refresh().filter(|_| auto_here),
-                            cx.entity(),
-                            |this, every, window, cx| this.set_auto_refresh(every, window, cx),
-                        ))
-                    })
-                    .children(self.auto_refresh_stopped.map(|why| {
-                        div()
-                            .id("result-auto-refresh-stopped")
-                            .test_support()
-                            .text_color(warning)
-                            .child(SharedString::from(format!("Auto-refresh stopped: {why}.")))
-                    }))
-                    .children(grid.clone().map(|table| {
-                        Button::new("result-record")
+                    .aria_label(summary.clone())
+                    .child(summary)
+            })
+            .children(order.map(|order| div().id("result-order").test_support().child(order)))
+            .when(
+                requery.is_some()
+                    && grid.is_some()
+                    && !complete
+                    && pane.total.is_none()
+                    && self.side.is_none(),
+                |this| {
+                    this.child(
+                        Button::new("result-count")
                             .ghost()
                             .xsmall()
-                            .label("Record")
-                            .tooltip("One row as a list of its columns, or the grid again (Tab)")
-                            .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
-                    }))
-                    .children(
-                        grid.as_ref()
-                            .map(|table| super::grid_view::SelectionStats::of(table, cx)),
+                            .label("Count")
+                            .tooltip("Count every row of the result on the server")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.count_result(window, cx)),
+                            ),
                     )
-                    .when(grid.is_some() && has_more, |this| {
-                        this.child(
-                            Button::new("fetch-more")
-                                .ghost()
-                                .xsmall()
-                                .label("Fetch more")
-                                .on_click(cx.listener(|this, _, _, cx| this.fetch(false, cx))),
-                        )
-                        .child(
-                            Button::new("fetch-all")
-                                .ghost()
-                                .xsmall()
-                                .label("Fetch all")
-                                .on_click(cx.listener(|this, _, _, cx| this.fetch(true, cx))),
-                        )
-                    })
-                    .when(exportable, |this| {
-                        this.child(
-                            Button::new("result-export")
-                                .ghost()
-                                .xsmall()
-                                .label("Export…")
-                                .tooltip("Run the statement again and write all its rows to a file")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.export_result(window, cx);
-                                })),
-                        )
-                    })
-                    // Why its rows take no change.
-                    .children(read_only.map(|why| {
-                        div()
-                            .id("result-read-only")
-                            .test_support()
-                            .min_w_0()
-                            .truncate()
-                            .child(why.clone())
-                            .tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))
-                    }))
-                    // Which statement this is the result of.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_right()
-                            .font_family(mono)
-                            .child(SharedString::from(one_line(&pane.statement))),
-                    )
-                    .children(elapsed.map(SharedString::from)),
+                },
             )
+            .when(self.side.is_some(), |this| {
+                this.child("reading…").child(
+                    Button::new("result-side-cancel")
+                        .ghost()
+                        .xsmall()
+                        .label("Cancel")
+                        .tooltip("Stop the statement")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                )
+            })
+            .when(requery.is_some(), |this| {
+                this.child(auto_refresh_button(
+                    "result-auto-refresh",
+                    self.auto_refresh().filter(|_| auto_here),
+                    cx.entity(),
+                    |this, every, window, cx| this.set_auto_refresh(every, window, cx),
+                ))
+            })
+            .children(self.auto_refresh_stopped.map(|why| {
+                div()
+                    .id("result-auto-refresh-stopped")
+                    .test_support()
+                    .text_color(warning)
+                    .child(SharedString::from(format!("Auto-refresh stopped: {why}.")))
+            }))
+            .children(grid.clone().map(|table| {
+                Button::new("result-record")
+                    .ghost()
+                    .xsmall()
+                    .label("Record")
+                    .tooltip("One row as a list of its columns, or the grid again (Tab)")
+                    .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
+            }))
+            .children(
+                grid.as_ref()
+                    .map(|table| super::grid_view::SelectionStats::of(table, cx)),
+            )
+            .when(grid.is_some() && has_more, |this| {
+                this.child(
+                    Button::new("fetch-more")
+                        .ghost()
+                        .xsmall()
+                        .label("Fetch more")
+                        .on_click(cx.listener(|this, _, _, cx| this.fetch(false, cx))),
+                )
+                .child(
+                    Button::new("fetch-all")
+                        .ghost()
+                        .xsmall()
+                        .label("Fetch all")
+                        .on_click(cx.listener(|this, _, _, cx| this.fetch(true, cx))),
+                )
+            })
+            .when(exportable, |this| {
+                this.child(
+                    Button::new("result-export")
+                        .ghost()
+                        .xsmall()
+                        .label("Export…")
+                        .tooltip("Run the statement again and write all its rows to a file")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.export_result(window, cx);
+                        })),
+                )
+            })
+            // Why its rows take no change.
+            .children(read_only.map(|why| {
+                div()
+                    .id("result-read-only")
+                    .test_support()
+                    .min_w_0()
+                    .truncate()
+                    .child(why.clone())
+                    .tooltip(move |window, cx| Tooltip::new(why.clone()).build(window, cx))
+            }))
+            // Which statement this is the result of.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_right()
+                    .font_family(mono)
+                    .child(SharedString::from(one_line(&pane.statement))),
+            )
+            .children(elapsed.map(SharedString::from))
+            .into_any_element();
+        (filter_bar, edit_bar, footer)
     }
 }
 
@@ -6206,9 +6636,17 @@ impl Render for QueryTab {
         } else {
             Panels::Editor
         };
+        // Stacked results have no result tab bar (J11).
+        let stacked = self.stacked(cx) && !self.results.is_empty();
         // The result on screen is scrolled into the tab bar's view.
         let shown = self.results.get(self.active_result).map(|pane| pane.id);
-        if panels != Panels::Editor && shown.is_some() && self.revealed_result != shown {
+        // Stacked, the list scrolls to it (an error that ended the run).
+        if panels != Panels::Editor && stacked && shown.is_some() && self.revealed_result != shown {
+            self.stack_list.scroll_to_reveal_item(self.active_result);
+            self.revealed_result = shown;
+        }
+        if panels != Panels::Editor && !stacked && shown.is_some() && self.revealed_result != shown
+        {
             self.results_scroll.scroll_to_item(self.active_result);
             // Before the bar's first layout there is no width to scroll in.
             if self.results_scroll.bounds().size.width > px(0.) {
@@ -6294,7 +6732,11 @@ impl Render for QueryTab {
                     }
                 }
             }))
-            .child(self.render_results(cx));
+            .child(if stacked {
+                self.render_stacked(cx)
+            } else {
+                self.render_results(cx).into_any_element()
+            });
         // The environment's colour frames the editor and the results.
         let chrome = self
             .target

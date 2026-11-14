@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kerno_core::config::{
-    ConnectionConfig, Engine, ObjectFilter, Secret, Secrets, SshAuth, SshClient, SshConfig,
-    TlsConfig, TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
+    ConnectionConfig, DEFAULT_COMMAND_TIMEOUT, Engine, ObjectFilter, PasswordSource, Secret,
+    Secrets, SshAuth, SshClient, SshConfig, TlsConfig, TlsMode, bootstrap_refusal,
+    is_secret_option, parse_connection_url,
 };
 use kerno_core::sql::{LexRules, split_statements};
 
@@ -18,6 +19,11 @@ pub enum Field {
     Host,
     Port,
     User,
+    PasswordSource,
+    PasswordProgram,
+    PasswordTimeout,
+    RdsRegion,
+    OpReference,
     Options,
     InitSql,
     CaFile,
@@ -86,6 +92,49 @@ impl SshAuthKind {
     }
 }
 
+/// Where the database password comes from, as chosen in the dialog (J3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PasswordChoice {
+    /// Saved in the secret store (or `~/.pgpass` / `~/.my.cnf` when empty).
+    #[default]
+    Keychain,
+    /// Asked at each connect.
+    Ask,
+    /// A command of the user's.
+    Command,
+    /// `aws rds generate-db-auth-token`.
+    RdsIam,
+    /// `op read`.
+    OnePassword,
+}
+
+impl PasswordChoice {
+    pub const ALL: [PasswordChoice; 5] = [
+        Self::Keychain,
+        Self::Ask,
+        Self::Command,
+        Self::RdsIam,
+        Self::OnePassword,
+    ];
+
+    /// The label; `persistent` is false when no system secret store is used.
+    pub fn label(self, persistent: bool) -> &'static str {
+        match self {
+            Self::Keychain if persistent => "Keychain",
+            Self::Keychain => "Until Kerno quits",
+            Self::Ask => "Ask each time",
+            Self::Command => "Command",
+            Self::RdsIam => "AWS RDS IAM",
+            Self::OnePassword => "1Password",
+        }
+    }
+
+    /// Whether a program prints the password.
+    pub fn runs_a_command(self) -> bool {
+        matches!(self, Self::Command | Self::RdsIam | Self::OnePassword)
+    }
+}
+
 /// The dialog's fields, as the user typed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionForm {
@@ -99,7 +148,17 @@ pub struct ConnectionForm {
     pub port: String,
     pub user: String,
     pub password: String,
-    pub save_password: bool,
+    pub password_choice: PasswordChoice,
+    /// The command's program.
+    pub command_program: String,
+    /// Its arguments, one per line (no shell: a line is one argument).
+    pub command_args: String,
+    pub command_timeout: String,
+    pub rds_profile: String,
+    pub rds_region: String,
+    pub op_reference: String,
+    /// The command came from an imported file and is not confirmed yet.
+    pub command_unconfirmed: bool,
     pub database: String,
     /// Extra driver options, one `key=value` per line.
     pub options: String,
@@ -172,6 +231,35 @@ impl ConnectionForm {
             Some(SshAuth::Agent { socket }) => (SshAuthKind::Agent, String::new(), text(socket)),
             None => (SshAuthKind::default(), String::new(), String::new()),
         };
+        let mut command = (
+            String::new(),
+            String::new(),
+            DEFAULT_COMMAND_TIMEOUT.to_string(),
+        );
+        let (mut rds_profile, mut rds_region, mut op_reference) =
+            (String::new(), String::new(), String::new());
+        let password_choice = match &config.password_source {
+            PasswordSource::Stored if config.save_password => PasswordChoice::Keychain,
+            PasswordSource::Stored => PasswordChoice::Ask,
+            PasswordSource::Command {
+                program,
+                args,
+                timeout_secs,
+            } => {
+                command = (program.clone(), args.join("\n"), timeout_secs.to_string());
+                PasswordChoice::Command
+            }
+            PasswordSource::RdsIam { profile, region } => {
+                rds_profile = profile.clone().unwrap_or_default();
+                rds_region = region.clone();
+                PasswordChoice::RdsIam
+            }
+            PasswordSource::OnePassword { reference } => {
+                op_reference = reference.clone();
+                PasswordChoice::OnePassword
+            }
+        };
+        let (command_program, command_args, command_timeout) = command;
         Self {
             engine: config.engine,
             name: config.name.clone(),
@@ -182,7 +270,14 @@ impl ConnectionForm {
             port: config.port.to_string(),
             user: config.user.clone(),
             password: secret(&secrets.password),
-            save_password: config.save_password,
+            password_choice,
+            command_program,
+            command_args,
+            command_timeout,
+            rds_profile,
+            rds_region,
+            op_reference,
+            command_unconfirmed: config.password_command_unconfirmed,
             database: config.database.clone().unwrap_or_default(),
             options: config
                 .options
@@ -259,6 +354,57 @@ impl ConnectionForm {
             }
         }
         self.ssh_client = client;
+    }
+
+    /// Chooses where the password comes from. AWS RDS IAM sends its token
+    /// over TLS only: a mode that may go without it becomes `require`.
+    pub fn set_password_choice(&mut self, choice: PasswordChoice) {
+        self.password_choice = choice;
+        if choice == PasswordChoice::RdsIam
+            && matches!(self.tls_mode, TlsMode::Disable | TlsMode::Prefer)
+        {
+            self.tls_mode = TlsMode::Require;
+        }
+    }
+
+    /// The password source the fields describe, unchecked.
+    fn password_source(&self) -> PasswordSource {
+        let trimmed = |text: &str| text.trim().to_string();
+        match self.password_choice {
+            PasswordChoice::Keychain | PasswordChoice::Ask => PasswordSource::Stored,
+            PasswordChoice::Command => PasswordSource::Command {
+                program: trimmed(&self.command_program),
+                // One argument per line, kept as typed but for its line end.
+                args: self
+                    .command_args
+                    .lines()
+                    .map(|line| line.trim_end_matches('\r').to_string())
+                    .filter(|line| !line.trim().is_empty())
+                    .collect(),
+                timeout_secs: self.command_timeout.trim().parse().unwrap_or(0),
+            },
+            PasswordChoice::RdsIam => PasswordSource::RdsIam {
+                profile: Some(trimmed(&self.rds_profile)).filter(|p| !p.is_empty()),
+                region: trimmed(&self.rds_region),
+            },
+            PasswordChoice::OnePassword => PasswordSource::OnePassword {
+                reference: trimmed(&self.op_reference),
+            },
+        }
+    }
+
+    /// The command line the password choice runs, as the user will see it
+    /// before confirming it; `None` when no program runs.
+    pub fn command_display(&self) -> Option<String> {
+        let config = ConnectionConfig {
+            host: self.host.trim().to_string(),
+            port: self.port.trim().parse().unwrap_or(0),
+            user: self.user.trim().to_string(),
+            database: Some(self.database.trim().to_string()).filter(|d| !d.is_empty()),
+            password_source: self.password_source(),
+            ..ConnectionConfig::new(self.engine)
+        };
+        kerno_core::password::command_line(&config, None).map(|line| line.display())
     }
 
     /// Fills the fields a connection URL carries. Fields the URL does not
@@ -512,6 +658,45 @@ impl ConnectionForm {
             None
         };
 
+        let password_source = self.password_source();
+        match &password_source {
+            PasswordSource::Stored => {}
+            PasswordSource::Command { program, .. } => {
+                if program.is_empty() {
+                    errors.push(error(Field::PasswordProgram, "Enter the program to run"));
+                }
+                if !(1..=120).contains(&self.command_timeout.trim().parse::<u16>().unwrap_or(0)) {
+                    errors.push(error(
+                        Field::PasswordTimeout,
+                        "Enter a number of seconds between 1 and 120",
+                    ));
+                }
+            }
+            PasswordSource::RdsIam { region, .. } => {
+                if region.is_empty() {
+                    errors.push(error(
+                        Field::RdsRegion,
+                        "Enter the AWS region (us-east-1, …)",
+                    ));
+                }
+                if matches!(self.tls_mode, TlsMode::Disable | TlsMode::Prefer) {
+                    errors.push(error(
+                        Field::PasswordSource,
+                        "AWS RDS IAM sends its token over TLS only: choose require or a \
+                         verifying mode on the SSL / TLS tab",
+                    ));
+                }
+            }
+            PasswordSource::OnePassword { reference } => {
+                if !reference.starts_with("op://") {
+                    errors.push(error(
+                        Field::OpReference,
+                        "A reference starts with op:// (op://vault/item/field)",
+                    ));
+                }
+            }
+        }
+
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -534,7 +719,7 @@ impl ConnectionForm {
             environment: self.environment.clone(),
             color: self.color.clone(),
             group: kerno_core::config::folder_path(&self.group),
-            save_password: self.save_password,
+            save_password: self.password_choice != PasswordChoice::Ask,
             options,
             auto_commit: self.auto_commit,
             // MySQL and MariaDB have no schemas: the database is the default.
@@ -545,13 +730,18 @@ impl ConnectionForm {
             ignore_init_errors: self.ignore_init_errors,
             navigator_filters: self.navigator_filters.clone(),
             client_dir: self.client_dir.clone(),
+            password_command_unconfirmed: self.command_unconfirmed && !password_source.is_stored(),
+            password_source,
         };
         // Secrets are kept exactly as typed (a password may start or end
         // with a space), and only the ones the chosen methods use.
         let secret = |value: &str| (!value.is_empty()).then(|| Secret::new(value));
         let ssh_auth = self.ssh_enabled.then_some(self.ssh_auth);
         let secrets = Secrets {
-            password: secret(&self.password),
+            // A command prints the password: nothing typed is kept for it.
+            password: (!self.password_choice.runs_a_command())
+                .then(|| secret(&self.password))
+                .flatten(),
             ssh_password: (ssh_auth == Some(SshAuthKind::Password))
                 .then(|| secret(&self.ssh_password))
                 .flatten(),
@@ -586,7 +776,8 @@ mod tests {
             (form.host.as_str(), form.port.as_str(), form.user.as_str()),
             ("localhost", "5432", "postgres")
         );
-        assert!(form.save_password && !form.ssh_enabled && !form.read_only);
+        assert!(form.password_choice == PasswordChoice::Keychain);
+        assert!(!form.ssh_enabled && !form.read_only);
         assert_eq!(form.tls_mode, TlsMode::Prefer);
 
         let (config, secrets) = form.build().unwrap();
@@ -953,5 +1144,86 @@ mod tests {
         );
         form.group = " / ".into();
         assert_eq!(form.build().unwrap().0.group, None);
+    }
+
+    /// J3: each password choice builds its source and round-trips; a
+    /// command keeps no typed password; RDS IAM moves TLS to require; an
+    /// imported command stays unconfirmed until the dialog confirms it.
+    #[test]
+    fn password_choices_build_their_sources() {
+        let mut form = ConnectionForm::new(Engine::Postgres);
+        form.password = "typed".into();
+        form.set_password_choice(PasswordChoice::Ask);
+        let (config, secrets) = form.build().unwrap();
+        assert!(!config.save_password && config.password_source.is_stored());
+        assert_eq!(secrets.password.unwrap().expose(), "typed");
+
+        form.set_password_choice(PasswordChoice::Command);
+        let errors = form.build().unwrap_err();
+        assert_eq!(fields(&errors), [Field::PasswordProgram]);
+        form.command_program = " vault ".into();
+        form.command_args = "read\r\n\nsecret/${host} with spaces\n".into();
+        form.command_timeout = "0".into();
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::PasswordTimeout]);
+        form.command_timeout = "30".into();
+        let (config, secrets) = form.build().unwrap();
+        assert_eq!(
+            config.password_source,
+            PasswordSource::Command {
+                program: "vault".into(),
+                args: vec!["read".into(), "secret/${host} with spaces".into()],
+                timeout_secs: 30,
+            }
+        );
+        assert!(config.save_password, "SSH secrets are still saved");
+        assert_eq!(secrets.password, None, "the typed password is not kept");
+        assert_eq!(
+            form.command_display().as_deref(),
+            Some("vault read 'secret/localhost with spaces'")
+        );
+        assert_eq!(
+            ConnectionForm::from_saved(&config, &secrets).command_args,
+            "read\nsecret/${host} with spaces"
+        );
+
+        assert_eq!(form.tls_mode, TlsMode::Prefer);
+        form.set_password_choice(PasswordChoice::RdsIam);
+        assert_eq!(form.tls_mode, TlsMode::Require, "RDS IAM needs TLS");
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::RdsRegion]);
+        form.rds_region = "eu-west-3".into();
+        form.tls_mode = TlsMode::Disable;
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::PasswordSource]);
+        form.tls_mode = TlsMode::VerifyFull;
+        let (config, _) = form.build().unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.password_source,
+            PasswordSource::RdsIam {
+                profile: None,
+                region: "eu-west-3".into()
+            }
+        );
+        assert_eq!(
+            ConnectionForm::from_saved(&config, &Secrets::default()).password_choice,
+            PasswordChoice::RdsIam
+        );
+
+        form.set_password_choice(PasswordChoice::OnePassword);
+        form.op_reference = "Work/db".into();
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::OpReference]);
+        form.op_reference = "op://Work/db/password".into();
+        let (mut config, _) = form.build().unwrap();
+        assert_eq!(
+            form.command_display().as_deref(),
+            Some("op read op://Work/db/password")
+        );
+
+        // Imported: kept unconfirmed through the form until confirmed.
+        config.password_command_unconfirmed = true;
+        let mut imported = ConnectionForm::from_saved(&config, &Secrets::default());
+        assert!(imported.command_unconfirmed);
+        assert!(imported.build().unwrap().0.password_command_unconfirmed);
+        imported.command_unconfirmed = false;
+        assert!(!imported.build().unwrap().0.password_command_unconfirmed);
     }
 }

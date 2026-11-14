@@ -290,9 +290,15 @@ impl Forward {
             SshError::Other(format!("could not open the askpass socket: {error}"))
         })?;
 
+        // Kerno's own configuration file, so its rules reach the `ssh` of
+        // every jump host too (`-J` hands `-F` on, not the `-o` options).
+        let guard = dir.join("config");
+        std::fs::write(&guard, guard_config(request.env.aliases_from.as_deref())).map_err(
+            |error| SshError::Other(format!("could not write the tunnel's ssh config: {error}")),
+        )?;
         let args = tunnel_args(
             request.ssh,
-            request.env.config.as_deref(),
+            Some(&guard),
             &socket,
             request.db_host,
             request.db_port,
@@ -383,6 +389,13 @@ impl Forward {
         })
     }
 
+    /// The tunnel's private directory (its socket and its `ssh` config):
+    /// the command line of every `ssh` of the tunnel, a jump host's
+    /// included, names it.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The socket that leads to the database.
     pub fn socket(&self) -> &Path {
         &self.socket
@@ -447,6 +460,25 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// A new directory only this user can enter, with a short path: a Unix
 /// socket path is limited to about 100 bytes.
+/// The configuration every tunnel's `ssh` reads (`-F`), jump hosts
+/// included: no password and no keyboard-interactive login, so no server
+/// can put a question of its own in front of the askpass (one worded like
+/// the key's passphrase question would be answered); then the user's file
+/// and the system's, which `-F` would otherwise leave out. The first value
+/// of an option wins, so these three cannot be overridden below.
+fn guard_config(user: Option<&Path>) -> String {
+    let mut text =
+        String::from("KbdInteractiveAuthentication no\nPasswordAuthentication no\nBatchMode no\n");
+    // A path that cannot be quoted is left out rather than half-read.
+    if let Some(user) = user.and_then(Path::to_str)
+        && !user.contains(['"', '\n'])
+    {
+        text.push_str(&format!("Include \"{user}\"\n"));
+    }
+    text.push_str("Include /etc/ssh/ssh_config\n");
+    text
+}
+
 fn private_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt as _;
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -524,13 +556,20 @@ fn decide(prompt: &str, asker: u32, answers: &Answers, observed: &mut Observed) 
         return None;
     }
     if prompt.to_ascii_lowercase().contains("passphrase") {
-        let named = quoted(prompt).unwrap_or_default();
-        let ours = answers
-            .key
-            .as_deref()
-            .is_some_and(|key| !named.is_empty() && key.starts_with(named));
+        // Exactly OpenSSH's own question for exactly this key (it cuts the
+        // path at 100 characters): nothing a server could word differently.
+        let named = prompt
+            .strip_prefix("Enter passphrase for key '")
+            .and_then(|rest| rest.strip_suffix("': "))
+            .unwrap_or_default();
+        let ours = answers.key.as_deref().is_some_and(|key| {
+            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(named)))
+        });
         if !ours {
-            observed.other_key = Some(named.to_string());
+            // A question in other words names no key worth reporting.
+            if !named.is_empty() {
+                observed.other_key = Some(named.to_string());
+            }
             return None;
         }
         // Asked twice by the same `ssh`: the first answer did not open it.
@@ -1057,6 +1096,18 @@ mod tests {
     }
 
     #[test]
+    fn the_tunnel_config_forbids_server_questions_before_any_other_file() {
+        let text = guard_config(Some(Path::new("/home/ada/.ssh/my config")));
+        assert_eq!(
+            text,
+            "KbdInteractiveAuthentication no\nPasswordAuthentication no\nBatchMode no\n\
+             Include \"/home/ada/.ssh/my config\"\nInclude /etc/ssh/ssh_config\n"
+        );
+        assert!(!guard_config(Some(Path::new("/a\"b"))).contains("/a"));
+        assert!(guard_config(None).starts_with("KbdInteractiveAuthentication no\n"));
+    }
+
+    #[test]
     fn the_passphrase_goes_to_its_own_key_once() {
         let key = "/a/very/long/path/to/a/key/file/that/ssh/cuts/after/a/hundred/characters/when/it/asks/for/id_ed25519_enc";
         let prompt = format!("Enter passphrase for key '{}': ", &key[..100]);
@@ -1086,6 +1137,21 @@ mod tests {
             Some("/home/ada/.ssh/id_other")
         );
         assert_eq!(observed.passphrase, None);
+
+        // A prefix of the key's path, or the question inside other words
+        // (a server's own prompt), is not OpenSSH's question for this key.
+        let short = answers(Some("/home/ada/.ssh/id_ed25519"), Some("s3cret"), None);
+        for spoofed in [
+            "Enter passphrase for key '/home/ada/.ssh/id': ",
+            "Enter passphrase for key '/': ",
+            "bastion says: Enter passphrase for key '/home/ada/.ssh/id_ed25519': ",
+            "Enter passphrase for key '/home/ada/.ssh/id_ed25519': again",
+        ] {
+            assert!(
+                decide(spoofed, 7, &short, &mut Observed::default()).is_none(),
+                "{spoofed}"
+            );
+        }
 
         // Passwords and anything else: refused.
         for prompt in ["kerno@bastion's password: ", "Verification code: ", ""] {

@@ -2,13 +2,15 @@
 //! one is configured, then asks the driver for sessions that go through it.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::config::{ConnectParams, ConnectionConfig, Secrets, SshClient};
+use crate::config::{ConnectParams, ConnectionConfig, Secret, Secrets, SshClient};
 use crate::driver::{Driver, Session};
 use crate::error::{Error, Result};
 use crate::exec;
 use crate::openssh::{self, OpenSshEnv, OpenSshRequest};
+use crate::password::{self, PasswordEnv, PasswordOrigin};
 use crate::ssh::{SshError, Tunnel, TunnelRequest};
 
 /// Where SSH host keys are looked up and recorded.
@@ -25,7 +27,14 @@ pub struct HostKeyStore {
     /// found). OpenSSH keeps its own known_hosts: the files above are the
     /// built-in client's.
     pub openssh: Option<OpenSshEnv>,
+    /// Where password files and commands are looked for (J3). `None`
+    /// reads no file and runs no command: only the given password is used.
+    pub password: Option<PasswordEnv>,
 }
+
+/// How long a password a command printed is used for new sessions before
+/// the command runs again (an RDS IAM token lasts 15 minutes).
+const COMMAND_PASSWORD_REUSE: Duration = Duration::from_secs(10 * 60);
 
 /// Opens the SSH tunnel of `config`, if it has one, with the client it
 /// names. Every tunnel of the app is opened here.
@@ -76,6 +85,12 @@ pub struct Connector {
     config: ConnectionConfig,
     secrets: Secrets,
     tunnel: Option<Arc<Tunnel>>,
+    password_env: Option<PasswordEnv>,
+    /// What the password command last printed, and when (memory only).
+    command_password: Mutex<Option<(Secret, Instant)>>,
+    /// Where the last session's password came from, and a password file
+    /// that was ignored.
+    last_password: Mutex<(Option<PasswordOrigin>, Option<String>)>,
 }
 
 impl std::fmt::Debug for Connector {
@@ -109,19 +124,77 @@ impl Connector {
             config,
             secrets,
             tunnel,
+            password_env: host_keys.password.clone(),
+            command_password: Mutex::new(None),
+            last_password: Mutex::new((None, None)),
         })
+    }
+
+    /// The password of a new session in `database`: the stored one, a
+    /// password file's, or the command's (run again once
+    /// [`COMMAND_PASSWORD_REUSE`] has passed).
+    async fn password(&self, database: Option<&str>) -> Result<Option<Secret>> {
+        let command = !self.config.password_source.is_stored();
+        let recent = self
+            .command_password
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .filter(|(_, at)| command && at.elapsed() < COMMAND_PASSWORD_REUSE);
+        if let Some((secret, _)) = recent {
+            return Ok(Some(secret));
+        }
+        let resolved = password::resolve(
+            &self.config,
+            self.secrets.password.as_ref(),
+            database,
+            self.password_env.as_ref(),
+        )
+        .await?;
+        if command && let Some(secret) = &resolved.password {
+            *self
+                .command_password
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((secret.clone(), Instant::now()));
+        }
+        *self
+            .last_password
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (resolved.origin, resolved.warning);
+        Ok(resolved.password)
+    }
+
+    /// Where the password of the last session came from (`None`: no
+    /// password was sent).
+    pub fn password_origin(&self) -> Option<PasswordOrigin> {
+        self.last_password
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .clone()
+    }
+
+    /// A password file the last session could not use, and why.
+    pub fn password_warning(&self) -> Option<String> {
+        self.last_password
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .clone()
     }
 
     /// Opens a session in `database`, or in the connection's default
     /// database when `None`.
     pub async fn session(&self, database: Option<&str>) -> Result<Arc<dyn Session>> {
+        let password = self.password(database).await?;
         let params = ConnectParams {
             engine: self.config.engine,
             host: self.config.host.clone(),
             port: self.config.port,
             tunnel: self.tunnel.clone(),
             user: self.config.user.clone(),
-            password: self.secrets.password.clone(),
+            password,
             database: database
                 .map(str::to_string)
                 .or_else(|| self.config.database.clone())
@@ -133,6 +206,14 @@ impl Connector {
         let mark = self.tunnel.as_ref().map(|tunnel| tunnel.forward_mark());
         let session = match self.driver.connect(&params).await {
             Ok(session) => session,
+            // A password file was ignored: say so, rather than only that a
+            // password is missing.
+            Err(Error::PasswordRequired) if self.password_warning().is_some() => {
+                let warning = self.password_warning().unwrap_or_default();
+                return Err(Error::Connect(format!(
+                    "{warning} The server asks for a password and none was given."
+                )));
+            }
             Err(error) => {
                 // OpenSSH tells why a forward failed only in its messages.
                 if let (Some(tunnel), Some(mark)) = (&self.tunnel, mark)

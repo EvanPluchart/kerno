@@ -479,7 +479,7 @@ impl Navigator {
 
     /// Opens or closes the row `id`, whatever it is: a folder (remembered),
     /// a connection (opening it connects it), or an object.
-    fn set_open(&mut self, id: &str, open: bool, cx: &mut Context<Self>) {
+    pub fn set_open(&mut self, id: &str, open: bool, cx: &mut Context<Self>) {
         match model::parse_row(id) {
             Some(RowId::Folder(path)) => set_collapsed(path, !open, cx),
             Some(RowId::Connection(connection)) if open => self.open_connection(connection, cx),
@@ -2518,8 +2518,7 @@ impl Navigator {
 
     /// The rows under the row of `connection` (absolute index, depth below
     /// it, label), without the lines that say what the connection is
-    /// doing; for tests.
-    #[cfg(test)]
+    /// doing; for tests and the bench.
     fn rows_under(&self, connection: &str, cx: &App) -> Vec<(usize, usize, SharedString)> {
         let state = self.tree_state.read(cx);
         let Some(start) = state.index_of(&model::connection_row(connection).into()) else {
@@ -2557,8 +2556,7 @@ impl Navigator {
             .unwrap_or_default()
     }
 
-    /// The id of the row at `row`; for tests.
-    #[cfg(test)]
+    /// The id of the row at `row`; for tests and the bench.
     pub fn id_at(&self, row: usize, cx: &App) -> String {
         self.tree_state
             .read(cx)
@@ -2623,8 +2621,7 @@ impl Navigator {
     }
 
     /// The row reached by these labels from the current connection's
-    /// first level down; for tests.
-    #[cfg(test)]
+    /// first level down; for tests and the bench.
     pub fn row_of(&self, label_path: &[&str], cx: &App) -> Option<usize> {
         let rows = self.rows_under(self.current.as_deref()?, cx);
         let mut depth = 0;
@@ -2857,6 +2854,7 @@ impl Navigator {
         let connections = self.connections.read(cx);
         let saved = &connections.saved()[at];
         let config = &saved.config;
+        let password_origin = connections.password_origin(&saved.id);
         let (state_label, state_color) = match connections.status(&saved.id) {
             Status::Disconnected => (config.engine.label(), theme.muted_foreground),
             Status::Connecting => ("connecting…", theme.muted_foreground),
@@ -2907,12 +2905,40 @@ impl Navigator {
                             .truncate()
                             .child(entry.item().label.clone()),
                     )
+                    // Opened from a URL (`kerno <url>`): gone at quit unless
+                    // its menu saves it.
+                    .when(connections.is_unsaved(&saved.id), |this| {
+                        this.child(
+                            div()
+                                .id(("connection-unsaved", at))
+                                .test_support()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("unsaved")
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Opened from a URL, not saved: its menu saves it")
+                                        .build(window, cx)
+                                }),
+                        )
+                    })
                     .child(
                         div()
+                            .id(("connection-state", at))
                             .flex_none()
                             .text_xs()
                             .text_color(state_color)
-                            .child(state_label),
+                            .child(state_label)
+                            // Where the password came from (J3).
+                            .when_some(password_origin, |this, origin| {
+                                this.tooltip(move |window, cx| {
+                                    Tooltip::new(origin.clone()).build(window, cx)
+                                })
+                            }),
                     ),
             )
     }

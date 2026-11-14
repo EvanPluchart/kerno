@@ -484,6 +484,9 @@ mod tests {
             ("muted.foreground", "table.active.background"),
             ("foreground", "list.hover.background"),
             ("foreground", "list.active.background"),
+            // The side list of tabs and the headers of stacked results (J10, J11).
+            ("muted.foreground", "list.active.background"),
+            ("muted.foreground", "tab_bar.background"),
             ("foreground", "selection.background"),
             // Semantic colours used as text (error messages, links).
             ("danger.background", "background"),

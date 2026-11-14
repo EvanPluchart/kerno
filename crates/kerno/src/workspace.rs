@@ -8,14 +8,16 @@ use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, TitleBar, WindowExt as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, TitleBar,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -66,6 +68,7 @@ use crate::navigator::actions::ToolEntry;
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
+use crate::settings::TabLayout;
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
@@ -78,17 +81,24 @@ use crate::theme::{self, Appearance};
 use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::WeakFocusHandle;
 use gpui_kit::component::Disableable as _;
-use kerno_core::TxState;
 use kerno_core::browse::Filter;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::CellValue;
 use kerno_core::storage::SavedQuery;
+use kerno_core::{Engine, TxState};
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
 
 /// How many closed query tabs can be reopened.
 const CLOSED_TABS: usize = 10;
+
+/// The height of a tab of the kit (its default size), a row of the tabs.
+const TAB_HEIGHT: gpui_kit::Pixels = px(32.);
+/// The rows of tabs shown before they scroll.
+const TAB_ROWS: usize = 4;
+/// The list of every open tab gets a filter past this many.
+const FILTER_TABS_OVER: usize = 15;
 
 pub(crate) mod toolbar;
 pub(crate) mod updates;
@@ -376,8 +386,13 @@ pub struct Workspace {
     shown_tab: Rc<Cell<Option<EntityId>>>,
     /// The scroll of the tab strip.
     tab_scroll: ScrollHandle,
-    /// The active tab and the tab count the strip last scrolled for.
-    revealed_tab: Option<(usize, usize)>,
+    /// The active tab, the tab count and the layout the strip last
+    /// scrolled for.
+    revealed_tab: Option<(usize, usize, TabLayout)>,
+    /// The list of every open tab (J10) is open.
+    all_tabs_open: bool,
+    /// The filter of that list, shown when many tabs are open.
+    all_tabs_filter: Entity<InputState>,
     /// A dialog was open at the last frame: see `keep_focus`.
     dialog_open: bool,
     /// What had the keyboard in the window, while no dialog was open.
@@ -416,6 +431,12 @@ impl Workspace {
         let navigator_events = cx.subscribe_in(&navigator, window, Self::on_navigator_event);
         let connection_events = cx.subscribe_in(&connections, window, Self::on_connections_event);
         let sidebar_events = cx.subscribe_in(&sidebar, window, Self::on_sidebar_event);
+        let all_tabs_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter tabs"));
+        let all_tabs_filtered = cx.subscribe(&all_tabs_filter, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
 
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
@@ -432,6 +453,8 @@ impl Workspace {
             shown_tab: Rc::new(Cell::new(None)),
             tab_scroll: ScrollHandle::new(),
             revealed_tab: None,
+            all_tabs_open: false,
+            all_tabs_filter,
             dialog_open: false,
             last_focus: None,
             tab_subscriptions: Vec::new(),
@@ -441,6 +464,7 @@ impl Workspace {
                 connection_events,
                 navigator_events,
                 sidebar_events,
+                all_tabs_filtered,
             ],
         };
         for snapshot in tabs {
@@ -554,18 +578,21 @@ impl Workspace {
         self.tabs.get(index)?.admin().cloned()
     }
 
-    /// Whether the active tab is wholly inside the tab strip, and whether
-    /// the strip overflows; for tests.
+    /// Whether the active tab is wholly inside the tab strip (the rows,
+    /// the side list), and whether it overflows; for tests.
     #[cfg(test)]
     pub fn active_tab_in_view(&self) -> (bool, bool) {
         let strip = &self.tab_scroll;
-        let (viewport, offset) = (strip.bounds(), strip.offset().x);
+        let (viewport, offset) = (strip.bounds(), strip.offset());
         // Item bounds are laid out unscrolled: on screen at x + offset.
         let inside = strip.bounds_for_item(self.active_tab).is_some_and(|tab| {
-            tab.left() + offset >= viewport.left() - px(1.)
-                && tab.right() + offset <= viewport.right() + px(1.)
+            tab.left() + offset.x >= viewport.left() - px(1.)
+                && tab.right() + offset.x <= viewport.right() + px(1.)
+                && tab.top() + offset.y >= viewport.top() - px(1.)
+                && tab.bottom() + offset.y <= viewport.bottom() + px(1.)
         });
-        (inside, strip.max_offset().x > px(0.))
+        let overflow = strip.max_offset();
+        (inside, overflow.x > px(0.) || overflow.y > px(0.))
     }
 
     /// Index of the active tab, when there is one.
@@ -1792,7 +1819,6 @@ impl Workspace {
     }
 
     /// The schema tree of the sidebar.
-    #[cfg(test)]
     pub fn navigator(&self, cx: &App) -> Entity<Navigator> {
         self.sidebar.read(cx).navigator().clone()
     }
@@ -3208,119 +3234,15 @@ impl Workspace {
                 .into_any_element();
         }
 
-        // The active tab's accent marker under its title: olive on light,
-        // Lime on dark (the theme's primary).
-        let (active, accent, none) = (self.active_tab, theme.primary, theme.transparent);
-        let marker = move |index| if index == active { accent } else { none };
-        let marked = |title: gpui_kit::Stateful<gpui_kit::Div>, index| {
-            title
-                .h_full()
-                .flex()
-                .items_center()
-                .border_b_2()
-                .border_color(marker(index))
-        };
-        let tab_bar = TabBar::new("tabs")
-            .track_scroll(&self.tab_scroll)
-            .selected_index(self.active_tab)
-            .on_click(
-                cx.listener(|this, index: &usize, window, cx| {
-                    this.activate_tab(*index, window, cx)
-                }),
-            )
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                // The connection's tag as a dot, then its engine's logo; the
-                // title takes the colour of its environment, when it has one.
-                let config = self.connection_config(tab.connection(cx).as_deref(), cx);
-                let dot = config
-                    .as_ref()
-                    .and_then(|config| theme::connection_color(config, cx));
-                let chrome = config
-                    .as_ref()
-                    .and_then(|config| theme::environment_chrome(config, cx));
-                Tab::new()
-                    .when_some(config.as_ref(), |tab, config| {
-                        tab.prefix(
-                            h_flex()
-                                .flex_none()
-                                .ml_1()
-                                .gap_1()
-                                .children(dot.map(|color| {
-                                    div()
-                                        .id(("tab-dot", index))
-                                        .test_support()
-                                        .flex_none()
-                                        .size(px(6.))
-                                        .rounded_full()
-                                        .bg(color)
-                                }))
-                                .child(
-                                    div()
-                                        .id(("tab-logo", index))
-                                        .test_support()
-                                        .flex_none()
-                                        .child(crate::engine_logo::engine_logo(
-                                            config.engine,
-                                            px(12.),
-                                            cx,
-                                        )),
-                                ),
-                        )
-                    })
-                    // A middle click closes the tab, as in a browser.
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.perform(Some(index), TabAction::Close, window, cx)
-                        }),
-                    )
-                    .child(
-                        div()
-                            .id(("tab-title", index))
-                            .map(|title| marked(title, index))
-                            .test_support()
-                            .context_menu(self.menu(MenuOf::Tab(index), cx))
-                            .map(|title| match chrome {
-                                // The kit's tab paints its own background, so
-                                // the tint goes on the title.
-                                Some(chrome) => title.child(
-                                    div()
-                                        .id(("tab-env", index))
-                                        .test_support()
-                                        .px_1()
-                                        .rounded_sm()
-                                        .bg(chrome.bar)
-                                        .text_color(chrome.bar_text)
-                                        .child(tab.label(cx)),
-                                ),
-                                None => title.child(tab.label(cx)),
-                            }),
-                    )
-                    .suffix(
-                        Button::new(("close-tab", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close tab")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // The click must not also reach the tab, which
-                                // would activate the tab being closed.
-                                cx.stop_propagation();
-                                this.perform(Some(index), TabAction::Close, window, cx)
-                            })),
-                    )
-            }))
-            .last_empty_space(
-                div()
-                    .id("tab-bar-empty")
-                    .test_support()
-                    .flex_1()
-                    .min_w(px(24.))
-                    .h_full()
-                    .context_menu(self.menu(MenuOf::Bar, cx)),
-            )
-            .suffix(
+        let (tab_bar_bg, border, muted) = (theme.tab_bar, theme.border, theme.muted_foreground);
+        let layout = AppState::get(cx).settings.tab_layout;
+        // The list of every tab, then a new one: at the end of the strip or
+        // of the rows, at the top of the side list.
+        let tools = h_flex()
+            .flex_none()
+            .items_center()
+            .child(self.render_all_tabs(cx))
+            .child(
                 Button::new("new-tab")
                     .ghost()
                     .xsmall()
@@ -3329,22 +3251,418 @@ impl Workspace {
                     .tooltip("New query tab")
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(NewQueryTab), cx)),
             );
-        v_flex()
-            .size_full()
-            .child(tab_bar)
-            .children(self.tabs.get(self.active_tab).map(|tab| {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(tab.view())
-                    // ⌘-wheel over an editor or a grid zooms them (J7).
-                    .when(
-                        matches!(tab, OpenTab::Query(_) | OpenTab::Data(_)),
-                        |area| area.child(crate::settings_view::zoom_wheel()),
-                    )
+        // The empty area after the tabs answers a right-click with the
+        // bar's menu, in every layout.
+        let empty = div()
+            .id("tab-bar-empty")
+            .test_support()
+            .flex_1()
+            .min_w(px(24.))
+            .context_menu(self.menu(MenuOf::Bar, cx));
+        // A middle click closes the tab, as in a browser.
+        let view = cx.entity().downgrade();
+        let middle_close = |index: usize, _: &mut Context<Self>| {
+            let view = view.clone();
+            move |_: &gpui_kit::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+                let _ = view.update(cx, |this, cx| {
+                    this.perform(Some(index), TabAction::Close, window, cx)
+                });
+            }
+        };
+        let activate = |index: usize, _: &mut Context<Self>| {
+            let view = view.clone();
+            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.activate_tab(index, window, cx));
+            }
+        };
+        let bar = match layout {
+            TabLayout::SingleRow => TabBar::new("tabs")
+                .track_scroll(&self.tab_scroll)
+                .selected_index(self.active_tab)
+                .on_click(cx.listener(|this, index: &usize, window, cx| {
+                    this.activate_tab(*index, window, cx)
+                }))
+                .children((0..self.tabs.len()).map(|index| {
+                    let (prefix, title, close) = self.tab_parts(index, true, cx);
+                    Tab::new()
+                        .when_some(prefix, |tab, prefix| tab.prefix(prefix))
+                        .on_mouse_down(MouseButton::Middle, middle_close(index, cx))
+                        .child(title)
+                        .suffix(close)
+                }))
+                .last_empty_space(empty.h_full())
+                .suffix(tools)
+                .into_any_element(),
+            // The rows wrap; past four they scroll (DBeaver #7114).
+            TabLayout::Rows => h_flex()
+                .id("tab-rows-bar")
+                .w_full()
+                .items_start()
+                .bg(tab_bar_bg)
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .id("tab-rows")
+                        .test_support()
+                        .flex()
+                        .flex_wrap()
+                        .flex_1()
+                        .min_w_0()
+                        .max_h(TAB_HEIGHT * TAB_ROWS as f32)
+                        .overflow_y_scroll()
+                        .track_scroll(&self.tab_scroll)
+                        .children((0..self.tabs.len()).map(|index| {
+                            let (prefix, title, close) = self.tab_parts(index, true, cx);
+                            // The kit's tab takes its index as its id: its
+                            // own wrapper keeps the ids apart.
+                            div().id(("tab-cell", index)).flex_none().child(
+                                Tab::new()
+                                    .selected(index == self.active_tab)
+                                    .when_some(prefix, |tab, prefix| tab.prefix(prefix))
+                                    .on_click(activate(index, cx))
+                                    .on_mouse_down(MouseButton::Middle, middle_close(index, cx))
+                                    .child(title)
+                                    .suffix(close),
+                            )
+                        }))
+                        .child(empty.h(TAB_HEIGHT)),
+                )
+                .child(tools.h(TAB_HEIGHT))
+                .into_any_element(),
+            // A list at the side (DBeaver #23248): the active row by its
+            // background, never a bar at its edge.
+            TabLayout::Vertical => v_flex()
+                .id("tab-list-panel")
+                .size_full()
+                .bg(tab_bar_bg)
+                .border_r_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .h(TAB_HEIGHT)
+                        .pl_3()
+                        .pr_1()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(SharedString::from(format!("{} tabs", self.tabs.len()))),
+                        )
+                        .child(tools),
+                )
+                .child(
+                    v_flex()
+                        .id("tab-list")
+                        .test_support()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.tab_scroll)
+                        .children((0..self.tabs.len()).map(|index| {
+                            let (prefix, title, close) = self.tab_parts(index, false, cx);
+                            ListItem::new(("tab-row", index))
+                                .selected(index == self.active_tab)
+                                .px_2()
+                                .py_0p5()
+                                .on_click(activate(index, cx))
+                                .on_mouse_down(MouseButton::Middle, middle_close(index, cx))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .children(prefix)
+                                        .child(div().flex_1().min_w_0().truncate().child(title))
+                                        .child(close),
+                                )
+                        }))
+                        .child(empty.min_h(TAB_HEIGHT)),
+                )
+                .into_any_element(),
+        };
+        let content = self.tabs.get(self.active_tab).map(|tab| {
+            div()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .relative()
+                .child(tab.view())
+                // ⌘-wheel over an editor or a grid zooms them (J7).
+                .when(
+                    matches!(tab, OpenTab::Query(_) | OpenTab::Data(_)),
+                    |area| area.child(crate::settings_view::zoom_wheel()),
+                )
+        });
+        match layout {
+            TabLayout::Vertical => h_resizable("tab-list-split")
+                .child(
+                    resizable_panel()
+                        .size(px(220.))
+                        .size_range(px(140.)..px(420.))
+                        .child(bar),
+                )
+                .child(resizable_panel().children(content))
+                .into_any_element(),
+            TabLayout::SingleRow | TabLayout::Rows => v_flex()
+                .size_full()
+                .child(bar)
+                .children(content)
+                .into_any_element(),
+        }
+    }
+
+    /// What every layout draws of tab `index`: the connection's dot and
+    /// engine logo, the title (in its environment's colour, with the tab's
+    /// menu; underlined when active, in the strip and the rows) and its
+    /// close button.
+    fn tab_parts(
+        &self,
+        index: usize,
+        underline: bool,
+        cx: &mut Context<Self>,
+    ) -> (Option<AnyElement>, AnyElement, AnyElement) {
+        let tab = &self.tabs[index];
+        let config = self.connection_config(tab.connection(cx).as_deref(), cx);
+        let dot = config
+            .as_ref()
+            .and_then(|config| theme::connection_color(config, cx));
+        let chrome = config
+            .as_ref()
+            .and_then(|config| theme::environment_chrome(config, cx));
+        let prefix = config.as_ref().map(|config| {
+            h_flex()
+                .flex_none()
+                .ml_1()
+                .gap_1()
+                .children(dot.map(|color| {
+                    div()
+                        .id(("tab-dot", index))
+                        .test_support()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(color)
+                }))
+                .child(
+                    div()
+                        .id(("tab-logo", index))
+                        .test_support()
+                        .flex_none()
+                        .child(crate::engine_logo::engine_logo(config.engine, px(12.), cx)),
+                )
+                .into_any_element()
+        });
+        // The active tab's accent marker under its title: olive on light,
+        // Lime on dark (the theme's primary).
+        let marker = if underline && index == self.active_tab {
+            cx.theme().primary
+        } else {
+            cx.theme().transparent
+        };
+        let title = div()
+            .id(("tab-title", index))
+            .h_full()
+            .flex()
+            .items_center()
+            .when(underline, |title| title.border_b_2().border_color(marker))
+            .test_support()
+            .context_menu(self.menu(MenuOf::Tab(index), cx))
+            .map(|title| match chrome {
+                // The kit's tab paints its own background, so the tint goes
+                // on the title.
+                Some(chrome) => title.child(
+                    div()
+                        .id(("tab-env", index))
+                        .test_support()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(chrome.bar)
+                        .text_color(chrome.bar_text)
+                        .child(tab.label(cx)),
+                ),
+                None => title.child(tab.label(cx)),
+            })
+            .into_any_element();
+        let close = Button::new(("close-tab", index))
+            .ghost()
+            .xsmall()
+            .flex_none()
+            .icon(IconName::Close)
+            .tooltip("Close tab")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                // The click must not also reach the tab, which would
+                // activate the tab being closed.
+                cx.stop_propagation();
+                this.perform(Some(index), TabAction::Close, window, cx)
             }))
-            .into_any_element()
+            .into_any_element();
+        (prefix, title, close)
+    }
+
+    /// The button that lists every open tab (J10, DBeaver #7114): engine
+    /// logo, title with its unsaved mark, environment dot, the active one
+    /// checked; a filter above them when more than [`FILTER_TABS_OVER`]
+    /// are open. A click shows the tab and scrolls the bar to it.
+    fn render_all_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries: Vec<(usize, SharedString, Option<Engine>, Option<Hsla>)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let config = self.connection_config(tab.connection(cx).as_deref(), cx);
+                let env = config
+                    .as_ref()
+                    .and_then(|config| theme::environment_chrome(config, cx))
+                    .map(|chrome| chrome.frame);
+                (
+                    index,
+                    tab.label(cx),
+                    config.map(|config| config.engine),
+                    env,
+                )
+            })
+            .collect();
+        let filtering = entries.len() > FILTER_TABS_OVER;
+        let filter = self.all_tabs_filter.clone();
+        let active = self.active_tab;
+        let view = cx.entity().downgrade();
+        let opened = view.clone();
+        // The filter takes the keyboard when the list opens.
+        let filter_focus = self.all_tabs_filter.read(cx).focus_handle(cx);
+        Popover::new("all-tabs")
+            .anchor(Anchor::TopRight)
+            .when(filtering, |popover| popover.track_focus(&filter_focus))
+            .open(self.all_tabs_open)
+            .on_open_change(move |open, window, cx| {
+                let _ = opened.update(cx, |this, cx| this.show_all_tabs(*open, window, cx));
+            })
+            .trigger(
+                Button::new("tabs-overflow")
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .icon(IconName::ChevronDown)
+                    .tooltip("All open tabs"),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                let typed = filter.read(cx).value().to_lowercase();
+                let rows = entries.iter().filter(|(_, label, _, _)| {
+                    !filtering || typed.is_empty() || label.to_lowercase().contains(&typed)
+                });
+                v_flex()
+                    .id("all-tabs-list")
+                    .test_support()
+                    .w(px(300.))
+                    .max_h(px(420.))
+                    .gap_1()
+                    .when(filtering, |list| {
+                        list.child(
+                            div()
+                                .id("all-tabs-filter")
+                                .test_support()
+                                .child(Input::new(&filter).small().cleanable(true)),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .id("all-tabs-rows")
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(rows.map(|(index, label, engine, env)| {
+                                let (index, view) = (*index, view.clone());
+                                ListItem::new(("all-tabs-item", index))
+                                    .selected(index == active)
+                                    .px_2()
+                                    .py_0p5()
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.show_all_tabs(false, window, cx);
+                                            this.activate_tab(index, window, cx);
+                                        });
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1p5()
+                                            .text_sm()
+                                            .child(div().w(px(14.)).flex_none().when(
+                                                index == active,
+                                                |mark| {
+                                                    mark.child(Icon::new(IconName::Check).xsmall())
+                                                },
+                                            ))
+                                            .children(env.map(|color| {
+                                                div()
+                                                    .flex_none()
+                                                    .size(px(6.))
+                                                    .rounded_full()
+                                                    .bg(color)
+                                            }))
+                                            .children(engine.map(|engine| {
+                                                div().flex_none().child(
+                                                    crate::engine_logo::engine_logo(
+                                                        engine,
+                                                        px(12.),
+                                                        cx,
+                                                    ),
+                                                )
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(label.clone()),
+                                            ),
+                                    )
+                            }))
+                            .when(filtering && !typed.is_empty(), |list| {
+                                list.when(
+                                    !entries.iter().any(|(_, label, _, _)| {
+                                        label.to_lowercase().contains(&typed)
+                                    }),
+                                    |list| {
+                                        list.child(
+                                            div()
+                                                .p_2()
+                                                .text_sm()
+                                                .text_color(theme.muted_foreground)
+                                                .child("No open tab matches."),
+                                        )
+                                    },
+                                )
+                            }),
+                    )
+            })
+    }
+
+    /// Opens or closes the list of every open tab; it opens with an empty
+    /// filter.
+    fn show_all_tabs(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if open == self.all_tabs_open {
+            return;
+        }
+        self.all_tabs_open = open;
+        if open {
+            self.all_tabs_filter
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Lays the tabs out on one row, several, or at the side (J10).
+    pub fn set_tab_layout(&mut self, layout: TabLayout, cx: &mut Context<Self>) {
+        AppState::update_settings(cx, |settings| settings.tab_layout = layout);
+        cx.notify();
     }
 
     /// What the status bar says, left to right: the active tab's
@@ -4091,6 +4409,26 @@ impl Workspace {
         .on_action(cx.listener(|_, _: &actions::ZoomReset, window, cx| {
             crate::settings_view::zoom_grid(None, window, cx)
         }))
+        // J10, J11: the tabs' layout, the list of every tab, stacked results.
+        .on_action(cx.listener(|this, _: &actions::TabsOnOneRow, _, cx| {
+            this.set_tab_layout(TabLayout::SingleRow, cx)
+        }))
+        .on_action(cx.listener(|this, _: &actions::TabsOnSeveralRows, _, cx| {
+            this.set_tab_layout(TabLayout::Rows, cx)
+        }))
+        .on_action(cx.listener(|this, _: &actions::TabsAtTheSide, _, cx| {
+            this.set_tab_layout(TabLayout::Vertical, cx)
+        }))
+        .on_action(cx.listener(|this, _: &actions::ShowAllTabs, window, cx| {
+            if !this.tabs.is_empty() {
+                this.show_all_tabs(true, window, cx)
+            }
+        }))
+        .on_action(
+            cx.listener(|_, _: &actions::ToggleStackedResults, window, cx| {
+                QueryTab::set_stacked(!AppState::get(cx).settings.stack_results, window, cx)
+            }),
+        )
         .on_action(
             cx.listener(|this, _: &actions::SelectAllOccurrences, window, cx| {
                 if let Some(tab) = this.active_query_tab().cloned() {
@@ -4487,7 +4825,11 @@ impl Render for Workspace {
         // The active tab is scrolled into view whenever it or the tabs
         // change (a tab opened, restored, closed or activated by key); a
         // scroll of the strip by hand is left alone until then.
-        let shown = (self.active_tab, self.tabs.len());
+        let shown = (
+            self.active_tab,
+            self.tabs.len(),
+            AppState::get(cx).settings.tab_layout,
+        );
         if self.revealed_tab != Some(shown) {
             self.tab_scroll.scroll_to_item(self.active_tab);
             // Before the strip's first layout there is no width to scroll

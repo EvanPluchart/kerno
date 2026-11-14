@@ -85,11 +85,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 
 use crate::config::{ConnectParams, Engine, Secret, TlsConfig, TlsMode};
 use crate::error::{Error, Result};
@@ -791,6 +791,9 @@ pub struct ToolCommand {
     pub password: Option<(&'static str, Secret)>,
     /// A file fed to the child's standard input.
     pub stdin: Option<PathBuf>,
+    /// How many bytes of `stdin` [`run`] has fed to the child so far: the
+    /// progress of a script, against the file's size.
+    pub sent: Arc<AtomicU64>,
     /// The SSH tunnel to open before starting the child.
     pub tunnel: Option<TunnelHop>,
     /// A script the child will read, which [`run`] checks with
@@ -2090,7 +2093,10 @@ fn sql_script_command(tool_path: &Path, params: &ConnectParams, script: &SqlScri
             // Without ON_ERROR_STOP psql goes on after a failed statement
             // and exits 0.
             args.push("--set=ON_ERROR_STOP=1".into());
-            args.push(format!("--file={}", script.input.display()));
+            // Read from the standard input, which `run` feeds and counts:
+            // `--file=<path>` would leave no way to show the progress.
+            args.push("--file=-".into());
+            command.stdin = Some(script.input.to_path_buf());
             command.script_check = check(Tool::Psql);
         }
         Engine::MySql | Engine::MariaDb => {
@@ -2197,6 +2203,7 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> ToolCommand {
             .filter(|password| !password.is_empty())
             .map(|password| (password_var, password)),
         stdin: None,
+        sent: Arc::default(),
         tunnel: params.tunnel.clone().map(|tunnel| TunnelHop {
             tunnel,
             host: params.host.clone(),
@@ -2337,11 +2344,18 @@ pub async fn run(
     if let Some((name, password)) = &command.password {
         child.env(name, password.expose());
     }
-    child.stdin(match &command.stdin {
-        Some(path) => std::fs::File::open(path)
-            .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?
-            .into(),
-        None => Stdio::null(),
+    let input = match &command.stdin {
+        Some(path) => Some(
+            tokio::fs::File::open(path)
+                .await
+                .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?,
+        ),
+        None => None,
+    };
+    child.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
     });
     child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child.spawn().map_err(|error| {
@@ -2350,6 +2364,11 @@ pub async fn run(
             error,
         )
     })?;
+    // Fed beside the reading of the output, and stopped with the child.
+    let feeding = input
+        .zip(child.stdin.take())
+        .map(|(input, pipe)| tokio::spawn(feed(input, pipe, command.sent.clone())));
+    let _feeding = Feeding(feeding);
 
     let mut stdout = child.stdout.take().map(BufReader::new);
     let mut stderr = child.stderr.take().map(BufReader::new);
@@ -2375,6 +2394,38 @@ pub async fn run(
                     return Err(Error::Cancelled);
                 }
             }
+        }
+    }
+}
+
+/// Copies `input` to the child's standard input, counting the bytes in
+/// `sent`, then closes it (the end of the script). Stops quietly when the
+/// child closes its end first: it stopped on an error, or was killed.
+async fn feed(
+    mut input: tokio::fs::File,
+    mut pipe: tokio::process::ChildStdin,
+    sent: Arc<AtomicU64>,
+) {
+    let mut chunk = vec![0; 256 * 1024];
+    loop {
+        let read = match input.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        if pipe.write_all(&chunk[..read]).await.is_err() {
+            return;
+        }
+        sent.fetch_add(read as u64, Ordering::Relaxed);
+    }
+}
+
+/// Aborts the feeding task when [`run`] returns, however it returns.
+struct Feeding(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for Feeding {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
         }
     }
 }
@@ -3042,7 +3093,7 @@ mod tests {
             command.display(),
             "PGSSLMODE=prefer PGPASSWORD=••• /usr/bin/psql --no-password --host=db.example.com \
              --port=6543 --username=ada --no-psqlrc --dbname=shop_copy --set=ON_ERROR_STOP=1 \
-             --single-transaction --file=/backups/shop.dump"
+             --single-transaction --file=- < /backups/shop.dump"
         );
         assert_eq!(
             command.script_check,
@@ -3301,7 +3352,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(command.script_check, None);
-        assert!(command.args.contains(&"--file=/backups/shop.dump".into()));
+        assert!(command.args.contains(&"--file=-".into()));
+        assert_eq!(command.stdin, Some(PathBuf::from("/backups/shop.dump")));
     }
 
     /// What [`scan`] finds in `text`: line and command.
@@ -4288,9 +4340,11 @@ mod tests {
                 "--dbname=shop",
                 "--set=ON_ERROR_STOP=1",
                 "--echo-errors",
-                "--file=/s/fix.sql"
+                "--file=-"
             ]
         );
+        // Fed through the standard input, which `run` counts.
+        assert_eq!(pg.stdin, Some(PathBuf::from("/s/fix.sql")));
         assert!(pg.script_check.is_some(), "client commands are checked");
         let mut mysql_only = ScriptOptions::new(Engine::Postgres, "shop", "/s/fix.sql");
         mysql_only.disable_foreign_keys = true;
@@ -5019,6 +5073,7 @@ mod tests {
             env: vec![("KERNO_VISIBLE".into(), "seen".into())],
             password: Some(("PGPASSWORD", Secret::new(PASSWORD))),
             stdin: None,
+            sent: Arc::default(),
             tunnel: None,
             script_check: None,
         }
@@ -5054,12 +5109,15 @@ mod tests {
         std::fs::write(&input, "SELECT 1;\nSELECT 2;\n").unwrap();
         let mut command = shell("cat");
         command.stdin = Some(input);
+        let sent = command.sent.clone();
         let (lines, on_line) = collect();
         let status = run(command, on_line, Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
         assert!(status.success());
         assert_eq!(*lines.lock().unwrap(), ["SELECT 1;", "SELECT 2;"]);
+        // Counted, for the progress of a script (CLAUDE.md §4 J9).
+        assert_eq!(sent.load(Ordering::Relaxed), 20);
 
         let mut missing = shell("true");
         missing.stdin = Some(dir.path().join("absent.sql"));
@@ -5068,6 +5126,36 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("absent.sql"), "{error}");
         assert!(!error.to_string().contains(PASSWORD));
+    }
+
+    /// A client that stops reading (psql's ON_ERROR_STOP) ends the run at
+    /// once, with what was fed so far; one that never reads is cancelled.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_its_script_ends_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("big.sql");
+        std::fs::write(&input, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        let mut command = shell("head -c 1000 >/dev/null; exit 3");
+        command.stdin = Some(input.clone());
+        let sent = command.sent.clone();
+        let started = Instant::now();
+        let status = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(sent.load(Ordering::Relaxed) < 8 * 1024 * 1024);
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let mut stuck = shell("exec sleep 30");
+        stuck.stdin = Some(input);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(run(stuck, |_| {}, cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let outcome = task.await.unwrap();
+        assert!(matches!(outcome, Err(Error::Cancelled)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

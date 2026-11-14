@@ -127,6 +127,36 @@ pub struct Settings {
     /// The `.sql` files opened or saved last, the latest first (the main
     /// toolbar's New SQL editor lists them).
     pub recent_scripts: Vec<PathBuf>,
+    /// How the open tabs are laid out (DBeaver #7114, #23248).
+    pub tab_layout: TabLayout,
+    /// A multi-statement run shows its results one under the other in one
+    /// panel, instead of one result tab each (DBeaver #6861).
+    pub stack_results: bool,
+}
+
+/// How the open tabs are laid out above (or beside) the tab on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabLayout {
+    /// One row that scrolls sideways.
+    #[default]
+    SingleRow,
+    /// As many rows as the tabs need, up to four, then it scrolls.
+    Rows,
+    /// A list at the left of the tab on screen.
+    Vertical,
+}
+
+impl TabLayout {
+    pub const ALL: [TabLayout; 3] = [Self::SingleRow, Self::Rows, Self::Vertical];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SingleRow => "One row",
+            Self::Rows => "Several rows",
+            Self::Vertical => "A list at the side",
+        }
+    }
 }
 
 /// How many `.sql` files the main toolbar lists.
@@ -175,6 +205,8 @@ impl Default for Settings {
             toolbar_visible: true,
             toolbar_hidden: BTreeSet::new(),
             recent_scripts: Vec::new(),
+            tab_layout: TabLayout::SingleRow,
+            stack_results: false,
         }
     }
 }
@@ -318,6 +350,8 @@ mod tests {
             toolbar_visible: false,
             toolbar_hidden: ["commit".to_string()].into(),
             recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
+            tab_layout: TabLayout::Vertical,
+            stack_results: true,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

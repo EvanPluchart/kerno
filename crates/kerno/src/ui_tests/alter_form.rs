@@ -60,11 +60,15 @@ fn every_change_of_the_form_is_previewed_confirmed_and_applied(cx: &mut TestAppC
         app.wait_for_structure(cx);
         app.click(cx, "structure-edit");
         app.wait_for_editor(cx);
-        // Columns cannot be moved on an existing table, and the form says so.
+        // Whether columns can be moved on an existing table, and why not.
         assert!(paints(
             &app,
             cx,
-            "Columns keep their order on the server; new ones are added at the end."
+            if pg {
+                kerno_core::table_draft::CANNOT_MOVE_COLUMNS
+            } else {
+                "↑ and ↓ move a column; the server rewrites the table to put it there."
+            }
         ));
 
         // Columns: 0 id, 1 name, 2 note, 3 qty, 4 parent_id, then 5 added.

@@ -277,6 +277,7 @@ pub async fn trusted_host_keys(known_hosts: PathBuf) -> HostKeyStore {
         learn_into: Some(known_hosts),
         trusted_fingerprint,
         openssh: None,
+        password: None,
     }
 }
 
@@ -301,4 +302,48 @@ pub fn exclusive_run() {
         file.lock().ok()?;
         Some(file)
     });
+}
+
+/// A fake `aws` for the password-command tests (J3): an executable script
+/// in `dir` that writes its arguments, one per line, to `dir/aws-args` and
+/// prints the test servers' real password, so that a successful login
+/// proves its output was used. The returned environment's `PATH` and
+/// `HOME` are `dir` alone: the real `aws`, `op` and the developer's
+/// `~/.pgpass` and `~/.my.cnf` are never reached.
+pub fn fake_aws(dir: &std::path::Path) -> crate::password::PasswordEnv {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("aws");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{DB_PASSWORD}'\n",
+            dir.join("aws-args").display()
+        ),
+    )
+    .expect("write the fake aws");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make the fake aws executable");
+    crate::password::PasswordEnv {
+        path: vec![dir.to_path_buf()],
+        home: Some(dir.to_path_buf()),
+        pgpassfile: None,
+    }
+}
+
+/// The arguments the fake `aws` of [`fake_aws`] was last run with.
+pub fn fake_aws_args(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("aws-args"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Writes a password file (`.pgpass`, `.my.cnf`) in `dir` with `mode`.
+pub fn password_file(dir: &std::path::Path, name: &str, text: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, text).expect("write the password file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+        .expect("set the password file's permissions");
 }

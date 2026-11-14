@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::TestTextExt as _;
@@ -268,6 +268,9 @@ pub struct BackupDialog {
     log: VecDeque<SharedString>,
     log_scroll: UniformListScrollHandle,
     cancel: Arc<AtomicBool>,
+    /// A restore or script fed through the tool's standard input: bytes
+    /// sent so far and the file's size (0 until read).
+    feed: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
     /// Close the dialog once the stopped tool has ended.
     close_when_stopped: bool,
     /// Bumped at each probe, so a late answer is dropped.
@@ -531,6 +534,7 @@ impl BackupDialog {
             log: VecDeque::new(),
             log_scroll: UniformListScrollHandle::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            feed: None,
             close_when_stopped: false,
             generation: 0,
             on_restored,
@@ -1727,9 +1731,19 @@ impl BackupDialog {
         let cancel = self.cancel.clone();
         let program = program_name(&command);
         let directory = self.mode == Mode::Backup && self.backup.format == BackupFormat::Directory;
+        let total = Arc::new(AtomicU64::new(0));
+        self.feed = command
+            .stdin
+            .is_some()
+            .then(|| (command.sent.clone(), total.clone()));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
         let running = bridge::spawn(cx, async move {
             let started = std::time::SystemTime::now();
+            if let Some(input) = &command.stdin
+                && let Ok(meta) = tokio::fs::metadata(input).await
+            {
+                total.store(meta.len(), Ordering::Relaxed);
+            }
             let outcome = tools::run(
                 command,
                 move |line| {
@@ -1787,10 +1801,12 @@ impl BackupDialog {
                 this.finish(program, ended, window, cx)
             });
         }));
-        // The elapsed time, every second while it runs.
+        // The elapsed time and the progress, while it runs.
         self.ticking = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
                 let running = this
                     .update(cx, |this, cx| {
                         cx.notify();
@@ -1803,6 +1819,53 @@ impl BackupDialog {
             }
         }));
         cx.notify();
+    }
+
+    /// How much of the file a restore or script has sent to its tool:
+    /// "45.2 MB of 200 MB sent (22 %)" (CLAUDE.md §4 J9).
+    pub fn progress(&self) -> Option<String> {
+        let (sent, total) = self.feed.as_ref()?;
+        let (sent, total) = (sent.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
+        if total == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} of {} sent ({} %)",
+            byte_size(sent),
+            byte_size(total),
+            sent.min(total) * 100 / total
+        ))
+    }
+
+    /// Runs the restore or script at once, without the confirmation Start
+    /// shows (the bench cannot click it: `KERNO_BENCH=import` only, on its
+    /// scratch database); what keeps it from running otherwise.
+    pub fn run_unconfirmed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if matches!(self.tool_state, ToolState::Probing) || self.input.is_none() {
+            return Err("probing".into());
+        }
+        let command = self.command(cx)?;
+        self.run(command, None, window, cx);
+        Ok(())
+    }
+
+    /// Whether the run succeeded, once it has ended, with what it says.
+    pub fn ended(&self) -> Option<(bool, &str)> {
+        match &self.step {
+            Step::Finished { success, text } => Some((*success, text)),
+            _ => None,
+        }
+    }
+
+    /// Bytes of the file sent to the tool and the file's size; for the
+    /// bench.
+    pub fn fed(&self) -> Option<(u64, u64)> {
+        let (sent, total) = self.feed.as_ref()?;
+        Some((sent.load(Ordering::Relaxed), total.load(Ordering::Relaxed)))
     }
 
     fn push_lines(&mut self, lines: Vec<String>, cx: &mut Context<Self>) {
@@ -1819,7 +1882,9 @@ impl BackupDialog {
             .chain([typed])
             .filter(|secret| !secret.is_empty())
             .collect();
-        for mut line in lines {
+        // Only the lines the log keeps: a script prints one per statement.
+        let skip = lines.len().saturating_sub(LOG_LINES);
+        for mut line in lines.into_iter().skip(skip) {
             for secret in &secrets {
                 line = line.replace(secret.as_str(), "•••");
             }
@@ -3945,12 +4010,15 @@ impl BackupDialog {
                     _ => (
                         "backup-elapsed",
                         format!(
-                            "Running · {}",
+                            "Running · {}{}",
                             seconds(
                                 self.started
                                     .map(|started| started.elapsed())
                                     .unwrap_or_default()
-                            )
+                            ),
+                            self.progress()
+                                .map(|text| format!(" · {text}"))
+                                .unwrap_or_default()
                         ),
                         theme.muted_foreground,
                     ),
@@ -3961,6 +4029,15 @@ impl BackupDialog {
                         .test_text(status)
                         .into_any_element(),
                 );
+                if let (Step::Running, Some((sent, total))) = (&self.step, self.fed())
+                    && total > 0
+                {
+                    body.push(
+                        gpui_kit::component::progress::Progress::new("backup-progress")
+                            .value(sent.min(total) as f32 * 100. / total as f32)
+                            .into_any_element(),
+                    );
+                }
                 let command = self.shown_command.clone().unwrap_or_default();
                 body.push(self.render_command(Ok(command), cx));
                 body.push(self.render_log(cx));

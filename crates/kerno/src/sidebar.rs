@@ -79,6 +79,9 @@ pub enum SidebarAction {
     CopyName,
     CopyUrl,
     CopyHost,
+    /// Stores a connection opened from a URL (`kerno <url>`), through the
+    /// connection dialog.
+    SaveConnection,
 }
 
 impl SidebarAction {
@@ -111,6 +114,7 @@ impl SidebarAction {
             Self::CopyName => "Name",
             Self::CopyUrl => "Connection URL",
             Self::CopyHost => "Host",
+            Self::SaveConnection => "Save connection…",
         }
         .to_string()
     }
@@ -376,6 +380,17 @@ impl Sidebar {
         let Subject::Connection(id) = subject else {
             return entries;
         };
+        // A connection opened from a URL says first that it is not saved.
+        let entries = match connections.is_unsaved(id) {
+            true => [
+                Entry::Item(SidebarAction::SaveConnection, None),
+                Entry::Separator,
+            ]
+            .into_iter()
+            .chain(entries)
+            .collect(),
+            false => entries,
+        };
         let postgres = connections
             .get(id)
             .is_some_and(|saved| saved.config.engine == kerno_core::Engine::Postgres);
@@ -541,6 +556,7 @@ impl Sidebar {
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
             (Subject::Connection(_), Tool(entry)) => cx.emit(SidebarEvent::Tool(id, entry)),
             (Subject::Connection(_), Edit) => Self::edit(connections, id, window, cx),
+            (Subject::Connection(_), SaveConnection) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), Duplicate) => {
                 connections.update(cx, |c, cx| c.duplicate(&id, cx))
             }
@@ -594,6 +610,12 @@ impl Sidebar {
                 let secrets = loading.await;
                 let _ = cx.update(|window, cx| match secrets {
                     Ok(secrets) => {
+                        // An unsaved connection is saved as a new one is:
+                        // its password goes to the secret store.
+                        let mut saved = saved;
+                        if connections.read(cx).is_unsaved(&saved.id) {
+                            saved.config.save_password = true;
+                        }
                         ConnectionDialog::open(connections, Some((saved, secrets)), window, cx)
                     }
                     Err(error) => window.push_notification(
