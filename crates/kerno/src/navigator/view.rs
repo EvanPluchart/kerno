@@ -118,6 +118,11 @@ pub enum NavigatorEvent {
     },
     /// Make `target` (a database and schema) the active query tab's.
     SetDefault { target: Target },
+    /// Show the ER diagram of a schema, or of a table and its neighbours.
+    ViewDiagram {
+        target: Target,
+        scope: kerno_core::erd::Scope,
+    },
     /// Tell the user something went otherwise than asked.
     Warn(String),
     /// Open a Tools ▸ entry (not a maintenance tool: the navigator opens
@@ -888,6 +893,21 @@ impl Navigator {
                         schema,
                         table,
                     });
+                }
+            }
+            Action::ViewDiagram => {
+                let scope = match &node.kind {
+                    NodeKind::Object(ObjectRef::Schema(schema) | ObjectRef::Database(schema)) => {
+                        Some(kerno_core::erd::Scope::Schema(schema.clone()))
+                    }
+                    NodeKind::Object(ObjectRef::Relation(table, _)) => {
+                        Some(kerno_core::erd::Scope::Around(table.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some(scope) = scope {
+                    let target = Self::target_of(connection, &node, false);
+                    cx.emit(NavigatorEvent::ViewDiagram { target, scope });
                 }
             }
             Action::Backup | Action::Restore => {

@@ -87,6 +87,9 @@ pub enum Action {
     /// The structure tab of a table or view on its Properties sub-tab:
     /// where DBeaver's object editor ("Edit", F4) opens.
     Properties,
+    /// The ER diagram of a schema (a MySQL database), or of a table and its
+    /// neighbours (DBeaver's "View Diagram", J18).
+    ViewDiagram,
 }
 
 impl Action {
@@ -133,6 +136,7 @@ impl Action {
             Action::ExecuteRoutine => "Execute…",
             Action::EditColumn => "Edit column…",
             Action::Properties => "Properties",
+            Action::ViewDiagram => "View diagram",
         }
     }
 
@@ -191,7 +195,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateDatabase,
             ],
-            vec![ImportCsv],
+            vec![ImportCsv, ViewDiagram],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
@@ -203,7 +207,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateSchema,
             ],
-            vec![ImportCsv],
+            vec![ImportCsv, ViewDiagram],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
@@ -216,7 +220,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 ReadInConsole,
             ],
             // Backup and Truncate are under Tools ▸ ([`tool_entries`]).
-            vec![Export, ImportCsv],
+            vec![Export, ImportCsv, ViewDiagram],
             all_templates.to_vec(),
             vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
@@ -1176,6 +1180,7 @@ mod tests {
             GenerateCall,
             ExecuteRoutine,
             EditColumn,
+            ViewDiagram,
         ] {
             assert!(!action.writes(), "{action:?}");
         }

@@ -14,7 +14,9 @@ followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing e
 redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Turn it off in
 Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
 click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
-[architecture notes](docs/ARCHITECTURE.md#the-update-check) give the details.
+[architecture notes](docs/ARCHITECTURE.md#the-update-check) give the details. The AI assistant is off
+until you turn it on, and then talks only to the endpoint you configure, only when you ask: see
+[AI assistant and what it sends](#ai-assistant-and-what-it-sends).
 
 Version 1 connects to PostgreSQL, MySQL and MariaDB. Its feature set and interactions follow DBeaver
 Community; its look follows the calm, dense style of modern editors. Licensed under MIT OR Apache-2.0.
@@ -67,6 +69,10 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
   Tasks view (there is no scheduler). Settings ▸ Local clients lists every client install it finds, with its
   version, and lets you add a folder and choose the default per engine; a connection can use its own.
 - An administration view (sessions, roles, sizes, settings).
+- An ER diagram of a schema (a MySQL database), or of a table and the tables linked to it ("View diagram" in
+  the tree, "Diagram" in a table's structure, View ER Diagram in the palette): tables with their PK and FK
+  marks, one edge per foreign key, pan, zoom, fit, drag a table aside; a double click opens its data. Exports
+  to SVG, PNG and Mermaid. Read-only.
 - Copy tables with their rows to another connection, PostgreSQL, MySQL or MariaDB in any direction (Tools ▸
   Copy tables to another connection…): the tables are created or appended to, each column's type mapped and
   editable, what has no counterpart refused until skipped or typed, the SQL shown and confirmed, the rows
@@ -130,10 +136,76 @@ sent and never shows them. A saved password is linked automatically only to a co
 already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
 unlinked cannot read any of the old secrets. Files written by earlier versions still import.
 
+## AI assistant and what it sends
+
+The assistant is off until **Settings → AI ▸ Enable the AI assistant** is ticked. While it is off, no
+request is ever made: its entries (editor menu ▸ **AI: Write SQL…**, **Explain query**, **Explain plan**,
+**Explain error**, the palette, Query ▸ AI Assistant) say "turn on in Settings → AI" and do nothing.
+
+On, it talks to one OpenAI-compatible endpoint you set (`POST <endpoint>/chat/completions`), and only when
+you click **Send**. Local servers come first: Ollama (`http://localhost:11434/v1`) and LM Studio
+(`http://localhost:1234/v1`). Plain `http://` is accepted only for this computer (`localhost`, `127.0.0.1`,
+`::1`); any other host needs `https://`, and Kerno names it ("Requests will leave this computer and go to
+…") and sends nothing there until you click **Allow requests to …** once for that endpoint. Requests never go
+through a proxy and never follow a redirect. **List models** asks `GET <endpoint>/models`, only when you click
+it. An API key, for the endpoints that want one, is kept in the system's secret store for that endpoint
+only; it is sent as `Authorization: Bearer …` and appears nowhere else (previews and the log show
+`Bearer ***`).
+
+What a request holds, and nothing more:
+
+- the instruction for the action, and your sentence, the statement (the selection or the one at the
+  cursor), the plan on screen, or the statement and the server's error message (which may quote a value:
+  the preview shows it before you send);
+- the engine, its version and the current database; the names of the schemas; the tables the statement or
+  the sentence names (else the tables of the tab's schema): their names, column names and types and foreign
+  keys, 200 tables at most with their columns, then names only;
+- rows only when you tick **Include sample rows (first 5 rows of the tables above)** for that request (up to
+  10 tables); the tick is off again at every new request.
+
+**What is sent…** in the panel shows the exact bytes before you send them; Settings → AI ▸ **What was sent**
+lists every request of the session (time, endpoint, body), in memory only. The answer is shown as text:
+nothing in it runs or opens anything. **Insert** puts its SQL in the editor (at the cursor, selected, one undo
+step; a proposed fix goes after your text as a new statement) and you run it yourself, through the usual
+confirmations, read-only and production rules. **Stop** drops an answer you no longer want (the request ends
+on its own within its 60 s timeout).
+
+## Vim mode
+
+Off by default. Turn it on with **Settings → Editor ▸ Vim mode** or the command **Toggle Vim Mode** (palette,
+Edit menu). While it is off nothing of it runs: the editor behaves exactly as without it.
+
+On, the SQL editors have vim's Normal, Insert, Visual (`v`) and Visual line (`V`) modes. The status bar shows
+the mode; in Normal mode the character under the cursor is shaded as a block (the editor's thin caret stays).
+What is supported, and nothing more:
+
+- **Motions**, with a count: `h j k l`, `w b e`, `0 ^ $`, `gg` and `G` (with a count, that line), `f{char}`
+  and `t{char}` on the line, `%` (the matching bracket; brackets in strings and comments are text), Enter,
+  Backspace and Space.
+- **Operators**: `d`, `c` and `y` with a motion, with `iw` or `aw`, or on a Visual selection; `dd`, `cc`, `yy`;
+  `x`; `p` and `P`; `u` and `Ctrl+R` (undo, redo); `.` repeats the last change, typed text included.
+- **Insert**: `i a I A o O` (`o` and `O` keep the line's indentation), `Esc` back to Normal mode.
+- **Search**: `/text` then Enter, `n` and `N` (plain text, case-sensitive, wraps around).
+- **Commands**: `:w` saves the file, `:q` closes the tab, `:wq` (or `:x`) saves then closes, `:q!` closes
+  without keeping unsaved text. `:` and `/` open a one-line field under the editor; Escape closes it.
+- **One register, the system clipboard**: `y`, `d` and `c` write it, `p` reads it, so they work with Cmd+C
+  and Cmd+V. Lines yanked by vim paste as lines while the clipboard still holds them; text copied elsewhere
+  pastes as characters.
+
+In every mode the arrows, Home/End, Page Up/Down, the mouse and every Cmd shortcut (Ctrl on Linux) keep
+working: run (Cmd+Enter), save, the palette, find, zoom, completion. In Insert mode every key but Escape is
+the editor's, so Tab and Enter still accept a completion. `:q` asks before closing what would be lost, as
+Cmd+W does; `:q!` lets go of unsaved text, but an open transaction or pending changes still ask. On Linux,
+Ctrl+R is Refresh Rows outside Normal mode.
+
+Not supported: counts on `i a o`, `F T ; ,`, text objects other than `iw` and `aw`, named registers, marks,
+macros, `r ~ J > <`, Visual block (`Ctrl+V`) and other `:` commands. The editor records each edit on its own,
+so `ciw` followed by typed text is undone in two steps (the deletion, then the typing).
+
 ## Install
 
 There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
-`scripts/bundle-linux.sh` builds a tarball with the binary, a `.desktop` file, icons and licences.
+`scripts/bundle-linux.sh` builds the Linux packages (below).
 
 On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
 (`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). Kerno reads each saved password from
@@ -141,11 +213,21 @@ the keychain once per run. An ad-hoc signature changes with every build, so the 
 password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it, and an update installed by Kerno
 keeps the signature of its release: an ad-hoc one makes the keychain ask again once.
 
-On Linux, unpack the tarball into a prefix:
+### Linux
 
-```sh
-tar -xzf dist/kerno-<version>-linux-<arch>.tar.gz -C ~/.local --strip-components=1
-```
+Each release carries, for x86_64 and arm64 (aarch64):
+
+| Package | Install |
+|---|---|
+| `kerno_<version>_amd64.deb`, `kerno_<version>_arm64.deb` | `sudo apt install ./kerno_<version>_amd64.deb` (Debian, Ubuntu and their derivatives; apt installs the dependencies) |
+| `kerno-<version>-linux-x86_64.tar.gz`, `…-aarch64.tar.gz` | `tar -xzf kerno-<version>-linux-x86_64.tar.gz -C ~/.local --strip-components=1`, then run `~/.local/bin/kerno`. Kerno updates itself in place from this one |
+| `Kerno-<version>-x86_64.AppImage`, `…-aarch64.AppImage` | `chmod +x Kerno-<version>-x86_64.AppImage` and run it. It mounts itself through FUSE (the `fusermount3` or `fusermount` program, from the `fuse3` or `fuse` package); without FUSE, run it with `--appimage-extract-and-run` |
+
+The packages run on any distribution with **glibc 2.31 or newer** (Ubuntu 20.04, Debian 11 and later): they are built on Ubuntu 20.04, and each is started there and on Debian 13 before a release
+(`scripts/check-linux-packages.sh`). The tarball and the AppImage use the system's libraries, as the `.deb`
+does through its dependencies; install them if they are missing (Debian and Ubuntu names):
+`sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1`, and a Vulkan driver
+(`mesa-vulkan-drivers` or your GPU vendor's). The fonts are built in.
 
 Backup and restore call `pg_dump`, `pg_restore`, `psql`, `mysqldump` and `mysql` when they are installed;
 nothing else needs them.
@@ -171,8 +253,11 @@ sudo scripts/install-linux-deps.sh
 nice -n 10 cargo build --release -p kerno
 ```
 
-From macOS, `scripts/bundle-linux.sh` builds the Linux package inside Docker (`Dockerfile.linux-build`).
-`.cargo/config.toml` caps cargo at 3 jobs.
+`scripts/bundle-linux.sh` builds the Linux packages inside Docker, from macOS or Linux, on an arm64 host (Apple
+Silicon): the image of `packaging/linux/Dockerfile` (Ubuntu 20.04) builds arm64 natively and cross-compiles
+x86_64. `KERNO_JOBS` sets cargo's jobs (3 by default). The image `kerno-linux-build` and the volume
+`kerno-linux-cache` (cargo registry and build output) stay for the next run; `scripts/bundle-linux.sh --clean`
+removes both. `.cargo/config.toml` caps cargo at 3 jobs.
 
 ## Checks and releases
 
@@ -182,9 +267,11 @@ running, and stopping them again if it started them), one summary line per step,
 failure. `scripts/check.sh --no-tests` skips the tests. It refuses to start when the machine is busy.
 
 A release is built locally with `scripts/release.sh [version]`: it checks the tree is clean and the version
-matches `Cargo.toml`, builds the macOS `.dmg` (on macOS) and the Linux tarball, and writes `dist/SHA256SUMS`.
-It then prints the `gh release create` command; the owner runs it. The script itself makes no network
-request, creates no tag and pushes nothing.
+matches `Cargo.toml`, builds the macOS `.dmg` (on macOS) and the Linux packages, starts each Linux package in
+clean containers (`scripts/check-linux-packages.sh`), and writes `dist/SHA256SUMS`.
+`scripts/release.sh --linux-only` builds and checks the Linux packages alone, on a tree that may be dirty.
+It then prints the `gh release create` command; the owner runs it. The script creates no tag, pushes and
+uploads nothing; its only downloads are the Docker base images and pinned build tools of the Linux build.
 
 ## Test databases
 

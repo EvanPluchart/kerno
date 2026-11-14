@@ -6,9 +6,9 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 
 ## Beyond v1, in order
 
-1. **ERD diagrams** (NAV-58, OBJ-20, CM-47). Built from `Session::table_structure`, which already returns
-   columns, keys and foreign keys in both directions. No trait change: a layout and a canvas view in the app,
-   fed by the structure of the tables of a schema.
+1. **ERD diagrams** (NAV-58, OBJ-20, CM-47): done in v1.1, read-only (CLAUDE.md §4 J18, D-069). Still to
+   come: editing the schema from the diagram, layouts saved between runs, a diagram of several schemas, a
+   diagram of a multi-selection of the tree (needs NAV-34).
 2. **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22). Reads `table_structure` and `ddl` from two sessions,
    diffs the engine-neutral `TableStructure` values in `kerno-core`, and writes the migration with the
    dialect's `alter_table_sql` and `create_table_sql`. No new trait method; the diff is core code with unit
@@ -31,10 +31,12 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
    branch on the engine name in the UI.
 7. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
    the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
-8. **AI assistant** (TOOL-24). Not before the owner decides how to square it with "nothing leaves the
-   machine": it would be opt-in, per connection, and either local or an explicit endpoint the user
-   configures. It reads `completion_catalog` and the structure for context, and anything it proposes runs
-   through the same guards (read-only, confirmation, production) as typed SQL. No trait change.
+8. **AI assistant** (TOOL-24). Done in v1.1 (J17, D-068): opt-in (off until Settings → AI turns it on),
+   one OpenAI-compatible endpoint the user configures (local first: Ollama, LM Studio; a remote host must be
+   allowed once and use `https://`), only when the user asks. It reads the tab's `completion_catalog` for
+   context (names and types; rows only with the per-request tick) and its SQL is inserted, never run, so it
+   goes through the same guards as typed SQL. Left for later: streaming answers, per-connection opt-out,
+   tool calls. No trait change.
 9. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
    migrations) and never carries secrets: those stay in the OS secret store. Opt-in, with a visible account.
 10. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
@@ -42,14 +44,11 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 
 ## Limits found on the way
 
-- **AppImage for Linux.** `scripts/bundle-linux.sh` produces a tarball (binary, `.desktop` file, icons,
-  licences). An AppImage needs `appimagetool` and a desktop-integration step that the build image does not
-  carry; it comes with the first public release.
-- **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
-  (arm64 here); amd64 needs an amd64 Linux host (there is no hosted CI). Cross-building locally would run under
-  emulation.
 - **RSA SSH key files with the built-in client** are refused (RUSTSEC-2023-0071, D-013); they work through the
   OpenSSH client (J2, D-056), and agent-held RSA keys work with both.
+- **Linux release builds need an arm64 Docker host.** The image of `packaging/linux/Dockerfile` builds arm64
+  natively and cross-compiles x86_64 (D-066); on an x86_64 host Docker would emulate the whole build. The
+  mirror recipe (native x86_64, cross arm64) waits for a machine that needs it.
 
 ## From the competitors' issues (triage of 2026-11-14): not now
 
@@ -61,7 +60,8 @@ v1.1 (CLAUDE.md §4 J, `docs/plans/M11.md`). What was left out, and why:
 - **Wayland and fractional-scaling checks.** They need a real Linux desktop session; the Linux build is
   checked in a container, which has no compositor.
 - **Flathub, Snap, an apt repository.** Publishing is the owner's step (CLAUDE.md §8). The packages of J16
-  (tarballs, `.deb`, AppImage) come first and are what such a repository would carry.
+  (tarballs, `.deb`, AppImage for x86_64 and arm64, D-066) are built and checked; a repository would carry
+  them (an apt repository also needs a signing key and a `Maintainer` e-mail in `packaging/linux/control.in`).
 - **PostGIS geometry viewer, role and sequence editors, row-level security in the navigator.** Real but
   smaller demand; the next round. Each is a view over catalog queries the drivers already have the shape
   for (`admin_query`, `table_structure`).
@@ -83,18 +83,18 @@ The order and the driver-trait extension of each are in "Beyond v1, in order" ab
 | ID | Feature | PG / MySQL | Reason |
 | -- | ---- | ---- | ---- |
 | NAV-57 | Compare / Migrate | PG, My | Schema compare is outside v1 (CLAUDE.md §4, last paragraph) |
-| NAV-58 | View Diagram | PG, My | ERD is outside v1 (CLAUDE.md §4, last paragraph) |
-| OBJ-20 | ER diagram page | PG, My | ERD is outside v1 (CLAUDE.md §4, last paragraph) |
+| NAV-58 | View Diagram | PG, My | Done in v1.1: "View diagram" opens the ER diagram tab (J18, D-069) |
+| OBJ-20 | ER diagram page | PG, My | Done in v1.1: "View diagram" opens the ER diagram tab (J18, D-069) |
 | TOOL-20 | Dashboards | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-30 | Task scheduler | PG, My | Saved tasks are done (TOOL-21); DBeaver Community has no scheduler either, and one needs a background runner while Kerno is closed |
 | TOOL-31 | Maintenance tools and data transfers as tasks | PG, My | The four client-tool wizards save tasks; the maintenance dialog and the export wizard have no serialisable settings yet (M10 Part 11b) |
 | TOOL-22 | Data compare, schema compare | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-23 | Mock data generator | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
-| TOOL-24 | AI assistant | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
+| TOOL-24 | AI assistant | PG, My | Done in v1.1 (J17, D-068): Settings → AI, editor menu ▸ AI: Write SQL / Explain query, plan, error; opt-in, to the endpoint the user configures only |
 | TOOL-25 | Debugger | PG | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-26 | Visual query builder | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | CM-21 | Compare / Migrate ▸ | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
-| CM-47 | View Diagram | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
+| CM-47 | View Diagram | PG, My | Done in v1.1: "View diagram" opens the ER diagram tab (J18, D-069) |
 | CM-59 | Compare / Migrate ▸ | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 
 ### Eclipse workbench, projects and JDBC plumbing

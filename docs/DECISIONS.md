@@ -608,6 +608,8 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   remote). The scripts are to be run again with the icon at the end (plans/M10.md Part 8). An AppImage and an
   amd64 build from this Mac are on the roadmap. The image `kerno-linux-build` (5.6 GB) is removed at the end
   of the goal.
+- The Linux half is replaced by D-066 (Ubuntu 20.04 image of `packaging/linux/Dockerfile`, x86_64
+  cross-compiled, `.deb` and AppImage); `Dockerfile.linux-build` is gone.
 
 ## D-032 — Brand colours in the theme
 
@@ -1330,3 +1332,132 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   file). Unlinked, a replaced connection loses all three before "Enter now" stores the new password, and a new
   one gets a fresh id, so no old SSH secret can reach another SSH server (second security review).
   `Connections::import` is removed (no caller left).
+
+## D-066 — Linux packages (M11 Part 12, J16)
+
+- **Floor: Ubuntu 20.04, glibc 2.31.** Tried first in the order of the plan, and it built with no backport:
+  GPUI's Linux dependencies (libxkbcommon 0.10, libxcb 1.14, clang 10 for bindgen) are enough, so Debian 11
+  and Ubuntu 22.04 were not needed. Both binaries need at most `GLIBC_2.30` (`objdump -T`) and no
+  `libstdc++`; the README says 2.31, the glibc of the build image, where every package is started.
+- **One image, tools only** (`packaging/linux/Dockerfile`, build context `packaging/linux/`, about 1.5 GB):
+  no source and no `target/` in its layers. `scripts/bundle-linux.sh` runs it with the source mounted
+  read-only, `dist/` writable and the volume `kerno-linux-cache` as `CARGO_HOME` and `CARGO_TARGET_DIR`
+  (about 5 GB for both targets), so a second run rebuilds only what changed. Both targets are built with an
+  explicit `--target`, so build scripts and proc-macros are compiled once for the arm64 host and shared.
+  `scripts/bundle-linux.sh --clean` (or `scripts/release.sh --clean`) removes the image and the volume.
+  `Dockerfile.linux-build` and `.dockerignore` are removed; `scripts/install-linux-deps.sh` stays for
+  building on a current Debian or Ubuntu.
+- **x86_64 is cross-compiled in the arm64 container, never emulated**: `dpkg --add-architecture amd64`, the
+  arm64 sources tagged `[arch=arm64]` (ports.ubuntu.com) and `archive.ubuntu.com` / `security.ubuntu.com`
+  focal lines tagged `[arch=amd64]`; `crossbuild-essential-amd64` and the `-dev:amd64` libraries;
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc`, `CC_`/`CXX_`/`AR_x86_64_unknown_linux_gnu`,
+  `PKG_CONFIG_ALLOW_CROSS_x86_64_unknown_linux_gnu=1` and
+  `PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig`
+  (target-suffixed, so host build scripts keep the arm64 libraries). The image is arm64: on an x86_64 host
+  Docker would emulate it (ROADMAP limit). Emulation is used only by the start check.
+- **Pinned downloads** (build tools, like crates): base image
+  `ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214` (the multi-arch
+  index); `rustup-init` 1.29.3 aarch64
+  `9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282`, which installs the toolchain of
+  `rust-toolchain.toml` (rustfmt and clippy too, so runs do not download them) with both targets; the
+  AppImage type-2 runtime, `github.com/AppImage/type2-runtime` release `20251108`, `runtime-aarch64`
+  `00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444` and `runtime-x86_64`
+  `2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d`; apt packages from Ubuntu's signed
+  archive. The app gains no network behaviour.
+- **Packages per architecture**, one install prefix (`bin/kerno`, the desktop entry, hicolor PNG icons and the
+  SVG, licences, notices and README under `share/doc/kerno`) laid out three ways:
+  `kerno-<v>-linux-<aarch64|x86_64>.tar.gz` (unchanged layout and names: the updater's `artifact()` and
+  `check_tarball` rules, one top folder, no link; ownership 0/0); `kerno_<v>_<arm64|amd64>.deb` (the prefix
+  under `/usr`, `dpkg-deb --root-owner-group`, `packaging/linux/control.in`; `Depends` from
+  `dpkg-shlibdeps` run with `DEB_HOST_ARCH` set for the foreign binary, plus `libvulkan1` and
+  `libwayland-client0`, which GPUI opens with `dlopen` and `dpkg-shlibdeps` cannot see (found with
+  `strings`); `Recommends: mesa-vulkan-drivers | vulkan-icd`, `Suggests` the database client tools);
+  `Kerno-<v>-<aarch64|x86_64>.AppImage` (AppDir with `AppRun`, the desktop entry and the icon at its root,
+  `mksquashfs -comp gzip -all-root`, the runtime prepended). The AppImage bundles no library: the binary
+  links only `libxcb`, `libxkbcommon`, `libxkbcommon-x11` and glibc (desktop libraries), and the README
+  lists them with the `apt install` line for a system that lacks one. The `.deb` has no `Maintainer` e-mail (none in the repository); an apt repository
+  needs one (owner's step, ROADMAP).
+- **Start check** (`scripts/check-linux-packages.sh`, run by `release.sh`): the tarballs' listings against
+  the updater's rules, then every package in a fresh `--rm` container named `kerno-check-*` of Ubuntu 20.04
+  and Debian 13, arm64 natively and x86_64 with `--platform linux/amd64`: `apt-get install ./kerno.deb`
+  (Depends resolve), the tarball and the AppImage (`--appimage-extract-and-run`) after installing the
+  `.deb`'s Depends; each compares `kerno --version` with the workspace version. Every pull and run names
+  its platform, and the base images it pulled are removed by id: a tag holds one platform, so pulling the
+  amd64 `ubuntu:20.04` leaves the arm64 one untagged, out of reach of a removal by tag.
+- **`scripts/release.sh --linux-only [version]`** builds and checks the Linux packages alone, on a tree
+  that may be dirty, and prints the `gh release create` command with every artifact; the full mode keeps
+  the clean-tree check and the macOS half unchanged. `KERNO_JOBS` (default 3) and `KERNO_NICE` (default
+  10) are the script defaults.
+- Measured on 2026-11-14 (Apple Silicon, OrbStack, 11 CPUs, `KERNO_JOBS=8`, while three other agents
+  compiled): arm64 release build 4 min 44 s from an empty cache, x86_64 cross build 249 s after it; a
+  second `release.sh --linux-only` with the cache warm took 2 min 0 s, start checks included (12 runs).
+  Sizes: tarballs 35.3 MB (aarch64) and 36.0 MB (x86_64), `.deb` 21.2 MB and 22.9 MB, AppImages 36.7 MB
+  and 37.4 MB.
+- Not verified: an AppImage mounted through FUSE (containers have none; `--appimage-extract-and-run` is),
+  the app's window on a real Linux desktop from these packages (the check is `--version`), distributions
+  other than Ubuntu 20.04 and Debian 13.
+
+## D-068 — The AI assistant (M11 Part 13, J17)
+
+- **The second and last network exception, by construction.** `kerno_core::ai::build_payload` is the
+  only way a request body is made and `ai::body` the only way it becomes bytes (pretty-printed JSON);
+  the panel's "What is sent…" and the log of Settings → AI show those bytes, and they are what goes on
+  the wire (the fake-endpoint tests compare them byte for byte). `ai::request` is the only function that
+  opens a socket for the assistant (chat and "List models" both): it calls `ai::gate` first, which
+  refuses while the setting is off, for an address that is not `https://` (plain `http://` only to
+  127.0.0.0/8, `::1`, `localhost`, compared on the parsed host), for an address carrying a user name,
+  password, query or fragment, and for a host other than this computer that is not in
+  `AiSettings::confirmed`. No warm-up, no background request: "List models" runs on click only.
+- **HTTP client: `ureq` 3.5** (MIT OR Apache-2.0), `default-features = false, features = ["rustls"]`:
+  rustls with ring and webpki-roots, all three already in the tree; new crates `ureq-proto`, `base64`
+  0.23, `utf8-zero`. No HTTP client was in the tree (GPUI's `http_client` is a trait without a
+  transport; the update check uses the system's `curl`, which would need the key in a file or on stdin).
+  The agent is built per request with `proxy(None)` (the default reads `HTTP(S)_PROXY`, a host the user
+  never configured), `max_redirects(0)`, `https_only` for non-loopback hosts, a 60 s global timeout, a
+  4 MB answer cap. `cargo deny check` stays clean; no native-tls, OpenSSL or aws-lc in the tree.
+- **The key** is a secret-store entry per endpoint (`ai/<base address>`), read in the blocking task that
+  sends; never in settings, storage, logs, error text or a process argument. Previews and the log show
+  `Authorization: Bearer ***`.
+- **Context** comes from the tab's completion catalog (names, types, foreign keys): the tables the SQL or
+  sentence names (a word equal to a table name, or one `s` apart), else the tab's schema (else the first
+  schema of the search path); 200 tables with columns, then up to 1,000 names. Row data only through
+  `Context::sample_rows`, read (`SELECT * … LIMIT 5`, 10 tables at most, on the connection's meta session,
+  not recorded in the history) only while the per-request tick is on; a new panel starts with it off and
+  Send turns it off again.
+- **The answer is text.** Nothing in it runs or opens: no tool calls, no links, no auto-run. `ai::sql_block`
+  picks the first ```sql (or plain ```) block, else the whole answer, for Insert (`EditorState::insert`: one
+  undo step, then selected); a fix from "Explain error" goes after the text as a new statement.
+- **Stop** drops the waiting task and bumps a generation, so a late answer is ignored; the blocking call
+  itself cannot be interrupted and ends when the server answers or at the 60 s timeout, on its thread.
+- **UI places**: AI entries appended to the editor menu after its other entries (no new `TabAction`, so
+  `tabs.rs` is untouched), four palette commands (group "AI assistant", Query ▸ AI Assistant), "Explain
+  with AI…" on a plan and "Explain error with AI…" on an error, shown only while the assistant is on;
+  the handlers live on the query tab. While off, a command shows "turn it on in Settings → AI" and opens
+  nothing; the menu entries are disabled with that reason. Settings → AI is the ninth section, appended
+  last so the other sections keep their indexes.
+
+## D-069 — The ER diagram (M11 Part 14, J18)
+
+- **Core, no GPUI** (`kerno-core/src/erd.rs`): `Diagram` from `table_structure` of the chosen tables (read 8
+  at a time with `buffered`, then sorted: the same catalog gives the same diagram), one edge per foreign key
+  from `foreign_keys` only (not `referenced_by`, which would count each key twice), keys to tables outside
+  the diagram left out. A table that cannot be read (dropped meanwhile) is skipped and named, unless none
+  can be read.
+- **Layout written for Kerno, not ported** (DBeaver's ERD uses GEF/Draw2D's layouts): ranks by foreign-key
+  depth (self-references ignored, other cycles cut by a walk in table order), barycentre ordering, layers
+  wrapped at 10 tables, unlinked tables in a grid below. Box sizes come from a per-character estimate and the
+  text is cut with an ellipsis in core, so the canvas, the SVG and the PNG show the same boxes. Edges are
+  orthogonal with a vertical turn in the gap between two tables; when that would cross another table (a key
+  that skips a layer), the edge rises in the free gap left of its column, runs above every table and comes
+  down the gap left of the referenced one (columns are left-aligned, so those gaps are free). `ponytail:`
+  such edges share the top channel in five lanes; a real router if large schemas get crowded.
+- **Canvas**: tables are absolutely placed `div`s (ids, context menus, clicks and tests for free), only those
+  in view; edges are painted on a `canvas` with GPUI paths under them. Zoom scales sizes and text; under
+  40 % the rows are not drawn.
+- **PNG through `resvg` 0.46**, already a dependency of the app (folder icons, D-047): no new crate, no
+  `deny` change. The SVG is rasterised at 2× (at most 8,192 px a side) with Inter and JetBrains Mono loaded
+  from the embedded font files into usvg's font database, never the system's.
+- **Exports use the theme's tokens** (`Palette` built from `cx.theme()`): no colour in core or in the tab.
+- **Scope**: a schema (a MySQL database) or a table and its neighbours; the tree has no multi-selection
+  (NAV-34), so "a selection of tables" is the table's neighbourhood. Dragged positions last for the
+  session; the restored tab keeps its schema or table, not its layout.

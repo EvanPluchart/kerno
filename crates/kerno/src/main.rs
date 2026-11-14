@@ -2,6 +2,7 @@
 
 mod actions;
 mod admin;
+mod ai_view;
 mod app_icon;
 mod backup_dialog;
 mod bench;
@@ -12,6 +13,7 @@ mod data;
 mod database_dialog;
 mod engine_logo;
 mod environments_view;
+mod erd_tab;
 mod export_dialog;
 mod fdw_dialog;
 mod folder_dialog;
@@ -374,6 +376,7 @@ fn menus() -> Vec<Menu> {
                 command("lower_case"),
                 command("show_completions"),
                 command("toggle_soft_wrap"),
+                command("toggle_vim_mode"),
                 command("select_all_occurrences"),
                 command("unfold_all"),
                 separator(),
@@ -425,6 +428,16 @@ fn menus() -> Vec<Menu> {
                 separator(),
                 MenuItem::action("Explain Statement", ExplainStatement),
                 MenuItem::action("Explain Analyze", ExplainAnalyze),
+                // J17: off until turned on in Settings → AI.
+                MenuItem::submenu(menu(
+                    "AI Assistant",
+                    vec![
+                        command("ai_write_sql"),
+                        command("ai_explain_query"),
+                        command("ai_explain_plan"),
+                        command("ai_explain_error"),
+                    ],
+                )),
                 separator(),
                 MenuItem::action("Go to Next Statement", actions::NextStatement),
                 MenuItem::action("Go to Previous Statement", actions::PreviousStatement),
@@ -562,6 +575,7 @@ fn menus() -> Vec<Menu> {
                         command("new_query_on_object"),
                         command("set_default_schema"),
                         command("read_object_in_console"),
+                        command("view_diagram"),
                         command("generate_routine_call"),
                         command("execute_routine"),
                         command("add_column_to_object"),

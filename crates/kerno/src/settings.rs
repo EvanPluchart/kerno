@@ -101,6 +101,8 @@ pub struct Settings {
     pub format_on_save: bool,
     /// Ligatures in the SQL editors (`>=` drawn as one sign).
     pub ligatures: bool,
+    /// Vim mode in the SQL editors (J19): off until the user turns it on.
+    pub vim_mode: bool,
     /// What a NULL cell shows.
     pub null_text: String,
     /// Timestamps with a time zone show their offset.
@@ -132,6 +134,9 @@ pub struct Settings {
     /// A multi-statement run shows its results one under the other in one
     /// panel, instead of one result tab each (DBeaver #6861).
     pub stack_results: bool,
+    /// The AI assistant (J17): off until the user turns it on; its key is in
+    /// the secret store, never here.
+    pub ai: kerno_core::ai::AiSettings,
 }
 
 /// How the open tabs are laid out above (or beside) the tab on screen.
@@ -194,6 +199,7 @@ impl Default for Settings {
             format: FormatOptions::default(),
             format_on_save: false,
             ligatures: false,
+            vim_mode: false,
             null_text: "NULL".to_string(),
             show_time_zone: true,
             link_with_editor: false,
@@ -207,6 +213,7 @@ impl Default for Settings {
             recent_scripts: Vec::new(),
             tab_layout: TabLayout::SingleRow,
             stack_results: false,
+            ai: kerno_core::ai::AiSettings::default(),
         }
     }
 }
@@ -327,6 +334,7 @@ mod tests {
             },
             format_on_save: true,
             ligatures: true,
+            vim_mode: true,
             null_text: "∅".to_string(),
             show_time_zone: false,
             link_with_editor: true,
@@ -352,6 +360,12 @@ mod tests {
             recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
             tab_layout: TabLayout::Vertical,
             stack_results: true,
+            ai: kerno_core::ai::AiSettings {
+                enabled: true,
+                endpoint: "http://localhost:11434/v1".into(),
+                model: "llama3.2".into(),
+                confirmed: ["https://api.example.com/v1".to_string()].into(),
+            },
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

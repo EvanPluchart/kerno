@@ -14,3 +14,4 @@ pub mod plan_view;
 pub mod tab;
 pub mod tx_log;
 pub mod viewer;
+pub mod vim;

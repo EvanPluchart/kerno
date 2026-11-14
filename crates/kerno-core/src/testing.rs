@@ -479,6 +479,168 @@ async fn proxy_pump(
     }
 }
 
+/// One request the fake AI endpoint received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiRequest {
+    /// `POST /v1/chat/completions`.
+    pub line: String,
+    /// Header names in lower case, with their values.
+    pub headers: Vec<(String, String)>,
+    /// The body, byte for byte.
+    pub body: Vec<u8>,
+}
+
+impl AiRequest {
+    /// The value of header `name` (any case).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(found, _)| *found == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Default)]
+struct AiLog {
+    connections: usize,
+    requests: Vec<AiRequest>,
+}
+
+/// A fake OpenAI-compatible endpoint on `127.0.0.1` (J17): a `tokio` listener on a thread and
+/// a runtime of its own that counts every connection it accepts and records every request.
+/// `POST …/chat/completions` answers `answer` as the model's message, `GET …/models` lists
+/// `fake-model` and `other-model`, after `delay`. Dropped, it stops.
+pub struct FakeAi {
+    port: u16,
+    log: std::sync::Arc<std::sync::Mutex<AiLog>>,
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl FakeAi {
+    /// A fake answering `answer` at once.
+    pub fn start(answer: &str) -> Self {
+        Self::start_with(answer, Duration::ZERO)
+    }
+
+    /// A fake answering `answer` after `delay`.
+    pub fn start_with(answer: &str, delay: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake AI");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
+        let port = listener.local_addr().expect("the fake's port").port();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(AiLog::default()));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (shared, answer) = (log.clone(), answer.to_string());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the fake's runtime");
+            runtime.block_on(async move {
+                let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+                    return;
+                };
+                let serve = async {
+                    loop {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            continue;
+                        };
+                        shared.lock().unwrap().connections += 1;
+                        let (log, answer) = (shared.clone(), answer.clone());
+                        tokio::spawn(fake_ai_serve(stream, log, answer, delay));
+                    }
+                };
+                tokio::select! {
+                    () = serve => {}
+                    _ = stopped => {}
+                }
+            });
+        });
+        Self {
+            port,
+            log,
+            _stop: stop,
+        }
+    }
+
+    /// Its base address: `http://127.0.0.1:<port>/v1`.
+    pub fn base(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    /// The connections it accepted, whether a request came or not.
+    pub fn connections(&self) -> usize {
+        self.log.lock().unwrap().connections
+    }
+
+    /// The requests it read, in order.
+    pub fn requests(&self) -> Vec<AiRequest> {
+        self.log.lock().unwrap().requests.clone()
+    }
+}
+
+async fn fake_ai_serve(
+    mut stream: tokio::net::TcpStream,
+    log: std::sync::Arc<std::sync::Mutex<AiLog>>,
+    answer: String,
+    delay: Duration,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    let head_end = loop {
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end;
+        }
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+        }
+    };
+    let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let line = lines.next().unwrap_or_default().to_string();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let length: usize = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = bytes[head_end + 4..].to_vec();
+    while body.len() < length {
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&buffer[..read]),
+        }
+    }
+    let models = line.contains("/models");
+    log.lock().unwrap().requests.push(AiRequest {
+        line,
+        headers,
+        body,
+    });
+    tokio::time::sleep(delay).await;
+    let reply = if models {
+        serde_json::json!({"object": "list", "data": [{"id": "other-model"}, {"id": "fake-model"}]})
+    } else {
+        serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": answer}}]})
+    }
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+        reply.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
 #[cfg(test)]
 mod proxy_tests {
     use super::*;

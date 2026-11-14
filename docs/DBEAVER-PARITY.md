@@ -192,7 +192,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | NAV-55 | Rename | Renames an object with a preview | core `org.eclipse.ui.edit.rename` | PG, My | **done**: `dropping_renaming_and_truncating_show_the_sql_and_ask` |
 | NAV-56 | Delete (drop) | Drops with SQL preview and confirmation | core `org.eclipse.ui.edit.delete` | PG, My | **done**: `dropping_renaming_and_truncating_show_the_sql_and_ask`, `production_asks_twice_and_read_only_refuses` |
 | NAV-57 | Compare / Migrate | Simple schema compare | cmp.simple.ui | PG, My | **roadmap**: Schema compare is outside v1 (CLAUDE.md §4, last paragraph) |
-| NAV-58 | View Diagram | ER diagram of a table or schema | ui.editors.erd | PG, My | **roadmap**: ERD is outside v1 (CLAUDE.md §4, last paragraph) |
+| NAV-58 | View Diagram | ER diagram of a table or schema | ui.editors.erd | PG, My | **done** (v1.1, J18): the ER diagram tab, read-only (D-069) |
 | NAV-59 | Connection view ▸ (simple / advanced / custom) | Per-connection tree presets and display toggles | core `ConnectionViewSettingsContributor` | PG, My | **roadmap**: One tree layout; system objects (NAV-24) and descriptions (NAV-23) are on the roadmap separately |
 
 ## SQL editor
@@ -354,7 +354,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | OBJ-17 | Role / user editors | Create and edit roles or users, attributes, limits, privileges | ext.postgresql.ui role editor; ext.mysql.ui `MySQLUserEditorGeneral`, `MySQLUserEditorPrivileges` | PG, My | **roadmap**: CLAUDE.md §4.H2 asks for a read view of users and grants; editing them is beyond v1 |
 | OBJ-18 | Dependencies page | Objects this one depends on and the reverse | ext.postgresql tree `dependency` | PG | **roadmap**: See NAV-09 |
 | OBJ-19 | Statistics page | Table sizes and counters | engine table properties | PG, My | **done**: Database and table sizes in the administration tab; `roles_and_their_grants_sizes_and_settings_are_listed`, `sizes_show_for_people_and_sort_by_bytes` |
-| OBJ-20 | ER diagram page | Diagram tab of a table or schema | ui.editors.erd | PG, My | **roadmap**: ERD is outside v1 (CLAUDE.md §4, last paragraph) |
+| OBJ-20 | ER diagram page | Diagram tab of a table or schema | ui.editors.erd | PG, My | **done** (v1.1, J18): the ER diagram tab, read-only (D-069) |
 | OBJ-21 | Data page | Data tab inside the object editor | ui.editors.data `DatabaseDataEditor` | PG, My | **done**: Separate data tab; "Open data" from the structure tab; `a_table_opened_from_the_tree_comes_back_after_a_restart` |
 
 ## Tools and administration
@@ -384,7 +384,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | TOOL-21 | Saved tasks and the Tasks view | Tool settings saved under a name, run again, edited, duplicated, deleted, with the last run's status and log | registry `TaskImpl`, `TaskManagerImpl`; tasks.ui `DatabaseTasksView`; tasks.native.ui | PG, My | **done**: "Save as task…" on the backup, global backup, restore and execute-script wizards, Tools ▸ Create new task…, the Tasks view (Run, Edit, Duplicate, Rename, Delete, Show log, right-click menu); no secret kept, the connection and its rules looked up at each run; `a_backup_task_is_saved_listed_run_again_edited_duplicated_and_deleted`, `a_task_whose_connection_was_deleted_says_so_and_cannot_run`, `a_task_keeps_no_password_and_asks_the_override_s_at_each_run`, `a_script_task_asks_before_each_run_and_follows_the_connection_s_rules`; core: `tasks_are_saved_listed_updated_run_and_deleted`, `a_store_at_version_2_gains_the_tasks_table_and_keeps_its_data`. Left: maintenance tools and exports as tasks (TOOL-31) |
 | TOOL-22 | Data compare, schema compare | Diff of data or structure | cmp.simple.ui (PRO for full compare) | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-23 | Mock data generator | Fills tables with generated rows | PRO / datadam | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
-| TOOL-24 | AI assistant | Natural language to SQL | model.ai `sqlCommand` ai | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
+| TOOL-24 | AI assistant | Natural language to SQL | model.ai `sqlCommand` ai | PG, My | **done** (v1.1, J17, D-068): Settings → AI; editor menu ▸ AI entries; opt-in, local first |
 | TOOL-25 | Debugger | PL/pgSQL debugger | ext.postgresql.debug.ui | PG | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-26 | Visual query builder | Graphical SELECT builder (PRO) | PRO | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-27 | SQL terminal presentation | Results shown as a terminal log | ui.editors.sql.terminal | PG, My | **roadmap**: Alternative presentation of results; outside CLAUDE.md §4 |
@@ -467,7 +467,7 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 | ID | Entry | What it does | DBeaver source | PG / MySQL | Kerno |
 | -- | ---- | ---- | ---- | ---- | ---- |
 | CM-46 | Edit Table (F4) | Object editor | ui.navigator `core.object.open` | PG, My | **done**: Open structure, F4; `the_structure_of_a_table_is_shown_in_tabs`, `each_kind_of_node_gets_the_actions_that_make_sense_for_it`, `navigator_keys_run_the_actions_of_the_selected_node` |
-| CM-47 | View Diagram | ER diagram | ui.editors.erd | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
+| CM-47 | View Diagram | ER diagram | ui.editors.erd | PG, My | **done** (v1.1, J18): the ER diagram tab, read-only (D-069) |
 | CM-48 | View Data | Data editor | ui.editors.data `forSelection` | PG, My | **done**: Open data; `a_table_opened_from_the_tree_comes_back_after_a_restart` |
 | CM-49 | Create ▸ (column, index, constraint, foreign key, trigger) | New child objects | ui.navigator `core.object.create` | PG, My | **done**: Through the table form (Edit table…); `a_table_is_altered_from_the_form_with_a_preview`; triggers: G10 |
 | CM-50 | Generate SQL ▸ SELECT / INSERT / UPDATE / DELETE / DDL | Templates | ui.editors.sql `sqlGenerator` | PG, My | **done**: `statements_and_ddl_open_in_a_tab_and_run_nothing` |

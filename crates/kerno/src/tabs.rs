@@ -78,6 +78,16 @@ pub enum TabSnapshot {
         /// The connection, and the database its tables are listed from.
         target: Target,
     },
+    /// An ER diagram (J18): of a schema, or of a table and its neighbours.
+    Diagram {
+        /// The connection and database the tables are in.
+        target: Target,
+        /// PostgreSQL schema or MySQL database.
+        schema: String,
+        /// The table whose neighbours are drawn; the whole schema when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+    },
 }
 
 /// An entry of the menus of the tabs, the editor and the status bar.
@@ -1535,6 +1545,33 @@ mod tests {
             r#"{"kind":"admin","target":{"connection":"c1","database":"kerno"}}"#
         );
         assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), admin);
+        // An ER diagram of a schema, and of a table and its neighbours.
+        let diagram = TabSnapshot::Diagram {
+            target: Target {
+                connection: "c1".into(),
+                database: Some("kerno".into()),
+                schema: None,
+            },
+            schema: "shop".into(),
+            table: None,
+        };
+        let json = serde_json::to_string(&diagram).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"diagram","target":{"connection":"c1","database":"kerno"},"schema":"shop"}"#
+        );
+        assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), diagram);
+        let around = TabSnapshot::Diagram {
+            target: Target {
+                connection: "c1".into(),
+                database: None,
+                schema: None,
+            },
+            schema: "shop".into(),
+            table: Some("orders".into()),
+        };
+        let json = serde_json::to_string(&around).unwrap();
+        assert_eq!(serde_json::from_str::<TabSnapshot>(&json).unwrap(), around);
         // A kind this version does not know is rejected, and the storage
         // layer then skips that tab instead of failing to start.
         assert!(serde_json::from_str::<TabSnapshot>(r#"{"kind":"from_the_future"}"#).is_err());

@@ -58,6 +58,7 @@ use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
 use crate::data::tab::{DataTab, DataTabEvent};
+use crate::erd_tab::{DiagramTab, DiagramTabEvent};
 use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
@@ -80,6 +81,7 @@ use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::WeakFocusHandle;
 use gpui_kit::component::Disableable as _;
 use kerno_core::browse::Filter;
+use kerno_core::erd::Scope as DiagramScope;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::CellValue;
 use kerno_core::storage::SavedQuery;
@@ -124,6 +126,8 @@ enum OpenTab {
     /// The saved tasks; not restored after a restart (reopened from Tools ▸
     /// Tasks or the palette).
     Tasks(Entity<TasksView>),
+    /// An ER diagram (J18).
+    Diagram(Entity<DiagramTab>),
 }
 
 impl OpenTab {
@@ -169,6 +173,13 @@ impl OpenTab {
         }
     }
 
+    fn diagram(&self) -> Option<&Entity<DiagramTab>> {
+        match self {
+            OpenTab::Diagram(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     /// A restored tab reads nothing, and opens no session, until it is
     /// shown.
     fn defer_until_shown(&self, cx: &mut App) {
@@ -176,6 +187,7 @@ impl OpenTab {
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             // A query tab opens its session on its first run.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
@@ -187,6 +199,7 @@ impl OpenTab {
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             // Called at every frame: the Tasks view reads its list when it
             // opens and when a task changes, never from here.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
@@ -201,7 +214,8 @@ impl OpenTab {
             OpenTab::Structure(_)
             | OpenTab::Admin(_)
             | OpenTab::TableEditor(_)
-            | OpenTab::Tasks(_) => {}
+            | OpenTab::Tasks(_)
+            | OpenTab::Diagram(_) => {}
         }
     }
 
@@ -213,6 +227,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => tab.entity_id(),
             OpenTab::TableEditor(tab) => tab.entity_id(),
             OpenTab::Tasks(tab) => tab.entity_id(),
+            OpenTab::Diagram(tab) => tab.entity_id(),
         }
     }
 
@@ -249,7 +264,9 @@ impl OpenTab {
                 0 => Vec::new(),
                 count => vec![Loss::Pending(count)],
             },
-            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) => Vec::new(),
+            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {
+                Vec::new()
+            }
             OpenTab::TableEditor(tab) => {
                 if tab.read(cx).dirty(cx) {
                     vec![Loss::Form]
@@ -268,6 +285,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Admin(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::Diagram(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -280,6 +298,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Admin(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::Diagram(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -292,6 +311,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => tab.focus_handle(cx),
             OpenTab::TableEditor(tab) => tab.focus_handle(cx),
             OpenTab::Tasks(tab) => tab.focus_handle(cx),
+            OpenTab::Diagram(tab) => tab.focus_handle(cx),
         }
     }
 
@@ -302,6 +322,7 @@ impl OpenTab {
             OpenTab::Data(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Structure(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Admin(tab) => Some(tab.read(cx).snapshot()),
+            OpenTab::Diagram(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::TableEditor(_) | OpenTab::Tasks(_) => None,
         }
     }
@@ -314,6 +335,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => tab.read(cx).title(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).title(),
             OpenTab::Tasks(tab) => tab.read(cx).title(),
+            OpenTab::Diagram(tab) => tab.read(cx).title(),
         }
     }
 
@@ -326,7 +348,9 @@ impl OpenTab {
                 tab.file().is_some() && tab.unsaved() || tab.pending_count(cx) > 0
             }
             OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
-            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) => false,
+            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {
+                false
+            }
             OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
         };
         let title = self.title(cx);
@@ -345,6 +369,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => tab.read(cx).status(cx),
             OpenTab::TableEditor(tab) => tab.read(cx).status(cx),
             OpenTab::Tasks(tab) => tab.read(cx).status(cx),
+            OpenTab::Diagram(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -356,6 +381,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => tab.clone().into(),
             OpenTab::TableEditor(tab) => tab.clone().into(),
             OpenTab::Tasks(tab) => tab.clone().into(),
+            OpenTab::Diagram(tab) => tab.clone().into(),
         }
     }
 }
@@ -540,6 +566,17 @@ impl Workspace {
             }
             TabSnapshot::Admin { target } => {
                 self.push_admin_tab(target, window, cx);
+            }
+            TabSnapshot::Diagram {
+                target,
+                schema,
+                table,
+            } => {
+                let scope = match table {
+                    Some(table) => DiagramScope::Around(TableRef::new(schema, table)),
+                    None => DiagramScope::Schema(schema),
+                };
+                self.push_diagram_tab(target, scope, window, cx);
             }
         }
     }
@@ -762,6 +799,10 @@ impl Workspace {
                         let schema = table.schema.clone();
                         this.open_table_editor(target, schema, Some(table.clone()), window, cx);
                     }
+                    StructureTabEvent::ViewDiagram { table } => {
+                        let scope = DiagramScope::Around(table.clone());
+                        this.open_diagram(target, scope, window, cx);
+                    }
                 }
             },
         ));
@@ -797,6 +838,93 @@ impl Workspace {
         self.activate_tab(self.tabs.len() - 1, window, cx);
         self.schedule_save(cx);
         tab
+    }
+
+    /// Opens an ER diagram in a tab of its own.
+    fn push_diagram_tab(
+        &mut self,
+        target: Target,
+        scope: DiagramScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DiagramTab> {
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| DiagramTab::new(target, scope, connections, window, cx));
+        // One subscription per tab: `close_tab_at` removes them by index.
+        self.tab_subscriptions.push(cx.subscribe_in(
+            &tab,
+            window,
+            |this, tab, event: &DiagramTabEvent, window, cx| {
+                let target = tab.read(cx).target().clone();
+                match event {
+                    DiagramTabEvent::OpenData { table } => {
+                        let kind = RelationKind::Table;
+                        this.open_data(target, table.clone(), kind, Filter::default(), window, cx);
+                    }
+                    DiagramTabEvent::OpenStructure { table } => {
+                        this.open_structure(target, table.clone(), RelationKind::Table, window, cx);
+                    }
+                }
+            },
+        ));
+        self.tabs.push(OpenTab::Diagram(tab.clone()));
+        self.active_tab = self.tabs.len() - 1;
+        tab
+    }
+
+    /// Shows the ER diagram of a schema, or of a table and its neighbours:
+    /// in the tab that already shows it, else in a new one.
+    pub fn open_diagram(
+        &mut self,
+        target: Target,
+        scope: DiagramScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DiagramTab> {
+        let open = self.tabs.iter().position(|tab| {
+            tab.diagram().is_some_and(|tab| {
+                let tab = tab.read(cx);
+                tab.target() == &target && tab.scope() == &scope
+            })
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index].diagram().expect("a diagram tab").clone();
+        }
+        let tab = self.push_diagram_tab(target, scope, window, cx);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.schedule_save(cx);
+        tab
+    }
+
+    /// The palette's "View ER Diagram": of the table of the active
+    /// structure tab, else of what is selected in the schema tree.
+    fn view_diagram_command(
+        &mut self,
+        _: &crate::actions::ViewDiagram,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let structure = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(OpenTab::structure)
+            .map(|tab| {
+                let tab = tab.read(cx);
+                (tab.target().clone(), tab.table().clone())
+            });
+        match structure {
+            Some((target, table)) => {
+                self.open_diagram(target, DiagramScope::Around(table), window, cx);
+            }
+            None => self.on_tree(TreeAction::ViewDiagram, window, cx),
+        }
+    }
+
+    /// The tab at `index`, when it shows a diagram; for tests.
+    #[cfg(test)]
+    pub fn diagram_tab_at(&self, index: usize) -> Option<Entity<DiagramTab>> {
+        self.tabs.get(index)?.diagram().cloned()
     }
 
     /// Opens the administration of a server in a tab of its own.
@@ -1070,7 +1198,10 @@ impl Workspace {
             OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
-            OpenTab::Structure(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
+            OpenTab::Structure(_)
+            | OpenTab::TableEditor(_)
+            | OpenTab::Tasks(_)
+            | OpenTab::Diagram(_) => {}
         }
         // A closed query tab can be opened again, with its text.
         if let OpenTab::Query(tab) = tab {
@@ -1739,6 +1870,9 @@ impl Workspace {
             } => {
                 let tab = self.open_structure(target.clone(), table.clone(), *kind, window, cx);
                 tab.update(cx, |tab, cx| tab.select(PROPERTIES_SECTION, cx));
+            }
+            NavigatorEvent::ViewDiagram { target, scope } => {
+                self.open_diagram(target.clone(), scope.clone(), window, cx);
             }
             NavigatorEvent::Warn(text) => window
                 .push_notification(Notification::warning(SharedString::from(text.clone())), cx),
@@ -3910,6 +4044,10 @@ impl Workspace {
         let warning = theme.warning;
         let memory_only = !AppState::get(cx).secrets.is_persistent();
         let chrome = self.active_chrome(cx);
+        // The vim mode of the active query tab, while vim mode is on (J19).
+        let vim_mode = self
+            .active_query_tab()
+            .and_then(|tab| tab.read(cx).vim_mode());
         h_flex()
             .id("status-bar")
             .test_support()
@@ -3935,6 +4073,13 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_3()
+                    .children(vim_mode.map(|mode| {
+                        div()
+                            .id("status-vim-mode")
+                            .test_support()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(mode.label())
+                    }))
                     .children(self.update_item(cx))
                     .when(memory_only, |this| {
                         this.child(self.render_status_item(
@@ -4437,6 +4582,10 @@ impl Workspace {
         }))
         .on_action(cx.listener(|_, _: &actions::ToggleSoftWrap, _, cx| {
             AppState::update_settings(cx, |settings| settings.soft_wrap = !settings.soft_wrap);
+        }))
+        .on_action(cx.listener(|_, _: &actions::ToggleVimMode, window, cx| {
+            AppState::update_settings(cx, |settings| settings.vim_mode = !settings.vim_mode);
+            window.refresh();
         }))
         .on_action(cx.listener(|_, _: &actions::ZoomIn, window, cx| {
             crate::settings_view::zoom_grid(Some(1.0), window, cx)
@@ -4967,6 +5116,7 @@ impl Render for Workspace {
                 this.perform(None, TabAction::EditConnection, window, cx)
             }))
             .on_action(cx.listener(Self::open_admin_command))
+            .on_action(cx.listener(Self::view_diagram_command))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::toggle_sidebar))

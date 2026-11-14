@@ -266,9 +266,11 @@ storage. They never build the real update runner.
 There is no hosted CI and no GitHub Actions workflow. `scripts/check.sh` runs `cargo fmt --check`, clippy with
 `-D warnings`, `cargo deny check` and the workspace tests, starting the containers only if they are down and
 stopping them only if it started them; it refuses to start when the load average is above the core count.
-`scripts/release.sh [version]` builds the macOS `.dmg` and the Linux tarball locally, writes `dist/SHA256SUMS` and prints
-the `gh release create` command for the owner to run; it makes no network request and creates no tag.
-`scripts/bundle-macos.sh` and `scripts/bundle-linux.sh` build the packages (the Linux one inside Docker from macOS).
+`scripts/release.sh [version]` builds the macOS `.dmg` and the Linux packages locally, starts each Linux package in
+clean containers (`scripts/check-linux-packages.sh`), writes `dist/SHA256SUMS` and prints the `gh release create`
+command for the owner to run; it creates no tag and uploads nothing. `scripts/bundle-macos.sh` and
+`scripts/bundle-linux.sh` build the packages; the Linux ones (tarball, `.deb`, AppImage for x86_64 and arm64) in the
+Ubuntu 20.04 image of `packaging/linux/Dockerfile`, x86_64 cross-compiled (D-066).
 
 ## How to add an engine
 

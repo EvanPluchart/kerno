@@ -184,6 +184,9 @@ gpui_kit::actions!(
         OpenLockManager,
         /// Runs "Read data in SQL console" on the selected tree node.
         ReadObjectInConsole,
+        /// Opens the ER diagram of the selected schema or table, or of the
+        /// active structure tab's table.
+        ViewDiagram,
         /// Writes the call of the selected routine into a query tab.
         GenerateRoutineCall,
         /// Runs the selected routine, asking for its parameters.
@@ -361,6 +364,16 @@ gpui_kit::actions!(
         /// Shows the results of a script one under the other, or in result
         /// tabs again (J11).
         ToggleStackedResults,
+        /// Turns vim mode in the SQL editors on or off (J19).
+        ToggleVimMode,
+        /// Asks the AI assistant for SQL written from a sentence (J17).
+        AiWriteSql,
+        /// Asks the AI assistant to explain the statement at the cursor.
+        AiExplainQuery,
+        /// Asks the AI assistant to explain the plan on screen.
+        AiExplainPlan,
+        /// Asks the AI assistant to explain the error on screen.
+        AiExplainError,
     ]
 );
 
@@ -1410,6 +1423,15 @@ pub const COMMANDS: &[Command] = &[
         RevertFile
     ),
     // DBeaver's Ctrl+Alt+Shift+W (`word.wrap`).
+    // J19 (DBeaver #37897, #8219; Beekeeper #317): off by default.
+    command!(
+        "toggle_vim_mode",
+        "Toggle Vim Mode",
+        "Editor",
+        [],
+        ["vim", "modal", "normal mode", "insert mode", "keybindings"],
+        ToggleVimMode
+    ),
     command!(
         "toggle_soft_wrap",
         "Toggle Soft Wrap",
@@ -1459,6 +1481,39 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-shift-e"],
         ["plan", "timing", "slow"],
         ExplainAnalyze
+    ),
+    // J17 (DBeaver #36951, #20072): off until turned on in Settings → AI.
+    command!(
+        "ai_write_sql",
+        "AI: Write SQL…",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "generate", "natural language", "ollama"],
+        AiWriteSql
+    ),
+    command!(
+        "ai_explain_query",
+        "AI: Explain Query",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "describe", "ollama"],
+        AiExplainQuery
+    ),
+    command!(
+        "ai_explain_plan",
+        "AI: Explain Plan",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "explain", "slow", "ollama"],
+        AiExplainPlan
+    ),
+    command!(
+        "ai_explain_error",
+        "AI: Explain Error",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "fix", "ollama"],
+        AiExplainError
     ),
     command!(
         "close_tab",
@@ -1770,6 +1825,21 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["select", "rows", "table", "console"],
         ReadObjectInConsole
+    ),
+    // DBeaver's "View Diagram" (`ui.editors.erd`), J18.
+    command!(
+        "view_diagram",
+        "View ER Diagram",
+        "Navigator",
+        [],
+        [
+            "erd",
+            "entity relationship",
+            "schema",
+            "foreign keys",
+            "mermaid"
+        ],
+        ViewDiagram
     ),
     command!(
         "generate_routine_call",

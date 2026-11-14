@@ -44,6 +44,8 @@ pub enum StructureTabEvent {
     OpenData { table: TableRef, kind: RelationKind },
     /// Open this table in the table form.
     EditTable { table: TableRef },
+    /// Draw this table and its neighbours in an ER diagram (J18).
+    ViewDiagram { table: TableRef },
 }
 
 /// A list of the structure, shown as a table.
@@ -681,6 +683,20 @@ impl StructureTab {
                         })
                     })),
             )
+            .when(self.kind.is_table(), |bar| {
+                bar.child(
+                    Button::new("structure-diagram")
+                        .ghost()
+                        .small()
+                        .label("Diagram")
+                        .tooltip("Draw this table and the tables linked to it by foreign keys")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.emit(StructureTabEvent::ViewDiagram {
+                                table: this.table.clone(),
+                            })
+                        })),
+                )
+            })
             // Views are edited through their source, not this form.
             .when(self.kind.is_table(), |bar| {
                 match self.read_only_reason(cx) {

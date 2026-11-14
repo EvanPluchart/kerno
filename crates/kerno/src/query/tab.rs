@@ -479,6 +479,10 @@ pub struct QueryTab {
     idle_rollback: Option<((usize, u32), Task<()>)>,
     /// The run on several connections this tab took part in (J14).
     script: Option<ScriptRun>,
+    /// The AI assistant's panel at the side, while open (J17).
+    ai: Option<Entity<crate::ai_view::AiPanel>>,
+    /// Vim mode (J19), only while Settings ▸ Editor turns it on.
+    pub(super) vim: Option<super::vim::VimEditor>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -537,6 +541,9 @@ impl QueryTab {
         let edits = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.occurrences.text_changed();
+                if let Some(vim) = this.vim.as_mut() {
+                    vim.text_changed();
+                }
             }
             if matches!(event, InputEvent::Change) && this.file.is_some() && !this.unsaved {
                 this.unsaved = true;
@@ -550,6 +557,9 @@ impl QueryTab {
         let cursor_moves = cx.observe(&editor, |this: &mut Self, editor, cx| {
             this.mark_brackets(cx);
             this.occurrences.refresh(&editor, cx);
+            if let Some(vim) = this.vim.as_mut() {
+                vim.refresh_block(&editor, cx);
+            }
         });
         let subscription = cx.subscribe_in(
             &connections,
@@ -643,6 +653,8 @@ impl QueryTab {
             occurrences,
             idle_rollback: None,
             script: None,
+            ai: None,
+            vim: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
         // Every change of the tab may start, restart or stop the wait for
@@ -652,6 +664,7 @@ impl QueryTab {
         });
         tab._subscriptions.push(idle);
         tab.follow_connection(cx);
+        super::vim::follow_setting(&mut tab, cx);
         tab
     }
 
@@ -663,6 +676,7 @@ impl QueryTab {
 
     /// The editor takes a changed setting at once.
     fn follow_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        super::vim::follow_setting(self, cx);
         let wanted = Self::editor_settings(cx);
         if wanted == self.editor_options {
             return;
@@ -736,6 +750,17 @@ impl QueryTab {
     /// The `.sql` file of this tab, when it has one.
     pub fn file(&self) -> Option<&Path> {
         self.file.as_deref()
+    }
+
+    /// `:q!` in vim mode: the text is let go without asking.
+    pub(super) fn forget_unsaved(&mut self, cx: &mut Context<Self>) {
+        self.unsaved = false;
+        cx.notify();
+    }
+
+    /// The vim mode the editor is in, when vim mode is on (J19).
+    pub fn vim_mode(&self) -> Option<kerno_core::vim::Mode> {
+        self.vim.as_ref().map(|vim| vim.mode())
     }
 
     /// Whether the text differs from its file's (always, without a file).
@@ -1344,7 +1369,7 @@ impl QueryTab {
 
     /// The statements a run takes: the selection or, without one, the
     /// statement at the cursor or the whole text.
-    fn lex_rules(&self, cx: &App) -> LexRules {
+    pub(super) fn lex_rules(&self, cx: &App) -> LexRules {
         self.target
             .as_ref()
             .and_then(|target| self.connections.read(cx).meta_session(&target.connection))
@@ -2982,6 +3007,7 @@ impl QueryTab {
                 window,
                 cx,
             );
+            let menu = crate::ai_view::editor_entries(menu, window, cx);
             tabs::fit_window(menu, window)
         }
     }
@@ -5712,6 +5738,21 @@ impl QueryTab {
                             .gap_1()
                             .child(view(false, "plan-as-tree", "Plan").disabled(plan.is_none()))
                             .child(view(true, "plan-as-raw", "Raw output"))
+                            .when(AppState::get(cx).settings.ai.enabled, |bar| {
+                                bar.child(
+                                    Button::new("ai-explain-plan")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Explain with AI…")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.ai_request(
+                                                crate::ai_view::Kind::ExplainPlan,
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            })
                             .children(problem.clone().map(|problem| {
                                 div().pl_2().text_xs().text_color(theme.warning).child(
                                     SharedString::from(format!(
@@ -5769,6 +5810,19 @@ impl QueryTab {
                         .clone()
                         .map(|hint| div().child(SharedString::from(format!("Hint: {hint}")))),
                 )
+                .when(AppState::get(cx).settings.ai.enabled, |error| {
+                    error.child(
+                        div().pt_1().child(
+                            Button::new("ai-explain-error")
+                                .outline()
+                                .xsmall()
+                                .label("Explain error with AI…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.ai_request(crate::ai_view::Kind::ExplainError, window, cx)
+                                })),
+                        ),
+                    )
+                })
                 .into_any_element(),
         }
     }
@@ -6724,6 +6778,145 @@ impl QueryTab {
     }
 }
 
+// The AI assistant (J17, DBeaver #36951, #20072): the request is put
+// together from what the tab shows; `crate::ai_view` does the rest.
+impl QueryTab {
+    /// Opens the AI panel on a request of `kind`: the sentence to write, the
+    /// statement at the cursor (or the selection), the plan or the error on
+    /// screen. Off, says how to turn the assistant on and opens nothing.
+    pub fn ai_request(
+        &mut self,
+        kind: crate::ai_view::Kind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ai_view::Kind;
+        use kerno_core::ai::Action as AiAction;
+        let say = |text: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            window.push_notification(Notification::warning(SharedString::from(text)), cx)
+        };
+        if !AppState::get(cx).settings.ai.enabled {
+            say(
+                "The AI assistant is off: turn it on in Settings → AI.",
+                window,
+                cx,
+            );
+            return;
+        }
+        let pane = self.results.get(self.active_result);
+        let action = match kind {
+            Kind::WriteSql => AiAction::WriteSql {
+                sentence: String::new(),
+            },
+            Kind::ExplainQuery => {
+                let sql = (self.statements(Scope::AtCursor, cx).into_iter())
+                    .map(|statement| statement.sql)
+                    .collect::<Vec<_>>()
+                    .join(";\n");
+                if sql.trim().is_empty() {
+                    say("No statement at the cursor to explain.", window, cx);
+                    return;
+                }
+                AiAction::ExplainQuery { sql }
+            }
+            Kind::ExplainPlan => match pane.map(|pane| (&pane.statement, &pane.outcome)) {
+                Some((sql, Outcome::Plan { raw, .. })) => AiAction::ExplainPlan {
+                    sql: sql.clone(),
+                    plan: raw.clone(),
+                },
+                _ => {
+                    say("No plan on screen: run Explain plan first.", window, cx);
+                    return;
+                }
+            },
+            Kind::ExplainError => match pane.map(|pane| (&pane.statement, &pane.outcome)) {
+                Some((sql, Outcome::Failed(failure))) => {
+                    let mut error = match &failure.code {
+                        Some(code) => format!("{} [{code}]", failure.message),
+                        None => failure.message.clone(),
+                    };
+                    for (label, text) in [("Detail", &failure.detail), ("Hint", &failure.hint)] {
+                        if let Some(text) = text {
+                            error.push_str(&format!("\n{label}: {text}"));
+                        }
+                    }
+                    AiAction::ExplainError {
+                        sql: sql.clone(),
+                        error,
+                    }
+                }
+                _ => {
+                    say("No error on screen to explain.", window, cx);
+                    return;
+                }
+            },
+        };
+        let database = self.choices(cx).database;
+        let connections = self.connections.read(cx);
+        let connection = self.target.as_ref().map(|target| target.connection.clone());
+        let engine = connection
+            .as_ref()
+            .and_then(|id| connections.get(id))
+            .map(|saved| saved.config.engine);
+        // The catalog's database, as `load_catalog` read it: the sample
+        // rows come from the same one.
+        let meta = connection
+            .as_ref()
+            .and_then(|id| connections.meta_session(id));
+        let in_meta = self.target.as_ref().is_some_and(|target| {
+            target.database.is_none() || target.database == meta.as_ref().and_then(|m| m.database())
+        });
+        let session = if in_meta { meta } else { self.session.clone() };
+        let mut catalog = self.catalog.borrow().clone();
+        // MySQL's schemas are databases: only the tab's goes (§4 J17).
+        if matches!(
+            engine,
+            Some(kerno_core::Engine::MySql | kerno_core::Engine::MariaDb)
+        ) && let Some(database) = &database
+        {
+            catalog = Arc::new(kerno_core::sql::Catalog {
+                schemas: (catalog.schemas.iter())
+                    .filter(|schema| schema.name == *database)
+                    .cloned()
+                    .collect(),
+                search_path: vec![database.clone()],
+            });
+        }
+        let facts = crate::ai_view::Facts {
+            catalog,
+            engine: engine
+                .map(|engine| engine.label().to_string())
+                .unwrap_or_default(),
+            server_version: match connection.as_ref().map(|id| connections.status(id)) {
+                Some(Status::Connected { version }) => Some(version),
+                _ => None,
+            },
+            database,
+            schema: self
+                .target
+                .as_ref()
+                .and_then(|target| target.schema.clone()),
+            session,
+        };
+        let (tab, editor) = (cx.entity().downgrade(), self.editor.clone());
+        self.ai =
+            Some(cx.new(|cx| crate::ai_view::AiPanel::new(tab, editor, action, facts, window, cx)));
+        cx.notify();
+    }
+
+    /// Closes the AI panel.
+    pub fn close_ai(&mut self, cx: &mut Context<Self>) {
+        self.ai = None;
+        cx.notify();
+    }
+
+    /// The AI panel, while open; for tests.
+    #[cfg(test)]
+    pub fn ai_panel(&self) -> Option<&Entity<crate::ai_view::AiPanel>> {
+        self.ai.as_ref()
+    }
+}
+
 /// Runs an entry of the editor's menu as its command does: through the
 /// editor, which has the focus.
 pub(crate) fn run_editor_action(
@@ -6919,6 +7112,13 @@ impl Render for QueryTab {
                     })
                     .context_menu(|menu, _, _| menu),
             );
+        // Vim mode (J19) puts its key handlers and command field around
+        // it, only while it is on.
+        let editor = if self.vim.is_some() {
+            super::vim::render(self, editor, window, cx)
+        } else {
+            editor.into_any_element()
+        };
         let results = div()
             .id("results")
             .test_support()
@@ -6977,11 +7177,37 @@ impl Render for QueryTab {
                     .child(resizable_panel().child(results)),
             ),
         });
+        // The AI assistant's answers at the side (J17).
+        let area = match self.ai.clone() {
+            Some(panel) => h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(area.h_full().min_w_0())
+                .child(panel)
+                .into_any_element(),
+            None => area.into_any_element(),
+        };
         v_flex()
             .id("query-tab")
             .key_context("QueryTab")
             .test_support()
             .size_full()
+            .on_action(cx.listener(|this, _: &actions::AiWriteSql, window, cx| {
+                this.ai_request(crate::ai_view::Kind::WriteSql, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::AiExplainQuery, window, cx| {
+                    this.ai_request(crate::ai_view::Kind::ExplainQuery, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &actions::AiExplainPlan, window, cx| {
+                this.ai_request(crate::ai_view::Kind::ExplainPlan, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::AiExplainError, window, cx| {
+                    this.ai_request(crate::ai_view::Kind::ExplainError, window, cx)
+                }),
+            )
             .child(self.render_toolbar(cx))
             .child(match chrome {
                 Some(chrome) => v_flex()

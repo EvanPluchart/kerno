@@ -2,6 +2,7 @@
 //! connection settings, SSH tunnels and SQL helpers. No UI dependency.
 
 pub mod aggregate;
+pub mod ai;
 pub mod browse;
 pub mod config;
 pub mod connector;
@@ -9,6 +10,7 @@ pub mod dialect;
 pub mod driver;
 pub mod editable;
 pub mod environment;
+pub mod erd;
 pub mod error;
 pub mod exec;
 pub mod export;
@@ -35,6 +37,7 @@ pub mod testing;
 pub mod tools;
 pub mod transfer;
 pub mod update;
+pub mod vim;
 pub mod xlsx;
 
 pub use config::{

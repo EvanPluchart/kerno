@@ -38,6 +38,7 @@ use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
+mod ai;
 mod alter_form;
 mod brackets;
 mod connection_feedback;
@@ -45,6 +46,7 @@ mod coverage;
 mod editing_v11;
 mod editor_v11;
 mod environments;
+mod erd;
 mod folders;
 mod grid_v11;
 mod menus;
@@ -65,6 +67,7 @@ mod toolbar;
 mod tools_menu;
 mod transfer;
 mod updates;
+mod vim;
 mod visual4;
 mod xlsx;
 

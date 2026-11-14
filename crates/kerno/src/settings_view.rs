@@ -36,9 +36,10 @@ pub(crate) enum Section {
     Tools,
     Environments,
     Updates,
+    Ai,
 }
 
-pub(crate) const SECTIONS: [(Section, &str); 8] = [
+pub(crate) const SECTIONS: [(Section, &str); 9] = [
     (Section::Appearance, "Appearance"),
     (Section::Fonts, "Fonts"),
     (Section::Editor, "Editor"),
@@ -47,6 +48,7 @@ pub(crate) const SECTIONS: [(Section, &str); 8] = [
     (Section::Tools, "Local clients"),
     (Section::Environments, "Environments"),
     (Section::Updates, "Updates"),
+    (Section::Ai, "AI"),
 ];
 
 /// One text size the settings hold.
@@ -195,6 +197,7 @@ pub struct SettingsView {
     null_text: Entity<InputState>,
     local_clients: Entity<LocalClientsView>,
     environments: Entity<EnvironmentsView>,
+    ai: Entity<crate::ai_view::AiSettingsView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -257,12 +260,14 @@ impl SettingsView {
         ];
         let local_clients = cx.new(LocalClientsView::new);
         let environments = cx.new(|cx| EnvironmentsView::new(connections, window, cx));
+        let ai = cx.new(|cx| crate::ai_view::AiSettingsView::new(window, cx));
         Self {
             section: Section::Appearance,
             page_size,
             null_text,
             local_clients,
             environments,
+            ai,
             _subscriptions: subscriptions,
         }
     }
@@ -534,6 +539,13 @@ impl SettingsView {
                     settings.ligatures,
                     |settings, on| settings.ligatures = on,
                 ))
+                // J19 (DBeaver #37897, Beekeeper #317).
+                .child(Self::toggle(
+                    "settings-vim-mode",
+                    "Vim mode: Normal, Insert and Visual modes in the SQL editors",
+                    settings.vim_mode,
+                    |settings, on| settings.vim_mode = on,
+                ))
                 .child(Self::formatter(&settings, cx))
                 .into_any_element(),
             Section::Grid => {
@@ -614,6 +626,7 @@ impl SettingsView {
                 .into_any_element(),
             Section::Tools => self.local_clients.clone().into_any_element(),
             Section::Environments => self.environments.clone().into_any_element(),
+            Section::Ai => self.ai.clone().into_any_element(),
             Section::Updates => v_flex()
                 .gap_2()
                 .child(Self::toggle(
