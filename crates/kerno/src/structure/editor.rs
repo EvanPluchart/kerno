@@ -35,6 +35,12 @@ use crate::query::tab::TabStatus;
 use crate::tabs::Target;
 use crate::theme;
 
+/// The widths of a column row's Type and Default fields: enough for common
+/// values whole ("timestamp with time zone", "CURRENT_TIMESTAMP"); Comment
+/// takes what is left (at least 100 px), which still fits a 1280 px window.
+const TYPE_WIDTH: f32 = 190.;
+const DEFAULT_WIDTH: f32 = 170.;
+
 /// What a table editor tells the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableEditorEvent {
@@ -1268,7 +1274,7 @@ impl TableEditor {
                     Button::new(("column-up", index))
                         .ghost()
                         .xsmall()
-                        .label("↑")
+                        .icon(IconName::ArrowUp)
                         .tooltip(refused.unwrap_or("Move up"))
                         .disabled(refused.is_some() || index == 0)
                         .on_click(
@@ -1279,7 +1285,7 @@ impl TableEditor {
                     Button::new(("column-down", index))
                         .ghost()
                         .xsmall()
-                        .label("↓")
+                        .icon(IconName::ArrowDown)
                         .tooltip(refused.unwrap_or("Move down"))
                         .disabled(refused.is_some() || index + 1 == count)
                         .on_click(
@@ -1295,7 +1301,7 @@ impl TableEditor {
                     ),
                 )
                 .child(
-                    div().flex_none().w(px(150.)).child(
+                    div().flex_none().w(px(TYPE_WIDTH)).child(
                         Input::new(&row.data_type)
                             .small()
                             .id(("column-type", index))
@@ -1325,7 +1331,7 @@ impl TableEditor {
                         })),
                 )
                 .child(
-                    div().flex_none().w(px(120.)).child(
+                    div().flex_none().w(px(DEFAULT_WIDTH)).child(
                         Input::new(&row.default)
                             .small()
                             .id(("column-default", index))
@@ -1372,7 +1378,8 @@ impl TableEditor {
                     div()
                         .id(("column-note", index))
                         .test_support()
-                        .flex_none()
+                        // Shrinks (ellipsized) before the fields would.
+                        .min_w_0()
                         .max_w(px(220.))
                         .truncate()
                         .text_xs()
@@ -1393,9 +1400,9 @@ impl TableEditor {
                     .gap_1()
                     .pl(px(mover))
                     .child(Self::heading("Name", 150., cx))
-                    .child(Self::heading("Type", 178., cx))
+                    .child(Self::heading("Type", TYPE_WIDTH + 28., cx))
                     .child(Self::heading("", 58., cx))
-                    .child(Self::heading("Default", 120., cx))
+                    .child(Self::heading("Default", DEFAULT_WIDTH, cx))
                     .child(Self::heading("", 102., cx))
                     .child(Self::heading("Comment", 100., cx)),
             )

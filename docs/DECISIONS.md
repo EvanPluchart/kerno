@@ -1485,3 +1485,60 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Visual mode** keeps its anchor and head; an arrow or a click that moved the editor's cursor moves the
   head at the next key. `:wq` closes the tab once the asynchronous write has cleared `unsaved`; `:q!`
   clears it first, and the close goes through the usual question for transactions and pending changes.
+
+## D-071 — Review follow-ups of milestone 11
+
+- **J4, unsaved connections**: history is still written (saving keeps the id, so it follows); what an unsaved
+  connection left is removed instead: `Storage::forget_unknown_connections` deletes the history and table
+  layouts whose connection is not stored, at quit and at startup (a crash), only in the instance that holds
+  `instance.sock` (a second instance beside it must not remove the first one's; a `kerno <url>` handed over
+  exits before reading storage). Saved queries and tasks stay (the user named them). Restored tabs of a gone connection, deleted or unsaved alike: query tabs keep their text
+  with no connection, the others are not reopened. The dialog of "Save connection…" is titled so.
+- **J11**: the query tab follows the "Stack results" setting in its settings observer, so Settings, the View
+  menu and the results menu all scroll the result tab bar to the result on screen.
+- **J17, commands outside a query tab**: the window takes the four "AI: …" commands when no query tab has the
+  keyboard: the active query tab does the work; with none, "Open a query tab first", or the off notice.
+- **J15**: an import that replaces a connection calls `Connections::replaced` (also after a failed import):
+  the cached secrets of those whose secrets the import changed or forgot are dropped (a moved server must not
+  get the old password; the others keep theirs, no second keychain read) and, once the list is read again,
+  an open one goes through the window's reconnect, which asks about what its tabs hold, as saving an edited
+  connection does.
+- **J6**: a layout key names the database the session is in, known before it opens: a PostgreSQL connection
+  without a default database uses the driver's `DEFAULT_DATABASE` (`postgres`), as the tree does.
+- **J17, Stop**: `ureq` 3.5 has no way to abort a call; Stop says "Stopped" at once and drops the task that
+  waits for the answer (the generation check stays as a backstop); the call ends on its own blocking thread,
+  so the next request does not wait for it.
+- **J13**: the transfer wizard keeps its plan and `CREATE` preview, worked out again (before the next frame)
+  only when an input changed: the target fields, the connection list, the mapping fields, a skip, the table
+  shown, the three choices, the mapping read.
+
+## D-072 — Visual fixes after the first v1.1 captures
+
+- **J7 occurrences**: a faint tint plus a 1 px frame (the kit draws one style per decoration: two collections).
+  New `theme.rs` tokens: `OCCURRENCE_FILL` `#F6F8F2` / `#1B201B` (every syntax colour stays at 4.5:1 or more on
+  it: comment 4.57 / 4.60), `MARK_EDGE` Olive `#4D6B00` / Lime `#C8F03C` (5.74 / 12.6:1 on the editor). The
+  selection stays a solid Lime fill with no frame, the bracket match a frame in the text colour.
+- **J10 rows**: past four rows the rows scroll with the kit's vertical scrollbar; rows start 8 px in; the
+  strip scrolls to the active tab again when its label changes (the unsaved mark widened the last tab and
+  pushed its close button half out of the strip: the `>` seen at the strip's end was that clipped `×`).
+- **J10 side list**: the panel sits on the sidebar's surface, so the active row's `list.active` wash reads as
+  the schema tree's selected row; its title is medium weight. A long title ends in an ellipsis (on the element
+  that holds the text) and the row carries the whole title as tooltip and accessible description.
+- **J10 tab list**: the check and the label (with the unsaved mark) have ids; the list opens scrolled to the
+  active tab; the popup gets a 1 px `input.border` edge, since the kit's hairline ring (the completion list and
+  menus have the same one) fades into a dark grid.
+- **J6 find**: "No match" instead of "No matches" ("3 of 11" after a step was already there); matches tinted
+  `GRID_MATCH_FILL` `#DFE4D1` / `#3C4721` (text 13.6 / 8.2:1, links 4.7 / 7.6:1; not the selected row's
+  Lime wash), the current one framed in `MARK_EDGE` (4.7 / 7.6:1 on the tint); the bar's buttons are small,
+  not extra small.
+- **J6 matching rows only**: the row numbers keep the number each row has without the filter (its place in
+  the sort shown when sorted), copied numbers too; the result footer and the status bar say "11 of 30 rows"
+  ("fetched rows" when incomplete), from the find's `rows_shown`, as the bar does.
+- **J8 column moves**: the arrows are the kit's arrow icons (the `↑`/`↓` text glyphs were too thin to read when
+  disabled; disabled now looks like every disabled ghost button). Type is 190 px and Default 170 px wide;
+  Comment takes the rest (at least 100 px), still inside a 1280 px window.
+- **J3 AWS RDS IAM**: "Region" and "Profile" labels on their fields; a muted line under the command says that
+  the token needs TLS and what the SSL mode now is (set to "require", or the verifying mode the user chose).
+- **Value viewer**: the JSON view is offered (and first) only for a JSON column or a text holding an object or
+  an array; an integer opens on Text. The Unix-time line stays in the secondary text colour, now right under
+  the value. The size line is the byte length of the value's text, by design.

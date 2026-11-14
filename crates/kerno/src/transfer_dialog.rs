@@ -20,6 +20,8 @@
 //! confirmed (`sql_confirm`: twice on production). The copy runs on two
 //! sessions of its own, off the UI thread; memory holds one batch.
 
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +104,14 @@ struct Running {
     target: Option<Arc<dyn Session>>,
 }
 
+/// The plan and the `CREATE` preview of the table on the mapping page,
+/// worked out when something they depend on changed, not at every frame.
+struct Computed {
+    plan: Option<TransferPlan>,
+    /// The statements, or why there are none (empty: nothing to say).
+    preview: Result<String, String>,
+}
+
 pub struct TransferDialog {
     connections: Entity<Connections>,
     /// The source connection and database.
@@ -132,6 +142,11 @@ pub struct TransferDialog {
     cancel: Arc<AtomicBool>,
     tasks: Vec<Task<()>>,
     mapping_subscriptions: Vec<Subscription>,
+    computed: Computed,
+    /// An input changed since `computed` was worked out.
+    stale: bool,
+    /// How many times the plan was built; for tests.
+    plan_builds: Cell<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -223,15 +238,15 @@ impl TransferDialog {
         let mut subscriptions: Vec<Subscription> = [&target_database, &target_schema]
             .into_iter()
             .map(|input| {
-                cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                cx.subscribe(input, |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
-                        cx.notify();
+                        this.changed(cx);
                     }
                 })
             })
             .collect();
         // A target that connects, or fails to, is shown as it goes.
-        subscriptions.push(cx.observe(&connections, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&connections, |this, _, cx| this.changed(cx)));
         let current = tables
             .first()
             .map(|table| table.schema.clone())
@@ -261,6 +276,12 @@ impl TransferDialog {
             cancel: Arc::new(AtomicBool::new(false)),
             tasks: Vec::new(),
             mapping_subscriptions: Vec::new(),
+            computed: Computed {
+                plan: None,
+                preview: Err(String::new()),
+            },
+            stale: true,
+            plan_builds: Cell::new(0),
             _subscriptions: subscriptions,
         };
         dialog.load_objects(cx);
@@ -371,7 +392,7 @@ impl TransferDialog {
                 .update(cx, |connections, cx| connections.connect(&id, cx));
         }
         self.target = Some(id);
-        cx.notify();
+        self.changed(cx);
     }
 
     fn target_engine(&self, cx: &App) -> Option<Engine> {
@@ -405,6 +426,7 @@ impl TransferDialog {
             connections.open_session(&self.source.connection, Some(self.database.clone()), cx);
         let target = connections.open_session(&target, database, cx);
         self.mapping = Loaded::Loading;
+        self.stale = true;
         self.mapping_subscriptions.clear();
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let sessions = match (source.await, target.await) {
@@ -438,7 +460,7 @@ impl TransferDialog {
                         Loaded::Ready(this.rows(transfers, window, cx))
                     }
                 };
-                cx.notify();
+                this.changed(cx);
             });
         }));
     }
@@ -459,9 +481,9 @@ impl TransferDialog {
             });
             self.mapping_subscriptions.push(cx.subscribe(
                 &input,
-                |_, _, event: &InputEvent, cx| {
+                |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
-                        cx.notify();
+                        this.changed(cx);
                     }
                 },
             ));
@@ -495,7 +517,38 @@ impl TransferDialog {
         {
             mapping.skip = skip;
         }
+        self.changed(cx);
+    }
+
+    /// An input of the plan or of the preview changed: they are worked out
+    /// again before the next frame.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        self.stale = true;
         cx.notify();
+    }
+
+    /// Works the plan and the preview out again if an input changed.
+    fn refresh(&mut self, cx: &App) {
+        if std::mem::take(&mut self.stale) {
+            let plan = self.plan(cx);
+            let preview = self.preview(plan.as_ref(), cx);
+            self.computed = Computed { plan, preview };
+        }
+    }
+
+    /// The plan: the one worked out, or a new one while a change waits for
+    /// the next frame.
+    fn current_plan(&self, cx: &App) -> Option<Cow<'_, TransferPlan>> {
+        match self.stale {
+            true => self.plan(cx).map(Cow::Owned),
+            false => self.computed.plan.as_ref().map(Cow::Borrowed),
+        }
+    }
+
+    /// How many times the plan was built; for tests.
+    #[cfg(test)]
+    pub fn plan_builds(&self) -> usize {
+        self.plan_builds.get()
     }
 
     /// The copy as the pages describe it, the fields read.
@@ -503,6 +556,7 @@ impl TransferDialog {
         let Loaded::Ready(rows) = &self.mapping else {
             return None;
         };
+        self.plan_builds.set(self.plan_builds.get() + 1);
         let tables = rows
             .iter()
             .map(|row| {
@@ -520,6 +574,55 @@ impl TransferDialog {
         plan.if_exists = self.if_exists;
         plan.on_error = self.on_error;
         Some(plan)
+    }
+
+    /// The `CREATE TABLE` of the table on the mapping page under `plan`,
+    /// or what happens to that table instead.
+    fn preview(&self, plan: Option<&TransferPlan>, cx: &App) -> Result<String, String> {
+        let Loaded::Ready(rows) = &self.mapping else {
+            return Err(String::new());
+        };
+        let transfer = rows.get(self.shown).and_then(|row| {
+            plan?
+                .tables
+                .iter()
+                .find(|t| t.source == row.transfer.source)
+        });
+        match (plan, transfer, self.target.as_ref()) {
+            (Some(plan), Some(transfer), Some(target)) => {
+                let exists = self.exists(&transfer.target_name);
+                if plan.mode == TransferMode::Append || exists {
+                    let what = match (plan.mode, plan.if_exists) {
+                        (TransferMode::Append, _) | (_, IfExists::Append) => {
+                            "The table exists on the target: the rows are added to it."
+                        }
+                        (_, IfExists::Skip) => "The table exists on the target: it is skipped.",
+                        (_, IfExists::Stop) => {
+                            "The table exists on the target: the copy would stop here."
+                        }
+                    };
+                    let what = if plan.mode == TransferMode::Append && !exists {
+                        "The table does not exist on the target: Append needs it."
+                    } else {
+                        what
+                    };
+                    Ok(what.to_string())
+                } else {
+                    let meta = self.connections.read(cx).meta_session(target);
+                    match meta {
+                        Some(meta) => transfer::create_statements(
+                            transfer,
+                            &plan.target_schema,
+                            meta.dialect(),
+                        )
+                        .map(|sql| format!("{};", sql.join(";\n")))
+                        .map_err(|error| error_text(&error)),
+                        None => Err("The target is not connected.".into()),
+                    }
+                }
+            }
+            _ => Err(String::new()),
+        }
     }
 
     fn exists(&self, name: &str) -> bool {
@@ -544,7 +647,7 @@ impl TransferDialog {
                 let plan = match &self.mapping {
                     Loaded::Loading => return Some("Reading the tables' columns…".into()),
                     Loaded::Failed(why) => return Some(why.clone()),
-                    Loaded::Ready(_) => self.plan(cx)?,
+                    Loaded::Ready(_) => self.current_plan(cx)?,
                 };
                 if let Some(problem) = plan.problems().into_iter().next() {
                     return Some(problem);
@@ -1175,7 +1278,10 @@ impl TransferDialog {
                     (TransferMode::Append, "Add the rows to existing tables"),
                 ],
                 self.mode,
-                |this, mode| this.mode = mode,
+                |this, mode| {
+                    this.mode = mode;
+                    this.stale = true;
+                },
                 cx,
             ))
             .when(self.mode == TransferMode::Create, |this| {
@@ -1188,7 +1294,10 @@ impl TransferDialog {
                             (IfExists::Skip, "Skip it"),
                         ],
                         self.if_exists,
-                        |this, choice| this.if_exists = choice,
+                        |this, choice| {
+                            this.if_exists = choice;
+                            this.stale = true;
+                        },
                         cx,
                     ))
             })
@@ -1200,7 +1309,10 @@ impl TransferDialog {
                     (OnError::SkipTable, "Go on with the next table"),
                 ],
                 self.on_error,
-                |this, choice| this.on_error = choice,
+                |this, choice| {
+                    this.on_error = choice;
+                    this.stale = true;
+                },
                 cx,
             ))
             .into_any_element()
@@ -1247,16 +1359,14 @@ impl TransferDialog {
                     .child(SharedString::from(row.transfer.source.name.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.shown = index;
-                        cx.notify();
+                        this.changed(cx);
                     }))
             }));
         let Some(row) = rows.get(self.shown) else {
             return tables.into_any_element();
         };
         let table = self.shown;
-        let plan = self.plan(cx);
-        let transfer = plan
-            .as_ref()
+        let transfer = (self.computed.plan.as_ref())
             .and_then(|plan| plan.tables.iter().find(|t| t.source == row.transfer.source));
         let columns = v_flex()
             .gap_1()
@@ -1347,42 +1457,8 @@ impl TransferDialog {
                             })
                     }),
             );
-        let preview = match (&plan, transfer, self.target.as_ref()) {
-            (Some(plan), Some(transfer), Some(target)) => {
-                let exists = self.exists(&transfer.target_name);
-                if plan.mode == TransferMode::Append || exists {
-                    let what = match (plan.mode, plan.if_exists) {
-                        (TransferMode::Append, _) | (_, IfExists::Append) => {
-                            "The table exists on the target: the rows are added to it."
-                        }
-                        (_, IfExists::Skip) => "The table exists on the target: it is skipped.",
-                        (_, IfExists::Stop) => {
-                            "The table exists on the target: the copy would stop here."
-                        }
-                    };
-                    let what = if plan.mode == TransferMode::Append && !exists {
-                        "The table does not exist on the target: Append needs it."
-                    } else {
-                        what
-                    };
-                    Ok(what.to_string())
-                } else {
-                    let meta = self.connections.read(cx).meta_session(target);
-                    match meta {
-                        Some(meta) => transfer::create_statements(
-                            transfer,
-                            &plan.target_schema,
-                            meta.dialect(),
-                        )
-                        .map(|sql| format!("{};", sql.join(";\n")))
-                        .map_err(|error| error_text(&error)),
-                        None => Err("The target is not connected.".into()),
-                    }
-                }
-            }
-            _ => Err(String::new()),
-        };
-        let preview_text = match &preview {
+        let preview = &self.computed.preview;
+        let preview_text = match preview {
             Ok(text) | Err(text) => text.clone(),
         };
         let not_copied = (!row.transfer.not_copied.is_empty()).then(|| {
@@ -1455,7 +1531,7 @@ impl TransferDialog {
                 })
                 .collect(),
             (Loaded::Ready(_), None) => self
-                .plan(cx)
+                .current_plan(cx)
                 .map(|plan| {
                     plan.tables
                         .iter()
@@ -1668,6 +1744,7 @@ impl TransferDialog {
 
 impl Render for TransferDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh(cx);
         let theme = cx.theme();
         let intro = format!(
             "Copy tables of the database “{}” of “{}” with their rows to another connection.",

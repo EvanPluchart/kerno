@@ -471,3 +471,75 @@ fn a_tunnel_moved_to_another_ssh_host_loses_every_saved_secret(cx: &mut TestAppC
         Secrets::default()
     );
 }
+
+/// An import that replaces a connection that is open does what saving an edited one does
+/// (`saving_an_open_connection_asks_before_it_reconnects`): the window asks about what its
+/// tabs hold, then the connection opens again with the imported settings (DBeaver #22579).
+#[gpui_kit::test]
+fn an_import_that_replaces_an_open_connection_reconnects_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = entries_scratch("kerno_ui_import_open");
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.run_for_row(cx, "show transaction_read_only", &["off"]);
+    app.open_transaction(cx, "insert into kerno_ui_import_open.entries values (1)");
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("out.json");
+    let (workspace, target) = (app.workspace.clone(), file.clone());
+    app.step(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.export_connections_to(target, window, cx)
+        })
+    });
+    app.wait_until(cx, "the export", |app, cx| app.has(cx, "portable-done"));
+    app.click(cx, "portable-close");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    json["connections"][0]["read_only"] = true.into();
+    let changed = dir.path().join("changed.json");
+    std::fs::write(&changed, json.to_string()).unwrap();
+    let preview = app.import_preview(cx, changed);
+    let summary = app.summary(cx, &preview);
+    assert!(summary.contains("Replace Linked"), "{summary}");
+    app.click(cx, "import-next");
+    if app.has(cx, "import-confirm") {
+        app.click(cx, "import-confirm");
+    }
+    app.wait_until(cx, "the question", |app, cx| app.has(cx, "end-question"));
+    // Nothing reconnects before the answer.
+    let reconnects = Rc::new(std::cell::Cell::new(0));
+    let _watch = cx.update(|cx| {
+        let reconnects = reconnects.clone();
+        cx.subscribe(&app.connections, move |connections, event, cx| {
+            if let crate::connections::manager::ConnectionsEvent::StatusChanged { id } = event
+                && connections.read(cx).status(id) == Status::Connecting
+            {
+                reconnects.set(reconnects.get() + 1);
+            }
+        })
+    });
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        let read_only = cx.update(|cx| app.connections.read(cx).saved()[0].config.read_only);
+        read_only
+            && reconnects.get() > 0
+            && matches!(app.status(cx, 0), Status::Connected { .. })
+            && app.tx_state(cx) == kerno_core::TxState::Idle
+    });
+    assert_eq!(
+        on_server(
+            Engine::Postgres,
+            "SELECT count(*) FROM kerno_ui_import_open.entries"
+        ),
+        "0"
+    );
+    app.click(cx, "import-close");
+    assert!(!app.dialog_open(cx));
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+    app.click(cx, "query-editor");
+    app.run_for_row(cx, "show transaction_read_only", &["on"]);
+}

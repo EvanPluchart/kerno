@@ -130,6 +130,14 @@ fn main() {
         Startup::load().map(|startup| {
             let socket = instance::socket_path(&startup.paths.data_dir);
             let listener = instance::listen(&socket);
+            // What a run that crashed left of its unsaved connections (J4);
+            // only by the instance that holds the socket: a second one
+            // beside it must not touch the first one's.
+            if matches!(listener, Ok(Some(_)))
+                && let Err(error) = startup.storage.forget_unknown_connections()
+            {
+                eprintln!("kerno: could not forget the unsaved connections: {error}");
+            }
             (startup, listener)
         })
     });
@@ -267,6 +275,17 @@ fn start(
         bench::begin(&workspace, &connections, window, cx);
         if let Some(listener) = listener {
             open_url::listen(listener, &workspace, &connections, window, cx);
+            // The connections opened from a URL and never saved leave no
+            // history or layout behind (J4); only this instance had them.
+            cx.on_app_quit(|cx| {
+                let storage = AppState::get(cx).storage.clone();
+                bridge::spawn_blocking(cx, move || {
+                    if let Err(error) = storage.forget_unknown_connections() {
+                        tracing::warn!(%error, "could not forget the unsaved connections");
+                    }
+                })
+            })
+            .detach();
         }
         if let Some(url) = url.as_ref().and_then(|url| {
             tracing::info!(url = %instance::redact_url(url.expose()), "opening a URL");

@@ -165,6 +165,10 @@ impl ConnectionDialog {
         cx: &mut App,
     ) {
         let title = match &existing {
+            // One opened from a URL (J4) is saved here for the first time.
+            Some((saved, _)) if connections.read(cx).is_unsaved(&saved.id) => {
+                "Save connection".to_string()
+            }
             Some((saved, _)) => format!("Edit “{}”", saved.config.name),
             None => "New connection".to_string(),
         };
@@ -203,7 +207,11 @@ impl ConnectionDialog {
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
             dialog
-                .title(SharedString::from(title.clone()))
+                .title(
+                    div()
+                        .child(SharedString::from(title.clone()))
+                        .test_text(title.clone()),
+                )
                 .w(px(720.))
                 // Enter in a field must not close a half-filled form.
                 .on_ok(|_, _, _| false)
@@ -1148,20 +1156,34 @@ impl ConnectionDialog {
                     ),
                 )
                 .into_any_element(),
-            PasswordChoice::RdsIam => h_flex()
-                .gap_2()
-                .flex_1()
-                .child(
-                    Input::new(&self.inputs.rds_region)
-                        .id("conn-rds-region")
-                        .flex_1(),
-                )
-                .child(
-                    Input::new(&self.inputs.rds_profile)
-                        .id("conn-rds-profile")
-                        .flex_1(),
-                )
-                .into_any_element(),
+            // Each field with its small label, as the dialog's others.
+            PasswordChoice::RdsIam => {
+                let labelled = |label: &'static str, input: Input| {
+                    v_flex()
+                        .flex_1()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted)
+                                .child(label),
+                        )
+                        .child(input)
+                };
+                h_flex()
+                    .gap_2()
+                    .flex_1()
+                    .child(labelled(
+                        "Region",
+                        Input::new(&self.inputs.rds_region).id("conn-rds-region"),
+                    ))
+                    .child(labelled(
+                        "Profile",
+                        Input::new(&self.inputs.rds_profile).id("conn-rds-profile"),
+                    ))
+                    .into_any_element()
+            }
             PasswordChoice::OnePassword => Input::new(&self.inputs.op_reference)
                 .id("conn-op-reference")
                 .flex_1()
@@ -1176,12 +1198,19 @@ impl ConnectionDialog {
         ]
         .into_iter()
         .find_map(|field| self.error_for(field));
-        let mut block = v_flex().gap_1().child(self.field(
-            "Password from",
-            None,
-            h_flex().gap_2().child(picker).child(fields),
-            cx,
-        ));
+        let mut block = v_flex().gap_1().child(
+            self.field(
+                "Password from",
+                None,
+                // Beside labelled fields, the picker lines up with them.
+                h_flex()
+                    .gap_2()
+                    .when(choice == PasswordChoice::RdsIam, |row| row.items_end())
+                    .child(picker)
+                    .child(fields),
+                cx,
+            ),
+        );
         if choice == PasswordChoice::Command {
             block = block.child(Textarea::new(&self.inputs.command_args));
         }
@@ -1225,6 +1254,23 @@ impl ConnectionDialog {
                     .child(line.clone())
                     .test_text(line),
             )
+            // The token goes over TLS only: say what the SSL tab now holds.
+            .when(choice == PasswordChoice::RdsIam, |block| {
+                let text = match form.tls_mode {
+                    TlsMode::Disable | TlsMode::Prefer => "AWS RDS IAM sends its token over TLS \
+                                                            only: choose “require” on the SSL / \
+                                                            TLS tab."
+                        .to_string(),
+                    TlsMode::Require => "TLS is required for an IAM token: the SSL mode was set \
+                                         to “require” (SSL / TLS tab)."
+                        .to_string(),
+                    mode => format!(
+                        "TLS is required for an IAM token: the SSL mode stays “{}”.",
+                        mode.as_str()
+                    ),
+                };
+                block.child(note("conn-rds-tls", text, muted))
+            })
             .child(
                 h_flex()
                     .gap_2()

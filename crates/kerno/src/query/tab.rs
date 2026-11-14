@@ -452,6 +452,10 @@ pub struct QueryTab {
     /// "Open in its own tab" showed the results in tabs while they are
     /// stacked (J11): until the next run.
     unstacked: bool,
+    /// The "Stack results" setting as this tab last saw it: when it changes
+    /// (Settings, the View menu, the results menu), the result on screen is
+    /// scrolled into view again.
+    stacking: bool,
     /// The stacked results, virtual: only those in view are laid out.
     stack_list: ListState,
     /// The panes (and `u64::MAX` for the messages) the list holds.
@@ -639,6 +643,7 @@ impl QueryTab {
             next_find: None,
             carried_find: None,
             unstacked: false,
+            stacking: AppState::get(cx).settings.stack_results,
             stack_list: ListState::new(0, ListAlignment::Top, px(200.)),
             stack_items: RefCell::new(Vec::new()),
             requery: None,
@@ -677,6 +682,13 @@ impl QueryTab {
     /// The editor takes a changed setting at once.
     fn follow_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         super::vim::follow_setting(self, cx);
+        let stacking = AppState::get(cx).settings.stack_results;
+        if stacking != self.stacking {
+            self.stacking = stacking;
+            self.unstacked = false;
+            self.revealed_result = None;
+            cx.notify();
+        }
         let wanted = Self::editor_settings(cx);
         if wanted == self.editor_options {
             return;
@@ -6606,7 +6618,10 @@ impl QueryTab {
                 let rows = grid.row_count();
                 let more = grid.has_more();
                 let count = plan_view::number(rows as f64);
+                // The find shows matching rows only: of how many.
+                let shown = super::find::rows_shown(grid);
                 let text = match pane.total {
+                    _ if shown.is_some() => shown.unwrap_or_default(),
                     _ if grid.is_complete() => {
                         format!("{count} row{}", if rows == 1 { "" } else { "s" })
                     }
@@ -6796,11 +6811,7 @@ impl QueryTab {
             window.push_notification(Notification::warning(SharedString::from(text)), cx)
         };
         if !AppState::get(cx).settings.ai.enabled {
-            say(
-                "The AI assistant is off: turn it on in Settings → AI.",
-                window,
-                cx,
-            );
+            say(crate::ai_view::OFF_NOTICE, window, cx);
             return;
         }
         let pane = self.results.get(self.active_result);

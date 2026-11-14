@@ -460,3 +460,145 @@ fn a_cell_menu_edits_its_own_stacked_result(cx: &mut TestAppContext) {
     tab.update(cx, |tab, cx| tab.discard(cx));
     assert_eq!(pending(cx, &second), 0);
 }
+
+/// "Stack results" turned off from Settings or the View menu, as from the
+/// results menu, scrolls the result tab bar to the result on screen: here
+/// the error that ended a 31-statement script, far to the right (DBeaver
+/// #6861).
+#[gpui_kit::test]
+fn unstacking_from_settings_shows_the_result_on_screen_in_the_tab_bar(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.stack_results = true));
+    let mut script: Vec<String> = (1..=30).map(|n| format!("select {n}")).collect();
+    script.push("select * from kerno_no_such_table".into());
+    app.run_in_new_tab(cx, &script.join(";\n"), "secondary-shift-enter");
+    app.wait_until(cx, "the script", |app, cx| {
+        app.outcomes(cx).len() == 31 && !app.running(cx)
+    });
+    let tab = app.tab(cx);
+    assert_eq!(cx.update(|cx| tab.read(cx).active_result()), 30);
+    assert!(app.has(cx, "stacked-results"));
+
+    // As the Settings toggle does.
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.stack_results = false));
+    assert!(app.has(cx, ("result-tab", 30usize)));
+    app.step(cx, |window, _| window.refresh());
+    assert!(
+        cx.update(|cx| tab.read(cx).result_bar_offset()) < px(0.),
+        "the bar scrolled to the error's tab"
+    );
+}
+
+/// Forty tabs on several rows: past four rows they scroll, with a
+/// scrollbar, and every tab can be brought into view: each one activated in
+/// turn is scrolled to, the last one too (DBeaver #7114).
+#[gpui_kit::test]
+fn forty_tabs_on_several_rows_scroll_to_each_one(cx: &mut TestAppContext) {
+    let app = open(cx, many_tabs(40));
+    app.dispatch(cx, actions::TabsOnSeveralRows);
+    assert_eq!(layout(cx), TabLayout::Rows);
+    let in_view = |cx: &mut TestAppContext| {
+        app.step(cx, |window, _| window.refresh());
+        cx.update(|cx| app.workspace.read(cx).active_tab_in_view())
+    };
+    pick_from_all_tabs(&app, cx, 0);
+    for index in 0..40usize {
+        assert_eq!(app.active(cx), Some(index));
+        let (inside, overflows) = in_view(cx);
+        assert!(overflows, "40 tabs take more than four rows");
+        assert!(inside, "tab {index} is scrolled into view");
+        app.dispatch(cx, actions::NextTab);
+    }
+    // The last one, picked from the list after the first.
+    pick_from_all_tabs(&app, cx, 0);
+    pick_from_all_tabs(&app, cx, 39);
+    assert!(in_view(cx).0, "the last tab is in view");
+    assert!(app.has(cx, ("tab-title", 39usize)));
+}
+
+/// The list of every tab opens on the active one, checks it, and shows a
+/// tab's unsaved mark as the tab does (DBeaver #7114).
+#[gpui_kit::test]
+fn the_list_of_tabs_checks_the_active_one_and_shows_unsaved_marks(cx: &mut TestAppContext) {
+    let storage = many_tabs(30);
+    let mut tabs: Vec<TabSnapshot> = storage.tabs().unwrap();
+    if let TabSnapshot::Query {
+        file, unsaved, sql, ..
+    } = &mut tabs[4]
+    {
+        *file = Some("/tmp/kerno_ui_list_unsaved.sql".into());
+        *unsaved = true;
+        *sql = "select 1".into();
+    }
+    storage.save_tabs(&tabs).unwrap();
+    let app = open(cx, storage);
+    pick_from_all_tabs(&app, cx, 27);
+    app.click(cx, "tabs-overflow");
+    assert!(app.has(cx, ("all-tabs-check", 27usize)));
+    // It opened scrolled to the active tab.
+    let (list, check) = app.step(cx, |window, _| {
+        (
+            window.find("all-tabs-list").bounds(),
+            window.find(("all-tabs-check", 27usize)).bounds(),
+        )
+    });
+    assert!(
+        check.top() >= list.top() && check.bottom() <= list.bottom(),
+        "the active tab is in view: {check:?} in {list:?}"
+    );
+    assert!(!app.has(cx, ("all-tabs-check", 0usize)));
+    // What the list writes of a tab.
+    let listed = |cx: &mut TestAppContext, index: usize| {
+        let id = gpui_kit::ElementId::from(("all-tabs-label", index));
+        app.step(cx, |window, _| {
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .filter(|text| text.path().contains(&id))
+                .map(|text| text.text().to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+    let labels = cx.update(|cx| app.workspace.read(cx).tab_labels(cx));
+    assert!(labels[4].ends_with('•'), "{}", labels[4]);
+    assert!(listed(cx, 4).contains(&labels[4]), "{:?}", listed(cx, 4));
+    assert!(listed(cx, 5).contains(&"Query 6".to_string()));
+}
+
+/// At the side, a long title ends in an ellipsis inside its row and the row
+/// has the whole title as its tooltip (DBeaver #23248).
+#[gpui_kit::test]
+fn a_long_title_at_the_side_is_cut_and_whole_in_its_tooltip(cx: &mut TestAppContext) {
+    let storage = many_tabs(3);
+    let mut tabs: Vec<TabSnapshot> = storage.tabs().unwrap();
+    let long = "customer_lifetime_value(p_customer_id bigint, p_since timestamp)";
+    if let TabSnapshot::Query { title, .. } = &mut tabs[1] {
+        *title = long.into();
+    }
+    storage.save_tabs(&tabs).unwrap();
+    let app = open(cx, storage);
+    app.dispatch(cx, actions::TabsAtTheSide);
+    let (row, title) = app.step(cx, |window, _| {
+        (
+            window.find(("tab-row", 1usize)).bounds(),
+            window.find(("tab-title", 1usize)).bounds(),
+        )
+    });
+    assert!(
+        title.right() <= row.right(),
+        "the title stays in its row: {title:?} in {row:?}"
+    );
+    let tooltip = app.step(cx, |window, _| {
+        window
+            .find(("tab-row-title", 1usize))
+            .description()
+            .map(str::to_string)
+    });
+    assert_eq!(
+        tooltip.as_deref(),
+        Some(long),
+        "the tooltip has the whole title"
+    );
+}

@@ -440,22 +440,50 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
     assert!(panel(&app, cx).is_none());
 }
 
-/// Stop drops the request being waited on; the next one goes.
+/// Stop drops the request being waited on, at once ("Stopped"); the next one goes without
+/// waiting for it; a stopped request's answer, when the fake finally sends it, is never shown
+/// and inserts nothing (`ureq` 3 cannot abort the call: it ends on its own thread).
 #[gpui_kit::test]
 fn a_request_is_stopped(cx: &mut TestAppContext) {
-    let fake = FakeAi::start_with(ANSWER, Duration::from_secs(5));
+    let fake = FakeAi::start_with(ANSWER, Duration::from_secs(1));
     let app = open(cx, memory_storage());
     app.press(cx, &["secondary-t"]);
     enable(cx, &fake.base(), true);
     write_sql(&app, cx, "anything");
-    app.click(cx, "ai-send");
     let panel = panel(&app, cx).unwrap();
-    assert!(cx.update(|cx| panel.read(cx).sending()));
-    app.wait_until(cx, "the request", |_, _| fake.requests().len() == 1);
-    app.click(cx, "ai-stop");
-    assert!(!cx.update(|cx| panel.read(cx).sending()));
+    let send_and_stop = |cx: &mut TestAppContext, sent: usize| {
+        app.click(cx, "ai-send");
+        assert!(cx.update(|cx| panel.read(cx).sending()));
+        app.wait_until(cx, "the request", |_, _| fake.requests().len() == sent);
+        app.click(cx, "ai-stop");
+        assert!(!cx.update(|cx| panel.read(cx).sending()));
+        assert!(app.has(cx, "ai-stopped"), "says so at once");
+        assert!(!app.has(cx, "ai-stop"));
+    };
+    send_and_stop(cx, 1);
+    // The next request goes while the first is still held by the server.
+    send_and_stop(cx, 2);
+    assert_eq!(fake.answered(), 0, "sent before the first answer came");
+
+    // Both answers come: neither is shown, Insert has nothing to insert.
+    app.wait_until(cx, "the held answers", |_, _| fake.answered() == 2);
+    let tab = app.tab(cx);
+    let editor = cx.update(|cx| tab.read(cx).editor().clone());
+    let before = cx.update(|cx| editor.read(cx).text().to_string());
+    for _ in 0..5 {
+        app.step(cx, |window, _| window.refresh());
+    }
+    app.step(cx, |window, cx| {
+        panel.update(cx, |panel, cx| panel.insert(window, cx))
+    });
+    assert!(app.has(cx, "ai-stopped"));
     assert!(answer(&app, cx).is_none() && failure(&app, cx).is_none());
-    assert!(!app.has(cx, "ai-stop"));
+    assert_eq!(cx.update(|cx| editor.read(cx).text().to_string()), before);
+
+    // A request after them is answered.
+    send_and_wait(&app, cx);
+    assert_eq!(answer(&app, cx).as_deref(), Some(ANSWER));
+    assert_eq!(fake.answered(), 3);
 }
 
 /// The context is built from the tab's catalog on MySQL and MariaDB too: names and types,
@@ -515,5 +543,34 @@ fn the_editor_menu_offers_the_assistant_and_says_when_it_is_off(cx: &mut TestApp
     app.right_click(cx, "query-editor", on_text);
     app.click_label(cx, "AI: Write SQL…");
     app.wait_until(cx, "the panel", |app, cx| panel(app, cx).is_some());
+    assert!(app.has(cx, "ai-sentence"));
+}
+
+/// An "AI: …" command run with the keyboard outside a query tab is not lost: off, it says how
+/// to turn the assistant on, as in a query tab; on with no query tab, it says to open one; on
+/// with a query tab active, that tab takes it.
+#[gpui_kit::test]
+fn an_ai_command_outside_a_query_tab_says_what_it_needs(cx: &mut TestAppContext) {
+    // The notifications' text is not observable here; their count is.
+    let notifications = |app: &Fixture, cx: &mut TestAppContext| {
+        use gpui_kit::component::WindowExt as _;
+        app.step(cx, |window, cx| window.notifications(cx).len())
+    };
+    let app = open(cx, memory_storage());
+    app.dispatch(cx, actions::AiExplainQuery);
+    assert_eq!(notifications(&app, cx), 1, "off: says so");
+    // Never sent: the endpoint is a closed port.
+    enable(cx, "http://127.0.0.1:9/v1", true);
+    app.dispatch(cx, actions::AiWriteSql);
+    assert_eq!(notifications(&app, cx), 2, "no query tab: says so");
+    assert!(app.titles(cx).is_empty(), "no tab was opened");
+    // A query tab active, the keyboard elsewhere in the window.
+    app.press(cx, &["secondary-t"]);
+    let workspace = app.workspace.clone();
+    app.step(cx, |window, cx| {
+        workspace.focus_handle(cx).focus(window, cx)
+    });
+    app.dispatch(cx, actions::AiWriteSql);
+    assert!(panel(&app, cx).is_some());
     assert!(app.has(cx, "ai-sentence"));
 }

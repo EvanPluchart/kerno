@@ -777,10 +777,11 @@ pub(super) fn typed_value(typed: &str, initial: &str, kind: TypeKind) -> Option<
 }
 
 /// The numbers of rows of the grid as the row-number column shows them, one
-/// per line (DBeaver's `grid.copyRowNames`, `ResultSetHandlerMain`).
-pub fn row_numbers(rows: &RangeInclusive<usize>) -> String {
+/// per line (DBeaver's `grid.copyRowNames`, `ResultSetHandlerMain`);
+/// `number` is [`Grid::row_number`].
+pub fn row_numbers(rows: &RangeInclusive<usize>, number: impl Fn(usize) -> usize) -> String {
     rows.clone()
-        .map(|row| (row + 1).to_string())
+        .map(|row| number(row).to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1853,6 +1854,16 @@ impl Grid {
         }
     }
 
+    /// The number the row-number column gives a row of the grid (from 1):
+    /// while the find shows matching rows only, the number the row has
+    /// without the filter.
+    pub fn row_number(&self, row: usize) -> usize {
+        self.find
+            .as_ref()
+            .and_then(|find| find.number(row))
+            .unwrap_or(row + 1)
+    }
+
     /// The row of the result shown on a row of the grid.
     pub fn source_row(&self, row: usize) -> usize {
         if let Some(rows) = self.find.as_ref().and_then(super::find::Find::rows) {
@@ -2454,7 +2465,8 @@ impl Grid {
                     .selected(selection)
                     .map_or_else(|| row.map(|row| row..=row), |selected| Some(selected.rows));
                 if let Some(rows) = rows {
-                    cx.write_to_clipboard(ClipboardItem::new_string(row_numbers(&rows)));
+                    let text = row_numbers(&rows, |row| grid.row_number(row));
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
             GridAction::RecordView(_) => Self::toggle_record(table, window, cx),
@@ -2950,8 +2962,8 @@ impl TableDelegate for Grid {
             // A new row has no number yet.
             let (label, color) = match self.mark(row, 0) {
                 Mark::New => ("+".to_string(), theme.success),
-                Mark::Deleted => ((row + 1).to_string(), theme.danger),
-                _ => ((row + 1).to_string(), theme.muted_foreground),
+                Mark::Deleted => (self.row_number(row).to_string(), theme.danger),
+                _ => (self.row_number(row).to_string(), theme.muted_foreground),
             };
             // The row number answers a right-click with the row's menu.
             let table = cx.entity();
@@ -3082,21 +3094,29 @@ impl TableDelegate for Grid {
             .when(mark == Mark::Edited, |cell| {
                 cell.bg(theme.warning.opacity(0.22))
             })
-            // Matches in the find's colour, the current one stronger; an
-            // empty marker names them for tests.
+            // Matches in the brand's tint, the current one framed; the
+            // marker (the frame, or an empty box) names them for tests.
             .when_some(found, |cell, current| {
-                let (id, strength) = if current {
-                    ("find-current", 0.45)
+                let id = if current {
+                    "find-current"
                 } else {
-                    ("find-match", 0.2)
+                    "find-match"
                 };
-                cell.bg(theme.info.opacity(strength)).child(
-                    div()
-                        .id((id, (row << 12) | column))
-                        .test_support()
-                        .absolute()
-                        .size_0(),
-                )
+                cell.relative()
+                    .bg(crate::theme::pick(crate::theme::GRID_MATCH_FILL, cx))
+                    .child(
+                        div()
+                            .id((id, (row << 12) | column))
+                            .test_support()
+                            .absolute()
+                            .when(current, |frame| {
+                                frame
+                                    .inset_0()
+                                    .border_1()
+                                    .border_color(crate::theme::pick(crate::theme::MARK_EDGE, cx))
+                            })
+                            .when(!current, |marker| marker.size_0()),
+                    )
             })
             .when(self.in_range(row, column), |cell| cell.bg(theme.selection))
             // Shift and click stretches the selection to this cell; a plain
@@ -3684,8 +3704,9 @@ mod tests {
 
     #[test]
     fn row_numbers_are_copied_one_per_line_from_one() {
-        assert_eq!(row_numbers(&(0..=0)), "1");
-        assert_eq!(row_numbers(&(4..=6)), "5\n6\n7");
+        let plain = |row: usize| row + 1;
+        assert_eq!(row_numbers(&(0..=0), plain), "1");
+        assert_eq!(row_numbers(&(4..=6), plain), "5\n6\n7");
     }
 
     #[test]

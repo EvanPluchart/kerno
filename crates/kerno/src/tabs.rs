@@ -90,6 +90,41 @@ pub enum TabSnapshot {
     },
 }
 
+impl TabSnapshot {
+    /// The tab as it opens again when its connection is gone (deleted, or
+    /// opened from a URL and never saved): a query tab keeps its text and
+    /// runs nowhere until a connection is chosen; a tab that only shows
+    /// something of that connection is not opened. `known` says whether a
+    /// connection id is a saved connection.
+    pub fn without_gone_connection(self, known: impl Fn(&str) -> bool) -> Option<Self> {
+        match self {
+            Self::Query {
+                title,
+                sql,
+                target,
+                file,
+                unsaved,
+                source,
+            } => {
+                let gone = target.as_ref().is_some_and(|t| !known(&t.connection));
+                Some(Self::Query {
+                    title,
+                    sql,
+                    target: target.filter(|_| !gone),
+                    file,
+                    unsaved,
+                    // Source mode belongs to an object of that connection.
+                    source: source.filter(|_| !gone),
+                })
+            }
+            Self::Data { ref target, .. }
+            | Self::Structure { ref target, .. }
+            | Self::Admin { ref target }
+            | Self::Diagram { ref target, .. } => known(&target.connection).then_some(self),
+        }
+    }
+}
+
 /// An entry of the menus of the tabs, the editor and the status bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabAction {

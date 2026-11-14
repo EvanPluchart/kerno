@@ -353,7 +353,10 @@ impl DataTab {
 
     /// What the layout of this table's columns is stored under: the
     /// database, the schema and the table (a MySQL table's schema is its
-    /// database), with the connection apart.
+    /// database), with the connection apart. The database is the one the
+    /// session is in, known before it opens: a PostgreSQL connection that
+    /// names none opens in the driver's default one, which is also what the
+    /// tree names (J6).
     fn layout_key(&self, cx: &App) -> String {
         let saved = self.connections.read(cx).get(&self.target.connection);
         let database = match saved.map(|saved| saved.config.engine) {
@@ -363,7 +366,7 @@ impl DataTab {
                 .database
                 .clone()
                 .or_else(|| saved.and_then(|saved| saved.config.database.clone()))
-                .unwrap_or_default(),
+                .unwrap_or_else(|| kerno_postgres::DEFAULT_DATABASE.to_string()),
         };
         serde_json::to_string(&[database.as_str(), &self.table.schema, &self.table.name])
             .unwrap_or_default()
@@ -1081,6 +1084,12 @@ impl DataTab {
         self.remember_layout(cx);
         self.page = 0;
         self.reload(window, cx);
+    }
+
+    /// What the layout of the table is stored under; for tests.
+    #[cfg(test)]
+    pub fn stored_layout_key(&self, cx: &App) -> String {
+        self.layout_key(cx)
     }
 
     /// The column sorted on and whether descending; for tests.

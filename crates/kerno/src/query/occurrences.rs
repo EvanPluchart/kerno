@@ -6,14 +6,15 @@
 use std::ops::Range;
 
 use gpui_kit::base::input::{self, RangeDecorationStyle};
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::EditorState;
 use gpui_kit::{App, Entity};
 use kerno_core::sql::occurrences;
 
-/// The highlights of one editor.
+/// The highlights of one editor: a tint, and a frame around it (the kit
+/// draws one style per decoration).
 pub struct Occurrences {
     marks: input::RangeDecorationCollection,
+    frames: input::RangeDecorationCollection,
     /// The selection and text length the marks were computed for; the text
     /// changed since when `stale`.
     seen: Option<(Range<usize>, usize)>,
@@ -22,11 +23,15 @@ pub struct Occurrences {
 
 impl Occurrences {
     pub fn new(editor: &Entity<EditorState>, cx: &mut App) -> Self {
-        let marks = editor.update(cx, |editor, cx| {
-            editor.create_range_decorations_collection(Vec::new(), cx)
+        let (marks, frames) = editor.update(cx, |editor, cx| {
+            (
+                editor.create_range_decorations_collection(Vec::new(), cx),
+                editor.create_range_decorations_collection(Vec::new(), cx),
+            )
         });
         Self {
             marks,
+            frames,
             seen: None,
             stale: true,
         }
@@ -61,16 +66,26 @@ impl Occurrences {
         };
         // Setting them notifies the editor, which calls this again.
         if self.marks.get_ranges(cx) != marks {
-            let color = cx.theme().selection.opacity(0.45);
-            let marks = marks
-                .into_iter()
-                .map(|range| {
-                    input::RangeDecoration::new(range)
-                        .with_style(RangeDecorationStyle::Fill)
-                        .with_color(color)
-                })
-                .collect();
-            self.marks.set(marks, cx);
+            let (fill, edge) = (
+                crate::theme::pick(crate::theme::OCCURRENCE_FILL, cx),
+                crate::theme::pick(crate::theme::MARK_EDGE, cx),
+            );
+            let decorations = |style, color| {
+                marks
+                    .iter()
+                    .map(|range| {
+                        input::RangeDecoration::new(range.clone())
+                            .with_style(style)
+                            .with_color(color)
+                    })
+                    .collect()
+            };
+            let (fills, frames) = (
+                decorations(RangeDecorationStyle::Fill, fill),
+                decorations(RangeDecorationStyle::Frame, edge),
+            );
+            self.marks.set(fills, cx);
+            self.frames.set(frames, cx);
         }
     }
 

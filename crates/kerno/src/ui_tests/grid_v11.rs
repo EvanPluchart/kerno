@@ -86,7 +86,7 @@ fn cmd_f_in_a_result_counts_steps_through_and_marks_the_matches(cx: &mut TestApp
     );
     // Upper case told apart: nothing is "ITEM".
     app.click(cx, "grid-find-case");
-    assert_eq!(summary(cx, &grid), Some(("No matches".into(), None, None)));
+    assert_eq!(summary(cx, &grid), Some(("No match".into(), None, None)));
     app.click(cx, "grid-find-case");
     assert_eq!(summary(cx, &grid).unwrap().0, "11 matches");
     // Escape closes the bar; the grid has the keyboard again.
@@ -151,6 +151,62 @@ fn matching_rows_only_follows_the_sort(cx: &mut TestAppContext) {
     let all = first_column(cx, &grid);
     assert_eq!(all.len(), 30);
     assert_eq!(all[..2], ["1", "2"]);
+}
+
+/// "Matching rows only" keeps each row's number (the number it has
+/// without the filter, in the sort shown), and the result's footer and the
+/// status bar say how many rows of how many are shown, as the find bar
+/// does (Beekeeper #524).
+#[gpui_kit::test]
+fn matching_rows_keep_their_numbers_and_every_count_says_of_how_many(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let grid = thirty_rows(&app, cx);
+    let numbers = |cx: &mut TestAppContext| -> Vec<usize> {
+        cx.update(|cx| {
+            let grid = grid.read(cx).delegate();
+            (0..grid.total_rows())
+                .map(|row| grid.row_number(row))
+                .collect()
+        })
+    };
+    app.step(cx, |window, cx| find::open(&grid, window, cx));
+    app.type_text(cx, "item 2");
+    app.click(cx, "grid-find-only");
+    let mut unsorted = vec![2];
+    unsorted.extend(20..=29);
+    assert_eq!(numbers(cx), unsorted);
+    // The find bar, the footer and the status bar.
+    let said = |cx: &mut TestAppContext| {
+        let status = cx.update(|cx| app.workspace.read(cx).status_text(cx));
+        (
+            paints(&app, cx, "11 of 30 rows"),
+            app.label_of(cx, "result-summary"),
+            status.iter().any(|item| item == "11 of 30 rows"),
+        )
+    };
+    assert_eq!(said(cx), (true, "11 of 30 rows".to_string(), true));
+    // Sorted by n, descending: 30 is row 1, 29 row 2, ..., 2 row 29.
+    app.step(cx, |window, cx| {
+        grid.update(cx, |table, cx| {
+            use gpui_kit::component::table::TableDelegate as _;
+            table
+                .delegate_mut()
+                .perform_sort(1, ColumnSort::Descending, window, cx)
+        })
+    });
+    app.wait_until(cx, "the descending matches", |_, cx| {
+        first_column(cx, &grid).first().map(String::as_str) == Some("29")
+    });
+    let mut descending: Vec<usize> = (2..=11).collect();
+    descending.push(29);
+    assert_eq!(numbers(cx), descending);
+    // Closed: every row, numbered from 1 again, and "30 rows".
+    app.click(cx, "grid-find-close");
+    assert_eq!(numbers(cx), (1..=30).collect::<Vec<_>>());
+    assert_eq!(said(cx), (false, "30 rows".to_string(), false));
 }
 
 /// In a table's data the find works as in a result; "matching rows only"
@@ -244,7 +300,7 @@ fn an_integer_that_looks_like_a_unix_time_says_when(cx: &mut TestAppContext) {
     let app = connected(cx, Engine::Postgres);
     app.run_in_new_tab(
         cx,
-        "select 1794619425 as seconds, 'x' as text",
+        "select 1794619425 as seconds, 'x' as text, '{\"a\": 1}'::jsonb as doc",
         "secondary-enter",
     );
     app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
@@ -259,11 +315,23 @@ fn an_integer_that_looks_like_a_unix_time_says_when(cx: &mut TestAppContext) {
         cx,
         "Unix seconds \u{2192} 2026-11-14 01:23:45 UTC"
     ));
+    // An integer opens as text: a bare number is no JSON document.
+    let json_view = |cx: &mut TestAppContext| {
+        use gpui_kit::test::TestQueryExt as _;
+        app.step(cx, |window, _| window.try_find_by_label("JSON").is_some())
+    };
+    assert!(!json_view(cx), "no JSON view for an integer");
     app.click(cx, "value-close");
     app.step(cx, |window, cx| {
         Grid::open_value(&grid, 0, 2, false, window, cx)
     });
     assert!(!app.has(cx, "value-unix-time"));
+    app.click(cx, "value-close");
+    // A JSON column has it.
+    app.step(cx, |window, cx| {
+        Grid::open_value(&grid, 0, 3, false, window, cx)
+    });
+    assert!(json_view(cx), "the JSON view of a jsonb value");
     app.click(cx, "value-close");
 }
 
@@ -523,4 +591,44 @@ fn a_tables_layout_comes_back_until_it_is_reset(cx: &mut TestAppContext) {
             window.dispatch_action(Box::new(actions::CloseTab), cx)
         });
     }
+}
+
+/// A table of a PostgreSQL connection that names no database is the same
+/// table whether the tree opened it (in the server's default database) or
+/// something that names no database did: one layout for both (DBeaver
+/// #38133).
+#[gpui_kit::test]
+fn a_table_has_one_layout_key_with_or_without_its_database(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let config = ConnectionConfig {
+        database: None,
+        ..testing::config(Engine::Postgres)
+    };
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    let key = |database: Option<&str>, cx: &mut TestAppContext| {
+        let target = Target {
+            connection: id.clone(),
+            database: database.map(str::to_string),
+            schema: None,
+        };
+        let tab = app.step(cx, |window, cx| {
+            app.workspace.update(cx, |workspace, cx| {
+                workspace.open_data(
+                    target,
+                    TableRef::new("kerno_ui_layout_key", "t"),
+                    RelationKind::Table,
+                    Filter::default(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| tab.read(cx).stored_layout_key(cx))
+    };
+    let from_the_tree = key(Some(kerno_postgres::DEFAULT_DATABASE), cx);
+    assert_eq!(key(None, cx), from_the_tree);
+    assert_eq!(from_the_tree, r#"["postgres","kerno_ui_layout_key","t"]"#);
+    // Another database is another table.
+    assert_ne!(key(Some("kerno"), cx), from_the_tree);
 }

@@ -924,3 +924,61 @@ fn copy_tables_opens_from_tools_and_from_the_palette(cx: &mut TestAppContext) {
     app.dispatch(cx, crate::actions::CopyTables);
     assert!(app.has(cx, "transfer-dialog"));
 }
+
+/// The plan and the `CREATE` preview of the mapping page are worked out
+/// when an input changes (a column skipped, a field typed, the target), not
+/// at every frame, as `TasksView::reload` since M10 (DBeaver #17767).
+#[gpui_kit::test]
+fn the_mapping_page_builds_its_plan_once_per_change(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _source = Scratch::new(
+        Engine::Postgres,
+        &[
+            "DROP SCHEMA IF EXISTS kerno_ui_transfer_frames CASCADE",
+            "DROP SCHEMA IF EXISTS kerno_ui_transfer_frames_dst CASCADE",
+        ],
+        &[
+            "CREATE SCHEMA kerno_ui_transfer_frames",
+            "CREATE SCHEMA kerno_ui_transfer_frames_dst",
+            "CREATE TABLE kerno_ui_transfer_frames.t (id integer PRIMARY KEY, name text)",
+        ],
+    );
+    let app = two_connections(
+        cx,
+        testing::config(Engine::Postgres),
+        testing::config(Engine::Postgres),
+    );
+    let dialog = app.transfer_dialog(
+        cx,
+        None,
+        vec![TableRef::new("kerno_ui_transfer_frames", "t")],
+    );
+    app.wait_transfer_exactly(cx, &dialog, "tables");
+    app.click(cx, "transfer-next");
+    app.click(cx, ("transfer-target", 1usize));
+    app.wait_until(cx, "the target connection", |app, cx| {
+        matches!(app.status(cx, 1), Status::Connected { .. })
+    });
+    app.replace_text(cx, "transfer-schema-field", "kerno_ui_transfer_frames_dst");
+    app.click(cx, "transfer-next");
+    app.wait_transfer_exactly(cx, &dialog, "mapping");
+    assert!(super::tool_wizards::paints(&app, cx, "\"name\" text"));
+    let builds = |cx: &mut TestAppContext| cx.update(|cx| dialog.read(cx).plan_builds());
+    let before = builds(cx);
+    for _ in 0..5 {
+        app.step(cx, |window, _| window.refresh());
+    }
+    assert_eq!(builds(cx), before, "frames build nothing");
+    // A column skipped: built again.
+    app.click(cx, ("transfer-skip", 1usize));
+    app.step(cx, |window, _| window.refresh());
+    let after = builds(cx);
+    assert!(after > before, "{before} → {after}");
+    assert!(!super::tool_wizards::paints(&app, cx, "\"name\" text"));
+    for _ in 0..5 {
+        app.step(cx, |window, _| window.refresh());
+    }
+    assert_eq!(builds(cx), after, "frames build nothing");
+}

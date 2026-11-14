@@ -371,6 +371,25 @@ impl Storage {
         })
     }
 
+    /// Removes the history and the tables' layouts of connections that are
+    /// not stored: those of a connection opened from a URL and never saved
+    /// (J4), left at quit or by a run that crashed. Saved queries and tasks
+    /// stay: the user named them.
+    pub fn forget_unknown_connections(&self) -> Result<()> {
+        self.with(|c| {
+            let tx = c.transaction()?;
+            for table in ["history", "table_layouts"] {
+                tx.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE connection_id NOT IN (SELECT id FROM connections)"
+                    ),
+                    [],
+                )?;
+            }
+            tx.commit()
+        })
+    }
+
     // History ---------------------------------------------------------------
 
     /// Records an executed statement. `rules` are the lexical rules of the
@@ -1791,6 +1810,36 @@ mod tests {
             .unwrap();
         storage.delete_connection(&connection).unwrap();
         assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+    }
+
+    /// J4: what an unsaved connection left goes; a saved one keeps it.
+    #[test]
+    fn the_history_and_layouts_of_unknown_connections_are_forgotten() {
+        let storage = Storage::in_memory().unwrap();
+        let saved = storage
+            .save_connection(None, &ConnectionConfig::new(Engine::Postgres))
+            .unwrap();
+        for id in [saved.as_str(), "unsaved"] {
+            storage
+                .add_history(&entry(id, "select 1", 1), LexRules::POSTGRES)
+                .unwrap();
+            storage.save_table_layout(id, "k", &layout()).unwrap();
+        }
+        let query = SavedQuery {
+            id: 0,
+            connection_id: Some("unsaved".into()),
+            folder: String::new(),
+            name: "kept".into(),
+            sql: "select 1".into(),
+        };
+        storage.save_query(&query).unwrap();
+        storage.forget_unknown_connections().unwrap();
+        let history = storage.history(None, "", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].connection_id, saved);
+        assert!(storage.table_layout(&saved, "k").unwrap().is_some());
+        assert_eq!(storage.table_layout("unsaved", "k").unwrap(), None);
+        assert_eq!(storage.saved_queries().unwrap().len(), 1);
     }
 
     #[test]

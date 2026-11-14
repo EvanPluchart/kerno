@@ -512,6 +512,32 @@ impl Connections {
     /// Reads the saved list again from storage, and checks the open
     /// connections now rather than at their next keep-alive.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_then(Vec::new(), cx);
+    }
+
+    /// Connections an import replaced (J15): read again with the list, the
+    /// secrets of `secrets_changed` read again at the next connect (the
+    /// import changed or forgot them: a server moved elsewhere must not get
+    /// the old password), and the open ones reconnected with the new
+    /// settings once the window asked about what their tabs hold, as saving
+    /// an edited one does.
+    pub fn replaced(
+        &mut self,
+        ids: Vec<String>,
+        secrets_changed: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        for id in secrets_changed {
+            if let Some(runtime) = self.runtime.get_mut(id) {
+                runtime.secrets = None;
+            }
+        }
+        self.reload_then(ids, cx);
+    }
+
+    /// Reads the saved list again; then asks the window to reconnect the
+    /// open connections of `reopen`, which now have their new settings.
+    fn reload_then(&mut self, reopen: Vec<String>, cx: &mut Context<Self>) {
         let storage = AppState::get(cx).storage.clone();
         // A change still being written is read back, not undone.
         let previous = self.writing.take();
@@ -533,6 +559,14 @@ impl Connections {
                     this.saved.extend(unsaved);
                     cx.emit(ConnectionsEvent::ListChanged);
                     cx.notify();
+                    for id in reopen {
+                        if !matches!(
+                            this.status(&id),
+                            Status::Disconnected | Status::Failed { .. }
+                        ) {
+                            cx.emit(ConnectionsEvent::ReconnectRequested { id });
+                        }
+                    }
                 }
                 Err(error) => this.fail(
                     format!("The saved connections could not be read: {error}"),

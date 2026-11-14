@@ -675,6 +675,18 @@ impl ImportSetup {
                 },
             );
         }
+        // The connections replaced, and those of them whose secrets change:
+        // an open one reconnects with its new settings (J15).
+        let replaced: Vec<String> = (self.file.connections.iter())
+            .zip(&self.plan.connections)
+            .filter(|(_, action)| self.replace && **action == ImportAction::Replace)
+            .filter_map(|(connection, _)| connection.id.clone())
+            .collect();
+        let secrets_changed: Vec<String> = (passwords.keys())
+            .filter_map(|index| self.file.connections[*index].id.clone())
+            .filter(|id| replaced.contains(id))
+            .collect();
+        let reopened = (replaced, secrets_changed);
         let state = AppState::get(cx);
         let (storage, store) = (state.storage.clone(), state.secrets.clone());
         let replace = self.replace;
@@ -756,10 +768,13 @@ impl ImportSetup {
         self.work = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = writing.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok((connections, tasks)) => this.finish(connections, tasks, window, cx),
+                Ok((connections, tasks)) => this.finish(connections, tasks, reopened, window, cx),
                 Err(error) => {
-                    // What was written before the failure is shown.
-                    this.connections.update(cx, |list, cx| list.reload(cx));
+                    // What was written before the failure is shown, and
+                    // goes into the open connections.
+                    let (ids, secrets) = reopened;
+                    this.connections
+                        .update(cx, |list, cx| list.replaced(ids, &secrets, cx));
                     this.step = Step::Failed(format!("The import stopped: {error}"));
                     cx.notify();
                 }
@@ -773,6 +788,7 @@ impl ImportSetup {
         &mut self,
         connections: usize,
         tasks: usize,
+        (replaced, secrets): (Vec<String>, Vec<String>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -804,7 +820,7 @@ impl ImportSetup {
         let looks = std::mem::take(&mut self.file.folders);
         self.connections.update(cx, |list, cx| {
             list.import_folder_looks(looks, cx);
-            list.reload(cx);
+            list.replaced(replaced, &secrets, cx);
         });
         for view in &self.tasks_views {
             view.update(cx, |view, cx| view.reload(cx));

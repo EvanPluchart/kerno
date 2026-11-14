@@ -527,10 +527,9 @@ async fn a_plain_file_with_client_commands_runs_nothing() {
         let command =
             tools::restore_command(&psql, &testing::params(Engine::Postgres), &allowed).unwrap();
         assert_eq!(command.script_check, None);
-        assert!(
-            command
-                .args
-                .contains(&format!("--file={}", input.display()))
-        );
+        // The script reaches `psql` on its standard input (the progress is
+        // counted there), not as a path.
+        assert!(command.args.contains(&"--file=-".to_string()));
+        assert_eq!(command.stdin.as_deref(), Some(input.as_path()));
     }
 }

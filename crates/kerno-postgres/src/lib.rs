@@ -18,6 +18,11 @@ use kerno_core::{Driver, Engine, Result, Session};
 pub use dialect::PgDialect;
 pub use session::PgSession;
 
+/// The database a session opens in when the connection names none: libpq
+/// falls back to the user name; "postgres" exists on almost every server
+/// and is what people expect to land in.
+pub const DEFAULT_DATABASE: &str = "postgres";
+
 /// Opens PostgreSQL sessions.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PostgresDriver;

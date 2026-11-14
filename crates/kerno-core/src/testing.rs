@@ -505,6 +505,8 @@ impl AiRequest {
 struct AiLog {
     connections: usize,
     requests: Vec<AiRequest>,
+    /// The answers written back, once each was.
+    answered: usize,
 }
 
 /// A fake OpenAI-compatible endpoint on `127.0.0.1` (J17): a `tokio` listener on a thread and
@@ -579,6 +581,11 @@ impl FakeAi {
     pub fn requests(&self) -> Vec<AiRequest> {
         self.log.lock().unwrap().requests.clone()
     }
+
+    /// The answers it wrote back (after its delay).
+    pub fn answered(&self) -> usize {
+        self.log.lock().unwrap().answered
+    }
 }
 
 async fn fake_ai_serve(
@@ -639,6 +646,7 @@ async fn fake_ai_serve(
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+    log.lock().unwrap().answered += 1;
 }
 
 #[cfg(test)]

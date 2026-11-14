@@ -141,6 +141,15 @@ fn a_url_opens_an_unsaved_connection_that_runs_a_query_and_is_saved(cx: &mut Tes
             SidebarAction::SaveConnection,
         );
         app.wait_until(cx, "the dialog", |app, cx| app.has(cx, "conn-save"));
+        // Saved for the first time: not "Edit".
+        assert!(
+            super::tool_wizards::paints(&app, cx, "Save connection"),
+            "{engine:?}"
+        );
+        assert!(
+            !super::tool_wizards::paints(&app, cx, "Edit “"),
+            "{engine:?}"
+        );
         app.click(cx, "conn-save");
         app.wait_until(cx, "the saved connection", |app, cx| {
             !app.unsaved(cx, &id) && app.storage.connections().unwrap().len() == 1
@@ -218,4 +227,71 @@ fn urls_handed_over_through_the_socket_open_in_the_same_window(cx: &mut TestAppC
     assert_eq!(engines, [Engine::Postgres, Engine::MySql]);
     assert_eq!(cx.update(|cx| cx.windows().len()), 1);
     assert!(app.storage.connections().unwrap().is_empty());
+}
+
+/// Beekeeper #361: an unsaved connection that is never saved leaves no
+/// history or layout behind once the app quits (or starts again after a
+/// crash: both run `forget_unknown_connections`); its tabs come back at the
+/// next start exactly as a deleted connection's do: query tabs keep their
+/// text and run nowhere, its data tabs are gone.
+#[gpui_kit::test]
+fn an_unsaved_connection_leaves_nothing_behind_and_its_tabs_come_back_as_a_deleted_ones(
+    cx: &mut TestAppContext,
+) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = open(cx, memory_storage());
+    app.open_url(cx, &url(Engine::Postgres, true));
+    app.wait_connected(cx, 0);
+    let id = app.listed(cx)[0].clone();
+    app.run_in_new_tab(cx, "select 1 as one", "secondary-enter");
+    app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the history and the tabs", |app, cx| {
+        cx.executor().advance_clock(Duration::from_secs(1));
+        app.storage.history(Some(&id), "", 10).unwrap().len() == 1
+            && app.storage.tabs::<TabSnapshot>().unwrap().len() == 2
+    });
+
+    // What the quit (and the next start) runs.
+    app.storage.forget_unknown_connections().unwrap();
+    assert!(app.storage.history(Some(&id), "", 10).unwrap().is_empty());
+
+    // The same two tabs on a connection deleted since.
+    let deleted = app
+        .storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    app.storage.delete_connection(&deleted).unwrap();
+    let mut stored: Vec<TabSnapshot> = app.storage.tabs().unwrap();
+    let on_deleted: Vec<TabSnapshot> = stored
+        .iter()
+        .cloned()
+        .map(|mut tab| {
+            match &mut tab {
+                TabSnapshot::Query {
+                    target: Some(target),
+                    ..
+                }
+                | TabSnapshot::Data { target, .. } => target.connection = deleted.clone(),
+                other => panic!("{other:?}"),
+            }
+            tab
+        })
+        .collect();
+    stored.extend(on_deleted);
+    app.storage.save_tabs(&stored).unwrap();
+
+    let restarted = open(cx, app.storage.clone());
+    let tabs = cx.update(|cx| restarted.workspace.read(cx).tab_snapshots(cx));
+    let query = TabSnapshot::Query {
+        title: "Query 1".into(),
+        sql: "select 1 as one".into(),
+        target: None,
+        file: None,
+        unsaved: false,
+        source: None,
+    };
+    assert_eq!(tabs, [query.clone(), query]);
 }

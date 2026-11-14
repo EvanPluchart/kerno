@@ -195,9 +195,12 @@ pub(crate) async fn open(
     let mut config = tokio_postgres::Config::new();
     config
         .user(&params.user)
-        // libpq falls back to the user name; "postgres" exists on almost
-        // every server and is what people expect to land in.
-        .dbname(params.database.as_deref().unwrap_or("postgres"))
+        .dbname(
+            params
+                .database
+                .as_deref()
+                .unwrap_or(crate::DEFAULT_DATABASE),
+        )
         .ssl_mode(match params.tls.mode {
             TlsMode::Disable => SslMode::Disable,
             TlsMode::Prefer => SslMode::Prefer,

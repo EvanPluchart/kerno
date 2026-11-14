@@ -54,6 +54,9 @@ pub struct Find {
     total: u64,
     /// The rows shown while "matching rows only" is on, in the order shown.
     rows: Option<Arc<[u32]>>,
+    /// Where each of `rows` stands among every row in the sort, when
+    /// sorted (its number unfiltered); unsorted, it is the row itself.
+    numbers: Option<Arc<[u32]>>,
     /// The sort `rows` follows.
     rows_order: Option<Arc<[u32]>>,
     /// The match last moved to (row and column of the grid), and its rank.
@@ -75,6 +78,17 @@ impl Find {
     /// The rows shown in its place while "matching rows only" is on.
     pub(super) fn rows(&self) -> Option<&Arc<[u32]>> {
         self.rows.as_ref().filter(|_| self.only)
+    }
+
+    /// The number a row of the grid has without the filter (from 1), while
+    /// "matching rows only" is on.
+    pub(super) fn number(&self, row: usize) -> Option<usize> {
+        let rows = self.rows()?;
+        let at = match &self.numbers {
+            Some(numbers) => numbers.get(row),
+            None => rows.get(row),
+        };
+        at.map(|&at| at as usize + 1)
     }
 
     /// Whether a cell (a fetched row, `cell` its value) is a match, and
@@ -187,6 +201,7 @@ pub fn restore(table: &Table, carried: Carried, window: &mut Window, cx: &mut Ap
             counts: Arc::from([]),
             total: 0,
             rows: None,
+            numbers: None,
             rows_order: None,
             current: None,
             job: None,
@@ -299,6 +314,7 @@ fn follow(state: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) {
         find.counts = Arc::from([]);
         find.total = 0;
         find.rows = None;
+        find.numbers = None;
         find.rows_order = None;
         find.current = None;
         if wanted.is_none() {
@@ -348,7 +364,7 @@ fn follow(state: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) {
             u16::try_from(matched).unwrap_or(u16::MAX)
         }));
         let total = counts.iter().map(|&count| u64::from(count)).sum();
-        let rows = only.then(|| Arc::from(matching_rows(&counts, order.as_deref())));
+        let rows = only.then(|| shown(&counts, order.as_deref()));
         settle(state, counts.into(), total, rows, order, cx);
         return;
     }
@@ -362,7 +378,7 @@ fn follow(state: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) {
         counts.extend_from_slice(&prefix);
         counts.extend(added);
         let total = counts.iter().map(|&count| u64::from(count)).sum::<u64>();
-        let rows = only.then(|| Arc::<[u32]>::from(matching_rows(&counts, snapshot.as_deref())));
+        let rows = only.then(|| shown(&counts, snapshot.as_deref()));
         Some((Arc::<[u16]>::from(counts), total, rows))
     });
     let task = cx.spawn(async move |table, cx| {
@@ -380,6 +396,23 @@ fn follow(state: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) {
     cx.notify();
 }
 
+/// The rows "matching rows only" shows, and their numbers when sorted.
+type Shown = (Arc<[u32]>, Option<Arc<[u32]>>);
+
+/// The matching rows in `order`, with where each stands in it.
+fn shown(counts: &[u16], order: Option<&[u32]>) -> Shown {
+    let rows = Arc::from(matching_rows(counts, order));
+    let numbers = order.map(|order| {
+        order
+            .iter()
+            .enumerate()
+            .filter(|&(_, &row)| counts.get(row as usize).is_some_and(|&count| count > 0))
+            .map(|(at, _)| u32::try_from(at).unwrap_or(u32::MAX))
+            .collect()
+    });
+    (rows, numbers)
+}
+
 /// Whether two sorts are the same one.
 fn same_order(a: Option<&Arc<[u32]>>, b: Option<&Arc<[u32]>>) -> bool {
     match (a, b) {
@@ -394,7 +427,7 @@ fn settle(
     state: &mut TableState<Grid>,
     counts: Arc<[u16]>,
     total: u64,
-    rows: Option<Arc<[u32]>>,
+    rows: Option<Shown>,
     order: Option<Arc<[u32]>>,
     cx: &mut Context<TableState<Grid>>,
 ) {
@@ -403,7 +436,7 @@ fn settle(
     };
     find.counts = counts;
     find.total = total;
-    find.rows = rows;
+    (find.rows, find.numbers) = rows.map_or((None, None), |(rows, numbers)| (Some(rows), numbers));
     find.rows_order = order;
     // The rank of the current match moves with what was counted.
     if let Some((row, column, _)) = find.current {
@@ -541,13 +574,31 @@ fn count_text(find: &Find) -> String {
     match (&find.of, find.current) {
         (None, _) => String::new(),
         (Some(_), _) if find.counts.is_empty() && find.job.is_some() => "Searching…".into(),
-        (Some(_), _) if find.total == 0 => "No matches".into(),
+        (Some(_), _) if find.total == 0 => "No match".into(),
         (Some(_), Some((_, _, rank))) if rank > 0 => {
             format!("{} of {}", thousands(rank), thousands(find.total))
         }
         (Some(_), _) if find.total == 1 => "1 match".into(),
         (Some(_), _) => format!("{} matches", thousands(find.total)),
     }
+}
+
+/// How many rows a grid shows while "matching rows only" is on: "11 of 30
+/// rows", "of 1,000 fetched rows" while more may come. The find bar, the
+/// result's footer and the status bar say it alike.
+pub fn rows_shown(grid: &Grid) -> Option<String> {
+    let rows = grid.find.as_ref()?.rows()?;
+    let fetched = grid.store().row_count() as u64;
+    let what = if grid.is_complete() {
+        "rows"
+    } else {
+        "fetched rows"
+    };
+    Some(format!(
+        "{} of {} {what}",
+        thousands(rows.len() as u64),
+        thousands(fetched)
+    ))
 }
 
 /// The bar above a grid, when its find is open.
@@ -557,19 +608,7 @@ pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
     let find = grid.find.as_ref()?;
     let theme = cx.theme();
     let count = count_text(find);
-    let rows = find.rows().map(|rows| {
-        let fetched = grid.store().row_count() as u64;
-        let what = if grid.is_complete() {
-            "rows"
-        } else {
-            "fetched rows"
-        };
-        format!(
-            "{} of {} {what}",
-            thousands(rows.len() as u64),
-            thousands(fetched)
-        )
-    });
+    let rows = rows_shown(grid);
     let more = rows.is_some() && grid.has_more();
     let (case, only) = (find.case, find.only);
     let on = |table: &Table| table.clone();
@@ -620,7 +659,7 @@ pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
             .child(
                 Button::new("grid-find-previous")
                     .ghost()
-                    .xsmall()
+                    .small()
                     .icon(IconName::ChevronUp)
                     .tooltip("Previous match (Shift+Enter)")
                     .on_click(move |_, window, cx| {
@@ -631,7 +670,7 @@ pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
             .child(
                 Button::new("grid-find-next")
                     .ghost()
-                    .xsmall()
+                    .small()
                     .icon(IconName::ChevronDown)
                     .tooltip("Next match (Enter)")
                     .on_click(move |_, window, cx| {
@@ -642,7 +681,7 @@ pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
             .child(
                 Button::new("grid-find-case")
                     .ghost()
-                    .xsmall()
+                    .small()
                     .icon(IconName::CaseSensitive)
                     .toggled(case)
                     .tooltip("Match case")
@@ -683,7 +722,7 @@ pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
             .child(
                 Button::new("grid-find-close")
                     .ghost()
-                    .xsmall()
+                    .small()
                     .icon(IconName::Close)
                     .tooltip("Close (Escape)")
                     .on_click(move |_, window, cx| close(&closing, window, cx)),

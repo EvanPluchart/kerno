@@ -101,6 +101,12 @@ fn each_password_choice_shows_its_fields(cx: &mut TestAppContext) {
         "Runs: aws rds generate-db-auth-token --hostname localhost --port 5432 --username \
          postgres --region eu-west-3"
     ));
+    // The token needs TLS: the dialog says the SSL mode moved to require.
+    assert!(paints(
+        &app,
+        cx,
+        "TLS is required for an IAM token: the SSL mode was set to “require”"
+    ));
     app.click(cx, "conn-name");
     app.type_text(cx, "kerno_ui rds");
     app.click(cx, "conn-save");

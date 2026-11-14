@@ -286,19 +286,7 @@ fn show(
     cx: &mut App,
 ) {
     let title = SharedString::from(format!("{} · {}", column.name, column.type_name));
-    let text = value.and_then(|bytes| std::str::from_utf8(bytes).ok());
-    let json = text.and_then(pretty_json);
-    let binary = column.kind == TypeKind::Binary || (value.is_some() && text.is_none());
-    let mut views = Vec::new();
-    if json.is_some() {
-        views.push(View::Json);
-    }
-    if !binary {
-        views.push(View::Text);
-    }
-    if value.is_some() {
-        views.push(View::Hex);
-    }
+    let (views, json) = views_for(column, value);
     let viewer = cx.new(|_| ValueViewer {
         value: value.map(<[u8]>::to_vec),
         json,
@@ -314,6 +302,29 @@ fn show(
             .on_close(move |_, window, cx| give_back(back.clone(), window, cx))
             .content(move |content, _, _| content.child(viewer.clone()))
     });
+}
+
+/// The views of a value, the first shown first, and the value indented
+/// when JSON is one of them: only for a JSON column, or a text that holds a
+/// JSON object or array (a number, a string or a boolean is no document).
+fn views_for(column: &Column, value: Option<&[u8]>) -> (Vec<View>, Option<String>) {
+    let text = value.and_then(|bytes| std::str::from_utf8(bytes).ok());
+    let document = |text: &str| matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['));
+    let json = text
+        .filter(|text| column.kind == TypeKind::Json || document(text))
+        .and_then(pretty_json);
+    let binary = column.kind == TypeKind::Binary || (value.is_some() && text.is_none());
+    let mut views = Vec::new();
+    if json.is_some() {
+        views.push(View::Json);
+    }
+    if !binary {
+        views.push(View::Text);
+    }
+    if value.is_some() {
+        views.push(View::Hex);
+    }
+    (views, json)
 }
 
 impl ValueViewer {
@@ -382,22 +393,27 @@ impl Render for ValueViewer {
                         })),
                 )
             })
+            // What an integer means in time sits right under it.
             .child(
-                div()
-                    .id("value-text")
-                    .test_support()
-                    .h(px(360.))
-                    .p_2()
-                    .overflow_y_scroll()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.muted)
-                    .font_family(theme.mono_font_family.clone())
-                    .text_sm()
-                    .child(body),
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("value-text")
+                            .test_support()
+                            .h(px(360.))
+                            .p_2()
+                            .overflow_y_scroll()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.muted)
+                            .font_family(theme.mono_font_family.clone())
+                            .text_sm()
+                            .child(body),
+                    )
+                    .children(hint_line(self.hint.clone(), cx)),
             )
-            .children(hint_line(self.hint.clone(), cx))
             .child(
                 h_flex()
                     .justify_between()
@@ -432,5 +448,32 @@ impl Render for ValueViewer {
                             ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn views(kind: TypeKind, value: &str) -> Vec<View> {
+        views_for(&Column::new("c", "t", kind), Some(value.as_bytes())).0
+    }
+
+    /// JSON is offered first for a JSON column and for a text holding an
+    /// object or an array; an integer, a string or a boolean opens as text
+    /// (an integer is valid JSON, and was shown as such).
+    #[test]
+    fn the_json_view_is_for_documents_only() {
+        use View::{Hex, Json, Text};
+        assert_eq!(views(TypeKind::Integer, "1794619425"), [Text, Hex]);
+        assert_eq!(views(TypeKind::Text, "\"quoted\""), [Text, Hex]);
+        assert_eq!(views(TypeKind::Text, "true"), [Text, Hex]);
+        assert_eq!(views(TypeKind::Text, " {\"a\": 1}"), [Json, Text, Hex]);
+        assert_eq!(views(TypeKind::Text, "[1, 2]"), [Json, Text, Hex]);
+        assert_eq!(views(TypeKind::Json, "42"), [Json, Text, Hex]);
+        assert_eq!(views(TypeKind::Text, "{not json"), [Text, Hex]);
+        // NULL: the text view says so.
+        let null = views_for(&Column::new("c", "t", TypeKind::Integer), None).0;
+        assert_eq!(null, [Text]);
     }
 }

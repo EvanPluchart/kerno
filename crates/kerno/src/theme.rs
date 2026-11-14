@@ -145,6 +145,26 @@ pub const TAG_COLORS: [(&str, u32, u32); 8] = [
     ("pink", 0xB8327F, 0xEE7FBB),
 ];
 
+/// A token the kit has no slot for: `(light, dark)`.
+pub type Pair = (u32, u32);
+
+/// The other occurrences of the word at the cursor in the SQL editor (J7):
+/// a faint Olive / Lime tint, light enough that every syntax colour keeps
+/// 4.5:1 on it, framed by [`MARK_EDGE`]. The selection is a solid Lime
+/// fill without a frame; the bracket match a frame in the text colour.
+pub const OCCURRENCE_FILL: Pair = (0xF6F8F2, 0x1B201B);
+/// The frame of an occurrence and of the current match of a grid's find:
+/// Olive on light, Lime on dark (the brand's accent for marks).
+pub const MARK_EDGE: Pair = (0x4D6B00, 0xC8F03C);
+/// A cell that matches a grid's find (J6): Olive over white, Lime over the
+/// dark grid; not the Lime wash of the selected row.
+pub const GRID_MATCH_FILL: Pair = (0xDFE4D1, 0x3C4721);
+
+/// The colour of `pair` in the current theme.
+pub fn pick(pair: Pair, cx: &App) -> Hsla {
+    rgb(if cx.theme().is_dark() { pair.1 } else { pair.0 }).into()
+}
+
 /// The colour of a connection tag, or `None` for an unknown key.
 pub fn tag_color(key: &str, cx: &App) -> Option<Hsla> {
     let dark = cx.theme().is_dark();
@@ -637,6 +657,75 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "below 4.5:1:\n{}", failures.join("\n"));
+    }
+
+    /// The marks of the editor's occurrences and of a grid's find (J6, J7):
+    /// every syntax colour reads on the occurrence tint (4.5:1), the grid's
+    /// text and links on the match tint (4.5:1); the frame stands out from
+    /// the editor and from the match tint (3:1); and neither tint is the
+    /// selection or the selected row.
+    #[test]
+    fn find_and_occurrence_marks_meet_wcag() {
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let dark = theme.mode == "dark";
+            let of = |pair: Pair| format!("#{:06X}", if dark { pair.1 } else { pair.0 });
+            let (occurrence, edge, matched) =
+                (of(OCCURRENCE_FILL), of(MARK_EDGE), of(GRID_MATCH_FILL));
+            let mut check = |what: String, ratio: f64, floor: f64| {
+                if ratio < floor {
+                    failures.push(format!("{}: {what} is {ratio:.2}:1", theme.name));
+                }
+            };
+            let mut texts = theme.syntax();
+            texts.insert(
+                "editor.foreground".into(),
+                theme.editor("editor.foreground"),
+            );
+            for (kind, hex) in &texts {
+                check(
+                    format!("{kind} on an occurrence"),
+                    contrast(hex, &occurrence),
+                    4.5,
+                );
+            }
+            for key in ["foreground", "link"] {
+                check(
+                    format!("{key} on a match"),
+                    contrast(&theme.colors[key], &matched),
+                    4.5,
+                );
+            }
+            let editor = theme.editor("editor.background");
+            check(
+                "the frame on the editor".into(),
+                contrast(&edge, &editor),
+                3.0,
+            );
+            check(
+                "the frame on an occurrence".into(),
+                contrast(&edge, &occurrence),
+                3.0,
+            );
+            check(
+                "the frame on a match".into(),
+                contrast(&edge, &matched),
+                3.0,
+            );
+            check(
+                "a match on the grid".into(),
+                contrast(&matched, &theme.colors["table.background"]),
+                1.25,
+            );
+            for (fill, other) in [
+                (&occurrence, "selection.background"),
+                (&matched, "selection.background"),
+                (&matched, "table.active.background"),
+            ] {
+                assert_ne!(fill.to_uppercase(), theme.colors[other].to_uppercase());
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The brand (`assets/brand/BRAND.md`) is where its rules put it: Lime

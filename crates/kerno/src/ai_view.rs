@@ -33,6 +33,26 @@ use crate::theme;
 /// What an entry says while the assistant is off.
 pub const OFF: &str = "turn on in Settings → AI";
 
+/// What an "AI: …" command says while the assistant is off, wherever it runs.
+pub const OFF_NOTICE: &str = "The AI assistant is off: turn it on in Settings → AI.";
+
+/// An "AI: …" command that reached the window, not a query tab (the keyboard was in the
+/// sidebar or a data tab): the active query tab takes it; with none, it says what is needed.
+pub fn command(kind: Kind, tab: Option<Entity<QueryTab>>, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::notification::Notification;
+    match tab {
+        Some(tab) => tab.update(cx, |tab, cx| tab.ai_request(kind, window, cx)),
+        None => {
+            let text = match AppState::get(cx).settings.ai.enabled {
+                true => "Open a query tab first: the AI assistant works on its editor.",
+                false => OFF_NOTICE,
+            };
+            window.push_notification(Notification::warning(SharedString::from(text)), cx);
+        }
+    }
+}
+
 /// What the user asks of the assistant, before the request is put together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -383,7 +403,9 @@ impl AiPanel {
     }
 
     /// Stops waiting: the answer, if it comes, is dropped (the request itself ends when the
-    /// server answers or after the 60 s timeout, on its own thread).
+    /// server answers or after the 60 s timeout, on its own thread: `ureq` 3 has no way to
+    /// abort a call in flight). Dropping the task drops the wait on that thread, so nothing of
+    /// the late answer reaches the panel; a new request goes on a thread of its own.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         if matches!(self.stage, Stage::Sending { .. }) {
             self.generation += 1;
@@ -535,6 +557,8 @@ impl Render for AiPanel {
                 )
                 .into_any_element(),
             Stage::Stopped => div()
+                .id("ai-stopped")
+                .test_support()
                 .text_xs()
                 .text_color(muted)
                 .child("Stopped. An answer that comes now is dropped.")

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -14,7 +15,9 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _, TitleBar,
     WindowExt as _, h_flex, v_flex,
@@ -410,13 +413,16 @@ pub struct Workspace {
     shown_tab: Rc<Cell<Option<EntityId>>>,
     /// The scroll of the tab strip.
     tab_scroll: ScrollHandle,
-    /// The active tab, the tab count and the layout the strip last
-    /// scrolled for.
-    revealed_tab: Option<(usize, usize, TabLayout)>,
+    /// The active tab, the tab count, the layout and the active tab's label
+    /// the strip last scrolled for (a label that grows, an unsaved mark
+    /// added, can push its close button out of the strip).
+    revealed_tab: Option<(usize, usize, TabLayout, Option<SharedString>)>,
     /// The list of every open tab (J10) is open.
     all_tabs_open: bool,
     /// The filter of that list, shown when many tabs are open.
     all_tabs_filter: Entity<InputState>,
+    /// The scroll of that list: it opens on the active tab.
+    all_tabs_scroll: ScrollHandle,
     /// A dialog was open at the last frame: see `keep_focus`.
     dialog_open: bool,
     /// What had the keyboard in the window, while no dialog was open.
@@ -480,6 +486,7 @@ impl Workspace {
             shown_tab: Rc::new(Cell::new(None)),
             tab_scroll: ScrollHandle::new(),
             revealed_tab: None,
+            all_tabs_scroll: ScrollHandle::new(),
             all_tabs_open: false,
             all_tabs_filter,
             dialog_open: false,
@@ -495,7 +502,15 @@ impl Workspace {
                 all_tabs_filtered,
             ],
         };
-        for snapshot in tabs {
+        // A connection gone since (deleted, or opened from a URL and never
+        // saved) leaves its query tabs' text, not its other tabs.
+        let mut active_tab = active_tab;
+        for (index, snapshot) in tabs.into_iter().enumerate() {
+            let known = |id: &str| workspace.connections.read(cx).get(id).is_some();
+            let Some(snapshot) = snapshot.without_gone_connection(known) else {
+                active_tab -= usize::from(index < active_tab);
+                continue;
+            };
             workspace.push_snapshot(snapshot, window, cx);
             if let Some(tab) = workspace.tabs.last() {
                 tab.defer_until_shown(cx);
@@ -587,6 +602,15 @@ impl Workspace {
         self.tabs
             .iter()
             .map(|tab| tab.title(cx).to_string())
+            .collect()
+    }
+
+    /// What would be stored of the open tabs now; for tests.
+    #[cfg(test)]
+    pub fn tab_snapshots(&self, cx: &App) -> Vec<TabSnapshot> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.snapshot(cx))
             .collect()
     }
 
@@ -3407,6 +3431,7 @@ impl Workspace {
         }
 
         let (tab_bar_bg, border, muted) = (theme.tab_bar, theme.border, theme.muted_foreground);
+        let side_bg = theme.sidebar;
         let layout = AppState::get(cx).settings.tab_layout;
         // The list of every tab, then a new one: at the end of the strip or
         // of the rows, at the top of the side list.
@@ -3466,7 +3491,8 @@ impl Workspace {
                 .last_empty_space(empty.h_full())
                 .suffix(tools)
                 .into_any_element(),
-            // The rows wrap; past four they scroll (DBeaver #7114).
+            // The rows wrap; past four they scroll, with a scrollbar that
+            // says more are below (DBeaver #7114).
             TabLayout::Rows => h_flex()
                 .id("tab-rows-bar")
                 .w_full()
@@ -3478,10 +3504,13 @@ impl Workspace {
                     div()
                         .id("tab-rows")
                         .test_support()
+                        .relative()
                         .flex()
                         .flex_wrap()
                         .flex_1()
                         .min_w_0()
+                        // Each row starts inside the bar, not on its edge.
+                        .pl_2()
                         .max_h(TAB_HEIGHT * TAB_ROWS as f32)
                         .overflow_y_scroll()
                         .track_scroll(&self.tab_scroll)
@@ -3499,16 +3528,19 @@ impl Workspace {
                                     .suffix(close),
                             )
                         }))
-                        .child(empty.h(TAB_HEIGHT)),
+                        .child(empty.h(TAB_HEIGHT))
+                        // Last, so the tabs keep their indices in the scroll.
+                        .vertical_scrollbar(&self.tab_scroll),
                 )
                 .child(tools.h(TAB_HEIGHT))
                 .into_any_element(),
             // A list at the side (DBeaver #23248): the active row by its
-            // background, never a bar at its edge.
+            // background, never a bar at its edge. On the sidebar's surface,
+            // so the selected row reads as the schema tree's does.
             TabLayout::Vertical => v_flex()
                 .id("tab-list-panel")
                 .size_full()
-                .bg(tab_bar_bg)
+                .bg(side_bg)
                 .border_r_1()
                 .border_color(border)
                 .child(
@@ -3550,7 +3582,24 @@ impl Workspace {
                                         .min_w_0()
                                         .gap_1()
                                         .children(prefix)
-                                        .child(div().flex_1().min_w_0().truncate().child(title))
+                                        // A long title ends in an ellipsis;
+                                        // the tooltip has it whole.
+                                        .child({
+                                            let full = self.tabs[index].label(cx);
+                                            div()
+                                                .id(("tab-row-title", index))
+                                                .test_support()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .when(index == self.active_tab, |title| {
+                                                    title.font_weight(FontWeight::MEDIUM)
+                                                })
+                                                .aria_description(full.clone())
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(full.clone()).build(window, cx)
+                                                })
+                                                .child(title)
+                                        })
                                         .child(close),
                                 )
                         }))
@@ -3637,12 +3686,18 @@ impl Workspace {
         } else {
             cx.theme().transparent
         };
+        // In the side list (no underline) the title may be cut: it ends in
+        // an ellipsis, on the element that holds the text.
+        let text = div()
+            .when(!underline, |text| text.min_w_0().truncate())
+            .child(tab.label(cx));
         let title = div()
             .id(("tab-title", index))
             .h_full()
             .flex()
             .items_center()
             .when(underline, |title| title.border_b_2().border_color(marker))
+            .when(!underline, |title| title.min_w_0())
             .test_support()
             .context_menu(self.menu(MenuOf::Tab(index), cx))
             .map(|title| match chrome {
@@ -3652,13 +3707,14 @@ impl Workspace {
                     div()
                         .id(("tab-env", index))
                         .test_support()
+                        .min_w_0()
                         .px_1()
                         .rounded_sm()
                         .bg(chrome.bar)
                         .text_color(chrome.bar_text)
-                        .child(tab.label(cx)),
+                        .child(text),
                 ),
-                None => title.child(tab.label(cx)),
+                None => title.child(text),
             })
             .into_any_element();
         let close = Button::new(("close-tab", index))
@@ -3707,8 +3763,13 @@ impl Workspace {
         let opened = view.clone();
         // The filter takes the keyboard when the list opens.
         let filter_focus = self.all_tabs_filter.read(cx).focus_handle(cx);
+        let scroll = self.all_tabs_scroll.clone();
         Popover::new("all-tabs")
             .anchor(Anchor::TopRight)
+            // An edge that shows over a grid or an editor in both themes (the
+            // kit's hairline ring alone fades into a dark page).
+            .border_1()
+            .border_color(cx.theme().input)
             .when(filtering, |popover| popover.track_focus(&filter_focus))
             .open(self.all_tabs_open)
             .on_open_change(move |open, window, cx| {
@@ -3747,6 +3808,7 @@ impl Workspace {
                             .id("all-tabs-rows")
                             .min_h_0()
                             .overflow_y_scroll()
+                            .track_scroll(&scroll)
                             .children(rows.map(|(index, label, engine, env)| {
                                 let (index, view) = (*index, view.clone());
                                 ListItem::new(("all-tabs-item", index))
@@ -3767,7 +3829,14 @@ impl Workspace {
                                             .child(div().w(px(14.)).flex_none().when(
                                                 index == active,
                                                 |mark| {
-                                                    mark.child(Icon::new(IconName::Check).xsmall())
+                                                    mark.child(
+                                                        div()
+                                                            .id(("all-tabs-check", index))
+                                                            .test_support()
+                                                            .child(
+                                                                Icon::new(IconName::Check).xsmall(),
+                                                            ),
+                                                    )
                                                 },
                                             ))
                                             .children(env.map(|color| {
@@ -3786,12 +3855,17 @@ impl Workspace {
                                                     ),
                                                 )
                                             }))
+                                            // With its unsaved mark, as
+                                            // on the tab.
                                             .child(
                                                 div()
+                                                    .id(("all-tabs-label", index))
+                                                    .test_support()
                                                     .flex_1()
                                                     .min_w_0()
                                                     .truncate()
-                                                    .child(label.clone()),
+                                                    .child(label.clone())
+                                                    .test_text(label.to_string()),
                                             ),
                                     )
                             }))
@@ -3825,6 +3899,7 @@ impl Workspace {
         if open {
             self.all_tabs_filter
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            self.all_tabs_scroll.scroll_to_item(self.active_tab);
         } else {
             self.focus_active(window, cx);
         }
@@ -3900,10 +3975,14 @@ impl Workspace {
                 Some(theme.warning),
             ));
         }
+        // While the grid's find shows matching rows only: of how many.
+        let shown = self
+            .active_grid(cx)
+            .and_then(|grid| crate::query::find::rows_shown(grid.read(cx).delegate()));
         items.extend(rows.map(|rows| {
             (
                 StatusItem::Rows,
-                format!("{rows} row{}", if rows == 1 { "" } else { "s" }),
+                shown.unwrap_or_else(|| format!("{rows} row{}", if rows == 1 { "" } else { "s" })),
                 None,
             )
         }));
@@ -4616,6 +4695,28 @@ impl Workspace {
                 QueryTab::set_stacked(!AppState::get(cx).settings.stack_results, window, cx)
             }),
         )
+        // J17: an "AI: …" command run outside a query tab (a query tab
+        // that has the keyboard takes it first).
+        .on_action(cx.listener(|this, _: &actions::AiWriteSql, window, cx| {
+            let tab = this.active_query_tab().cloned();
+            crate::ai_view::command(crate::ai_view::Kind::WriteSql, tab, window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::AiExplainQuery, window, cx| {
+                let tab = this.active_query_tab().cloned();
+                crate::ai_view::command(crate::ai_view::Kind::ExplainQuery, tab, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::AiExplainPlan, window, cx| {
+            let tab = this.active_query_tab().cloned();
+            crate::ai_view::command(crate::ai_view::Kind::ExplainPlan, tab, window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::AiExplainError, window, cx| {
+                let tab = this.active_query_tab().cloned();
+                crate::ai_view::command(crate::ai_view::Kind::ExplainError, tab, window, cx)
+            }),
+        )
         .on_action(
             cx.listener(|this, _: &actions::SelectAllOccurrences, window, cx| {
                 if let Some(tab) = this.active_query_tab().cloned() {
@@ -5016,8 +5117,9 @@ impl Render for Workspace {
             self.active_tab,
             self.tabs.len(),
             AppState::get(cx).settings.tab_layout,
+            self.tabs.get(self.active_tab).map(|tab| tab.label(cx)),
         );
-        if self.revealed_tab != Some(shown) {
+        if self.revealed_tab.as_ref() != Some(&shown) {
             self.tab_scroll.scroll_to_item(self.active_tab);
             // Before the strip's first layout there is no width to scroll
             // in: again on the next frame.
