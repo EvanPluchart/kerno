@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -28,7 +29,8 @@ use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{CellValue, RowChange, RowSql, apply_edits};
-use kerno_core::{Error, ResultStore, Session, TxState, exec};
+use kerno_core::storage::TableLayout;
+use kerno_core::{Engine, Error, ResultStore, Session, TxState, exec};
 
 use crate::actions::CloseTab;
 use crate::bridge;
@@ -248,8 +250,19 @@ pub struct DataTab {
     /// Why the last apply changed nothing.
     apply_error: Option<String>,
     grid_subscriptions: Vec<Subscription>,
+    /// How the columns were last laid out (J6, DBeaver #38133), once read:
+    /// the first page waits for it, for its sort.
+    layout: Option<TableLayout>,
+    /// The grid's column changes already noted.
+    layout_seen: u64,
+    /// Counts the layouts given to be written: a delayed write that is
+    /// not the last one gives up.
+    layout_writes: Arc<AtomicU64>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A layout is written this long after its last change.
+const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 impl EventEmitter<DataTabEvent> for DataTab {}
 
@@ -325,14 +338,146 @@ impl DataTab {
             refocus_grid: false,
             apply_error: None,
             grid_subscriptions: Vec::new(),
+            layout: None,
+            layout_seen: 0,
+            layout_writes: Arc::new(AtomicU64::new(0)),
             _subscriptions: subscriptions,
         };
         for condition in filter.conditions {
             tab.push_filter_row(condition, window, cx);
         }
         tab.load_history(cx);
-        tab.reload(window, cx);
+        tab.load_layout(window, cx);
         tab
+    }
+
+    /// What the layout of this table's columns is stored under: the
+    /// database, the schema and the table (a MySQL table's schema is its
+    /// database), with the connection apart.
+    fn layout_key(&self, cx: &App) -> String {
+        let saved = self.connections.read(cx).get(&self.target.connection);
+        let database = match saved.map(|saved| saved.config.engine) {
+            Some(Engine::MySql | Engine::MariaDb) => String::new(),
+            _ => self
+                .target
+                .database
+                .clone()
+                .or_else(|| saved.and_then(|saved| saved.config.database.clone()))
+                .unwrap_or_default(),
+        };
+        serde_json::to_string(&[database.as_str(), &self.table.schema, &self.table.name])
+            .unwrap_or_default()
+    }
+
+    /// Reads the layout last given to this table, then the first page, in
+    /// its order.
+    fn load_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (storage, connection, key) = (
+            AppState::get(cx).storage.clone(),
+            self.target.connection.clone(),
+            self.layout_key(cx),
+        );
+        let reading = bridge::spawn_blocking(cx, move || storage.table_layout(&connection, &key));
+        cx.spawn_in(window, async move |this, cx| {
+            let layout = reading.await.ok().flatten().unwrap_or_default();
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.sort.is_none() {
+                    this.sort = layout.sort.clone();
+                }
+                this.layout = Some(layout);
+                this.reload(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Notes how the columns are laid out now, and writes it a moment
+    /// later when it changed.
+    fn remember_layout(&mut self, cx: &mut Context<Self>) {
+        let Some(table) = &self.grid else {
+            return;
+        };
+        let state = table.read(cx);
+        let grid = state.delegate();
+        let columns = grid.store().columns();
+        let shown: Vec<String> = grid
+            .layout()
+            .iter()
+            .map(|&column| columns[column].name.clone())
+            .collect();
+        let pinned = shown
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| grid.is_pinned(index + 1))
+            .map(|(_, name)| name.clone())
+            .collect();
+        let hidden: Vec<String> = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .filter(|name| !shown.contains(name))
+            .collect();
+        let mut widths = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.widths.clone())
+            .unwrap_or_default();
+        widths.extend(
+            Grid::widths(state)
+                .into_iter()
+                .map(|(name, width)| (name, f32::from(width))),
+        );
+        let layout = TableLayout {
+            order: shown.iter().chain(&hidden).cloned().collect(),
+            hidden,
+            pinned,
+            widths,
+            sort: self.sort.clone(),
+        };
+        if self.layout.as_ref() == Some(&layout) {
+            return;
+        }
+        self.layout = Some(layout.clone());
+        self.write_layout(layout, cx);
+    }
+
+    /// Writes a layout once no other came for a moment, off the UI
+    /// thread; closing the tab does not stop it.
+    fn write_layout(&mut self, layout: TableLayout, cx: &mut Context<Self>) {
+        let version = self.layout_writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let writes = self.layout_writes.clone();
+        let (storage, connection, key) = (
+            AppState::get(cx).storage.clone(),
+            self.target.connection.clone(),
+            self.layout_key(cx),
+        );
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(LAYOUT_SAVE_DELAY).await;
+            if writes.load(Ordering::SeqCst) != version {
+                return;
+            }
+            let writing = cx.update(|cx| {
+                bridge::spawn_blocking(cx, move || {
+                    storage.save_table_layout(&connection, &key, &layout)
+                })
+            });
+            if let Err(error) = writing.await {
+                tracing::warn!(%error, "the layout of a table could not be stored");
+            }
+        })
+        .detach();
+    }
+
+    /// Forgets the layout of the columns: the table's own order, every
+    /// column shown, widths from the rows, no order (J6).
+    pub fn reset_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.free_to_move(window, cx) {
+            return;
+        }
+        self.layout = Some(TableLayout::default());
+        self.sort = None;
+        self.write_layout(TableLayout::default(), cx);
+        self.page = 0;
+        self.reload(window, cx);
     }
 
     /// What the filter history of this table is stored under.
@@ -581,6 +726,11 @@ impl DataTab {
             return;
         }
         self.state = State::Loading;
+        // The layout read first gives the order; it reads again when done.
+        if self.layout.is_none() {
+            cx.notify();
+            return;
+        }
         self.apply_error = None;
         let previous = self.load.take();
         let opening = self.session(cx);
@@ -622,6 +772,10 @@ impl DataTab {
                             None
                         };
                         let identity = structure.row_identity().unwrap_or_default();
+                        // A remembered order on a column gone since is dropped.
+                        let sort = sort.filter(|(name, _)| {
+                            structure.columns.iter().any(|column| column.name == *name)
+                        });
                         let sql = page_sql(
                             session.dialect(),
                             &structure.columns,
@@ -749,6 +903,9 @@ impl DataTab {
                 .position(|column| &column.name == name)?;
             Some((column, *descending))
         });
+        if sort.is_none() {
+            self.sort = None;
+        }
         // A computed column takes no value, nor does an identity the server
         // always generates (`ColumnEdit::of`).
         let target = match self.read_only(cx) {
@@ -788,7 +945,7 @@ impl DataTab {
             keyless,
             structure: Some(described),
         };
-        let grid = Grid::page(
+        let mut grid = Grid::page(
             store,
             session,
             self.table.clone(),
@@ -797,6 +954,31 @@ impl DataTab {
             sort_on_server,
         )
         .with_owner(owner);
+        // The columns as they were last left (J6).
+        if let Some(layout) = &self.layout {
+            let (columns, pinned) = {
+                let names: Vec<&str> = grid
+                    .store()
+                    .columns()
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect();
+                layout.arrange(&names)
+            };
+            grid.arrange(columns, pinned);
+            grid = grid.with_widths(
+                layout
+                    .widths
+                    .iter()
+                    .map(|(name, width)| (name.clone(), px(*width)))
+                    .collect(),
+            );
+        }
+        // The find bar stays open, with its text, over the new page.
+        let find = self
+            .grid
+            .as_ref()
+            .and_then(|old| crate::query::find::carried(old, cx));
         let table = cx.new(|cx| {
             TableState::new(grid, window, cx)
                 .col_resizable(true)
@@ -811,7 +993,11 @@ impl DataTab {
             cx.subscribe_in(
                 &table,
                 window,
-                |_, table, event: &TableEvent, window, cx| {
+                |this, table, event: &TableEvent, window, cx| {
+                    // A column resized is remembered (J6).
+                    if matches!(event, TableEvent::ColumnWidthsChanged(_)) {
+                        this.remember_layout(cx);
+                    }
                     if matches!(
                         event,
                         TableEvent::SelectCell(..)
@@ -833,13 +1019,23 @@ impl DataTab {
             ),
             // Pending changes show in the toolbar, and stop auto-refresh: a
             // refresh would drop them.
-            cx.observe(&table, |this, _, cx| {
+            cx.observe(&table, |this, table, cx| {
                 if this.auto_refresh.is_some() && this.pending_count(cx) > 0 {
                     this.stop_auto_refresh(Some("changes are pending"), cx);
+                }
+                // Columns hidden, pinned or moved are remembered (J6).
+                let version = table.read(cx).delegate().layout_version();
+                if version != this.layout_seen {
+                    this.layout_seen = version;
+                    this.remember_layout(cx);
                 }
                 cx.notify()
             }),
         ];
+        self.layout_seen = 0;
+        if let Some(find) = find {
+            crate::query::find::restore(&table, find, window, cx);
+        }
         if std::mem::take(&mut self.refocus_grid) {
             // Only while the keyboard is still on this tab, not after the
             // user moved on during the reload.
@@ -882,6 +1078,7 @@ impl DataTab {
         let columns = grid.read(cx).delegate().store().columns().clone();
         self.sort = sort
             .and_then(|(column, descending)| Some((columns.get(column)?.name.clone(), descending)));
+        self.remember_layout(cx);
         self.page = 0;
         self.reload(window, cx);
     }
@@ -1467,7 +1664,9 @@ impl DataTab {
             GridAction::EditCell => self.edit_cell(row, column, window, cx),
             // Cells of NOT NULL columns are left alone, as with Delete.
             GridAction::SetNull => self.clear_selected(window, cx),
-            GridAction::SetDefault => self.set_selected(CellValue::Default, window, cx),
+            GridAction::SetDefault => {
+                self.set_selected(CellValue::Expression("DEFAULT".into()), window, cx)
+            }
             GridAction::CopyFromRow(above) => self.copy_from_row(above, window, cx),
             GridAction::DuplicateRow => self.duplicate_rows(Some(row), window, cx),
             GridAction::DeleteRow => self.delete_rows(Some(row), window, cx),
@@ -1478,6 +1677,7 @@ impl DataTab {
             GridAction::Generate(kind) => self.generate_sql(kind, row, window, cx),
             GridAction::AddRow => self.add_row(window, cx),
             GridAction::Refresh => self.refresh(window, cx),
+            GridAction::ResetLayout => self.reset_layout(window, cx),
             // The grid runs the others itself.
             _ => {}
         }
@@ -1856,7 +2056,7 @@ impl DataTab {
                     )
                     .disabled(!has_selection)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.set_selected(CellValue::Default, window, cx)
+                        this.set_selected(CellValue::Expression("DEFAULT".into()), window, cx)
                     })),
                 )
             })

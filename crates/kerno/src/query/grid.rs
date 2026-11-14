@@ -35,7 +35,11 @@ use kerno_core::sql::{CellValue, RowChange, RowSql, edit_statements, rows_sql};
 use kerno_core::{Dialect, ResultStore, RowBatch, RowDemand, Session, TypeKind};
 
 /// Cells longer than this are cut in the grid; the value viewer shows all.
-const MAX_CELL_CHARS: usize = 300;
+pub(super) const MAX_CELL_CHARS: usize = 300;
+
+/// Why rows take no change while the find shows matching rows only: they
+/// are shown out of their place.
+const FILTERED: &str = "matching rows only";
 
 /// Results up to this many rows are sorted at once; larger ones off the UI
 /// thread.
@@ -244,6 +248,10 @@ pub enum GridAction {
     GoToRow,
     /// Lists the columns to select one.
     GoToColumn,
+    /// Opens the find bar over the fetched rows.
+    Find,
+    /// Forgets the remembered layout of a table's columns.
+    ResetLayout,
 }
 
 /// Where "First / Previous / Next / Last row" moves the selection.
@@ -328,6 +336,8 @@ impl GridAction {
             Self::Panel(Panel::Columns) => "Columns",
             Self::GoToRow => "Go to row…",
             Self::GoToColumn => "Go to column…",
+            Self::Find => "Find in results…",
+            Self::ResetLayout => "Reset layout",
         }
         .to_string()
     }
@@ -573,6 +583,7 @@ fn navigate_menu() -> Entry {
     Entry::Submenu(
         "Navigate",
         vec![
+            enabled(GridAction::Find),
             enabled(GridAction::GoToRow),
             enabled(GridAction::GoToColumn),
         ],
@@ -688,6 +699,10 @@ pub fn header_menu(facts: &HeaderFacts) -> Vec<Entry> {
         enabled(A::FitWidth),
         enabled(A::FitAllWidths),
     ]);
+    // A table's columns are laid out as last left (J6); a result's are not.
+    if facts.data {
+        entries.extend([Entry::Separator, enabled(A::ResetLayout)]);
+    }
     entries
 }
 
@@ -798,8 +813,8 @@ pub fn bool_text(column: &kerno_core::Column, value: bool) -> &'static str {
 
 /// What is open in a cell being edited.
 pub(super) enum Editor {
-    /// Typed text.
-    Text(Entity<InputState>),
+    /// Typed text: a value, or a SQL expression when the flag is set.
+    Text(Entity<InputState>, bool),
     /// A list of the column's values.
     Choice(Entity<PopupMenu>),
 }
@@ -937,6 +952,10 @@ pub struct Grid {
     generation: u64,
     /// Widths kept from before the result was read again, by column name.
     widths: HashMap<String, Pixels>,
+    /// The find bar and its matches, while open (`super::find`).
+    pub(super) find: Option<super::find::Find>,
+    /// Counts the changes to the columns shown (hidden, pinned, moved).
+    layout_version: u64,
 }
 
 impl Grid {
@@ -974,6 +993,8 @@ impl Grid {
             stats: None,
             record_view: None,
             going_to: None,
+            find: None,
+            layout_version: 0,
             generation: 0,
             widths: HashMap::new(),
         }
@@ -1051,6 +1072,8 @@ impl Grid {
             stats: None,
             record_view: None,
             going_to: None,
+            find: None,
+            layout_version: 0,
             generation: 0,
             widths: HashMap::new(),
             store,
@@ -1172,8 +1195,13 @@ impl Grid {
         self.edits.as_ref().map(|edits| &edits.pending)
     }
 
-    /// Changes the pending changes, when the grid takes some.
+    /// Changes the pending changes, when the grid takes some. Not while
+    /// the find shows matching rows only: changes are kept by row as
+    /// fetched, which the rows shown are not.
     pub fn edit(&mut self, change: impl FnOnce(&mut Pending, &ResultStore)) {
+        if self.filtered().is_some() {
+            return;
+        }
         if let Some(edits) = &mut self.edits {
             edits.editing = None;
             change(&mut edits.pending, &self.store);
@@ -1188,7 +1216,20 @@ impl Grid {
 
     /// Rows shown: the fetched ones, then the new ones.
     pub fn total_rows(&self) -> usize {
-        self.store.row_count() + self.pending().map_or(0, Pending::inserted)
+        let fetched = match self.find.as_ref().and_then(super::find::Find::rows) {
+            Some(rows) => rows.len(),
+            None => self.store.row_count(),
+        };
+        fetched + self.pending().map_or(0, Pending::inserted)
+    }
+
+    /// Why the rows take no change now that they would otherwise take:
+    /// the find shows matching rows only.
+    fn filtered(&self) -> Option<&'static str> {
+        self.find
+            .as_ref()
+            .and_then(super::find::Find::rows)
+            .map(|_| FILTERED)
     }
 
     /// What a cell holds as it shows: the pending value when there is one,
@@ -1202,7 +1243,8 @@ impl Grid {
         {
             Some(CellValue::Text(text)) => Some(text.as_bytes()),
             Some(CellValue::Bytes(bytes)) => Some(bytes),
-            Some(CellValue::Null | CellValue::Default) => None,
+            // A default or an expression is known once the server wrote it.
+            Some(CellValue::Null | CellValue::Default | CellValue::Expression(_)) => None,
             None if row < fetched => self.store.cell(self.source_row(row), source),
             None => None,
         }
@@ -1257,6 +1299,9 @@ impl Grid {
         let Some(edits) = &self.edits else {
             return Err("These rows cannot be edited.");
         };
+        if self.filtered().is_some() {
+            return Err("Matching rows only are shown: turn it off in the find bar to edit.");
+        }
         let Some(source) = self.source_column(column) else {
             return Err("Row numbers are not data.");
         };
@@ -1343,12 +1388,34 @@ impl Grid {
             cx.notify();
             return true;
         }
+        // A cell holding an expression opens on it, as an expression.
+        let fetched = self.store.row_count();
+        let expression = match self
+            .pending()
+            .and_then(|pending| pending.value(fetched, row, source))
+        {
+            Some(CellValue::Expression(sql)) => Some(sql.clone()),
+            _ => None,
+        };
+        let initial = expression.clone().unwrap_or(initial);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(initial.clone()));
         let subscription = cx.subscribe_in(
             &input,
             window,
             |table, _, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } => {
+                    // An empty expression is no value: the cell stays open.
+                    if table.delegate().typing_empty_expression(cx) {
+                        gpui_kit::component::WindowExt::push_notification(
+                            window,
+                            gpui_kit::component::notification::Notification::warning(
+                                "An empty SQL expression is not a value: type one, or switch \
+                                 back to a value (\u{2318}E).",
+                            ),
+                            cx,
+                        );
+                        return;
+                    }
                     table.delegate_mut().commit_edit(cx);
                     table.focus_handle(cx).focus(window, cx);
                     cx.notify();
@@ -1371,7 +1438,7 @@ impl Grid {
                 row,
                 column: source,
                 initial,
-                editor: Editor::Text(input),
+                editor: Editor::Text(input, expression.is_some()),
                 _subscription: subscription,
             });
         }
@@ -1435,18 +1502,46 @@ impl Grid {
             return;
         };
         // A list sets its value when a choice is clicked.
-        let Editor::Text(input) = &editing.editor else {
+        let Editor::Text(input, expression) = &editing.editor else {
             return;
         };
         let typed = input.read(cx).value().to_string();
         let kind = self.store.columns()[editing.column].kind;
-        if let Some(value) = typed_value(&typed, &editing.initial, kind) {
+        let was = edits
+            .pending
+            .value(self.store.row_count(), editing.row, editing.column);
+        let was_expression = matches!(was, Some(CellValue::Expression(_)));
+        let value =
+            super::edit::edited_value(&typed, &editing.initial, kind, *expression, was_expression);
+        if let Some(value) = value {
             let store = &self.store;
             edits
                 .pending
                 .step(|pending| pending.set(store, editing.row, editing.column, value));
             self.generation += 1;
         }
+    }
+
+    /// Switches the cell being typed in between a value and a SQL
+    /// expression. Returns whether a cell is being typed in.
+    pub fn toggle_expression(&mut self) -> bool {
+        let editing = self.edits.as_mut().and_then(|edits| edits.editing.as_mut());
+        match editing.map(|editing| &mut editing.editor) {
+            Some(Editor::Text(_, expression)) => {
+                *expression = !*expression;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the cell being typed in holds an empty SQL expression.
+    pub fn typing_empty_expression(&self, cx: &App) -> bool {
+        let editing = self.edits.as_ref().and_then(|edits| edits.editing.as_ref());
+        matches!(
+            editing.map(|editing| &editing.editor),
+            Some(Editor::Text(input, true)) if input.read(cx).value().trim().is_empty()
+        )
     }
 
     /// Drops what is being typed.
@@ -1607,9 +1702,40 @@ impl Grid {
         (editing.row == row && editing.column == source).then_some(&editing.editor)
     }
 
-    /// The rows in the order shown, when sorted here.
+    /// The rows in the order shown, when sorted here or when the find
+    /// shows matching rows only.
     pub(super) fn order(&self) -> Option<Arc<[u32]>> {
+        match self.find.as_ref().and_then(super::find::Find::rows) {
+            Some(rows) => Some(rows.clone()),
+            None => self.order.clone(),
+        }
+    }
+
+    /// The rows in the order of the sort made here, when there is one.
+    pub(super) fn sort_order(&self) -> Option<Arc<[u32]>> {
         self.order.clone()
+    }
+
+    /// Whether the rows take changes (a table's data, an editable result).
+    pub(super) fn has_edits(&self) -> bool {
+        self.edits.is_some()
+    }
+
+    /// Changes each time columns are hidden, pinned, moved or shown again.
+    pub fn layout_version(&self) -> u64 {
+        self.layout_version
+    }
+
+    /// Shows the columns of the result `layout` names, left to right, the
+    /// first `pinned` of them kept in view (a remembered layout).
+    pub fn arrange(&mut self, layout: Vec<usize>, pinned: usize) {
+        let columns = self.store.columns().len();
+        if layout.is_empty() || layout.iter().any(|&column| column >= columns) {
+            return;
+        }
+        self.pinned = pinned.min(layout.len());
+        self.layout = layout;
+        self.clear_selection();
     }
 
     /// Whether changes wait to be applied.
@@ -1729,6 +1855,9 @@ impl Grid {
 
     /// The row of the result shown on a row of the grid.
     pub fn source_row(&self, row: usize) -> usize {
+        if let Some(rows) = self.find.as_ref().and_then(super::find::Find::rows) {
+            return rows.get(row).map_or(row, |&source| source as usize);
+        }
         match &self.order {
             Some(order) => order.get(row).map_or(row, |&source| source as usize),
             None => row,
@@ -1755,6 +1884,7 @@ impl Grid {
         if index < self.pinned {
             self.pinned -= 1;
         }
+        self.layout_version += 1;
         self.clear_selection();
     }
 
@@ -1762,6 +1892,7 @@ impl Grid {
     pub fn show_all(&mut self) {
         self.layout = (0..self.store.columns().len()).collect();
         self.pinned = 0;
+        self.layout_version += 1;
         self.clear_selection();
     }
 
@@ -1792,6 +1923,7 @@ impl Grid {
             self.layout.insert(self.pinned, source);
             self.pinned += 1;
         }
+        self.layout_version += 1;
         self.clear_selection();
     }
 
@@ -2069,7 +2201,7 @@ impl Grid {
         CellFacts {
             data: self.sort_on_server.is_some(),
             editable: self.sort_on_server.is_none() && self.edits.is_some(),
-            read_only: self.read_only,
+            read_only: self.read_only.or(self.filtered()),
             kind: self.store.columns()[source].kind,
             null: self.cell(row, source).is_none(),
             computed: self.edits.as_ref().is_some_and(|edits| {
@@ -2277,9 +2409,12 @@ impl Grid {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Rearranging the columns: the table reads them again.
+        // Rearranging the columns: the table reads them again, at the
+        // widths they have now (a resized column keeps its width).
         let rearrange = |cx: &mut App, change: fn(&mut Grid, usize)| {
             table.update(cx, |table, cx| {
+                let widths = Grid::widths(table);
+                table.delegate_mut().widths.extend(widths);
                 change(table.delegate_mut(), column);
                 table.refresh(cx);
                 cx.notify();
@@ -2334,6 +2469,7 @@ impl Grid {
             GridAction::Panel(panel) => super::grid_view::open_panel(table, panel, window, cx),
             GridAction::GoToRow => super::grid_view::go_to_row(table, window, cx),
             GridAction::GoToColumn => super::grid_view::go_to_column(table, window, cx),
+            GridAction::Find => super::find::open(table, window, cx),
             GridAction::Order(order) => table.update(cx, |table, cx| {
                 let sort = match order {
                     Some(false) => ColumnSort::Ascending,
@@ -2387,8 +2523,19 @@ pub(super) fn editor_element(
             })
         }
     };
+    // The cell takes a value or a SQL expression (DBeaver #9964).
+    let toggle = {
+        let table = table.clone();
+        move |cx: &mut App| {
+            table.update(cx, |table, cx| {
+                table.delegate_mut().toggle_expression();
+                cx.notify();
+            })
+        }
+    };
+    let key_toggle = toggle.clone();
     match editor {
-        Editor::Text(input) => div()
+        Editor::Text(input, expression) => h_flex()
             .id("cell-editor")
             .w_full()
             // Escape, once the input has no use for it, drops the edit.
@@ -2396,13 +2543,35 @@ pub(super) fn editor_element(
             // Tab while typing stays in the cell: it does not switch to the
             // record view.
             .on_action(|_: &crate::actions::ToggleRecordView, _, cx| cx.stop_propagation())
+            // \u{2318}E while typing switches the cell between a value and
+            // an expression; it explains no statement here.
+            .on_action(move |_: &crate::actions::ExplainStatement, _, cx| {
+                key_toggle(cx);
+                cx.stop_propagation();
+            })
             .child(
                 Input::new(input)
                     .xsmall()
                     .text_size(size)
                     .appearance(false)
                     .font_family(theme.mono_font_family.clone())
-                    .when(numeric, |input| input.text_right()),
+                    .when(*expression, |input| input.italic())
+                    .when(numeric && !*expression, |input| input.text_right()),
+            )
+            .child(
+                Button::new("cell-expression")
+                    .map(|button| match expression {
+                        true => button.primary(),
+                        false => button.ghost(),
+                    })
+                    .xsmall()
+                    .label("=")
+                    .tooltip(if *expression {
+                        "SQL expression, written as typed (\u{2318}E: a value)"
+                    } else {
+                        "A value (\u{2318}E: a SQL expression)"
+                    })
+                    .on_click(move |_, _, cx| toggle(cx)),
             )
             .into_any_element(),
         Editor::Choice(menu) => {
@@ -2673,6 +2842,7 @@ impl TableDelegate for Grid {
         }
         let source = self.layout.remove(from);
         self.layout.insert(to, source);
+        self.layout_version += 1;
         self.clear_selection();
         cx.notify();
     }
@@ -2840,7 +3010,15 @@ impl TableDelegate for Grid {
         );
         let table = cx.entity();
         let settings = &crate::state::AppState::get(cx).settings;
-        let text = if pending == Some(&CellValue::Default) {
+        // SQL the user wrote, run when the row is written: a leading `=`
+        // tells it from a literal (DBeaver #9964).
+        let expression = match pending {
+            Some(CellValue::Expression(sql)) => Some(sql),
+            _ => None,
+        };
+        let text = if let Some(sql) = expression {
+            SharedString::from(format!("={sql}"))
+        } else if pending == Some(&CellValue::Default) {
             // The server gives the value when the row is written.
             SharedString::from("default")
         } else if shown.style == CellStyle::Null {
@@ -2857,17 +3035,43 @@ impl TableDelegate for Grid {
         let text = cell
             // NULL is not the empty string: it is drawn apart.
             .when(
-                shown.style == CellStyle::Null || pending == Some(&CellValue::Default),
+                (shown.style == CellStyle::Null && expression.is_none())
+                    || pending == Some(&CellValue::Default),
                 |cell| cell.italic().text_color(theme.muted_foreground),
             )
             .when(
-                matches!(shown.style, CellStyle::Boolean | CellStyle::Binary),
+                matches!(shown.style, CellStyle::Boolean | CellStyle::Binary)
+                    && expression.is_none(),
                 |cell| cell.text_color(theme.muted_foreground),
             )
             .when(mark == Mark::Deleted, |cell| {
                 cell.line_through().text_color(theme.muted_foreground)
             })
-            .child(text);
+            .map(|cell| match expression {
+                Some(_) => cell
+                    .italic()
+                    .child(gpui_kit::StyledText::new(text).with_highlights([(
+                        0..1,
+                        gpui_kit::HighlightStyle {
+                            color: Some(theme.link),
+                            ..Default::default()
+                        },
+                    )])),
+                None => cell.child(text),
+            });
+        // A match of the find bar, on a fetched row (J6).
+        let found = self
+            .find
+            .as_ref()
+            .filter(|_| row < fetched)
+            .and_then(|find| {
+                find.state(
+                    self.source_row(row),
+                    self.cell(row, source),
+                    &self.store.columns()[source],
+                    (row, column),
+                )
+            });
         // The text's style stays on the text: the menu, drawn inside the
         // element that opens it, would inherit it.
         div()
@@ -2877,6 +3081,22 @@ impl TableDelegate for Grid {
             // tinted as a whole, by `render_tr`).
             .when(mark == Mark::Edited, |cell| {
                 cell.bg(theme.warning.opacity(0.22))
+            })
+            // Matches in the find's colour, the current one stronger; an
+            // empty marker names them for tests.
+            .when_some(found, |cell, current| {
+                let (id, strength) = if current {
+                    ("find-current", 0.45)
+                } else {
+                    ("find-match", 0.2)
+                };
+                cell.bg(theme.info.opacity(strength)).child(
+                    div()
+                        .id((id, (row << 12) | column))
+                        .test_support()
+                        .absolute()
+                        .size_0(),
+                )
             })
             .when(self.in_range(row, column), |cell| cell.bg(theme.selection))
             // Shift and click stretches the selection to this cell; a plain
@@ -2915,8 +3135,10 @@ impl TableDelegate for Grid {
             .into_any_element()
     }
 
+    // While the find shows matching rows only, reaching its last row asks
+    // for nothing: "Fetch all" in the find bar does.
     fn has_more(&self, _: &App) -> bool {
-        Grid::has_more(self)
+        Grid::has_more(self) && self.filtered().is_none()
     }
 
     fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {
@@ -3021,7 +3243,7 @@ mod tests {
 
     const COPY_AS: &str = "Copy as ▸ With column names | CSV | JSON | Markdown | SQL INSERT";
     const ORDER: &str = "Order by this column ▸ Ascending | Descending | Clear order (not ordered)";
-    const NAVIGATE: &str = "Navigate ▸ Go to row… | Go to column…";
+    const NAVIGATE: &str = "Navigate ▸ Find in results… | Go to row… | Go to column…";
     const COLUMN: &str = "Column ▸ Copy column name | Pin column | Hide column | \
                           Show all columns (none hidden)";
     const GENERATE: &str = "Generate SQL ▸ SELECT by key | SELECT … IN | INSERT | UPDATE | DELETE";
@@ -3286,8 +3508,12 @@ mod tests {
                 "—",
                 "Fit width",
                 "Fit all widths",
+                "—",
+                "Reset layout",
             ]
         );
+        // A result's layout is not remembered: nothing to reset (J6).
+        assert!(!labels(&header_menu(&column())).contains(&"Reset layout".to_string()));
         // A result the server cannot read again has no filter; a SELECT's has.
         assert!(!labels(&header_menu(&column())).contains(&"Filter on this column…".to_string()));
         let select = labels(&header_menu(&HeaderFacts {

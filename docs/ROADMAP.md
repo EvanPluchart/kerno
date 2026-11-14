@@ -48,7 +48,8 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 - **amd64 Linux build from an Apple Silicon Mac.** The container build runs on the host's architecture
   (arm64 here); amd64 needs an amd64 Linux host (there is no hosted CI). Cross-building locally would run under
   emulation.
-- **RSA SSH key files** are refused (RUSTSEC-2023-0071, D-013); agent-held RSA keys work.
+- **RSA SSH key files with the built-in client** are refused (RUSTSEC-2023-0071, D-013); they work through the
+  OpenSSH client (J2, D-056), and agent-held RSA keys work with both.
 
 ## From the competitors' issues (triage of 2026-11-14): not now
 
@@ -186,7 +187,7 @@ The owner can pull any row back by naming its ID.
 | SQL-36 | Format ▸ Morph to delimited list, trim spaces | PG, My | Text utilities, not SQL client features |
 | SQL-40 | Templates | PG, My | Saved queries cover reusable SQL |
 | SQL-43 | Go to / select to matching bracket | PG, My | Editor-kit feature; low use |
-| SQL-44 | Foldings | PG, My | Depends on the kit's editor |
+| SQL-44 | Foldings from the keyboard (Fold, Fold all), and folds on indentation or marker comments (DBeaver #17240, #23137) | PG, My | Folding from the gutter works (a statement, a subquery, a `BEGIN … END` body; tested, J7) and Unfold All is a command; gpui-kit 0.9.1 has no call to fold a line, only its gutter (D-057) |
 | SQL-49 | Advanced copy in the editor | PG, My | Plain copy is enough for code |
 | SQL-51 | Set connection from navigator, auto-sync | PG, My | Off by default; "New query here" binds a tab to a node |
 | SQL-53 | Disable SQL syntax parser | PG, My | Kerno splits and reads only what a run needs on its own tolerant lexer (`a_long_script_splits_in_linear_time`), so there is nothing to turn off |

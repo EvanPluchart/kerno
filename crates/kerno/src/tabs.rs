@@ -116,11 +116,13 @@ pub enum TabAction {
     Copy,
     Paste,
     SelectAll,
+    SelectAllOccurrences,
     ToggleComment,
     ToggleBlockComment,
     UpperCase,
     LowerCase,
     ToggleSoftWrap,
+    UnfoldAll,
     Find,
     Replace,
     Save,
@@ -205,11 +207,13 @@ impl TabAction {
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::SelectAll => "Select all",
+            Self::SelectAllOccurrences => "Select all occurrences",
             Self::ToggleComment => "Toggle line comment",
             Self::ToggleBlockComment => "Toggle block comment",
             Self::UpperCase => "Upper case",
             Self::LowerCase => "Lower case",
             Self::ToggleSoftWrap => "Toggle word wrap",
+            Self::UnfoldAll => "Unfold all",
             Self::Find => "Find…",
             Self::Replace => "Replace…",
             Self::Save => "Save",
@@ -456,6 +460,7 @@ pub fn editor_menu(facts: EditorFacts, choices: &Choices) -> Vec<Entry> {
         Item(TabAction::CopyStatement, empty),
         enabled(TabAction::Paste),
         Item(TabAction::SelectAll, empty),
+        Item(TabAction::SelectAllOccurrences, empty),
         Separator,
         Submenu(
             "Format",
@@ -468,6 +473,7 @@ pub fn editor_menu(facts: EditorFacts, choices: &Choices) -> Vec<Entry> {
                 enabled(TabAction::ToggleBlockComment),
                 Separator,
                 enabled(TabAction::ToggleSoftWrap),
+                enabled(TabAction::UnfoldAll),
             ],
         ),
         enabled(TabAction::Find),
@@ -1024,9 +1030,10 @@ mod tests {
                 "Copy statement",
                 "Paste",
                 "Select all",
+                "Select all occurrences",
                 "—",
                 "Format ▸ [Format SQL, Upper case, Lower case, —, Toggle line comment, \
-                 Toggle block comment, —, Toggle word wrap]",
+                 Toggle block comment, —, Toggle word wrap, Unfold all]",
                 "Find…",
                 "Replace…",
                 "—",
@@ -1064,15 +1071,16 @@ mod tests {
         assert_eq!(idle[8], "Toggle results panel");
         assert_eq!(idle[15], "Cut (no selection)");
         assert_eq!(idle[17], "Copy statement (empty)");
+        assert_eq!(idle[20], "Select all occurrences (empty)");
         assert!(
-            idle[21].contains("Upper case (no selection)"),
+            idle[22].contains("Upper case (no selection)"),
             "{}",
-            idle[21]
+            idle[22]
         );
         assert!(
-            idle[25].contains("Save (empty), Save as… (empty), Save as query… (empty)"),
+            idle[26].contains("Save (empty), Save as… (empty), Save as query… (empty)"),
             "{}",
-            idle[25]
+            idle[26]
         );
         // While a statement runs; a file saved as it is; source mode.
         let busy = labels(&editor_menu(
@@ -1092,11 +1100,11 @@ mod tests {
         );
         assert!(busy[5].contains("Fetch all rows,"), "{}", busy[5]);
         assert!(
-            busy[27].contains("Save (saved)")
-                && busy[27].contains("Rename… (named after its file)")
-                && busy[27].contains("Revert to saved file (saved)"),
+            busy[28].contains("Save (saved)")
+                && busy[28].contains("Rename… (named after its file)")
+                && busy[28].contains("Revert to saved file (saved)"),
             "{}",
-            busy[27]
+            busy[28]
         );
         // The toolbar's Run dropdown offers the same commands.
         assert_eq!(

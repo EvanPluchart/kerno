@@ -1,7 +1,9 @@
 //! SSH tunnels: reaching a database through an SSH server.
 //!
-//! A [`Tunnel`] is an authenticated SSH connection. Drivers use it in one of
-//! two ways, and neither leaves a port open for other local processes:
+//! A [`Tunnel`] is an authenticated SSH connection, made by the built-in
+//! client (russh, this module) or by the system's `ssh` ([`crate::openssh`]).
+//! Drivers use it in one of two ways, and neither leaves a port open for
+//! other local processes:
 //!
 //! - [`Tunnel::open_stream`] returns a stream that *is* the forwarded
 //!   connection. A driver that can run its protocol over any stream
@@ -10,7 +12,7 @@
 //!   only dial an address (MySQL). The port admits exactly one connection and
 //!   closes; see that method for what this does and does not guarantee.
 //!
-//! Host keys are checked against known-hosts files (the user's
+//! The built-in client checks host keys against known-hosts files (the user's
 //! `~/.ssh/known_hosts`, read-only, and Kerno's own). An unknown host fails
 //! with [`SshError::UnknownHostKey`], which carries the fingerprint to show
 //! the user; connecting again with that fingerprint in
@@ -35,9 +37,10 @@ use russh::keys::{
     Algorithm, EcdsaCurve, PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixStream};
 
 use crate::config::{Secret, SshAuth, SshConfig};
+use crate::openssh::{Forward, OpenSshRequest};
 
 /// Why a tunnel could not be opened or stopped working.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -116,8 +119,8 @@ pub enum SshError {
     /// crate, left out of this build for its timing side channel
     /// (RUSTSEC-2023-0071); an agent signs RSA keys itself.
     #[error(
-        "the private key {path} is an RSA key. RSA key files are not supported in this build: \
-         load the key in your SSH agent, or use an Ed25519 key"
+        "the private key {path} is an RSA key, which the built-in SSH client cannot use: \
+         choose the OpenSSH client on the SSH tab, or load the key in your SSH agent"
     )]
     RsaKeyFile {
         /// Key file.
@@ -135,6 +138,13 @@ pub enum SshError {
         port: u16,
         /// What failed.
         reason: String,
+    },
+    /// The system's `ssh` failed; `stderr` is what it printed, which
+    /// [`crate::error::explain`] tells in plain words.
+    #[error("OpenSSH: {stderr}")]
+    OpenSsh {
+        /// `ssh`'s messages.
+        stderr: String,
     },
     /// Anything else.
     #[error("{0}")]
@@ -163,7 +173,14 @@ pub struct TunnelRequest<'a> {
 ///
 /// A concrete type rather than a boxed trait object: generic driver code
 /// (TLS upgrade, connection tasks) needs to prove it is `Send + 'static`.
-pub struct TunnelStream(russh::ChannelStream<client::Msg>);
+pub struct TunnelStream(StreamKind);
+
+enum StreamKind {
+    /// A channel of the built-in client.
+    Channel(russh::ChannelStream<client::Msg>),
+    /// The private socket OpenSSH forwards.
+    Local(UnixStream),
+}
 
 impl std::fmt::Debug for TunnelStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -177,7 +194,10 @@ impl AsyncRead for TunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        match &mut self.0 {
+            StreamKind::Channel(stream) => Pin::new(stream).poll_read(cx, buf),
+            StreamKind::Local(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
     }
 }
 
@@ -187,15 +207,24 @@ impl AsyncWrite for TunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        match &mut self.0 {
+            StreamKind::Channel(stream) => Pin::new(stream).poll_write(cx, buf),
+            StreamKind::Local(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        match &mut self.0 {
+            StreamKind::Channel(stream) => Pin::new(stream).poll_flush(cx),
+            StreamKind::Local(stream) => Pin::new(stream).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        match &mut self.0 {
+            StreamKind::Channel(stream) => Pin::new(stream).poll_shutdown(cx),
+            StreamKind::Local(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
     }
 }
 
@@ -203,7 +232,45 @@ impl AsyncWrite for TunnelStream {
 /// reaches. Dropping it closes the SSH connection and everything forwarded
 /// through it.
 pub struct Tunnel {
-    handle: Arc<Handle<HostKeyCheck>>,
+    route: Route,
+}
+
+/// The two clients a tunnel can go through.
+#[derive(Clone)]
+enum Route {
+    /// The built-in client: any host the SSH server reaches.
+    Builtin(Arc<Handle<HostKeyCheck>>),
+    /// The system's `ssh`: the one database it forwards to.
+    OpenSsh(Arc<Forward>),
+}
+
+impl Route {
+    /// A new connection to `host:port` as the SSH server sees it.
+    async fn connect(&self, host: &str, port: u16) -> Result<TunnelStream, SshError> {
+        match self {
+            Route::Builtin(handle) => {
+                let channel = open_channel(handle, host, port).await?;
+                Ok(TunnelStream(StreamKind::Channel(channel.into_stream())))
+            }
+            Route::OpenSsh(forward) => {
+                if forward.target() != (host, port) {
+                    return Err(SshError::Other(format!(
+                        "this OpenSSH tunnel leads to {}:{}, not {host}:{port}",
+                        forward.target().0,
+                        forward.target().1
+                    )));
+                }
+                let stream = UnixStream::connect(forward.socket())
+                    .await
+                    .map_err(|error| SshError::Forward {
+                        host: host.to_string(),
+                        port,
+                        reason: format!("the tunnel's socket did not answer: {error}"),
+                    })?;
+                Ok(TunnelStream(StreamKind::Local(stream)))
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Tunnel {
@@ -283,15 +350,22 @@ impl Tunnel {
 
         authenticate(&mut handle, &request).await?;
         Ok(Self {
-            handle: Arc::new(handle),
+            route: Route::Builtin(Arc::new(handle)),
+        })
+    }
+
+    /// Starts the system's `ssh` (see [`crate::openssh`]): the tunnel leads
+    /// to `request.db_host:request.db_port` only.
+    pub async fn open_openssh(request: OpenSshRequest<'_>) -> Result<Self, SshError> {
+        Ok(Self {
+            route: Route::OpenSsh(Arc::new(Forward::start(request).await?)),
         })
     }
 
     /// Opens a connection to `host:port` as seen from the SSH server and
     /// returns it as a stream. Nothing listens on the local machine.
     pub async fn open_stream(&self, host: &str, port: u16) -> Result<TunnelStream, SshError> {
-        let channel = open_channel(&self.handle, host, port).await?;
-        Ok(TunnelStream(channel.into_stream()))
+        self.route.connect(host, port).await
     }
 
     /// Opens a loopback port that forwards one connection to `host:port`,
@@ -318,7 +392,7 @@ impl Tunnel {
         let local_addr = listener
             .local_addr()
             .map_err(|error| SshError::Other(error.to_string()))?;
-        let handle = self.handle.clone();
+        let route = self.route.clone();
         let host = host.to_string();
 
         tokio::spawn(async move {
@@ -335,14 +409,13 @@ impl Tunnel {
                 );
                 return;
             }
-            let channel = match open_channel(&handle, &host, port).await {
-                Ok(channel) => channel,
+            let mut remote = match route.connect(&host, port).await {
+                Ok(stream) => stream,
                 Err(error) => {
                     tracing::warn!(%error, "SSH tunnel could not open a forward channel");
                     return;
                 }
             };
-            let mut remote = channel.into_stream();
             // Ends when either side closes; errors here are ordinary
             // disconnects, which the database driver reports itself.
             let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
@@ -353,13 +426,43 @@ impl Tunnel {
 
     /// Whether the SSH connection is gone.
     pub fn is_closed(&self) -> bool {
-        self.handle.is_closed()
+        match &self.route {
+            Route::Builtin(handle) => handle.is_closed(),
+            Route::OpenSsh(forward) => forward.is_closed(),
+        }
+    }
+
+    /// A mark to pass to [`Tunnel::forward_failure`] after a connection
+    /// through the tunnel failed.
+    pub fn forward_mark(&self) -> u64 {
+        match &self.route {
+            Route::Builtin(_) => 0,
+            Route::OpenSsh(forward) => forward.forward_mark(),
+        }
+    }
+
+    /// Why the SSH server refused to open the way to `host:port` since
+    /// `mark`. OpenSSH accepts the local connection first and says so only
+    /// in its messages; the built-in client reports it when it happens.
+    pub async fn forward_failure(&self, mark: u64, host: &str, port: u16) -> Option<SshError> {
+        let Route::OpenSsh(forward) = &self.route else {
+            return None;
+        };
+        let reason = forward.forward_failure(mark).await?;
+        Some(SshError::Forward {
+            host: host.to_string(),
+            port,
+            reason,
+        })
     }
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        let handle = self.handle.clone();
+        let Route::Builtin(handle) = &self.route else {
+            return;
+        };
+        let handle = handle.clone();
         // Say goodbye politely when a runtime is still around to do it.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -631,6 +734,7 @@ impl client::Handler for HostKeyCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SshClient;
 
     #[test]
     fn ssh_keepalive_is_passed_to_the_client() {
@@ -640,6 +744,8 @@ mod tests {
             user: "kerno".into(),
             auth: SshAuth::default(),
             keepalive_secs: 45,
+            client: SshClient::Builtin,
+            jump: None,
         };
         let config = client_config(&ssh);
         assert_eq!(config.keepalive_interval, Some(Duration::from_secs(45)));

@@ -13,9 +13,11 @@ pub mod error;
 pub mod exec;
 pub mod export;
 pub mod export_file;
+pub mod find;
 pub mod format;
 pub mod import;
 pub mod maintenance;
+pub mod openssh;
 pub mod pending;
 pub mod plan;
 pub mod result;
@@ -32,8 +34,8 @@ pub mod tools;
 pub mod update;
 
 pub use config::{
-    ConnectParams, ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshConfig, TlsConfig,
-    TlsMode,
+    ConnectParams, ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshClient, SshConfig,
+    TlsConfig, TlsMode,
 };
 pub use connector::{Connector, HostKeyStore};
 pub use dialect::{Dialect, IsolationLevel};

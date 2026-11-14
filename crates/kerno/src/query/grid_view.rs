@@ -36,8 +36,22 @@ use super::viewer::give_back;
 /// the UI thread.
 const INLINE_CELLS: usize = 100_000;
 
-/// The grid, or the record view when it is on.
+/// The grid, or the record view when it is on; the find bar above it
+/// while open.
 pub fn render(table: &Entity<TableState<Grid>>, cx: &mut App) -> AnyElement {
+    let rows = rows(table, cx);
+    match super::find::bar(table, cx) {
+        Some(bar) => v_flex()
+            .size_full()
+            .child(bar)
+            .child(div().flex_1().min_h_0().w_full().child(rows))
+            .into_any_element(),
+        None => rows,
+    }
+}
+
+/// The grid, or the record view when it is on.
+fn rows(table: &Entity<TableState<Grid>>, cx: &mut App) -> AnyElement {
     if !table.read(cx).delegate().record {
         return DataTable::new(table)
             .with_size(table_size(cx))
@@ -247,7 +261,7 @@ fn record_view(table: &Entity<TableState<Grid>>, cx: &App) -> AnyElement {
 // Selection statistics --------------------------------------------------------
 
 /// Stops a count running off the UI thread when dropped.
-struct StopOnDrop(Arc<AtomicBool>);
+pub(super) struct StopOnDrop(pub(super) Arc<AtomicBool>);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {

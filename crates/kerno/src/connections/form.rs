@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kerno_core::config::{
-    ConnectionConfig, Engine, ObjectFilter, Secret, Secrets, SshAuth, SshConfig, TlsConfig,
-    TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
+    ConnectionConfig, Engine, ObjectFilter, Secret, Secrets, SshAuth, SshClient, SshConfig,
+    TlsConfig, TlsMode, bootstrap_refusal, is_secret_option, parse_connection_url,
 };
 use kerno_core::sql::{LexRules, split_statements};
 
@@ -26,6 +26,8 @@ pub enum Field {
     SshHost,
     SshPort,
     SshUser,
+    SshJump,
+    SshAuth,
     SshKeyFile,
     SshAgentSocket,
     SshKeepalive,
@@ -56,12 +58,30 @@ pub enum SshAuthKind {
 
 impl SshAuthKind {
     pub const ALL: [SshAuthKind; 3] = [Self::Agent, Self::Password, Self::KeyFile];
+    /// OpenSSH asks no password: Kerno would have to type it.
+    pub const OPENSSH: [SshAuthKind; 2] = [Self::Agent, Self::KeyFile];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Agent => "SSH agent",
             Self::Password => "Password",
             Self::KeyFile => "Key file",
+        }
+    }
+
+    /// The methods `client` offers, in the dialog's order.
+    pub fn choices(client: SshClient) -> &'static [SshAuthKind] {
+        match client {
+            SshClient::Builtin => &Self::ALL,
+            SshClient::OpenSsh => &Self::OPENSSH,
+        }
+    }
+
+    /// The label of the method with `client`.
+    pub fn label_for(self, client: SshClient) -> &'static str {
+        match (self, client) {
+            (Self::Agent, SshClient::OpenSsh) => "SSH config or agent",
+            _ => self.label(),
         }
     }
 }
@@ -89,6 +109,7 @@ pub struct ConnectionForm {
     pub cert_file: String,
     pub key_file: String,
     pub ssh_enabled: bool,
+    pub ssh_client: SshClient,
     pub ssh_host: String,
     pub ssh_port: String,
     pub ssh_user: String,
@@ -98,6 +119,8 @@ pub struct ConnectionForm {
     pub ssh_key_passphrase: String,
     pub ssh_agent_socket: String,
     pub ssh_keepalive: String,
+    /// Jump hosts (`ssh -J`), OpenSSH only.
+    pub ssh_jump: String,
     /// The commit mode new tabs start in; `None` follows the environment.
     pub auto_commit: Option<bool>,
     /// PostgreSQL only.
@@ -173,8 +196,13 @@ impl ConnectionForm {
             cert_file: text(&config.tls.cert_file),
             key_file: text(&config.tls.key_file),
             ssh_enabled: ssh.is_some(),
+            ssh_client: ssh.map(|ssh| ssh.client).unwrap_or_default(),
             ssh_host: ssh.map(|ssh| ssh.host.clone()).unwrap_or_default(),
-            ssh_port: ssh.map_or(22, |ssh| ssh.port).to_string(),
+            // OpenSSH's port 0: from the SSH configuration.
+            ssh_port: match ssh.map_or(22, |ssh| ssh.port) {
+                0 => String::new(),
+                port => port.to_string(),
+            },
             ssh_user: ssh.map(|ssh| ssh.user.clone()).unwrap_or_default(),
             ssh_auth,
             ssh_password: secret(&secrets.ssh_password),
@@ -182,6 +210,7 @@ impl ConnectionForm {
             ssh_key_passphrase: secret(&secrets.ssh_key_passphrase),
             ssh_agent_socket,
             ssh_keepalive: ssh.map_or(30, |ssh| ssh.keepalive_secs).to_string(),
+            ssh_jump: ssh.and_then(|ssh| ssh.jump.clone()).unwrap_or_default(),
             auto_commit: config.auto_commit,
             default_schema: config.default_schema.clone().unwrap_or_default(),
             init_sql: config
@@ -207,6 +236,29 @@ impl ConnectionForm {
             self.user = engine.default_user().to_string();
         }
         self.engine = engine;
+    }
+
+    /// Switches the SSH client. The port follows only while it holds the
+    /// other client's default (22, or empty for "from the SSH
+    /// configuration"); a password, which OpenSSH cannot take, becomes the
+    /// agent.
+    pub fn set_ssh_client(&mut self, client: SshClient) {
+        match client {
+            SshClient::OpenSsh => {
+                if self.ssh_port.trim() == "22" {
+                    self.ssh_port.clear();
+                }
+                if self.ssh_auth == SshAuthKind::Password {
+                    self.ssh_auth = SshAuthKind::Agent;
+                }
+            }
+            SshClient::Builtin => {
+                if self.ssh_port.trim().is_empty() {
+                    self.ssh_port = "22".into();
+                }
+            }
+        }
+        self.ssh_client = client;
     }
 
     /// Fills the fields a connection URL carries. Fields the URL does not
@@ -359,9 +411,53 @@ impl ConnectionForm {
         }
 
         let ssh = if self.ssh_enabled {
+            let openssh = self.ssh_client == SshClient::OpenSsh;
             required(&self.ssh_host, Field::SshHost, "The SSH host", &mut errors);
-            required(&self.ssh_user, Field::SshUser, "The SSH user", &mut errors);
-            let ssh_port = port(&self.ssh_port, Field::SshPort, &mut errors);
+            // OpenSSH: an empty port or user comes from the SSH configuration.
+            if !openssh {
+                required(&self.ssh_user, Field::SshUser, "The SSH user", &mut errors);
+            }
+            let ssh_port = if openssh && self.ssh_port.trim().is_empty() {
+                0
+            } else {
+                port(&self.ssh_port, Field::SshPort, &mut errors)
+            };
+            let jump = self.ssh_jump.trim();
+            let jump = (openssh && !jump.is_empty()).then(|| jump.to_string());
+            if openssh {
+                let words = [
+                    (Field::SshHost, self.ssh_host.trim(), false, "Host"),
+                    (Field::SshUser, self.ssh_user.trim(), false, "User"),
+                    (
+                        Field::SshJump,
+                        jump.as_deref().unwrap_or_default(),
+                        true,
+                        "Jump host",
+                    ),
+                ];
+                for (field, text, list, what) in words {
+                    if !text.is_empty() && !kerno_core::openssh::safe_ssh_word(text, list) {
+                        errors.push(error(
+                            field,
+                            format!(
+                                "{what}: use letters, digits and . - _ @ : [ ]{}",
+                                if list {
+                                    ", and commas between hosts"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ));
+                    }
+                }
+                if self.ssh_auth == SshAuthKind::Password {
+                    errors.push(error(
+                        Field::SshAuth,
+                        "OpenSSH logs in with a key or your SSH agent; for a password, choose \
+                         the built-in client",
+                    ));
+                }
+            }
             let keepalive_secs = self
                 .ssh_keepalive
                 .trim()
@@ -409,6 +505,8 @@ impl ConnectionForm {
                 user: self.ssh_user.trim().to_string(),
                 auth,
                 keepalive_secs,
+                client: self.ssh_client,
+                jump,
             })
         } else {
             None
@@ -729,6 +827,8 @@ mod tests {
                 path: file("id_ed25519"),
             },
             keepalive_secs: 0,
+            client: SshClient::Builtin,
+            jump: None,
         });
         let secrets = Secrets {
             password: Some(Secret::new("db")),
@@ -737,6 +837,60 @@ mod tests {
         };
         let form = ConnectionForm::from_saved(&config, &secrets);
         assert_eq!(form.build().unwrap(), (config, secrets));
+    }
+
+    /// J2 (DBeaver #17976, Beekeeper #1344): an alias alone is enough with
+    /// OpenSSH; a password stays the built-in client's.
+    #[test]
+    fn openssh_fields_build_and_round_trip() {
+        let mut form = ConnectionForm::new(Engine::Postgres);
+        form.ssh_enabled = true;
+        assert_eq!(form.ssh_client, SshClient::Builtin);
+        form.ssh_auth = SshAuthKind::Password;
+        form.set_ssh_client(SshClient::OpenSsh);
+        assert_eq!(form.ssh_port, "", "the default port leaves it to the file");
+        assert_eq!(
+            form.ssh_auth,
+            SshAuthKind::Agent,
+            "OpenSSH takes no password"
+        );
+        form.ssh_host = "prod-bastion".into();
+        form.ssh_jump = " ops@jump:2222,edge ".into();
+        let (config, secrets) = form.build().unwrap();
+        let ssh = config.ssh.clone().unwrap();
+        assert_eq!(
+            (ssh.client, ssh.port, ssh.user.as_str(), ssh.jump.as_deref()),
+            (SshClient::OpenSsh, 0, "", Some("ops@jump:2222,edge"))
+        );
+        config.validate().unwrap();
+        assert_eq!(
+            ConnectionForm::from_saved(&config, &secrets)
+                .build()
+                .unwrap(),
+            (config, secrets)
+        );
+
+        // Back to the built-in client: the port and the user are needed
+        // again, and the jump host is not kept.
+        form.set_ssh_client(SshClient::Builtin);
+        assert_eq!(form.ssh_port, "22");
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::SshUser]);
+        form.ssh_user = "ops".into();
+        assert_eq!(form.build().unwrap().0.ssh.unwrap().jump, None);
+
+        // What OpenSSH refuses, each on its field.
+        form.set_ssh_client(SshClient::OpenSsh);
+        form.ssh_auth = SshAuthKind::Password;
+        form.ssh_jump = "j;id".into();
+        form.ssh_host = "a b".into();
+        assert_eq!(
+            fields(&form.build().unwrap_err()),
+            [Field::SshHost, Field::SshJump, Field::SshAuth]
+        );
+        assert_eq!(
+            SshAuthKind::choices(SshClient::OpenSsh),
+            [SshAuthKind::Agent, SshAuthKind::KeyFile]
+        );
     }
 
     #[test]

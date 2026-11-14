@@ -21,7 +21,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use kerno_core::Error;
-use kerno_core::config::{Engine, Secrets, TlsMode};
+use kerno_core::config::{Engine, Secrets, SshClient, TlsMode};
 use kerno_core::environment;
 use kerno_core::error::{Explained, explain};
 use kerno_core::ssh::SshError;
@@ -108,6 +108,7 @@ struct Inputs {
     ssh_key_passphrase: Entity<InputState>,
     ssh_agent_socket: Entity<InputState>,
     ssh_keepalive: Entity<InputState>,
+    ssh_jump: Entity<InputState>,
 }
 
 /// The dialog's view.
@@ -129,6 +130,10 @@ pub struct ConnectionDialog {
     listing: Option<Task<()>>,
     /// Probing the client folder chosen on the Advanced tab.
     choosing_client: Option<Task<()>>,
+    /// The `Host` aliases of the user's SSH configuration (OpenSSH).
+    ssh_aliases: Vec<String>,
+    /// Reading them, off the UI thread.
+    loading_aliases: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -212,6 +217,12 @@ impl ConnectionDialog {
         if let Some(folder) = folder {
             form.group = folder;
         }
+        // J2: a new connection goes through the system's OpenSSH when there
+        // is one (its default authentication is the agent, not a password).
+        let openssh = connections.read(cx).openssh().cloned();
+        if editing.is_none() && openssh.is_some() {
+            form.set_ssh_client(SshClient::OpenSsh);
+        }
         let mut text = |value: &str, placeholder: &'static str| {
             let value = value.to_string();
             cx.new(|cx| {
@@ -232,8 +243,9 @@ impl ConnectionDialog {
         let cert_file = text(&form.cert_file, "Client certificate (optional)");
         let key_file = text(&form.key_file, "Client key (optional)");
         let ssh_host = text(&form.ssh_host, "bastion.example.com");
-        let ssh_port = text(&form.ssh_port, "22");
-        let ssh_user = text(&form.ssh_user, "User on the SSH server");
+        let ssh_port = text(&form.ssh_port, ssh_port_placeholder(form.ssh_client));
+        let ssh_user = text(&form.ssh_user, ssh_user_placeholder(form.ssh_client));
+        let ssh_jump = text(&form.ssh_jump, "user@jump.example.com:22 (optional)");
         let ssh_key_file = text(&form.ssh_key_file, "~/.ssh/id_ed25519");
         let ssh_agent_socket = text(&form.ssh_agent_socket, "SSH_AUTH_SOCK when empty");
         let ssh_keepalive = text(&form.ssh_keepalive, "30");
@@ -311,6 +323,7 @@ impl ConnectionDialog {
                 ssh_key_passphrase,
                 ssh_agent_socket,
                 ssh_keepalive,
+                ssh_jump,
             },
             section: Section::General,
             errors: Vec::new(),
@@ -320,8 +333,44 @@ impl ConnectionDialog {
             databases: DatabaseList::Unknown,
             listing: None,
             choosing_client: None,
+            ssh_aliases: Vec::new(),
+            loading_aliases: openssh.and_then(|env| {
+                let file = env.aliases_from?;
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let reading = crate::bridge::spawn_blocking(cx, move || {
+                    kerno_core::openssh::host_aliases(&file, home.as_deref())
+                });
+                Some(cx.spawn(async move |this, cx| {
+                    let aliases = reading.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.ssh_aliases = aliases;
+                        this.loading_aliases = None;
+                        cx.notify();
+                    });
+                }))
+            }),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Switches the SSH client, with the fields that follow it.
+    fn set_ssh_client(&mut self, client: SshClient, window: &mut Window, cx: &mut Context<Self>) {
+        let mut form = self.read_form(cx);
+        form.set_ssh_client(client);
+        let (port, user) = (&self.inputs.ssh_port, &self.inputs.ssh_user);
+        if port.read(cx).value().as_ref() != form.ssh_port {
+            let value = form.ssh_port.clone();
+            port.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        port.update(cx, |input, cx| {
+            input.set_placeholder(ssh_port_placeholder(client), window, cx)
+        });
+        user.update(cx, |input, cx| {
+            input.set_placeholder(ssh_user_placeholder(client), window, cx)
+        });
+        self.form = form;
+        self.test = TestState::NotRun;
+        cx.notify();
     }
 
     /// Drops the databases listed for other values of the fields.
@@ -397,6 +446,7 @@ impl ConnectionDialog {
             ssh_key_passphrase: value(&i.ssh_key_passphrase),
             ssh_agent_socket: value(&i.ssh_agent_socket),
             ssh_keepalive: value(&i.ssh_keepalive),
+            ssh_jump: value(&i.ssh_jump),
             ..self.form.clone()
         }
     }
@@ -1049,10 +1099,14 @@ impl ConnectionDialog {
     }
 
     fn render_ssh(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let auth = SshAuthKind::ALL
-            .iter()
-            .position(|kind| *kind == self.form.ssh_auth);
+        let client = self.form.ssh_client;
+        let openssh = client == SshClient::OpenSsh;
+        let found = self.connections.read(cx).openssh().is_some();
+        let choices = SshAuthKind::choices(client);
+        let auth = choices.iter().position(|kind| *kind == self.form.ssh_auth);
         let enabled = self.form.ssh_enabled;
+        let clients = [SshClient::OpenSsh, SshClient::Builtin];
+        let muted = cx.theme().muted_foreground;
         v_flex()
             .gap_3()
             .child(
@@ -1066,15 +1120,59 @@ impl ConnectionDialog {
             )
             .when(enabled, |this| {
                 this.child(
+                    self.field(
+                        "Client",
+                        None,
+                        RadioGroup::horizontal("conn-ssh-client")
+                            .children(["OpenSSH (your ~/.ssh/config)", "Built-in"])
+                            .selected_index(clients.iter().position(|c| *c == client))
+                            .on_click(cx.listener(move |this, index: &usize, window, cx| {
+                                if let Some(client) = clients.get(*index) {
+                                    this.set_ssh_client(*client, window, cx);
+                                }
+                            })),
+                        cx,
+                    ),
+                )
+                .when(openssh && !found, |this| {
+                    this.child(
+                        div()
+                            .id("conn-ssh-openssh-missing")
+                            .test_support()
+                            .text_xs()
+                            .text_color(cx.theme().warning)
+                            .child(
+                                "OpenSSH was not found on this computer; use the built-in client.",
+                            ),
+                    )
+                })
+                .child(
                     h_flex()
                         .gap_3()
                         .items_start()
-                        .child(div().flex_1().child(self.field(
-                            "SSH host",
-                            Some(Field::SshHost),
-                            Input::new(&self.inputs.ssh_host).id("conn-ssh-host"),
-                            cx,
-                        )))
+                        .child(
+                            div().flex_1().child(
+                                self.field(
+                                    if openssh {
+                                        "SSH host or alias"
+                                    } else {
+                                        "SSH host"
+                                    },
+                                    Some(Field::SshHost),
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Input::new(&self.inputs.ssh_host)
+                                                .id("conn-ssh-host")
+                                                .flex_1(),
+                                        )
+                                        .when(openssh && !self.ssh_aliases.is_empty(), |this| {
+                                            this.child(self.alias_picker())
+                                        }),
+                                    cx,
+                                ),
+                            ),
+                        )
                         .child(div().w(px(120.)).child(self.field(
                             "Port",
                             Some(Field::SshPort),
@@ -1088,15 +1186,23 @@ impl ConnectionDialog {
                     Input::new(&self.inputs.ssh_user).id("conn-ssh-user"),
                     cx,
                 ))
+                .when(openssh, |this| {
+                    this.child(self.field(
+                        "Jump host",
+                        Some(Field::SshJump),
+                        Input::new(&self.inputs.ssh_jump).id("conn-ssh-jump"),
+                        cx,
+                    ))
+                })
                 .child(
                     self.field(
                         "Authentication",
-                        None,
+                        Some(Field::SshAuth),
                         RadioGroup::horizontal("conn-ssh-auth")
-                            .children(SshAuthKind::ALL.map(SshAuthKind::label))
+                            .children(choices.iter().map(|kind| kind.label_for(client)))
                             .selected_index(auth)
-                            .on_click(cx.listener(|this, index: &usize, _, cx| {
-                                if let Some(kind) = SshAuthKind::ALL.get(*index) {
+                            .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                                if let Some(kind) = choices.get(*index) {
                                     this.form.ssh_auth = *kind;
                                     cx.notify();
                                 }
@@ -1146,7 +1252,39 @@ impl ConnectionDialog {
                     Input::new(&self.inputs.ssh_keepalive).id("conn-ssh-keepalive"),
                     cx,
                 )))
+                .when(openssh, |this| {
+                    this.child(div().text_xs().text_color(muted).child(
+                        "Empty fields come from your SSH configuration. OpenSSH checks host keys \
+                         against your known_hosts; a key you trust here is added there.",
+                    ))
+                })
             })
+    }
+
+    /// The aliases of the user's SSH configuration, to fill the host field
+    /// (still free text).
+    fn alias_picker(&self) -> AnyElement {
+        let aliases = self.ssh_aliases.clone();
+        let input = self.inputs.ssh_host.clone();
+        Button::new("conn-ssh-host-list")
+            .outline()
+            .dropdown_caret(true)
+            .tooltip("Pick a Host of your SSH configuration")
+            .dropdown_menu(move |mut menu: PopupMenu, _, _| {
+                for alias in &aliases {
+                    let (input, value) = (input.clone(), alias.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(SharedString::from(alias.clone())).on_click(
+                            move |_, window, cx| {
+                                let value = value.clone();
+                                input.update(cx, |input, cx| input.set_value(value, window, cx));
+                            },
+                        ),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     fn render_advanced(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1381,10 +1519,26 @@ fn section_of(field: Field) -> Section {
         Field::SshHost
         | Field::SshPort
         | Field::SshUser
+        | Field::SshJump
+        | Field::SshAuth
         | Field::SshKeyFile
         | Field::SshAgentSocket
         | Field::SshKeepalive => Section::Ssh,
         Field::Options | Field::InitSql => Section::Advanced,
+    }
+}
+
+fn ssh_port_placeholder(client: SshClient) -> &'static str {
+    match client {
+        SshClient::OpenSsh => "from SSH config",
+        SshClient::Builtin => "22",
+    }
+}
+
+fn ssh_user_placeholder(client: SshClient) -> &'static str {
+    match client {
+        SshClient::OpenSsh => "From your SSH configuration when empty",
+        SshClient::Builtin => "User on the SSH server",
     }
 }
 

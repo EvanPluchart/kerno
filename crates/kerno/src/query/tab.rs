@@ -44,8 +44,8 @@ use kerno_core::sql::{
     apply_edits_in_transaction, classify,
 };
 use kerno_core::sql::{
-    LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_sql,
-    matching_bracket, split_statements, statement_at, toggle_block_comment,
+    LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_cleanly,
+    format_with, matching_bracket, split_statements, statement_at, toggle_block_comment,
 };
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
@@ -58,6 +58,7 @@ use super::completion::{self, SharedCatalog, SqlCompletion};
 use super::distinct;
 use super::edit;
 use super::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner};
+use super::occurrences::Occurrences;
 use super::params;
 use super::plan_view;
 use super::tx_log::{self, TxLogEntry};
@@ -411,6 +412,8 @@ pub struct QueryTab {
     auto_refresh_stopped: Option<&'static str>,
     /// The frames around the bracket at the cursor and its match.
     brackets: input::RangeDecorationCollection,
+    /// The other occurrences of the word or selection at the cursor.
+    occurrences: Occurrences,
     /// The rollback of a transaction left idle, armed for the length of
     /// its log and the environment's period (see `watch_idle_transaction`).
     idle_rollback: Option<((usize, u32), Task<()>)>,
@@ -466,9 +469,13 @@ impl QueryTab {
                 .set_completion_highlighter(Rc::new(completion::highlight));
             editor.create_range_decorations_collection(Vec::new(), cx)
         });
+        let occurrences = Occurrences::new(&editor, cx);
         // An edit makes a file's tab differ from its file. (Moving the
         // cursor also notifies observers; only a change of text counts.)
         let edits = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.occurrences.text_changed();
+            }
             if matches!(event, InputEvent::Change) && this.file.is_some() && !this.unsaved {
                 this.unsaved = true;
                 cx.notify();
@@ -476,8 +483,12 @@ impl QueryTab {
         });
         // Every change of the editor (text, cursor, blink) re-marks the
         // brackets: the scan is bounded, and nothing is redrawn when the
-        // marks stay the same.
-        let cursor_moves = cx.observe(&editor, |this: &mut Self, _, cx| this.mark_brackets(cx));
+        // marks stay the same. The occurrences are computed again only when
+        // the text or the selection changed.
+        let cursor_moves = cx.observe(&editor, |this: &mut Self, editor, cx| {
+            this.mark_brackets(cx);
+            this.occurrences.refresh(&editor, cx);
+        });
         let subscription = cx.subscribe_in(
             &connections,
             window,
@@ -562,6 +573,7 @@ impl QueryTab {
             auto_refresh: None,
             auto_refresh_stopped: None,
             brackets,
+            occurrences,
             idle_rollback: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
@@ -1378,6 +1390,7 @@ impl QueryTab {
     /// laid out is left alone.
     pub fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rules = self.lex_rules(cx);
+        let options = AppState::get(cx).settings.format;
         self.editor.update(cx, |editor, cx| {
             let text = editor.text().to_string();
             let mut range = editor.selected_range();
@@ -1388,7 +1401,7 @@ impl QueryTab {
                 range = 0..text.len();
             }
             let part = &text[range.clone()];
-            let mut formatted = format_sql(part, rules);
+            let mut formatted = format_with(part, rules, &options);
             // A piece of the text keeps what followed it on its line.
             if range.len() < text.len() && !part.ends_with('\n') && formatted.ends_with('\n') {
                 formatted.pop();
@@ -1401,6 +1414,56 @@ impl QueryTab {
             let cursor = editor.text().offset_to_position(range.start);
             editor.set_cursor_position(cursor, window, cx);
         });
+    }
+
+    /// Format on save: lays the whole text out when it does so cleanly
+    /// (one step to undo), keeping the cursor on its line; a script that
+    /// does not is left as it is.
+    pub fn format_for_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = self.lex_rules(cx);
+        let options = AppState::get(cx).settings.format;
+        self.editor.update(cx, |editor, cx| {
+            let text = editor.text().to_string();
+            let Some(formatted) = format_cleanly(&text, rules, &options) else {
+                return;
+            };
+            if formatted == text {
+                return;
+            }
+            let cursor = editor.cursor_position();
+            editor.replace_all(formatted, window, cx);
+            editor.set_cursor_position(cursor, window, cx);
+        });
+    }
+
+    /// Selects every occurrence of the word or selection at the cursor
+    /// (⌘⇧L, DBeaver's ⌥J): typing changes them all.
+    pub fn select_all_occurrences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Occurrences::select_all(&self.editor, cx);
+        self.editor.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// Opens every folded region. The kit folds from the gutter only, and
+    /// opens a fold through a line it hides.
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let folded: Vec<usize> = editor
+                .display_map()
+                .folded_ranges()
+                .iter()
+                .map(|fold| fold.start_line)
+                .collect();
+            for line in folded {
+                editor.unfold_at(Position::new(line as u32 + 1, 0), cx);
+            }
+        });
+    }
+
+    /// The highlighted occurrences of the word or selection at the cursor;
+    /// for tests.
+    #[cfg(test)]
+    pub fn marked_occurrences(&self, cx: &App) -> Vec<std::ops::Range<usize>> {
+        self.occurrences.marked(cx)
     }
 
     /// Puts the selection in upper (`upper`) or lower case, strings, quoted
@@ -3440,7 +3503,9 @@ impl QueryTab {
             GridAction::SetNull => self.on_result_rows(window, cx, |grid, cx| {
                 edit::set_cells(grid, CellValue::Null, true, cx)
             }),
-            GridAction::SetDefault => self.set_selected(CellValue::Default, window, cx),
+            GridAction::SetDefault => {
+                self.set_selected(CellValue::Expression("DEFAULT".into()), window, cx)
+            }
             GridAction::CopyFromRow(above) => self.copy_from_row(above, window, cx),
             GridAction::DuplicateRow => self.duplicate_rows(Some(row), window, cx),
             GridAction::DeleteRow => self.delete_rows(Some(row), window, cx),
@@ -6066,6 +6131,8 @@ pub(crate) fn run_editor_action(
         TabAction::UpperCase => Box::new(actions::UpperCase),
         TabAction::LowerCase => Box::new(actions::LowerCase),
         TabAction::ToggleSoftWrap => Box::new(actions::ToggleSoftWrap),
+        TabAction::SelectAllOccurrences => Box::new(actions::SelectAllOccurrences),
+        TabAction::UnfoldAll => Box::new(actions::UnfoldAll),
         TabAction::FetchAllRows => Box::new(actions::FetchAllRows),
         TabAction::ExportFromQuery => Box::new(actions::ExportFromQuery),
         TabAction::RevertFile => Box::new(actions::RevertFile),
@@ -6156,6 +6223,27 @@ impl Render for QueryTab {
             .id("query-editor")
             .test_support()
             .size_full()
+            // Tab accepts the highlighted completion as Enter does (J1,
+            // DBeaver #2316): the kit's list knows only Enter, and its Tab
+            // indents. Before the editor sees the key; otherwise Tab indents.
+            .capture_action(cx.listener(|this, _: &input::IndentInline, window, cx| {
+                let editor = this.editor.clone();
+                if !AppState::get(cx).settings.tab_accepts_completion
+                    || !editor.read(cx).completion_menu_state().open
+                {
+                    return;
+                }
+                let accept = Box::new(input::Enter {
+                    secondary: false,
+                    shift: false,
+                });
+                // The list lets the key go on: stopped after it took it.
+                if editor.update(cx, |editor, cx| {
+                    editor.route_overlay_action(accept, window, cx)
+                }) {
+                    cx.stop_propagation();
+                }
+            }))
             .context_menu(self.editor_menu(cx))
             .child(
                 Editor::new(&self.editor)

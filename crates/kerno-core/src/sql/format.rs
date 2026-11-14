@@ -6,13 +6,100 @@
 //! It only changes whitespace and the letter case of keywords. Each
 //! statement is checked after the fact: if its tokens are not the ones that
 //! came in, it is returned as it was written.
+//!
+//! [`FormatOptions`] choose the case of keywords, the indentation, where
+//! commas go and when a short list stays on one line; the defaults are the
+//! layout described here.
 
 use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 
 use super::complete::{runs_on, upper};
 use super::lex::{LexRules, Token, TokenKind, lex};
 
-const INDENT: &str = "    ";
+/// How keywords are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeywordCase {
+    /// `SELECT`.
+    #[default]
+    Upper,
+    /// `select`.
+    Lower,
+    /// As they were typed.
+    Keep,
+}
+
+impl KeywordCase {
+    /// `word`, a keyword as it was typed, in this case.
+    fn apply(self, word: &str) -> Cow<'_, str> {
+        match self {
+            Self::Upper => Cow::Owned(word.to_ascii_uppercase()),
+            Self::Lower => Cow::Owned(word.to_ascii_lowercase()),
+            Self::Keep => Cow::Borrowed(word),
+        }
+    }
+}
+
+/// One level of indentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Indent {
+    /// This many spaces (1 to 8).
+    Spaces(u8),
+    /// A tab character, counted as 4 columns for the line width.
+    Tab,
+}
+
+impl Default for Indent {
+    fn default() -> Self {
+        Self::Spaces(4)
+    }
+}
+
+/// Where the comma between the items of a list laid out one per line goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Comma {
+    /// `a,` then `b` on the next line.
+    #[default]
+    Trailing,
+    /// `a` then `, b` on the next line.
+    Leading,
+}
+
+/// How [`format_with`] lays SQL out. The default is [`format_sql`]'s layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FormatOptions {
+    pub keyword_case: KeywordCase,
+    pub indent: Indent,
+    pub comma: Comma,
+    /// A SELECT, SET or VALUES list stays on its keyword's line when the
+    /// whole clause fits in this many columns; 0 puts each item on its own
+    /// line whatever its length.
+    pub line_width: u16,
+}
+
+impl FormatOptions {
+    /// The options with every value in its range (a hand-edited store
+    /// cannot make the layout absurd).
+    pub fn sanitized(mut self) -> Self {
+        if let Indent::Spaces(spaces) = self.indent {
+            self.indent = Indent::Spaces(spaces.clamp(1, 8));
+        }
+        self
+    }
+
+    /// The text of one level of indentation, and its width in columns.
+    fn indent(&self) -> (String, usize) {
+        match self.indent {
+            Indent::Spaces(spaces) => (" ".repeat(spaces.into()), spaces.into()),
+            Indent::Tab => ("\t".to_string(), 4),
+        }
+    }
+}
 
 /// Keywords written in upper case, sorted. The flag is set for words MySQL
 /// does not reserve: there they can name a table without quotes, and table
@@ -157,12 +244,28 @@ const CONTEXTUAL: &[(&[&str], &[&str])] = &[
 /// byte, MySQL `DELIMITER` sections are not touched at all, and formatting
 /// twice gives the same text as formatting once.
 pub fn format_sql(sql: &str, rules: LexRules) -> String {
-    format_counting(sql, rules).0
+    format_with(sql, rules, &FormatOptions::default())
 }
 
-/// [`format_sql`], and how many statements were kept as written because
+/// [`format_sql`] with other [`FormatOptions`].
+pub fn format_with(sql: &str, rules: LexRules, options: &FormatOptions) -> String {
+    format_counting(sql, rules, options).0
+}
+
+/// [`format_with`], or `None` when the script does not lay out cleanly: a
+/// statement would come back as it was written, or a string, quoted name
+/// or comment is left open at the end (format on save leaves such a script
+/// alone).
+pub fn format_cleanly(sql: &str, rules: LexRules, options: &FormatOptions) -> Option<String> {
+    let (formatted, kept) = format_counting(sql, rules, options);
+    // The layout ends with a newline unless something is left open.
+    let closed = formatted.is_empty() || formatted.ends_with('\n');
+    (kept == 0 && closed).then_some(formatted)
+}
+
+/// [`format_with`], and how many statements were kept as written because
 /// laying them out would have changed their tokens.
-fn format_counting(sql: &str, rules: LexRules) -> (String, usize) {
+fn format_counting(sql: &str, rules: LexRules, options: &FormatOptions) -> (String, usize) {
     let tokens = lex(sql, rules);
     let mut out = String::with_capacity(sql.len() + sql.len() / 8);
     let mut kept = 0;
@@ -197,8 +300,8 @@ fn format_counting(sql: &str, rules: LexRules) -> (String, usize) {
         } else {
             index = statement_end(sql, &tokens, index);
             let statement = &tokens[start..index];
-            let formatted = Statement::new(sql, statement, rules).layout();
-            if same_tokens(sql, statement, &formatted, rules) {
+            let formatted = Statement::new(sql, statement, rules).layout(options);
+            if same_tokens(sql, statement, &formatted, rules, options.keyword_case) {
                 Cow::Owned(formatted)
             } else {
                 kept += 1;
@@ -292,8 +395,14 @@ fn statement_end(sql: &str, tokens: &[Token], start: usize) -> usize {
 }
 
 /// Whether `formatted` holds the tokens of the statement it was made from:
-/// the same kinds and text, keywords in upper case aside.
-fn same_tokens(sql: &str, statement: &[Token], formatted: &str, rules: LexRules) -> bool {
+/// the same kinds and text, keywords written in `case` aside.
+fn same_tokens(
+    sql: &str,
+    statement: &[Token],
+    formatted: &str,
+    rules: LexRules,
+    case: KeywordCase,
+) -> bool {
     let after = lex(formatted, rules);
     let mut after = after
         .iter()
@@ -306,10 +415,8 @@ fn same_tokens(sql: &str, statement: &[Token], formatted: &str, rules: LexRules)
             return false;
         };
         let (was, is) = (&sql[token.range.clone()], &formatted[other.range.clone()]);
-        let upper_cased = token.kind == TokenKind::Word
-            && is.eq_ignore_ascii_case(was)
-            && !is.bytes().any(|byte| byte.is_ascii_lowercase());
-        if other.kind != token.kind || !(was == is || upper_cased) {
+        let cased = token.kind == TokenKind::Word && case.apply(was) == is;
+        if other.kind != token.kind || !(was == is || cased) {
             return false;
         }
     }
@@ -431,13 +538,14 @@ enum Sep {
     Line(usize),
 }
 
-#[derive(Default)]
 struct Out {
     text: String,
     /// Indentation of the current line.
     level: usize,
     /// Nothing is written on the current line yet.
     fresh: bool,
+    /// One level of indentation.
+    indent: String,
 }
 
 impl Out {
@@ -447,7 +555,7 @@ impl Out {
         }
         self.text.push('\n');
         for _ in 0..level {
-            self.text.push_str(INDENT);
+            self.text.push_str(&self.indent);
         }
         self.level = level;
         self.fresh = true;
@@ -766,8 +874,56 @@ impl<'a> Statement<'a> {
         }
     }
 
-    fn layout(&self) -> String {
-        let mut out = Out::default();
+    /// Whether the clause keyword at the `k`th significant token and its
+    /// list, starting at the `first`th, fit on one line of `width` columns
+    /// at indentation `level`. Measured on the tokens alone, as they will
+    /// be spaced, so a list joined once is joined again. A list holding a
+    /// comment, a CASE or a subquery is never joined: they break lines.
+    fn fits(&self, k: usize, level: usize, options: &FormatOptions) -> bool {
+        let width = usize::from(options.line_width);
+        if width == 0 {
+            return false;
+        }
+        let mut used = level * options.indent().1 + self.text(k).chars().count();
+        let mut depth = 0usize;
+        let mut run = Run::Prefix;
+        for at in k + 1..self.sig.len() {
+            let tok = &self.toks[self.sig[at]];
+            match tok.class() {
+                Class::Open => {
+                    if matches!(self.kw(at + 1), "SELECT" | "WITH") {
+                        return false;
+                    }
+                    depth += 1;
+                }
+                Class::Close if depth == 0 => break,
+                Class::Close => depth -= 1,
+                Class::Semicolon => break,
+                _ if depth == 0 && self.clause_start(at).is_some() => break,
+                _ => {}
+            }
+            if tok.keyword == Some("CASE") {
+                return false;
+            }
+            // A comment between two tokens of the list.
+            if self.sig[at] != self.sig[at - 1] + 1 {
+                return false;
+            }
+            used += usize::from(self.space(at, &mut run)) + tok.text.chars().count();
+            if used > width {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn layout(&self, options: &FormatOptions) -> String {
+        let mut out = Out {
+            text: String::new(),
+            level: 0,
+            fresh: false,
+            indent: options.indent().0,
+        };
         let mut frames = vec![Frame {
             kind: FrameKind::Top,
             open: "",
@@ -859,7 +1015,7 @@ impl<'a> Statement<'a> {
                         if clause == Clause::Select && self.kw(first) == "ON" {
                             first = self.after_group(first + 1);
                         }
-                        if self.has_comma(first) {
+                        if self.has_comma(first) && !self.fits(k, frame.level, options) {
                             frame.list_level = Some(frame.level + 1);
                             pending = Some((first, frame.level + 1));
                         }
@@ -872,11 +1028,17 @@ impl<'a> Statement<'a> {
                 } else if class == Class::Comma
                     && let Some(level) = frame.list_level
                 {
-                    pending = Some((k + 1, level));
+                    match options.comma {
+                        Comma::Trailing => pending = Some((k + 1, level)),
+                        Comma::Leading => sep = Sep::Line(level),
+                    }
                 }
             }
             if class == Class::Comma && frame.kind == FrameKind::List {
-                pending = Some((k + 1, frame.level));
+                match options.comma {
+                    Comma::Trailing => pending = Some((k + 1, frame.level)),
+                    Comma::Leading => sep = Sep::Line(frame.level),
+                }
             }
             let mut opens_case = None;
             match keyword {
@@ -936,7 +1098,10 @@ impl<'a> Statement<'a> {
                 Sep::Space => out.space(),
                 Sep::None => {}
             }
-            out.put(tok.keyword.unwrap_or(tok.text));
+            match tok.keyword {
+                Some(_) => out.put(&options.keyword_case.apply(tok.text)),
+                None => out.put(tok.text),
+            }
             comments_from = index + 1;
 
             if let Some(multiline) = opens_case {
@@ -1306,8 +1471,49 @@ mod tests {
     }
 
     fn is_keyword(word: &str) -> bool {
+        let word = word.to_ascii_uppercase();
+        let word = word.as_str();
         KEYWORDS.iter().any(|(keyword, _)| *keyword == word)
             || CONTEXTUAL.iter().any(|(words, _)| words.contains(&word))
+    }
+
+    /// The defaults, then options that change every part of the layout:
+    /// the properties below hold for each.
+    const OPTIONS: [FormatOptions; 4] = [
+        FormatOptions {
+            keyword_case: KeywordCase::Upper,
+            indent: Indent::Spaces(4),
+            comma: Comma::Trailing,
+            line_width: 0,
+        },
+        FormatOptions {
+            keyword_case: KeywordCase::Lower,
+            indent: Indent::Spaces(2),
+            comma: Comma::Leading,
+            line_width: 80,
+        },
+        FormatOptions {
+            keyword_case: KeywordCase::Keep,
+            indent: Indent::Tab,
+            comma: Comma::Trailing,
+            line_width: 40,
+        },
+        FormatOptions {
+            keyword_case: KeywordCase::Upper,
+            indent: Indent::Spaces(3),
+            comma: Comma::Leading,
+            line_width: 0,
+        },
+    ];
+
+    /// Whether `is` is `was` as `options` write it: the same text, or a
+    /// keyword in their case.
+    fn same(was: (TokenKind, &str), is: (TokenKind, &str), options: &FormatOptions) -> bool {
+        was.0 == is.0
+            && (was.1 == is.1
+                || (was.0 == TokenKind::Word
+                    && is.1 == options.keyword_case.apply(was.1)
+                    && is_keyword(is.1)))
     }
 
     #[test]
@@ -1347,27 +1553,21 @@ mod tests {
     /// for byte.
     #[test]
     fn formatting_preserves_every_token() {
-        for rules in [R::POSTGRES, R::MYSQL] {
-            for input in corpus() {
-                let formatted = format_sql(input, rules);
-                let before = significant(input, rules);
-                let after = significant(&formatted, rules);
-                assert_eq!(
-                    before.len(),
-                    after.len(),
-                    "\n--- input ---\n{input}\n--- got ---\n{formatted}"
-                );
-                for (was, is) in before.iter().zip(&after) {
+        for options in &OPTIONS {
+            for rules in [R::POSTGRES, R::MYSQL] {
+                for input in corpus() {
+                    let formatted = format_with(input, rules, options);
+                    let before = significant(input, rules);
+                    let after = significant(&formatted, rules);
                     assert_eq!(
-                        was.0, is.0,
+                        before.len(),
+                        after.len(),
                         "\n--- input ---\n{input}\n--- got ---\n{formatted}"
                     );
-                    if was.1 != is.1 {
+                    for (was, is) in before.iter().zip(&after) {
                         assert!(
-                            was.0 == TokenKind::Word
-                                && is.1 == was.1.to_ascii_uppercase()
-                                && is_keyword(is.1),
-                            "{:?} became {:?}\n--- input ---\n{input}\n--- got ---\n{formatted}",
+                            same(*was, *is, options),
+                            "{:?} became {:?} with {options:?}\n--- input ---\n{input}\n--- got ---\n{formatted}",
                             was.1,
                             is.1
                         );
@@ -1379,14 +1579,16 @@ mod tests {
 
     #[test]
     fn formatting_is_idempotent() {
-        for rules in [R::POSTGRES, R::MYSQL] {
-            for input in corpus() {
-                let once = format_sql(input, rules);
-                let twice = format_sql(&once, rules);
-                assert_eq!(
-                    twice, once,
-                    "\n--- input ---\n{input}\n--- once ---\n{once}\n--- twice ---\n{twice}"
-                );
+        for options in &OPTIONS {
+            for rules in [R::POSTGRES, R::MYSQL] {
+                for input in corpus() {
+                    let once = format_with(input, rules, options);
+                    let twice = format_with(&once, rules, options);
+                    assert_eq!(
+                        twice, once,
+                        "{options:?}\n--- input ---\n{input}\n--- once ---\n{once}\n--- twice ---\n{twice}"
+                    );
+                }
             }
         }
     }
@@ -1395,13 +1597,15 @@ mod tests {
     /// the properties hold.
     #[test]
     fn no_statement_of_the_corpus_needs_the_safety_net() {
-        for rules in [R::POSTGRES, R::MYSQL] {
-            for input in corpus() {
-                let (formatted, kept) = format_counting(input, rules);
-                assert_eq!(
-                    kept, 0,
-                    "\n--- input ---\n{input}\n--- got ---\n{formatted}"
-                );
+        for options in &OPTIONS {
+            for rules in [R::POSTGRES, R::MYSQL] {
+                for input in corpus() {
+                    let (formatted, kept) = format_counting(input, rules, options);
+                    assert_eq!(
+                        kept, 0,
+                        "{options:?}\n--- input ---\n{input}\n--- got ---\n{formatted}"
+                    );
+                }
             }
         }
     }
@@ -1533,21 +1737,24 @@ mod tests {
                     input.push(' ');
                 }
             }
-            for rules in [R::POSTGRES, R::MYSQL] {
-                let (once, kept) = format_counting(&input, rules);
+            for (rules, options) in [R::POSTGRES, R::MYSQL]
+                .into_iter()
+                .flat_map(|rules| OPTIONS.iter().map(move |options| (rules, options)))
+            {
+                let (once, kept) = format_counting(&input, rules, options);
                 kept_total += kept;
                 let before = significant(&input, rules);
                 let after = significant(&once, rules);
                 let same = before.len() == after.len()
-                    && before.iter().zip(&after).all(|(was, is)| {
-                        was.0 == is.0
-                            && (was.1 == is.1
-                                || (was.0 == TokenKind::Word
-                                    && is.1 == was.1.to_ascii_uppercase()
-                                    && is_keyword(is.1)))
-                    });
-                assert!(same, "\n--- input ---\n{input:?}\n--- got ---\n{once:?}");
-                let twice = format_sql(&once, rules);
+                    && before
+                        .iter()
+                        .zip(&after)
+                        .all(|(was, is)| same(*was, *is, options));
+                assert!(
+                    same,
+                    "{options:?}\n--- input ---\n{input:?}\n--- got ---\n{once:?}"
+                );
+                let twice = format_with(&once, rules, options);
                 assert_eq!(
                     twice, once,
                     "\n--- input ---\n{input:?}\n--- once ---\n{once}\n--- twice ---\n{twice}"
@@ -1595,6 +1802,210 @@ mod tests {
                 R::POSTGRES
             ),
             "SELECT 1;\n\n-- about two\nSELECT 2;\n\n-- loose\n\nSELECT 3;\n"
+        );
+    }
+
+    fn with(sql: &str, rules: LexRules, options: FormatOptions) -> String {
+        format_with(sql, rules, &options)
+    }
+
+    const PG: &str = "select o.id, count(*) as n from shop.orders o where o.total > 10 and o.status = 'paid' group by o.id";
+    const MY: &str = "select `id`, `name` from `users` where id = ? limit 10";
+
+    #[test]
+    fn the_default_options_are_the_usual_layout() {
+        for rules in [R::POSTGRES, R::MYSQL] {
+            for input in corpus() {
+                assert_eq!(
+                    format_with(input, rules, &FormatOptions::default()),
+                    format_sql(input, rules)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keywords_take_the_chosen_case() {
+        let lower = FormatOptions {
+            keyword_case: KeywordCase::Lower,
+            ..Default::default()
+        };
+        assert_eq!(
+            with(PG, R::POSTGRES, lower),
+            "select\n    o.id,\n    count(*) as n\nfrom shop.orders o\nwhere o.total > 10\n    and o.status = 'paid'\ngroup by o.id\n"
+        );
+        let keep = FormatOptions {
+            keyword_case: KeywordCase::Keep,
+            ..Default::default()
+        };
+        assert_eq!(
+            with("Select a, B from T Where x", R::MYSQL, keep),
+            "Select\n    a,\n    B\nfrom T\nWhere x\n"
+        );
+        // Names, strings and quoted names are never touched.
+        assert_eq!(
+            with("SELECT \"Id\", 'SELECT' FROM Orders", R::POSTGRES, lower),
+            "select\n    \"Id\",\n    'SELECT'\nfrom Orders\n"
+        );
+        assert_eq!(
+            with(MY, R::MYSQL, lower),
+            "select\n    `id`,\n    `name`\nfrom `users`\nwhere id = ?\nlimit 10\n"
+        );
+    }
+
+    #[test]
+    fn indentation_is_the_chosen_width_or_a_tab() {
+        let two = FormatOptions {
+            indent: Indent::Spaces(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            with(MY, R::MYSQL, two),
+            "SELECT\n  `id`,\n  `name`\nFROM `users`\nWHERE id = ?\nLIMIT 10\n"
+        );
+        let tab = FormatOptions {
+            indent: Indent::Tab,
+            ..Default::default()
+        };
+        assert_eq!(
+            with(
+                "select * from (select a, b from t) s where x = 1 and y = 2",
+                R::POSTGRES,
+                tab
+            ),
+            "SELECT *\nFROM (\n\tSELECT\n\t\ta,\n\t\tb\n\tFROM t\n) s\nWHERE x = 1\n\tAND y = 2\n"
+        );
+        // A stored width out of range is brought back.
+        let wide = FormatOptions {
+            indent: Indent::Spaces(40),
+            ..Default::default()
+        };
+        assert_eq!(wide.sanitized().indent, Indent::Spaces(8));
+    }
+
+    #[test]
+    fn leading_commas_start_the_lines_of_a_list() {
+        let leading = FormatOptions {
+            comma: Comma::Leading,
+            ..Default::default()
+        };
+        assert_eq!(
+            with(PG, R::POSTGRES, leading),
+            "SELECT\n    o.id\n    , count(*) AS n\nFROM shop.orders o\nWHERE o.total > 10\n    AND o.status = 'paid'\nGROUP BY o.id\n"
+        );
+        assert_eq!(
+            with(
+                "create table t (id int primary key, name text not null)",
+                R::POSTGRES,
+                leading
+            ),
+            "CREATE TABLE t (\n    id int PRIMARY KEY\n    , name text NOT NULL\n)\n"
+        );
+        assert_eq!(
+            with(
+                "update `t` set a = 1, b = 2 where id = 3",
+                R::MYSQL,
+                leading
+            ),
+            "UPDATE `t`\nSET\n    a = 1\n    , b = 2\nWHERE id = 3\n"
+        );
+        // Commas inside a call stay where they are.
+        assert_eq!(
+            with("select coalesce(a, b)", R::POSTGRES, leading),
+            "SELECT coalesce(a, b)\n"
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_the_line_width_stays_on_its_line() {
+        let width = |line_width| FormatOptions {
+            line_width,
+            ..Default::default()
+        };
+        assert_eq!(
+            with(PG, R::POSTGRES, width(80)),
+            "SELECT o.id, count(*) AS n\nFROM shop.orders o\nWHERE o.total > 10\n    AND o.status = 'paid'\nGROUP BY o.id\n"
+        );
+        // `SELECT o.id, count(*) AS n` is 26 columns.
+        assert_eq!(
+            with(PG, R::POSTGRES, width(26)),
+            with(PG, R::POSTGRES, width(80))
+        );
+        assert_eq!(
+            with(PG, R::POSTGRES, width(25)),
+            format_sql(PG, R::POSTGRES)
+        );
+        assert_eq!(
+            with(MY, R::MYSQL, width(80)),
+            "SELECT `id`, `name`\nFROM `users`\nWHERE id = ?\nLIMIT 10\n"
+        );
+        // Inside a subquery, its indentation counts.
+        assert_eq!(
+            with(
+                "select * from (select a, b from t) s",
+                R::POSTGRES,
+                width(14)
+            ),
+            "SELECT *\nFROM (\n    SELECT\n        a,\n        b\n    FROM t\n) s\n"
+        );
+        assert_eq!(
+            with(
+                "select * from (select a, b from t) s",
+                R::POSTGRES,
+                width(16)
+            ),
+            "SELECT *\nFROM (\n    SELECT a, b\n    FROM t\n) s\n"
+        );
+        // A list with a comment, a CASE or a subquery keeps its lines.
+        for kept in [
+            "select a, -- why\n b from t",
+            "select a, case when x then 1 when y then 2 end from t",
+            "select a, (select 1) from t",
+        ] {
+            let laid_out = with(kept, R::POSTGRES, width(200));
+            assert!(laid_out.starts_with("SELECT\n    a"), "{laid_out}");
+        }
+    }
+
+    #[test]
+    fn a_script_that_does_not_lay_out_cleanly_is_refused() {
+        let options = FormatOptions::default();
+        assert_eq!(
+            format_cleanly("select 1", R::POSTGRES, &options).as_deref(),
+            Some("SELECT 1\n")
+        );
+        assert_eq!(
+            format_cleanly("", R::POSTGRES, &options).as_deref(),
+            Some("")
+        );
+        // A string or a comment left open: the script is being written.
+        assert_eq!(format_cleanly("select 'abc", R::POSTGRES, &options), None);
+        assert_eq!(
+            format_cleanly("select 1 /* to do", R::MYSQL, &options),
+            None
+        );
+    }
+
+    #[test]
+    fn the_options_survive_a_round_trip_and_fill_what_is_missing() {
+        let options = FormatOptions {
+            keyword_case: KeywordCase::Keep,
+            indent: Indent::Tab,
+            comma: Comma::Leading,
+            line_width: 100,
+        };
+        let stored = serde_json::to_string(&options).unwrap();
+        assert_eq!(
+            serde_json::from_str::<FormatOptions>(&stored).unwrap(),
+            options
+        );
+        let partial: FormatOptions = serde_json::from_str(r#"{"indent": {"spaces": 2}}"#).unwrap();
+        assert_eq!(
+            partial,
+            FormatOptions {
+                indent: Indent::Spaces(2),
+                ..Default::default()
+            }
         );
     }
 }

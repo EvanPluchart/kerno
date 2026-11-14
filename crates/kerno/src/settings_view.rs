@@ -100,13 +100,57 @@ impl FontSize {
     }
 }
 
-/// Grid text size: the zoom commands (DBeaver's `resultset.zoomIn` /
-/// `zoomOut`) and their reset.
+/// The text size of the SQL editors and the grids together: the zoom
+/// commands (⌘+ / ⌘- / ⌘0 over an editor or a grid, ⌘-wheel, DBeaver's
+/// `resultset.zoomIn` / `zoomOut`) move both by `step` points, each within
+/// its range; `None` gives both their defaults back.
 pub fn zoom_grid(step: Option<f32>, window: &mut Window, cx: &mut App) {
-    match step {
-        Some(step) => FontSize::Grid.change(step, window, cx),
-        None => FontSize::Grid.reset(window, cx),
+    for size in [FontSize::Editor, FontSize::Grid] {
+        match step {
+            Some(step) => size.change(step, window, cx),
+            None => size.reset(window, cx),
+        }
     }
+}
+
+/// Zooms the SQL editors and the grids (as [`zoom_grid`]) with the wheel
+/// while Cmd (Ctrl elsewhere) is held over the element it is a child of,
+/// which must be `relative`: before the editor or the grid scrolls. A
+/// trackpad's small deltas add up to one step per 40 pixels.
+pub fn zoom_wheel() -> impl IntoElement {
+    use gpui_kit::{HitboxBehavior, ScrollDelta, ScrollEvent, canvas};
+    thread_local! {
+        static PIXELS: std::cell::Cell<f32> = const { std::cell::Cell::new(0.) };
+    }
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        |_, hitbox, window, _| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+                if !phase.capture() || !event.modifiers.secondary(cx) || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                cx.stop_propagation();
+                let steps = match event.delta {
+                    ScrollDelta::Lines(lines) if lines.y == 0. => 0.,
+                    ScrollDelta::Lines(lines) => lines.y.signum(),
+                    ScrollDelta::Pixels(pixels) => PIXELS.with(|sum| {
+                        let total = sum.get() + pixels.y.as_f32();
+                        let steps = (total / 40.).trunc();
+                        sum.set(total - steps * 40.);
+                        steps
+                    }),
+                };
+                if steps != 0. {
+                    zoom_grid(Some(steps), window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 /// Opens the keymap file, written with an example (every command and its
@@ -242,6 +286,99 @@ impl SettingsView {
             })
     }
 
+    /// Settings ▸ Editor ▸ Formatter: the options of "Format SQL", format
+    /// on save, and a sample laid out with them.
+    fn formatter(settings: &Settings, cx: &App) -> impl IntoElement {
+        use kerno_core::sql::{Comma, FormatOptions, Indent, KeywordCase, LexRules, format_with};
+        const SAMPLE: &str = "select o.id, c.name, sum(o.total) as total from shop.orders o \
+            join shop.customers c on c.id = o.customer_id where o.status = 'paid' \
+            and o.total > 10 group by o.id, c.name";
+        /// A row of chips, one per value of one option.
+        fn row<T: Copy + PartialEq + 'static>(
+            label: &'static str,
+            id: &'static str,
+            choices: &[(T, &'static str)],
+            current: T,
+            set: fn(&mut FormatOptions, T),
+        ) -> impl IntoElement {
+            h_flex()
+                .gap_2()
+                .child(div().w(px(180.)).child(label))
+                .children(choices.iter().enumerate().map(|(index, &(value, text))| {
+                    theme::chip(
+                        SharedString::from(format!("{id}-{index}")),
+                        value == current,
+                    )
+                    .small()
+                    .label(text)
+                    .on_click(move |_, _, cx| {
+                        AppState::update_settings(cx, |settings| set(&mut settings.format, value))
+                    })
+                }))
+        }
+        let options = settings.format;
+        let theme = cx.theme();
+        let sample = format_with(SAMPLE, LexRules::POSTGRES, &options).replace('\t', "    ");
+        v_flex()
+            .gap_2()
+            .child(Self::heading("Formatter"))
+            .child(row(
+                "Keywords",
+                "format-case",
+                &[
+                    (KeywordCase::Upper, "UPPER"),
+                    (KeywordCase::Lower, "lower"),
+                    (KeywordCase::Keep, "As typed"),
+                ],
+                options.keyword_case,
+                |options, case| options.keyword_case = case,
+            ))
+            .child(row(
+                "Indentation",
+                "format-indent",
+                &[
+                    (Indent::Spaces(2), "2 spaces"),
+                    (Indent::Spaces(4), "4 spaces"),
+                    (Indent::Tab, "Tab"),
+                ],
+                options.indent,
+                |options, indent| options.indent = indent,
+            ))
+            .child(row(
+                "Commas in lists",
+                "format-comma",
+                &[(Comma::Trailing, "At line end"), (Comma::Leading, "At line start")],
+                options.comma,
+                |options, comma| options.comma = comma,
+            ))
+            .child(row(
+                "Short lists on one line",
+                "format-width",
+                &[(0, "Never"), (80, "Up to 80 columns"), (120, "Up to 120 columns")],
+                options.line_width,
+                |options, width| options.line_width = width,
+            ))
+            .child(Self::toggle(
+                "settings-format-on-save",
+                "Format .sql files when saving them (a script that does not lay out cleanly is saved as it is)",
+                settings.format_on_save,
+                |settings, on| settings.format_on_save = on,
+            ))
+            .child(
+                div()
+                    .id("formatter-sample")
+                    .test_support()
+                    .p_2()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.muted)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_sm()
+                    .child(SharedString::from(sample)),
+            )
+    }
+
     fn font_row(size: FontSize, label: &'static str, cx: &App) -> impl IntoElement {
         let value = size.get(&AppState::get(cx).settings);
         let id = size.id();
@@ -324,8 +461,8 @@ impl SettingsView {
                 .child(Self::font_row(FontSize::Editor, "SQL editor", cx))
                 .child(Self::font_row(FontSize::Grid, "Result and table grids", cx))
                 .child(note(
-                    "The faces are the embedded Inter and JetBrains Mono. In a grid, Cmd+= and \
-                     Cmd+- change its size, Cmd+0 resets it.",
+                    "The faces are the embedded Inter and JetBrains Mono. Over an editor or a grid, \
+                     Cmd+= and Cmd+- (or Cmd with the wheel) change both sizes, Cmd+0 resets them.",
                 ))
                 .into_any_element(),
             Section::Editor => v_flex()
@@ -365,11 +502,18 @@ impl SettingsView {
                     |settings, on| settings.auto_completion = on,
                 ))
                 .child(Self::toggle(
+                    "settings-tab-accepts-completion",
+                    "Tab accepts the highlighted completion, as Enter does",
+                    settings.tab_accepts_completion,
+                    |settings, on| settings.tab_accepts_completion = on,
+                ))
+                .child(Self::toggle(
                     "settings-ligatures",
                     "Draw ligatures (>= as one sign)",
                     settings.ligatures,
                     |settings, on| settings.ligatures = on,
                 ))
+                .child(Self::formatter(&settings, cx))
                 .into_any_element(),
             Section::Grid => {
                 let typed = self

@@ -100,6 +100,27 @@ pub fn copy_from_row(table: &Table, above: bool, cx: &mut App) {
     }
 }
 
+/// What the cell editor gives: as [`super::grid::typed_value`] for a value
+/// (`was_expression`: the cell held an expression, so the same text is
+/// still a change); an expression is kept exactly as typed, and an empty
+/// one is no value at all (DBeaver #9964).
+pub fn edited_value(
+    typed: &str,
+    initial: &str,
+    kind: TypeKind,
+    expression: bool,
+    was_expression: bool,
+) -> Option<CellValue> {
+    match (expression, was_expression) {
+        (true, _) if typed.trim().is_empty() => None,
+        (true, true) if typed == initial => None,
+        (true, _) => Some(CellValue::Expression(typed.to_string())),
+        (false, true) => super::grid::typed_value(typed, initial, kind)
+            .or_else(|| Some(CellValue::Text(typed.to_string()))),
+        (false, false) => super::grid::typed_value(typed, initial, kind),
+    }
+}
+
 /// Selects a row and shows it.
 fn show_row(table: &Table, row: Option<usize>, cx: &mut App) {
     if let Some(row) = row {
@@ -290,5 +311,47 @@ pub fn on_key(
             boolean.is_some()
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cell_editor_gives_values_and_expressions() {
+        let text = |value: &str| Some(CellValue::Text(value.into()));
+        let expression = |sql: &str| Some(CellValue::Expression(sql.into()));
+        // A value, as before.
+        assert_eq!(
+            edited_value("7", "7", TypeKind::Integer, false, false),
+            None
+        );
+        assert_eq!(
+            edited_value("", "7", TypeKind::Integer, false, false),
+            Some(CellValue::Null)
+        );
+        // An expression is written as typed, spaces and case kept.
+        assert_eq!(
+            edited_value(" now() ", "", TypeKind::DateTime, true, false),
+            expression(" now() ")
+        );
+        // Text switched to an expression with the same text is a change.
+        assert_eq!(
+            edited_value("now()", "now()", TypeKind::Text, true, false),
+            expression("now()")
+        );
+        // An expression left as it was is none; switched to a value, it is.
+        assert_eq!(
+            edited_value("now()", "now()", TypeKind::Text, true, true),
+            None
+        );
+        assert_eq!(
+            edited_value("now()", "now()", TypeKind::Text, false, true),
+            text("now()")
+        );
+        // An empty expression is no value.
+        assert_eq!(edited_value("  ", "x", TypeKind::Text, true, false), None);
+        assert_eq!(edited_value("", "now()", TypeKind::Text, true, true), None);
     }
 }

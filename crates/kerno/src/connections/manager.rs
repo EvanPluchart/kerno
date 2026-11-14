@@ -148,8 +148,11 @@ pub struct Connections {
     drivers: Drivers,
     saved: Vec<SavedConnection>,
     runtime: HashMap<String, Runtime>,
-    /// The user's own SSH known-hosts file, read but never written.
+    /// The user's own SSH known-hosts file, read but never written by the
+    /// built-in client (OpenSSH records the keys the user trusts there).
     user_known_hosts: Option<PathBuf>,
+    /// The system's OpenSSH, when there is one.
+    openssh: Option<kerno_core::openssh::OpenSshEnv>,
     /// The last write of moved or renamed connections.
     writing: Option<Task<()>>,
 }
@@ -177,8 +180,19 @@ impl Connections {
             saved,
             runtime: HashMap::new(),
             user_known_hosts,
+            openssh: None,
             writing: None,
         }
+    }
+
+    /// Sets where the system's OpenSSH is (`None`: not found).
+    pub fn set_openssh(&mut self, openssh: Option<kerno_core::openssh::OpenSshEnv>) {
+        self.openssh = openssh;
+    }
+
+    /// The system's OpenSSH, when there is one.
+    pub fn openssh(&self) -> Option<&kerno_core::openssh::OpenSshEnv> {
+        self.openssh.as_ref()
     }
 
     /// SSH host keys are looked up in the user's own known-hosts file and
@@ -194,6 +208,7 @@ impl Connections {
                 .collect(),
             learn_into: Some(kerno_file),
             trusted_fingerprint,
+            openssh: self.openssh.clone(),
         }
     }
 

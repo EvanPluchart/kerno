@@ -81,6 +81,15 @@ const MIGRATIONS: &[&str] = &[
          last_status   TEXT,
          last_log      TEXT NOT NULL DEFAULT ''
      );",
+    // 4: the layout of each table's data (column order, hidden and pinned
+    // columns, widths, sort), per connection; gone with the connection.
+    "CREATE TABLE table_layouts (
+         connection_id TEXT NOT NULL,
+         table_key     TEXT NOT NULL,
+         layout_json   TEXT NOT NULL,
+         updated_at    INTEGER NOT NULL,
+         PRIMARY KEY (connection_id, table_key)
+     );",
 ];
 
 /// How many filters [`Storage::filters`] keeps for one key.
@@ -332,13 +341,15 @@ impl Storage {
         }
     }
 
-    /// Removes a connection with its history and its saved queries. The
+    /// Removes a connection with its history, its saved queries and its
+    /// tables' layouts. The
     /// caller removes its secrets from the secret store.
     pub fn delete_connection(&self, id: &str) -> Result<()> {
         self.with(|c| {
             let tx = c.transaction()?;
             tx.execute("DELETE FROM history WHERE connection_id = ?1", [id])?;
             tx.execute("DELETE FROM saved_queries WHERE connection_id = ?1", [id])?;
+            tx.execute("DELETE FROM table_layouts WHERE connection_id = ?1", [id])?;
             tx.execute("DELETE FROM connections WHERE id = ?1", [id])?;
             tx.commit()
         })
@@ -732,6 +743,121 @@ impl Storage {
         })
         .map(drop)
     }
+
+    // Table layouts -----------------------------------------------------------
+
+    /// The layout last given to a table's data on a connection (DBeaver
+    /// #38133); `None` when there is none, or it cannot be read.
+    pub fn table_layout(
+        &self,
+        connection_id: &str,
+        table_key: &str,
+    ) -> Result<Option<TableLayout>> {
+        let json: Option<String> = self.with(|c| {
+            c.query_row(
+                "SELECT layout_json FROM table_layouts WHERE connection_id = ?1 AND table_key = ?2",
+                params![connection_id, table_key],
+                |row| row.get(0),
+            )
+            .optional()
+        })?;
+        Ok(json.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
+    /// Keeps the layout of a table's data; the layout a table has by itself
+    /// is not kept (an earlier one is removed).
+    pub fn save_table_layout(
+        &self,
+        connection_id: &str,
+        table_key: &str,
+        layout: &TableLayout,
+    ) -> Result<()> {
+        if layout == &TableLayout::default() {
+            return self
+                .with(|c| {
+                    c.execute(
+                        "DELETE FROM table_layouts WHERE connection_id = ?1 AND table_key = ?2",
+                        params![connection_id, table_key],
+                    )
+                })
+                .map(drop);
+        }
+        let json =
+            serde_json::to_string(layout).map_err(|error| Error::Storage(error.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO table_layouts (connection_id, table_key, layout_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (connection_id, table_key) DO UPDATE
+                 SET layout_json = excluded.layout_json, updated_at = excluded.updated_at",
+                params![connection_id, table_key, json, now_ms()],
+            )
+        })
+        .map(drop)
+    }
+}
+
+/// How the columns of a table's data were laid out, by column name: a
+/// column renamed or dropped since is ignored, one added since is shown
+/// after the others.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TableLayout {
+    /// The columns left to right, hidden ones included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+    /// The columns kept in view at the left, left to right.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
+    /// Widths in pixels.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub widths: std::collections::BTreeMap<String, f32>,
+    /// The column the rows are ordered by, and whether descending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<(String, bool)>,
+}
+
+impl TableLayout {
+    /// The columns of a table whose columns are now `names` to show, left
+    /// to right, as indexes into `names`, and how many of the first are
+    /// pinned. Never nothing: a layout that would hide every column shows
+    /// them all.
+    pub fn arrange(&self, names: &[&str]) -> (Vec<usize>, usize) {
+        let index = |name: &String| names.iter().position(|known| *known == name);
+        let mut order: Vec<usize> = Vec::with_capacity(names.len());
+        for found in self.order.iter().filter_map(index) {
+            if !order.contains(&found) {
+                order.push(found);
+            }
+        }
+        let added: Vec<usize> = (0..names.len())
+            .filter(|column| !order.contains(column))
+            .collect();
+        order.extend(added);
+        let hidden: Vec<usize> = self.hidden.iter().filter_map(index).collect();
+        let shown: Vec<usize> = order
+            .into_iter()
+            .filter(|column| !hidden.contains(column))
+            .collect();
+        if shown.is_empty() {
+            return ((0..names.len()).collect(), 0);
+        }
+        let pinned: Vec<usize> = self.pinned.iter().filter_map(index).collect();
+        let (mut layout, rest): (Vec<usize>, Vec<usize>) = shown
+            .into_iter()
+            .partition(|column| pinned.contains(column));
+        let count = layout.len();
+        layout.extend(rest);
+        (layout, count)
+    }
+
+    /// The order of the rows, unless its column is gone.
+    pub fn sort_among(&self, names: &[&str]) -> Option<(String, bool)> {
+        self.sort
+            .clone()
+            .filter(|(column, _)| names.contains(&column.as_str()))
+    }
 }
 
 /// Creates an empty file only its owner can read or write.
@@ -1004,7 +1130,7 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Engine, SshAuth, SshConfig};
+    use crate::config::{Engine, SshAuth, SshClient, SshConfig};
 
     fn config(name: &str) -> ConnectionConfig {
         let mut config = ConnectionConfig::new(Engine::Postgres);
@@ -1051,6 +1177,8 @@ mod tests {
             user: "ops".into(),
             auth: SshAuth::Password,
             keepalive_secs: 30,
+            client: SshClient::Builtin,
+            jump: None,
         });
         assert_eq!(storage.save_connection(Some(&a), &changed).unwrap(), a);
         let stored = storage.connections().unwrap();
@@ -1596,5 +1724,117 @@ mod tests {
             "CREATE USER MAPPING FOR CURRENT_USER SERVER kerno_fdw \
              OPTIONS (user 'kerno', password '***')"
         );
+    }
+
+    fn layout() -> TableLayout {
+        TableLayout {
+            order: vec!["name".into(), "id".into(), "total".into(), "note".into()],
+            hidden: vec!["note".into()],
+            pinned: vec!["id".into()],
+            widths: [("name".to_string(), 180.0), ("id".to_string(), 64.5)].into(),
+            sort: Some(("total".into(), true)),
+        }
+    }
+
+    #[test]
+    fn a_table_layout_round_trips_and_goes_with_its_connection() {
+        let storage = Storage::in_memory().unwrap();
+        let connection = storage.save_connection(None, &config("c")).unwrap();
+        let key = r#"["kerno","shop","orders"]"#;
+        assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+        storage
+            .save_table_layout(&connection, key, &layout())
+            .unwrap();
+        assert_eq!(
+            storage.table_layout(&connection, key).unwrap(),
+            Some(layout())
+        );
+        // Per connection and per table.
+        assert_eq!(storage.table_layout("other", key).unwrap(), None);
+        assert_eq!(storage.table_layout(&connection, "x").unwrap(), None);
+        // Saved again, it replaces the first.
+        let narrower = TableLayout {
+            sort: None,
+            ..layout()
+        };
+        storage
+            .save_table_layout(&connection, key, &narrower)
+            .unwrap();
+        assert_eq!(
+            storage.table_layout(&connection, key).unwrap(),
+            Some(narrower)
+        );
+        // The layout a table has by itself is not kept.
+        storage
+            .save_table_layout(&connection, key, &TableLayout::default())
+            .unwrap();
+        assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+
+        storage
+            .save_table_layout(&connection, key, &layout())
+            .unwrap();
+        storage.delete_connection(&connection).unwrap();
+        assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+    }
+
+    #[test]
+    fn a_layout_that_cannot_be_read_is_no_layout() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO table_layouts VALUES ('c', 't', 'not json', 0)",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(storage.table_layout("c", "t").unwrap(), None);
+    }
+
+    #[test]
+    fn a_layout_arranges_the_columns_a_table_has_now() {
+        // As it was: order, hidden, pinned first.
+        let names = ["id", "name", "total", "note"];
+        assert_eq!(layout().arrange(&names), (vec![0, 1, 2], 1));
+        // A column dropped is ignored; one added is shown after the others.
+        let names = ["id", "total", "note", "added"];
+        assert_eq!(layout().arrange(&names), (vec![0, 1, 3], 1));
+        // A pinned column renamed: nothing pinned, and the new name comes
+        // after the others.
+        let names = ["key", "name", "total", "note"];
+        assert_eq!(layout().arrange(&names), (vec![1, 2, 0], 0));
+        // Nothing remembered: the table's own order.
+        assert_eq!(
+            TableLayout::default().arrange(&names),
+            (vec![0, 1, 2, 3], 0)
+        );
+        // Every column hidden: all shown.
+        let hidden = TableLayout {
+            hidden: vec!["a".into(), "b".into()],
+            ..TableLayout::default()
+        };
+        assert_eq!(hidden.arrange(&["a", "b"]), (vec![0, 1], 0));
+        // A sort on a column that is gone is dropped.
+        assert_eq!(
+            layout().sort_among(&["id", "total"]),
+            Some(("total".into(), true))
+        );
+        assert_eq!(layout().sort_among(&["id", "name"]), None);
+    }
+
+    #[test]
+    fn a_layout_is_written_as_short_json() {
+        assert_eq!(
+            serde_json::to_string(&TableLayout::default()).unwrap(),
+            "{}"
+        );
+        let json = serde_json::to_string(&layout()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TableLayout>(&json).unwrap(),
+            layout()
+        );
+        // A layout written by a later version with more fields still reads.
+        let later: TableLayout = serde_json::from_str(r#"{"hidden":["a"],"future":1}"#).unwrap();
+        assert_eq!(later.hidden, ["a"]);
     }
 }

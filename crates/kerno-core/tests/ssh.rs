@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use kerno_core::config::{Engine, Secret, SshAuth, SshConfig};
+use kerno_core::config::{Engine, Secret, SshAuth, SshClient, SshConfig};
 use kerno_core::connector::HostKeyStore;
 use kerno_core::ssh::{SshError, Tunnel, TunnelRequest};
 use kerno_core::testing;
@@ -266,8 +266,9 @@ async fn key_file_authentication() {
     }
 }
 
-/// RSA key files are refused before any network authentication, in every
-/// format, with or without a passphrase at hand. The bastion trusts
+/// The built-in client refuses RSA key files before any network
+/// authentication, in every format, with or without a passphrase at hand,
+/// and points to OpenSSH (where they work: `tests/openssh.rs`). The bastion trusts
 /// `id_rsa`, so the refusal is Kerno's, not the server's.
 #[tokio::test]
 async fn rsa_key_files_are_refused_with_a_clear_message() {
@@ -279,8 +280,9 @@ async fn rsa_key_files_are_refused_with_a_clear_message() {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "the private key {} is an RSA key. RSA key files are not supported in this \
-                     build: load the key in your SSH agent, or use an Ed25519 key",
+                    "the private key {} is an RSA key, which the built-in SSH client cannot \
+                     use: choose the OpenSSH client on the SSH tab, or load the key in your SSH \
+                     agent",
                     path.display()
                 )
             );
@@ -429,6 +431,8 @@ async fn unreachable_ssh_server_is_reported() {
         user: "kerno".into(),
         auth: SshAuth::Password,
         keepalive_secs: 0,
+        client: SshClient::Builtin,
+        jump: None,
     };
     let password = Secret::new("x");
     let outcome = Tunnel::open(TunnelRequest {

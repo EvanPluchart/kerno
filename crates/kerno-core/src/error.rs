@@ -227,15 +227,49 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
     let ssh = config.ssh.as_ref();
     let ssh_host = ssh.map(|ssh| ssh.host.as_str()).unwrap_or_default();
     let ssh_port = ssh.map(|ssh| ssh.port).unwrap_or(22);
+    // OpenSSH's port 0 is the SSH configuration's: the host alone.
+    let ssh_server = match ssh_port {
+        0 => ssh_host.to_string(),
+        port => format!("{ssh_host}:{port}"),
+    };
     let ssh_user = ssh.map(|ssh| ssh.user.as_str()).unwrap_or_default();
 
     let (kind, headline, next_step) = if let Some(ssh_text) = raw.split_once("SSH tunnel: ") {
         let ssh_text = ssh_text.1;
-        if ssh_text.contains("is not known yet") {
+        if let Some(stderr) = ssh_text.strip_prefix("OpenSSH: ") {
+            openssh_words(stderr, config)
+        } else if ssh_text.starts_with(crate::openssh::NOT_FOUND) {
+            (
+                FailureKind::Other,
+                "OpenSSH was not found on this computer.".to_string(),
+                "Choose the built-in client on the SSH tab, or install OpenSSH.".to_string(),
+            )
+        } else if ssh_text.contains("is not known yet") {
+            // The server named in the text: with OpenSSH, maybe a jump host.
+            let server = between(ssh_text, "the SSH server ", " is not known yet")
+                .map(str::to_string)
+                .unwrap_or_else(|| ssh_server.clone());
             (
                 FailureKind::SshHostKeyUnknown,
-                format!("The SSH server {ssh_host}:{ssh_port} is not known yet."),
+                format!("The SSH server {server} is not known yet."),
                 "Check its key fingerprint and trust it if it is the right server.".to_string(),
+            )
+        } else if let Some(path) = between(
+            ssh_text,
+            "the private key ",
+            " is encrypted: a passphrase is required",
+        ) {
+            (
+                FailureKind::SshAuthentication,
+                format!("The key in {path} needs a passphrase."),
+                "Load it with ssh-add or enter it here.".to_string(),
+            )
+        } else if let Some(path) = between(ssh_text, "the private key ", " is an RSA key") {
+            (
+                FailureKind::SshAuthentication,
+                format!("The built-in SSH client cannot use the RSA key {path}."),
+                "Choose the OpenSSH client on the SSH tab, or load the key in your SSH agent."
+                    .to_string(),
             )
         } else if ssh_text.contains("could not reach the SSH server") {
             if any(ssh_text, &HOST_NOT_FOUND) {
@@ -247,7 +281,7 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
             } else {
                 (
                     FailureKind::SshUnreachable,
-                    format!("The SSH server {ssh_host}:{ssh_port} could not be reached."),
+                    format!("The SSH server {ssh_server} could not be reached."),
                     "Check the SSH host and port, and that the SSH server is running.".to_string(),
                 )
             }
@@ -264,11 +298,24 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
                     .to_string(),
             )
         } else if ssh_text.contains("changed (now") {
+            let server = between(ssh_text, "the key of SSH server ", " changed (now")
+                .map(str::to_string)
+                .unwrap_or_else(|| ssh_server.clone());
             (
                 FailureKind::SshHostKeyChanged,
-                format!("The key of SSH server {ssh_host}:{ssh_port} has changed."),
+                format!("The key of SSH server {server} has changed."),
                 "This can mean someone is intercepting the connection. If the server was \
                  reinstalled, remove its old key from the known-hosts file named below."
+                    .to_string(),
+            )
+        } else if ssh_text.contains("could not connect to")
+            && ssh_text.contains("administratively prohibited")
+        {
+            (
+                FailureKind::SshForward,
+                "The SSH server does not allow forwarding to the database.".to_string(),
+                "Its AllowTcpForwarding setting (or the account's permitopen) forbids it: ask \
+                 its administrator."
                     .to_string(),
             )
         } else if ssh_text.contains("could not connect to") {
@@ -332,6 +379,192 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
     }
 }
 
+/// What an OpenSSH tunnel says when `ssh` neither connected nor gave up.
+pub(crate) const NO_ANSWER_FROM_SSH: &str = "no answer from ssh after";
+
+/// The text between `start` and `end`.
+fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let (_, rest) = text.split_once(start)?;
+    rest.split_once(end).map(|(inside, _)| inside)
+}
+
+/// The jump hosts of the connection's Jump host field, as (host, port).
+fn jump_hosts(config: &crate::config::ConnectionConfig) -> Vec<(String, Option<u16>)> {
+    let jump = config.ssh.as_ref().and_then(|ssh| ssh.jump.as_deref());
+    jump.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|hop| !hop.is_empty())
+        .map(|hop| {
+            let hop = hop.rsplit_once('@').map_or(hop, |(_, host)| host);
+            match hop.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+                Some((host, rest)) => (
+                    host.to_string(),
+                    rest.strip_prefix(':').and_then(|port| port.parse().ok()),
+                ),
+                None => match hop.split_once(':') {
+                    Some((host, port)) => (host.to_string(), port.parse().ok()),
+                    None => (hop.to_string(), None),
+                },
+            }
+        })
+        .collect()
+}
+
+/// What `ssh`'s messages say, in plain words. Its first recognised line
+/// wins: a jump host's failure comes before the tunnel's own.
+fn openssh_words(
+    stderr: &str,
+    config: &crate::config::ConnectionConfig,
+) -> (FailureKind, String, String) {
+    let jumps = jump_hosts(config);
+    let is_jump = |host: &str, port: Option<u16>| {
+        jumps.iter().any(|(jump, jump_port)| {
+            jump == host && (jump_port.is_none() || port.is_none() || *jump_port == port)
+        })
+    };
+    let role = |host: &str, port: Option<u16>| match is_jump(host, port) {
+        true => "jump host",
+        false => "SSH server",
+    };
+    let words = |kind, headline: String, next: &str| (kind, headline, next.to_string());
+    for line in stderr.lines().map(str::trim) {
+        if let Some(rest) = line
+            .split_once("Could not resolve hostname ")
+            .map(|(_, r)| r)
+        {
+            let host = rest.split(':').next().unwrap_or(rest).trim();
+            let who = if is_jump(host, None) {
+                "Jump host"
+            } else {
+                "SSH host"
+            };
+            return words(
+                FailureKind::SshUnreachable,
+                format!("{who} “{host}” was not found."),
+                "Check the host name, or its Host entry in your SSH configuration \
+                 (~/.ssh/config).",
+            );
+        }
+        if let Some(rest) = line.split_once("connect to host ").map(|(_, r)| r)
+            && let Some((host, rest)) = rest.split_once(" port ")
+            && let Some((port, reason)) = rest.split_once(": ")
+        {
+            let port = port.parse().ok();
+            let shown = format!("{host}:{}", port.unwrap_or(22));
+            let role = role(host, port);
+            return if reason.contains("refused") {
+                words(
+                    FailureKind::SshUnreachable,
+                    format!("Nothing answers on the {role} {shown}."),
+                    "Check the host and port, and that the SSH server is running.",
+                )
+            } else {
+                words(
+                    FailureKind::SshUnreachable,
+                    format!("The {role} {shown} did not answer in time."),
+                    "Check the host and port, and that no firewall or VPN blocks the way.",
+                )
+            };
+        }
+        if let Some((who, _)) = line.split_once(": Permission denied") {
+            let host = who.rsplit_once('@').map_or(who, |(_, host)| host);
+            let role = role(host, None);
+            return words(
+                FailureKind::SshAuthentication,
+                format!("The {role} refused the login of “{who}”."),
+                "Check the user and the key file, or the keys in your SSH agent (ssh-add -l). \
+                 An encrypted key needs its passphrase: load it with ssh-add or enter it here.",
+            );
+        }
+        if let Some(key) = between(line, "the key ", " needs a passphrase") {
+            return words(
+                FailureKind::SshAuthentication,
+                format!("The key in {key} needs a passphrase."),
+                "Load it with ssh-add, then connect again.",
+            );
+        }
+        if let Some(key) =
+            between(line, "Permissions ", " are too open").and_then(|rest| between(rest, "'", "'"))
+        {
+            return words(
+                FailureKind::SshAuthentication,
+                format!("OpenSSH will not use the key {key}: other users can read it."),
+                &format!("Make it private: chmod 600 {key}"),
+            );
+        }
+        if let Some(file) = line
+            .split_once("Bad owner or permissions on ")
+            .map(|(_, f)| f)
+        {
+            return words(
+                FailureKind::Other,
+                format!("OpenSSH will not read {file}: its owner or permissions are unsafe."),
+                &format!("Make it yours and private: chmod 600 {file}"),
+            );
+        }
+        if let Some(host) = between(line, "host key is known for ", " and you have requested") {
+            return words(
+                FailureKind::SshHostKeyUnknown,
+                format!("The SSH server {host} is not in your known_hosts file yet."),
+                "Your SSH configuration asks for strict checking: connect once with ssh in a \
+                 terminal to check its key, then try again.",
+            );
+        }
+        if line.contains("administratively prohibited") {
+            return words(
+                FailureKind::SshForward,
+                "The SSH server does not allow forwarding.".to_string(),
+                "Its AllowTcpForwarding setting (or the account's permitopen) forbids it: ask \
+                 its administrator.",
+            );
+        }
+        if line.contains("stdio forwarding failed") {
+            return words(
+                FailureKind::SshForward,
+                "A jump host could not reach the next SSH server.".to_string(),
+                "Check the SSH host and port as the jump host sees them.",
+            );
+        }
+        if line.contains("Host key verification failed") {
+            return words(
+                FailureKind::SshHostKeyUnknown,
+                "OpenSSH could not verify an SSH server's key.".to_string(),
+                "Connect once with ssh in a terminal to check and record its key, then try \
+                 again.",
+            );
+        }
+        if line.contains(NO_ANSWER_FROM_SSH) {
+            let host = config.ssh.as_ref().map(|ssh| ssh.host.as_str());
+            return words(
+                FailureKind::SshUnreachable,
+                format!(
+                    "The SSH server {} did not answer in time.",
+                    host.unwrap_or_default()
+                ),
+                "Check the host and port, the jump hosts if any, and that no firewall or VPN \
+                 blocks the way.",
+            );
+        }
+        if line.contains("Connection closed by")
+            || line.contains("Connection reset by")
+            || line.contains("kex_exchange_identification")
+        {
+            return words(
+                FailureKind::SshUnreachable,
+                "The SSH server closed the connection.".to_string(),
+                "Check the SSH host and port, and the jump hosts if any: something that is not \
+                 an SSH server answered, or the server refused this computer.",
+            );
+        }
+    }
+    words(
+        FailureKind::Other,
+        "OpenSSH could not open the tunnel.".to_string(),
+        "Read ssh's message below.",
+    )
+}
+
 fn other() -> (FailureKind, String, String) {
     (
         FailureKind::Other,
@@ -343,7 +576,7 @@ fn other() -> (FailureKind, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConnectionConfig, Engine, SshConfig};
+    use crate::config::{ConnectionConfig, Engine, SshClient, SshConfig};
 
     fn config() -> ConnectionConfig {
         ConnectionConfig {
@@ -357,6 +590,8 @@ mod tests {
                 user: "deploy".into(),
                 auth: Default::default(),
                 keepalive_secs: 30,
+                client: SshClient::Builtin,
+                jump: None,
             }),
             ..ConnectionConfig::new(Engine::Postgres)
         }
@@ -527,6 +762,150 @@ mod tests {
             assert_eq!(explained.headline, *headline, "{raw}");
             assert!(!explained.next_step.is_empty(), "{raw}");
         }
+    }
+
+    /// J2: `ssh`'s messages (OpenSSH 10 on macOS, from the `kerno-ssh*`
+    /// containers) in plain words; a jump host is named as one.
+    #[test]
+    fn openssh_messages_are_told_in_plain_words() {
+        use FailureKind::*;
+        let mut config = config();
+        if let Some(ssh) = config.ssh.as_mut() {
+            ssh.client = SshClient::OpenSsh;
+            ssh.jump = Some("ops@jump.example.com:2200".into());
+        }
+        let cases: &[(&str, FailureKind, &str)] = &[
+            (
+                "ssh: Could not resolve hostname bastion: nodename nor servname provided, or not known",
+                SshUnreachable,
+                "SSH host “bastion” was not found.",
+            ),
+            (
+                "ssh: Could not resolve hostname jump.example.com: Name or service not known\n\
+                 Connection closed by UNKNOWN port 65535",
+                SshUnreachable,
+                "Jump host “jump.example.com” was not found.",
+            ),
+            (
+                "ssh: connect to host jump.example.com port 2200: Connection refused\n\
+                 Connection closed by UNKNOWN port 65535",
+                SshUnreachable,
+                "Nothing answers on the jump host jump.example.com:2200.",
+            ),
+            (
+                "ssh: connect to host 10.0.0.9 port 22: Operation timed out",
+                SshUnreachable,
+                "The SSH server 10.0.0.9:22 did not answer in time.",
+            ),
+            (
+                "deploy@bastion: Permission denied (publickey).",
+                SshAuthentication,
+                "The SSH server refused the login of “deploy@bastion”.",
+            ),
+            (
+                "ops@jump.example.com: Permission denied (publickey,password).",
+                SshAuthentication,
+                "The jump host refused the login of “ops@jump.example.com”.",
+            ),
+            (
+                "the key /Users/ada/.ssh/id_rsa needs a passphrase, which ssh asked for\n\
+                 deploy@bastion: Permission denied (publickey).",
+                SshAuthentication,
+                "The key in /Users/ada/.ssh/id_rsa needs a passphrase.",
+            ),
+            (
+                "@@@@\n@         WARNING: UNPROTECTED PRIVATE KEY FILE!          @\n\
+                 Permissions 0644 for '/k/id_ed25519' are too open.",
+                SshAuthentication,
+                "OpenSSH will not use the key /k/id_ed25519: other users can read it.",
+            ),
+            (
+                "Bad owner or permissions on /Users/ada/.ssh/config",
+                Other,
+                "OpenSSH will not read /Users/ada/.ssh/config: its owner or permissions are unsafe.",
+            ),
+            (
+                "No ED25519 host key is known for bastion and you have requested strict checking.\n\
+                 Host key verification failed.",
+                SshHostKeyUnknown,
+                "The SSH server bastion is not in your known_hosts file yet.",
+            ),
+            (
+                "channel 0: open failed: administratively prohibited: open failed\n\
+                 stdio forwarding failed",
+                SshForward,
+                "The SSH server does not allow forwarding.",
+            ),
+            (
+                "kex_exchange_identification: Connection closed by remote host",
+                SshUnreachable,
+                "The SSH server closed the connection.",
+            ),
+            (
+                "no answer from ssh after 30 s",
+                SshUnreachable,
+                "The SSH server bastion did not answer in time.",
+            ),
+            ("something new", Other, "OpenSSH could not open the tunnel."),
+        ];
+        for (stderr, kind, headline) in cases {
+            let raw = format!("SSH tunnel: OpenSSH: {stderr}");
+            let explained = explain(&raw, &config);
+            assert_eq!(explained.kind, *kind, "{stderr}");
+            assert_eq!(explained.headline, *headline, "{stderr}");
+            assert!(!explained.next_step.is_empty(), "{stderr}");
+            // ssh's own words stay below.
+            assert_eq!(explained.raw, raw);
+        }
+
+        // "The key in ~/.ssh/id_rsa needs a passphrase: load it with ssh-add
+        // or enter it here" (CLAUDE.md §4 J2), for either client.
+        let explained = explain(
+            "SSH tunnel: the private key ~/.ssh/id_rsa is encrypted: a passphrase is required",
+            &config,
+        );
+        assert_eq!(
+            format!("{} {}", explained.headline, explained.next_step),
+            "The key in ~/.ssh/id_rsa needs a passphrase. Load it with ssh-add or enter it here."
+        );
+        let explained = explain(
+            "SSH tunnel: the private key /k/id_rsa is an RSA key, which the built-in SSH \
+             client cannot use: choose the OpenSSH client on the SSH tab, or load the key in \
+             your SSH agent",
+            &config,
+        );
+        assert_eq!(
+            explained.headline,
+            "The built-in SSH client cannot use the RSA key /k/id_rsa."
+        );
+        let explained = explain(
+            "SSH tunnel: OpenSSH was not found on this computer; use the built-in client",
+            &config,
+        );
+        assert_eq!(
+            explained.headline,
+            "OpenSSH was not found on this computer."
+        );
+        let explained = explain(
+            "SSH tunnel: the SSH server could not connect to studio:5432: channel 2: open \
+             failed: administratively prohibited: open failed",
+            &config,
+        );
+        assert_eq!(explained.kind, SshForward);
+        assert_eq!(
+            explained.headline,
+            "The SSH server does not allow forwarding to the database."
+        );
+        // A jump host's unknown key names the jump host.
+        let explained = explain(
+            "SSH tunnel: the SSH server jump.example.com:2200 is not known yet; its ED25519 key \
+             fingerprint is SHA256:abc",
+            &config,
+        );
+        assert_eq!(
+            explained.headline,
+            "The SSH server jump.example.com:2200 is not known yet."
+        );
     }
 
     #[test]

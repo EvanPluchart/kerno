@@ -163,15 +163,31 @@ impl Default for SshAuth {
     }
 }
 
+/// Which SSH client carries a tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshClient {
+    /// Kerno's own client (russh): password, key file without RSA, agent.
+    #[default]
+    Builtin,
+    /// The system's `ssh`, with everything it reads from `~/.ssh/config`
+    /// (aliases, ProxyJump, IdentityAgent, RSA keys, known_hosts).
+    #[serde(rename = "openssh")]
+    OpenSsh,
+}
+
 /// An SSH tunnel through which the database is reached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConfig {
-    /// SSH server host.
+    /// SSH server host. With [`SshClient::OpenSsh`], also a `Host` alias of
+    /// the SSH configuration.
     pub host: String,
-    /// SSH server port.
+    /// SSH server port. With [`SshClient::OpenSsh`], 0 leaves it to the
+    /// SSH configuration.
     #[serde(default = "default_ssh_port")]
     pub port: u16,
-    /// SSH user.
+    /// SSH user. With [`SshClient::OpenSsh`], empty leaves it to the SSH
+    /// configuration.
     pub user: String,
     /// Authentication method.
     #[serde(default)]
@@ -179,6 +195,13 @@ pub struct SshConfig {
     /// Seconds between keep-alive messages; 0 turns them off.
     #[serde(default = "default_keepalive")]
     pub keepalive_secs: u16,
+    /// The client that opens the tunnel.
+    #[serde(default)]
+    pub client: SshClient,
+    /// Jump hosts, as `ssh -J` takes them (`user@host:port`, several
+    /// separated by commas). OpenSSH only.
+    #[serde(default)]
+    pub jump: Option<String>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -442,13 +465,58 @@ impl ConnectionConfig {
             if ssh.host.trim().is_empty() {
                 return missing("the SSH host");
             }
-            if ssh.user.trim().is_empty() {
+            let builtin = ssh.client == SshClient::Builtin;
+            // OpenSSH takes the user and the port from its configuration.
+            if builtin && ssh.user.trim().is_empty() {
                 return missing("the SSH user");
+            }
+            if builtin && ssh.port == 0 {
+                return missing("a port between 1 and 65535 for the SSH server");
             }
             if let SshAuth::KeyFile { path } = &ssh.auth
                 && path.as_os_str().is_empty()
             {
                 return missing("the SSH private key file");
+            }
+            if !builtin && ssh.auth == SshAuth::Password {
+                return Err(Error::Config(
+                    "SSH password login works with the built-in client only: choose it, or log \
+                     in with a key or your SSH agent through OpenSSH"
+                        .into(),
+                ));
+            }
+            if builtin
+                && ssh
+                    .jump
+                    .as_deref()
+                    .is_some_and(|jump| !jump.trim().is_empty())
+            {
+                return Err(Error::Config(
+                    "a jump host needs the OpenSSH client: choose it on the SSH tab".into(),
+                ));
+            }
+            // OpenSSH hands jump hosts to a shell (ProxyJump): a connection
+            // file from elsewhere must not run commands through them.
+            let jump = ssh.jump.as_deref().map(str::trim).unwrap_or_default();
+            let unsafe_word = [
+                ("SSH host", ssh.host.trim(), false),
+                ("SSH user", ssh.user.trim(), false),
+                ("jump host", jump, true),
+            ]
+            .into_iter()
+            .find(|(_, text, list)| {
+                !builtin && !text.is_empty() && !crate::openssh::safe_ssh_word(text, *list)
+            });
+            if let Some((what, text, _)) = unsafe_word {
+                return Err(Error::Config(format!(
+                    "the {what} “{text}” has characters OpenSSH cannot take: use letters, \
+                     digits and . - _ @ : [ ]{}",
+                    if what == "jump host" {
+                        " (and , between hosts)"
+                    } else {
+                        ""
+                    }
+                )));
             }
         }
         Ok(())
@@ -1187,6 +1255,8 @@ mod tests {
                 path: "/home/ops/.ssh/id_ed25519".into(),
             },
             keepalive_secs: 15,
+            client: SshClient::Builtin,
+            jump: None,
         });
         let json = serde_json::to_string(&config).unwrap();
         assert_eq!(
@@ -1467,6 +1537,8 @@ mod tests {
             user: "u".into(),
             auth: SshAuth::default(),
             keepalive_secs: 30,
+            client: SshClient::Builtin,
+            jump: None,
         });
         assert!(
             config
@@ -1475,6 +1547,73 @@ mod tests {
                 .to_string()
                 .contains("SSH host")
         );
+    }
+
+    /// J2 (DBeaver #5845, #17976): OpenSSH takes an alias with nothing else;
+    /// a password needs the built-in client, a jump host OpenSSH.
+    #[test]
+    fn openssh_settings_are_checked_in_plain_words() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        let mut ssh = SshConfig {
+            host: "prod-bastion".into(),
+            port: 0,
+            user: String::new(),
+            auth: SshAuth::Agent { socket: None },
+            keepalive_secs: 30,
+            client: SshClient::OpenSsh,
+            jump: Some("ops@jump1:2222,jump2".into()),
+        };
+        config.ssh = Some(ssh.clone());
+        config.validate().unwrap();
+        let error = |config: &ConnectionConfig| config.validate().unwrap_err().to_string();
+
+        ssh.auth = SshAuth::Password;
+        config.ssh = Some(ssh.clone());
+        assert!(
+            error(&config).contains("built-in client only"),
+            "{}",
+            error(&config)
+        );
+
+        ssh.auth = SshAuth::Agent { socket: None };
+        ssh.client = SshClient::Builtin;
+        config.ssh = Some(ssh.clone());
+        assert!(error(&config).contains("SSH user"), "{}", error(&config));
+        ssh.user = "ops".into();
+        ssh.port = 22;
+        config.ssh = Some(ssh.clone());
+        assert!(error(&config).contains("jump host needs the OpenSSH client"));
+        ssh.jump = None;
+        config.ssh = Some(ssh.clone());
+        config.validate().unwrap();
+
+        // An imported file cannot slip a command into ProxyJump.
+        ssh.client = SshClient::OpenSsh;
+        for (host, jump) in [
+            ("bastion", "j;touch /tmp/x"),
+            ("bastion", "$(id)"),
+            ("-oProxyCommand=id", ""),
+            ("a b", ""),
+        ] {
+            ssh.host = host.into();
+            ssh.jump = Some(jump.into());
+            config.ssh = Some(ssh.clone());
+            assert!(
+                error(&config).contains("characters OpenSSH cannot take"),
+                "{host} {jump}"
+            );
+        }
+
+        // Stored before J2: the built-in client, no jump host.
+        let stored: SshConfig =
+            serde_json::from_str(r#"{"host":"b","port":22,"user":"u"}"#).unwrap();
+        assert_eq!((stored.client, &stored.jump), (SshClient::Builtin, &None));
+        let json = serde_json::to_string(&SshConfig {
+            client: SshClient::OpenSsh,
+            ..stored
+        })
+        .unwrap();
+        assert!(json.contains(r#""client":"openssh""#), "{json}");
     }
 
     #[test]
@@ -1514,6 +1653,8 @@ mod tests {
             user: "ops".into(),
             auth: SshAuth::Agent { socket: None },
             keepalive_secs: 30,
+            client: SshClient::Builtin,
+            jump: None,
         });
         first.auto_commit = Some(true);
         first.default_schema = Some("shop".into());

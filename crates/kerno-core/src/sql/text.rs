@@ -132,9 +132,134 @@ pub fn matching_bracket(
     None
 }
 
+/// The most occurrences [`occurrences`] returns.
+pub const MAX_OCCURRENCES: usize = 1_000;
+
+/// Every occurrence in `text` of what `selection` designates, in order and
+/// the designating one included, at most [`MAX_OCCURRENCES`]:
+///
+/// - an empty selection (a cursor) designates the word it touches (a cursor
+///   just after a word counts), matched as a whole word;
+/// - a selection on one line designates its text, matched anywhere.
+///
+/// Matching ignores ASCII case, as SQL names and keywords do (`Orders` and
+/// `orders` are one table). Strings and comments are searched too, as
+/// editors do. Nothing is designated by a cursor outside a word, a
+/// selection over several lines, or one of blanks only.
+pub fn occurrences(text: &str, selection: Range<usize>) -> Vec<Range<usize>> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let (needle, whole_word) = if selection.is_empty() {
+        let at = selection.start;
+        if !text.is_char_boundary(at) {
+            return Vec::new();
+        }
+        let start = text[..at]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| is_word(c))
+            .last()
+            .map_or(at, |(index, _)| index);
+        let end = at
+            + text[at..]
+                .char_indices()
+                .find(|&(_, c)| !is_word(c))
+                .map_or(text.len() - at, |(index, _)| index);
+        (&text[start..end], true)
+    } else {
+        match text.get(selection) {
+            Some(selected) if !selected.contains('\n') && !selected.trim().is_empty() => {
+                (selected, false)
+            }
+            _ => return Vec::new(),
+        }
+    };
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let (hay, pin) = (text.as_bytes(), needle.as_bytes());
+    let mut found = Vec::new();
+    let mut at = 0;
+    // ponytail: a plain scan, O(text × word); a 1 MB script with a long
+    // selection stays well under a frame.
+    while at + pin.len() <= hay.len() && found.len() < MAX_OCCURRENCES {
+        // A match starts on a character: `pin` begins with an ASCII byte or
+        // a lead byte, which no continuation byte equals.
+        if hay[at..at + pin.len()].eq_ignore_ascii_case(pin) {
+            let end = at + pin.len();
+            let apart = !whole_word
+                || (!text[..at].chars().next_back().is_some_and(is_word)
+                    && !text[end..].chars().next().is_some_and(is_word));
+            if apart {
+                found.push(at..end);
+                at = end;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The occurrences, with the cursor or selection marked by `|` (one:
+    /// a cursor; two: a selection), as the text each covers at its offset.
+    fn marks(marked: &str) -> Vec<String> {
+        let first = marked.find('|').expect("a cursor");
+        let text = marked.replace('|', "");
+        let second = marked[first + 1..].find('|').map(|at| at + first);
+        let selection = first..second.unwrap_or(first);
+        occurrences(&text, selection)
+            .into_iter()
+            .map(|range| format!("{}@{}", &text[range.clone()], range.start))
+            .collect()
+    }
+
+    #[test]
+    fn the_word_at_the_cursor_is_found_as_a_whole_word_in_any_case() {
+        assert_eq!(
+            marks("select id, o.|id from orders o where ID > 1 and idx = 2"),
+            ["id@7", "id@13", "ID@36"]
+        );
+        // A cursor just after the word, or just before it, is in it.
+        assert_eq!(marks("a.b| + b"), ["b@2", "b@6"]);
+        assert_eq!(marks("|ab + ab_c + ab"), ["ab@0", "ab@12"]);
+        // Inside strings and comments too.
+        assert_eq!(
+            marks("total| -- the total\n'total'"),
+            ["total@0", "total@13", "total@20"]
+        );
+        // Outside a word, nothing.
+        assert_eq!(marks("a + | b"), Vec::<String>::new());
+        assert_eq!(marks("|"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_selection_on_one_line_is_found_anywhere() {
+        assert_eq!(marks("|id|x id idx ID"), ["id@0", "id@4", "id@7", "ID@11"]);
+        assert_eq!(marks("a|.b| a.b"), [".b@1", ".b@5"]);
+        // Several lines, or only blanks: nothing.
+        assert_eq!(marks("|a\nb| a\nb"), Vec::<String>::new());
+        assert_eq!(marks("a| |b a b"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn letters_beyond_ascii_are_matched_as_they_are() {
+        assert_eq!(marks("|été| ÉTÉ été"), ["été@0", "été@12"]);
+        assert_eq!(marks("prix_|été été_x été"), ["prix_été@0"]);
+        // An offset inside a character designates nothing.
+        assert_eq!(occurrences("é", 1..1), Vec::<Range<usize>>::new());
+        assert_eq!(occurrences("ab", 9..9), Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn matches_do_not_overlap_and_stop_at_the_cap() {
+        assert_eq!(marks("|aa|aaa"), ["aa@0", "aa@2"]);
+        let text = "x ".repeat(MAX_OCCURRENCES + 10);
+        assert_eq!(occurrences(&text, 0..0).len(), MAX_OCCURRENCES);
+    }
 
     fn upper(text: &str) -> String {
         change_case(text, 0..text.len(), true, LexRules::POSTGRES)

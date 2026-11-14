@@ -582,3 +582,62 @@ async fn connector_runs_the_bootstrap_on_every_session() {
         "\"no\"\"pe\", public"
     );
 }
+
+/// J2 (DBeaver #5845, #14749; Beekeeper #1240): the driver through the
+/// system's OpenSSH, an alias whose ProxyJump goes through the jump host;
+/// a database the SSH server cannot reach is told as such.
+#[tokio::test]
+async fn connector_goes_through_openssh_and_a_jump_host() {
+    if !testing::ssh_jump_available() {
+        return;
+    }
+    for engine in [ENGINE] {
+        if !testing::available(engine) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = testing::openssh(dir.path(), "/usr/bin/false".into(), true);
+        let host_keys = HostKeyStore {
+            openssh: Some(fixture.env.clone()),
+            ..HostKeyStore::default()
+        };
+        let connector = Connector::open(
+            Arc::new(PostgresDriver),
+            testing::openssh_config(engine),
+            testing::secrets(),
+            &host_keys,
+        )
+        .await
+        .unwrap();
+        // Several sessions over the one tunnel.
+        for _ in 0..2 {
+            let session = connector.session(None).await.unwrap();
+            assert_eq!(
+                scalar(&session, "SELECT current_database()::text").await,
+                "kerno"
+            );
+        }
+        assert!(!connector.tunnel_closed());
+        drop(connector);
+
+        let mut config = testing::openssh_config(engine);
+        config.host = "kerno-no-such-database".into();
+        let connector = Connector::open(
+            Arc::new(PostgresDriver),
+            config,
+            testing::secrets(),
+            &host_keys,
+        )
+        .await
+        .unwrap();
+        let error = connector
+            .session(None)
+            .await
+            .err()
+            .expect("no database there");
+        assert!(
+            matches!(&error, Error::Ssh(ssh) if matches!(**ssh, kerno_core::ssh::SshError::Forward { .. })),
+            "{error:?}"
+        );
+    }
+}

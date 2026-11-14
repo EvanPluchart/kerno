@@ -22,7 +22,9 @@ pub use complete::{
 pub use edits::{
     ApplyFailure, CellValue, RowChange, apply_edits, apply_edits_in_transaction, edit_statements,
 };
-pub use format::format_sql;
+pub use format::{
+    Comma, FormatOptions, Indent, KeywordCase, format_cleanly, format_sql, format_with,
+};
 pub use generate::{
     RowSql, call_routine, delete_template, insert_template, rows_sql, select_template,
     update_template,
@@ -30,4 +32,4 @@ pub use generate::{
 pub use lex::{LexRules, Token, TokenKind, lex};
 pub use params::{Param, ParamKey, ParamValue, bind_params, find_params};
 pub use split::{StatementSpan, split_statements, statement_at};
-pub use text::{change_case, matching_bracket, toggle_block_comment};
+pub use text::{change_case, matching_bracket, occurrences, toggle_block_comment};

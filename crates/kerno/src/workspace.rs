@@ -1963,6 +1963,15 @@ impl Workspace {
         let Some(tab) = self.active_query_tab().cloned() else {
             return;
         };
+        // Format on save (J7): the editor's text first, so the file and the
+        // editor stay the same.
+        if AppState::get(cx).settings.format_on_save
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+        {
+            tab.update(cx, |tab, cx| tab.format_for_save(window, cx));
+        }
         let sql = tab.read(cx).sql(cx);
         let target = path.clone();
         let writing = bridge::spawn_blocking(cx, move || std::fs::write(&target, sql));
@@ -2575,8 +2584,8 @@ impl Workspace {
         self.on_rows(
             window,
             cx,
-            |tab, window, cx| tab.set_selected(CellValue::Default, window, cx),
-            |tab, window, cx| tab.set_selected(CellValue::Default, window, cx),
+            |tab, window, cx| tab.set_selected(CellValue::Expression("DEFAULT".into()), window, cx),
+            |tab, window, cx| tab.set_selected(CellValue::Expression("DEFAULT".into()), window, cx),
         );
     }
 
@@ -3323,11 +3332,18 @@ impl Workspace {
         v_flex()
             .size_full()
             .child(tab_bar)
-            .children(
-                self.tabs
-                    .get(self.active_tab)
-                    .map(|tab| div().flex_1().min_h_0().child(tab.view())),
-            )
+            .children(self.tabs.get(self.active_tab).map(|tab| {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(tab.view())
+                    // ⌘-wheel over an editor or a grid zooms them (J7).
+                    .when(
+                        matches!(tab, OpenTab::Query(_) | OpenTab::Data(_)),
+                        |area| area.child(crate::settings_view::zoom_wheel()),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -4066,14 +4082,26 @@ impl Workspace {
         .on_action(cx.listener(|_, _: &actions::ToggleSoftWrap, _, cx| {
             AppState::update_settings(cx, |settings| settings.soft_wrap = !settings.soft_wrap);
         }))
-        .on_action(cx.listener(|_, _: &actions::GridZoomIn, window, cx| {
+        .on_action(cx.listener(|_, _: &actions::ZoomIn, window, cx| {
             crate::settings_view::zoom_grid(Some(1.0), window, cx)
         }))
-        .on_action(cx.listener(|_, _: &actions::GridZoomOut, window, cx| {
+        .on_action(cx.listener(|_, _: &actions::ZoomOut, window, cx| {
             crate::settings_view::zoom_grid(Some(-1.0), window, cx)
         }))
-        .on_action(cx.listener(|_, _: &actions::GridZoomReset, window, cx| {
+        .on_action(cx.listener(|_, _: &actions::ZoomReset, window, cx| {
             crate::settings_view::zoom_grid(None, window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::SelectAllOccurrences, window, cx| {
+                if let Some(tab) = this.active_query_tab().cloned() {
+                    tab.update(cx, |tab, cx| tab.select_all_occurrences(window, cx));
+                }
+            }),
+        )
+        .on_action(cx.listener(|this, _: &actions::UnfoldAll, _, cx| {
+            if let Some(tab) = this.active_query_tab().cloned() {
+                tab.update(cx, |tab, cx| tab.unfold_all(cx));
+            }
         }))
         .on_action(
             cx.listener(|this, _: &actions::ToggleRecordView, window, cx| {
@@ -4106,6 +4134,29 @@ impl Workspace {
                 crate::query::grid_view::go_to_column(&grid, window, cx);
             }
         }))
+        // J6: find in the grid on screen, and its layout.
+        .on_action(cx.listener(|this, _: &actions::FindInResults, window, cx| {
+            if let Some(grid) = this.active_grid(cx) {
+                crate::query::find::open(&grid, window, cx);
+            }
+        }))
+        .on_action(cx.listener(|this, _: &actions::FindNextInResults, _, cx| {
+            if let Some(grid) = this.active_grid(cx) {
+                crate::query::find::next(&grid, true, cx);
+            }
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::FindPreviousInResults, _, cx| {
+                if let Some(grid) = this.active_grid(cx) {
+                    crate::query::find::next(&grid, false, cx);
+                }
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::ResetTableLayout, window, cx| {
+                this.on_grid(GridAction::ResetLayout, window, cx)
+            }),
+        )
         .on_action(
             cx.listener(|this, _: &actions::CopyRowNumbers, window, cx| {
                 this.on_grid(GridAction::CopyRowNumbers, window, cx)

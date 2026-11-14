@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -15,7 +16,7 @@ use gpui_kit::{
     TestSupportExt as _, Window, div, px,
 };
 use gpui_kit::{Entity, FocusHandle, Focusable as _};
-use kerno_core::format::{byte_size, compact_json, hex_dump, pretty_json};
+use kerno_core::format::{byte_size, compact_json, hex_dump, pretty_json, unix_time_hint};
 use kerno_core::sql::CellValue;
 use kerno_core::{Column, TypeKind};
 
@@ -37,6 +38,8 @@ struct ValueViewer {
     json: Option<String>,
     view: View,
     views: Vec<View>,
+    /// When the value is an integer that looks like a Unix time.
+    hint: Option<String>,
 }
 
 /// Makes a value a pending change of the cell.
@@ -85,6 +88,7 @@ pub fn edit(
         fetched,
         kind,
         problem: None,
+        hint: time_hint(column, value),
         save,
     });
     let text = editor.read(cx).text.clone();
@@ -104,6 +108,26 @@ pub fn edit(
     });
 }
 
+/// What an integer cell that looks like a Unix time is (Beekeeper #941).
+fn time_hint(column: &Column, value: Option<&[u8]>) -> Option<String> {
+    (column.kind == TypeKind::Integer)
+        .then(|| unix_time_hint(std::str::from_utf8(value?).ok()?))
+        .flatten()
+}
+
+/// The line that says what time an integer is.
+fn hint_line(hint: Option<String>, cx: &App) -> Option<impl IntoElement> {
+    hint.map(|hint| {
+        div()
+            .id("value-unix-time")
+            .test_support()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(SharedString::from(hint.clone()))
+            .test_text(hint)
+    })
+}
+
 /// Once a dialog has closed, the keyboard goes back where it was.
 pub fn give_back(focus: Option<FocusHandle>, window: &mut Window, cx: &mut App) {
     if let Some(focus) = focus {
@@ -121,6 +145,8 @@ struct ValueEditor {
     kind: TypeKind,
     /// Why the text cannot be saved.
     problem: Option<String>,
+    /// When the value is an integer that looks like a Unix time.
+    hint: Option<String>,
     save: Save,
 }
 
@@ -186,6 +212,7 @@ impl Render for ValueEditor {
                     .text_sm()
                     .child(Textarea::new(&self.text)),
             )
+            .children(hint_line(self.hint.clone(), cx))
             .children(self.problem.clone().map(|problem| {
                 div()
                     .id("value-problem")
@@ -277,6 +304,7 @@ fn show(
         json,
         view: views.first().copied().unwrap_or(View::Text),
         views,
+        hint: time_hint(column, value),
     });
     window.open_dialog(cx, move |dialog, _, _| {
         let (viewer, back) = (viewer.clone(), back.clone());
@@ -369,6 +397,7 @@ impl Render for ValueViewer {
                     .text_sm()
                     .child(body),
             )
+            .children(hint_line(self.hint.clone(), cx))
             .child(
                 h_flex()
                     .justify_between()

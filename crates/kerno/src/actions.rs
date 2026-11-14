@@ -270,12 +270,6 @@ gpui_kit::actions!(
         ViewCellValue,
         /// Wraps long lines in the SQL editors, or stops.
         ToggleSoftWrap,
-        /// Makes the text of the grids larger.
-        GridZoomIn,
-        /// Makes the text of the grids smaller.
-        GridZoomOut,
-        /// Gives the grids their usual text size.
-        GridZoomReset,
         /// Opens the rows of the table or view named at the editor's cursor.
         OpenTableAtCursor,
         /// Opens the structure of the table or view named at the cursor.
@@ -314,6 +308,14 @@ gpui_kit::actions!(
         GoToRow,
         /// Lists the columns of the grid to select one.
         GoToColumn,
+        /// Opens the find bar over the fetched rows of the grid.
+        FindInResults,
+        /// Moves to the next match of the grid's find bar.
+        FindNextInResults,
+        /// Moves to the previous match of the grid's find bar.
+        FindPreviousInResults,
+        /// Forgets the remembered layout of the table's columns.
+        ResetTableLayout,
         /// Copies the numbers of the selected rows.
         CopyRowNumbers,
         /// Shows the figures of the selected cells in the grid's footer, or
@@ -332,6 +334,16 @@ gpui_kit::actions!(
         CalculateRowCount,
         /// Reads the rows on screen again every few seconds, or stops.
         ToggleAutoRefresh,
+        /// Selects every occurrence of the word or selection at the cursor.
+        SelectAllOccurrences,
+        /// Opens every folded region of the editor.
+        UnfoldAll,
+        /// Makes the text of the SQL editors and the grids larger.
+        ZoomIn,
+        /// Makes the text of the SQL editors and the grids smaller.
+        ZoomOut,
+        /// Gives the SQL editors and the grids their usual text size.
+        ZoomReset,
     ]
 );
 
@@ -1082,6 +1094,44 @@ pub const COMMANDS: &[Command] = &[
         GoToColumn,
         "DataTable"
     ),
+    // J6 (DBeaver #38133): Cmd+F finds in the grid that has the focus; the
+    // editor keeps its own Cmd+F. Next and previous while the find bar has
+    // the keyboard; `cmd-` because Ctrl+G goes to a row on Linux.
+    command!(
+        "find_in_results",
+        "Find in Results…",
+        "Data",
+        ["secondary-f"],
+        ["search", "quick filter", "matching rows", "grid"],
+        FindInResults,
+        "DataTable"
+    ),
+    command!(
+        "find_next_in_results",
+        "Find Next in Results",
+        "Data",
+        ["cmd-g"],
+        ["search", "next match"],
+        FindNextInResults,
+        "GridFind"
+    ),
+    command!(
+        "find_previous_in_results",
+        "Find Previous in Results",
+        "Data",
+        ["cmd-shift-g"],
+        ["search", "previous match"],
+        FindPreviousInResults,
+        "GridFind"
+    ),
+    command!(
+        "reset_table_layout",
+        "Reset Table Layout",
+        "Data",
+        [],
+        ["columns", "widths", "hidden", "order", "forget", "default"],
+        ResetTableLayout
+    ),
     command!(
         "copy_row_numbers",
         "Copy Row Numbers",
@@ -1115,35 +1165,6 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["metadata", "types", "keys", "nullable", "panels"],
         ShowColumnsPanel
-    ),
-    // DBeaver's Alt+0 / Alt+9 (`resultset.zoomIn` / `zoomOut`), after the
-    // Cmd keys a Mac keyboard reaches.
-    command!(
-        "grid_zoom_in",
-        "Grid: Larger Text",
-        "Data",
-        ["secondary-=", "alt-0"],
-        ["zoom", "font size", "bigger"],
-        GridZoomIn,
-        "DataTable"
-    ),
-    command!(
-        "grid_zoom_out",
-        "Grid: Smaller Text",
-        "Data",
-        ["secondary--", "alt-9"],
-        ["zoom", "font size", "smaller"],
-        GridZoomOut,
-        "DataTable"
-    ),
-    command!(
-        "grid_zoom_reset",
-        "Grid: Usual Text Size",
-        "Data",
-        ["secondary-0"],
-        ["zoom", "font size", "reset"],
-        GridZoomReset,
-        "DataTable"
     ),
     command!(
         "apply_changes",
@@ -1244,6 +1265,56 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-shift-y"],
         ["small letters", "lowercase", "format"],
         LowerCase
+    ),
+    // DBeaver's ⌥J (`select.all.occurrences`), on VS Code's key (CLAUDE.md §4 J7).
+    command!(
+        "select_all_occurrences",
+        "Select All Occurrences",
+        "Editor",
+        ["secondary-shift-l"],
+        [
+            "multi-cursor",
+            "same word",
+            "matches",
+            "rename",
+            "highlight"
+        ],
+        SelectAllOccurrences,
+        "QueryTab > mode == editor"
+    ),
+    // The kit folds from the gutter only (#17240); opening every fold is reachable.
+    command!(
+        "unfold_all",
+        "Unfold All",
+        "Editor",
+        [],
+        ["folding", "expand", "collapse", "regions"],
+        UnfoldAll
+    ),
+    // ⌘+ / ⌘- / ⌘0 from anywhere: the editors and the grids together (#17817).
+    command!(
+        "zoom_in",
+        "Zoom In (Editor and Grids)",
+        "View",
+        ["secondary-="],
+        ["font size", "bigger", "larger text"],
+        ZoomIn
+    ),
+    command!(
+        "zoom_out",
+        "Zoom Out (Editor and Grids)",
+        "View",
+        ["secondary--"],
+        ["font size", "smaller", "smaller text"],
+        ZoomOut
+    ),
+    command!(
+        "zoom_reset",
+        "Reset Zoom (Editor and Grids)",
+        "View",
+        ["secondary-0"],
+        ["font size", "usual size", "reset"],
+        ZoomReset
     ),
     // DBeaver's `copy.query`.
     command!(
@@ -2265,9 +2336,9 @@ mod tests {
             ("show_completions", &["ctrl-space", "secondary-i"]),
             ("fetch_more_rows", &["ctrl-alt-n"]),
             ("fetch_all_rows", &["ctrl-+"]),
-            ("grid_zoom_in", &["secondary-=", "alt-0"]),
-            ("grid_zoom_out", &["secondary--", "alt-9"]),
-            ("grid_zoom_reset", &["secondary-0"]),
+            ("zoom_in", &["secondary-="]),
+            ("zoom_out", &["secondary--"]),
+            ("zoom_reset", &["secondary-0"]),
             ("toggle_block_comment", &["secondary-shift-/"]),
             ("upper_case", &["secondary-shift-x"]),
             ("lower_case", &["secondary-shift-y"]),

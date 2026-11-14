@@ -65,6 +65,18 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
 
 Measurements: [docs/BENCH.md](docs/BENCH.md).
 
+## SSH
+
+A connection reaches its database through an SSH server with one of two clients, chosen on the SSH tab.
+**OpenSSH**, the default when `ssh` is installed, runs your own `ssh`, so everything in `~/.ssh/config` applies:
+`Host` aliases (the host field lists them), `ProxyJump` and the Jump host field (`ssh -J`, several hosts
+separated by commas), IdentityAgent (1Password, Secretive), RSA and every other key type, and OpenSSH's
+known_hosts; port, user and key may be left empty for the configuration to give them. It forwards a private
+Unix socket, never a TCP port. A key's passphrase is asked for and kept in the secret store, never on the
+command line; a server key you choose to trust is added to your known_hosts. `KERNO_SSH_CONFIG=<file>` makes
+Kerno pass another configuration file to `ssh` (`-F`). The **built-in** client needs no `ssh` and is the one for
+a password login; it takes Ed25519 and ECDSA key files and the keys of an SSH agent, not RSA key files.
+
 ## Install
 
 There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
@@ -124,7 +136,8 @@ request, creates no tag and pushes nothing.
 ## Test databases
 
 The integration tests run against containers named `kerno-*`: PostgreSQL 17 (host port 55432), MySQL 8.4
-(53306), MariaDB 11 (53307) and an SSH server (52222), all bound to 127.0.0.1 with test-only credentials.
+(53306), MariaDB 11 (53307), an SSH server (52222) and a jump host in front of it (52223), all bound to
+127.0.0.1 with test-only credentials.
 
 ```sh
 scripts/test-env.sh up        # generate test certificates and keys, start, wait until seeded

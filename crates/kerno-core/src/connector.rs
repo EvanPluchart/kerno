@@ -4,11 +4,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{ConnectParams, ConnectionConfig, Secrets};
+use crate::config::{ConnectParams, ConnectionConfig, Secrets, SshClient};
 use crate::driver::{Driver, Session};
 use crate::error::{Error, Result};
 use crate::exec;
-use crate::ssh::{Tunnel, TunnelRequest};
+use crate::openssh::{self, OpenSshEnv, OpenSshRequest};
+use crate::ssh::{SshError, Tunnel, TunnelRequest};
 
 /// Where SSH host keys are looked up and recorded.
 #[derive(Debug, Clone, Default)]
@@ -20,6 +21,51 @@ pub struct HostKeyStore {
     /// Fingerprint the user just agreed to trust, from a previous
     /// [`crate::ssh::SshError::UnknownHostKey`].
     pub trusted_fingerprint: Option<String>,
+    /// The system's OpenSSH, for connections that use it (`None`: not
+    /// found). OpenSSH keeps its own known_hosts: the files above are the
+    /// built-in client's.
+    pub openssh: Option<OpenSshEnv>,
+}
+
+/// Opens the SSH tunnel of `config`, if it has one, with the client it
+/// names. Every tunnel of the app is opened here.
+pub async fn open_tunnel(
+    config: &ConnectionConfig,
+    secrets: &Secrets,
+    host_keys: &HostKeyStore,
+) -> Result<Option<Arc<Tunnel>>> {
+    let Some(ssh) = &config.ssh else {
+        return Ok(None);
+    };
+    let tunnel = match ssh.client {
+        SshClient::Builtin => {
+            Tunnel::open(TunnelRequest {
+                ssh,
+                password: secrets.ssh_password.as_ref(),
+                key_passphrase: secrets.ssh_key_passphrase.as_ref(),
+                known_hosts: &host_keys.known_hosts,
+                learn_into: host_keys.learn_into.as_deref(),
+                trusted_fingerprint: host_keys.trusted_fingerprint.as_deref(),
+            })
+            .await?
+        }
+        SshClient::OpenSsh => {
+            let env = host_keys
+                .openssh
+                .as_ref()
+                .ok_or_else(|| SshError::Other(openssh::NOT_FOUND.into()))?;
+            Tunnel::open_openssh(OpenSshRequest {
+                ssh,
+                env,
+                db_host: &config.host,
+                db_port: config.port,
+                key_passphrase: secrets.ssh_key_passphrase.as_ref(),
+                trusted_fingerprint: host_keys.trusted_fingerprint.as_deref(),
+            })
+            .await?
+        }
+    };
+    Ok(Some(Arc::new(tunnel)))
 }
 
 /// A live route to one server: the driver, the settings, the secrets (in
@@ -57,20 +103,7 @@ impl Connector {
                 config.engine.label()
             )));
         }
-        let tunnel = match &config.ssh {
-            None => None,
-            Some(ssh) => Some(Arc::new(
-                Tunnel::open(TunnelRequest {
-                    ssh,
-                    password: secrets.ssh_password.as_ref(),
-                    key_passphrase: secrets.ssh_key_passphrase.as_ref(),
-                    known_hosts: &host_keys.known_hosts,
-                    learn_into: host_keys.learn_into.as_deref(),
-                    trusted_fingerprint: host_keys.trusted_fingerprint.as_deref(),
-                })
-                .await?,
-            )),
-        };
+        let tunnel = open_tunnel(&config, &secrets, host_keys).await?;
         Ok(Self {
             driver,
             config,
@@ -97,7 +130,21 @@ impl Connector {
             read_only: self.config.read_only,
             options: self.config.options.clone(),
         };
-        let session = self.driver.connect(&params).await?;
+        let mark = self.tunnel.as_ref().map(|tunnel| tunnel.forward_mark());
+        let session = match self.driver.connect(&params).await {
+            Ok(session) => session,
+            Err(error) => {
+                // OpenSSH tells why a forward failed only in its messages.
+                if let (Some(tunnel), Some(mark)) = (&self.tunnel, mark)
+                    && let Some(refused) = tunnel
+                        .forward_failure(mark, &self.config.host, self.config.port)
+                        .await
+                {
+                    return Err(refused.into());
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.bootstrap(&session).await {
             session.close().await;
             return Err(error);

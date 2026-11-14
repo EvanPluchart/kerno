@@ -57,6 +57,10 @@ use crate::theme::Appearance;
 use crate::workspace::Workspace;
 
 fn main() {
+    // Run by `ssh` to ask a question for an OpenSSH tunnel: answer, end.
+    if let Some(code) = kerno_core::openssh::answer_askpass() {
+        std::process::exit(code);
+    }
     bench::init();
     // Kerno's own files are read on another thread while the platform
     // starts up, so the first frame has the saved tabs and the right theme
@@ -151,14 +155,28 @@ fn start(startup: Startup, cx: &mut App) -> anyhow::Result<()> {
     let keymap_file = AppState::get(cx).paths.keymap();
     gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("Kerno");
-        // The user's own known_hosts is read, never written: keys Kerno
+        // The built-in client reads the user's own known_hosts, never writes
+        // it (OpenSSH connections use OpenSSH's, see D-056): keys Kerno
         // learns go to its own file.
         let user_known_hosts = std::env::var_os("HOME")
             .map(|home| std::path::PathBuf::from(home).join(".ssh/known_hosts"));
         let drivers = Drivers::default()
             .with(kerno_postgres::PostgresDriver)
             .with(kerno_mysql::MysqlDriver);
-        let connections = cx.new(|_| Connections::new(connections, drivers, user_known_hosts));
+        // The system's OpenSSH (J2); `KERNO_SSH_CONFIG` names another file.
+        let openssh = kerno_core::openssh::OpenSshEnv::detect(
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+            std::env::var_os("KERNO_SSH_CONFIG").map(std::path::PathBuf::from),
+            std::env::current_exe().unwrap_or_else(|_| "kerno".into()),
+        );
+        let connections = cx.new(|_| {
+            let mut connections = Connections::new(connections, drivers, user_known_hosts);
+            connections.set_openssh(openssh);
+            connections
+        });
         let workspace =
             cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
         bench::begin(&workspace, &connections, window, cx);
@@ -261,6 +279,8 @@ fn menus() -> Vec<Menu> {
                 command("lower_case"),
                 command("show_completions"),
                 command("toggle_soft_wrap"),
+                command("select_all_occurrences"),
+                command("unfold_all"),
                 separator(),
                 command("open_table_at_cursor"),
                 command("open_structure_at_cursor"),
@@ -282,9 +302,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Light Appearance", UseLightTheme),
                 MenuItem::action("Dark Appearance", UseDarkTheme),
                 separator(),
-                command("grid_zoom_in"),
-                command("grid_zoom_out"),
-                command("grid_zoom_reset"),
+                command("zoom_in"),
+                command("zoom_out"),
+                command("zoom_reset"),
             ],
         ),
         menu(
@@ -361,9 +381,14 @@ fn menus() -> Vec<Menu> {
                 command("go_to_row"),
                 command("go_to_column"),
                 separator(),
+                command("find_in_results"),
+                command("find_next_in_results"),
+                command("find_previous_in_results"),
+                separator(),
                 command("toggle_selection_stats"),
                 command("show_aggregate_panel"),
                 command("show_columns_panel"),
+                command("reset_table_layout"),
             ],
         ),
         // The connection of the active tab, as DBeaver's Database menu.

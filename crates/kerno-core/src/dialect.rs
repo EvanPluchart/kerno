@@ -720,6 +720,7 @@ pub fn default_literal<D: Dialect + ?Sized>(
         CellValue::Null => "NULL".into(),
         CellValue::Default => "DEFAULT".into(),
         CellValue::Bytes(bytes) => dialect.quote_bytes(bytes),
+        CellValue::Expression(sql) => sql.clone(),
         CellValue::Text(text) => match column.kind {
             kind if kind.is_numeric() && is_number(text) => text.trim().to_string(),
             TypeKind::Boolean if is(["t", "true"], text) => "TRUE".into(),
@@ -843,6 +844,13 @@ mod tests {
             d.literal(&CellValue::Bytes(vec![1, 255]), &column(TypeKind::Binary)),
             "X'01ff'"
         );
+        // An expression is the user's SQL, whatever the column.
+        for kind in [TypeKind::Text, TypeKind::Integer, TypeKind::Boolean] {
+            assert_eq!(
+                d.literal(&CellValue::Expression("now()".into()), &column(kind)),
+                "now()"
+            );
+        }
         // Numbers are bare only in numeric columns, and only when plain.
         assert_eq!(d.literal(&text("42"), &column(TypeKind::Integer)), "42");
         assert_eq!(

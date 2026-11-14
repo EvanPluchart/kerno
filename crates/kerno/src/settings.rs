@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use kerno_core::config::FolderLook;
 use kerno_core::environment::{self, EnvironmentDef};
+use kerno_core::sql::FormatOptions;
 use kerno_core::storage::Storage;
 use kerno_core::tools::ClientFamily;
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,14 @@ pub struct Settings {
     /// The completion list opens by itself while typing (it always opens on
     /// demand).
     pub auto_completion: bool,
+    /// Tab accepts the highlighted completion, as Enter does (DBeaver
+    /// #2316); off, Tab indents.
+    pub tab_accepts_completion: bool,
+    /// How "Format SQL" lays the text out.
+    pub format: FormatOptions,
+    /// Saving a `.sql` file formats its text first, when it lays out
+    /// cleanly.
+    pub format_on_save: bool,
     /// Ligatures in the SQL editors (`>=` drawn as one sign).
     pub ligatures: bool,
     /// What a NULL cell shows.
@@ -151,6 +160,9 @@ impl Default for Settings {
             soft_wrap: false,
             line_numbers: true,
             auto_completion: true,
+            tab_accepts_completion: true,
+            format: FormatOptions::default(),
+            format_on_save: false,
             ligatures: false,
             null_text: "NULL".to_string(),
             show_time_zone: true,
@@ -203,6 +215,7 @@ impl Settings {
             &CODE_FONT_SIZES,
             default.grid_font_size,
         );
+        self.format = self.format.sanitized();
         if !matches!(self.tab_size, 2 | 4) {
             self.tab_size = default.tab_size;
         }
@@ -273,6 +286,14 @@ mod tests {
             soft_wrap: true,
             line_numbers: false,
             auto_completion: false,
+            tab_accepts_completion: false,
+            format: FormatOptions {
+                keyword_case: kerno_core::sql::KeywordCase::Lower,
+                indent: kerno_core::sql::Indent::Tab,
+                comma: kerno_core::sql::Comma::Leading,
+                line_width: 100,
+            },
+            format_on_save: true,
             ligatures: true,
             null_text: "∅".to_string(),
             show_time_zone: false,
@@ -377,6 +398,10 @@ mod tests {
         assert_eq!(loaded.grid_font_size, 11.5);
         assert_eq!(loaded.null_text, "NULL");
         assert!(loaded.line_numbers && loaded.auto_completion && !loaded.ligatures);
+        // Tab accepts a completion; the formatter keeps its layout and does
+        // not run on save.
+        assert!(loaded.tab_accepts_completion && !loaded.format_on_save);
+        assert_eq!(loaded.format, FormatOptions::default());
         // Settings stored before environments were the user's: the
         // built-ins, so production still asks twice.
         assert_eq!(loaded.environments, environment::builtin_environments());

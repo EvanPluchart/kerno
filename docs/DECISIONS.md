@@ -214,9 +214,10 @@ russh to a version on the fixed `rsa`, or replace the affected dependency); see 
 candidate below the patched `>= 0.10.0`, so no upgrade and no `[patch]` fixes it. Kerno builds russh
 without its `rsa` feature instead (`rsa`, `pkcs1` and `crypto-primes` leave `Cargo.lock`). Consequences:
 
-- RSA private key **files** are refused before any login, in every format, with: "the private key … is an
-  RSA key. RSA key files are not supported in this build: load the key in your SSH agent, or use an Ed25519
-  key".
+- RSA private key **files** are refused by the built-in client before any login, in every format. Since
+  J2 (D-056) they work through the OpenSSH client, and the built-in client's refusal says so: "the private
+  key … is an RSA key, which the built-in SSH client cannot use: choose the OpenSSH client on the SSH tab, or
+  load the key in your SSH agent". No `rsa` crate came back.
 - RSA keys held by the SSH agent still work (the agent signs; covered by a test). Ed25519 and ECDSA key
   files are unaffected.
 - An SSH server whose only host key is RSA cannot be reached: Kerno offers Ed25519 and ECDSA host keys and
@@ -960,3 +961,154 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   both had ended runs on the 180 s watchdog. No app bug behind them.
 - `docs/BENCH.md` gives both idle figures, the bare binary (what `scripts/bench.sh` runs) and the binary
   inside the bundle (what a user runs), and says which one the verdict is about.
+
+## D-054 — A pending value can be SQL (M11 Part 3, J5)
+
+- **`CellValue::Expression(String)`**, written into the statement exactly as typed (no quoting, no
+  trimming); refused in a key and when empty (`edit_statements`, the shared root, so paste and copy are
+  covered too). It goes through the usual review and confirmation; nothing runs unseen.
+- **"Set default" writes the expression `DEFAULT`** on fetched and new cells, so it draws and edits like
+  any expression. `CellValue::Default` stays as the "nothing given" marker of a new row's cells (left out
+  of the `INSERT`).
+- **⌘E while typing in a cell switches value / expression**: the cell editor catches `ExplainStatement`
+  (⌘E's command) and stops it there, so a user's rebinding of Explain moves the toggle with it. The `=`
+  button beside the input does the same. The flag lives in `Editor::Text`, so `grid_view.rs` (record view)
+  gets the toggle without a change.
+- **An enum cell has no expression toggle** (its editor is the list of values); "Set default" covers the
+  common case there.
+- The key-kind, JSON and expression tests on the three engines found no failure in the literal or
+  identity code: nothing there was changed.
+
+## D-055 — v1.1 (milestone 11): how the work is run, and two review notes (main session)
+
+- **Fifteen parts in three waves** (`docs/plans/M11.md`), up to four agents in one working tree (D-052);
+  commits are checkpoints of a tree that lints, so one commit can hold finished parts and the first files of
+  parts still running.
+- **One set of zoom commands.** Part 2 added Zoom In / Out / Reset beside the grid's older "Grid: Larger /
+  Smaller Text"; both did the same thing after J7 (editor and grids together). The grid's three commands and
+  their Alt+0 / Alt+9 keys are removed; ⌘= / ⌘- / ⌘0 work from anywhere.
+- **Known limit of the OpenSSH askpass (D-056).** The destination's `ssh` runs with password and
+  keyboard-interactive authentication off, so a server cannot ask a question that looks like the key's
+  passphrase prompt. `-J` gives no way to pass those options to the jump host's own `ssh`: a jump host the
+  user trusted and that turned hostile could send such a prompt and receive the passphrase of the key file
+  (not the key). Same exposure as typing into a terminal `ssh`. Closing it needs a `ProxyCommand` built by
+  Kerno instead of `-J`; noted for a later pass.
+
+## D-056 — SSH through the system OpenSSH (M11 Part 1, J2)
+
+- **One `ssh -N` per connection, forwarding a Unix socket** (`-L <dir>/db:<db host>:<db port>`) in a new
+  0700 directory under the temp dir, not a TCP port and not `-W` per session: no port is open to other local
+  processes (the built-in client's promise, `ssh.rs`), one SSH login serves every session, and readiness is
+  the socket appearing (ssh binds it after authentication). Drivers keep their surface: `Tunnel` is an enum of
+  the two clients inside (`open_stream` gives the socket, `forward_once` the single-use loopback port over
+  it), `TunnelStream` too. `connector::open_tunnel` is the one place a tunnel is opened (connector and the
+  tools' dialog). An OpenSSH tunnel leads to the connection's own database host and port only.
+- **ssh never prompts on a terminal**: `SSH_ASKPASS` is Kerno itself, forced, for every `ssh` (a jump host's
+  too; the app passes `current_exe()`, `main` calls `answer_askpass` first). The question comes back over a
+  second socket in that directory, open only while `ssh` starts. Kerno answers the passphrase of the
+  connection's own key file (from the secret store, so the manager's existing passphrase prompt is
+  "enter it here"; once per asking `ssh`, which the helper names by its parent pid: a jump host's `ssh`
+  asks for the same key on its own, and a second question from the same `ssh` means a wrong passphrase),
+  says "yes" to a host-key question only when its fingerprint is the one the user trusted,
+  and refuses anything else (passwords, other keys' passphrases). `BatchMode=no` because BatchMode stops ssh
+  from asking for a passphrase; `PasswordAuthentication=no`, `ControlPath=none`, `ExitOnForwardFailure=yes`.
+- **Host keys are OpenSSH's known_hosts**, checked with the real fingerprint: ssh's question carries it, the
+  existing trust dialog shows it, and the retry answers "yes" to that fingerprint only (not
+  `StrictHostKeyChecking=accept-new`, which would accept whatever key comes and cannot reach a jump host:
+  `-J` passes no `-o` to the hop). The key is then written by ssh to the user's known_hosts, which Kerno's
+  built-in client still only reads. A changed key fails before any question and is never offered.
+- **What the fields mean with OpenSSH**: the host may be an alias; port 0 and an empty user are not passed
+  (`-p`/`-l` would override the file); the key file is `-i … -o IdentitiesOnly=yes` and applies to the target
+  only (a jump host takes its key from the file); the agent socket is `IdentityAgent`. Password login stays
+  with the built-in client; a jump host needs OpenSSH. Host, user and jump hosts are restricted to letters,
+  digits and `. - _ @ : [ ]` (and `,` between jump hosts) because ssh hands jump hosts to a shell
+  (ProxyJump), checked in `validate` and again where `ssh` is spawned (a store edited by hand skips
+  `validate`); the host comes after `--`.
+- **Errors**: ssh's stderr is drained into a bounded tail and told in plain words by `error::explain`
+  (`SshError::OpenSsh`): host not found, refused, timed out, login refused, unprotected key, unsafe config
+  permissions, strict checking, forwarding prohibited, closed connection; a hop named in the Jump host field
+  is called the jump host. A forward the server refuses shows only in ssh's messages after the driver failed:
+  `Connector::session` turns it into `SshError::Forward`.
+- **Detection**: `ssh` on `PATH`, then `/usr/bin`, `/opt/homebrew/bin`, `/usr/local/bin` (a GUI app's `PATH`
+  is short). `KERNO_SSH_CONFIG` is passed as `-F`; otherwise ssh reads its own files (`-F` would drop
+  `/etc/ssh/ssh_config`). The dialog lists the `Host` names of that file and its `Include`s (relative to the
+  including file, `~` expanded, globs in the file name, depth 8, `Match` blocks skipped), read off the UI thread.
+- **Tests** pass their own `-F` file (`testing::openssh`) with its own known_hosts, `IdentityAgent none` and
+  `IdentitiesOnly yes`, so the developer's `~/.ssh` is never read; the core tests' askpass is the
+  `kerno-askpass` bin of kerno-core, the drivers' and the app's `/usr/bin/false` (the test binary must never
+  be ssh's askpass). `kerno-ssh-jump` (built from the `kerno-ssh` image, host port 52223) is the jump host;
+  tests read each container's host key with `ssh-keyscan` and trust whatever each question shows, so the two
+  containers need not share a key.
+
+## D-057 — The editor of v1.1 (M11 Part 2, J1 and J7): what the kit allows, and the choices
+
+- **Tab accepts a completion (J1, DBeaver #2316)** without forking the kit: gpui-kit 0.9.1's completion
+  list answers only Enter, Escape, Up and Down, and Tab is the editor's `IndentInline`. The query tab's
+  wrapper around the editor catches `IndentInline` in the capture phase while the list is open and the
+  setting `tab_accepts_completion` is on (default), sends the kit's own `Enter` to the list
+  (`route_overlay_action`), and stops the key only when the list took it; otherwise Tab indents as before.
+  The list shows no "Tab" hint: the kit's list has no footer, and its only side area is the selected
+  item's documentation, which would open a second box beside every list.
+- **Occurrences** (`sql::occurrences`): the word at the cursor as a whole word, or a one-line selection
+  anywhere; ASCII case ignored (SQL folds the case of names and keywords), strings and comments included,
+  at most 1,000. Computed when the text or the selection changes, never per frame (the editor notifies at
+  each cursor blink). The occurrence at the cursor is not highlighted (it is the cursor's). "Select All
+  Occurrences" is on ⌘⇧L (VS Code's key: DBeaver's ⌥J types a character on a Mac) and uses the kit's
+  `add_selection`.
+- **Folding (#17240)**: the kit folds, from its gutter, every tree-sitter node over three lines or more
+  (a statement, a subquery, a `do $$ … $$` body); a folded region still runs and saves in full (tested).
+  The kit has no public call to fold a line (only `unfold_at` and `set_folding`), so Kerno offers
+  "Unfold All" and no "Fold" / "Fold all"; ROADMAP SQL-44 keeps keyboard folding and folds on indentation
+  or marker comments.
+- **Zoom (#17817)**: one step moves the editor and the grid sizes together, each clamped to its range
+  (`zoom_grid`, also behind the grid's own zoom keys, whose labels stay "Grid: …"). ⌘+ / ⌘- / ⌘0 are bound
+  in the editor's context, beside the grid's DataTable keys, not globally; the grid's `alt-0` / `alt-9` stay
+  local because Option with a digit types a character on a Mac. The View menu carries the new commands.
+  ⌘-wheel is a capture-phase listener over the query and data tabs' area (tested over the editor and the
+  result grid), one step per wheel notch or per 40 pixels of a trackpad.
+- **Formatter options** (`FormatOptions`: keyword case, indent 1–8 spaces or a tab, comma at line end or
+  start, line width): the default is the former layout byte for byte; `line_width` 0 (the default) puts
+  each list item on its own line, otherwise a SELECT, SET or VALUES list whose clause fits stays on its
+  keyword's line, decided from the tokens alone so formatting stays idempotent, and never for a list
+  holding a comment, a CASE or a subquery. The token check after layout accepts keywords in the chosen
+  case only. The property tests run over four option sets.
+- **Format on save** (off by default): a `.sql` file's text is laid out in the editor first (one undo
+  step, the cursor kept at its line and column, clamped), then written, so file and editor agree. A script
+  that does not lay out cleanly (a statement the safety net keeps, or a string or comment left open at the
+  end) is saved as it is.
+
+## D-058 — The grid of v1.1 (M11 Part 4, J6): find, remembered layout, Unix time hint
+
+- **What a find matches** (DBeaver #38133, Beekeeper #524): the text each cell draws (`format::display`,
+  cut at the grid's 300 characters: text further in is not found), substring, ASCII case folded without an
+  allocation, other letters lower-cased per cell (`ponytail:` in `kerno-core/src/find.rs`). NULL never
+  matches; a timestamp's offset counts even when Settings hides it. Pending values count as shown.
+- **Where it runs**: a count of matching cells per fetched row (two bytes a row) is made by
+  `bridge::spawn_blocking` on a snapshot of the store, stopped when the text changes; rows that arrive later
+  are counted on their own; results of up to 20,000 cells, and a table page with changes pending, are
+  counted at once. Highlights are worked out for the cells on screen only. Measured: 0.40 s for 1,000,000
+  rows × 20 columns in a release build (0.46 s case-sensitive, 1.13 s for a needle outside ASCII;
+  `a_million_rows_are_searched`); the UI steps of the 1M-row UI test, frames included, take 24 to 44 ms in a
+  debug build alone and up to 137 ms beside the rest of the suite, so the test checks where the work runs,
+  not a time.
+- **"Matching rows only"** is a row mapping in the order shown, made from the sort's own mapping. Pending
+  changes are kept by row as fetched, so it is refused while changes are pending, and a grid shows no edit
+  while it is on (`Grid::edit` and `Grid::editable` refuse, the menus say "matching rows only"). Reaching its
+  last row asks the server for nothing; "Fetch all" in the bar does.
+- **Keys**: ⌘F (`secondary-f`) while a grid has the focus; ⌘G / ⇧⌘G as `cmd-` keys in the bar's own context,
+  because `ctrl-g` goes to a row on Linux; Enter / ⇧Enter in the bar; Escape closes and gives every row back.
+  The bar stays open over a table page read again (its text and options carried to the new grid). A
+  result read again on the server (a header sort while rows are still to come) is a new grid in the query
+  tab, which this part does not touch: the bar closes there.
+- **Layout of a table's data**: migration 4, `table_layouts(connection_id, table_key, layout_json,
+  updated_at)`; the key is `[database, schema, table]` as JSON, the database left empty on MySQL/MariaDB (the
+  schema is the database) and taken from the connection's default when the tab names none. By column name:
+  a column renamed or dropped is ignored, one added is shown after the others, a sort on a column gone is
+  dropped before the page is read. The first page waits for the stored layout (its order), and every page
+  gets it (hidden columns used to come back on each page). Once a change is noted, the widths of every shown
+  column are kept, and a column hidden or pinned from its menu leaves the others at their widths (the
+  table used to give them their first widths back). Written 0.5 s after the last change, off the UI thread, by a detached task: closing the
+  tab right after does not lose it. Query results are not remembered (no stable identity).
+- **Unix time hint** (Beekeeper #941): an integer column's value from 2000-01-01 to 2100-01-01 in seconds,
+  milliseconds or microseconds; Howard Hinnant's `civil_from_days` written out, no date crate; shown in the
+  value viewer and in the value panel (a table's cells open the panel).

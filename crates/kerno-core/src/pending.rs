@@ -528,6 +528,31 @@ mod tests {
         assert_eq!(pending.value(2, 0, 1), Some(&text("ann2")));
     }
 
+    /// DBeaver #9964: an expression is a change even when its text is the
+    /// cell's, and it reaches the statement as it was typed.
+    #[test]
+    fn an_expression_is_a_pending_value_of_its_own() {
+        let store = store();
+        let mut pending = Pending::default();
+        let expression = CellValue::Expression("ann".into());
+        pending.set(&store, 0, 1, expression.clone());
+        let new = pending.add_row(&store);
+        pending.set(&store, new, 0, CellValue::Expression("DEFAULT".into()));
+        assert_eq!(pending.value(2, 0, 1), Some(&expression));
+        assert_eq!(
+            pending.changes(&store, &id()).unwrap(),
+            vec![
+                RowChange::Update {
+                    key: vec![("id".into(), text("1"))],
+                    set: vec![("name".into(), expression)],
+                },
+                RowChange::Insert {
+                    values: vec![("id".into(), CellValue::Expression("DEFAULT".into()))]
+                },
+            ]
+        );
+    }
+
     #[test]
     fn without_a_key_only_new_rows_can_be_written() {
         let store = store();

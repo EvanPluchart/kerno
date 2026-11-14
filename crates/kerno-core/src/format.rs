@@ -455,9 +455,117 @@ pub fn byte_size(bytes: u64) -> String {
     }
 }
 
+/// What an integer that looks like a Unix time is, for the value viewer
+/// (Beekeeper #941): `Unix seconds → 2026-11-14 01:23:45 UTC`. Seconds
+/// from 2000-01-01 to 2100-01-01 (946684800 to 4102444800), or the same
+/// span in milliseconds or microseconds; `None` for anything else.
+pub fn unix_time_hint(text: &str) -> Option<String> {
+    const FIRST: i64 = 946_684_800;
+    const LAST: i64 = 4_102_444_800;
+    let text = text.trim();
+    let value: i64 = text.strip_prefix('+').unwrap_or(text).parse().ok()?;
+    let (unit, per_second, digits) = [
+        ("seconds", 1, 0),
+        ("milliseconds", 1_000, 3),
+        ("microseconds", 1_000_000, 6),
+    ]
+    .into_iter()
+    .find(|(_, per_second, _)| (FIRST * per_second..=LAST * per_second).contains(&value))?;
+    let (seconds, fraction) = (value / per_second, value % per_second);
+    let (days, time) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    let (year, month, day) = civil_from_days(days);
+    let mut out = format!(
+        "Unix {unit} \u{2192} {year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        time / 3600,
+        time % 3600 / 60,
+        time % 60
+    );
+    if digits > 0 {
+        let _ = write!(out, ".{fraction:0digits$}");
+    }
+    out.push_str(" UTC");
+    Some(out)
+}
+
+/// The proleptic Gregorian date `days` after 1970-01-01. Howard Hinnant's
+/// `civil_from_days` (public domain, "chrono-Compatible Low-Level Date
+/// Algorithms").
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integers_that_look_like_unix_times_say_when() {
+        let hint = |text: &str| unix_time_hint(text);
+        assert_eq!(hint("946684799"), None);
+        assert_eq!(
+            hint("946684800").as_deref(),
+            Some("Unix seconds \u{2192} 2000-01-01 00:00:00 UTC")
+        );
+        assert_eq!(
+            hint("4102444800").as_deref(),
+            Some("Unix seconds \u{2192} 2100-01-01 00:00:00 UTC")
+        );
+        assert_eq!(hint("4102444801"), None);
+        assert_eq!(
+            hint("1794619425").as_deref(),
+            Some("Unix seconds \u{2192} 2026-11-14 01:23:45 UTC")
+        );
+        // Leap day, and the end of a day.
+        assert_eq!(
+            hint("951868799").as_deref(),
+            Some("Unix seconds \u{2192} 2000-02-29 23:59:59 UTC")
+        );
+        // Milliseconds and microseconds, with their fraction.
+        assert_eq!(
+            hint("1794619425678").as_deref(),
+            Some("Unix milliseconds \u{2192} 2026-11-14 01:23:45.678 UTC")
+        );
+        assert_eq!(
+            hint("946684800000").as_deref(),
+            Some("Unix milliseconds \u{2192} 2000-01-01 00:00:00.000 UTC")
+        );
+        assert_eq!(
+            hint("4102444800000000").as_deref(),
+            Some("Unix microseconds \u{2192} 2100-01-01 00:00:00.000000 UTC")
+        );
+        assert_eq!(
+            hint("1794619425000042").as_deref(),
+            Some("Unix microseconds \u{2192} 2026-11-14 01:23:45.000042 UTC")
+        );
+        // Between the spans, outside them, or not a whole number: nothing.
+        for text in [
+            "4102444800001",
+            "946684799999",
+            "0",
+            "-1794619425",
+            "1794619425.5",
+            "",
+            "abc",
+            "99999999999999999999",
+        ] {
+            assert_eq!(hint(text), None, "{text}");
+        }
+        assert!(hint(" +1794619425 ").is_some());
+    }
 
     fn show(cell: Option<&[u8]>, kind: TypeKind, max_chars: usize) -> (String, CellStyle, bool) {
         let column = Column::new("c", "t", kind);

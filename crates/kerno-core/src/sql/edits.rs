@@ -26,6 +26,10 @@ pub enum CellValue {
     Text(String),
     /// Raw bytes, for binary columns.
     Bytes(Vec<u8>),
+    /// SQL the user wrote (`now()`, `DEFAULT`, `gen_random_uuid()`),
+    /// written into the statement as it is: never quoted, never changed.
+    /// Only meaningful when storing; an empty one is refused.
+    Expression(String),
 }
 
 /// One pending change to a table.
@@ -82,15 +86,34 @@ pub(super) fn where_clause(
         let ident = dialect.quote_ident(name);
         conditions.push(match value {
             CellValue::Null => format!("{ident} IS NULL"),
-            CellValue::Default => {
+            CellValue::Default | CellValue::Expression(_) => {
                 return Err(Error::Config(format!(
-                    "DEFAULT is not a value column \"{name}\" can be matched against"
+                    "a column's default or an expression is not a value column \"{name}\" \
+                     can be matched against"
                 )));
             }
             value => format!("{ident} = {}", dialect.literal(value, info)),
         });
     }
     Ok(conditions.join(" AND "))
+}
+
+/// The literal of `value` for `column`; an empty SQL expression is no
+/// value and is refused.
+fn value_sql(
+    dialect: &dyn Dialect,
+    value: &CellValue,
+    info: &ColumnInfo,
+    name: &str,
+) -> Result<String> {
+    if let CellValue::Expression(sql) = value
+        && sql.trim().is_empty()
+    {
+        return Err(Error::Config(format!(
+            "the SQL expression for column \"{name}\" is empty"
+        )));
+    }
+    Ok(dialect.literal(value, info))
 }
 
 /// The statements that carry out `changes`, one per change, in the order
@@ -114,7 +137,7 @@ pub fn edit_statements(
                 for (column_name, value) in values {
                     let info = column(columns, column_name, table)?;
                     names.push(dialect.quote_ident(column_name));
-                    literals.push(dialect.literal(value, info));
+                    literals.push(value_sql(dialect, value, info, column_name)?);
                 }
                 statements.push(format!(
                     "INSERT INTO {name} ({}) VALUES ({})",
@@ -130,7 +153,7 @@ pub fn edit_statements(
                     assignments.push(format!(
                         "{} = {}",
                         dialect.quote_ident(column_name),
-                        dialect.literal(value, info)
+                        value_sql(dialect, value, info, column_name)?
                     ));
                 }
                 statements.push(format!(
@@ -480,6 +503,50 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// DBeaver #9964, Beekeeper #2313: a value can be SQL (`now()`,
+    /// `DEFAULT`), written as typed; never in a key, never empty.
+    #[test]
+    fn expressions_are_written_as_typed() {
+        let expression = |sql: &str| CellValue::Expression(sql.into());
+        let statements = generate(&[
+            RowChange::Update {
+                key: key(),
+                set: vec![
+                    ("note".into(), expression("upper('it''s')  ")),
+                    ("price".into(), expression("DEFAULT")),
+                ],
+            },
+            RowChange::Insert {
+                values: vec![("sku".into(), expression("gen_random_uuid()"))],
+            },
+        ]);
+        assert_eq!(
+            statements,
+            [
+                "UPDATE \"shop\".\"order items\" SET \"note\" = upper('it''s')  , \
+                 \"price\" = DEFAULT WHERE \"order_id\" = 7 AND \"line_no\" = 2",
+                "INSERT INTO \"shop\".\"order items\" (\"sku\") VALUES (gen_random_uuid())",
+            ]
+        );
+        let (table, columns) = fixture();
+        for change in [
+            RowChange::Insert {
+                values: vec![("note".into(), expression(" \n"))],
+            },
+            RowChange::Update {
+                key: key(),
+                set: vec![("note".into(), expression(""))],
+            },
+        ] {
+            let error = edit_statements(&AnsiDialect, &table, &columns, &[change]).unwrap_err();
+            assert!(error.to_string().contains("is empty"), "{error}");
+        }
+        let in_key = RowChange::Delete {
+            key: vec![("order_id".into(), expression("7"))],
+        };
+        assert!(edit_statements(&AnsiDialect, &table, &columns, &[in_key]).is_err());
     }
 
     #[test]

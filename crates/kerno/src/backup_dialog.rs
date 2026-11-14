@@ -49,10 +49,10 @@ use gpui_kit::{
     TestSupportExt as _, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use kerno_core::config::{ConnectParams, ConnectionConfig, Engine, Secret, Secrets, TlsMode};
+use kerno_core::connector::HostKeyStore;
 use kerno_core::format::byte_size;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::LexRules;
-use kerno_core::ssh::{Tunnel, TunnelRequest};
 use kerno_core::storage::{HistoryStatus, SavedTask};
 use kerno_core::tools::{
     self, BackupContent, BackupFormat, BackupOptions, ClientFamily, ClientInstall, ClientRoots,
@@ -562,19 +562,26 @@ impl BackupDialog {
     ) {
         let secrets = connections.read(cx).secrets_of(&self.connection, cx);
         // The host key was trusted when the connection was opened: in the
-        // user's own known_hosts (read, never written) or in Kerno's.
+        // user's own known_hosts (read, never written by the built-in client;
+        // OpenSSH checks its own) or in Kerno's.
         let known_hosts: Vec<PathBuf> = std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".ssh/known_hosts"))
             .into_iter()
             .chain([AppState::get(cx).paths.known_hosts()])
             .collect();
+        let openssh = connections.read(cx).openssh().cloned();
         let database = self.database.clone();
         self.tasks.push(cx.spawn(async move |this, cx| {
             let prepared = match secrets.await {
                 Err(error) => Err(error),
                 Ok(secrets) => {
                     let opening = cx.update(|cx| {
-                        bridge::spawn(cx, params_for(config, secrets, known_hosts, database))
+                        let host_keys = HostKeyStore {
+                            known_hosts,
+                            openssh,
+                            ..HostKeyStore::default()
+                        };
+                        bridge::spawn(cx, params_for(config, secrets, host_keys, database))
                     });
                     opening.await
                 }
@@ -2120,24 +2127,11 @@ struct Ended {
 async fn params_for(
     config: ConnectionConfig,
     secrets: Secrets,
-    known_hosts: Vec<PathBuf>,
+    // Only a key trusted already: nothing is learned here.
+    host_keys: HostKeyStore,
     database: String,
 ) -> kerno_core::Result<ConnectParams> {
-    let tunnel = match &config.ssh {
-        None => None,
-        Some(ssh) => Some(Arc::new(
-            Tunnel::open(TunnelRequest {
-                ssh,
-                password: secrets.ssh_password.as_ref(),
-                key_passphrase: secrets.ssh_key_passphrase.as_ref(),
-                known_hosts: &known_hosts,
-                // Only a key trusted already: nothing is learned here.
-                learn_into: None,
-                trusted_fingerprint: None,
-            })
-            .await?,
-        )),
-    };
+    let tunnel = kerno_core::connector::open_tunnel(&config, &secrets, &host_keys).await?;
     Ok(ConnectParams {
         engine: config.engine,
         host: config.host,
