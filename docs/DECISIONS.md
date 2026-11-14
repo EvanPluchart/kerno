@@ -1542,3 +1542,19 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Value viewer**: the JSON view is offered (and first) only for a JSON column or a text holding an object or
   an array; an integer opens on Text. The Unix-time line stays in the secondary text colour, now right under
   the value. The size line is the byte length of the value's text, by design.
+
+## D-073 — Closing milestone 11 (main session)
+
+- **The version stays 0.1.0.** "v1.1" is the name of the scope (CLAUDE.md §4 J); nothing was ever published,
+  so the first release the owner makes carries everything. The update check compares `X.Y.Z` tags: bump the
+  workspace version before a second release, not before the first.
+- **Captures of v1.1** are the `v11-*` files of `docs/screenshots/final/`, light and dark, all looked at.
+  Three passes: the first found ten visual defects (D-072), the second three more (the active side tab now has
+  the strip's underline, the copy wizard's first column, plain punctuation in the AI suggestions), the third
+  confirmed them. Not captured: the import preview and the Execute script progress, whose file is chosen in a
+  native panel the GUI driver cannot reach, and states that need a broken server ("reconnecting…"). Their
+  rows in `docs/FEATURES.md` say `no screenshot` and name the UI tests that draw them.
+- **The first bench run of the final pass was thrown away**: a compile ran beside it. The published numbers
+  come from a second run on the final code with nothing else running (`docs/BENCH.md` says which commit).
+- **A second full `scripts/check.sh` after the last code change** is the one the final verification quotes.
+
