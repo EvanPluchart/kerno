@@ -50,6 +50,25 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
   emulation.
 - **RSA SSH key files** are refused (RUSTSEC-2023-0071, D-013); agent-held RSA keys work.
 
+## From the competitors' issues (triage of 2026-11-14): not now
+
+`docs/COMPETITOR-ISSUES.md` sorts what DBeaver's and Beekeeper Studio's users ask for. The "do" list is
+v1.1 (CLAUDE.md §4 J, `docs/plans/M11.md`). What was left out, and why:
+
+- **Parquet export.** A heavy dependency (Arrow and Parquet crates) for little demand in the sample; XLSX
+  (J12) answers the larger request first. It would be one more `ExportFormat` on the streamed export path.
+- **Wayland and fractional-scaling checks.** They need a real Linux desktop session; the Linux build is
+  checked in a container, which has no compositor.
+- **Flathub, Snap, an apt repository.** Publishing is the owner's step (CLAUDE.md §8). The packages of J16
+  (tarballs, `.deb`, AppImage) come first and are what such a repository would carry.
+- **PostGIS geometry viewer, role and sequence editors, row-level security in the navigator.** Real but
+  smaller demand; the next round. Each is a view over catalog queries the drivers already have the shape
+  for (`admin_query`, `table_structure`).
+- **Schema compare and data compare** (items 2 and 3 above), **notebooks, PRQL, an HTTP proxy for
+  connections, Emacs keys, real bind parameters.** Low demand in the sample.
+- **Other engines** (MongoDB, Oracle, SQL Server, ClickHouse, SQLite…). The biggest block of demand and out
+  of v1's scope: items 5 and 6 above, through the driver layer.
+
 ## From the DBeaver inventory
 
 Rows of `docs/DBEAVER-PARITY.md` marked **roadmap**, grouped by reason (IDs refer to that file). The 67 gaps the inventory
