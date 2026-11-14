@@ -85,8 +85,8 @@ for target in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
   cp -R "$prefix" "$stage/$name"
   tar -czf "dist/$name.tar.gz" -C "$stage" --owner=0 --group=0 "$name"
 
-  # .deb: the prefix under /usr; Depends from the libraries the binary links, plus the ones GPUI
-  # opens at run time (Vulkan), which dpkg-shlibdeps cannot see.
+  # .deb: the prefix under /usr; Depends from the libraries the binary links, plus the two GPUI
+  # opens at run time (Vulkan and the Wayland client), which dpkg-shlibdeps cannot see.
   deb=$stage/deb-$deb_arch
   rm -rf "$deb"
   mkdir -p "$deb/DEBIAN" "$deb/usr"
@@ -97,7 +97,7 @@ for target in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
     | sed -n 's/^shlibs:Depends=//p')
   [ -n "$depends" ] || { echo "dpkg-shlibdeps found no dependency for $deb_arch" >&2; exit 1; }
   sed -e "s/@VERSION@/$version/" -e "s/@ARCH@/$deb_arch/" \
-    -e "s/@SIZE@/$(du -sk "$deb/usr" | cut -f1)/" -e "s/@DEPENDS@/$depends, libvulkan1/" \
+    -e "s/@SIZE@/$(du -sk "$deb/usr" | cut -f1)/" -e "s/@DEPENDS@/$depends, libvulkan1, libwayland-client0/" \
     packaging/linux/control.in > "$deb/DEBIAN/control"
   dpkg-deb --root-owner-group --build "$deb" "dist/kerno_${version}_$deb_arch.deb" >/dev/null
 
@@ -117,7 +117,7 @@ APPRUN
   chmod 755 "$appdir/AppRun"
   image=Kerno-$version-$arch.AppImage
   rm -f "$stage/squashfs"
-  mksquashfs "$appdir" "$stage/squashfs" -all-root -noappend -comp gzip -no-progress
+  mksquashfs "$appdir" "$stage/squashfs" -all-root -noappend -comp gzip -no-progress >/dev/null
   cat "/opt/appimage/runtime-$arch" "$stage/squashfs" > "dist/$image"
   chmod 755 "dist/$image"
 done

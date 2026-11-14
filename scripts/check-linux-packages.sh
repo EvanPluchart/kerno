@@ -10,7 +10,7 @@
 #   AppImage   the .deb's Depends installed, --appimage-extract-and-run --version (no FUSE needed)
 # The tarballs' listings are checked first with the updater's rules (one top folder named as
 # artifact() names it, plain files and folders only). Containers are named kerno-check-* and
-# removed; base images this script pulled are removed at the end.
+# removed; the base images this script pulled (by id, both platforms) are removed at the end.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,16 +32,17 @@ for arch in aarch64 x86_64; do
   fi
 done
 
+# Images are removed by id: a tag holds one platform, so pulling the other one leaves the first untagged.
+before=$(docker images -aq --no-trunc)
 pulled=()
-for distro in "${distros[@]}"; do
-  docker image inspect "$distro" >/dev/null 2>&1 || pulled+=("$distro")
-done
 
 for arch in aarch64 x86_64; do
   case $arch in aarch64) platform=linux/arm64 deb_arch=arm64 ;; x86_64) platform=linux/amd64 deb_arch=amd64 ;; esac
   deb=kerno_${version}_$deb_arch.deb
   for distro in "${distros[@]}"; do
     docker pull -q --platform "$platform" "$distro" >/dev/null
+    id=$(docker image inspect --format '{{.Id}}' "$distro")
+    grep -qx "$id" <<<"$before" || pulled+=("$id")
     install="apt-get update -qq && apt-get install -y -qq --no-install-recommends"
     # The .deb's Depends as package names: the first of each alternative, versions dropped.
     libs="\$(dpkg-deb -f /dist/$deb Depends | tr ',' '\\n' | sed 's/|.*//; s/(.*)//; s/ //g' | tr '\\n' ' ')"
@@ -67,5 +68,5 @@ for arch in aarch64 x86_64; do
   done
 done
 
-for image in "${pulled[@]}"; do docker image rm "$image" >/dev/null 2>&1 || true; done
+for id in ${pulled[@]+"${pulled[@]}"}; do docker image rm "$id" >/dev/null 2>&1 || true; done
 [ "$failed" = 0 ] && echo "all Linux packages start" || { echo "some Linux packages failed" >&2; exit 1; }

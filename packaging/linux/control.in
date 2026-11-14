@@ -4,6 +4,7 @@ Architecture: @ARCH@
 Maintainer: Evan Pluchart
 Installed-Size: @SIZE@
 Depends: @DEPENDS@
+Recommends: mesa-vulkan-drivers | vulkan-icd
 Suggests: postgresql-client, default-mysql-client | mariadb-client
 Section: database
 Priority: optional

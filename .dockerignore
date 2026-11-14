@@ -1,8 +1,0 @@
-# The Linux build image (Dockerfile.linux-build) gets the sources only: no
-# host build output, no git history, and never the generated test keys.
-target
-dist
-.git
-tests/fixtures/generated
-docs/screenshots
-**/.DS_Store
