@@ -430,7 +430,9 @@ committed checkpoints, and ran the final checks. Decisions D-054 to D-073.
    open" below.
 4. **`scripts/release.sh`** builds the macOS bundle and, for x86_64 and arm64, a tarball, a `.deb` and an
    AppImage, with `SHA256SUMS`; `scripts/check-linux-packages.sh` starts each Linux package in Ubuntu 20.04
-   (the floor, glibc 2.31) and Debian 13: RELEASE_RESULT. The floor is in the README.
+   (the floor, glibc 2.31) and Debian 13: run in full on the final code, seven artifacts (the `.dmg` and six
+   Linux packages), twelve starts of twelve print `kerno 0.1.0`, `shasum -c SHA256SUMS` OK for the seven.
+   The floor is in the README.
 5. **`scripts/check.sh`** on the final code: `cargo fmt --all --check`, `cargo clippy --workspace
    --all-targets -- -D warnings`, `cargo deny check` (no ignored advisory) and the whole suite with the
    containers: all passed, 1,402 tests, 0 failed (2 ignored: two timing measurements, slow in a debug build).
@@ -443,7 +445,9 @@ committed checkpoints, and ran the final checks. Decisions D-054 to D-073.
    what it sends, and the Linux packages; `docs/PLAN.md`, this file and `docs/DECISIONS.md` (to D-073) are
    current; every J group has its commits (list above).
 8. **Local only**: `git remote -v` is empty, no tag, nothing pushed or published. At the end no Kerno
-   instance, container, watcher or browser of this session runs (END_STATE).
+   instance, container, watcher or browser of this session runs: `pgrep -x kerno` is empty, the `kerno-*`
+   containers are stopped, the Linux build image and its cache volume are removed, the scratch objects of
+   the captures and of the bench are dropped.
 
 Still open (for the owner):
 
