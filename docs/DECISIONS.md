@@ -304,7 +304,7 @@ strings, quoted identifiers and comments, which is what the `mysql` client does 
   connection says "save password" and the attempt succeeded. A typed secret that fails is forgotten, so the
   next attempt asks again rather than replaying it.
 - Auto-reconnect: a 30 s keep-alive ping on the navigator session; a failed ping drops the sessions and
-  connects again once, with the secrets already in memory.
+  connects again once, with the secrets already in memory. Superseded for v1.1 by D-062 (Part 5b: a 5 s check, attempts of 10 s retried until the server answers).
 - Export writes the settings only. Secret-named driver options are refused at validation (D-012), so an
   export cannot carry one. Imported connections get new ids and no secrets.
 - The dialog does not close on Enter (a half-filled form must not be saved by accident); Enter in the URL
@@ -1461,3 +1461,27 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Scope**: a schema (a MySQL database) or a table and its neighbours; the tree has no multi-selection
   (NAV-34), so "a selection of tables" is the table's neighbourhood. Dragged positions last for the
   session; the restored tab keeps its schema or table, not its layout.
+
+## D-070 — Vim mode (M11 Part 15, J19)
+
+- **Pure core** (`kerno-core/src/vim.rs`): `Vim::key(Key, &Buffer) -> Vec<Effect>` over the text, the cursor,
+  the clipboard text and the lex rules; the app applies the effects through `EditorState`. Motions scan from
+  the cursor to the next line break or word boundary; `%` lexes a 64 KiB window, as the bracket marks do. The
+  app keeps a copy of the text, read again only after a change, so Normal-mode keys copy nothing.
+- **Routing**: the editor's bindings run before key handlers, so printable keys (and ⌃r) are taken in a
+  capture-phase key handler around the editor, and Escape, Enter, Backspace, Delete, Tab and Shift+Tab as
+  capture-phase actions (Escape not stopped: the kit still closes its list). Arrows, Home/End, Page keys,
+  the mouse and ⌘/Ctrl keys are never touched (Beekeeper #1621, #1636). Off, the tab holds no `VimEditor` and
+  the wrapper is not rendered. On Linux `secondary-r` is Refresh Rows, a global Ctrl+R binding: in Normal
+  mode in the editor vim takes it as redo; on macOS ⌃r is unbound and reaches the key handler.
+- **Undo**: each command is one `Replace` (`3x`, `dd`, `p` with a count: one range), one kit undo step. The
+  kit's transaction brackets are `pub(super)`, so `c` + typed text is two steps (deletion, typing); `u`
+  dispatches the kit's own Undo. `.` replays a change with the text typed in Insert mode, read back at Esc
+  when it is one run before the cursor.
+- **Register**: the system clipboard is the only register. Linewise is not stored on the clipboard: vim
+  remembers its last yank, and a paste is linewise only while the clipboard still holds that text.
+- **Block cursor**: the kit's caret width is a private 1 px constant; Normal mode shades the character under
+  the cursor with a range decoration instead (the caret stays visible inside it).
+- **Visual mode** keeps its anchor and head; an arrow or a click that moved the editor's cursor moves the
+  head at the next key. `:wq` closes the tab once the asynchronous write has cleared `unsaved`; `:q!`
+  clears it first, and the close goes through the usual question for transactions and pending changes.

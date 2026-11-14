@@ -6,41 +6,37 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 
 ## Beyond v1, in order
 
-1. **ERD diagrams** (NAV-58, OBJ-20, CM-47): done in v1.1, read-only (CLAUDE.md §4 J18, D-069). Still to
-   come: editing the schema from the diagram, layouts saved between runs, a diagram of several schemas, a
-   diagram of a multi-selection of the tree (needs NAV-34).
-2. **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22). Reads `table_structure` and `ddl` from two sessions,
+1. **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22). Reads `table_structure` and `ddl` from two sessions,
    diffs the engine-neutral `TableStructure` values in `kerno-core`, and writes the migration with the
    dialect's `alter_table_sql` and `create_table_sql`. No new trait method; the diff is core code with unit
    tests.
-3. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
+2. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
    row identity the table view already computes, and merges the two streams. Applying differences reuses the
    pending-edit SQL and its transactional apply. No trait change.
-4. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
+3. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
    `LIMIT/OFFSET`; its output is SQL text in a query tab. No trait change.
-5. **SQLite** as the first engine beyond v1 (it needs no server). A new `Engine` variant and a
+4. **SQLite** as the first engine beyond v1 (it needs no server). A new `Engine` variant and a
    `kerno-sqlite` crate following the walkthrough in ARCHITECTURE.md. It stresses the trait where PostgreSQL
    and MySQL do not: there is no host, port, user or tunnel (`ConnectParams` and the connection form gain a
    file-path variant), `has_schemas` is false, cancel is an interrupt of the running statement, and
    `admin_query` returns `None` for the views it has no equivalent of.
-6. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
+5. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
    brings its own `Dialect` (quoting, `LIMIT` or `TOP`/`FETCH`, `explain`, `parse_plan`), its introspection
    queries, a `TypeKind` mapping and a cancel mechanism. Where a feature has no equivalent, the provided
    `Dialect` defaults refuse and the UI hides the entry (as it does for engines without schemas). If a new
    engine needs a capability the trait cannot express, add a method with a refusing default rather than a
    branch on the engine name in the UI.
-7. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
+6. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
    the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
-8. **AI assistant** (TOOL-24). Done in v1.1 (J17, D-068): opt-in (off until Settings → AI turns it on),
-   one OpenAI-compatible endpoint the user configures (local first: Ollama, LM Studio; a remote host must be
-   allowed once and use `https://`), only when the user asks. It reads the tab's `completion_catalog` for
-   context (names and types; rows only with the per-request tick) and its SQL is inserted, never run, so it
-   goes through the same guards as typed SQL. Left for later: streaming answers, per-connection opt-out,
-   tool calls. No trait change.
-9. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
+7. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
    migrations) and never carries secrets: those stay in the OS secret store. Opt-in, with a visible account.
-10. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
+8. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
     session capability, so it waits for a use for it.
+
+Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47; J18, D-069), read-only; still to come: editing the schema
+from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
+**AI assistant** (TOOL-24; J17, D-068), opt-in and local first; left for later: streaming answers, per-connection opt-out, tool calls.
+Their FEATURES rows are J18 and J17.
 
 ## Limits found on the way
 
@@ -65,10 +61,10 @@ v1.1 (CLAUDE.md §4 J, `docs/plans/M11.md`). What was left out, and why:
 - **PostGIS geometry viewer, role and sequence editors, row-level security in the navigator.** Real but
   smaller demand; the next round. Each is a view over catalog queries the drivers already have the shape
   for (`admin_query`, `table_structure`).
-- **Schema compare and data compare** (items 2 and 3 above), **notebooks, PRQL, an HTTP proxy for
+- **Schema compare and data compare** (items 1 and 2 above), **notebooks, PRQL, an HTTP proxy for
   connections, Emacs keys, real bind parameters.** Low demand in the sample.
 - **Other engines** (MongoDB, Oracle, SQL Server, ClickHouse, SQLite…). The biggest block of demand and out
-  of v1's scope: items 5 and 6 above, through the driver layer.
+  of v1's scope: items 4 and 5 above, through the driver layer.
 
 ## From the DBeaver inventory
 
@@ -147,7 +143,7 @@ The owner can pull any row back by naming its ID.
 | CON-18 | Keep-alive (database) | PG, My | Off by default in DBeaver; Kerno re-establishes a dropped connection (`a_lost_connection_is_re_established`) |
 | CON-19 | Close idle connection after N seconds | PG, My | Resource saving, not a daily need; needs an idle timer per connection |
 | CON-20 | Auto-close idle transactions | PG, My | Safety net for manual mode; Kerno already asks before closing a tab with an open transaction (M5 Part 4) Update: done since (D-044), an environment's "close idle transactions" rule. |
-| CON-26 | SSH: jump servers | PG, My | Beyond CLAUDE.md §4.A4 (one tunnel); bastion chains are uncommon |
+| CON-26 | SSH: jump servers | PG, My | Done in v1.1 (J2, D-056): the Jump host field and `ProxyJump` through the system OpenSSH client |
 | CON-27 | SSH: local / remote host and port overrides, connect timeout | PG, My | Automatic local port is enough for a client; rare settings |
 | CON-28 | SSH: share tunnel between connections | PG, My | Optimisation only |
 | CON-29 | SOCKS proxy and network profiles | PG, My | Not in CLAUDE.md §4.A; enterprise networks only |
@@ -180,7 +176,7 @@ The owner can pull any row back by naming its ID.
 | SQL-10 | Execute script natively (Alt+N) | PG, My | The client tools are used for backup / restore (M8 Part 3); running editor scripts through them adds little |
 | SQL-14 | Evaluate SQL expression | PG, My | Selecting `select <expr>` and running it does the same |
 | SQL-17 | Load execution plan | PG, My | Plan files from elsewhere are rare; raw output can be pasted |
-| SQL-20 | Multiple results per tab | PG, My | Layout preference; one tab per statement is the default in both apps |
+| SQL-20 | Multiple results per tab | PG, My | Done in v1.1 (J11): Settings ▸ Grid stacks a script's results in one panel; one tab per statement stays the default |
 | SQL-22 | Toggle editor layout | PG, My | Layout preference |
 | SQL-26 | Script variables and commands (`@set`, `@include`, `@echo`, `@export`, variables panel) | PG, My | DBeaver-specific script language; not standard SQL |
 | SQL-27 | Outline | PG, My | Nice-to-have for long scripts |

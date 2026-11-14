@@ -55,11 +55,24 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
   hides it.
 - A lazy schema navigator, a SQL editor with schema-aware completion, a streamed results grid, EXPLAIN as a
   plan tree, per-tab transactions, query history and saved queries.
+- In the editor, Tab accepts the highlighted completion as Enter does (Settings ▸ Editor, on by default); the
+  other occurrences of the word at the cursor are highlighted and Cmd+Shift+L selects them all; blocks fold
+  from the gutter; Cmd+plus, Cmd+minus, Cmd+0 and Cmd+wheel zoom the editor and the grids; Settings ▸ Editor
+  sets the formatter (keyword case, indentation, comma position, line width) and Format on save for `.sql`
+  files.
+- Tabs: a button at the right of the tab bar lists every open tab, and the View menu (or Settings ▸ Appearance) shows
+  them on several rows or in a list at the side. Settings ▸ Grid can stack the results of a multi-statement script one under the other in
+  a single panel, each with its own header, instead of one tab per statement.
 - Run script on connections… (editor menu, Run menu, palette, Query menu): tick connections or whole folders,
   and the script runs in a tab of its own on each, at most four at a time, under each connection's own rules
   (read-only refuses the writes, production asks first); a summary lists each one's outcome.
-- A table data view with inline editing, SQL review and one-transaction apply; structure views and a form
-  editor for tables.
+- A table data view with inline editing, SQL review and one-transaction apply; a pending value can be a SQL
+  expression (`now()`, `DEFAULT`, `gen_random_uuid()`), shown apart from a literal and unquoted in the review;
+  structure views and a form editor for tables, where the columns of a MySQL or MariaDB table can be moved
+  (`MODIFY ... AFTER` or `FIRST`, previewed); PostgreSQL cannot reorder columns and says so.
+- Cmd+F in a grid finds in the fetched rows (next, previous, matching rows only); a table's sort, hidden columns
+  and widths are remembered per connection and table; an integer that looks like a Unix time shows its date in
+  the value viewer.
 - Exports to CSV, TSV, JSON, NDJSON, SQL INSERT, Markdown and Excel (XLSX: numbers, booleans and dates as
   typed cells, a new sheet every 1,048,575 rows), streamed to disk with progress and cancel; CSV import, and a
   Tools submenu on databases, schemas and tables: backup, global
@@ -175,9 +188,10 @@ on its own within its 60 s timeout).
 Off by default. Turn it on with **Settings → Editor ▸ Vim mode** or the command **Toggle Vim Mode** (palette,
 Edit menu). While it is off nothing of it runs: the editor behaves exactly as without it.
 
-On, the SQL editors have vim's Normal, Insert, Visual (`v`) and Visual line (`V`) modes. The status bar shows
-the mode; in Normal mode the character under the cursor is shaded as a block (the editor's thin caret stays).
-What is supported, and nothing more:
+On, the editor of every query tab (scripts, and the sources of views and routines opened there) has vim's
+Normal, Insert, Visual (`v`) and Visual line (`V`) modes. The status bar shows the mode; in Normal mode the
+character under the cursor is shaded as a block (the editor's thin caret stays). What is supported, and
+nothing more:
 
 - **Motions**, with a count: `h j k l`, `w b e`, `0 ^ $`, `gg` and `G` (with a count, that line), `f{char}`
   and `t{char}` on the line, `%` (the matching bracket; brackets in strings and comments are text), Enter,

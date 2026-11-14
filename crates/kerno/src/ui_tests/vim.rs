@@ -98,6 +98,12 @@ fn ddp_swaps_two_lines_through_the_clipboard(cx: &mut TestAppContext) {
     assert_eq!(app.active_query(cx).1, "two\nthree");
     keys(&app, cx, "u");
     assert_eq!(app.active_query(cx).1, "one\ntwo\nthree");
+    // ⌃r redoes (no binding of Kerno's or the kit's takes it on macOS; on
+    // Linux vim takes Refresh Rows' Ctrl+R in Normal mode).
+    app.press(cx, &["ctrl-r"]);
+    assert_eq!(app.active_query(cx).1, "two\nthree");
+    keys(&app, cx, "u");
+    assert_eq!(app.active_query(cx).1, "one\ntwo\nthree");
     // Text copied elsewhere (⌘C) pastes as characters.
     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("X".into()));
     set_text(&app, cx, "ab", 0);

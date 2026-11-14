@@ -64,4 +64,4 @@ For every feature of §4, in this order:
 - `mysql` and `mysqldump` were thought missing: they are installed (Homebrew `mysql-client`, keg-only, not
   on `$PATH`); the backup tools find them in their fallback directories. Nothing to ask the owner.
 - Done on 2026-11-13: `cargo deny check` is clean with no ignored advisory (russh built without its `rsa`
-  feature; RSA key files and RSA-only host keys are refused, see DECISIONS D-013).
+  feature; RSA key files and RSA-only host keys are refused by the built-in client, see DECISIONS D-013; the OpenSSH client of v1.1 handles both, D-056).

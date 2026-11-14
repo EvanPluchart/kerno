@@ -41,8 +41,8 @@ key, `M1` and `COMMAND` are Cmd on macOS. Nothing was copied but names of comman
 
 **Left out** (brief): Eclipse workbench plumbing (perspectives, views layout, workspace and project
 resources, team / Git), PRO and Enterprise features, engines other than PostgreSQL and MySQL / MariaDB, the
-internals of the data-transfer wizards, ERD, dashboards, AI, debuggers, task scheduler and mock data. Each
-of those families has one roadmap row with its reason.
+internals of the data-transfer wizards, dashboards, debuggers, task scheduler and mock data (the ER diagram and the AI assistant
+were left out first and are built in v1.1, J18 and J17). Each of those families has one roadmap row with its reason.
 
 **Not read**: the entity editor's Java (`ui.editors.entity`, property pages are described from the
 navigator model and the engine plugins), the hex / image / JSON / XML value editors, the SQL formatter and
@@ -103,7 +103,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | CON-23 | SSH: save credentials | Keep SSH secrets or ask | net.ssh.ui `model_ssh_configurator_checkbox_save_pass` | PG, My | **done**: Secrets in the keychain or asked; `a_tunnelled_connection_asks_for_trust_then_for_each_missing_secret` |
 | CON-24 | SSH: keep-alive interval | Keep-alive packets on the tunnel | net.ssh.ui `model_ssh_configurator_label_keep_alive` | PG, My | **done**: `ssh_keepalive_is_passed_to_the_client` |
 | CON-25 | SSH: host key verification | Known-hosts check; option to bypass it | net.ssh.ui `model_ssh_configurator_label_bypass_verification` | PG, My | **done**: Fingerprint shown and trusted on first use, never bypassed; `an_unknown_ssh_host_is_shown_before_it_is_trusted` |
-| CON-26 | SSH: jump servers | Chain of SSH hosts before the target | net.ssh.ui `model_ssh_configurator_label_jump_server_edit_hint` | PG, My | **roadmap**: Beyond CLAUDE.md §4.A4 (one tunnel); bastion chains are uncommon |
+| CON-26 | SSH: jump servers | Chain of SSH hosts before the target | net.ssh.ui `model_ssh_configurator_label_jump_server_edit_hint` | PG, My | **done** (v1.1, J2, D-056): through the system OpenSSH client: the Jump host field (`ssh -J`) and `ProxyJump` chains from `~/.ssh/config`; `the_jump_host_field_goes_through_the_jump_host`, `a_proxyjump_alias_needs_no_other_field` |
 | CON-27 | SSH: local / remote host and port overrides, connect timeout | Fixed local port, other remote endpoint, tunnel timeout | net.ssh.ui `model_ssh_configurator_label_local_port`, `..._tunnel_timeout` | PG, My | **roadmap**: Automatic local port is enough for a client; rare settings |
 | CON-28 | SSH: share tunnel between connections | One tunnel reused by several connections | net.ssh.ui `model_ssh_configurator_label_share_tunnels` | PG, My | **roadmap**: Optimisation only |
 | CON-29 | SOCKS proxy and network profiles | Proxy handler and reusable network settings | ui.editors.connection `SocksProxyConfiguratorUI`, `PrefPageNetworkProfiles` | PG, My | **roadmap**: Not in CLAUDE.md §4.A; enterprise networks only |
@@ -218,7 +218,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | SQL-17 | Load execution plan | Opens a saved plan file | ui.editors.sql `load.plan` | PG, My | **roadmap**: Plan files from elsewhere are rare; raw output can be pasted |
 | SQL-18 | Next / previous query (Alt+Down / Alt+Up) | Moves the cursor between statements | ui.editors.sql `query.next`, `query.prev` | PG, My | **done**: Alt+Down / Alt+Up move between statements; `statements_are_reached_and_run_from_the_cursor` |
 | SQL-19 | Result tabs: close, close others / left / right / all, pin, rename, detach | Menu of the result tabs; pinned tabs survive the next run (Ctrl+Shift+P pins) | ui.editors.sql `SQLEditor` result tab menu, `toggle.pinned.tab`, `close.tab` | PG, My | **done**: Result tabs close, pin and rename from a right-click menu or a middle click; pinned ones survive the next run; `result_tabs_close_pin_and_rename`, `a_result_tab_closes_pins_and_names_as_in_dbeaver` |
-| SQL-20 | Multiple results per tab | All results in one scrollable tab | ui.editors.sql `multipleResultsPerTab` | PG, My | **roadmap**: Layout preference; one tab per statement is the default in both apps |
+| SQL-20 | Multiple results per tab | All results in one scrollable tab | ui.editors.sql `multipleResultsPerTab` | PG, My | **done** (v1.1, J11): Settings ▸ Grid "Show the results of a script one under the other in one panel"; one tab per statement stays the default; `the_results_of_a_script_stack_in_one_panel_on_every_engine` |
 | SQL-21 | Toggle / maximize results panel, switch panel | Hides, maximises, or focuses the results area | ui.editors.sql `toggle.result.panel`, `maximize.result.panel`, `switch.panel` | PG, My | **done**: Hide, maximise and focus the results panel; `the_results_panel_hides_maximizes_and_takes_the_keyboard` |
 | SQL-22 | Toggle editor layout | Results beside or below the editor | ui.editors.sql `toggleLayout` | PG, My | **roadmap**: Layout preference |
 | SQL-23 | Server output panel | Notices and warnings from the server | ui.editors.sql `show.output` | PG, My | **done**: Messages tab; `messages_errors_and_history_of_a_run` |
@@ -242,7 +242,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | SQL-41 | Open declaration (F4 / Ctrl+click) | Opens the object under the cursor | ui.editors.sql `navigate.object` | PG, My | **done**: F4 opens the rows, Shift+F4 the structure, of the table at the cursor (no Ctrl+click). `a_key_opens_the_rows_or_structure_of_the_table_at_the_cursor` |
 | SQL-42 | Bracket and quote auto-closing | Closes brackets, quotes and comments | ui.editors.sql prefs `SQLEDITOR_CLOSE_*` (true) | PG, My | **done**: `the_editor_closes_brackets_and_quotes` |
 | SQL-43 | Go to / select to matching bracket | Jumps between brackets | ui.editors.sql `gotoMatchingBracket`, `selectToMatchingBracket` | PG, My | **roadmap**: Editor-kit feature; low use |
-| SQL-44 | Foldings | Collapse blocks of the script | ui.editors.sql `FoldingsEnabled`, `ExpandAllFoldings` | PG, My | **roadmap**: Depends on the kit's editor |
+| SQL-44 | Foldings | Collapse blocks of the script | ui.editors.sql `FoldingsEnabled`, `ExpandAllFoldings` | PG, My | **roadmap**: folding from the gutter and Unfold All work (v1.1, J7); Fold / Fold all from the keyboard depend on the kit's editor (D-057) |
 | SQL-45 | Find / replace | Search in the script | Eclipse `findReplace` in the editor | PG, My | **done**: `find_in_editor`, `replace_in_editor`; `the_editor_searches_and_replaces` |
 | SQL-46 | Multi-cursor | Several carets | Eclipse text editor | PG, My | **done**: Cmd+Alt+Up / Down. `the_editor_adds_a_cursor_above_and_below` |
 | SQL-47 | Error position | Error shown with its position in the script | ui.editors.sql `SQLEditor` error handling | PG, My | **done**: `messages_errors_and_history_of_a_run` |
@@ -341,7 +341,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | OBJ-04 | Edit and save a table (Ctrl+S with SQL preview) | Changes persisted after a script preview | ui.editors.entity save; ui.navigator pref `NAVIGATOR_SHOW_SQL_PREVIEW` (true) | PG, My | **done**: Table form with live DDL; `a_table_is_altered_from_the_form_with_a_preview`, `the_form_refuses_what_is_invalid` |
 | OBJ-05 | Create table | New table editor | ui.navigator `core.object.create` on Tables | PG, My | **done**: `a_table_is_created_from_the_form` |
 | OBJ-06 | Columns, indexes, keys created from the editor | Add column / index / foreign key dialogs | engine `*Manager` classes (e.g. `PostgreTableColumnManager`) | PG, My | **done**: `a_table_is_altered_from_the_form_with_a_preview` |
-| OBJ-07 | Column order | Move columns (MySQL `AFTER`) | ext.mysql `MySQLTableColumnManager` | My | **roadmap**: Noted as not editable in M7; MySQL-only |
+| OBJ-07 | Column order | Move columns (MySQL `AFTER`) | ext.mysql `MySQLTableColumnManager` | My | **done** (v1.1, J8, D-062): arrows and Move up / Move down in the table form on MySQL and MariaDB, previewed as `AFTER` / `FIRST`; PostgreSQL cannot and says why; `columns_are_reordered_and_keep_their_definitions`, `columns_move_with_the_arrows_and_the_row_menu_on_mysql_and_mariadb` |
 | OBJ-08 | Edit view / function / procedure source and save | Source tab applied as CREATE OR REPLACE | ext.postgresql.ui `PostgreSourceViewEditor`; ext.mysql.ui `MySQLSourceViewEditor` | PG, My | **done**: Edit source; `editing_a_source_applies_it_once_its_sql_is_confirmed`, `a_materialized_view_whose_new_source_fails_is_kept` |
 | OBJ-09 | Edit trigger source | Trigger definition edited and saved | engine trigger managers | PG, My | **roadmap**: PostgreSQL trigger bodies are functions (editable); MySQL triggers are re-created from Show DDL |
 | OBJ-10 | DDL page | Read-only DDL of the object | ext.postgresql.ui `postgresql.source.ddl`; ext.mysql.ui `mysql.source.ddl` | PG, My | **done**: DDL sub-tab and Show DDL; `the_structure_of_a_table_is_shown_in_tabs` |
@@ -379,7 +379,7 @@ them in that order. The result-grid menu follows `ResultSetViewer.fillContextMen
 | TOOL-16 | Server settings | pg_settings / SHOW VARIABLES | ext.postgresql tree `PostgreSetting`; ext.mysql `sessionVariables`, `globalVariables` | PG, My | **done**: Server settings with a filter; `roles_and_their_grants_sizes_and_settings_are_listed` |
 | TOOL-17 | MySQL status, engines, charsets, collations, plugins | System information folders | ext.mysql tree `MySQLInformation` | My | **roadmap**: Available through SHOW statements in the editor |
 | TOOL-18 | Refresh publications (subscriptions) | Logical replication tool | ext.postgresql.ui `refreshSubscription` | PG | **roadmap**: Replication objects are outside CLAUDE.md §4 |
-| TOOL-19 | Data transfer beyond files | Database to database, XLSX, XML, HTML, Parquet and other formats | data.transfer.ui wizards and processors | PG, My | **roadmap**: Data-transfer wizards beyond CLAUDE.md §4.G (left out by the brief) |
+| TOOL-19 | Data transfer beyond files | Database to database, XLSX, XML, HTML, Parquet and other formats | data.transfer.ui wizards and processors | PG, My | **roadmap**: database to database (J13) and XLSX (J12) are done in v1.1; XML, HTML, Parquet and the other transfer wizards stay out (left out by the brief) |
 | TOOL-20 | Dashboards | Server activity charts | ui.dashboard | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-21 | Saved tasks and the Tasks view | Tool settings saved under a name, run again, edited, duplicated, deleted, with the last run's status and log | registry `TaskImpl`, `TaskManagerImpl`; tasks.ui `DatabaseTasksView`; tasks.native.ui | PG, My | **done**: "Save as task…" on the backup, global backup, restore and execute-script wizards, Tools ▸ Create new task…, the Tasks view (Run, Edit, Duplicate, Rename, Delete, Show log, right-click menu); no secret kept, the connection and its rules looked up at each run; `a_backup_task_is_saved_listed_run_again_edited_duplicated_and_deleted`, `a_task_whose_connection_was_deleted_says_so_and_cannot_run`, `a_task_keeps_no_password_and_asks_the_override_s_at_each_run`, `a_script_task_asks_before_each_run_and_follows_the_connection_s_rules`; core: `tasks_are_saved_listed_updated_run_and_deleted`, `a_store_at_version_2_gains_the_tasks_table_and_keeps_its_data`. Left: maintenance tools and exports as tasks (TOOL-31) |
 | TOOL-22 | Data compare, schema compare | Diff of data or structure | cmp.simple.ui (PRO for full compare) | PG, My | **roadmap**: Outside v1 (CLAUDE.md §4, last paragraph) |
@@ -628,17 +628,17 @@ One table per surface, entries in DBeaver's order (contribution groups of the po
 
 ## Summary
 
-Counts per status and per area, recounted from the rows above at HEAD `409c4fc` on 2026-11-13: 322 done, 96 roadmap, no row left as done untested, planned or gap (the counts at earlier commits were 169 done at `712b7cf`, 136 at `cee8bd2`). The 96 roadmap rows (the 67 accepted on 2026-11-13 included) are each in `docs/ROADMAP.md` with their reason, and `docs/plans/PARITY-GAPS.md` holds the work orders that closed the gaps.
+Counts per status and per area, recounted from the rows above at HEAD `409c4fc` on 2026-11-13: 322 done, 96 roadmap, no row left as done untested, planned or gap (the counts at earlier commits were 169 done at `712b7cf`, 136 at `cee8bd2`). The 96 roadmap rows (the 67 accepted on 2026-11-13 included) are each in `docs/ROADMAP.md` with their reason, and `docs/plans/PARITY-GAPS.md` holds the work orders that closed the gaps. The table below was recounted on 2026-11-14 after v1.1 (before: 326 done and 97 roadmap; after: 337 and 86; among the rows now done: the ER diagram and AI rows, SSH jump servers, multiple results per tab and column order).
 
 | Area | done | done, untested | planned | gap | roadmap | total |
 | ---- | --: | --: | --: | --: | --: | --: |
-| Connections | 37 | 0 | 0 | 0 | 15 | 52 |
-| Navigator | 41 | 0 | 0 | 0 | 18 | 59 |
-| SQL editor | 38 | 0 | 0 | 0 | 16 | 54 |
+| Connections | 40 | 0 | 0 | 0 | 12 | 52 |
+| Navigator | 42 | 0 | 0 | 0 | 17 | 59 |
+| SQL editor | 39 | 0 | 0 | 0 | 15 | 54 |
 | Results and data editing | 57 | 0 | 0 | 0 | 15 | 72 |
-| Object editors (structure) | 15 | 0 | 0 | 0 | 6 | 21 |
-| Tools and administration | 15 | 0 | 0 | 0 | 16 | 31 |
-| Context menus | 123 | 0 | 0 | 0 | 11 | 134 |
-| **All** | **326** | **0** | **0** | **0** | **97** | **423** |
+| Object editors (structure) | 17 | 0 | 0 | 0 | 4 | 21 |
+| Tools and administration | 18 | 0 | 0 | 0 | 13 | 31 |
+| Context menus | 124 | 0 | 0 | 0 | 10 | 134 |
+| **All** | **337** | **0** | **0** | **0** | **86** | **423** |
 
 CM-09 (Paste of a copied connection), CM-15 (Refresh on a folder), NAV-48 and CM-33, once gaps, are done: each row names its test.

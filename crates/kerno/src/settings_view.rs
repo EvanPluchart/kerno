@@ -542,7 +542,7 @@ impl SettingsView {
                 // J19 (DBeaver #37897, Beekeeper #317).
                 .child(Self::toggle(
                     "settings-vim-mode",
-                    "Vim mode: Normal, Insert and Visual modes in the SQL editors",
+                    "Vim mode: Normal, Insert and Visual modes in the query editor",
                     settings.vim_mode,
                     |settings, on| settings.vim_mode = on,
                 ))

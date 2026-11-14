@@ -73,7 +73,13 @@ impl VimEditor {
         self.text = None;
     }
 
-    fn text(&mut self, editor: &Entity<EditorState>, cx: &App) -> &str {
+    /// Reads the editor's text into [`Self::text`] when it changed.
+    // ponytail: staleness is known from `InputEvent::Change` (every edit of
+    // the app goes through `replace`/`replace_all`, which emit it) and the
+    // length; a `set_value` of the same length, which emits nothing, would
+    // go unseen. Compare the rope with the copy per key if one is ever used
+    // on the query editor (O(n) per key).
+    fn read_text(&mut self, editor: &Entity<EditorState>, cx: &App) {
         let rope = editor.read(cx).text();
         if self
             .text
@@ -82,7 +88,6 @@ impl VimEditor {
         {
             self.text = Some(rope.to_string());
         }
-        self.text.as_deref().unwrap_or_default()
     }
 
     /// Draws the block where Normal mode's cursor is (the editor notifies
@@ -93,8 +98,9 @@ impl VimEditor {
             (state.cursor(), !state.selected_range().is_empty())
         };
         let block = if self.vim.mode() == Mode::Normal && !selected {
-            let text = self.text(editor, cx).to_owned();
-            self.vim.block(&text, cursor)
+            self.read_text(editor, cx);
+            self.vim
+                .block(self.text.as_deref().unwrap_or_default(), cursor)
         } else {
             None
         };
@@ -124,10 +130,13 @@ impl VimEditor {
         cx: &App,
     ) -> Vec<Effect> {
         let cursor = editor.read(cx).cursor();
-        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
-        let text = self.text(editor, cx).to_owned();
+        // Only a paste (or `.` repeating one) reads the clipboard.
+        let clipboard = matches!(key, Key::Char('p' | 'P' | '.'))
+            .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
+            .flatten();
+        self.read_text(editor, cx);
         let buffer = Buffer {
-            text: &text,
+            text: self.text.as_deref().unwrap_or_default(),
             cursor,
             clipboard: clipboard.as_deref(),
             rules,
@@ -310,12 +319,20 @@ fn run(tab: &mut QueryTab, key: Key, window: &mut Window, cx: &mut Context<Query
     let Some(vim) = tab.vim.as_mut() else {
         return;
     };
+    // A key after `:wq` cancels its pending close (a Save As cancelled, a
+    // write that failed): a later ⌘S never closes the tab.
+    vim.close_after_save = false;
+    let before = vim.mode();
     let effects = vim.handle(key, &editor, rules, cx);
+    // The status bar shows the mode.
+    if vim.mode() != before {
+        window.refresh();
+    }
     apply(effects, cx.entity().downgrade(), window, cx);
 }
 
 /// Applies vim's effects once the key's handling is over (nothing of the
-/// tab is borrowed then), then redraws the block and the status bar.
+/// tab is borrowed then), then redraws the block.
 fn apply(effects: Vec<Effect>, tab: WeakEntity<QueryTab>, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |window, cx| {
         let Some(tab) = tab.upgrade() else {
@@ -382,8 +399,6 @@ fn apply(effects: Vec<Effect>, tab: WeakEntity<QueryTab>, window: &mut Window, c
             }
             cx.notify();
         });
-        // The status bar shows the mode.
-        window.refresh();
     });
 }
 
@@ -410,9 +425,9 @@ fn open_prompt(tab: &mut QueryTab, kind: char, window: &mut Window, cx: &mut Con
                         return;
                     };
                     let cursor = editor.read(cx).cursor();
-                    let text = vim.text(&editor, cx).to_owned();
+                    vim.read_text(&editor, cx);
                     let buffer = Buffer {
-                        text: &text,
+                        text: vim.text.as_deref().unwrap_or_default(),
                         cursor,
                         clipboard: None,
                         rules,
