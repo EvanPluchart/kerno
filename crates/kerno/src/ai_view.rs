@@ -1046,7 +1046,7 @@ impl Render for AiSettingsView {
                             Button::new(("ai-suggestion", index))
                                 .ghost()
                                 .xsmall()
-                                .label(SharedString::from(format!("{name} — {address}")))
+                                .label(SharedString::from(format!("{name}: {address}")))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.set_endpoint(address, window, cx)
                                 }))

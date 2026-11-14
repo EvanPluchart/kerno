@@ -1375,7 +1375,7 @@ impl TransferDialog {
                     .gap_2()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(div().w(px(24.)).child("Copy"))
+                    .child(div().w(px(32.)).flex_none().child("Copy"))
                     .child(div().w(px(200.)).child("Source column"))
                     .child(div().w(px(160.)).child("Target name"))
                     .child(div().w(px(160.)).child("Target type")),
@@ -1398,7 +1398,7 @@ impl TransferDialog {
                                 h_flex()
                                     .gap_2()
                                     .child(
-                                        div().w(px(24.)).child(
+                                        div().w(px(32.)).flex_none().child(
                                             Checkbox::new(("transfer-skip", index))
                                                 .checked(!column.skip)
                                                 .on_click(cx.listener(

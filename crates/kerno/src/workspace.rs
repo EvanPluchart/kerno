@@ -3681,13 +3681,13 @@ impl Workspace {
         });
         // The active tab's accent marker under its title: olive on light,
         // Lime on dark (the theme's primary).
-        let marker = if underline && index == self.active_tab {
+        let marker = if index == self.active_tab {
             cx.theme().primary
         } else {
             cx.theme().transparent
         };
-        // In the side list (no underline) the title may be cut: it ends in
-        // an ellipsis, on the element that holds the text.
+        // In the side list (`underline` false) the title may be cut: it ends
+        // in an ellipsis, on the element that holds the text.
         let text = div()
             .when(!underline, |text| text.min_w_0().truncate())
             .child(tab.label(cx));
@@ -3696,7 +3696,10 @@ impl Workspace {
             .h_full()
             .flex()
             .items_center()
-            .when(underline, |title| title.border_b_2().border_color(marker))
+            // The active tab's mark is the same in every layout: a line
+            // under its title (never a bar at the row's edge).
+            .border_b_2()
+            .border_color(marker)
             .when(!underline, |title| title.min_w_0())
             .test_support()
             .context_menu(self.menu(MenuOf::Tab(index), cx))
