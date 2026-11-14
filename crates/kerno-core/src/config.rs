@@ -957,67 +957,142 @@ pub fn bootstrap_refusal(sql: &str, engine: Engine) -> Option<&'static str> {
     plain(assigns && values(at + 1))
 }
 
-/// The file written by "export connections": settings only, no secrets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The file written by "export connections" (J15, DBeaver #22579):
+/// connections, the looks of their folders, environments and saved tasks,
+/// settings only. Never a password, a passphrase or anything else of the
+/// secret store, never a folder of this computer (local client, custom
+/// folder picture), never a password command's confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ConnectionsFile {
     /// Format marker, so another JSON file is not mistaken for this one.
     pub kerno_connections: u32,
     /// The connections.
-    pub connections: Vec<ConnectionConfig>,
+    pub connections: Vec<PortableConnection>,
     /// The looks of their folders, by path: colour and glyph, never a
     /// custom image (a file of this computer). Older files have none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub folders: BTreeMap<String, FolderLook>,
+    /// The user's environments and the built-ins they edited (version 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<EnvironmentDef>,
+    /// Saved tasks (version 2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<PortableTask>,
 }
 
-/// Version written in [`ConnectionsFile::kerno_connections`].
-const CONNECTIONS_FILE_VERSION: u32 = 1;
+/// A connection in a [`ConnectionsFile`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableConnection {
+    /// Its id where it was exported (version 2): an import that finds the
+    /// id replaces that connection, and its keychain entries are found by
+    /// it. Version 1 files have none; neither has an id that is not a UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(flatten)]
+    pub config: ConnectionConfig,
+}
 
-/// Serializes connections for export. Passwords and passphrases are not
-/// part of [`ConnectionConfig`], so the result cannot contain any.
+/// A saved task in a [`ConnectionsFile`]: its settings hold no secret
+/// (the authentication override keeps its user only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableTask {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The id of the connection it runs on.
+    pub connection_id: String,
+    /// That connection's engine, which decides what the tool's extra
+    /// arguments may hold.
+    pub engine: Engine,
+    pub settings: crate::tools::TaskSettings,
+}
+
+/// Version written in [`ConnectionsFile::kerno_connections`]: 2 added
+/// connection ids, environments and tasks. Version 1 files still import.
+const CONNECTIONS_FILE_VERSION: u32 = 2;
+
+/// Serializes connections for export, without ids. Passwords and
+/// passphrases are not part of [`ConnectionConfig`], so the result cannot
+/// contain any.
 pub fn export_connections(connections: &[ConnectionConfig]) -> Result<String> {
-    export_connections_with_folders(connections, &BTreeMap::new())
+    export_connections_file(ConnectionsFile {
+        connections: connections
+            .iter()
+            .map(|config| PortableConnection {
+                id: None,
+                config: config.clone(),
+            })
+            .collect(),
+        ..ConnectionsFile::default()
+    })
 }
 
-/// [`export_connections`] with the looks of the folders (see
-/// [`ConnectionsFile::folders`]).
-pub fn export_connections_with_folders(
-    connections: &[ConnectionConfig],
-    folders: &BTreeMap<String, FolderLook>,
-) -> Result<String> {
+/// Writes a connections file. What is this computer's only is dropped
+/// (local client folders, folder pictures, password command
+/// confirmations), as are the built-in environments left as shipped; a
+/// connection named like a secret option, or a task whose extra arguments
+/// hold a password, refuses the whole file.
+pub fn export_connections_file(file: ConnectionsFile) -> Result<String> {
     // The one free-form part of a connection is its options: refuse to
     // write a file if any of them is named like a secret.
-    for connection in connections {
-        connection.validate().map_err(|error| {
-            Error::Config(format!("connection \"{}\": {error}", connection.name))
+    for connection in &file.connections {
+        connection.config.validate().map_err(|error| {
+            Error::Config(format!(
+                "connection \"{}\": {error}",
+                connection.config.name
+            ))
         })?;
     }
-    // The client folder is this computer's choice: never exported.
-    let connections = connections
-        .iter()
-        .cloned()
-        .map(|mut connection| {
-            connection.client_dir = None;
-            // Confirmation is this computer's: an importer confirms again.
-            connection.password_command_unconfirmed = false;
-            connection
-        })
-        .collect();
-    serde_json::to_string_pretty(&ConnectionsFile {
+    check_tasks(&file.tasks)?;
+    let builtins = environment::builtin_environments();
+    let file = ConnectionsFile {
         kerno_connections: CONNECTIONS_FILE_VERSION,
-        connections,
-        folders: shared_looks(folders),
-    })
-    .map_err(|error| Error::Config(format!("could not encode the connections: {error}")))
+        connections: file
+            .connections
+            .into_iter()
+            .map(|mut connection| {
+                // The client folder is this computer's choice: never exported.
+                connection.config.client_dir = None;
+                // Confirmation is this computer's: an importer confirms again.
+                connection.config.password_command_unconfirmed = false;
+                connection
+            })
+            .collect(),
+        folders: shared_looks(&file.folders),
+        environments: file
+            .environments
+            .into_iter()
+            .filter(|def| !builtins.contains(def))
+            .collect(),
+        tasks: file.tasks,
+    };
+    serde_json::to_string_pretty(&file)
+        .map_err(|error| Error::Config(format!("could not encode the connections: {error}")))
+}
+
+/// A task whose extra arguments the tool refuses (a password among them)
+/// refuses the file.
+fn check_tasks(tasks: &[PortableTask]) -> Result<()> {
+    for task in tasks {
+        task.settings
+            .check(task.engine)
+            .map_err(|error| Error::Config(format!("task \"{}\": {error}", task.name)))?;
+    }
+    Ok(())
 }
 
 /// Reads an exported connections file. Every connection is validated; one
 /// bad entry rejects the file, naming it, rather than importing part of it.
 pub fn import_connections(json: &str) -> Result<Vec<ConnectionConfig>> {
-    Ok(import_connections_file(json)?.connections)
+    Ok(import_connections_file(json)?
+        .connections
+        .into_iter()
+        .map(|connection| connection.config)
+        .collect())
 }
 
-/// [`import_connections`] with the looks of the folders the file carries.
+/// [`import_connections`] with everything else the file carries: ids,
+/// folder looks, environments and tasks. Version 1 and 2 files.
 pub fn import_connections_file(json: &str) -> Result<ConnectionsFile> {
     let file: ConnectionsFile = serde_json::from_str(json)
         .map_err(|error| Error::Config(format!("this is not a Kerno connections file: {error}")))?;
@@ -1028,32 +1103,154 @@ pub fn import_connections_file(json: &str) -> Result<ConnectionsFile> {
         )));
     }
     for (index, connection) in file.connections.iter().enumerate() {
-        connection.validate().map_err(|error| {
+        connection.config.validate().map_err(|error| {
             Error::Config(format!(
                 "connection {} (\"{}\"): {error}",
                 index + 1,
-                connection.name
+                connection.config.name
             ))
         })?;
     }
-    // A file could otherwise point backups at programs someone else chose:
-    // the client folder is always this computer's own choice.
+    for (index, def) in file.environments.iter().enumerate() {
+        if def.id.trim().is_empty() || def.name.trim().is_empty() {
+            return Err(Error::Config(format!(
+                "environment {} needs an id and a name",
+                index + 1
+            )));
+        }
+    }
+    check_tasks(&file.tasks)?;
+    let mut ids = std::collections::HashSet::new();
     let connections = file
         .connections
         .into_iter()
         .map(|mut connection| {
-            connection.client_dir = None;
+            // Only a UUID can name a connection, once.
+            connection.id = connection
+                .id
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok() && ids.insert(id.clone()));
+            // A file could otherwise point backups at programs someone
+            // else chose: the client folder is this computer's own choice.
+            connection.config.client_dir = None;
             // A password command from a file runs only once the user has
             // seen it and confirmed it, whatever the file says.
-            connection.password_command_unconfirmed = !connection.password_source.is_stored();
+            connection.config.password_command_unconfirmed =
+                !connection.config.password_source.is_stored();
             connection
         })
         .collect();
+    let mut seen = std::collections::HashSet::new();
     Ok(ConnectionsFile {
         connections,
         folders: shared_looks(&file.folders),
+        environments: file
+            .environments
+            .into_iter()
+            .filter(|def| seen.insert(def.id.clone()))
+            .collect(),
         ..file
     })
+}
+
+/// What an import does with one item of a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportAction {
+    /// Nothing has its id (its name, for a task): it is added.
+    Add,
+    /// It replaces the item with the same id (name).
+    Replace,
+    /// The same item is there already: nothing changes.
+    Unchanged,
+}
+
+/// What importing a file changes, item by item, in the order of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPlan {
+    pub connections: Vec<ImportAction>,
+    pub environments: Vec<ImportAction>,
+    pub tasks: Vec<ImportAction>,
+}
+
+/// Compares a file with what this computer has.
+pub fn plan_import(
+    file: &ConnectionsFile,
+    connections: &[crate::storage::SavedConnection],
+    environments: &[EnvironmentDef],
+    tasks: &[crate::storage::SavedTask],
+) -> ImportPlan {
+    fn action<T: PartialEq>(existing: Option<T>, imported: T) -> ImportAction {
+        match existing {
+            None => ImportAction::Add,
+            Some(existing) if existing == imported => ImportAction::Unchanged,
+            Some(_) => ImportAction::Replace,
+        }
+    }
+    ImportPlan {
+        connections: file
+            .connections
+            .iter()
+            .map(|imported| {
+                let existing = imported.id.as_deref().and_then(|id| {
+                    connections
+                        .iter()
+                        .find(|saved| saved.id == id)
+                        .map(|saved| &saved.config)
+                });
+                // What is this computer's alone is not a change.
+                let existing = existing.map(|config| ConnectionConfig {
+                    client_dir: None,
+                    password_command_unconfirmed: imported.config.password_command_unconfirmed,
+                    ..config.clone()
+                });
+                action(existing.as_ref(), &imported.config)
+            })
+            .collect(),
+        environments: file
+            .environments
+            .iter()
+            .map(|imported| {
+                action(
+                    environments.iter().find(|def| def.id == imported.id),
+                    imported,
+                )
+            })
+            .collect(),
+        tasks: file
+            .tasks
+            .iter()
+            .map(|imported| {
+                let existing = tasks.iter().find(|task| task.name == imported.name);
+                action(
+                    existing.map(|task| (&task.description, &task.connection_id, &task.settings)),
+                    (
+                        &imported.description,
+                        &imported.connection_id,
+                        &imported.settings,
+                    ),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Whether `imported`, replacing `existing`, would send its password
+/// somewhere else: another engine, host, port, user or SSH tunnel. A
+/// keychain entry is then not linked without asking (a file could reuse a
+/// known id to collect a password).
+pub fn reaches_another_server(existing: &ConnectionConfig, imported: &ConnectionConfig) -> bool {
+    (
+        existing.engine,
+        &existing.host,
+        existing.port,
+        &existing.user,
+        &existing.ssh,
+    ) != (
+        imported.engine,
+        &imported.host,
+        imported.port,
+        &imported.user,
+        &imported.ssh,
+    )
 }
 
 /// The looks of folders as a connections file carries them: paths tidied,
@@ -1794,8 +1991,11 @@ mod tests {
             assert!(tricked.validate().is_err(), "{trick:?}");
             let file = serde_json::to_string(&ConnectionsFile {
                 kerno_connections: 1,
-                connections: vec![tricked],
-                folders: BTreeMap::new(),
+                connections: vec![PortableConnection {
+                    id: None,
+                    config: tricked,
+                }],
+                ..ConnectionsFile::default()
             })
             .unwrap();
             assert!(import_connections(&file).is_err(), "{trick:?}");
@@ -1840,7 +2040,7 @@ mod tests {
         let mut second = ConnectionConfig::new(Engine::MySql);
         second.name = "Billing".into();
         let exported = export_connections(&[first.clone(), second.clone()]).unwrap();
-        assert!(exported.contains("\"kerno_connections\": 1"), "{exported}");
+        assert!(exported.contains("\"kerno_connections\": 2"), "{exported}");
         for key in [
             "auto_commit",
             "default_schema",
@@ -1857,6 +2057,251 @@ mod tests {
             import_connections(&export_connections(&[]).unwrap()).unwrap(),
             []
         );
+    }
+
+    /// A task of the tool wizards, for the connections file tests.
+    fn backup_task(name: &str, connection_id: &str) -> PortableTask {
+        PortableTask {
+            name: name.into(),
+            description: String::new(),
+            connection_id: connection_id.into(),
+            engine: Engine::Postgres,
+            settings: crate::tools::TaskSettings::Backup(crate::tools::BackupOptions::new(
+                Engine::Postgres,
+                "shop",
+            )),
+        }
+    }
+
+    const ID: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+    /// J15 (DBeaver #22579): every field that could hold something of this
+    /// computer or a confirmation is filled, and none of it reaches the
+    /// file. Passwords and passphrases are not part of a connection at all
+    /// (the UI test checks the secret store's values end to end).
+    #[test]
+    fn nothing_secret_or_local_is_in_an_exported_file() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Shop".into();
+        config.client_dir = Some("/Users/ada/secret-client-dir".into());
+        config.password_source = PasswordSource::Command {
+            program: "vault".into(),
+            args: vec!["read".into()],
+            timeout_secs: 10,
+        };
+        // Confirmed on this computer.
+        config.password_command_unconfirmed = false;
+        let mut task = backup_task("nightly", ID);
+        if let crate::tools::TaskSettings::Backup(options) = &mut task.settings {
+            options.auth_user = Some("backup_user".into());
+        }
+        let exported = export_connections_file(ConnectionsFile {
+            connections: vec![PortableConnection {
+                id: Some(ID.into()),
+                config,
+            }],
+            folders: BTreeMap::from([(
+                "Work".to_string(),
+                FolderLook {
+                    color: Some("blue".into()),
+                    glyph: None,
+                    image: Some("secret-picture.png".into()),
+                },
+            )]),
+            tasks: vec![task],
+            ..ConnectionsFile::default()
+        })
+        .unwrap();
+        for leak in [
+            "secret-client-dir",
+            "client_dir",
+            "secret-picture.png",
+            "image",
+            "password_command_unconfirmed",
+            "\"password\":",
+            "passphrase",
+        ] {
+            assert!(!exported.contains(leak), "{leak}: {exported}");
+        }
+        // What is kept: the command (not a secret), the task's user.
+        assert!(exported.contains("vault") && exported.contains("backup_user"));
+        // A file that brings any of it back has it dropped.
+        let file = import_connections_file(&exported.replace(
+            "\"name\": \"Shop\"",
+            "\"name\": \"Shop\", \"client_dir\": \"/tmp/evil\", \"password_command_unconfirmed\": false",
+        ))
+        .unwrap();
+        assert_eq!(file.connections[0].config.client_dir, None);
+        assert!(file.connections[0].config.password_command_unconfirmed);
+
+        // A task holding a password in its extra arguments is refused both ways.
+        let mut leaky = backup_task("leaky", ID);
+        if let crate::tools::TaskSettings::Backup(options) = &mut leaky.settings {
+            options.extra_args = "--password=hunter2".into();
+        }
+        let error = export_connections_file(ConnectionsFile {
+            tasks: vec![leaky.clone()],
+            ..ConnectionsFile::default()
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("task \"leaky\""), "{error}");
+        let hostile = serde_json::to_string(&ConnectionsFile {
+            kerno_connections: 2,
+            tasks: vec![leaky],
+            ..ConnectionsFile::default()
+        })
+        .unwrap();
+        assert!(import_connections_file(&hostile).is_err());
+    }
+
+    /// J15: version 2 carries ids, environments and tasks; version 1 files
+    /// still import, with no id.
+    #[test]
+    fn version_two_round_trips_and_version_one_still_imports() {
+        let mut config = ConnectionConfig::new(Engine::MySql);
+        config.name = "Billing".into();
+        config.environment = "qa".into();
+        let mut production = environment::builtin_environments()[2].clone();
+        production.rules.confirm_execute = false;
+        let qa = EnvironmentDef {
+            id: "qa".into(),
+            name: "QA".into(),
+            color_light: Some("#336699".into()),
+            color_dark: None,
+            tint: environment::Tint::Soft,
+            rules: environment::EnvironmentRules::default(),
+        };
+        let mut environments = environment::builtin_environments();
+        environments[2] = production.clone();
+        environments.push(qa.clone());
+        let file = ConnectionsFile {
+            connections: vec![PortableConnection {
+                id: Some(ID.into()),
+                config: config.clone(),
+            }],
+            environments,
+            tasks: vec![backup_task("nightly", ID)],
+            ..ConnectionsFile::default()
+        };
+        let exported = export_connections_file(file.clone()).unwrap();
+        let imported = import_connections_file(&exported).unwrap();
+        assert_eq!(imported.kerno_connections, 2);
+        assert_eq!(imported.connections, file.connections);
+        // The built-ins left as shipped stay out.
+        assert_eq!(imported.environments, [production, qa]);
+        assert_eq!(imported.tasks, file.tasks);
+
+        // Version 1: no id, no environment, no task.
+        let old = r#"{"kerno_connections": 1, "connections": [{
+            "name": "Old", "engine": "postgres", "host": "db", "port": 5432, "user": "ada"}]}"#;
+        let imported = import_connections_file(old).unwrap();
+        assert_eq!(imported.connections[0].id, None);
+        assert_eq!(imported.connections[0].config.name, "Old");
+        assert!(imported.environments.is_empty() && imported.tasks.is_empty());
+
+        // An id that is not a UUID, or that comes twice, names nothing.
+        let twice = format!(
+            r#"{{"kerno_connections": 2, "connections": [
+            {{"id": "{ID}", "name": "A", "engine": "postgres", "host": "db", "port": 5432, "user": "u"}},
+            {{"id": "{ID}", "name": "B", "engine": "postgres", "host": "db", "port": 5432, "user": "u"}},
+            {{"id": "../../x", "name": "C", "engine": "postgres", "host": "db", "port": 5432, "user": "u"}}]}}"#
+        );
+        let ids: Vec<Option<String>> = import_connections_file(&twice)
+            .unwrap()
+            .connections
+            .into_iter()
+            .map(|connection| connection.id)
+            .collect();
+        assert_eq!(ids, [Some(ID.to_string()), None, None]);
+        // An environment without an id is refused.
+        let nameless = r#"{"kerno_connections": 2, "connections": [],
+            "environments": [{"id": " ", "name": "x"}]}"#;
+        assert!(import_connections_file(nameless).is_err());
+    }
+
+    #[test]
+    fn the_import_plan_says_what_is_added_replaced_or_unchanged() {
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Shop".into();
+        let other = "0f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+        let saved = [crate::storage::SavedConnection {
+            id: ID.into(),
+            config: ConnectionConfig {
+                // Only this computer's: not a change.
+                client_dir: Some("/opt/x".into()),
+                ..config.clone()
+            },
+        }];
+        let renamed = ConnectionConfig {
+            name: "Shop (prod)".into(),
+            ..config.clone()
+        };
+        let connection = |id: Option<&str>, config: &ConnectionConfig| PortableConnection {
+            id: id.map(str::to_string),
+            config: config.clone(),
+        };
+        let mut edited_local = environment::builtin_environments()[0].clone();
+        edited_local.name = "Laptop".into();
+        let mut task = backup_task("nightly", ID);
+        let stored = crate::storage::SavedTask::new("nightly", ID, task.settings.clone());
+        let file = ConnectionsFile {
+            connections: vec![
+                connection(Some(ID), &config),
+                connection(Some(ID), &renamed),
+                connection(Some(other), &config),
+                connection(None, &config),
+            ],
+            environments: vec![environment::builtin_environments()[1].clone(), edited_local],
+            tasks: vec![task.clone(), backup_task("weekly", ID)],
+            ..ConnectionsFile::default()
+        };
+        let plan = plan_import(
+            &file,
+            &saved,
+            &environment::builtin_environments(),
+            std::slice::from_ref(&stored),
+        );
+        use ImportAction::*;
+        assert_eq!(plan.connections, [Unchanged, Replace, Add, Add]);
+        assert_eq!(plan.environments, [Unchanged, Replace]);
+        assert_eq!(plan.tasks, [Unchanged, Add]);
+        task.description = "changed".into();
+        let file = ConnectionsFile {
+            tasks: vec![task],
+            ..file
+        };
+        assert_eq!(plan_import(&file, &saved, &[], &[stored]).tasks, [Replace]);
+
+        // A password goes only where it went.
+        assert!(!reaches_another_server(&config, &renamed));
+        for changed in [
+            ConnectionConfig {
+                host: "attacker.example".into(),
+                ..config.clone()
+            },
+            ConnectionConfig {
+                port: 6543,
+                ..config.clone()
+            },
+            ConnectionConfig {
+                user: "root".into(),
+                ..config.clone()
+            },
+            ConnectionConfig {
+                ssh: Some(SshConfig {
+                    host: "bastion".into(),
+                    port: 22,
+                    user: "ops".into(),
+                    auth: SshAuth::default(),
+                    keepalive_secs: 30,
+                    client: SshClient::Builtin,
+                    jump: None,
+                }),
+                ..config.clone()
+            },
+        ] {
+            assert!(reaches_another_server(&config, &changed), "{changed:?}");
+        }
     }
 
     #[test]
@@ -1884,11 +2329,18 @@ mod tests {
                 look(None, None, Some("fedcba9876543210.png")),
             ),
         ]);
-        let exported =
-            export_connections_with_folders(std::slice::from_ref(&connection), &folders).unwrap();
+        let exported = export_connections_file(ConnectionsFile {
+            connections: vec![PortableConnection {
+                id: None,
+                config: connection.clone(),
+            }],
+            folders: folders.clone(),
+            ..ConnectionsFile::default()
+        })
+        .unwrap();
         assert!(!exported.contains(".png"), "{exported}");
         let file = import_connections_file(&exported).unwrap();
-        assert_eq!(file.connections, [connection.clone()]);
+        assert_eq!(file.connections[0].config, connection);
         assert_eq!(
             file.folders,
             BTreeMap::from([(

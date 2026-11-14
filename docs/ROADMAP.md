@@ -121,7 +121,7 @@ v1 exports CSV, TSV, JSON, NDJSON, SQL INSERT and Markdown, and imports CSV.
 | -- | ---- | ---- | ---- |
 | RES-44 | Copy as ▸ HTML, XML, TXT, source code, DbUnit | PG, My | Data-transfer formats beyond CLAUDE.md §4.D3 / §4.G |
 | RES-68 | Open with | PG, My | Writes a temp file and launches another app; data-transfer feature beyond §4.G |
-| TOOL-19 | Data transfer beyond files | PG, My | Data-transfer wizards beyond CLAUDE.md §4.G (left out by the brief) |
+| TOOL-19 | Data transfer beyond files | PG, My | Database to database is done in v1.1 (J13, D-063: Tools ▸ Copy tables to another connection…); the other data-transfer wizards stay out |
 
 ### Other scope decisions
 

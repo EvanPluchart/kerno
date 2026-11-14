@@ -1388,7 +1388,7 @@ impl Navigator {
         // ticked.
         let tables = match (&entry, &node.kind) {
             (
-                ToolEntry::Backup | ToolEntry::NewTask,
+                ToolEntry::Backup | ToolEntry::NewTask | ToolEntry::CopyTables,
                 NodeKind::Object(ObjectRef::Relation(table, _)),
             ) => vec![table.clone()],
             _ => Vec::new(),
@@ -2262,6 +2262,9 @@ impl Navigator {
                 }
             },
             (Status::Connected { .. }, None) => vec![line(LINE_STATUS, "Connected")],
+            (Status::Connecting, _) if connections.reconnecting(connection) => {
+                vec![line(LINE_STATUS, "Connection lost: reconnecting…")]
+            }
             (Status::Connecting, _) => vec![line(LINE_STATUS, "Connecting…")],
             (Status::WaitingForInput, _) => vec![line(LINE_STATUS, "Waiting for your answer…")],
             // In plain words first, then the server's own (CLAUDE.md §3 item 5).
@@ -2857,6 +2860,9 @@ impl Navigator {
         let password_origin = connections.password_origin(&saved.id);
         let (state_label, state_color) = match connections.status(&saved.id) {
             Status::Disconnected => (config.engine.label(), theme.muted_foreground),
+            Status::Connecting if connections.reconnecting(&saved.id) => {
+                ("reconnecting…", theme.warning)
+            }
             Status::Connecting => ("connecting…", theme.muted_foreground),
             Status::WaitingForInput => ("waiting for you", theme.warning),
             Status::Connected { .. } => ("connected", theme.success),

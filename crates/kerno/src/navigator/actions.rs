@@ -383,6 +383,8 @@ pub enum ToolEntry {
     NewTask,
     /// The Tasks view.
     Tasks,
+    /// Copies tables with their data to another connection (J13).
+    CopyTables,
 }
 
 impl ToolEntry {
@@ -402,6 +404,7 @@ impl ToolEntry {
             Self::LockManager => "Lock manager".into(),
             Self::NewTask => "Create new task…".into(),
             Self::Tasks => "Tasks".into(),
+            Self::CopyTables => "Copy tables to another connection…".into(),
         }
     }
 
@@ -458,6 +461,9 @@ pub fn tool_entries(
         (GlobalBackup, has_schemas),
         (Restore, whole),
         (ExecuteScript, whole),
+        // It reads here and writes on the other connection: on an object
+        // of the tree only, never greyed by this one being read-only.
+        (CopyTables, backup && object.is_some()),
     ];
     let mut groups = vec![
         client_tools
@@ -1290,17 +1296,22 @@ mod tests {
         assert_eq!(
             tool_labels(Some(&database), &pg),
             with_tail(&[
-                "Back up…, Global backup…, Restore…, Execute script…",
+                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…",
                 "Analyze…, Vacuum…",
             ])
         );
         assert_eq!(
             tool_labels(Some(&schema), &pg),
-            with_tail(&["Back up…, Global backup…, Restore…, Execute script…"])
+            with_tail(&[
+                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…"
+            ])
         );
         assert_eq!(
             tool_labels(Some(&relation(RelationKind::Table)), &pg),
-            with_tail(&["Back up…, Global backup…", "Analyze…, Vacuum…, Truncate…"])
+            with_tail(&[
+                "Back up…, Global backup…, Copy tables to another connection…",
+                "Analyze…, Vacuum…, Truncate…"
+            ])
         );
         assert_eq!(
             tool_labels(Some(&relation(RelationKind::MaterializedView)), &pg),
@@ -1340,7 +1351,7 @@ mod tests {
         let mysql_tail = &tail[1..];
         assert_eq!(
             tool_labels(Some(&database), &mysql),
-            ["Back up…, Restore…, Execute script…"]
+            ["Back up…, Restore…, Execute script…, Copy tables to another connection…"]
                 .iter()
                 .chain(mysql_tail)
                 .map(|group| group.to_string())
@@ -1349,7 +1360,7 @@ mod tests {
         assert_eq!(
             tool_labels(Some(&relation(RelationKind::Table)), &mysql)[..2],
             [
-                "Back up…",
+                "Back up…, Copy tables to another connection…",
                 "Analyze…, Check…, Optimize…, Repair…, Truncate…"
             ]
         );
@@ -1384,6 +1395,7 @@ mod tests {
             (ToolEntry::LockManager, false),
             (ToolEntry::NewTask, false),
             (ToolEntry::Tasks, false),
+            (ToolEntry::CopyTables, false),
         ] {
             assert_eq!(entry.writes(), writes, "{entry:?}");
         }

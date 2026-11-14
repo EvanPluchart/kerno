@@ -101,6 +101,8 @@ pub enum TabAction {
     RunInNewTab,
     RunFromCursor,
     RunScript,
+    /// Runs the script on connections the user picks (J14).
+    RunOnConnections,
     Explain,
     ExplainAnalyze,
     CountRows,
@@ -192,6 +194,7 @@ impl TabAction {
             Self::RunInNewTab => "Run statement in new result tab",
             Self::RunFromCursor => "Run script from the cursor",
             Self::RunScript => "Run script",
+            Self::RunOnConnections => "Run script on connections…",
             Self::Explain => "Explain plan",
             Self::ExplainAnalyze => "Explain analyze",
             Self::CountRows => "Count rows of statement",
@@ -430,6 +433,7 @@ pub fn editor_menu(facts: EditorFacts, choices: &Choices) -> Vec<Entry> {
             vec![
                 Item(TabAction::RunInNewTab, run),
                 Item(TabAction::RunFromCursor, run),
+                Item(TabAction::RunOnConnections, empty),
                 Item(TabAction::ExplainAnalyze, run),
                 Separator,
                 Item(TabAction::CountRows, run),
@@ -527,6 +531,7 @@ pub fn run_menu(facts: EditorFacts) -> Vec<Entry> {
         Item(TabAction::RunFromCursor, run),
         Item(TabAction::RunScript, run),
         Item(TabAction::CountRows, run),
+        Item(TabAction::RunOnConnections, empty),
         Separator,
         Item(TabAction::NextStatement, empty),
         Item(TabAction::PreviousStatement, empty),
@@ -1011,7 +1016,7 @@ mod tests {
                 "Run script",
                 "Explain plan",
                 "Execute ▸ [Run statement in new result tab, Run script from the cursor, \
-                 Explain analyze, —, Count rows of statement, Fetch all rows (no rows left), \
+                 Run script on connections…, Explain analyze, —, Count rows of statement, Fetch all rows (no rows left), \
                  Export from query…, —, Active connection ▸ [local (current), prod (not connected)], \
                  Active database ▸ [kerno (current), other], Active schema ▸ [public, shop]]",
                 "—",
@@ -1115,6 +1120,7 @@ mod tests {
                 "Run script from the cursor",
                 "Run script",
                 "Count rows of statement",
+                "Run script on connections…",
                 "—",
                 "Go to next statement",
                 "Go to previous statement",

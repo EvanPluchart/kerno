@@ -231,27 +231,33 @@ fn folder_looks_travel_with_exported_connections(cx: &mut TestAppContext) {
         "{exported}"
     );
 
-    let import = |app: &Fixture, cx: &mut TestAppContext, count: usize| {
+    // The file keeps the connection's id (J15): imported where it came
+    // from, the connection is unchanged and only the looks are merged.
+    let import = |app: &Fixture, cx: &mut TestAppContext| {
         let (workspace, source) = (app.workspace.clone(), file.clone());
         app.step(cx, move |window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.import_connections_from(source, window, cx)
             });
         });
-        app.wait_until(cx, "the import", |app, cx| {
-            cx.update(|cx| app.connections.read(cx).saved().len() == count)
+        app.wait_until(cx, "the import preview", |app, cx| {
+            app.has(cx, "import-dialog")
         });
+        app.click(cx, "import-next");
+        app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
+        app.click(cx, "import-close");
+        assert_eq!(app.storage.connections().unwrap().len(), 1);
     };
     // A folder without a look takes the file's: colour and glyph.
     set(&app, cx, FolderLook::default());
-    import(&app, cx, 2);
+    import(&app, cx);
     assert_eq!(
         app.looks(cx),
         BTreeMap::from([("Work".to_string(), look(Some("blue"), Some("server"), None))])
     );
     // One that has a look keeps it.
     set(&app, cx, look(Some("red"), None, None));
-    import(&app, cx, 3);
+    import(&app, cx);
     assert_eq!(
         app.looks(cx),
         BTreeMap::from([("Work".to_string(), look(Some("red"), None, None))])

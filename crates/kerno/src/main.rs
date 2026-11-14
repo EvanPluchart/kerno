@@ -20,8 +20,10 @@ mod library;
 mod local_clients_view;
 mod logging;
 mod maintenance_dialog;
+mod multi_run;
 mod navigator;
 mod open_url;
+mod portability;
 mod query;
 mod quick_open;
 mod settings;
@@ -33,6 +35,7 @@ mod structure;
 mod tabs;
 mod tasks_view;
 mod theme;
+mod transfer_dialog;
 #[cfg(test)]
 mod ui_tests;
 mod update;
@@ -417,6 +420,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Run All Statements", RunAll),
                 MenuItem::action("Count Rows of Statement", actions::CountStatementRows),
                 command("export_from_query"),
+                command("run_script_on_connections"),
+                command("show_multi_run"),
                 separator(),
                 MenuItem::action("Explain Statement", ExplainStatement),
                 MenuItem::action("Explain Analyze", ExplainAnalyze),
@@ -520,6 +525,7 @@ fn menus() -> Vec<Menu> {
                         command("global_backup"),
                         MenuItem::action("Restore Database…", RestoreDatabase),
                         command("execute_script"),
+                        command("copy_tables"),
                         separator(),
                         command("foreign_data_wrappers"),
                         separator(),

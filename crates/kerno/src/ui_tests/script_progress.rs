@@ -65,12 +65,14 @@ fn a_script_shows_how_much_was_sent_and_cancels_at_once(cx: &mut TestAppContext)
     assert!(app.has(cx, "backup-progress"));
     assert!(paints(&app, cx, &of));
 
+    // The bench times the stop (`scripts/bench.sh --only import`); here it
+    // only has to come, well before the 40 s the client would take.
     let cancelled = Instant::now();
     app.tap(cx, "backup-cancel");
     let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
     assert!(state.contains("Cancelled"), "{state}");
     assert!(
-        cancelled.elapsed() < Duration::from_secs(2),
+        cancelled.elapsed() < Duration::from_secs(10),
         "{:?}",
         cancelled.elapsed()
     );

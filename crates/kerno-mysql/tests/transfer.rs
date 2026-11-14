@@ -823,3 +823,125 @@ async fn cancel_rolls_the_import_back() {
     )
     .await;
 }
+
+/// J12 (DBeaver #18393): a workbook with typed cells on MySQL and MariaDB,
+/// read back from the file. Numbers Excel cannot hold exactly and `TIME`
+/// spans stay text; a long text is cut and counted.
+#[tokio::test]
+async fn an_xlsx_workbook_keeps_the_types_excel_can_hold() {
+    use kerno_core::xlsx::XlsxOptions;
+    use kerno_core::xlsx::read::{ReadCell, read_sheets};
+    in_scratch("transfer_xlsx", |session, engine, database| async move {
+        exec_ok(
+            &session,
+            &format!(
+                "CREATE TABLE {database}.typed (id INT PRIMARY KEY, big BIGINT UNSIGNED, \
+                 price DECIMAL(20,7), ratio DOUBLE, small TINYINT(1), day DATE, at DATETIME, \
+                 ts TIMESTAMP NULL, clock TIME, kind ENUM('a','b'), uid CHAR(36), doc JSON, \
+                 raw VARBINARY(8), note LONGTEXT)"
+            ),
+        )
+        .await;
+        exec_ok(
+            &session,
+            &format!(
+                "INSERT INTO {database}.typed VALUES \
+                 (1, 42, 12.5, 0.1, 1, '2024-02-29', '2024-02-29 12:00:00', \
+                  '2024-02-29 12:00:00', '12:00:00', 'b', \
+                  '00000000-0000-4000-8000-000000000001', '{{\"a\": 1}}', X'deadbeef', '=1+1'), \
+                 (2, 18446744073709551615, 1234567890.1234567, -0.5, 0, '1899-12-31', NULL, \
+                  NULL, '838:59:59', NULL, NULL, NULL, NULL, REPEAT('x', 40000)), \
+                 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+            ),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.xlsx");
+        let written = export(
+            &session,
+            &format!("SELECT * FROM {database}.typed ORDER BY id"),
+            ExportFormat::Xlsx(XlsxOptions::default()),
+            Encoding::Utf8,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (written.rows, written.sheets, written.truncated),
+            (3, 1, 1),
+            "{engine:?}"
+        );
+        assert!(!tmp_of(&path).exists());
+
+        let sheets = read_sheets(&path);
+        assert_eq!(sheets[0].name, "Sheet1");
+        let rows = &sheets[0].rows;
+        assert_eq!(rows.len(), 4, "{engine:?}");
+        let text = |value: &str| ReadCell::Text(value.into());
+        let date = |serial: f64, code: &str| ReadCell::Date(serial, code.into());
+        assert_eq!(rows[0][&0], text("id"));
+        let first: Vec<ReadCell> = rows[1].values().cloned().collect();
+        assert_eq!(
+            first,
+            [
+                ReadCell::Number(1.0),
+                ReadCell::Number(42.0),
+                ReadCell::Number(12.5),
+                ReadCell::Number(0.1),
+                // TINYINT(1) is MySQL's boolean.
+                ReadCell::Bool(true),
+                date(45_351.0, "yyyy-mm-dd"),
+                date(45_351.5, "yyyy-mm-dd hh:mm:ss"),
+                date(45_351.5, "yyyy-mm-dd hh:mm:ss"),
+                date(0.5, "hh:mm:ss"),
+                text("b"),
+                text("00000000-0000-4000-8000-000000000001"),
+                text("{\"a\": 1}"),
+                text("\\xdeadbeef"),
+                text("=1+1"),
+            ],
+            "{engine:?}"
+        );
+        let second = &rows[2];
+        assert_eq!(second[&1], text("18446744073709551615"), "{engine:?}");
+        assert_eq!(second[&2], text("1234567890.1234567"), "{engine:?}");
+        assert_eq!(second[&3], ReadCell::Number(-0.5));
+        assert_eq!(second[&5], text("1899-12-31"), "{engine:?}");
+        assert_eq!(second[&8], text("838:59:59"), "{engine:?}");
+        let ReadCell::Text(note) = &second[&13] else {
+            panic!("{second:?}");
+        };
+        assert_eq!(note.len(), 32_767);
+        assert_eq!(rows[3].keys().collect::<Vec<_>>(), [&0], "{engine:?}");
+    })
+    .await;
+}
+
+/// J12: a cancelled workbook leaves nothing in the folder.
+#[tokio::test]
+async fn a_cancelled_xlsx_export_leaves_no_file() {
+    use kerno_core::xlsx::XlsxOptions;
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.xlsx");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let job = ExportJob {
+            sql: "SELECT * FROM kerno_analytics.big_table".into(),
+            format: ExportFormat::Xlsx(XlsxOptions::default()),
+            encoding: Encoding::Utf8,
+            path: path.clone(),
+        };
+        let outcome = export_to_file(
+            session.clone(),
+            job,
+            move |_| flag.store(true, Ordering::Release),
+            cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Err(Error::Cancelled)), "{outcome:?}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(scalar(&session, "SELECT 2").await, "2");
+    }
+}

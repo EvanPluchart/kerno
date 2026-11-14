@@ -94,6 +94,8 @@ struct ConfirmView {
     /// twice): the title names it and the connection.
     asked_by: Option<String>,
     armed: bool,
+    /// `run` was called: the confirmation was not declined.
+    confirmed: bool,
     run: Rc<Run>,
     _subscriptions: Vec<Subscription>,
 }
@@ -105,7 +107,28 @@ pub fn open(
     cx: &mut App,
     run: impl Fn(String, &mut Window, &mut App) + 'static,
 ) {
-    let view = cx.new(|cx| ConfirmView::new(confirmation, Rc::new(run), window, cx));
+    open_or_decline(confirmation, window, cx, run, |_| {});
+}
+
+/// As [`open`], and calls `declined` when the confirmation goes away without
+/// running (Cancel, Escape, a click beside it): a run on several connections
+/// skips that target (J14).
+pub fn open_or_decline(
+    confirmation: Confirmation,
+    window: &mut Window,
+    cx: &mut App,
+    run: impl Fn(String, &mut Window, &mut App) + 'static,
+    declined: impl FnOnce(&mut App) + 'static,
+) {
+    let view = cx.new(|cx| {
+        cx.on_release(|view: &mut ConfirmView, cx| {
+            if !view.confirmed {
+                cx.defer(declined);
+            }
+        })
+        .detach();
+        ConfirmView::new(confirmation, Rc::new(run), window, cx)
+    });
     let title = SharedString::from(view.read(cx).title());
     let focus = view.read(cx).name.clone();
     window.open_dialog(cx, move |dialog, _, _| {
@@ -177,6 +200,7 @@ impl ConfirmView {
             twice,
             asked_by,
             armed: false,
+            confirmed: false,
             run,
             _subscriptions: subscriptions,
         }
@@ -236,6 +260,7 @@ impl ConfirmView {
             cx.notify();
             return;
         }
+        self.confirmed = true;
         window.close_dialog(cx);
         (self.run)(sql, window, cx);
     }

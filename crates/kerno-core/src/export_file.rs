@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::exec::{self, ExecEvent, RowLimit};
 use crate::export::{ExportFormat, Exporter};
 use crate::result::{Column, RowBatch};
+use crate::xlsx::{XlsxOptions, XlsxWriter};
 
 /// The character encoding of a text file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub struct ExportJob {
     pub sql: String,
     /// What rows are written as.
     pub format: ExportFormat,
-    /// The file's encoding.
+    /// The file's encoding; a workbook ([`ExportFormat::Xlsx`]) has its own.
     pub encoding: Encoding,
     /// The file to write. Replaced only once the export succeeded.
     pub path: PathBuf,
@@ -53,8 +54,13 @@ pub struct ExportJob {
 pub struct ExportProgress {
     /// Rows written.
     pub rows: u64,
-    /// Bytes written, after encoding.
+    /// Bytes written, after encoding. A workbook is put together at the
+    /// end: 0 until then.
     pub bytes: u64,
+    /// Workbook only: sheets, and text cells cut at Excel's 32,767
+    /// characters.
+    pub sheets: u32,
+    pub truncated: u64,
 }
 
 /// Progress is reported after about this many rows.
@@ -221,6 +227,10 @@ fn write_file(
         error => error,
     };
     let file = File::create(target.tmp).map_err(cannot_write)?;
+    if let ExportFormat::Xlsx(options) = &target.format {
+        drop(file);
+        return write_workbook(&target, options, receiver, progress).map_err(write_error);
+    }
     let bytes = Cell::new(0);
     let mut out = Encoder::new(BufWriter::new(file), target.encoding, &bytes);
     out.start().map_err(cannot_write)?;
@@ -228,7 +238,7 @@ fn write_file(
         Some(Chunk::Columns(columns)) => columns,
         _ => return Err(Error::Cancelled),
     };
-    let mut exporter = Exporter::new(&mut out, target.format, &columns, session.dialect());
+    let mut exporter = Exporter::new(&mut out, target.format.clone(), &columns, session.dialect());
     let mut rows = 0;
     let mut reported = 0;
     loop {
@@ -246,6 +256,7 @@ fn write_file(
                     progress(ExportProgress {
                         rows,
                         bytes: bytes.get(),
+                        ..ExportProgress::default()
                     });
                 }
             }
@@ -255,15 +266,72 @@ fn write_file(
     }
     exporter.finish().map_err(write_error)?;
     drop(out);
+    move_into_place(&target)?;
+    let done = ExportProgress {
+        rows,
+        bytes: bytes.get(),
+        ..ExportProgress::default()
+    };
+    progress(done);
+    Ok(done)
+}
+
+/// Renames the complete temporary file to the target.
+fn move_into_place(target: &Target<'_>) -> Result<()> {
     fs::rename(target.tmp, target.path).map_err(|error| {
         Error::io(
             format!("cannot move the export to {}", target.path.display()),
             error,
         )
-    })?;
+    })
+}
+
+/// [`write_file`] for a workbook: rows go to the worksheets' temporary
+/// files as they arrive, and the workbook is saved to the temporary file
+/// once the result is complete. A cancelled export saves nothing; the
+/// worksheets' temporary files go with the writer.
+fn write_workbook(
+    target: &Target<'_>,
+    options: &XlsxOptions,
+    mut receiver: mpsc::Receiver<Chunk>,
+    progress: impl Fn(ExportProgress),
+) -> Result<ExportProgress> {
+    let columns = match receiver.blocking_recv() {
+        Some(Chunk::Columns(columns)) => columns,
+        _ => return Err(Error::Cancelled),
+    };
+    let mut writer = XlsxWriter::new(&columns, options)?;
+    let mut reported = 0;
+    let mut rows = 0;
+    loop {
+        match receiver.blocking_recv() {
+            Some(Chunk::Rows(batch)) => {
+                let mut cells = Vec::with_capacity(batch.column_count());
+                for row in 0..batch.row_count() {
+                    cells.clear();
+                    cells.extend((0..batch.column_count()).map(|column| batch.cell(row, column)));
+                    writer.write_row(&cells)?;
+                }
+                rows += batch.row_count() as u64;
+                if rows - reported >= PROGRESS_ROWS {
+                    reported = rows;
+                    progress(ExportProgress {
+                        rows,
+                        ..ExportProgress::default()
+                    });
+                }
+            }
+            Some(Chunk::Done) => break,
+            Some(Chunk::Columns(_)) | None => return Err(Error::Cancelled),
+        }
+    }
+    let report = writer.finish(target.tmp)?;
+    move_into_place(target)?;
     let done = ExportProgress {
-        rows,
-        bytes: bytes.get(),
+        rows: report.rows,
+        bytes: fs::metadata(target.path).map_or(0, |meta| meta.len()),
+        sheets: report.sheets,
+        truncated: report.truncated,
     };
     progress(done);
     Ok(done)

@@ -53,15 +53,24 @@ The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs
   hides it.
 - A lazy schema navigator, a SQL editor with schema-aware completion, a streamed results grid, EXPLAIN as a
   plan tree, per-tab transactions, query history and saved queries.
+- Run script on connections… (editor menu, Run menu, palette, Query menu): tick connections or whole folders,
+  and the script runs in a tab of its own on each, at most four at a time, under each connection's own rules
+  (read-only refuses the writes, production asks first); a summary lists each one's outcome.
 - A table data view with inline editing, SQL review and one-transaction apply; structure views and a form
   editor for tables.
-- CSV and other exports, CSV import, and a Tools submenu on databases, schemas and tables: backup, global
+- Exports to CSV, TSV, JSON, NDJSON, SQL INSERT, Markdown and Excel (XLSX: numbers, booleans and dates as
+  typed cells, a new sheet every 1,048,575 rows), streamed to disk with progress and cancel; CSV import, and a
+  Tools submenu on databases, schemas and tables: backup, global
   backup, restore and execute script as step wizards on the installed client tools (`pg_dump`, `pg_dumpall`,
   `pg_restore`, `psql`, `mysqldump`, `mysql`), analyze, vacuum, optimize, check and repair, foreign data
   wrappers, the session and lock managers. A wizard's settings can be saved as a named task and run again from the
   Tasks view (there is no scheduler). Settings ▸ Local clients lists every client install it finds, with its
   version, and lets you add a folder and choose the default per engine; a connection can use its own.
 - An administration view (sessions, roles, sizes, settings).
+- Copy tables with their rows to another connection, PostgreSQL, MySQL or MariaDB in any direction (Tools ▸
+  Copy tables to another connection…): the tables are created or appended to, each column's type mapped and
+  editable, what has no counterpart refused until skipped or typed, the SQL shown and confirmed, the rows
+  written in batches with progress, cancel and a report.
 
 Measurements: [docs/BENCH.md](docs/BENCH.md).
 
@@ -106,6 +115,18 @@ the front. `kerno --version` and `kerno --help` print and exit.
 
 Leave the password out of the URL: other programs running as your user can read a command line (`ps`). Without
 one, Kerno asks for it when the server wants it.
+
+## Move your setup to another computer
+
+**Export Connections…** (File menu, the sidebar's menu, the palette) writes a JSON file with what you tick:
+the connections (with their ids), the folders' colours and icons, your environments and the built-ins you
+edited, and the saved tasks. The environments your connections use always go with them. The file holds no
+password, passphrase or key, no local client folder and no folder picture. **Import Connections…** first lists
+what the file adds, replaces (same id; same name for a task) or leaves as it is, then asks for each connection
+written where its password comes from: **Enter now** (kept in the secret store), **Ask when connecting**, or,
+when the secret store already holds an entry under that connection's id (the same computer, another data
+directory), **Linked to the keychain entry**, without showing it. A connection that would now point at another
+server is never linked by itself. Files written by earlier versions still import.
 
 ## Install
 

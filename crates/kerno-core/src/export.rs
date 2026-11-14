@@ -1,5 +1,6 @@
 //! Writing rows out as CSV or TSV, JSON, Markdown or SQL `INSERT`
-//! statements: clipboard copies and file exports share this code.
+//! statements: clipboard copies and file exports share this code. Excel
+//! workbooks are written to files only, by [`crate::xlsx`].
 //!
 //! An [`Exporter`] writes each row as it is given: it holds one row of
 //! text at most, whatever the number of rows.
@@ -14,6 +15,7 @@ use crate::format::{compact_json, is_json_number, parse_bool};
 use crate::result::{Column, TypeKind};
 use crate::schema::{ColumnInfo, TableRef};
 use crate::sql::edits::CellValue;
+use crate::xlsx::XlsxOptions;
 
 /// How lines end in delimited text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +102,9 @@ pub enum ExportFormat {
         /// The table the statements insert into.
         table: TableRef,
     },
+    /// An Excel workbook with typed cells (see [`crate::xlsx`]). Written to
+    /// a file only ([`crate::export_file`]): an [`Exporter`] refuses it.
+    Xlsx(XlsxOptions),
 }
 
 /// An [`ExportFormat`] with what is worked out once per export.
@@ -117,6 +122,8 @@ enum Layout {
         /// The columns as the dialect wants them to write literals.
         columns: Vec<ColumnInfo>,
     },
+    /// A workbook, which is not text.
+    Workbook,
 }
 
 /// Writes rows to `W` in one [`ExportFormat`].
@@ -153,6 +160,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 array: false,
             },
             ExportFormat::Markdown => Layout::Markdown,
+            ExportFormat::Xlsx(_) => Layout::Workbook,
             // A statement cannot list no column: the row is all defaults.
             ExportFormat::SqlInsert { table } if columns.is_empty() => Layout::Insert {
                 head: format!("{};\n", dialect.insert_defaults(&table)),
@@ -189,6 +197,9 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// Fails when the writer does, or when `cells` does not have one cell
     /// per column; nothing is written in that second case.
     pub fn write_row(&mut self, cells: &[Option<&[u8]>]) -> Result<()> {
+        if let Layout::Workbook = self.layout {
+            return Err(not_text());
+        }
         if cells.len() != self.columns.len() {
             return Err(Error::io(
                 "export",
@@ -268,6 +279,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                     line.extend_from_slice(b");\n");
                 }
             }
+            Layout::Workbook => {}
         }
         self.writer.write_all(&self.line).map_err(write_error)?;
         self.rows += 1;
@@ -278,6 +290,9 @@ impl<'a, W: Write> Exporter<'a, W> {
     /// array, the header of a result without rows), flushes the writer and
     /// returns the number of rows written.
     pub fn finish(mut self) -> Result<u64> {
+        if let Layout::Workbook = self.layout {
+            return Err(not_text());
+        }
         self.line.clear();
         if self.rows == 0 {
             self.push_header();
@@ -324,6 +339,17 @@ impl<'a, W: Write> Exporter<'a, W> {
             _ => {}
         }
     }
+}
+
+/// An [`Exporter`] given [`ExportFormat::Xlsx`].
+fn not_text() -> Error {
+    Error::io(
+        "export",
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an Excel workbook is written to a file, not as text",
+        ),
+    )
 }
 
 fn write_error(error: io::Error) -> Error {
@@ -1124,5 +1150,17 @@ INSERT INTO "shop"."people" ("id", "name", "price", "active", "meta", "blob") VA
             .finish()
             .unwrap_err();
         assert!(matches!(error, Error::Io { .. }), "{error:?}");
+    }
+
+    /// J12: a workbook is not text: the clipboard path says so rather than
+    /// writing something else.
+    #[test]
+    fn a_workbook_is_refused_as_text() {
+        let columns = text_columns(&["a"]);
+        let xlsx = || ExportFormat::Xlsx(XlsxOptions::default());
+        let error = export_to_string(xlsx(), &columns, &AnsiDialect, [[cell("x")]]).unwrap_err();
+        assert!(error.to_string().contains("written to a file"), "{error}");
+        let empty: [[Option<&[u8]>; 1]; 0] = [];
+        assert!(export_to_string(xlsx(), &columns, &AnsiDialect, empty).is_err());
     }
 }

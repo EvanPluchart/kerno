@@ -183,7 +183,8 @@ struct Bench(Marks);
 
 impl Global for Bench {}
 
-fn active() -> bool {
+/// Whether the app runs in a bench mode.
+pub(crate) fn active() -> bool {
     BENCH.get().is_some()
 }
 

@@ -67,7 +67,7 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
         assert_eq!(
             database[..2],
             [
-                "Back up…, Global backup…, Restore…, Execute script…",
+                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…",
                 "Analyze…, Vacuum…",
             ]
         );
@@ -76,14 +76,17 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
         let schema_menu = app.tool_menu(cx, &schema);
         assert_eq!(
             schema_menu[0],
-            "Back up…, Global backup…, Restore…, Execute script…"
+            "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…"
         );
         assert_eq!(schema_menu[1..], tail);
         // A table lists what applies to a table, nothing greyed for its kind.
         let table_menu = app.tool_menu(cx, &table);
         assert_eq!(
             table_menu[..2],
-            ["Back up…, Global backup…", "Analyze…, Vacuum…, Truncate…"]
+            [
+                "Back up…, Global backup…, Copy tables to another connection…",
+                "Analyze…, Vacuum…, Truncate…"
+            ]
         );
         assert_eq!(table_menu[2..], tail);
         let matview_menu = app.tool_menu(cx, &matview);
@@ -108,7 +111,7 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
         assert_eq!(
             database[0],
             "Back up…, Global backup…, Restore… (read-only connection), Execute script… \
-             (read-only connection)"
+             (read-only connection), Copy tables to another connection…"
         );
         assert!(
             database[1].starts_with("Analyze… (read-only connection)"),
@@ -146,14 +149,14 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
         ];
         let database = app.tool_menu(cx, &[scratch]);
         assert_eq!(
-            database[0], "Back up…, Restore…, Execute script…",
+            database[0], "Back up…, Restore…, Execute script…, Copy tables to another connection…",
             "{engine:?}"
         );
         assert_eq!(database[1..], tail, "{engine:?}");
         assert_eq!(
             app.tool_menu(cx, &table)[..2],
             [
-                "Back up…",
+                "Back up…, Copy tables to another connection…",
                 "Analyze…, Check…, Optimize…, Repair…, Truncate…"
             ],
             "{engine:?}"

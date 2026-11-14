@@ -26,7 +26,34 @@ use crate::bridge;
 use crate::state::AppState;
 
 /// How often an open connection is checked.
-const KEEP_ALIVE: Duration = Duration::from_secs(30);
+const KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// How long a check may take. A check that times out is tried once more
+/// at once (a long catalog read on the same session holds it up); two in
+/// a row, or a check that fails, and the connection is lost: a connection
+/// that stopped answering is noticed within 10 s of the next check.
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one attempt to reconnect may take before the next one.
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The wait before reconnect attempt `attempt` (from 0): 0.5 s, 1 s, then
+/// every 2 s for about a minute, then every 5 s.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(match attempt {
+        0 => 500,
+        1 => 1_000,
+        2..30 => 2_000,
+        _ => 5_000,
+    })
+}
+
+/// A failure that may pass by itself: the server or the network is away.
+/// A refused login, a host key or a missing secret is not retried.
+fn passing(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Connect(_) | Error::Closed(_) | Error::Io { .. }
+    )
+}
 
 /// The drivers the app was built with, by engine.
 #[derive(Clone, Default)]
@@ -147,6 +174,8 @@ struct Runtime {
     keep_alive: Option<Task<()>>,
     /// Where the open connection's password came from, in words (J3).
     password_origin: Option<String>,
+    /// Reconnecting after a loss: the attempts that failed so far.
+    reconnect: Option<u32>,
 }
 
 /// The saved connections and their live state.
@@ -463,13 +492,6 @@ impl Connections {
             });
         })
         .detach();
-    }
-
-    /// Adds imported connections. They come without secrets.
-    pub fn import(&mut self, configs: Vec<ConnectionConfig>, cx: &mut Context<Self>) {
-        for config in configs {
-            self.save(None, config, Secrets::default(), None, false, cx);
-        }
     }
 
     /// The secrets of a connection, to edit it: the ones of this run, or
@@ -846,6 +868,7 @@ impl Connections {
         self.set_status(id, Status::Connecting, cx);
 
         let runtime = self.runtime.entry(id.to_string()).or_default();
+        let reconnecting = runtime.reconnect.is_some();
         let known_secrets = runtime.secrets.clone();
         let trusted_fingerprint = runtime.trusted_fingerprint.clone();
         let driver = self.drivers.get(saved.config.engine);
@@ -898,11 +921,26 @@ impl Connections {
                     let (config, secrets) = (config.clone(), secrets.clone());
                     let opening = cx.update(|cx| {
                         bridge::spawn(cx, async move {
-                            let connector = Arc::new(
-                                Connector::open(driver, config, secrets, &host_keys).await?,
-                            );
-                            let meta = connector.session(None).await?;
-                            Ok((connector, meta))
+                            let opening = async move {
+                                let connector = Arc::new(
+                                    Connector::open(driver, config, secrets, &host_keys).await?,
+                                );
+                                let meta = connector.session(None).await?;
+                                Ok((connector, meta))
+                            };
+                            if !reconnecting {
+                                return opening.await;
+                            }
+                            // A server that accepts but does not answer
+                            // (frozen, or behind a dead route): next attempt.
+                            tokio::time::timeout(RECONNECT_TIMEOUT, opening)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Connect(format!(
+                                        "the server did not answer within {} s",
+                                        RECONNECT_TIMEOUT.as_secs()
+                                    )))
+                                })
                         })
                     });
                     opening.await
@@ -920,6 +958,9 @@ impl Connections {
     }
 
     fn ask(&mut self, id: &str, request: InputRequest, cx: &mut Context<Self>) {
+        if let Some(runtime) = self.runtime.get_mut(id) {
+            runtime.reconnect = None;
+        }
         self.set_status(id, Status::WaitingForInput, cx);
         cx.emit(ConnectionsEvent::NeedsInput {
             id: id.to_string(),
@@ -934,6 +975,13 @@ impl Connections {
         outcome: Attempt,
         cx: &mut Context<Self>,
     ) {
+        let runtime = self.runtime.entry(id.to_string()).or_default();
+        match (&outcome, runtime.reconnect) {
+            (Err(error), Some(failed)) if passing(error) => {
+                return self.retry_later(id, failed, error, cx);
+            }
+            _ => runtime.reconnect = None,
+        }
         match outcome {
             Ok((connector, meta)) => {
                 let version = meta.server().version.clone();
@@ -1072,12 +1120,42 @@ impl Connections {
             return;
         };
         runtime.attempt = None;
+        runtime.reconnect = None;
         runtime.keep_alive = None;
         runtime.connector = None;
         runtime.password_origin = None;
         let meta = runtime.meta.take();
         close_all(meta, &runtime.opened, cx);
         self.set_status(id, Status::Disconnected, cx);
+    }
+
+    /// Whether the connection is being opened again after a loss (its
+    /// status is then [`Status::Connecting`]).
+    pub fn reconnecting(&self, id: &str) -> bool {
+        self.runtime
+            .get(id)
+            .is_some_and(|runtime| runtime.reconnect.is_some())
+    }
+
+    /// A reconnect attempt failed while the server is away: the next one
+    /// after [`retry_delay`], the status still "reconnecting" (Disconnect
+    /// drops the wait with the attempt).
+    fn retry_later(&mut self, id: &str, failed: u32, error: &Error, cx: &mut Context<Self>) {
+        let delay = retry_delay(failed);
+        tracing::info!(connection = id, attempt = failed + 1, ?delay, %error, "reconnect failed; retrying");
+        let runtime = self.runtime.entry(id.to_string()).or_default();
+        runtime.reconnect = Some(failed + 1);
+        let id = id.to_string();
+        runtime.attempt = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(runtime) = this.runtime.get_mut(&id) {
+                    runtime.status = Some(Status::Disconnected);
+                }
+                this.connect(&id, cx);
+            });
+        }));
+        cx.notify();
     }
 
     /// Checks the connection every [`KEEP_ALIVE`], and reconnects when the
@@ -1090,8 +1168,20 @@ impl Connections {
                 let Ok(Some(meta)) = this.read_with(cx, |this, _| this.meta_session(&id)) else {
                     return;
                 };
-                let ping = cx.update(|cx| bridge::spawn(cx, async move { meta.ping().await }));
-                if ping.await.is_err() {
+                let ping = cx.update(|cx| {
+                    bridge::spawn(cx, async move {
+                        // A timeout once may be a long read on this
+                        // session; twice, the server is not answering.
+                        for _ in 0..2 {
+                            match tokio::time::timeout(PING_TIMEOUT, meta.ping()).await {
+                                Ok(outcome) => return outcome.is_ok(),
+                                Err(_) => continue,
+                            }
+                        }
+                        false
+                    })
+                });
+                if !ping.await {
                     let _ = this.update(cx, |this, cx| this.connection_lost(&id, cx));
                     return;
                 }
@@ -1100,7 +1190,9 @@ impl Connections {
     }
 
     /// Called when a session of this connection reported that the server
-    /// is gone: reconnects once, with the secrets already known.
+    /// is gone, or a check went unanswered: reconnects with the secrets
+    /// already known, again and again while the server is away (see
+    /// [`retry_delay`]), until it is back or the user disconnects.
     pub fn connection_lost(&mut self, id: &str, cx: &mut Context<Self>) {
         if !matches!(self.status(id), Status::Connected { .. }) {
             return;
@@ -1112,6 +1204,7 @@ impl Connections {
             // Gone with the server, or left half-open: closed either way.
             close_all(runtime.meta.take(), &runtime.opened, cx);
             runtime.status = Some(Status::Disconnected);
+            runtime.reconnect = Some(0);
         }
         tracing::info!(connection = id, "connection lost; reconnecting");
         self.connect(id, cx);
@@ -1215,7 +1308,8 @@ fn close_all(meta: Option<Arc<dyn Session>>, opened: &Opened, cx: &App) {
     if !sessions.is_empty() {
         bridge::spawn(cx, async move {
             for session in sessions {
-                session.close().await;
+                // A server that stopped answering would hold the close.
+                let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
             }
         })
         .detach();

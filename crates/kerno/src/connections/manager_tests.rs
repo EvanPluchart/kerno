@@ -554,8 +554,9 @@ fn duplicate_import_and_delete(cx: &mut TestAppContext) {
     let mut imported = testing::config(Engine::Postgres);
     imported.name = "Imported".into();
     cx.update(|cx| {
-        app.connections
-            .update(cx, |c, cx| c.import(vec![imported], cx))
+        app.connections.update(cx, |c, cx| {
+            c.save(None, imported, Secrets::default(), None, false, cx)
+        })
     });
     wait_until(cx, "the import", |cx| {
         cx.update(|cx| app.connections.read(cx).saved().len()) == 3
@@ -766,8 +767,9 @@ fn folders_are_made_renamed_and_removed_with_what_they_hold(cx: &mut TestAppCont
     let mut imported = testing::config(Engine::Postgres);
     imported.group = Some("Import/Old".into());
     cx.update(|cx| {
-        app.connections
-            .update(cx, |c, cx| c.import(vec![imported], cx))
+        app.connections.update(cx, |c, cx| {
+            c.save(None, imported, Secrets::default(), None, false, cx)
+        })
     });
     wait_until(cx, "the import", |cx| folders(cx).len() == 5);
     assert_eq!(

@@ -48,19 +48,25 @@ mod environments;
 mod folders;
 mod grid_v11;
 mod menus;
+mod multi_run;
 mod open_url;
 mod openssh;
 mod password_sources;
+mod portability;
+mod reconnect;
 mod reorder;
 mod script_progress;
 mod sidebar_tree;
 mod tabs_v11;
 mod tasks;
+mod tool_passwords;
 mod tool_wizards;
 mod toolbar;
 mod tools_menu;
+mod transfer;
 mod updates;
 mod visual4;
+mod xlsx;
 
 struct Fixture {
     window: WindowHandle<Root>,
@@ -1003,16 +1009,21 @@ fn connections_are_exported_without_secrets_and_imported_back(cx: &mut TestAppCo
     assert!(exported.contains("test MySQL"), "{exported}");
     assert!(!exported.contains("export-me-not"));
 
+    // J15: the file keeps the connection's id, so importing it where it
+    // came from finds it unchanged and adds nothing.
     let (workspace, source) = (app.workspace.clone(), file.clone());
     app.step(cx, move |window, cx| {
         workspace.update(cx, |workspace, cx| {
             workspace.import_connections_from(source, window, cx)
         });
     });
-    app.wait_until(cx, "the import", |app, cx| {
-        cx.update(|cx| app.connections.read(cx).saved().len() == 2)
+    app.wait_until(cx, "the import preview", |app, cx| {
+        app.has(cx, "import-dialog")
     });
-    assert_eq!(app.storage.connections().unwrap().len(), 2);
+    app.click(cx, "import-next");
+    app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
+    app.click(cx, "import-close");
+    assert_eq!(app.storage.connections().unwrap().len(), 1);
 
     // A file that is not an export changes nothing.
     std::fs::write(&file, "{}").unwrap();
@@ -1023,7 +1034,8 @@ fn connections_are_exported_without_secrets_and_imported_back(cx: &mut TestAppCo
         });
     });
     cx.run_until_parked();
-    assert_eq!(app.storage.connections().unwrap().len(), 2);
+    assert!(!app.has(cx, "import-dialog"));
+    assert_eq!(app.storage.connections().unwrap().len(), 1);
 }
 
 #[gpui_kit::test]

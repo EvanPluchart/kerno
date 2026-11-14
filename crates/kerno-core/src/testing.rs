@@ -347,3 +347,198 @@ pub fn password_file(dir: &std::path::Path, name: &str, text: &str, mode: u32) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
         .expect("set the password file's permissions");
 }
+
+/// What a [`Proxy`] does with the traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// Passes it both ways.
+    Forward,
+    /// Closes every connection and every new one at once: the server went
+    /// away (a crash, a restart).
+    Drop,
+    /// Holds every byte, closing nothing, new connections included: the
+    /// server or the route stopped answering. Back to `Forward`, what was
+    /// held goes on.
+    BlackHole,
+}
+
+/// A TCP proxy on `127.0.0.1` in front of a test server, which a test
+/// breaks and mends ([`ProxyMode`]) without touching the shared container.
+/// It runs on a thread and a runtime of its own, so a test of any kind
+/// uses it; dropped, it closes everything.
+pub struct Proxy {
+    port: u16,
+    mode: tokio::sync::watch::Sender<ProxyMode>,
+}
+
+impl Proxy {
+    /// A proxy forwarding to `127.0.0.1:target`.
+    pub fn start(target: u16) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
+        let port = listener.local_addr().expect("the proxy's port").port();
+        let (mode, watching) = tokio::sync::watch::channel(ProxyMode::Forward);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the proxy's runtime");
+            runtime.block_on(proxy_accept(listener, target, watching));
+        });
+        Self { port, mode }
+    }
+
+    /// The port to connect to instead of the server's.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Breaks or mends the traffic.
+    pub fn set(&self, mode: ProxyMode) {
+        self.mode.send_replace(mode);
+    }
+}
+
+async fn proxy_accept(
+    listener: std::net::TcpListener,
+    target: u16,
+    mut mode: tokio::sync::watch::Receiver<ProxyMode>,
+) {
+    let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
+        return;
+    };
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((client, _)) = accepted else { continue };
+                if *mode.borrow() == ProxyMode::Drop {
+                    continue; // closed at once
+                }
+                let watching = mode.clone();
+                tokio::spawn(async move {
+                    let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                    else {
+                        return;
+                    };
+                    let (client_read, client_write) = client.into_split();
+                    let (server_read, server_write) = server.into_split();
+                    tokio::join!(
+                        proxy_pump(client_read, server_write, watching.clone()),
+                        proxy_pump(server_read, client_write, watching),
+                    );
+                });
+            }
+            // The proxy was dropped: everything closes with the runtime.
+            changed = mode.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
+/// Waits while black-holed; `false` once the traffic must be dropped.
+async fn proxy_open(mode: &mut tokio::sync::watch::Receiver<ProxyMode>) -> bool {
+    loop {
+        match *mode.borrow_and_update() {
+            ProxyMode::Forward => return true,
+            ProxyMode::Drop => return false,
+            ProxyMode::BlackHole => {}
+        }
+        if mode.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+async fn proxy_pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    mut mode: tokio::sync::watch::Receiver<ProxyMode>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        if !proxy_open(&mut mode).await {
+            return;
+        }
+        tokio::select! {
+            read = from.read(&mut buffer) => {
+                let read = match read {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                // Held, not lost, if the hole opened meanwhile.
+                if !proxy_open(&mut mode).await
+                    || to.write_all(&buffer[..read]).await.is_err()
+                {
+                    return;
+                }
+            }
+            changed = mode.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    /// An echo server, the proxy in front, each mode in turn.
+    #[test]
+    fn the_proxy_forwards_drops_and_holds() {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = echo.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in echo.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buffer = [0; 64];
+                    while let Ok(read) = stream.read(&mut buffer) {
+                        if read == 0 || stream.write_all(&buffer[..read]).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let proxy = Proxy::start(target);
+        let connect = || {
+            let stream = TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            stream
+        };
+        let echoes = |stream: &mut TcpStream, text: &[u8]| -> std::io::Result<Vec<u8>> {
+            stream.write_all(text)?;
+            let mut buffer = vec![0; text.len()];
+            stream.read_exact(&mut buffer)?;
+            Ok(buffer)
+        };
+        let mut first = connect();
+        assert_eq!(echoes(&mut first, b"one").unwrap(), b"one");
+
+        proxy.set(ProxyMode::BlackHole);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(echoes(&mut first, b"two").is_err(), "held");
+        proxy.set(ProxyMode::Forward);
+        let mut late = vec![0; 3];
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        first.read_exact(&mut late).unwrap();
+        assert_eq!(late, b"two", "what was held goes on");
+
+        proxy.set(ProxyMode::Drop);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut rest = [0; 8];
+        assert!(matches!(first.read(&mut rest), Ok(0) | Err(_)), "closed");
+        let mut refused = connect();
+        assert!(echoes(&mut refused, b"x").is_err(), "a new one too");
+
+        proxy.set(ProxyMode::Forward);
+        let mut again = connect();
+        assert_eq!(echoes(&mut again, b"back").unwrap(), b"back");
+    }
+}

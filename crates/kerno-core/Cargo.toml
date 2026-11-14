@@ -10,7 +10,8 @@ workspace = true
 
 [features]
 # Facts about the kerno-* test containers, for integration tests.
-test-support = []
+# `xlsx::read`, which unzips a workbook in tests.
+test-support = ["dep:zip"]
 
 [dependencies]
 tokio.workspace = true
@@ -27,6 +28,9 @@ rusqlite.workspace = true
 directories.workspace = true
 uuid.workspace = true
 keyring.workspace = true
+rust_xlsxwriter.workspace = true
+# Already in the tree through rust_xlsxwriter.
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
 # The crate's own integration tests use its test support.

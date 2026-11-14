@@ -76,6 +76,7 @@ use crate::connections::manager::{Connections, ConnectionsEvent, Status};
 use crate::data::tab::{AutoRefresh, auto_refresh_button, history_button};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
+use crate::multi_run::{ScriptRun, Stage};
 use crate::sql_confirm::{self, Confirmation, Statement as ConfirmStatement};
 use crate::state::AppState;
 use crate::tabs::{self, Choices, EditorFacts, ResultFacts, TabAction, TabSnapshot, Target};
@@ -87,6 +88,9 @@ struct Statement {
     /// Byte offset of the statement in the editor's text, when it runs as
     /// written there.
     origin: Option<usize>,
+    /// Why it is not sent: a write on a read-only target of a run on
+    /// several connections (J14), shown in its place.
+    refused: Option<Failure>,
 }
 
 /// How a statement ended.
@@ -173,6 +177,24 @@ impl From<&Error> for Failure {
                 position: None,
             },
         }
+    }
+}
+
+/// What a statement cut off by a lost connection says: it is never run
+/// again by Kerno (a write could happen twice).
+pub const LOST_WHILE_RUNNING: &str = "The connection closed while this statement ran. Kerno does \
+                                      not run it again: whether the server applied it is not \
+                                      known, so check before you run it again.";
+
+/// The failure of a statement cut off by a lost connection, the driver's
+/// words as the detail.
+fn lost_failure(error: Option<&Error>) -> Failure {
+    Failure {
+        message: LOST_WHILE_RUNNING.into(),
+        code: None,
+        detail: error.map(|error| error.to_string()),
+        hint: Some("The connection is opened again by itself.".into()),
+        position: None,
     }
 }
 
@@ -295,6 +317,20 @@ pub struct TabStatus {
 /// Why the changes of a result are not applied after the tab moved.
 const MOVED_AWAY: &str = "The tab now runs on another connection or database than these rows were \
                           read on: discard their changes, or switch back.";
+
+/// Why a statement that writes was not sent on the read-only connection
+/// named `connection`.
+fn read_only_failure(connection: &str) -> Failure {
+    Failure {
+        message: format!(
+            "“{connection}” is a read-only connection: this statement would change the database and was not run."
+        ),
+        code: None,
+        detail: None,
+        hint: Some("Untick “Read-only” in the connection's settings to allow changes.".into()),
+        position: None,
+    }
+}
 
 /// A statement on one line, cut short: enough to tell which one it is.
 fn one_line(statement: &str) -> String {
@@ -441,6 +477,8 @@ pub struct QueryTab {
     /// The rollback of a transaction left idle, armed for the length of
     /// its log and the environment's period (see `watch_idle_transaction`).
     idle_rollback: Option<((usize, u32), Task<()>)>,
+    /// The run on several connections this tab took part in (J14).
+    script: Option<ScriptRun>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -604,6 +642,7 @@ impl QueryTab {
             brackets,
             occurrences,
             idle_rollback: None,
+            script: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
         // Every change of the tab may start, restart or stop the wait for
@@ -765,6 +804,18 @@ impl QueryTab {
             notices: self.notices.len(),
             pending: self.pending_count(cx),
         }
+    }
+
+    /// The messages of the failed statements of the last run; for tests.
+    #[cfg(test)]
+    pub fn failures(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter_map(|pane| match &pane.outcome {
+                Outcome::Failed(failure) => Some(failure.message.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// What each statement of the last run produced, in words; for tests.
@@ -959,6 +1010,25 @@ impl QueryTab {
         if self.connected(cx) || self.tx_state() == TxState::Idle {
             return;
         }
+        self.report_rolled_back(window, cx);
+    }
+
+    /// A statement of this tab found the connection gone: an open
+    /// transaction is reported lost, the session dropped, and the
+    /// connection opened again (CLAUDE.md §4 A5). Nothing runs again.
+    fn lost_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tx_state() != TxState::Idle {
+            self.report_rolled_back(window, cx);
+        }
+        self.activity = Activity::Idle;
+        self.close_session(cx);
+        if let Some(id) = self.connection_id().map(str::to_string) {
+            self.connections
+                .update(cx, |connections, cx| connections.connection_lost(&id, cx));
+        }
+    }
+
+    fn report_rolled_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = "The connection closed while this tab's transaction was open: the server \
                        rolled it back, and nothing of it was committed.";
         self.notices.push(Notice {
@@ -984,6 +1054,17 @@ impl QueryTab {
             return;
         };
         if !self.connected(cx) {
+            // A statement still running is cut off: said, never run again.
+            if self.run.is_some() && matches!(self.activity, Activity::Running { .. }) {
+                self.push_pane(
+                    String::new(),
+                    Outcome::Failed(lost_failure(None)),
+                    None,
+                    None,
+                );
+                self.active_result = self.results.len() - 1;
+                self.show_results();
+            }
             self.stop(cx);
             self.close_session(cx);
             self.complete_with(None, cx);
@@ -1325,6 +1406,7 @@ impl QueryTab {
         let from = |source: &str, base: usize, span: &kerno_core::sql::StatementSpan| Statement {
             sql: span.text(source).to_string(),
             origin: Some(base + span.range.start),
+            refused: None,
         };
         if scope != Scope::FromCursor
             && let Some(selected) = text.get(selection.clone())
@@ -1618,6 +1700,8 @@ impl QueryTab {
     fn stop(&mut self, cx: &mut Context<Self>) {
         // Dropping the run drops the execution, which stops the statement.
         if self.run.take().is_some() {
+            // A target of a run on several connections stops with it (J14).
+            self.end_script(Stage::Cancelled, None, cx);
             for pane in &mut self.results {
                 // A result kept from an earlier run stays complete.
                 if let Outcome::Rows(grid) = &pane.outcome
@@ -1650,13 +1734,15 @@ impl QueryTab {
         }
         // A run waiting for its connection is simply forgotten.
         if self.pending.take().is_some() {
+            self.end_script(Stage::Cancelled, None, cx);
             cx.notify();
             return;
         }
         if !matches!(self.activity, Activity::Running { .. }) {
             // Nothing is being computed; a result waiting to be paged is
-            // simply let go.
+            // simply let go. A target not yet running stops too (J14).
             self.stop(cx);
+            self.end_script(Stage::Cancelled, None, cx);
             cx.notify();
             return;
         }
@@ -1682,6 +1768,42 @@ impl QueryTab {
     /// statement is run and the plan carries what really happened.
     pub fn explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.launch(Scope::AtCursor, Some(analyze), false, window, cx);
+    }
+
+    /// Runs the whole text as one target of a run on several connections
+    /// (J14), through the usual path (connect, confirmations, history). Two
+    /// differences: on a read-only connection each write is refused in its
+    /// place and the other statements run; with `continue_on_error` an error
+    /// does not stop the statements after it.
+    // ponytail: a run the user starts in this tab while it is still a target
+    // counts as part of the script; mark the user's own runs if that matters.
+    pub(crate) fn run_script(
+        &mut self,
+        continue_on_error: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.script = Some(ScriptRun::new(continue_on_error));
+        self.launch(Scope::All, None, false, window, cx);
+        cx.notify();
+    }
+
+    /// Where this tab's part of a run on several connections stands.
+    pub(crate) fn script(&self) -> Option<&ScriptRun> {
+        self.script.as_ref()
+    }
+
+    /// The run on several connections in progress here, if any.
+    fn scripting(&mut self) -> Option<&mut ScriptRun> {
+        self.script.as_mut().filter(|script| script.active())
+    }
+
+    /// Ends this tab's part of a run on several connections.
+    fn end_script(&mut self, stage: Stage, error: Option<String>, cx: &mut Context<Self>) {
+        if let Some(script) = self.scripting() {
+            script.end(stage, error);
+            cx.notify();
+        }
     }
 
     /// When the tab's saved connection is closed: opens it, with its usual
@@ -1803,6 +1925,7 @@ impl QueryTab {
         self.explain_mode = explain;
         self.keep_results = keep;
         if statements.is_empty() {
+            self.end_script(Stage::Done, None, cx);
             return;
         }
         self.clear_error_mark(cx);
@@ -1884,6 +2007,7 @@ impl QueryTab {
                         } else {
                             None
                         },
+                        refused: None,
                     })
                     .collect();
                 let typed: Vec<(String, String)> = labels
@@ -1944,11 +2068,21 @@ impl QueryTab {
             })
             .collect();
         let name = saved.config.name.clone();
+        let mut statements = statements;
         if saved.config.read_only
             && let Some(blocked) = classes.iter().position(|class| class.writes)
         {
-            self.refuse_read_only(&statements[blocked].sql, &name, cx);
-            return;
+            if self.script.as_ref().is_none_or(|script| !script.active()) {
+                self.refuse_read_only(&statements[blocked].sql, &name, cx);
+                return;
+            }
+            // One target of a run on several connections (J14): each write
+            // is refused in its place, and the reads still run.
+            for (statement, class) in statements.iter_mut().zip(&classes) {
+                if class.writes {
+                    statement.refused = Some(read_only_failure(&name));
+                }
+            }
         }
         // Statements that destroy something are shown and confirmed first;
         // so is anything that writes where the environment asks twice, and
@@ -1961,17 +2095,18 @@ impl QueryTab {
         let to_confirm: Vec<(&Statement, &StatementClass)> = statements
             .iter()
             .zip(&classes)
-            .filter(|(_, class)| {
-                ask_all
-                    || (class.destructive && ask_destructive)
-                    || (asks.confirm_writes_twice && class.writes)
+            .filter(|(statement, class)| {
+                statement.refused.is_none()
+                    && (ask_all
+                        || (class.destructive && ask_destructive)
+                        || (asks.confirm_writes_twice && class.writes))
             })
             .collect();
         if to_confirm.is_empty() {
             self.start(statements, false, window, cx);
             return;
         }
-        let destructive = classes.iter().any(|class| class.destructive);
+        let destructive = to_confirm.iter().any(|(_, class)| class.destructive);
         let writes = to_confirm.iter().any(|(_, class)| class.writes);
         let confirmation = Confirmation {
             title: match to_confirm.len() {
@@ -2001,12 +2136,33 @@ impl QueryTab {
             writes,
         };
         let view = cx.entity();
-        sql_confirm::open(confirmation, window, cx, move |_, window, cx| {
-            let statements = statements.clone();
-            view.update(cx, |this, cx| this.start(statements, false, window, cx));
-            let editor = view.read(cx).focus_handle(cx);
-            window.defer(cx, move |window, cx| editor.focus(window, cx));
-        });
+        let declined = cx.weak_entity();
+        if let Some(script) = self.scripting() {
+            script.stage = Stage::Asking;
+        }
+        sql_confirm::open_or_decline(
+            confirmation,
+            window,
+            cx,
+            move |_, window, cx| {
+                let statements = statements.clone();
+                view.update(cx, |this, cx| this.start(statements, false, window, cx));
+                let editor = view.read(cx).focus_handle(cx);
+                window.defer(cx, move |window, cx| editor.focus(window, cx));
+            },
+            // A run on several connections skips this target (J14).
+            move |cx| {
+                let _ = declined.update(cx, |this, cx| {
+                    if this
+                        .script
+                        .as_ref()
+                        .is_some_and(|s| s.stage == Stage::Asking)
+                    {
+                        this.end_script(Stage::Declined, None, cx);
+                    }
+                });
+            },
+        );
     }
 
     /// Whether a run may replace the results. With changes waiting in one
@@ -2025,21 +2181,7 @@ impl QueryTab {
 
     /// Shows why a statement was not run on a read-only connection.
     fn refuse_read_only(&mut self, statement: &str, connection: &str, cx: &mut Context<Self>) {
-        self.refuse(
-            statement.to_string(),
-            Failure {
-                message: format!(
-                    "“{connection}” is a read-only connection: this statement would change the database and was not run."
-                ),
-                code: None,
-                detail: None,
-                hint: Some(
-                    "Untick “Read-only” in the connection's settings to allow changes.".into(),
-                ),
-                position: None,
-            },
-            cx,
-        );
+        self.refuse(statement.to_string(), read_only_failure(connection), cx);
     }
 
     /// Shows why a run did not happen, as its result.
@@ -2049,8 +2191,10 @@ impl QueryTab {
         self.show_results();
         self.clear_results();
         self.notices.clear();
+        let message = failure.message.clone();
         self.push_pane(statement, Outcome::Failed(failure), None, None);
         self.active_result = self.results.len() - 1;
+        self.end_script(Stage::Failed, Some(message), cx);
         cx.notify();
     }
 
@@ -2143,6 +2287,7 @@ impl QueryTab {
             .map(|span| Statement {
                 sql: span.text(&text).to_string(),
                 origin: Some(span.range.start),
+                refused: None,
             })
             .collect();
         if statements.is_empty() {
@@ -2243,6 +2388,13 @@ impl QueryTab {
         let explain = self.explain_mode;
         let rules = self.lex_rules(cx);
         let session = self.session(cx);
+        // A target of a run on several connections (J14) may go on after an
+        // error, and frees its session when its last result is paged.
+        let script = self.scripting().map(|script| {
+            script.stage = Stage::Running;
+            script.continue_on_error
+        });
+        let continue_on_error = script == Some(true);
         self.run = Some(cx.spawn_in(window, async move |this, cx| {
             let session = match session.await {
                 Ok(session) => session,
@@ -2255,6 +2407,7 @@ impl QueryTab {
                             None,
                         );
                         this.activity = Activity::Idle;
+                        this.end_script(Stage::Failed, Some(error.to_string()), cx);
                         cx.notify();
                     });
                     return;
@@ -2282,6 +2435,7 @@ impl QueryTab {
                         );
                         this.activity = Activity::Idle;
                         this.run = None;
+                        this.end_script(Stage::Failed, Some(error.to_string()), cx);
                         cx.notify();
                     });
                     return;
@@ -2292,7 +2446,19 @@ impl QueryTab {
             }
             let mut changed_schema = false;
             let mut any_failed = false;
+            let mut cancelled = false;
             for (index, statement) in statements.into_iter().enumerate() {
+                // A write refused on a read-only target is shown, not sent.
+                if let Some(refusal) = statement.refused.clone() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.push_pane(statement.sql.clone(), Outcome::Failed(refusal), None, None);
+                        if let Some(script) = this.scripting() {
+                            script.refused += 1;
+                        }
+                        cx.notify();
+                    });
+                    continue;
+                }
                 let started = Instant::now();
                 let started_at_ms = kerno_core::storage::now_ms();
                 // How the statement ended, for the history and the editor.
@@ -2381,7 +2547,14 @@ impl QueryTab {
                                         }
                                         // In a script the next statement needs the
                                         // session: this one stops at its first page.
-                                        if !last {
+                                        // So does the last of a run on several
+                                        // connections, which then ends.
+                                        if !last || script.is_some() {
+                                            if script.is_some() {
+                                                row_count = Some(
+                                                    grid.read(cx).delegate().row_count() as u64,
+                                                );
+                                            }
                                             grid.update(cx, |grid, cx| {
                                                 grid.delegate_mut().finish(false);
                                                 grid.refresh(cx);
@@ -2459,22 +2632,31 @@ impl QueryTab {
                                 // (an error on PostgreSQL); the tab knows it asked.
                                 let cancelled = std::mem::take(&mut this.cancel_requested)
                                     || matches!(error, Error::Cancelled);
+                                let lost = error.is_disconnect();
+                                let failure = if lost {
+                                    lost_failure(Some(&error))
+                                } else {
+                                    Failure::from(&error)
+                                };
                                 ended = Some(if cancelled {
                                     (HistoryStatus::Cancelled, None)
                                 } else {
-                                    (HistoryStatus::Error, Some(Failure::from(&error)))
+                                    (HistoryStatus::Error, Some(failure.clone()))
                                 });
                                 this.push_pane(
                                     statement.sql.clone(),
                                     if cancelled {
                                         Outcome::Cancelled
                                     } else {
-                                        Outcome::Failed(Failure::from(&error))
+                                        Outcome::Failed(failure)
                                     },
                                     None,
                                     Some(started.elapsed()),
                                 );
                                 this.active_result = this.results.len() - 1;
+                                if lost {
+                                    this.lost_connection(window, cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -2511,12 +2693,16 @@ impl QueryTab {
                     let recorded = Statement {
                         sql: sent.clone(),
                         origin: statement.origin.filter(|_| explain.is_none()),
+                        refused: None,
                     };
                     this.statement_ended(&recorded, ended, cx)
                 });
                 if failed {
                     any_failed = true;
-                    break;
+                    cancelled |= status == HistoryStatus::Cancelled;
+                    if cancelled || !continue_on_error {
+                        break;
+                    }
                 }
             }
             // A source that failed inside its own transaction leaves nothing
@@ -2533,6 +2719,14 @@ impl QueryTab {
             let _ = this.update(cx, |this, cx| {
                 this.activity = Activity::Idle;
                 this.run = None;
+                let ended = if cancelled {
+                    Stage::Cancelled
+                } else if any_failed && !continue_on_error {
+                    Stage::Failed
+                } else {
+                    Stage::Done
+                };
+                this.end_script(ended, None, cx);
                 if changed_schema {
                     this.load_catalog(cx);
                 }
@@ -2555,6 +2749,13 @@ impl QueryTab {
             failure,
             row_count,
         } = ended;
+        if let Some(script) = self.scripting() {
+            script.record(
+                elapsed,
+                row_count,
+                failure.as_ref().map(|f| f.message.as_str()),
+            );
+        }
         // Auto-refresh reads the same statement again and again: the
         // history and the transaction's log keep the first run only.
         let auto = self.requery.as_ref().is_some_and(|requery| requery.auto);
@@ -3991,7 +4192,16 @@ impl QueryTab {
         self.close_results(&[id], cx);
         self.explain_mode = None;
         self.keep_results = true;
-        self.execute(vec![Statement { sql, origin: None }], false, window, cx);
+        self.execute(
+            vec![Statement {
+                sql,
+                origin: None,
+                refused: None,
+            }],
+            false,
+            window,
+            cx,
+        );
     }
 
     /// The menu of the result tab of pane `id`, built when it opens.
@@ -4431,7 +4641,16 @@ impl QueryTab {
         self.close_results(&[id], cx);
         self.explain_mode = None;
         self.keep_results = true;
-        self.execute(vec![Statement { sql, origin: None }], false, window, cx);
+        self.execute(
+            vec![Statement {
+                sql,
+                origin: None,
+                refused: None,
+            }],
+            false,
+            window,
+            cx,
+        );
     }
 
     /// The order a header asked of a result not wholly fetched: a column
@@ -6273,7 +6492,12 @@ impl QueryTab {
                     .get(&target.connection)
                     .map(|saved| saved.config.name.clone())
                     .unwrap_or_default();
-                format!("Connecting to “{name}”… The statements run once it is open.")
+                let verb = if self.connections.read(cx).reconnecting(&target.connection) {
+                    "Reconnecting"
+                } else {
+                    "Connecting"
+                };
+                format!("{verb} to “{name}”… The statements run once it is open.")
             });
             let text = match (connecting, self.activity) {
                 (Some(connecting), _) => connecting,
@@ -6572,6 +6796,7 @@ pub(crate) fn run_editor_action(
         TabAction::RunInNewTab => Box::new(RunStatementInNewTab),
         TabAction::RunFromCursor => Box::new(RunFromCursor),
         TabAction::RunScript => Box::new(RunAll),
+        TabAction::RunOnConnections => Box::new(actions::RunScriptOnConnections),
         TabAction::Explain => Box::new(ExplainStatement),
         TabAction::ExplainAnalyze => Box::new(ExplainAnalyze),
         TabAction::CountRows => Box::new(CountStatementRows),

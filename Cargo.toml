@@ -37,6 +37,9 @@ keyring = "4"
 url = "2"
 percent-encoding = "2"
 
+# XLSX export (J12): constant-memory worksheets, rows streamed to a temporary file.
+rust_xlsxwriter = { version = "=0.102.0", default-features = false, features = ["constant_memory"] }
+
 # TLS: rustls with the ring provider everywhere (GPUI already brings both).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", features = ["std"] }

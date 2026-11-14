@@ -22,6 +22,7 @@ use kerno_core::export::{DelimitedOptions, ExportFormat, LineEnding};
 use kerno_core::export_file::{Encoding, ExportJob, ExportProgress, export_to_file};
 use kerno_core::format::byte_size;
 use kerno_core::schema::TableRef;
+use kerno_core::xlsx::XlsxOptions;
 use kerno_core::{Error, Session, exec};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -54,16 +55,19 @@ pub enum Format {
     NdJson,
     SqlInsert,
     Markdown,
+    /// An Excel workbook (J12).
+    Xlsx,
 }
 
 impl Format {
-    pub const ALL: [Format; 6] = [
+    pub const ALL: [Format; 7] = [
         Format::Csv,
         Format::Tsv,
         Format::JsonArray,
         Format::NdJson,
         Format::SqlInsert,
         Format::Markdown,
+        Format::Xlsx,
     ];
 
     fn label(self) -> &'static str {
@@ -74,6 +78,7 @@ impl Format {
             Format::NdJson => "NDJSON",
             Format::SqlInsert => "SQL INSERT",
             Format::Markdown => "Markdown",
+            Format::Xlsx => "Excel (XLSX)",
         }
     }
 
@@ -85,6 +90,7 @@ impl Format {
             Format::NdJson => "ndjson",
             Format::SqlInsert => "sql",
             Format::Markdown => "md",
+            Format::Xlsx => "xlsx",
         }
     }
 }
@@ -125,6 +131,8 @@ pub struct ExportDialog {
     encoding: Encoding,
     /// The table SQL INSERT statements write to, as `schema.table`.
     insert_table: Entity<InputState>,
+    /// The workbook's first sheet.
+    sheet_name: Entity<InputState>,
     /// Why the options cannot be used, after a try.
     problem: Option<String>,
     state: State,
@@ -176,9 +184,12 @@ impl ExportDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let table = match &source {
-            Source::Table { table, .. } => format!("{}.{}", table.schema, table.name),
-            Source::Query { .. } => "schema_name.table_name".into(),
+        let (table, sheet) = match &source {
+            Source::Table { table, .. } => (
+                format!("{}.{}", table.schema, table.name),
+                table.name.clone(),
+            ),
+            Source::Query { .. } => ("schema_name.table_name".into(), "Result".into()),
         };
         let mut input = |value: &str, placeholder: &'static str, cx: &mut Context<Self>| {
             let value = value.to_string();
@@ -193,6 +204,7 @@ impl ExportDialog {
             // An empty box writes NULL as nothing: the placeholder says so.
             null_text: input("", "empty", cx),
             insert_table: input(&table, "", cx),
+            sheet_name: input(&sheet, "Sheet1", cx),
             connections,
             target,
             source,
@@ -250,6 +262,10 @@ impl ExportDialog {
             Format::JsonArray => ExportFormat::JsonArray,
             Format::NdJson => ExportFormat::NdJson,
             Format::Markdown => ExportFormat::Markdown,
+            Format::Xlsx => ExportFormat::Xlsx(XlsxOptions {
+                header: self.header,
+                sheet_name: self.sheet_name.read(cx).value().trim().to_string(),
+            }),
             Format::SqlInsert => {
                 let typed = self.insert_table.read(cx).value().trim().to_string();
                 match typed.split_once('.') {
@@ -495,6 +511,39 @@ impl ExportDialog {
                     .into_any_element(),
             ));
         }
+        if self.format == Format::Xlsx {
+            rows.push(field(
+                "Sheet",
+                h_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .child(Input::new(&self.sheet_name).small().id("export-sheet-name")),
+                    )
+                    .child(
+                        Checkbox::new("export-header")
+                            .label("Header with the column names")
+                            .checked(self.header)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.header = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            ));
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "Numbers, booleans and dates keep their type when Excel holds them \
+                         exactly; times with a zone are written in UTC. A sheet holds 1,048,575 \
+                         rows: more go on the next sheets. Text is cut at 32,767 characters.",
+                    )
+                    .into_any_element(),
+            );
+        }
         if self.format == Format::SqlInsert {
             rows.push(field(
                 "Into table",
@@ -507,6 +556,9 @@ impl ExportDialog {
                     )
                     .into_any_element(),
             ));
+        }
+        if self.format == Format::Xlsx {
+            return rows;
         }
         rows.push(field(
             "Encoding",
@@ -595,14 +647,42 @@ async fn run(
     outcome
 }
 
-/// "123,000 rows · 14 MB".
+/// "123,000 rows · 14 MB", or the rows alone while the size is unknown.
 fn progress_text(progress: ExportProgress) -> String {
-    format!(
-        "{} {} · {}",
+    let rows = format!(
+        "{} {}",
         number(progress.rows as f64),
-        if progress.rows == 1 { "row" } else { "rows" },
-        byte_size(progress.bytes)
-    )
+        if progress.rows == 1 { "row" } else { "rows" }
+    );
+    // A workbook's size is known once it is saved.
+    match progress.bytes {
+        0 => rows,
+        bytes => format!("{rows} · {}", byte_size(bytes)),
+    }
+}
+
+/// What a workbook's report adds: its sheets beyond the first, and the
+/// cells Excel's limit cut.
+fn workbook_note(progress: ExportProgress) -> String {
+    let mut note = String::new();
+    if progress.sheets > 1 {
+        note.push_str(&format!(
+            " {} sheets: a sheet holds 1,048,575 rows.",
+            progress.sheets
+        ));
+    }
+    if progress.truncated > 0 {
+        note.push_str(&format!(
+            " {} {} cut at Excel's 32,767 characters.",
+            number(progress.truncated as f64),
+            if progress.truncated == 1 {
+                "cell was"
+            } else {
+                "cells were"
+            }
+        ));
+    }
+    note
 }
 
 fn path_text(path: &Path) -> String {
@@ -687,11 +767,12 @@ impl Render for ExportDialog {
                     message(
                         "export-done",
                         format!(
-                            "Exported {} {} to {} ({}).",
+                            "Exported {} {} to {} ({}).{}",
                             number(progress.rows as f64),
                             if progress.rows == 1 { "row" } else { "rows" },
                             path_text(path),
-                            byte_size(progress.bytes)
+                            byte_size(progress.bytes),
+                            workbook_note(*progress)
                         ),
                     )
                     .text_color(theme.success)

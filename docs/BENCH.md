@@ -98,7 +98,7 @@ and drop them, pass or fail (an exit trap, after Kerno quit); the reconnect step
 
 **The numbers below are indicative**: one run of each step with `--indicative`, on a machine where three
 other agents were compiling and testing (1-minute load 5 to 21, the script's limit is 4), release build of
-commit `1f5161b` plus the uncommitted M11 work. The final numbers are taken on a quiet machine (M11 Part 16)
+commit `1f5161b` plus the uncommitted M11 work (the reconnect rows: commit `c52e5df` plus Part 5b). The final numbers are taken on a quiet machine (M11 Part 16)
 and replace this table.
 
 | Case (demand) | Target | Indicative | Verdict |
@@ -107,7 +107,9 @@ and replace this table.
 | Open a database of 200 schemas (Beekeeper #135) | < 300 ms to the frame showing them | PostgreSQL 23 ms; MySQL (a database of 1,200 tables, to its folders) 38 ms | met |
 | Open a schema of 1,200 tables (Beekeeper #135) | < 500 ms to the frame showing them | PostgreSQL 247 ms (schema, its objects read) + 4 ms (Tables); MySQL 6 ms (Tables) | met |
 | Run a 200 MB `.sql` file (Beekeeper #702, #2325) | UI responsive, progress, cancel | 15.3 s, 13.3 MB/s; frames 8.33 ms on average, longest 10.9 ms; cancelled at 30 %: stopped in 114 ms | met |
-| Network drops 10 s and returns (DBeaver #6903) | usable < 5 s after the network is back | the statement in flight finished 112 ms *before* `docker network connect` returned; no failed run | met |
+| Server killed and started again (DBeaver #6903) | usable < 5 s after it accepts connections again | 1,025 ms; the loss seen at once (the tab's statement failed), two runs reported failed, none run again | met |
+| Server frozen 15 s (`docker pause`) | usable < 5 s after it is unfrozen | 230 ms; the loss found by the keep-alive 14 s into the freeze | met |
+| Server's network detached 10 s (informative) | — | −26 ms: the connection survives on OrbStack, nothing to reconnect | — |
 
 - **wide** (`KERNO_BENCH=scroll` on another table): `kerno_bench_wide.wide`, 300 columns plus a key ×
   20,000 rows: PostgreSQL cycles int, bigint, numeric, text, timestamp and boolean; MySQL int, bigint,
@@ -132,14 +134,18 @@ and replace this table.
   The MySQL side of this step is not measured (same code path, `mysql` reads its standard input).
 - **reconnect** (`KERNO_BENCH=reconnect`): a dedicated server, `kerno-bench-pg` (postgres:17) on its own
   network `kerno-bench-net`, host port 55440, created and removed by the step; the shared containers are
-  never touched. The app runs `SELECT 1` in a query tab every 500 ms; once one succeeded the script runs
-  `docker network disconnect`, waits 10 s, `docker network connect` and notes the wall clock; the app reports
-  the wall clock of the first statement that succeeds after one was held up (more than 2 s) or failed, and
-  the step prints the difference. With OrbStack (Docker 29.8) the published port comes back with the
-  network and the client's TCP connection survives: the statement sent during the outage waits and
-  completes as the network returns, before the `docker` command itself does, so the difference is
-  negative. Kerno's own reconnect (a keep-alive every 30 s, then one new connection) never had to act; the
-  connection's status stayed "Connected". `docker pause` was not needed.
+  never touched. The app runs `SELECT 1` in a query tab every 500 ms and prints `ready` once one succeeded;
+  the script then breaks the server one of three ways, notes the wall clock when it is back, and the app
+  reports the wall clock of the first statement that succeeds after one was held up (more than 2 s) or
+  failed; the step prints the difference. *Killed*: `docker kill`, `docker start`, back when `pg_isready`
+  answers inside the container (crash recovery included). *Frozen*: `docker pause` 15 s, back at
+  `docker unpause` (nothing closes: the case of a dead route or a hung server). *Detached*, informative:
+  `docker network disconnect` 10 s; with OrbStack (Docker 29.8) the published port and the client's TCP
+  connection survive it, the statement in flight finishes as the network returns, before the `docker`
+  command does (a negative difference), and no reconnect is needed. What Kerno does (D-062): a keep-alive
+  check every 5 s with a 5 s timeout, tried twice; a statement failing on a closed connection; then
+  attempts of at most 10 s, again after 0.5 s, 1 s and every 2 s. The statuses each run went through are
+  printed with the numbers (Connected, Connecting, Connected).
 
 ## Reproducing
 

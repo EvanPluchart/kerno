@@ -1163,8 +1163,8 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   server's "password required" into an error that names the file and the `chmod`, instead of a prompt.
 - **MySQL**: `enable_cleartext_plugin` is on whenever the session uses TLS, off otherwise: RDS IAM needs
   `mysql_clear_password`, and a password then never leaves in clear.
-- Not done: the backup / restore / script tools' `params_for` (`backup_dialog.rs`) still takes the stored
-  password only; a command-sourced connection needs `password::resolve` there (one call).
+- The backup / restore / script tools' `params_for` (`backup_dialog.rs`) resolves the password the same
+  way since M11 Part 5b (D-062).
 
 ## D-061 — Tab layouts and stacked results (M11 Part 8, J10 and J11)
 
@@ -1213,10 +1213,111 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   `ToolCommand::sent`) instead of handing the child the file; `psql` reads `--file=-`, plain-SQL restore
   included, so its error lines say `<stdin>` instead of the file name.
 - **Bench**: `BackupDialog::run_unconfirmed` runs a script without its confirmation, for `KERNO_BENCH=import`
-  only, on its scratch database. The navigator's `row_of`, `id_at`, `rows_under` and `set_open` are no
+  only, on its scratch database: it refuses outside a bench mode (`bench::active`). The navigator's `row_of`, `id_at`, `rows_under` and `set_open` are no
   longer test-only (the bench uses them). `--indicative` lifts the load limit of `scripts/bench.sh` and marks
   every output as such; never for published numbers.
-- **Reconnect**: OrbStack keeps a container's published port and the client's TCP connection through
-  `docker network disconnect` / `connect`: the statement in flight waits and finishes as the network comes
-  back, so Kerno's own reconnect (keep-alive every 30 s, one attempt, a ping without a timeout) is not
-  exercised by the bench and was not changed.
+- **Reconnect (Part 5b)**: the keep-alive checks the navigator's session every 5 s with a 5 s timeout; a
+  check that times out is tried once more at once (a catalog read longer than 5 s on that session must not
+  count as a loss), so a server that stops answering is noticed within 10 s of the next check and at most
+  15 s after it froze. A failed check, or a statement of a query tab failing with a closed connection,
+  starts the reconnect: each attempt limited to 10 s (a frozen server accepts and never answers), retried
+  after 0.5 s, 1 s, then every 2 s for about a minute, then every 5 s, while the error is one of the network
+  (`Connect`, `Closed`, `Io`); a refused login or an SSH question stops it and is shown as before. The
+  status stays `Connecting`, `Connections::reconnecting` tells it apart ("reconnecting…" in the sidebar,
+  "Connection lost: reconnecting…" under the connection, "Reconnecting to …" in a waiting tab);
+  Disconnect drops the wait with the attempt. Sessions closed on a loss get 2 s each (a close on a frozen
+  server waits otherwise). A capped 2 s cadence rather than 4 s then 5 s: a server back just after an
+  attempt is reached within about 2 s, the bench's 5 s budget.
+- **Query tab on a loss**: a statement cut off (its own error, or the connection found lost while it ran)
+  is reported failed with `LOST_WHILE_RUNNING`, the driver's words as detail, and never run again; an open
+  transaction is reported rolled back; the cached session is dropped and the manager told. A statement run
+  while reconnecting waits for the connection, as any run on a closed connection does.
+- **Tests** break a proxy of their own (`kerno_core::testing::Proxy`: forward, drop, black-hole) in front of
+  the shared servers. The bench breaks its own container: `docker kill` + `start`, `docker pause` 15 s, and,
+  informative, `docker network disconnect` 10 s (OrbStack keeps the connection through that one).
+- **Tools**: `params_for` resolves the password with `password::resolve` and the app's `PasswordEnv`, as a
+  session does (command, RDS IAM, 1Password, `.pgpass`, `.my.cnf`; an unconfirmed imported command refused);
+  it still reaches the tool through `PGPASSWORD` / `MYSQL_PWD` only.
+
+## D-063 — Copying tables to another connection (M11 Part 10, J13)
+
+- **Mapping** (`kerno_core::transfer::map_type`, principles from DBeaver's `DBStructUtils.mapTargetDataType`,
+  `JDBCSQLDialect` and `PostgreDialect.convertExternalDataType`): the same engine keeps the type as printed;
+  MySQL ↔ MariaDB keep it too, except MariaDB's `UUID` (→ `char(36)`) and its other own types (refused).
+  PostgreSQL ↔ MySQL / MariaDB: integers by width, unsigned widened (`int unsigned` → `bigint`,
+  `bigint unsigned` → `numeric(20,0)`), `numeric(p,s)` kept (unbounded → `decimal(65,30)`), `boolean` ↔
+  `tinyint(1)`, `varchar(n)` / `char(n)` kept up to the MySQL limits, longer or unbounded text → `longtext`
+  (`varchar(255)` when in the primary key: MySQL keys no TEXT), `bytea` ↔ blobs, time and timestamps keep
+  their precision (default 6 towards MySQL), `timestamptz` → `datetime` read in UTC (`AT TIME ZONE 'UTC'` on
+  the source), MySQL `timestamp` → `timestamp` (the wall clock of the source session), `uuid` ↔ `char(36)` /
+  MariaDB `uuid`, json ↔ `json` / `jsonb`, enums → `varchar(longest label)` and sets → `text` with a note,
+  `bit(n)` ↔ `bit(n)`, money → `decimal(19,2)` read as a number. **Refused**, with the column named: arrays,
+  ranges, geometric and spatial types, network types, `interval`, `time with time zone`, `bit varying`,
+  composite and other user-defined types across engines. A refused column blocks Start until skipped or given
+  a type by hand; a generated column is skipped by default.
+- **Created tables** get the copied columns, their NULL rules and the primary key (when all of it is copied);
+  identities become `GENERATED BY DEFAULT AS IDENTITY` / `AUTO_INCREMENT` (MySQL: first key column only) so
+  copied values can be written, and a PostgreSQL identity is moved past them (`setval`) at the end. Defaults,
+  indexes, foreign keys, checks and triggers are not copied and the report lists them. Tables are created in
+  foreign-key order among those picked.
+- **Writes**: values are literals of the target dialect for the target's own columns (read back after the
+  `CREATE`); one multi-row `INSERT` per batch (1,000 rows), each in its own transaction, rolled back when it
+  fails: the batches before it stay (said in the confirmation and the report, with the failing batch's first
+  row). Cancel stops between batches (and the statement in flight). A table that exists stops the copy, is
+  appended to or skipped (the user's choice); Append needs the table and every target column.
+- **Sessions**: source and target each run on a session of their own (`open_session`), never the navigator's;
+  the source is read with back-pressure, so memory holds one batch. A read-only target is refused in step 2;
+  the statements (the `CREATE`s, one sample `INSERT`, the `setval`s) go through `sql_confirm` on the target's
+  environment (production asks twice).
+- **Reuse**: `backup_dialog::{SchemaEntry, fetch_objects}` became `pub(crate)`, and the steps column and the
+  choice chips were extracted from the backup wizard as `wizard_steps` and `chips`, which both wizards draw.
+  The backup wizard's checkbox tree stays its own: it is bound to its `Selection` and to pg_dump's schema /
+  table rules; the copy wizard draws a lighter one. The navigator has no multi-selection: the wizard's
+  checkboxes are the selection (the table or schema it was opened on comes ticked).
+
+## D-064 — One script on several connections (M11 Part 11, J14)
+
+- **Each target is an ordinary query tab** (`<script> @ <connection>`, inserted after the source tab) run by
+  `QueryTab::run_script`, which enters the tab's usual path (`launch` → connect on demand → `execute` →
+  `sql_confirm` → `start`): history, notices, cancel, manual commit and the environment's questions are the
+  tab's. Two differences only while the tab is a target: on a read-only connection each write is marked
+  refused and shown in its place while the reads run (a single tab still refuses the whole run), and "Continue"
+  lets the loop go past an error; a cancel always stops. The last result stops at its first page so the run
+  ends and frees its session.
+- **Declined confirmations**: `sql_confirm::open_or_decline` calls back when the confirmation view is released
+  without its action having run (Cancel, Escape, a click beside it); `open` is that with nothing to call.
+- **Scheduling** (`multi_run::next_to_start`): at most 4 targets run at once, and a target starts only while no
+  started one is still connecting or asking, so two prompts (password, confirmation) are never open at once.
+  "Stop every connection" cancels the running targets and skips the waiting ones at the first target that
+  stopped at an error; a declined confirmation skips only its target.
+- **Refused up front**: a script with no statement or with parameters (`:name`, `$1`, `?`), which a run on
+  several connections cannot ask for.
+- **The run outlives its dialog**: the workspace keeps the last one (Query ▸ Show Last Run on Connections); a
+  new one is refused while it is in progress (its summary is shown instead).
+- **Reuse**: the tree is `navigator::model::sidebar_items` drawn with the kit's `Checkbox` (the backup wizard's
+  checkbox lists are methods of its own state, D-063); the entries are the editor menu's Execute ▸, the query
+  tab's Run dropdown (`tabs::run_menu`: the main toolbar has no run menu), the palette and the Query menu.
+
+## D-065 — XLSX export and the portable connections file (M11 Part 9, J12 and J15)
+
+- **XLSX** (`kerno_core::xlsx`): `rust_xlsxwriter =0.102.0` (MIT OR Apache-2.0), default features off plus
+  `constant_memory` (rows go to a temporary file per sheet; 11 MB peak RSS growth for 1,000,000 rows). Its
+  tree (`zip`, `zopfli`, `typed-path`, `constant_time_eq`, `tempfile`) passes `cargo deny` with no exception.
+  `ExportFormat::Xlsx(XlsxOptions)` goes through `export_file`'s writer thread like the text formats; an
+  `Exporter` (the clipboard path) refuses it. Excel dates are computed by Kerno (days from civil, UTC for
+  zoned timestamps, the header says "(UTC)", rather than a cell note), not by the crate's parser, so anything
+  it cannot read stays text. A number is a number only when a double holds it as written (≤ 15 significant
+  digits, < 2^53). Rows per sheet are fixed (1,048,576 less the header), not an option. Tests read the file
+  back with `xlsx::read` behind `test-support`, using `zip` already in the tree.
+- **Connections file version 2**: connections carry their id (`PortableConnection { id, #[serde(flatten)]
+  config }`); only a UUID is kept, once. Environments: the user's and the edited built-ins; the ones the
+  exported connections use always go, so a production connection never lands in "local". Tasks carry their
+  connection's engine, so `TaskSettings::check` refuses a password in the extra arguments on export and on
+  import; a task whose connection is gone is left out and counted. Tasks match by name.
+- **Import never writes the secret store behind the user's back**: it bypasses `Connections::save` (which
+  rewrote every secret of the id, deleting a linked entry) and writes storage directly, then reloads the
+  list. Only "Enter now" (`secrets::save_password`) and "Ask when connecting" over an existing entry
+  (`delete_secrets`) touch the store. The lookup is `secrets::has_password`: one key per connection, through
+  the cached store. A replaced connection whose engine, host, port, user or tunnel changes
+  (`reaches_another_server`) defaults to "Ask when connecting": a file reusing a known id cannot collect its
+  password. `Connections::import` is removed (no caller left).

@@ -275,8 +275,11 @@ PY
   pg -d kerno -c "DROP DATABASE kerno_bench_import WITH (FORCE)"
 fi
 
-# DBeaver #6903: the network of the server goes away for 10 s and comes
-# back; how long until a statement runs again. A server of the step's own.
+# DBeaver #6903: the server goes away and comes back; how long until a
+# statement runs again. A server of the step's own, broken three ways:
+# killed and started again (the connection is cut), frozen for 15 s
+# (nothing answers, nothing closes), and its network detached for 10 s
+# (informative: OrbStack keeps the connection through it).
 if want reconnect; then
   bench_password="bench-$RANDOM-$RANDOM"
   docker rm -f kerno-bench-pg >/dev/null 2>&1 || true
@@ -285,42 +288,64 @@ if want reconnect; then
   docker run -d --name kerno-bench-pg --network kerno-bench-net -p 127.0.0.1:55440:5432 \
     -e POSTGRES_USER=kerno -e POSTGRES_DB=kerno -e POSTGRES_PASSWORD="$bench_password" \
     postgres:17 >/dev/null
-  for _ in $(seq 1 60); do
-    docker exec kerno-bench-pg pg_isready -h 127.0.0.1 -U kerno >/dev/null 2>&1 && break
-    sleep 1
-  done
+  accepting() { docker exec kerno-bench-pg pg_isready -h 127.0.0.1 -U kerno >/dev/null 2>&1; }
+  for _ in $(seq 1 60); do accepting && break; sleep 1; done
   epoch_ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time * 1000'; }
-  for i in $(seq 1 "$runs"); do
-    wait_for_quiet
-    echo "reconnect $i/$runs (load $(load1))" >&2
-    printf '%s\t0\t{"bench":"load","load1":%s}\n' reconnect "$(load1)" >>"$raw"
-    out="$scratch/reconnect-$i.tsv"
-    : >"$out"
-    KERNO_BENCH_PASSWORD="$bench_password" run_app reconnect KERNO_DATA_DIR="$(fresh "reconnect-$i")" \
-      KERNO_BENCH=reconnect KERNO_BENCH_CONNECTION=reconnect KERNO_BENCH_SQL="SELECT 1" >"$out" &
-    app=$!
-    for _ in $(seq 1 120); do grep -q '"phase":"ready"' "$out" && break; sleep 0.5; done
-    if ! grep -q '"phase":"ready"' "$out"; then
-      echo "reconnect run $i: Kerno never ran its first statement" >&2
-      kill "$app" 2>/dev/null || true
-      wait "$app" 2>/dev/null || true
-      cat "$out" >>"$raw"
-      continue
-    fi
-    sleep 1
+  # Each breaks the server and mends it, then prints the instant it is
+  # back: accepting connections again, or unfrozen, or reattached.
+  kill_and_start() {
+    docker kill kerno-bench-pg >/dev/null
+    docker start kerno-bench-pg >/dev/null
+    until accepting; do sleep 0.1; done
+    epoch_ms
+  }
+  freeze_15s() {
+    docker pause kerno-bench-pg >/dev/null
+    sleep 15
+    docker unpause kerno-bench-pg >/dev/null
+    epoch_ms
+  }
+  detach_10s() {
     docker network disconnect kerno-bench-net kerno-bench-pg
     sleep 10
     docker network connect kerno-bench-net kerno-bench-pg
-    back="$(epoch_ms)"
-    wait "$app" || echo "reconnect run $i failed" >&2
-    cat "$out" >>"$raw"
-    recovered="$(sed -n 's/.*"recovered_epoch_ms":\([0-9]*\).*/\1/p' "$out")"
-    if [ -n "$recovered" ]; then
-      printf '%s\t0\t{"bench":"reconnect","usable_after_network_ms":%s}\n' reconnect \
-        "$((recovered - back))" >>"$raw"
-    fi
-    sleep 1
-  done
+    epoch_ms
+  }
+  reconnect_case() {
+    local label="$1" breaker="$2" i out app back recovered
+    for i in $(seq 1 "$runs"); do
+      wait_for_quiet
+      echo "$label $i/$runs (load $(load1))" >&2
+      printf '%s\t0\t{"bench":"load","load1":%s}\n' "$label" "$(load1)" >>"$raw"
+      out="$scratch/$label-$i.tsv"
+      : >"$out"
+      KERNO_BENCH_PASSWORD="$bench_password" run_app "$label" KERNO_DATA_DIR="$(fresh "$label-$i")" \
+        KERNO_BENCH=reconnect KERNO_BENCH_CONNECTION=reconnect KERNO_BENCH_SQL="SELECT 1" >"$out" &
+      app=$!
+      for _ in $(seq 1 120); do grep -q '"phase":"ready"' "$out" && break; sleep 0.5; done
+      if ! grep -q '"phase":"ready"' "$out"; then
+        echo "$label run $i: Kerno never ran its first statement" >&2
+        kill "$app" 2>/dev/null || true
+        wait "$app" 2>/dev/null || true
+        cat "$out" >>"$raw"
+        continue
+      fi
+      sleep 1
+      back="$($breaker)"
+      wait "$app" || echo "$label run $i failed" >&2
+      cat "$out" >>"$raw"
+      recovered="$(sed -n 's/.*"recovered_epoch_ms":\([0-9]*\).*/\1/p' "$out")"
+      if [ -n "$recovered" ]; then
+        printf '%s\t0\t{"bench":"reconnect","usable_after_back_ms":%s}\n' "$label" \
+          "$((recovered - back))" >>"$raw"
+      fi
+      until accepting; do sleep 0.2; done
+      sleep 1
+    done
+  }
+  reconnect_case reconnect-kill kill_and_start
+  reconnect_case reconnect-freeze freeze_15s
+  reconnect_case reconnect-detach detach_10s
   docker rm -f kerno-bench-pg >/dev/null
   docker network rm kerno-bench-net >/dev/null
 fi
@@ -367,7 +392,7 @@ targets = {
     ("navigator", "schema_ms"): 500,
     ("navigator", "tables_ms"): 500,
     ("import", "cancel_ms"): 2000,
-    ("reconnect", "usable_after_network_ms"): 5000,
+    ("reconnect", "usable_after_back_ms"): 5000,
 }
 loads = defaultdict(list)
 for row in open(sys.argv[1]):

@@ -200,6 +200,8 @@ gpui_kit::actions!(
         GlobalBackup,
         /// Runs a SQL file with the engine's client tool.
         ExecuteScript,
+        /// Copies tables with their data to another connection (J13).
+        CopyTables,
         /// The foreign data wrappers of a PostgreSQL database.
         ForeignDataWrappers,
         /// A tool's wizard whose aim is a saved task.
@@ -288,6 +290,10 @@ gpui_kit::actions!(
         RefreshCompletionMetadata,
         /// Exports the rows of the statement at the cursor to a file.
         ExportFromQuery,
+        /// Runs the active tab's script on connections the user picks (J14).
+        RunScriptOnConnections,
+        /// Shows the last run on several connections again.
+        ShowMultiRun,
         /// Puts back the text of the active tab's file.
         RevertFile,
         /// Selects the active tab's table in the schema tree, now and as
@@ -429,7 +435,7 @@ pub const COMMANDS: &[Command] = &[
         "Import Connections…",
         "Connections",
         [],
-        ["json", "file"],
+        ["json", "file", "environments", "tasks", "settings"],
         ImportConnections
     ),
     command!(
@@ -437,7 +443,7 @@ pub const COMMANDS: &[Command] = &[
         "Export Connections…",
         "Connections",
         [],
-        ["json", "file", "backup", "share"],
+        ["json", "file", "backup", "share", "environments", "tasks"],
         ExportConnections
     ),
     command!(
@@ -1423,6 +1429,22 @@ pub const COMMANDS: &[Command] = &[
         ExportFromQuery
     ),
     command!(
+        "run_script_on_connections",
+        "Run Script on Connections…",
+        "Query",
+        [],
+        ["several", "multiple", "servers", "connections", "execute"],
+        RunScriptOnConnections
+    ),
+    command!(
+        "show_multi_run",
+        "Show Last Run on Connections",
+        "Query",
+        [],
+        ["several", "multiple", "summary", "servers"],
+        ShowMultiRun
+    ),
+    command!(
         "explain_statement",
         "Explain Statement",
         "Query",
@@ -1673,6 +1695,21 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["psql", "mysql", "run file", "sql file", "script"],
         ExecuteScript
+    ),
+    // DBeaver's data transfer, database to database (DBeaver #17767).
+    command!(
+        "copy_tables",
+        "Copy Tables to Another Connection…",
+        "Server",
+        [],
+        [
+            "data transfer",
+            "migrate",
+            "copy data",
+            "move tables",
+            "export to database"
+        ],
+        CopyTables
     ),
     command!(
         "foreign_data_wrappers",

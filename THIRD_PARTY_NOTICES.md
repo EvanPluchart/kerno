@@ -93,6 +93,10 @@ screenshot, name, colour or wording of either is included.
   DBeaver's logic say so in a comment naming the DBeaver source file. At present:
   - `crates/kerno-postgres/src/ddl.rs`: the order of the parts of a reconstructed table script follows
     `SQLTableManager.java`.
+  - `crates/kerno-core/src/transfer.rs`: the principles of the type mapping of the data transfer between
+    connections follow `DBStructUtils.mapTargetDataType`, `JDBCSQLDialect.convertExternalDataType` and
+    `PostgreDialect.convertExternalDataType` (the same kind of server keeps the type, a `varchar` without a
+    length becomes the target's long text, `json` and `jsonb` become `jsonb` on PostgreSQL).
 - **Beekeeper Studio** (https://github.com/beekeeper-studio/beekeeper-studio, GPL-3.0) was read to understand
   behaviour and user experience only. None of its code was translated or copied, and its commercially
   licensed directories were never opened.

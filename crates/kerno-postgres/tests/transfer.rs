@@ -890,3 +890,174 @@ async fn cancel_rolls_the_import_back() {
     })
     .await;
 }
+
+/// J12 (DBeaver #18393): a workbook with typed cells, read back from the
+/// file. Numbers Excel cannot hold exactly, zoned times and values outside
+/// Excel's calendar stay text; a long text is cut and counted.
+#[tokio::test]
+async fn an_xlsx_workbook_keeps_the_types_excel_can_hold() {
+    use kerno_core::xlsx::XlsxOptions;
+    use kerno_core::xlsx::read::{ReadCell, read_sheets};
+    in_scratch("transfer_xlsx", |session, schema| async move {
+        exec_ok(
+            &session,
+            &format!(
+                "CREATE TABLE {schema}.typed (id int PRIMARY KEY, big bigint, price numeric(20,7), \
+                 ratio float8, flag boolean, day date, at timestamp, zoned timestamptz, \
+                 clock time, zclock timetz, span interval, uid uuid, doc jsonb, tags int[], \
+                 raw bytea, note text, cash money)"
+            ),
+        )
+        .await;
+        exec_ok(
+            &session,
+            &format!(
+                "INSERT INTO {schema}.typed VALUES \
+                 (1, 42, 12.5, 0.1, true, '2024-02-29', '2024-02-29 12:00:00', \
+                  '2024-02-29 13:00:00+01', '12:00:00', '12:00:00+02', '1 day', \
+                  '00000000-0000-4000-8000-000000000001', '{{\"a\": 1}}', '{{1,2}}', \
+                  '\\xdeadbeef', '=1+1', 12.5), \
+                 (2, 9007199254740993, 1234567890.1234567, 'NaN', false, '0044-03-15 BC', \
+                  'infinity', '-infinity', NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                  repeat('x', 40000), NULL), \
+                 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+                  NULL, NULL, NULL, NULL)"
+            ),
+        )
+        .await;
+        // The session shows zoned values in its zone: they come back in UTC.
+        exec_ok(&session, "SET TIME ZONE 'Asia/Kolkata'").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.xlsx");
+        let options = XlsxOptions {
+            header: true,
+            sheet_name: "typed".into(),
+        };
+        let written = export(
+            &session,
+            &format!("SELECT * FROM {schema}.typed ORDER BY id"),
+            ExportFormat::Xlsx(options),
+            Encoding::Utf8,
+            &path,
+        )
+        .await
+        .unwrap();
+        exec_ok(&session, "RESET TIME ZONE").await;
+        assert_eq!((written.rows, written.sheets, written.truncated), (3, 1, 1));
+        assert_eq!(written.bytes, std::fs::metadata(&path).unwrap().len());
+        assert!(!tmp_of(&path).exists());
+
+        let sheets = read_sheets(&path);
+        assert_eq!(sheets.len(), 1);
+        assert_eq!(sheets[0].name, "typed");
+        let rows = &sheets[0].rows;
+        assert_eq!(rows.len(), 4);
+        let text = |value: &str| ReadCell::Text(value.into());
+        let header: Vec<ReadCell> = rows[0].values().cloned().collect();
+        assert_eq!(header[7], text("zoned (UTC)"));
+        assert_eq!(header[0], text("id"));
+        let date = |serial: f64, code: &str| ReadCell::Date(serial, code.into());
+        let first: Vec<ReadCell> = rows[1].values().cloned().collect();
+        assert_eq!(
+            first,
+            [
+                ReadCell::Number(1.0),
+                ReadCell::Number(42.0),
+                ReadCell::Number(12.5),
+                ReadCell::Number(0.1),
+                ReadCell::Bool(true),
+                date(45_351.0, "yyyy-mm-dd"),
+                date(45_351.5, "yyyy-mm-dd hh:mm:ss"),
+                date(45_351.5, "yyyy-mm-dd hh:mm:ss"),
+                date(0.5, "hh:mm:ss"),
+                text("12:00:00+02"),
+                text("1 day"),
+                text("00000000-0000-4000-8000-000000000001"),
+                text("{\"a\": 1}"),
+                text("{1,2}"),
+                text("\\xdeadbeef"),
+                text("=1+1"),
+                text("$12.50"),
+            ]
+        );
+        let second = &rows[2];
+        assert_eq!(second[&1], text("9007199254740993"));
+        assert_eq!(second[&2], text("1234567890.1234567"));
+        assert_eq!(second[&3], text("NaN"));
+        assert_eq!(second[&4], ReadCell::Bool(false));
+        assert_eq!(second[&5], text("0044-03-15 BC"));
+        assert_eq!(second[&6], text("infinity"));
+        assert_eq!(second[&7], text("-infinity"));
+        let ReadCell::Text(note) = &second[&15] else {
+            panic!("{second:?}");
+        };
+        assert_eq!(note.len(), 32_767);
+        // NULL is an empty cell.
+        assert_eq!(rows[3].keys().collect::<Vec<_>>(), [&0]);
+    })
+    .await;
+}
+
+/// J12: a cancelled workbook leaves nothing in the folder, neither the
+/// file nor its temporary one.
+#[tokio::test]
+async fn a_cancelled_xlsx_export_leaves_no_file() {
+    use kerno_core::xlsx::XlsxOptions;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.xlsx");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let job = ExportJob {
+        sql: "SELECT * FROM analytics.big_table".into(),
+        format: ExportFormat::Xlsx(XlsxOptions::default()),
+        encoding: Encoding::Utf8,
+        path: path.clone(),
+    };
+    let outcome = export_to_file(
+        session.clone(),
+        job,
+        move |_| flag.store(true, Ordering::Release),
+        cancel,
+    )
+    .await;
+    assert!(matches!(outcome, Err(Error::Cancelled)), "{outcome:?}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(scalar(&session, "SELECT 2").await, "2");
+}
+
+/// J12: the 1,000,000-row table as a workbook, in constant memory.
+#[tokio::test]
+async fn the_million_row_table_exports_to_a_workbook() {
+    use kerno_core::xlsx::XlsxOptions;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.xlsx");
+    let job = ExportJob {
+        sql: "SELECT * FROM analytics.big_table".into(),
+        format: ExportFormat::Xlsx(XlsxOptions::default()),
+        encoding: Encoding::Utf8,
+        path: path.clone(),
+    };
+    let started = Instant::now();
+    let (written, growth) =
+        peak_growth_kb(export_to_file(session.clone(), job, |_| {}, Arc::default())).await;
+    let written = written.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!((written.rows, written.sheets), (1_000_000, 1));
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(written.bytes, size);
+    // Constant memory: far less than the rows would take in memory.
+    assert!(growth < 400 * 1024, "peak RSS growth {growth} KB");
+    eprintln!(
+        "PostgreSQL XLSX export: 1,000,000 rows, {} MB in {:.1} s = {:.0} rows/s; peak RSS growth {} MB",
+        size / 1_000_000,
+        elapsed.as_secs_f64(),
+        1_000_000.0 / elapsed.as_secs_f64(),
+        growth / 1024
+    );
+}

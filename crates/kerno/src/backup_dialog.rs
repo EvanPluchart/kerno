@@ -180,9 +180,9 @@ enum Step {
 
 /// The tables and views of one schema (the database on MySQL).
 #[derive(Debug, Clone)]
-struct SchemaEntry {
-    name: String,
-    relations: Vec<(String, RelationKind)>,
+pub(crate) struct SchemaEntry {
+    pub(crate) name: String,
+    pub(crate) relations: Vec<(String, RelationKind)>,
 }
 
 /// Something read from the server for a page.
@@ -574,6 +574,7 @@ impl BackupDialog {
             .chain([AppState::get(cx).paths.known_hosts()])
             .collect();
         let openssh = connections.read(cx).openssh().cloned();
+        let password_env = connections.read(cx).password_env().cloned();
         let database = self.database.clone();
         self.tasks.push(cx.spawn(async move |this, cx| {
             let prepared = match secrets.await {
@@ -585,7 +586,10 @@ impl BackupDialog {
                             openssh,
                             ..HostKeyStore::default()
                         };
-                        bridge::spawn(cx, params_for(config, secrets, host_keys, database))
+                        bridge::spawn(
+                            cx,
+                            params_for(config, secrets, host_keys, database, password_env),
+                        )
                     });
                     opening.await
                 }
@@ -1845,6 +1849,9 @@ impl BackupDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if !crate::bench::active() {
+            return Err("only in bench mode".into());
+        }
         if matches!(self.tool_state, ToolState::Probing) || self.input.is_none() {
             return Err("probing".into());
         }
@@ -2195,7 +2202,20 @@ async fn params_for(
     // Only a key trusted already: nothing is learned here.
     host_keys: HostKeyStore,
     database: String,
+    password_env: Option<kerno_core::password::PasswordEnv>,
 ) -> kerno_core::Result<ConnectParams> {
+    // The password as a connection gets it (stored or asked, a command,
+    // RDS IAM, 1Password, ~/.pgpass, ~/.my.cnf); an imported command not
+    // yet confirmed is refused here too. It reaches the tool through the
+    // variable it already reads (PGPASSWORD, MYSQL_PWD), never argv.
+    let password = kerno_core::password::resolve(
+        &config,
+        secrets.password.as_ref(),
+        Some(&database),
+        password_env.as_ref(),
+    )
+    .await?
+    .password;
     let tunnel = kerno_core::connector::open_tunnel(&config, &secrets, &host_keys).await?;
     Ok(ConnectParams {
         engine: config.engine,
@@ -2203,7 +2223,7 @@ async fn params_for(
         port: config.port,
         tunnel,
         user: config.user,
-        password: secrets.password,
+        password,
         database: Some(database),
         tls: config.tls,
         read_only: config.read_only,
@@ -2213,7 +2233,7 @@ async fn params_for(
 
 /// The schemas and their tables and views (the database alone on MySQL),
 /// partitions left out as in the tree.
-async fn fetch_objects(
+pub(crate) async fn fetch_objects(
     session: &dyn Session,
     engine: Engine,
     database: &str,
@@ -2536,6 +2556,62 @@ fn my_set(this: &mut BackupDialog, change: impl FnOnce(&mut tools::MySqlBackup))
 
 // Rendering -------------------------------------------------------------------
 
+/// The steps of a wizard, listed on the left: `current` is highlighted
+/// (none while a side panel shows). Shared by the tool wizards and the copy
+/// of tables.
+pub(crate) fn wizard_steps(labels: &[&str], current: Option<usize>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .flex_none()
+        .w(px(150.))
+        .gap_1()
+        .pr_3()
+        .border_r_1()
+        .border_color(theme.border)
+        .children(labels.iter().enumerate().map(|(index, label)| {
+            let here = current == Some(index);
+            div()
+                .id(("wizard-step", index))
+                .test_support()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .text_sm()
+                .when(here, |this| {
+                    this.bg(theme.accent)
+                        .text_color(theme.accent_foreground)
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .when(!here, |this| this.text_color(theme.muted_foreground))
+                .child(SharedString::from(format!("{}. {label}", index + 1)))
+        }))
+        .into_any_element()
+}
+
+/// One chip per choice, `current` selected; a click calls `set` on the view.
+pub(crate) fn chips<V: 'static, T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    choices: &[(T, &'static str)],
+    current: T,
+    set: fn(&mut V, T),
+    cx: &Context<V>,
+) -> AnyElement {
+    h_flex()
+        .gap_1()
+        .flex_wrap()
+        .children(choices.iter().enumerate().map(|(index, (choice, label))| {
+            let choice = *choice;
+            theme::chip((id, index), current == choice)
+                .small()
+                .label(*label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    set(this, choice);
+                    cx.notify();
+                }))
+        }))
+        .into_any_element()
+}
+
 impl BackupDialog {
     /// A labelled row.
     fn field(label: &'static str, field: AnyElement, cx: &Context<Self>) -> AnyElement {
@@ -2622,37 +2698,10 @@ impl BackupDialog {
     }
 
     fn render_steps(&self, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let current = self.current_page();
-        v_flex()
-            .flex_none()
-            .w(px(150.))
-            .gap_1()
-            .pr_3()
-            .border_r_1()
-            .border_color(theme.border)
-            .children(self.pages().into_iter().enumerate().map(|(index, page)| {
-                let here = page == current && !self.showing_clients;
-                div()
-                    .id(("wizard-step", index))
-                    .test_support()
-                    .px_2()
-                    .py_1()
-                    .rounded(theme.radius)
-                    .text_sm()
-                    .when(here, |this| {
-                        this.bg(theme.accent)
-                            .text_color(theme.accent_foreground)
-                            .font_weight(FontWeight::MEDIUM)
-                    })
-                    .when(!here, |this| this.text_color(theme.muted_foreground))
-                    .child(SharedString::from(format!(
-                        "{}. {}",
-                        index + 1,
-                        page.label(self.mode)
-                    )))
-            }))
-            .into_any_element()
+        let pages = self.pages();
+        let labels: Vec<&str> = pages.iter().map(|page| page.label(self.mode)).collect();
+        let current = pages.iter().position(|page| *page == self.current_page());
+        wizard_steps(&labels, current.filter(|_| !self.showing_clients), cx)
     }
 
     /// Why the client in use may not suit: a folder asked for that is not
@@ -3168,20 +3217,7 @@ impl BackupDialog {
         set: fn(&mut Self, T),
         cx: &Context<Self>,
     ) -> AnyElement {
-        h_flex()
-            .gap_1()
-            .flex_wrap()
-            .children(choices.iter().enumerate().map(|(index, (choice, label))| {
-                let choice = *choice;
-                theme::chip((id, index), current == choice)
-                    .small()
-                    .label(*label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        set(this, choice);
-                        cx.notify();
-                    }))
-            }))
-            .into_any_element()
+        chips(id, choices, current, set, cx)
     }
 
     fn render_backup_settings(&self, cx: &Context<Self>) -> Vec<AnyElement> {

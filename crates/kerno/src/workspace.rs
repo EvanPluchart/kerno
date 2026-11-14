@@ -27,9 +27,7 @@ use gpui_kit::{
     SharedString, Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div,
     px,
 };
-use kerno_core::config::{
-    ConnectionConfig, Secret, export_connections_with_folders, import_connections_file,
-};
+use kerno_core::config::{ConnectionConfig, Secret};
 
 use crate::actions::{
     self, About, AddRow, ApplyChanges, BackupDatabase, CancelQuery, CloseAllTabs, CloseOtherTabs,
@@ -397,6 +395,9 @@ pub struct Workspace {
     dialog_open: bool,
     /// What had the keyboard in the window, while no dialog was open.
     last_focus: Option<WeakFocusHandle>,
+    /// The last run of a script on several connections (J14): kept so it
+    /// goes on, and can be shown again, once its dialog is closed.
+    multi_run: Option<Entity<crate::multi_run::MultiRun>>,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -457,6 +458,7 @@ impl Workspace {
             all_tabs_filter,
             dialog_open: false,
             last_focus: None,
+            multi_run: None,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -2134,6 +2136,108 @@ impl Workspace {
         }
     }
 
+    /// Asks which connections to run the active tab's script on (J14). A
+    /// run still going on is shown instead of a new one.
+    fn run_script_on_connections(
+        &mut self,
+        _: &crate::actions::RunScriptOnConnections,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(run) = self
+            .multi_run
+            .clone()
+            .filter(|run| run.read(cx).in_progress())
+        {
+            crate::multi_run::show(&run, window, cx);
+            return;
+        }
+        let Some(tab) = self.active_query_tab().cloned() else {
+            window.push_notification(
+                Notification::warning("Open the query tab holding the script first."),
+                cx,
+            );
+            return;
+        };
+        let workspace = cx.entity();
+        self.multi_run = Some(crate::multi_run::open(
+            &workspace,
+            &tab,
+            self.connections.clone(),
+            window,
+            cx,
+        ));
+    }
+
+    /// Shows the last run on several connections again.
+    fn show_multi_run(
+        &mut self,
+        _: &crate::actions::ShowMultiRun,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &self.multi_run {
+            Some(run) => crate::multi_run::show(run, window, cx),
+            None => window.push_notification(
+                Notification::warning("No script was run on several connections yet."),
+                cx,
+            ),
+        }
+    }
+
+    /// The last run on several connections; for tests.
+    #[cfg(test)]
+    pub fn multi_run(&self) -> Option<&Entity<crate::multi_run::MultiRun>> {
+        self.multi_run.as_ref()
+    }
+
+    /// Opens a query tab holding `sql` right after the tab `after` (at the
+    /// end without it), leaving the active tab as it is.
+    pub(crate) fn open_query_after(
+        &mut self,
+        after: Option<&Entity<QueryTab>>,
+        title: String,
+        sql: &str,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<QueryTab> {
+        let active = self.active_tab;
+        let tab = self.push_query_tab(title, sql, Some(target), window, cx);
+        let at = after
+            .and_then(|after| {
+                self.tabs
+                    .iter()
+                    .position(|open| open.query() == Some(after))
+            })
+            .map_or(self.tabs.len() - 1, |index| index + 1);
+        // The tab and its subscription move together: both are by index.
+        if let (Some(open), Some(subscription)) = (self.tabs.pop(), self.tab_subscriptions.pop()) {
+            self.tabs.insert(at, open);
+            self.tab_subscriptions.insert(at, subscription);
+        }
+        self.active_tab = if active >= at && active < self.tabs.len() - 1 {
+            active + 1
+        } else {
+            active.min(self.tabs.len() - 1)
+        };
+        self.schedule_save(cx);
+        cx.notify();
+        tab
+    }
+
+    /// Activates the open query tab `tab`.
+    pub(crate) fn show_query_tab(
+        &mut self,
+        tab: &Entity<QueryTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.tabs.iter().position(|open| open.query() == Some(tab)) {
+            self.activate_tab(index, window, cx);
+        }
+    }
+
     fn explain_statement(
         &mut self,
         _: &ExplainStatement,
@@ -2458,6 +2562,9 @@ impl Workspace {
                 crate::fdw_dialog::open(self.connections.clone(), target, window, cx);
             }
             ToolEntry::NewTask => self.new_task(target, tables, window, cx),
+            ToolEntry::CopyTables => {
+                crate::transfer_dialog::open(self.connections.clone(), target, tables, window, cx);
+            }
             ToolEntry::Tasks => {
                 self.open_tasks(window, cx);
             }
@@ -3073,62 +3180,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let picking = cx.prompt_for_new_path(&home, Some("kerno-connections.json"));
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.export_connections_to(path, window, cx)
-                });
-            }
-        })
-        .detach();
+        crate::portability::open_export(self.connections.clone(), window, cx);
     }
 
-    /// Writes the saved connections, without their secrets, to `path`.
+    /// Writes the saved connections, folder looks, environments and tasks,
+    /// without any secret, to `path` (J15), as the dialog's file choice does.
+    #[cfg(test)]
     pub fn export_connections_to(
         &mut self,
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let configs: Vec<ConnectionConfig> = self
-            .connections
-            .read(cx)
-            .saved()
-            .iter()
-            .map(|saved| saved.config.clone())
-            .collect();
-        let count = configs.len();
-        // Folders travel with their colour and glyph, never their picture.
-        let folders = AppState::get(cx).settings.folder_looks.clone();
-        let target = path.clone();
-        let writing = bridge::spawn_blocking(cx, move || {
-            let json = export_connections_with_folders(&configs, &folders)?;
-            std::fs::write(&target, json).map_err(|error| {
-                kerno_core::Error::io(format!("writing {}", target.display()), error)
-            })
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = writing.await;
-            let _ = this.update_in(cx, |_, window, cx| match outcome {
-                Ok(()) => window.push_notification(
-                    Notification::success(SharedString::from(format!(
-                        "Exported {count} connection{} to {}. Passwords are not included.",
-                        if count == 1 { "" } else { "s" },
-                        path.display()
-                    ))),
-                    cx,
-                ),
-                Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!("The export failed: {error}"))),
-                    cx,
-                ),
-            });
-        })
-        .detach();
+        let dialog = crate::portability::open_export(self.connections.clone(), window, cx);
+        dialog.update(cx, |dialog, cx| dialog.export_to(path, window, cx));
     }
 
     fn import_connections(
@@ -3155,47 +3220,20 @@ impl Workspace {
         .detach();
     }
 
-    /// Adds the connections of an exported file.
+    /// Opens the preview of what the file at `path` imports (J15).
     pub fn import_connections_from(
         &mut self,
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let source = path.clone();
-        let reading = bridge::spawn_blocking(cx, move || {
-            let json = std::fs::read_to_string(&source).map_err(|error| {
-                kerno_core::Error::io(format!("reading {}", source.display()), error)
-            })?;
-            import_connections_file(&json)
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = reading.await;
-            let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(file) => {
-                    let count = file.connections.len();
-                    this.connections.update(cx, |connections, cx| {
-                        connections.import(file.connections, cx);
-                        connections.import_folder_looks(file.folders, cx);
-                    });
-                    window.push_notification(
-                        Notification::success(SharedString::from(format!(
-                            "Imported {count} connection{}. Enter their passwords when you connect.",
-                            if count == 1 { "" } else { "s" }
-                        ))),
-                        cx,
-                    );
-                }
-                Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "{} was not imported: {error}",
-                        path.display()
-                    ))),
-                    cx,
-                ),
-            });
-        })
-        .detach();
+        let tasks_views = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.tasks().cloned())
+            .collect();
+        crate::portability::open_import(path, self.connections.clone(), tasks_views, window, cx)
+            .detach();
     }
 
     // Rendering ---------------------------------------------------------------
@@ -4992,6 +5030,8 @@ impl Render for Workspace {
                 this.close_tabs(left, window, cx)
             }))
             .on_action(cx.listener(Self::run_all))
+            .on_action(cx.listener(Self::run_script_on_connections))
+            .on_action(cx.listener(Self::show_multi_run))
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::format_sql))
@@ -5013,6 +5053,11 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &crate::actions::ExecuteScript, window, cx| {
                     this.tool_command(ToolEntry::ExecuteScript, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CopyTables, window, cx| {
+                    this.tool_command(ToolEntry::CopyTables, window, cx)
                 }),
             )
             .on_action(cx.listener(
