@@ -29,7 +29,7 @@
     --k-ring: #4D6B00; --k-sel: #D8F477; --k-ibd: #878F9B; --k-ibg: #FFFFFF; --k-pop: #FFFFFF;
     --k-hov: #F3F5F7; --k-act: #F1F8D6; --k-even: #FAFBFC; --k-head: #F6F7F8; --k-side: #F6F7F8;
     --k-sacc: #E5F2BC; --k-title: #EFF1F3; --k-tfg: #5B6470; --k-rowbd: #E8EBEF; --k-thumb: #B8C0CA;
-    --k-ov: #16191D66; --k-al: #F3F6F7; --k-ln: #68727E;
+    --k-ov: #16191D26; --k-al: #F3F6F7; --k-ln: #68727E;
     --k-kw: #4D6B00; --k-fn: #1D6FB8; --k-nu: #7445C7; --k-st: #9A4A00; --k-ty: #B8327F; --k-cm: #68727E;
     color-scheme: light; box-shadow: 0 0 0 1px var(--k-bd), 0 24px 60px rgba(40, 50, 10, .14);
   }
@@ -80,7 +80,7 @@
 .kui input::placeholder, .kui textarea::placeholder { color: var(--k-mfg); opacity: 1; }
 .kui .k-tree { flex: 1; min-height: 0; overflow: auto; padding-bottom: 8px; }
 /* A row cut by the edge of a scroll area fades out instead of being sliced. */
-.kui .k-tree, .kui .k-grid, .kui .k-plan, .kui .k-ed, .kui .k-dbody { -webkit-mask-image: linear-gradient(#000 calc(100% - 34px), transparent); mask-image: linear-gradient(#000 calc(100% - 34px), transparent); }
+.kui .k-tree, .kui .k-grid, .kui .k-plan, .kui .k-ed, .kui .k-dbody, .kui .k-des { -webkit-mask-image: linear-gradient(#000 calc(100% - 34px), transparent); mask-image: linear-gradient(#000 calc(100% - 34px), transparent); }
 .kui .k-ti { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px 0 calc(8px + var(--d) * 14px); white-space: nowrap; cursor: default; }
 .kui .k-ti:hover { background: var(--k-hov); }
 .kui .k-ti.sel { background: var(--k-sacc); }
@@ -203,7 +203,7 @@
 .kui .k-des { flex: 1; min-height: 0; overflow: auto; padding: 4px 10px 12px; }
 .kui .k-des h4 { margin: 12px 0 6px; font-size: 12px; font-weight: 600; }
 .kui .k-des p { margin: 0 0 5px; font-size: 12px; }
-.kui .k-dh, .kui .k-dr { display: grid; grid-template-columns: 18px minmax(80px, 150px) minmax(90px, 150px) 12px 54px minmax(60px, 120px) 40px 52px minmax(60px, 1fr); align-items: center; gap: 6px; }
+.kui .k-dh, .kui .k-dr { display: grid; grid-template-columns: 18px minmax(80px, 150px) minmax(90px, 150px) 12px 54px minmax(60px, 110px) 40px 52px minmax(78px, 1fr); align-items: center; gap: 6px; }
 .kui .k-dh { font-size: 12px; color: var(--k-mfg); margin-bottom: 4px; }
 .kui .k-dh span:nth-child(2) { grid-column: 2; } .kui .k-dh span:nth-child(3) { grid-column: 3; }
 .kui .k-dh span:nth-child(4) { grid-column: 6; } .kui .k-dh span:nth-child(5) { grid-column: 9; }

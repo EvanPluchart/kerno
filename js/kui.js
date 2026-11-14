@@ -422,15 +422,15 @@ const MENU = [['Open data', 'data'], ['Open structure', 'structure'], ['Properti
   ['Add column...', 'addcol'], 0, ['Show DDL'], ['Copy name', 'copy'], ['Copy qualified name', 'copyq'], 0, ['Rename...'], ['Drop...'], ['Drop with cascade...'], 0,
   ['Tools: backup...', 'tools'], ['Filter', null, 1], 0, ['Refresh', 'refresh']];
 let menuFor = null, menuReturn = null;
-function menu(n, x, y) {
+function menu(n, x, y, quiet) {
   if (!n?.table) return;
   menuFor = n.table; menuReturn = document.activeElement;
   layer.querySelector('.k-menu')?.remove();
   layer.insertAdjacentHTML('beforeend', `<div class="k-menu" role="menu" aria-label="${esc(n.table)}" style="left:${Math.min(x, parseFloat(root.style.width) - 210)}px;top:${y}px">`
-    + MENU.map((m) => (m ? `<button type="button" role="menuitem" tabindex="-1"${m[1] ? ` data-a="menu" data-v="${m[1]}"` : ' aria-disabled="true"'}>${m[0]}${m[2] ? ic('chev') : ''}</button>` : '<hr>')).join('') + '</div>');
+    + MENU.filter((m, i, a) => (m ? m[1] : a.slice(0, i).reverse().find((x) => !x || x[1]) && a.slice(i + 1).some((x) => x && x[1]))).map((m) => (m ? `<button type="button" role="menuitem" tabindex="-1"${m[1] ? ` data-a="menu" data-v="${m[1]}"` : ' aria-disabled="true"'}>${m[0]}${m[2] ? ic('chev') : ''}</button>` : '<hr>')).join('') + '</div>');
   const el = layer.querySelector('.k-menu'); // keep it inside the window, under the title bar
   el.style.top = `${Math.max(36, Math.min(y, parseFloat(root.style.height) - el.offsetHeight - 8))}px`;
-  el.querySelector('[data-a]').focus({ preventScroll: true });
+  if (!quiet) el.querySelector('[data-a]').focus({ preventScroll: true });
 }
 function closeMenu(refocus) { const m = layer.querySelector('.k-menu'); if (!m) return; m.remove(); if (refocus && root.contains(menuReturn)) menuReturn.focus({ preventScroll: true }); }
 function menuAct(v) {
@@ -1008,6 +1008,19 @@ function show(name, byVisitor) {
   const v = st().view; if (v.table && T[v.table]) TREE.sel = `t:${v.table}`;
   render();
   if (byVisitor && st().dlg) focusDlg();
+  if (!st().touched) requestAnimationFrame(() => { if (cur === name && !st().touched) pose(name); });
+}
+
+// A state the visitor has not touched shows what its caption promises: the table's menu open in
+// the navigator, the completion list open in the editor. Nothing takes the focus; a click closes it.
+function pose(name) {
+  if (name === 'navigator') {
+    const el = side.querySelector('[aria-selected="true"]'), n = el && NODES.get(el.dataset.id);
+    if (n?.table) { const r = el.getBoundingClientRect(), edge = side.closest('.k-side').getBoundingClientRect().right; menu(n, ...local(edge - 4, r.top - 4), true); }
+  } else if (name === 'editor') {
+    const t = ta(), at = t ? t.value.indexOf('o.status') + 3 : 0; // after "o.s": the columns of orders in s
+    if (at > 2) { t.setSelectionRange(at, at); complete(true); }
+  }
 }
 
 export function selfCheck() {

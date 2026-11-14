@@ -67,14 +67,19 @@
           </a>
           <a class="btn quiet" data-os="linux" href="https://github.com/EvanPluchart/kerno/releases/latest"><span>Linux</span></a>
         </div>
-        <p class="cta-note"><span class="nw">Free · Open source</span><span class="sep"> · </span><span class="nw"><a href="https://github.com/EvanPluchart/kerno/releases">v0.1.0</a><span data-mac-only> · 24 MB · Apple silicon</span></span></p>
-        <p class="cta-note more" data-mac-only>Not notarised yet: <a href="#download">one extra step at first launch</a>.</p>
+      </div>
+      <div class="hero-meta">
+        <p class="cta-note"><span class="nw">Free · Open source · <a href="https://github.com/EvanPluchart/kerno/releases">v0.1.0</a><span data-mac-only> · 24 MB</span></span></p>
+        <p class="cta-note more">For Apple silicon Macs and arm64 Linux. MIT or Apache-2.0, with checksums for every release.<span data-mac-only> <a href="#faq">Not notarised yet</a>.</span></p>
       </div>
     </div>
     <div class="stage hero-stage">
       <picture class="window hero-window">
-        <source media="(prefers-color-scheme: light)" srcset="img/shots/hero-1180-light.webp 1180w, img/shots/hero-light.webp 2360w" sizes="(min-width: 1360px) 1180px, (min-width: 721px) 86vw, 215vw">
-        <img src="img/shots/hero-1180-dark.webp" srcset="img/shots/hero-1180-dark.webp 1180w, img/shots/hero-dark.webp 2360w" sizes="(min-width: 1360px) 1180px, (min-width: 721px) 86vw, 215vw" width="2360" height="1434" fetchpriority="high" alt="The Kerno window: the schema tree of a shop database on the left, a SQL query in the editor, and its result rows in the grid below.">
+        <!-- Phones get the editor and its results, at a size that reads. -->
+        <source media="(max-width: 720px) and (prefers-color-scheme: light)" srcset="img/shots/ph-hero-light.webp" width="900" height="820">
+        <source media="(max-width: 720px)" srcset="img/shots/ph-hero-dark.webp" width="900" height="820">
+        <source media="(prefers-color-scheme: light)" srcset="img/shots/hero-1180-light.webp 1180w, img/shots/hero-light.webp 2360w" sizes="(min-width: 1360px) 1180px, 86vw">
+        <img src="img/shots/hero-1180-dark.webp" srcset="img/shots/hero-1180-dark.webp 1180w, img/shots/hero-dark.webp 2360w" sizes="(min-width: 1360px) 1180px, 86vw" width="2360" height="1434" fetchpriority="high" alt="The Kerno window: the schema tree of a shop database on the left, a SQL query in the editor, and its result rows in the grid below.">
       </picture>
     </div>
     <p class="hero-tag" hidden>This window appeared in <b>279 ms</b>: Kerno’s measured launch time.</p>
@@ -106,7 +111,7 @@
       <div class="flip">
         <picture class="window shot-local">
           <source media="(prefers-color-scheme: light)" srcset="img/shots/flip-local-light.webp">
-          <img src="img/shots/flip-local-dark.webp" width="2000" height="1254" loading="lazy" alt="A local connection in Kerno: a neutral window, a query and its results.">
+          <img src="img/shots/flip-local-dark.webp" width="2000" height="1254" loading="lazy" alt="A local connection in Kerno: a neutral window, a DELETE statement in the editor above the rows it would remove.">
         </picture>
         <picture class="window shot-prod">
           <source media="(prefers-color-scheme: light)" srcset="img/shots/flip-prod-light.webp">
@@ -164,7 +169,7 @@
   <div class="wrap">
     <div class="features-head">
       <h2 data-r>Everything you reach for.</h2>
-      <p class="say" data-r><span class="no-kui">The whole toolbox of a heavyweight client, in an app that stays light.</span><span class="kui-only live">This window is live: run a query, edit a cell, open a dialog. It is a demo with sample data.</span></p>
+      <p class="say" data-r><span class="no-kui">The whole toolbox of a heavyweight client, in an app that stays light.</span><span class="kui-only live">This window is live: run a query, edit a cell, open a dialog. It is a demo with sample data.</span><span class="kui-only still">The command palette, in a capture of the app.</span></p>
     </div>
     <div class="feats" data-r>
       <div class="feat-side">
@@ -178,6 +183,7 @@
         <label><input type="radio" name="feat" value="export"><span>Import and export</span></label>
         <label><input type="radio" name="feat" value="backup"><span>Backup and restore</span></label>
         <label><input type="radio" name="feat" value="ssh"><span>SSH and TLS</span></label>
+        <label><input type="radio" name="feat" value="palette"><span>Command palette</span></label>
       </fieldset>
       </div>
       <div class="feat-view">
@@ -186,24 +192,26 @@
              keep the captures below. -->
         <div class="kui-mount" data-kui hidden></div>
         <div class="stage feat-stage">
-          <picture data-feat="navigator"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-navigator-light.webp"><img src="img/shots/feat-navigator-dark.webp" width="1720" height="1076" loading="lazy" alt="The schema tree of a shop database, with the size and row count of each table, beside a query and its results."></picture>
-          <picture data-feat="editor"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-editor-light.webp"><img src="img/shots/feat-editor-dark.webp" width="1720" height="1076" loading="lazy" alt="The SQL editor with a highlighted JOIN query and its typed result grid."></picture>
-          <picture data-feat="edits"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-edits-light.webp"><img src="img/shots/feat-edits-dark.webp" width="1608" height="1006" loading="lazy" alt="The products table with one edited cell highlighted, and the pending change waiting for Discard, Review SQL or Apply."></picture>
-          <picture data-feat="explain"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-explain-light.webp"><img src="img/shots/feat-explain-dark.webp" width="1608" height="1006" loading="lazy" alt="An EXPLAIN ANALYZE plan drawn as a tree, with cost, rows and time per step, a bar per step and the slowest step marked."></picture>
-          <picture data-feat="structure"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-structure-light.webp"><img src="img/shots/feat-structure-dark.webp" width="1720" height="1076" loading="lazy" alt="The table designer: columns in a form, and the ALTER TABLE statement it will run underneath."></picture>
-          <picture data-feat="export"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-export-light.webp"><img src="img/shots/feat-export-dark.webp" width="1720" height="1076" loading="lazy" alt="The export dialog: CSV, TSV, JSON, NDJSON, SQL INSERT or Markdown, with delimiter and encoding."></picture>
+          <picture data-feat="navigator"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-navigator-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-navigator-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-navigator-light.webp"><img src="img/shots/feat-navigator-dark.webp" width="1608" height="1006" loading="lazy" alt="The schema tree with the right-click menu of the orders table open: open data, generate SQL, show DDL, rename, drop, tools."></picture>
+          <picture data-feat="editor"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-editor-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-editor-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-editor-light.webp"><img src="img/shots/feat-editor-dark.webp" width="1608" height="1006" loading="lazy" alt="The SQL editor mid-query, its completion list open on the columns of the orders table, above the rows of the previous result."></picture>
+          <picture data-feat="edits"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-edits-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-edits-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-edits-light.webp"><img src="img/shots/feat-edits-dark.webp" width="1608" height="1006" loading="lazy" alt="The products table with one edited cell highlighted, and the pending change waiting for Discard, Review SQL or Apply."></picture>
+          <picture data-feat="explain"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-explain-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-explain-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-explain-light.webp"><img src="img/shots/feat-explain-dark.webp" width="1608" height="1006" loading="lazy" alt="An EXPLAIN ANALYZE plan drawn as a tree, with cost, rows and time per step, a bar per step and the slowest step marked."></picture>
+          <picture data-feat="structure"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-structure-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-structure-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-structure-light.webp"><img src="img/shots/feat-structure-dark.webp" width="1608" height="1006" loading="lazy" alt="The table designer on the products table: a new column in the form, and the ALTER TABLE statement it will run underneath."></picture>
+          <picture data-feat="export"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-export-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-export-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-export-light.webp"><img src="img/shots/feat-export-dark.webp" width="1268" height="532" loading="lazy" alt="The export dialog for the orders table: CSV, TSV, JSON, NDJSON, SQL INSERT or Markdown, with delimiter, NULL text, header, line ending and encoding."></picture>
           <picture data-feat="backup"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-backup-light.webp"><img src="img/shots/feat-backup-dark.webp" width="1720" height="1076" loading="lazy" alt="The backup wizard: format, compression, content and output folder for pg_dump."></picture>
           <picture data-feat="ssh"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-ssh-light.webp"><img src="img/shots/feat-ssh-dark.webp" width="1720" height="1076" loading="lazy" alt="The new connection dialog on its SSH tunnel tab: host, user, and agent, password or key file."></picture>
+          <picture data-feat="palette"><source media="(max-width: 560px) and (prefers-color-scheme: light)" srcset="img/shots/ph-palette-light.webp"><source media="(max-width: 560px)" srcset="img/shots/ph-palette-dark.webp"><source media="(prefers-color-scheme: light)" srcset="img/shots/feat-palette-light.webp"><img src="img/shots/feat-palette-dark.webp" width="1340" height="840" loading="lazy" alt="The command palette open over a query and its results, listing the commands that match “exp”: export connections, export from query, explain statement, explain analyze, export."></picture>
         </div>
         <div class="feat-captions">
-          <p data-feat="navigator">Every table, view and function in one tree, a right-click from anything.</p>
-          <p data-feat="editor">Completion from your schema, one keystroke to run, typed results.</p>
+          <p data-feat="navigator">Every table, view and function in one tree, and a right-click on any of them.</p>
+          <p data-feat="editor">Completion that knows your tables, columns and joins.</p>
           <p data-feat="edits">Edit cells in place, read the SQL, apply it in one transaction.</p>
           <p data-feat="explain">EXPLAIN as a tree, with the slowest step marked for you.</p>
           <p data-feat="structure">Change a table in a form and watch the DDL write itself.</p>
           <p data-feat="export">CSV, JSON, SQL and Markdown, streamed straight to disk.</p>
           <p data-feat="backup">pg_dump and mysqldump behind a wizard you can save and rerun.</p>
           <p data-feat="ssh">Tunnels, agents, keys and certificates, built into the connection.</p>
+          <p data-feat="palette">Every action is one search away, on Cmd+K.</p>
         </div>
       </div>
     </div>
@@ -220,7 +228,7 @@
       <div data-r><dt>24&nbsp;MB</dt><dd>to download. No bundled browser, no runtime to install.</dd></div>
       <div data-r><dt>Your keychain</dt><dd>holds the passwords: macOS Keychain or Linux Secret Service.</dd></div>
       <div data-r><dt>Zero tracking</dt><dd>No analytics, no crash reports. One update check you can switch off.</dd></div>
-      <div data-r><dt>MIT or Apache</dt><dd>Read the code and build it yourself. It stays free.</dd></div>
+      <div data-r><dt>Keyboard first</dt><dd>A command palette, a shortcut for every action, a keymap you can edit.</dd></div>
     </dl>
   </div>
 </section>
@@ -237,13 +245,7 @@
       </a>
       <a class="btn quiet" data-os="linux" href="https://github.com/EvanPluchart/kerno/releases/latest"><span>Linux</span></a>
     </div>
-    <p class="cta-note" data-r>Free and open source, with no account to create.</p>
-    <ul class="trust" data-r>
-      <li><b>Check it.</b> <code class="cmd">shasum -a 256 --ignore-missing -c SHA256SUMS</code></li>
-      <li><b>First launch.</b> The build is not notarised yet, so macOS blocks it once: open System Settings, Privacy &amp; Security, and choose Open Anyway.</li>
-      <li><b>Or build it.</b> <code class="cmd">cargo build --release -p kerno</code> From <a href="https://github.com/EvanPluchart/kerno">the source on GitHub</a>.</li>
-      <li><b>Know the limits.</b> 0.1.0 is a first release. Not yet: SQLite and other engines, ERD diagrams, schema and data compare, an Intel Mac or Windows build. <a href="https://github.com/EvanPluchart/kerno/blob/main/docs/ROADMAP.md">The roadmap</a></li>
-    </ul>
+    <p class="cta-note" data-r>Free and open source, with no account to create. Checksums ship with every release; the macOS build is <a href="#faq">not notarised yet</a>.</p>
   </div>
 </section>
 
@@ -258,6 +260,10 @@
         <summary>Is Kerno really free?</summary>
         <p>Yes. Kerno is open source under the MIT or Apache-2.0 licence, your choice. There is no paid tier and no account.</p>
       </details>
+      <details data-r open>
+        <summary>What does 0.1.0 not do yet?</summary>
+        <p>It is a first release. Not yet: SQLite and other engines, ERD diagrams, schema and data compare, an Intel Mac or a Windows build. The <a href="https://github.com/EvanPluchart/kerno/blob/main/docs/ROADMAP.md">roadmap</a> lists them in the order they will be built.</p>
+      </details>
       <details data-r>
         <summary>Which databases does it work with?</summary>
         <p>PostgreSQL, MySQL and MariaDB today. SQLite is next on the <a href="https://github.com/EvanPluchart/kerno/blob/main/docs/ROADMAP.md">roadmap</a>, and other engines follow through the same driver layer.</p>
@@ -268,7 +274,10 @@
       </details>
       <details data-r>
         <summary>How do I know my download is genuine?</summary>
-        <p>Every release comes with a <code>SHA256SUMS</code> file to check your download against, and Kerno verifies each update the same way before it installs. The app is not notarised by Apple yet, so macOS asks you to confirm the first launch in System Settings, under Privacy &amp; Security.</p>
+        <p>Every release comes with a <code>SHA256SUMS</code> file. Put it beside your download and run:</p>
+        <p><code class="cmd">shasum -a 256 --ignore-missing -c SHA256SUMS</code></p>
+        <p>Kerno verifies each update the same way before it installs. The app is not notarised by Apple yet, so macOS blocks its first launch once: open System Settings, Privacy &amp; Security, and choose Open Anyway. Or skip the question and build it yourself:</p>
+        <p><code class="cmd">cargo build --release -p kerno</code></p>
       </details>
       <details data-r>
         <summary>Where are my passwords?</summary>

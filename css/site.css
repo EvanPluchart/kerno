@@ -149,11 +149,15 @@ main a:not(.btn):hover { text-decoration-thickness: .16em; }
 
 /* 1. Hero: the statement and the action side by side, the window under them. */
 .hero { position: relative; padding-top: clamp(20px, 2.2vw, 28px); }
-.hero-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 372px); gap: 32px 48px; align-items: end; }
+.hero-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 408px); grid-template-areas: 'title side' 'meta side'; gap: 0 48px; align-items: end; }
+.hero-top h1 { grid-area: title; }
+.hero-side { grid-area: side; }
+.hero-meta { grid-area: meta; }
 .hero h1 .line { display: block; overflow: hidden; padding-bottom: .14em; margin-bottom: -.14em; white-space: nowrap; }
 .hero h1 .line > span { display: block; }
 .hero-side { padding-bottom: 6px; }
 .lede { font-size: var(--t-lead); line-height: 1.45; text-wrap: pretty; margin-bottom: 22px; }
+.hero-meta .cta-note:first-child { margin-top: 18px; }
 /* At 1440 the window is shown at its true size (1180 pt), pixel for pixel on a 2x screen. It
    stays flat: a tilted bitmap is a blurred bitmap. It only rises a little with the scroll. */
 .hero-stage { margin-top: clamp(24px, 2vw, 28px); padding: clamp(16px, 2vw, 28px) clamp(16px, 3.5vw, 50px) 0; }
@@ -164,16 +168,20 @@ main a:not(.btn):hover { text-decoration-thickness: .16em; }
 .hero-window.opening { opacity: 0; scale: .9; }
 .hero-window.opened { transition: opacity .279s linear, scale .279s var(--ease); }
 @media (max-width: 1120px) {
-  .hero-top { grid-template-columns: 1fr; }
-  .hero-side { max-width: 30em; }
+  .hero-top { grid-template-columns: 1fr; grid-template-areas: 'title' 'side' 'meta'; }
+  .hero-side { max-width: 30em; margin-top: 24px; }
+  .hero-meta .cta-note:first-child { margin-top: 14px; }
 }
 @media (max-width: 720px) {
   /* A whole window at phone width is unreadable: show its left part at a size that reads. */
   /* A whole window at phone width is unreadable: show its left half, down to the first rows. */
   .hero-stage { padding-right: 0; }
-  .hero-window { width: 230%; margin-bottom: -22%; }
-  .cta-note .sep { display: none; }
-  .cta-note .nw { display: block; }
+  .hero-window { width: 100%; margin-bottom: 0; border-radius: 10px 0 0; overflow: hidden;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent), linear-gradient(#000 calc(100% - 36px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent), linear-gradient(#000 calc(100% - 36px), transparent);
+    -webkit-mask-composite: source-in; mask-composite: intersect; }
+  .hero-window img { border-radius: 0; }
+    .cta-note .nw { display: block; }
   .hero .cta-buttons { flex-wrap: nowrap; }
   .hero .btn { padding-inline: 18px; }
   .hero .btn.primary { flex: 1; }
@@ -181,7 +189,7 @@ main a:not(.btn):hover { text-decoration-thickness: .16em; }
 @media (prefers-reduced-motion: no-preference) {
   .js .hero h1 .line > span { animation: rise .9s var(--ease) both; }
   .js .hero h1 .line + .line > span { animation-delay: .08s; }
-  .js .hero-side { animation: fade-up .8s var(--ease) .25s both; }
+  .js .hero-side, .js .hero-meta { animation: fade-up .8s var(--ease) .25s both; }
   .js .hero-stage { animation: fade-up .6s var(--ease) .2s both; }
   .stage::before, .light { animation: breathe 7s ease-in-out infinite alternate; }
 }
@@ -209,14 +217,19 @@ section { padding-block: var(--section); overflow-x: clip; }
 .speed-text .say { margin-top: 24px; }
 .replay { margin-top: 28px; min-height: 46px; padding: 0 18px; font-size: var(--t-small); border-radius: 10px; }
 /* A recording of the real app beside the figures it illustrates. */
-.speed-proof { display: grid; grid-template-columns: 8fr 4fr; gap: clamp(32px, 5vw, 80px); align-items: start; margin-top: clamp(36px, 4vw, 56px); }
-.reel .stage { padding: clamp(14px, 2.4vw, 32px); }
+.speed-proof { display: grid; grid-template-columns: 8fr 4fr; gap: clamp(32px, 5vw, 80px); align-items: stretch; margin-top: clamp(36px, 4vw, 56px); }
+.reel { display: flex; flex-direction: column; }
+.reel .stage { flex: 1; display: grid; align-content: center; padding: clamp(14px, 2.4vw, 32px); }
 .reel video { display: block; width: 100%; height: auto; border-radius: 8px; background: var(--bg); }
 .reel figcaption { margin-top: 14px; font-size: var(--t-small); color: var(--muted); }
 .stats { display: grid; gap: clamp(20px, 2.6vw, 36px); }
 .stats dt { font-size: var(--t-h2); font-weight: 600; letter-spacing: -.045em; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stats dd { margin-top: 10px; color: var(--muted); max-width: 24em; }
 .proof { margin-top: clamp(20px, 2.6vw, 36px); font-size: var(--t-small); color: var(--muted); }
+@media (max-width: 720px) {
+  /* The phone cut of the recording: four columns of the grid, at a size that reads. */
+  .reel video { aspect-ratio: 760 / 646; }
+}
 @media (max-width: 860px) {
   .speed-grid, .speed-proof { grid-template-columns: 1fr; }
 }
@@ -241,18 +254,18 @@ section { padding-block: var(--section); overflow-x: clip; }
 .safe-caption { margin-top: 20px; font-weight: 500; min-height: 3.1em; max-width: 26em; }
 .rules { list-style: none; margin: 28px 0 0; padding: 0; display: grid; gap: 10px; color: var(--muted); max-width: 30em; }
 .rules li { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: baseline; }
-.rules li::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--env); translate: 0 -1px; transition: background-color .5s; }
+.rules li::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--env); translate: 0 -1px; }
 .when-prod { display: none; }
 .safe:has(input[value='production']:checked) .when-local { display: none; }
 .safe:has(input[value='production']:checked) .when-prod { display: inline; }
 /* The window is wider than its stage: its right quarter stays outside (see tools/shots.sh). */
 .safe-stage { padding-right: 0; }
-.flip { position: relative; width: 143%; margin-bottom: var(--pad); }
-.flip .window + .window { position: absolute; inset: 0; opacity: 0; transition: opacity .25s; }
+.flip { position: relative; width: 160%; margin-bottom: var(--pad); }
+.flip .window + .window { position: absolute; inset: 0; opacity: 0; transition: opacity .15s; }
 .safe:has(input[value='production']:checked) .shot-prod { opacity: 1; }
 /* The app's own confirmation, laid over the empty editor of the window as a callout. In the app
    a scrim dims the window behind it; here the window stays red, which is the point. */
-.confirm { display: block; position: absolute; right: 18px; top: 34%; width: min(78%, 559px); opacity: 0; translate: 0 14px; scale: .97; transform-origin: 0 0; transition: opacity .25s, translate .3s var(--ease), scale .3s var(--ease); }
+.confirm { display: block; position: absolute; right: 18px; top: 36%; width: min(80%, 559px); opacity: 0; translate: 0 14px; scale: .97; transform-origin: 0 0; transition: opacity .25s, translate .3s var(--ease), scale .3s var(--ease); }
 .confirm img { width: 100%; border-radius: 1.25% / 3.2%; box-shadow: 0 0 0 1px var(--ring), var(--shadow); }
 .safe:has(input[value='production']:checked) .confirm { opacity: 1; translate: none; scale: 1; transition-delay: .45s; }
 @media (max-width: 860px) {
@@ -271,7 +284,7 @@ section { padding-block: var(--section); overflow-x: clip; }
 @media (max-width: 720px) {
   /* The left half of the window, at a size that reads, down to its status bar. */
   .safe-text { padding-top: 0; }
-  .safe-stage { --pad: 12px; margin-inline: calc(-1 * var(--gutter)); border-radius: 0; }
+  .safe-stage { --pad: 12px; }
   .flip { width: 200%; margin-bottom: 12px; }
 }
 
@@ -283,12 +296,14 @@ section { padding-block: var(--section); overflow-x: clip; }
 .features-head .say { justify-self: end; max-width: 24em; }
 .features:has(.has-kui) .no-kui { display: none; }
 .features:has(.has-kui) .features-head .kui-only { display: inline; }
+.features:has(.has-kui) .features-head .still, .features:has(input[value='palette']:checked) .features-head .live { display: none; }
+.features:has(.has-kui):has(input[value='palette']:checked) .features-head .still { display: inline; }
 .live::before { content: ''; display: inline-block; width: .5em; height: .5em; margin-right: .5em; border-radius: 50%; background: var(--link); vertical-align: .12em; }
 .feats { display: grid; grid-template-columns: 232px minmax(0, 1fr); gap: 36px; margin-top: clamp(20px, 3svh, 32px); align-items: start; }
 .feat-list { display: grid; gap: 2px; }
 .feat-list label { position: relative; cursor: pointer; }
 .feat-list input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
-.feat-list span { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin-left: -14px; border-radius: 10px; font-size: var(--t-lead); font-weight: 500; letter-spacing: -.02em; color: var(--muted); transition: color .2s, background-color .2s; }
+.feat-list span { display: flex; align-items: center; gap: 10px; padding: 9px 14px; margin-left: -14px; border-radius: 10px; font-size: var(--t-lead); font-weight: 500; letter-spacing: -.02em; color: var(--muted); transition: color .2s, background-color .2s; }
 .feat-list span::before { content: ''; flex: none; width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: .35; transition: background-color .2s, opacity .2s, scale .3s var(--ease); }
 .feat-list label:hover span { color: var(--ink); background: var(--bg-3); }
 .feat-list input:checked + span { color: var(--ink); background: var(--bg); }
@@ -299,6 +314,10 @@ section { padding-block: var(--section); overflow-x: clip; }
 .kui-only { display: none; }
 .has-kui .kui-only { display: block; }
 .has-kui .feat-stage { display: none; }
+/* The command palette has no live state: its capture takes the window's place. */
+.has-kui:has(input[value='palette']:checked) .feat-stage { display: grid; padding: 0; }
+.has-kui .feat-stage [data-feat='palette'] { width: min(670px, 92%); border-radius: 10px; align-self: center; justify-self: center; } /* its true size */
+.has-kui:has(input[value='palette']:checked) .kui-mount { display: none; }
 .feat-stage { display: grid; height: var(--kui-h); padding: var(--pad) 0 0 var(--pad); background: var(--bg); }
 .feat-stage picture { grid-area: 1 / 1; min-width: 0; width: 112%; border-radius: 10px 0 0; overflow: hidden; box-shadow: 0 0 0 1px var(--ring), var(--shadow); align-self: start; }
 .feat-stage img { width: 100%; }
@@ -313,6 +332,7 @@ section { padding-block: var(--section); overflow-x: clip; }
 .feats:has(input[value='structure']:checked) [data-feat='structure'],
 .feats:has(input[value='export']:checked) [data-feat='export'],
 .feats:has(input[value='backup']:checked) [data-feat='backup'],
+.feats:has(input[value='palette']:checked) [data-feat='palette'],
 .feats:has(input[value='ssh']:checked) [data-feat='ssh'] { opacity: 1; visibility: visible; transition: opacity .35s; }
 @media (min-width: 861px) {
   .features { padding-block: clamp(28px, 4.5svh, 56px); }
@@ -340,11 +360,15 @@ section { padding-block: var(--section); overflow-x: clip; }
      inside it, so that the frame's own edge is what cuts the picture. */
   .feat-stage picture { width: 100%; height: 100%; border-radius: 10px 0 0; }
   .feat-stage img { width: var(--w, 170%); max-width: none; translate: var(--tx, 0) var(--ty, 0); }
-  [data-feat='edits'] { --w: 150%; }
-  [data-feat='explain'] { --w: 132%; }
-  [data-feat='structure'] { --w: 200%; }
-  [data-feat='export'] { --w: 200%; --tx: -5.5%; --ty: -3.3%; }
-  [data-feat='backup'] { --w: 230%; --tx: -24%; --ty: -11.5%; }
+  [data-feat='navigator'], [data-feat='editor'], [data-feat='edits'], [data-feat='explain'], [data-feat='structure'], [data-feat='export'], [data-feat='palette'] { --w: 100%; }
+  /* A capture leaves its frame by the right and the bottom: those edges fade, so that a row or a
+     word cut there reads as running on, not as sliced. */
+  .feat-stage picture {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent), linear-gradient(#000 calc(100% - 36px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent), linear-gradient(#000 calc(100% - 36px), transparent);
+    -webkit-mask-composite: source-in; mask-composite: intersect;
+  }
+  [data-feat='backup'] { --w: 170%; --tx: -8.4%; }
   [data-feat='ssh'] { --w: 200%; --tx: -15.2%; --ty: -.9%; }
 }
 
@@ -369,13 +393,10 @@ section { padding-block: var(--section); overflow-x: clip; }
 .final-icon { border-radius: 22.6%; box-shadow: var(--shadow); }
 .final h2 { margin-top: 36px; max-width: 12em; }
 .final .cta-buttons { margin-top: 40px; justify-content: center; }
-.trust { list-style: none; margin: 44px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 24px clamp(32px, 5vw, 72px); width: min(100%, 980px); text-align: left; font-size: var(--t-small); line-height: 1.5; }
-.trust b { display: block; font-size: var(--t-body); font-weight: 600; margin-bottom: 4px; }
 .cmd { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 6px 0; padding: 10px 12px; border-radius: 10px; background: var(--bg-2); overflow-wrap: anywhere; }
 .cmd button { flex: none; padding: 6px 10px; border: 0; border-radius: 7px; background: var(--bg-3); color: var(--ink); font: 500 13px/1 Inter, system-ui, sans-serif; cursor: pointer; transition: background-color .2s, scale .15s; }
 .cmd button:hover { background: color-mix(in srgb, var(--ink) 16%, var(--bg-3)); }
 .cmd button:active { scale: .96; }
-@media (max-width: 860px) { .trust { grid-template-columns: 1fr; } }
 
 /* 7. Questions */
 .faq { padding-top: 0; }
@@ -390,6 +411,8 @@ section { padding-block: var(--section); overflow-x: clip; }
 .faq summary::after { content: ''; flex: none; width: 14px; height: 14px; background: currentColor; clip-path: polygon(0 41%, 41% 41%, 41% 0, 59% 0, 59% 41%, 100% 41%, 100% 59%, 59% 59%, 59% 100%, 41% 100%, 41% 59%, 0 59%); transition: rotate .3s var(--ease); }
 .faq details[open] summary::after { rotate: 45deg; }
 .faq details p { padding: 0 24px 24px; max-width: 38em; }
+.faq details p:not(:last-child) { padding-bottom: 12px; }
+.faq .cmd { background: var(--bg); }
 @media (max-width: 860px) { .faq-grid { grid-template-columns: 1fr; } .faq-grid > div:first-child { position: static; } }
 
 /* Footer */

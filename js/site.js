@@ -78,7 +78,8 @@ if (clock && !still) {
 // it is on screen. Without this script, or with reduced motion, it keeps its controls.
 const reel = $('.reel video');
 if (reel) {
-  if (matchMedia('(prefers-color-scheme: light)').matches) reel.poster = 'img/video/scroll-wide-light.webp';
+  const theme = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  reel.poster = `img/video/scroll-${matchMedia('(max-width: 720px)').matches ? '' : 'wide-'}${theme}.webp`;
   if (!still) {
     reel.controls = false;
     new IntersectionObserver(([e]) => { if (e.isIntersecting) reel.play().catch(() => { reel.controls = true; }); else reel.pause(); }, { threshold: 0.5 }).observe(reel);
