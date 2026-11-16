@@ -63,20 +63,17 @@ codesign --verify --deep --strict --verbose=2 "$app"
 echo "bundle: $app ($(du -sh "$app" | cut -f1))"
 
 if [ "${KERNO_SKIP_LAUNCH_CHECK:-}" != 1 ]; then
-  # One Kerno at a time: wait for an instance started by someone else.
-  for _ in $(seq 60); do pgrep -x kerno >/dev/null || break; sleep 1; done
-  if pgrep -x kerno >/dev/null; then
-    echo "launch check: another kerno is still running; quit it and run again" >&2
-    exit 1
-  fi
+  # The bundle's own process is found by its path: the user's own Kerno may
+  # be open, and is neither waited for nor touched.
+  exe="$(cd "$app" && pwd -P)/Contents/MacOS/kerno"
   data=$(mktemp -d -t kerno-bundle-check)
   pid=
   trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$data"' EXIT
   open -n --env KERNO_DATA_DIR="$data" --env KERNO_SECRET_STORE=memory "$app"
   window=
   for _ in $(seq 30); do
-    pid=$(pgrep -x kerno || true)
-    if [ -n "$pid" ] && window=$(swift scripts/window-id.swift kerno 2>/dev/null); then break; fi
+    pid=$(pgrep -f "^$exe" | head -1 || true)
+    if [ -n "$pid" ] && window=$(swift scripts/window-id.swift kerno "$pid" 2>/dev/null); then break; fi
     sleep 1
   done
   if [ -z "$window" ]; then

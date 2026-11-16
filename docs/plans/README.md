@@ -42,7 +42,9 @@ A subagent given a part must:
   reports instead. `target/` must stay under about 20 GB: report its size (`du -sh target`) at the end of a
   part. Docker images built for a check are removed when the check is done.
 - **At most 2 subagents at once, of any kind** (documentation-only agents count too).
-- One Kerno instance at a time; quit it (`pkill -x kerno`) when done. No process left running.
+- One Kerno instance of yours at a time; quit the one you started, by its process id, when done. **Never
+  stop Kerno by name** (`pkill -x kerno`, `killall kerno`): the owner uses the installed app, whose process
+  has the same name. The scripts find their own instance by path or pid. No process left running.
 - No secret in a file, a log or a panic message. No telemetry, no network call other than to the database.
 - Every statement that writes or destroys goes through `crates/kerno/src/sql_confirm.rs` (shows the SQL, asks;
   production asks twice; Enter never confirms). A `read_only` connection refuses writes in the client.

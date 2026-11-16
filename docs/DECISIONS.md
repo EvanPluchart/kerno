@@ -1587,3 +1587,14 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   `README.ko.md`, same structure, the app's own labels left in English (the interface is in English), the
   deeper documents linked as English-only.
 
+## D-075 — The scripts live beside the owner's own Kerno (2026-11-16)
+
+- The owner now uses the installed app daily. `scripts/bundle-macos.sh`, `scripts/capture.sh` and
+  `scripts/bench.sh` used to refuse to run while any process named `kerno` existed (the release run of the
+  same day stopped on it). They now find the instance they start by its path or process id
+  (`scripts/window-id.swift` takes a pid), and neither wait for nor touch another one.
+- **Never stop Kerno by name** (`pkill -x kerno`, `killall`): written in `docs/plans/README.md`. Checks and
+  captures keep using a scratch data directory and the in-memory secret store, so the owner's connections,
+  keychain and single-instance socket are never involved.
+- The look of the disk image is on the roadmap for the next release.
+

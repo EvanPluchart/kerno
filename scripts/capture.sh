@@ -17,11 +17,6 @@ bin="${KERNO_BIN:-}"
 if [ -z "$bin" ]; then
   if [ -x target/release/kerno ]; then bin=target/release/kerno; else bin=target/debug/kerno; fi
 fi
-if pgrep -x kerno >/dev/null; then
-  echo "another Kerno is already running; quit it first" >&2
-  exit 1
-fi
-
 data_dir="${KERNO_DATA_DIR:-$(mktemp -d)}"
 helper="${TMPDIR:-/tmp}/kerno-window-id"
 if [ ! -x "$helper" ] || [ scripts/window-id.swift -nt "$helper" ]; then
@@ -35,7 +30,8 @@ trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 
 # Wait for the window, then for the UI to settle.
 for _ in $(seq 1 50); do
-  if window_id="$("$helper" kerno 2>/dev/null)"; then break; fi
+  # By process id: the user's own Kerno may be open beside this one.
+  if window_id="$("$helper" kerno "$pid" 2>/dev/null)"; then break; fi
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "Kerno exited before showing a window:" >&2
     cat "$data_dir/stdout.log" >&2

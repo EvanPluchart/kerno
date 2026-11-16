@@ -55,8 +55,10 @@ max_load=4
 want() { [ -z "$only" ] || [ "$only" = "$1" ]; }
 bin="$PWD/target/release/kerno"
 
-if pgrep -x kerno >/dev/null; then
-  echo "another Kerno is running; quit it first" >&2
+# Only this binary counts: the user's own Kerno may be open, and is never
+# touched (every check and every kill below goes by this path).
+if pgrep -f "^$bin" >/dev/null; then
+  echo "a bench run of $bin is still going; wait for it" >&2
   exit 1
 fi
 

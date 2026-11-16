@@ -45,6 +45,11 @@ Their FEATURES rows are J18 and J17.
 - **Linux release builds need an arm64 Docker host.** The image of `packaging/linux/Dockerfile` builds arm64
   natively and cross-compiles x86_64 (D-066); on an x86_64 host Docker would emulate the whole build. The
   mirror recipe (native x86_64, cross arm64) waits for a machine that needs it.
+- **The inside of the macOS disk image is plain** (owner, 2026-11-16): the `.dmg` opens on Finder's default
+  window, two icons on a grey background. For the next release `scripts/bundle-macos.sh` gives it a
+  background picture in the brand's colours, a fixed window size, large icons placed on it (Kerno on the
+  left, Applications on the right, an arrow between them) and the volume icon. A notarized build (an Apple
+  developer account, the owner's) would remove the "Open Anyway" step of the first launch.
 
 ## From the competitors' issues (triage of 2026-11-14): not now
 
