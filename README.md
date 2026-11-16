@@ -5,395 +5,269 @@
   </picture>
 </p>
 
-Kerno is a native, open-source database client for macOS and Linux, written in Rust with GPUI. All database,
-file, SSH and secret-store work runs off the UI thread, results stream in pages and are drawn virtually, and
-every running query can be cancelled. There is no telemetry, no analytics and no crash upload. The one request
-Kerno makes on its own is the update check: at launch and every 6 hours it sends a `HEAD` request to
-`https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with the redirect not
-followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and reads the version in the
-redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Turn it off in
-Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
-click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
-[architecture notes](docs/ARCHITECTURE.md#the-update-check) give the details. The AI assistant is off
-until you turn it on, and then talks only to the endpoint you configure, only when you ask: see
-[AI assistant and what it sends](#ai-assistant-and-what-it-sends).
+<p align="center">
+  A fast, native database client for macOS and Linux.<br>
+  PostgreSQL, MySQL and MariaDB. Written in Rust. Open source.
+</p>
 
-Version 1 connects to PostgreSQL, MySQL and MariaDB. Its feature set and interactions follow DBeaver
-Community; its look follows the calm, dense style of modern editors. Licensed under MIT OR Apache-2.0.
+<p align="center">
+  <b>English</b> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.ko.md">한국어</a>
+</p>
 
-## Screenshots
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/query-results-dark.png">
+  <img src="docs/screenshots/final/query-results-light.png" alt="A query and its results in Kerno" width="100%">
+</picture>
 
-| Dark | Light |
-| ---- | ----- |
-| ![Query editor and results grid, dark](docs/screenshots/final/query-results-dark.png) | ![Query editor and results grid, light](docs/screenshots/final/query-results-light.png) |
-| ![Table data with pending edits, dark](docs/screenshots/final/table-data-pending-edits-dark.png) | ![Table data with pending edits, light](docs/screenshots/final/table-data-pending-edits-light.png) |
-| ![Structure editor, dark](docs/screenshots/final/structure-editor-dark.png) | ![Structure editor, light](docs/screenshots/final/structure-editor-light.png) |
-| ![EXPLAIN plan, dark](docs/screenshots/final/explain-plan-dark.png) | ![EXPLAIN plan, light](docs/screenshots/final/explain-plan-light.png) |
-| ![New connection dialog, dark](docs/screenshots/final/new-connection-dark.png) | ![New connection dialog, light](docs/screenshots/final/new-connection-light.png) |
-| ![Backup wizard, dark](docs/screenshots/final/backup-settings-dark.png) | ![Backup wizard, light](docs/screenshots/final/backup-settings-light.png) |
-| ![A production connection, dark](docs/screenshots/final/chrome-production-dark.png) | ![A production connection, light](docs/screenshots/final/chrome-production-light.png) |
+Kerno is a database client that opens at once and stays responsive: it is a native app, not a web page in a
+window. It has the breadth of DBeaver (schema tree, SQL editor, data editing, structure editor, backup,
+administration) in a calm interface, light or dark.
 
-## What it does
+| | |
+|---|---|
+| **Starts in 0.3 s** | 264 ms from launch to a usable window |
+| **Stays light** | about 150 MB of memory with a connection and a query tab open |
+| **Scrolls a million rows** | at the screen's full rate (8.4 ms a frame on a 120 Hz display) |
+| **Shows rows at once** | the first rows appear 3 to 6 ms after the server starts sending |
+| **Every query can be cancelled** | and results arrive in pages, so memory follows what you look at |
+| **Nothing leaves your computer** | no telemetry, no analytics, no crash upload |
 
-The list of what works, with the tests that cover it, is [docs/FEATURES.md](docs/FEATURES.md). In short:
+Measured on an Apple M3 Pro; the method and every number are in [docs/BENCH.md](docs/BENCH.md).
 
-- Connections with SSL/TLS modes, SSH tunnels and a read-only flag; passwords live in the OS secret store and
-  are read from it once per run. A connection that fails says what happened in plain words first (host not
-  found, connection refused, timed out, wrong password, TLS failure) with the next step, and shows the server's
-  own message below.
-- One tree in the sidebar, as DBeaver's Database Navigator: folders and connections are the roots, and opening a
-  connection connects it and shows its databases (the default one first), schemas and objects under it. Folders
-  have a colour and an icon (a built-in glyph or a PNG, JPEG or SVG you pick); connections move between folders
-  by drag and drop. Every surface answers a right-click.
-- Environments as DBeaver's connection types: local, staging and production, which can be edited, and your own.
-  Each has a colour that tints the window's chrome while its connection is active, and rules: auto-commit by
-  default, confirm every execution, read-only by default, idle transactions rolled back.
-- A main toolbar under the title bar, as DBeaver's: new connection (by engine), connect, reconnect,
-  disconnect, new SQL editor (with the recent scripts), commit, rollback, the transaction mode with the
-  isolation level, the transaction log, read-only, the active connection and `schema@connection`, the
-  dashboard, the connection's tools and Open table. Right-click it to hide items; View ▸ Show Main Toolbar
-  hides it.
-- A lazy schema navigator, a SQL editor with schema-aware completion, a streamed results grid, EXPLAIN as a
-  plan tree, per-tab transactions, query history and saved queries.
-- In the editor, Tab accepts the highlighted completion as Enter does (Settings ▸ Editor, on by default); the
-  other occurrences of the word at the cursor are highlighted and Cmd+Shift+L selects them all; blocks fold
-  from the gutter; Cmd+plus, Cmd+minus, Cmd+0 and Cmd+wheel zoom the editor and the grids; Settings ▸ Editor
-  sets the formatter (keyword case, indentation, comma position, line width) and Format on save for `.sql`
-  files.
-- Tabs: a button at the right of the tab bar lists every open tab, and the View menu (or Settings ▸ Appearance) shows
-  them on several rows or in a list at the side. Settings ▸ Grid can stack the results of a multi-statement script one under the other in
-  a single panel, each with its own header, instead of one tab per statement.
-- Run script on connections… (editor menu, Run menu, palette, Query menu): tick connections or whole folders,
-  and the script runs in a tab of its own on each, at most four at a time, under each connection's own rules
-  (read-only refuses the writes, production asks first); a summary lists each one's outcome.
-- A table data view with inline editing, SQL review and one-transaction apply; a pending value can be a SQL
-  expression (`now()`, `DEFAULT`, `gen_random_uuid()`), shown apart from a literal and unquoted in the review;
-  structure views and a form editor for tables, where the columns of a MySQL or MariaDB table can be moved
-  (`MODIFY ... AFTER` or `FIRST`, previewed); PostgreSQL cannot reorder columns and says so.
-- Cmd+F in a grid finds in the fetched rows (next, previous, matching rows only); a table's sort, hidden columns
-  and widths are remembered per connection and table; an integer that looks like a Unix time shows its date in
-  the value viewer.
-- Exports to CSV, TSV, JSON, NDJSON, SQL INSERT, Markdown and Excel (XLSX: numbers, booleans and dates as
-  typed cells, a new sheet every 1,048,575 rows), streamed to disk with progress and cancel; CSV import, and a
-  Tools submenu on databases, schemas and tables: backup, global
-  backup, restore and execute script as step wizards on the installed client tools (`pg_dump`, `pg_dumpall`,
-  `pg_restore`, `psql`, `mysqldump`, `mysql`), analyze, vacuum, optimize, check and repair, foreign data
-  wrappers, the session and lock managers. A wizard's settings can be saved as a named task and run again from the
-  Tasks view (there is no scheduler). Settings ▸ Local clients lists every client install it finds, with its
-  version, and lets you add a folder and choose the default per engine; a connection can use its own.
-- An administration view (sessions, roles, sizes, settings).
-- An ER diagram of a schema (a MySQL database), or of a table and the tables linked to it ("View diagram" in
-  the tree, "Diagram" in a table's structure, View ER Diagram in the palette): tables with their PK and FK
-  marks, one edge per foreign key, pan, zoom, fit, drag a table aside; a double click opens its data. Exports
-  to SVG, PNG and Mermaid. Read-only.
-- Copy tables with their rows to another connection, PostgreSQL, MySQL or MariaDB in any direction (Tools ▸
-  Copy tables to another connection…): the tables are created or appended to, each column's type mapped and
-  editable, what has no counterpart refused until skipped or typed, the SQL shown and confirmed, the rows
-  written in batches with progress, cancel and a report.
+## Contents
 
-Measurements: [docs/BENCH.md](docs/BENCH.md).
-
-## SSH
-
-A connection reaches its database through an SSH server with one of two clients, chosen on the SSH tab.
-**OpenSSH**, the default when `ssh` is installed, runs your own `ssh`, so everything in `~/.ssh/config` applies:
-`Host` aliases (the host field lists them), `ProxyJump` and the Jump host field (`ssh -J`, several hosts
-separated by commas), IdentityAgent (1Password, Secretive), RSA and every other key type, and OpenSSH's
-known_hosts; port, user and key may be left empty for the configuration to give them. It forwards a private
-Unix socket, never a TCP port. A key's passphrase is asked for and kept in the secret store, never on the
-command line; a server key you choose to trust is added to your known_hosts. `KERNO_SSH_CONFIG=<file>` makes
-Kerno pass another configuration file to `ssh` (`-F`). The **built-in** client needs no `ssh` and is the one for
-a password login; it takes Ed25519 and ECDSA key files and the keys of an SSH agent, not RSA key files.
-
-## Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf
-
-The connection dialog's **Password from** list says where the database password comes from. **Keychain**
-(the default) keeps it in the system secret store; left empty, Kerno reads `~/.pgpass` (or `PGPASSFILE`) for
-PostgreSQL and the `password` of the `[client]` group of `~/.my.cnf` for MySQL and MariaDB, as their own tools
-do (`!include` lines of `.my.cnf` are not followed). A `.pgpass` that other users can read, or a `.my.cnf`
-anyone can change, is ignored, and the error says so. **Ask each time** asks at every connect. **Command**
-runs a program of yours and uses what it prints (one trailing newline removed): no shell, one argument per
-line, `${host}`, `${port}`, `${user}` and `${database}` replaced inside the arguments, at most 120 s.
-**AWS RDS IAM** runs `aws rds generate-db-auth-token` with the connection's host, port and user, your region
-and optional profile, and needs TLS (the SSL mode moves to `require`). **1Password** runs `op read
-op://vault/item/field`. A command's output is used for that connect only, never stored or logged, and runs
-again for new sessions after ten minutes (an RDS token lasts fifteen); "Run now" checks it and shows only the
-length of what it printed. Programs are found on your `PATH` and in `/opt/homebrew/bin`, `/usr/local/bin`,
-`/usr/bin` and `/bin`. A test or a connection says where its password came from ("Password from ~/.pgpass").
-An exported connections file carries the command but no password; on import a command does not run until you
-have read it in the connection's settings and clicked "I trust this command".
-
-## Open a connection from the shell
-
-`kerno postgres://ada@db.example.com:5432/shop` opens that connection (`postgresql://`, `mysql://` and
-`mariadb://` too; `sslmode` and other parameters as in the connection dialog). A saved connection to the same
-engine, host, port, user and database is used when there is one; otherwise the connection opens **unsaved**:
-marked in the sidebar, kept for this run only, its password in memory, never in the keychain, until "Save
-connection…" in its menu stores it. When Kerno is already running, the URL opens in its window, which comes to
-the front. `kerno --version` and `kerno --help` print and exit.
-
-Leave the password out of the URL: other programs running as your user can read a command line (`ps`). Without
-one, Kerno asks for it when the server wants it.
-
-## Move your setup to another computer
-
-**Export Connections…** (File menu, the sidebar's menu, the palette) writes a JSON file with what you tick:
-the connections (with their ids), the folders' colours and icons, your environments and the built-ins you
-edited, and the saved tasks. The environments your connections use always go with them. The file holds no
-password, passphrase or key, no local client folder and no folder picture. **Import Connections…** first lists
-what the file adds, replaces (same id; same name for a task) or leaves as it is, then asks for each connection
-written where its password comes from: **Enter now** (kept in the secret store), **Ask when connecting**, or,
-when the secret store already holds secrets under that connection's id, **Use the keychain's saved secrets**
-(the database password and the SSH password or key passphrase, all or none), which names where each will be
-sent and never shows them. A saved password is linked automatically only to a connection this copy of Kerno
-already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
-unlinked cannot read any of the old secrets. Files written by earlier versions still import.
-
-## AI assistant and what it sends
-
-The assistant is off until **Settings → AI ▸ Enable the AI assistant** is ticked. While it is off, no
-request is ever made: its entries (editor menu ▸ **AI: Write SQL…**, **Explain query**, **Explain plan**,
-**Explain error**, the palette, Query ▸ AI Assistant) say "turn on in Settings → AI" and do nothing.
-
-On, it talks to one OpenAI-compatible endpoint you set (`POST <endpoint>/chat/completions`), and only when
-you click **Send**. Local servers come first: Ollama (`http://localhost:11434/v1`) and LM Studio
-(`http://localhost:1234/v1`). Plain `http://` is accepted only for this computer (`localhost`, `127.0.0.1`,
-`::1`); any other host needs `https://`, and Kerno names it ("Requests will leave this computer and go to
-…") and sends nothing there until you click **Allow requests to …** once for that endpoint. Requests never go
-through a proxy and never follow a redirect. **List models** asks `GET <endpoint>/models`, only when you click
-it. An API key, for the endpoints that want one, is kept in the system's secret store for that endpoint
-only; it is sent as `Authorization: Bearer …` and appears nowhere else (previews and the log show
-`Bearer ***`).
-
-What a request holds, and nothing more:
-
-- the instruction for the action, and your sentence, the statement (the selection or the one at the
-  cursor), the plan on screen, or the statement and the server's error message (which may quote a value:
-  the preview shows it before you send);
-- the engine, its version and the current database; the names of the schemas; the tables the statement or
-  the sentence names (else the tables of the tab's schema): their names, column names and types and foreign
-  keys, 200 tables at most with their columns, then names only;
-- rows only when you tick **Include sample rows (first 5 rows of the tables above)** for that request (up to
-  10 tables); the tick is off again at every new request.
-
-**What is sent…** in the panel shows the exact bytes before you send them; Settings → AI ▸ **What was sent**
-lists every request of the session (time, endpoint, body), in memory only. The answer is shown as text:
-nothing in it runs or opens anything. **Insert** puts its SQL in the editor (at the cursor, selected, one undo
-step; a proposed fix goes after your text as a new statement) and you run it yourself, through the usual
-confirmations, read-only and production rules. **Stop** drops an answer you no longer want (the request ends
-on its own within its 60 s timeout).
-
-## Vim mode
-
-Off by default. Turn it on with **Settings → Editor ▸ Vim mode** or the command **Toggle Vim Mode** (palette,
-Edit menu). While it is off nothing of it runs: the editor behaves exactly as without it.
-
-On, the editor of every query tab (scripts, and the sources of views and routines opened there) has vim's
-Normal, Insert, Visual (`v`) and Visual line (`V`) modes. The status bar shows the mode; in Normal mode the
-character under the cursor is shaded as a block (the editor's thin caret stays). What is supported, and
-nothing more:
-
-- **Motions**, with a count: `h j k l`, `w b e`, `0 ^ $`, `gg` and `G` (with a count, that line), `f{char}`
-  and `t{char}` on the line, `%` (the matching bracket; brackets in strings and comments are text), Enter,
-  Backspace and Space.
-- **Operators**: `d`, `c` and `y` with a motion, with `iw` or `aw`, or on a Visual selection; `dd`, `cc`, `yy`;
-  `x`; `p` and `P`; `u` and `Ctrl+R` (undo, redo); `.` repeats the last change, typed text included.
-- **Insert**: `i a I A o O` (`o` and `O` keep the line's indentation), `Esc` back to Normal mode.
-- **Search**: `/text` then Enter, `n` and `N` (plain text, case-sensitive, wraps around).
-- **Commands**: `:w` saves the file, `:q` closes the tab, `:wq` (or `:x`) saves then closes, `:q!` closes
-  without keeping unsaved text. `:` and `/` open a one-line field under the editor; Escape closes it.
-- **One register, the system clipboard**: `y`, `d` and `c` write it, `p` reads it, so they work with Cmd+C
-  and Cmd+V. Lines yanked by vim paste as lines while the clipboard still holds them; text copied elsewhere
-  pastes as characters.
-
-In every mode the arrows, Home/End, Page Up/Down, the mouse and every Cmd shortcut (Ctrl on Linux) keep
-working: run (Cmd+Enter), save, the palette, find, zoom, completion. In Insert mode every key but Escape is
-the editor's, so Tab and Enter still accept a completion. `:q` asks before closing what would be lost, as
-Cmd+W does; `:q!` lets go of unsaved text, but an open transaction or pending changes still ask. On Linux,
-Ctrl+R is Refresh Rows outside Normal mode.
-
-Not supported: counts on `i a o`, `F T ; ,`, text objects other than `iw` and `aw`, named registers, marks,
-macros, `r ~ J > <`, Visual block (`Ctrl+V`) and other `:` commands. The editor records each edit on its own,
-so `ciw` followed by typed text is undone in two steps (the deletion, then the typing).
+- [Install](#install)
+- [First steps](#first-steps)
+- [A tour](#a-tour)
+- [Privacy](#privacy)
+- [Performance](#performance)
+- [Documentation](#documentation)
+- [Build from source](#build-from-source)
+- [Status](#status)
+- [Licence](#licence)
 
 ## Install
 
-There is no published release yet. `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
-`scripts/bundle-linux.sh` builds the Linux packages (below).
+Download the file for your system from the
+[latest release](https://github.com/EvanPluchart/kerno/releases/latest). `SHA256SUMS` in the release lists the
+checksum of each file.
 
-On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
-(`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). Kerno reads each saved password from
-the keychain once per run. An ad-hoc signature changes with every build, so the keychain asks for your login
-password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it, and an update installed by Kerno
-keeps the signature of its release: an ad-hoc one makes the keychain ask again once.
+### macOS (Apple Silicon)
 
-### Linux
+1. Open `Kerno-<version>-macos-arm64.dmg` and drag Kerno to Applications.
+2. The first time, macOS says it cannot check the app, because the build is not notarized by Apple. Open
+   System Settings ▸ Privacy & Security and click **Open Anyway**. From a terminal:
+   `xattr -dr com.apple.quarantine /Applications/Kerno.app`.
 
-Each release carries, for x86_64 and arm64 (aarch64):
+### Linux (x86_64 and arm64)
 
 | Package | Install |
 |---|---|
-| `kerno_<version>_amd64.deb`, `kerno_<version>_arm64.deb` | `sudo apt install ./kerno_<version>_amd64.deb` (Debian, Ubuntu and their derivatives; apt installs the dependencies) |
-| `kerno-<version>-linux-x86_64.tar.gz`, `…-aarch64.tar.gz` | `tar -xzf kerno-<version>-linux-x86_64.tar.gz -C ~/.local --strip-components=1`, then run `~/.local/bin/kerno`. Kerno updates itself in place from this one |
-| `Kerno-<version>-x86_64.AppImage`, `…-aarch64.AppImage` | `chmod +x Kerno-<version>-x86_64.AppImage` and run it. It mounts itself through FUSE (the `fusermount3` or `fusermount` program, from the `fuse3` or `fuse` package); without FUSE, run it with `--appimage-extract-and-run` |
+| `kerno_<version>_amd64.deb`, `kerno_<version>_arm64.deb` | `sudo apt install ./kerno_<version>_amd64.deb` (Debian, Ubuntu and their derivatives) |
+| `kerno-<version>-linux-x86_64.tar.gz`, `…-aarch64.tar.gz` | `tar -xzf kerno-<version>-linux-x86_64.tar.gz -C ~/.local --strip-components=1`, then run `~/.local/bin/kerno` |
+| `Kerno-<version>-x86_64.AppImage`, `…-aarch64.AppImage` | `chmod +x Kerno-<version>-x86_64.AppImage`, then run it |
 
-The packages run on any distribution with **glibc 2.31 or newer** (Ubuntu 20.04, Debian 11 and later): they are built on Ubuntu 20.04, and each is started there and on Debian 13 before a release
-(`scripts/check-linux-packages.sh`). The tarball and the AppImage use the system's libraries, as the `.deb`
-does through its dependencies; install them if they are missing (Debian and Ubuntu names):
-`sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1`, and a Vulkan driver
-(`mesa-vulkan-drivers` or your GPU vendor's). The fonts are built in.
+The packages run on any distribution with **glibc 2.31 or newer** (Ubuntu 20.04, Debian 11 and later). The
+libraries they need and the AppImage's options are in the [guide](docs/GUIDE.md#linux).
 
-Backup and restore call `pg_dump`, `pg_restore`, `psql`, `mysqldump` and `mysql` when they are installed;
-nothing else needs them.
+There is no Windows build.
+
+## First steps
+
+1. **Add a connection**: press <kbd>Cmd</kbd>+<kbd>N</kbd> (<kbd>Ctrl</kbd>+<kbd>N</kbd> on Linux), pick the
+   engine, fill in host, user and password, then **Test connection** and **Save and connect**. You can also
+   paste a URL, or start Kerno with one: `kerno postgres://ada@db.example.com:5432/shop`.
+2. **Browse**: open the connection in the sidebar. A double click on a table opens its rows.
+3. **Query**: <kbd>Cmd</kbd>+<kbd>T</kbd> opens a query tab, <kbd>Cmd</kbd>+<kbd>Enter</kbd> runs the
+   statement at the cursor, <kbd>Cmd</kbd>+<kbd>.</kbd> cancels it.
+4. **Find anything**: <kbd>Cmd</kbd>+<kbd>K</kbd> opens the command palette, which lists every action with
+   its shortcut.
+
+## A tour
+
+### Connect to anything you can reach
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/v11-ssh-openssh-dark.png">
+  <img src="docs/screenshots/final/v11-ssh-openssh-light.png" alt="The SSH tab of the connection dialog, with the hosts of the SSH configuration" width="100%">
+</picture>
+
+- SSL/TLS in every mode, with your certificates.
+- SSH tunnels through your own OpenSSH: the hosts of `~/.ssh/config`, jump hosts and bastion chains, SSH
+  agents such as 1Password, and every key type. A built-in client covers password logins.
+- Passwords stay in the system keychain. They can also come from a command, AWS RDS IAM, 1Password,
+  `~/.pgpass` or `~/.my.cnf`.
+- When a connection fails, Kerno first says what happened in plain words (host not found, connection
+  refused, wrong password, TLS failure) and what to try, then shows the server's own message.
+
+### One tree for everything
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/navigator-dark.png">
+  <img src="docs/screenshots/final/navigator-light.png" alt="The sidebar tree: folders, connections, databases, schemas, tables and columns" width="100%">
+</picture>
+
+Folders and connections are the roots. Opening a connection shows its databases, schemas, tables, views,
+functions and the rest, loaded as you open them. Folders have a colour and an icon. Every row answers a
+right-click: open data, open structure, generate SQL, rename, drop, backup, and more.
+
+### Write SQL
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/explain-plan-dark.png">
+  <img src="docs/screenshots/final/explain-plan-light.png" alt="An EXPLAIN plan shown as a tree with the slowest step marked" width="100%">
+</picture>
+
+- Completion that knows your schemas, tables, columns and foreign keys.
+- Run the statement at the cursor, the selection, or the whole script, with one result per statement, in
+  tabs or stacked in one panel.
+- EXPLAIN and EXPLAIN ANALYZE as a readable tree, with the slowest step marked.
+- Transactions per tab, query history, saved queries, parameters, a formatter, find and replace, several
+  cursors, and an optional vim mode.
+- Run one script on several connections at once, each under its own rules.
+
+### Read results, however large
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/v11-grid-find-dark.png">
+  <img src="docs/screenshots/final/v11-grid-find-light.png" alt="Finding a value in a result grid" width="100%">
+</picture>
+
+Results stream in and only what is on screen is drawn, so a million rows scroll smoothly. Find a value in
+the fetched rows, sort, hide and pin columns, and look at long text, JSON or binary values in a viewer. Copy
+as CSV, JSON, Markdown or SQL, and export to CSV, JSON, SQL, Markdown or Excel.
+
+### Edit data without surprises
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/table-data-pending-edits-dark.png">
+  <img src="docs/screenshots/final/table-data-pending-edits-light.png" alt="A table with pending edits highlighted before they are applied" width="100%">
+</picture>
+
+Edit cells in place, add, duplicate and delete rows. Nothing is written until you ask: pending changes are
+highlighted, **Review SQL** shows the exact statements, and **Apply** runs them in one transaction. If one
+fails, everything is rolled back and your edits are kept. A value can also be a SQL expression such as
+`now()`.
+
+### Design tables
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/structure-editor-dark.png">
+  <img src="docs/screenshots/final/structure-editor-light.png" alt="The table form with a live preview of the DDL" width="100%">
+</picture>
+
+Create and alter tables in a form (columns, indexes, foreign keys, comments) with a live preview of the SQL,
+applied after you confirm. Views, functions and procedures open as source you can edit.
+
+### See how tables relate
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/v11-er-diagram-dark.png">
+  <img src="docs/screenshots/final/v11-er-diagram-light.png" alt="An ER diagram of a schema" width="100%">
+</picture>
+
+An ER diagram of a schema, or of a table and its neighbours, drawn from the foreign keys. Pan, zoom, open a
+table with a double click, and export to SVG, PNG or Mermaid.
+
+### Production stays safe
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/chrome-production-dark.png">
+  <img src="docs/screenshots/final/chrome-production-light.png" alt="A production connection tints the window" width="100%">
+</picture>
+
+Each connection has an environment (local, staging, production, or your own) with a colour that tints the
+window while it is active, and rules. Destructive statements always show their SQL and ask first; production
+asks a second time on any write. A connection can be read-only, in the app and on the server.
+
+### Move data
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/v11-transfer-mapping-dark.png">
+  <img src="docs/screenshots/final/v11-transfer-mapping-light.png" alt="Copying a table to another connection: the type of each column" width="100%">
+</picture>
+
+- Copy tables with their rows to another connection, between PostgreSQL, MySQL and MariaDB in any direction,
+  with the type of each column shown and editable.
+- Backup and restore through `pg_dump`, `pg_restore`, `psql`, `mysqldump` and `mysql`, as step-by-step
+  wizards that can be saved as tasks.
+- Import CSV into a new or existing table.
+- Export your connections, folders and settings to a file with no password in it, and import them elsewhere.
+
+### An AI assistant, only if you want one
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/final/v11-ai-write-sql-dark.png">
+  <img src="docs/screenshots/final/v11-ai-write-sql-light.png" alt="The AI panel showing exactly what will be sent before sending" width="100%">
+</picture>
+
+Off until you turn it on. It talks to the endpoint you choose, a local model first (Ollama, LM Studio), and
+only when you click Send. It can write SQL from a sentence and explain a query, a plan or an error. It sends
+the names of your tables and columns, never your rows unless you tick a box for that request, and it shows
+the exact content before sending. It never runs anything: it inserts SQL for you to read and run.
+
+### And also
+
+An administration view (sessions, locks, roles, sizes, settings), a command palette, a main toolbar, three
+tab layouts, a keymap file, and `kerno <url>` from the shell. The full list, with the test that covers each
+item, is in [docs/FEATURES.md](docs/FEATURES.md).
+
+## Privacy
+
+Kerno sends nothing about you or your data. It makes two kinds of request besides the connections to your
+databases:
+
+- **The update check.** At launch and every 6 hours, one request to this repository's releases page, with
+  no identifier. Turn it off in Settings ▸ Updates or with `KERNO_NO_UPDATE_CHECK=1`.
+- **The AI assistant**, only once you have turned it on, only to the endpoint you set, only when you ask.
+
+Passwords, SSH passphrases and API keys live in the system keychain (macOS Keychain, Linux Secret Service),
+never in a file or a log. Details in the [guide](docs/GUIDE.md#ai-assistant-and-what-it-sends).
+
+## Performance
+
+Release build on an Apple M3 Pro, local servers, medians.
+
+| Measure | Result |
+|---|---|
+| Cold start to a usable window | 264 ms |
+| Memory at rest, one connection and one query tab | 150 MB |
+| First rows on screen after the server starts sending | 3 to 6 ms |
+| Scrolling 1,000,000 rows | 8.4 ms a frame (120 Hz) |
+| 1,000,000 rows × 20 columns fetched in full | 340 MB (17 bytes a cell) |
+| Scrolling a 300-column table | 8.3 ms a frame |
+| Opening a schema of 1,200 tables | 103 ms |
+| Running a 200 MB `.sql` file | 17.7 s, the window stays responsive, cancel in 0.1 s |
+| Usable again after the server comes back | 1.0 s |
+
+[docs/BENCH.md](docs/BENCH.md) has the method, the ranges and how to reproduce them.
+
+## Documentation
+
+- [Guide](docs/GUIDE.md): SSH, password sources, the AI assistant and what it sends, vim mode, updates,
+  keyboard shortcuts and the keymap file.
+- [Features](docs/FEATURES.md): everything that works, with its tests and screenshots.
+- [Benchmarks](docs/BENCH.md), [architecture](docs/ARCHITECTURE.md), [roadmap](docs/ROADMAP.md),
+  [decisions](docs/DECISIONS.md).
+- [Contributing](CONTRIBUTING.md).
 
 ## Build from source
 
-The repository pins its Rust toolchain in `rust-toolchain.toml`; rustup installs it on first use.
-
-macOS: install the Xcode command line tools, then
-
-```sh
-nice -n 10 cargo build --release -p kerno
-nice -n 10 cargo run --release -p kerno
-```
-
-Metal shaders are compiled at runtime, so the Metal toolchain is not required (see D-002 in
-[docs/DECISIONS.md](docs/DECISIONS.md)).
-
-Linux (Debian or Ubuntu): install GPUI's native dependencies as root, then build the same way.
+You need Rust (the toolchain is pinned in `rust-toolchain.toml`; rustup installs it) and, on macOS, the Xcode
+command line tools.
 
 ```sh
-sudo scripts/install-linux-deps.sh
-nice -n 10 cargo build --release -p kerno
+cargo build --release -p kerno
+cargo run --release -p kerno
 ```
 
-`scripts/bundle-linux.sh` builds the Linux packages inside Docker, from macOS or Linux, on an arm64 host (Apple
-Silicon): the image of `packaging/linux/Dockerfile` (Ubuntu 20.04) builds arm64 natively and cross-compiles
-x86_64. `KERNO_JOBS` sets cargo's jobs (3 by default). The image `kerno-linux-build` and the volume
-`kerno-linux-cache` (cargo registry and build output) stay for the next run; `scripts/bundle-linux.sh --clean`
-removes both. `.cargo/config.toml` caps cargo at 3 jobs.
+On Debian or Ubuntu, install the system libraries first with `sudo scripts/install-linux-deps.sh`. Packaging,
+the local checks and the test databases are described in the [guide](docs/GUIDE.md#build-from-source).
 
-## Checks and releases
+## Status
 
-There is no hosted CI: the checks run locally. `scripts/check.sh` runs `cargo fmt --check`, clippy with
-`-D warnings`, `cargo deny check` and the workspace tests (starting the `kerno-*` containers if they are not
-running, and stopping them again if it started them), one summary line per step, stopping at the first
-failure. `scripts/check.sh --no-tests` skips the tests. It refuses to start when the machine is busy.
-
-A release is built locally with `scripts/release.sh [version]`: it checks the tree is clean and the version
-matches `Cargo.toml`, builds the macOS `.dmg` (on macOS) and the Linux packages, starts each Linux package in
-clean containers (`scripts/check-linux-packages.sh`), and writes `dist/SHA256SUMS`.
-`scripts/release.sh --linux-only` builds and checks the Linux packages alone, on a tree that may be dirty.
-It then prints the `gh release create` command; the owner runs it. The script creates no tag, pushes and
-uploads nothing; its only downloads are the Docker base images and pinned build tools of the Linux build.
-
-## Test databases
-
-The integration tests run against containers named `kerno-*`: PostgreSQL 17 (host port 55432), MySQL 8.4
-(53306), MariaDB 11 (53307), an SSH server (52222) and a jump host in front of it (52223), all bound to
-127.0.0.1 with test-only credentials.
-
-```sh
-scripts/test-env.sh up        # generate test certificates and keys, start, wait until seeded
-nice -n 10 cargo test --workspace -- --test-threads=3
-scripts/test-env.sh down      # stop and remove the containers
-```
-
-Tests skip with a message when a container is down; `KERNO_REQUIRE_CONTAINERS=1` makes that a failure.
-Details in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Keyboard shortcuts
-
-`Cmd` on macOS is `Ctrl` on Linux; `Ctrl` written alone is the Control key on both systems. Every action is also
-reachable from the command palette.
-
-| Shortcut | Action |
-| -------- | ------ |
-| Cmd+K | Command palette |
-| Cmd+, | Settings |
-| Cmd+N | New connection |
-| Cmd+P | Open table (quick open) |
-| Cmd+B | Toggle sidebar |
-| Cmd+Alt+F | Filter the schema tree |
-| Cmd+T | New query tab |
-| Cmd+W / Cmd+Shift+W | Close tab / close all tabs |
-| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Cmd+O | Open SQL file |
-| Cmd+S / Cmd+Shift+S | Save / save as |
-| Cmd+Enter | Run statement |
-| Cmd+Shift+Enter | Run all statements |
-| Cmd+\ | Run statement in a new result tab |
-| Cmd+Alt+Enter or Alt+P | Run the script from the cursor (editor) |
-| Cmd+Alt+] / Cmd+Alt+[ (or Alt+Down / Alt+Up) | Go to the next / previous statement (editor) |
-| Cmd+. | Cancel the running statement |
-| Ctrl+Alt+N / Ctrl++ | Fetch more rows / fetch all rows |
-| Ctrl+Shift+P | Pin or unpin the result tab |
-| Ctrl+Shift+\ (written Ctrl+\|) | Close the result tab |
-| Cmd+Alt+R or Alt+Shift+T | Show or hide the results panel |
-| Ctrl+Shift+T | Maximize the results panel |
-| Cmd+Alt+T or Alt+T | Move the focus between results and editor |
-| Ctrl+4 / Ctrl+8 | Commit / roll back the transaction |
-| Ctrl+Alt+A | Switch between auto-commit and manual commit |
-| Cmd+E / Cmd+Shift+E | Explain / explain analyze |
-| Cmd+Y | Query history |
-| Cmd+/ | Toggle line comment |
-| Cmd+Shift+/ | Toggle block comment |
-| Cmd+Shift+I | Format SQL |
-| Cmd+Shift+X / Cmd+Shift+Y | Upper case / lower case |
-| Ctrl+Alt+Shift+W | Toggle soft wrap |
-| Ctrl+Space or Cmd+I | Show completions |
-| F4 / Shift+F4 | Open the rows / the structure of the table at the cursor (editor) |
-| F4 | Edit the selected object, connection or folder (sidebar) |
-| F2 / F5 | Rename / refresh the selected object |
-| Backspace or Delete | Drop the selected object / delete the selected connection (sidebar) |
-| Enter | Open the selected connection (sidebar) |
-| Cmd+C / Cmd+Shift+C | Copy object name / qualified name (navigator) |
-| Cmd+] or Cmd+Alt+Enter | New query on the selected object (navigator) |
-| Cmd+Shift+A | Set the selected schema as the default of this tab (navigator) |
-| Cmd+Shift+, | Link the schema tree with the editor |
-| Cmd+R | Refresh rows (data view) |
-| Alt+Insert or Cmd+Shift+N | Add row (grid) |
-| Ctrl+Alt+Insert or Cmd+D | Duplicate the selected rows (grid) |
-| Alt+Delete or Cmd+Backspace | Delete the selected rows (grid) |
-| Ctrl+Backspace | Set the selected cells to their default (grid) |
-| Ctrl+D / Ctrl+Alt+D | Copy the values of the row above / below (grid) |
-| Escape | Revert the selected cells (grid) |
-| Cmd+Z | Undo the last pending change (grid) |
-| Cmd+Shift+C | Copy the selection with column names (grid) |
-| Shift+Enter | View or edit the value of the selected cell |
-| Tab | Toggle record view (grids) |
-| Ctrl+Alt+Left / Right | Previous / next row (Add Shift for the first / last row) |
-| Ctrl+G / Ctrl+Shift+G | Go to row / go to column |
-| Ctrl+F11 | Filter by distinct values of the column |
-| Cmd+= / Cmd+- / Cmd+0 (or Alt+0 / Alt+9) | Grid text larger / smaller / usual |
-| Cmd+Q | Quit |
-
-These are the defaults in `crates/kerno/src/actions.rs`; the full list is the command palette, and the
-keymap file below lists every command id with its shortcuts.
-
-### Changing shortcuts
-
-The command "Open Keymap File" (command palette) creates `keymap.json` in Kerno's config directory (the
-platform's config directory for "Kerno") if it does not exist, with every command id and its default
-shortcut listed under `commands` for reference. Each entry of `bindings` replaces the shortcuts of one
-command: one shortcut, a list of shortcuts, or `null` for none. `secondary` means Cmd on macOS and Ctrl on
-Linux; a sequence of keystrokes is separated by spaces. Changes apply at the next start, and problems in
-the file are reported when Kerno starts.
-
-```json
-{
-  "bindings": {
-    "new_query_tab": "secondary-shift-t",
-    "close_tab": ["secondary-w", "ctrl-f4"],
-    "toggle_sidebar": null
-  }
-}
-```
-
-## Roadmap
-
-[docs/ROADMAP.md](docs/ROADMAP.md) lists what is outside version 1 and how each item would be built.
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the code.
+Version 0.1.0, the first release. It covers PostgreSQL, MySQL and MariaDB on macOS (Apple Silicon) and Linux
+(x86_64 and arm64). Other engines, schema compare and more are on the [roadmap](docs/ROADMAP.md).
 
 ## Licence
 

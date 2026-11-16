@@ -1559,3 +1559,22 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   come from a second run on the final code with nothing else running (`docs/BENCH.md` says which commit).
 - **A second full `scripts/check.sh` after the last code change** is the one the final verification quotes.
 
+## D-074 — The repository and the first release, at the owner's request (2026-11-16)
+
+- The owner asked for the GitHub repository to be created private with the `gh` CLI and, the build being
+  judged ready, for a release with the installers. This lifts, for these two actions, the rule that nothing
+  is pushed or published by the agent (CLAUDE.md §1 and §8): `EvanPluchart/kerno` is created private, `main`
+  is pushed, and release `v0.1.0` carries the seven files of `scripts/release.sh` and `SHA256SUMS`, with the
+  notes of `docs/release-notes/v0.1.0.md`.
+- **0.1.0, not 1.0.0**: the version built, tested and written in every artifact name (D-073). The owner can
+  retag; a release and its tag in a private repository are removed with two commands.
+- **No Windows build**: Kerno targets macOS and Linux (CLAUDE.md). The release says so.
+- **While the repository is private the update check finds nothing**: the request to
+  `/releases/latest` is not authenticated and gets a 404, which Kerno treats as "no news". It starts to work
+  the day the repository is public.
+- **The README is short and has pictures**; the reference text it held (SSH, password sources, the AI
+  assistant's payload, vim mode, updates, shortcuts, building, checks) moved unchanged to `docs/GUIDE.md`.
+  Each picture follows the reader's light or dark theme. Translations: `README.fr.md`, `README.es.md`,
+  `README.ko.md`, same structure, the app's own labels left in English (the interface is in English), the
+  deeper documents linked as English-only.
+
