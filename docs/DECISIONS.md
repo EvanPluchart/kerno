@@ -1569,9 +1569,18 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **0.1.0, not 1.0.0**: the version built, tested and written in every artifact name (D-073). The owner can
   retag; a release and its tag in a private repository are removed with two commands.
 - **No Windows build**: Kerno targets macOS and Linux (CLAUDE.md). The release says so.
-- **While the repository is private the update check finds nothing**: the request to
-  `/releases/latest` is not authenticated and gets a 404, which Kerno treats as "no news". It starts to work
-  the day the repository is public.
+- **Public the same day.** GitHub Pages is not offered for a private repository on the owner's plan; told
+  so, the owner chose to make the repository public. Before the change the whole history of the two pushed
+  branches was searched for private keys and tokens (none; test-only credentials of the `kerno-*` containers
+  are in the tree by design). The update check now gets its answer: `/releases/latest` redirects to
+  `v0.1.0`, which an installed 0.1.0 does not offer (not strictly newer).
+- **GitHub Pages** serves the branch `gh-pages` (the committed `site/` of the `kerno-site` branch, built by
+  its `scripts/site-publish.sh`) at <https://evanpluchart.github.io/kerno/>: deploy from a branch, no
+  workflow file in the repository. The `kerno-site` branch itself is not pushed.
+- **The bundle's launch check** was skipped in the release run (`KERNO_SKIP_LAUNCH_CHECK=1`: the owner's own
+  Kerno was open) and done by hand on the same `dist/Kerno.app` once it was closed: window shown, data
+  written to a scratch directory, clean quit.
+- **The uploaded files were downloaded again** and checked against `SHA256SUMS`: seven of seven.
 - **The README is short and has pictures**; the reference text it held (SSH, password sources, the AI
   assistant's payload, vim mode, updates, shortcuts, building, checks) moved unchanged to `docs/GUIDE.md`.
   Each picture follows the reader's light or dark theme. Translations: `README.fr.md`, `README.es.md`,

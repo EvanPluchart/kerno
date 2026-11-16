@@ -465,11 +465,12 @@ Still open (for the owner):
   tabs or columns (buttons and menus do it).
 - The version is still 0.1.0 (D-073): nothing was published yet.
 
-## 2026-11-16 — Repository created private, README in four languages, release 0.1.0 (owner's request)
+## 2026-11-16 — Repository on GitHub, README in four languages, website, release 0.1.0 (owner's request)
 
 - New README (English) with a picture per section, an install section, the measured numbers and the privacy
   summary; the reference text moved to `docs/GUIDE.md`. `README.fr.md`, `README.es.md`, `README.ko.md`.
 - `docs/release-notes/v0.1.0.md`; `scripts/release.sh` run on the release commit.
-- `gh repo create EvanPluchart/kerno --private`, `main` pushed, tag `v0.1.0`, release with the seven files
-  and `SHA256SUMS` (D-074).
+- `gh repo create EvanPluchart/kerno --private`, `main` pushed; made public the same day at the owner's
+  request, GitHub Pages on `gh-pages` (<https://evanpluchart.github.io/kerno/>), release `v0.1.0` on
+  `7055e8b` with the seven files and `SHA256SUMS`, downloaded again and verified (D-074).
 
