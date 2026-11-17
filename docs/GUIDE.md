@@ -148,7 +148,10 @@ so `ciw` followed by typed text is undone in two steps (the deletion, then the t
 Kerno makes one request on its own: at launch and every 6 hours it sends a `HEAD` request to
 `https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with the redirect not
 followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and reads the version in
-the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Turn it off in
+the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Behind a proxy, `curl`
+uses the `HTTPS_PROXY` variable when Kerno was started from a shell that sets it; started from the Dock or a
+desktop launcher it has no proxy, and a network that allows nothing else simply finds no update (database
+drivers are built in: nothing is downloaded to connect). Turn it off in
 Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
 click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
 [architecture notes](ARCHITECTURE.md#the-update-check) give the details.

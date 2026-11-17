@@ -474,3 +474,21 @@ Still open (for the owner):
   request, GitHub Pages on `gh-pages` (<https://evanpluchart.github.io/kerno/>), release `v0.1.0` on
   `7055e8b` with the seven files and `SHA256SUMS`, downloaded again and verified (D-074).
 
+
+## 2026-11-17 — The general critique of DBeaver, verified; milestone 12 proposed
+
+- Triage of C1-C22 in `docs/COMPETITOR-ISSUES.md` (section of 2026-11-17): 5 answered, 9 gaps, 1 gap
+  (untested), 3 do not apply, 2 not now. Three audits by subagents (completion, splitting and formatter;
+  safety rails, tab binding and transactions; long operations and error surfaces), every cited line opened
+  again by the main session before it entered the table.
+- `crates/kerno-core/tests/sql_hard_inputs.rs`: 36 tests pinning the hard inputs Kerno gets right (dollar
+  quoting, `;` in every comment and string form, `DELIMITER`, statement at cursor, formatter comments,
+  dollar bodies, idempotence, completion of aliased `UPDATE … FROM`, backticks, quoted mixed case).
+- `docs/plans/M12.md` (proposed, awaiting the owner): K1-K10 above the cut, K11-K16 below; the proposed
+  `CLAUDE.md` §4 K and `docs/GOAL-3.md` in its appendix. `docs/ROADMAP.md`: the critique's "not now" lines.
+  `docs/GUIDE.md`: what the update check does behind a proxy. D-076.
+- Most important gaps found: Cmd+Q drops an open transaction without a question; data, structure and
+  navigator writes cannot be cancelled and wait forever behind a lock; after `USE` or `SET search_path` a tab
+  runs elsewhere than its picker shows, and a reconnect silently goes back; a `.sql` file opened beside a
+  production connection is bound to it; a start failure (downgrade, one bad saved row) quits without a
+  window or a log.

@@ -1598,3 +1598,32 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   keychain and single-instance socket are never involved.
 - The look of the disk image is on the roadmap for the next release.
 
+
+## D-076 — The general critique of DBeaver: triage and the proposed milestone 12 (2026-11-17)
+
+- The owner gave a second-hand list of 22 criticisms of DBeaver (`docs/research/dbeaver-critique.md`). The
+  first reading of that file was from memory; this triage checked every point in the code at `496e3a4`, by
+  the cited lines, the named tests and probes on hard inputs. Verdict counts: 5 answered, 9 gaps, 1 gap
+  (untested), 3 do not apply, 2 not now; two rows only summarise others (`docs/COMPETITOR-ISSUES.md`).
+- **An answered verdict needs a test.** Where the behaviour is right but nothing would catch a regression,
+  the verdict is "gap (untested)" or a K10 item, not "answered". Benchmarks count when `scripts/bench.sh`
+  checks them against a target.
+- **Probes that pass are kept, probes that fail are text.** The passing hard inputs of completion, splitting
+  and the formatter are `crates/kerno-core/tests/sql_hard_inputs.rs` (36 tests); the failing ones are written
+  as reproductions in `docs/plans/M12.md` (K11, K12), not as failing or ignored tests. The classifier probes
+  repeated `classify::tests::statements_are_classified` except two failures, which are K7.
+- **The cut line of M12 is data first.** K1-K10 close the ways to lose data or act on the wrong server
+  without being told (quit with a transaction, a write stuck behind a lock with no cancel, a tab whose
+  session moved with `USE`, a script bound to production on open, three classifier holes, an app that
+  vanishes at start, errors that drop the server's hint). Completion of CTE columns (K11) and `BEGIN … END`
+  bodies (K12) fail safe today and open the next milestone.
+- **Choices inside the plan:** no `lock_timeout` on writes (a user may wait on purpose; the missing part was
+  the cancel); `WHERE true` and `WHERE 1=1` stay an explicit `WHERE` (DBeaver agrees); `REPLACE INTO` and
+  upserts stay non-destructive (they act on keyed rows); a `WHERE` inside any MySQL versioned comment counts
+  as absent, whatever the version (one question too many on old version numbers, never one too few); a
+  script opened from a file binds only to a connection whose environment asks nothing; no "simple mode"
+  (C20): the default layout is the calm one, toolbar items can be hidden.
+- **Proxy (C13):** documented in `docs/GUIDE.md` rather than built: drivers need no download, and the update
+  check's `curl` already honours `HTTPS_PROXY` when Kerno is started from a shell that sets it.
+- `CLAUDE.md` §4 K and `docs/GOAL-3.md` are the owner's files: their proposed text is the appendix of
+  `docs/plans/M12.md`, and nothing in M12 starts before the owner says so.

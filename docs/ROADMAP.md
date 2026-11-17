@@ -71,6 +71,21 @@ v1.1 (CLAUDE.md §4 J, `docs/plans/M11.md`). What was left out, and why:
 - **Other engines** (MongoDB, Oracle, SQL Server, ClickHouse, SQLite…). The biggest block of demand and out
   of v1's scope: items 4 and 5 above, through the driver layer.
 
+## From the general critique of DBeaver (triage of 2026-11-17): not now
+
+`docs/COMPETITOR-ISSUES.md` (section of 2026-11-17) checks C1-C22 against the code; `docs/plans/M12.md` plans the
+gaps, K1-K10 for the next milestone and K11-K16 after it. What is left out of both, and why:
+
+- **Linux look (C7).** No capture of the Linux packages exists: they were start-checked in containers without
+  a display. Look at them on a real GNOME and KDE session (Wayland and X11, fractional scaling) with the
+  Wayland check above.
+- **Smart rename in SQL (C11).** Renaming an alias or a CTE across a statement, from J7's occurrences. Low
+  demand in the sample; the "also dropped" list before a cascade (K14) comes first because it protects data.
+- **AWS RDS IAM and 1Password against the real services (C18).** Tested with fakes; a real run needs the
+  owner's accounts (CLAUDE.md §8).
+- **Idle memory margin (C1).** 149.9 MB for a 150 MB bar; the fix left is a second `unsafe` call, with the
+  owner (D-042).
+
 ## From the DBeaver inventory
 
 Rows of `docs/DBEAVER-PARITY.md` marked **roadmap**, grouped by reason (IDs refer to that file). The 67 gaps the inventory
