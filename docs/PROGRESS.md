@@ -477,7 +477,7 @@ Still open (for the owner):
 
 ## 2026-11-17 — The general critique of DBeaver, verified; milestone 12 proposed
 
-- Triage of C1-C22 in `docs/COMPETITOR-ISSUES.md` (section of 2026-11-17): 5 answered, 9 gaps, 1 gap
+- Triage of C1-C22 in `docs/COMPETITOR-ISSUES.md` (section of 2026-11-17): 3 answered, 9 gaps, 3 gaps
   (untested), 3 do not apply, 2 not now. Three audits by subagents (completion, splitting and formatter;
   safety rails, tab binding and transactions; long operations and error surfaces), every cited line opened
   again by the main session before it entered the table.

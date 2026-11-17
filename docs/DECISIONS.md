@@ -1603,11 +1603,11 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 
 - The owner gave a second-hand list of 22 criticisms of DBeaver (`docs/research/dbeaver-critique.md`). The
   first reading of that file was from memory; this triage checked every point in the code at `496e3a4`, by
-  the cited lines, the named tests and probes on hard inputs. Verdict counts: 5 answered, 9 gaps, 1 gap
+  the cited lines, the named tests and probes on hard inputs. Verdict counts: 3 answered, 9 gaps, 3 gaps
   (untested), 3 do not apply, 2 not now; two rows only summarise others (`docs/COMPETITOR-ISSUES.md`).
 - **An answered verdict needs a test.** Where the behaviour is right but nothing would catch a regression,
-  the verdict is "gap (untested)" or a K10 item, not "answered". Benchmarks count when `scripts/bench.sh`
-  checks them against a target.
+  the verdict is "gap (untested)" with a K10 item, not "answered". That includes the benchmarks:
+  `scripts/bench.sh` prints MISSED but exits 0, so C1 and C2 are untested until K10 makes a miss fail.
 - **Probes that pass are kept, probes that fail are text.** The passing hard inputs of completion, splitting
   and the formatter are `crates/kerno-core/tests/sql_hard_inputs.rs` (36 tests); the failing ones are written
   as reproductions in `docs/plans/M12.md` (K11, K12), not as failing or ignored tests. The classifier probes
@@ -1621,7 +1621,9 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   the cancel); `WHERE true` and `WHERE 1=1` stay an explicit `WHERE` (DBeaver agrees); `REPLACE INTO` and
   upserts stay non-destructive (they act on keyed rows); a `WHERE` inside any MySQL versioned comment counts
   as absent, whatever the version (one question too many on old version numbers, never one too few); a
-  script opened from a file binds only to a connection whose environment asks nothing; no "simple mode"
+  script opened from a file binds only to a connection whose environment asks nothing (with today's
+  built-ins that includes staging, whose rules equal local's: whether staging should ask more by default is
+  the owner's call); no "simple mode"
   (C20): the default layout is the calm one, toolbar items can be hidden.
 - **Proxy (C13):** documented in `docs/GUIDE.md` rather than built: drivers need no download, and the update
   check's `curl` already honours `HTTPS_PROXY` when Kerno is started from a shell that sets it.
