@@ -24,11 +24,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AnyElement, AnyView, App, AppContext as _, BorrowAppContext as _, ClipboardItem,
-    Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
-    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div,
-    px,
+    Anchor, AnyElement, AnyView, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _,
+    ClipboardItem, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions,
+    Render, ScrollHandle, SharedString, Styled as _, Subscription, Task, TestSupportExt as _,
+    WeakEntity, Window, div, px,
 };
 use kerno_core::config::{ConnectionConfig, Secret};
 
@@ -52,7 +52,7 @@ use crate::actions::{
     PreviousStatement, RunFromCursor, RunStatementInNewTab, SwitchResultsFocus, TogglePinnedResult,
     ToggleResultsPanel,
 };
-use crate::actions::{DisconnectAll, DisconnectOtherConnections, ToggleReadOnly};
+use crate::actions::{DisconnectAll, DisconnectOtherConnections, Quit, ToggleReadOnly};
 use crate::admin::tab::AdminTab;
 use crate::backup_dialog::{self, BackupDialog};
 use crate::bridge;
@@ -92,6 +92,10 @@ use kerno_core::{Engine, TxState};
 
 /// How long after the last change the open tabs are written to storage.
 const SAVE_TABS_DELAY: Duration = Duration::from_millis(400);
+
+/// How long quitting waits for each session's ROLLBACK: a dead server does
+/// not hold the quit.
+const QUIT_ROLLBACK_LIMIT: Duration = Duration::from_secs(3);
 
 /// How many closed query tabs can be reopened.
 const CLOSED_TABS: usize = 10;
@@ -430,6 +434,12 @@ pub struct Workspace {
     /// The last run of a script on several connections (J14): kept so it
     /// goes on, and can be shown again, once its dialog is closed.
     multi_run: Option<Entity<crate::multi_run::MultiRun>>,
+    /// Alive while the quit question is on screen (its dialog holds the
+    /// other end): a second Quit does not ask again.
+    quit_question: std::rc::Weak<()>,
+    /// Quitting was decided (`cx.quit()` does nothing on the test platform).
+    #[cfg(test)]
+    quit_requested: bool,
     tab_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -457,6 +467,16 @@ impl Workspace {
                 tabs.await;
                 settings.await;
             }
+        });
+        // The window's close button quits as Quit does: it asks first what
+        // that would end (C15), so the window itself never closes here.
+        let workspace = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let workspace = workspace.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |this, cx| this.quit(window, cx));
+            });
+            false
         });
         let sidebar = cx.new(|cx| Sidebar::new(connections.clone(), window, cx));
         let navigator = sidebar.read(cx).navigator().clone();
@@ -492,6 +512,9 @@ impl Workspace {
             dialog_open: false,
             last_focus: None,
             multi_run: None,
+            quit_question: std::rc::Weak::new(),
+            #[cfg(test)]
+            quit_requested: false,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -656,6 +679,12 @@ impl Workspace {
         });
         let overflow = strip.max_offset();
         (inside, overflow.x > px(0.) || overflow.y > px(0.))
+    }
+
+    /// Whether Kerno decided to quit; for tests.
+    #[cfg(test)]
+    pub fn quit_requested(&self) -> bool {
+        self.quit_requested
     }
 
     /// Index of the active tab, when there is one.
@@ -4336,6 +4365,31 @@ impl Workspace {
             .collect()
     }
 
+    /// Quits Kerno (Cmd+Q, the menu, the window's close button) once what
+    /// every tab holds is ended, as closing all of them asks (C15).
+    pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_question.strong_count() > 0 {
+            return;
+        }
+        let then: Then = Box::new(|this, _, cx| this.quit_now(cx));
+        self.ask_then(
+            "Quit Kerno".into(),
+            self.tabs.clone(),
+            then,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn quit_now(&mut self, cx: &mut App) {
+        #[cfg(test)]
+        {
+            self.quit_requested = true;
+        }
+        cx.quit();
+    }
+
     /// The one check before sessions close (disconnect, reconnect, read-only,
     /// a tab moved): when `tabs` hold an open transaction or pending changes,
     /// one dialog lists them and asks how to end them; Cancel changes
@@ -4348,6 +4402,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ask_then(action, tabs, then, false, window, cx);
+    }
+
+    /// [`Self::end_then`]; `quitting`: each ROLLBACK waits at most
+    /// [`QUIT_ROLLBACK_LIMIT`] and one that fails or gets no answer does not
+    /// hold the quit (the server rolls back when the session closes). A
+    /// failed COMMIT still stops it.
+    fn ask_then(
+        &mut self,
+        action: String,
+        tabs: Vec<OpenTab>,
+        then: Then,
+        quitting: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let losses: Vec<(String, Loss)> = tabs
             .iter()
             .flat_map(|tab| {
@@ -4357,7 +4427,12 @@ impl Workspace {
                     .map(move |loss| (title.clone(), loss))
             })
             .collect();
-        let Some((title, text, ending)) = tabs::end_question(&action, &losses) else {
+        let question = if quitting {
+            tabs::quit_question(&losses)
+        } else {
+            tabs::end_question(&action, &losses)
+        };
+        let Some((title, text, ending)) = question else {
             then(self, window, cx);
             return;
         };
@@ -4369,13 +4444,20 @@ impl Workspace {
                 window.close_dialog(cx);
                 if let Some(then) = then.borrow_mut().take() {
                     let tabs = tabs.clone();
-                    let _ = workspace
-                        .update(cx, |this, cx| this.finish_then(end, tabs, then, window, cx));
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.finish_then(end, tabs, then, quitting, window, cx)
+                    });
                 }
             },
         );
         let (title, text) = (SharedString::from(title), SharedString::from(text));
+        // Dropped with the dialog, however it closes.
+        let on_screen = Rc::new(());
+        if quitting {
+            self.quit_question = Rc::downgrade(&on_screen);
+        }
         window.open_dialog(cx, move |dialog, _, _| {
+            let _on_screen = &on_screen;
             let (choose, text, ending) = (choose.clone(), text.clone(), ending.clone());
             let label = title.clone();
             dialog
@@ -4448,20 +4530,24 @@ impl Workspace {
 
     /// Ends the transactions of `tabs` (commits them with `Some(true)`),
     /// waits for the server, discards the pending changes, then runs
-    /// `then`. When a COMMIT or ROLLBACK fails, nothing else is done.
+    /// `then`. When a COMMIT or ROLLBACK fails, nothing else is done, but
+    /// for a ROLLBACK when `quitting` (see [`Self::ask_then`]).
     fn finish_then(
         &mut self,
         end: Option<bool>,
         tabs: Vec<OpenTab>,
         then: Then,
+        quitting: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let rolling_back_to_quit = quitting && end == Some(false);
+        let limit = rolling_back_to_quit.then_some(QUIT_ROLLBACK_LIMIT);
         let endings: Vec<Task<Result<(), String>>> = match end {
             Some(commit) => tabs
                 .iter()
                 .filter_map(OpenTab::query)
-                .map(|tab| tab.update(cx, |tab, cx| tab.finish_transaction(commit, cx)))
+                .map(|tab| tab.update(cx, |tab, cx| tab.finish_transaction(commit, limit, cx)))
                 .collect(),
             None => Vec::new(),
         };
@@ -4477,7 +4563,9 @@ impl Workspace {
                 }
             }
             let _ = this.update_in(cx, |this, window, cx| {
-                if !failures.is_empty() {
+                if rolling_back_to_quit && !failures.is_empty() {
+                    tracing::warn!(?failures, "quitting without the server's answer");
+                } else if !failures.is_empty() {
                     let text = format!("{}. Nothing else was done.", failures.join("; "));
                     window.push_notification(Notification::error(SharedString::from(text)), cx);
                     return;
@@ -5041,6 +5129,25 @@ fn open_wizard_with(
     )
 }
 
+/// Quit asks first what it would end (C15). The workspace answers it when it
+/// is on the keyboard's path; this, when it is not (a dialog or the palette
+/// has the keyboard, the menu bar with nothing focused): it hands Quit to the
+/// workspace of `window`, once the dispatch is over (the window is in use
+/// during one), and quits at once only when that window is gone.
+pub fn handle_quit(window: AnyWindowHandle, workspace: WeakEntity<Workspace>, cx: &mut App) {
+    cx.on_action(move |_: &Quit, cx: &mut App| {
+        let workspace = workspace.clone();
+        cx.defer(move |cx| {
+            let asked = window.update(cx, |_, window, cx| {
+                workspace.update(cx, |this, cx| this.quit(window, cx))
+            });
+            if !matches!(asked, Ok(Ok(()))) {
+                cx.quit();
+            }
+        });
+    });
+}
+
 /// Reads the tasks again in the Tasks view of `workspace`, if it is open.
 fn reload_tasks(workspace: &WeakEntity<Workspace>, cx: &mut App) {
     let _ = workspace.update(cx, |workspace, cx| workspace.reload_tasks(cx));
@@ -5176,6 +5283,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseTabsToTheRight, window, cx| {
                 this.perform(None, TabAction::CloseToRight, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.quit(window, cx)))
             .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
                 this.perform(None, TabAction::CloseAll, window, cx)
             }))

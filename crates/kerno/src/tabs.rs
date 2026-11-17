@@ -890,9 +890,28 @@ pub enum Ending {
 /// how they may be ended; `None` to go ahead without asking. Unsaved text
 /// and table forms survive a closed session and are not asked about.
 pub fn end_question(action: &str, losses: &[(String, Loss)]) -> Option<(String, String, Ending)> {
+    question(action, losses, false)
+}
+
+/// [`end_question`] for quitting Kerno (C15): a table form with changes
+/// not applied is closed with the app, so it is asked about too. Unsaved
+/// text is not: the stored tabs keep it for the next start.
+pub fn quit_question(losses: &[(String, Loss)]) -> Option<(String, String, Ending)> {
+    question("Quit Kerno", losses, true)
+}
+
+fn question(
+    action: &str,
+    losses: &[(String, Loss)],
+    forms: bool,
+) -> Option<(String, String, Ending)> {
     let asked: Vec<&(String, Loss)> = losses
         .iter()
-        .filter(|(_, loss)| loss.is_transaction() || matches!(loss, Loss::Pending(_)))
+        .filter(|(_, loss)| {
+            loss.is_transaction()
+                || matches!(loss, Loss::Pending(_))
+                || (forms && *loss == Loss::Form)
+        })
         .collect();
     if asked.is_empty() {
         return None;
@@ -1453,6 +1472,19 @@ mod tests {
                 commit: Some("a transaction failed")
             }
         );
+        // C15: quitting closes the table forms too, so it asks about them;
+        // unsaved text is kept by the stored tabs.
+        assert_eq!(
+            quit_question(&[tab("a.sql", Loss::Unsaved), tab("t · edit", Loss::Form)]),
+            Some((
+                "Quit Kerno?".into(),
+                "“t · edit”: the changes not applied to the table are lost.\n\
+                 Cancel to keep everything as it is."
+                    .into(),
+                Ending::Discard
+            ))
+        );
+        assert_eq!(quit_question(&[tab("a.sql", Loss::Unsaved)]), None);
         // Only pending changes: discarded, or nothing happens.
         assert_eq!(
             end_question("Disconnect all", &[tab("people", Loss::Pending(1))]),

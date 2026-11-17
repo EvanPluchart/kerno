@@ -506,7 +506,11 @@ fn an_idle_transaction_is_rolled_back_after_the_period(cx: &mut TestAppContext) 
         assert_eq!(app.result(cx, 0, 1).1[0][0].as_deref(), Some("0"));
         // End what this read opened before the scratch objects are dropped.
         let tab = app.tab(cx);
-        cx.update(|cx| tab.update(cx, |tab, cx| tab.finish_transaction(false, cx).detach()));
+        cx.update(|cx| {
+            tab.update(cx, |tab, cx| {
+                tab.finish_transaction(false, None, cx).detach()
+            })
+        });
         app.wait_until(cx, "the end of the transaction", |app, cx| !open(app, cx));
     }
 }

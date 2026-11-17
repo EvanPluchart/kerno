@@ -45,6 +45,11 @@ Their FEATURES rows are J18 and J17.
 - **Linux release builds need an arm64 Docker host.** The image of `packaging/linux/Dockerfile` builds arm64
   natively and cross-compiles x86_64 (D-066); on an x86_64 host Docker would emulate the whole build. The
   mirror recipe (native x86_64, cross arm64) waits for a machine that needs it.
+- **Quit from the Dock, a logout and SIGTERM do not ask** (K1, 2026-11-17). Cmd+Q, the Quit menu item and
+  the window's close button ask before dropping an open transaction or pending changes; the Dock's Quit and a
+  logout send `terminate:` straight to AppKit, and the pinned gpui has no `applicationShouldTerminate` to
+  answer it. The server rolls the transaction back when the socket closes; pending edits and an unapplied
+  table form are lost. Closing it needs that hook in the kit (the owner's fork) or a second `unsafe`.
 - **The inside of the macOS disk image is plain** (owner, 2026-11-16): the `.dmg` opens on Finder's default
   window, two icons on a grey background. For the next release `scripts/bundle-macos.sh` gives it a
   background picture in the brand's colours, a fixed window size, large icons placed on it (Kerno on the

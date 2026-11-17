@@ -3187,7 +3187,7 @@ impl QueryTab {
             "The transaction was left idle for {idle}: it was rolled back, as the {environment} \
              environment asks, and nothing of it was committed."
         );
-        let ending = self.finish_transaction(false, cx);
+        let ending = self.finish_transaction(false, None, cx);
         cx.spawn_in(window, async move |this, cx| {
             let outcome = ending.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
@@ -3220,7 +3220,7 @@ impl QueryTab {
 
     /// Commits or rolls back the tab's open transaction.
     pub fn end_transaction(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ending = self.finish_transaction(commit, cx);
+        let ending = self.finish_transaction(commit, None, cx);
         cx.spawn_in(window, async move |_, cx| {
             if let Err(error) = ending.await {
                 let _ = cx.update(|window, cx| {
@@ -3232,10 +3232,12 @@ impl QueryTab {
     }
 
     /// Commits or rolls back the tab's open transaction; done at once when
-    /// none is open. The error says which statement failed.
+    /// none is open. The error says which statement failed, or that the
+    /// server did not answer within `limit`.
     pub fn finish_transaction(
         &mut self,
         commit: bool,
+        limit: Option<Duration>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
         let Some(session) = self.session.clone() else {
@@ -3247,7 +3249,22 @@ impl QueryTab {
         // A result still being paged belongs to the transaction.
         self.stop(cx);
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
-        let ending = bridge::spawn(cx, exec::collect(session, sql));
+        let ending = bridge::spawn(cx, async move {
+            let ending = async {
+                exec::collect(session, sql)
+                    .await
+                    .map(drop)
+                    .map_err(|error| format!("{sql} failed: {error}"))
+            };
+            match limit {
+                Some(limit) => tokio::time::timeout(limit, ending)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(format!("{sql} got no answer within {} s", limit.as_secs()))
+                    }),
+                None => ending.await,
+            }
+        });
         cx.spawn(async move |this, cx| {
             let outcome = ending.await;
             let _ = this.update(cx, |this, cx| {
@@ -3257,8 +3274,6 @@ impl QueryTab {
                 cx.notify()
             });
             outcome
-                .map(drop)
-                .map_err(|error| format!("{sql} failed: {error}"))
         })
     }
 

@@ -186,7 +186,6 @@ fn start(
     #[cfg(target_os = "macos")]
     app_icon::set_dock_icon();
     let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
-    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     // The one request Kerno makes by itself (CLAUDE.md §1), unless an off
     // switch is set: where this copy lives is looked at off the UI thread.
     let exe = std::env::current_exe().ok();
@@ -272,6 +271,7 @@ fn start(
         });
         let workspace =
             cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
+        workspace::handle_quit(window.window_handle(), workspace.downgrade(), cx);
         bench::begin(&workspace, &connections, window, cx);
         if let Some(listener) = listener {
             open_url::listen(listener, &workspace, &connections, window, cx);
