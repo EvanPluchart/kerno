@@ -722,7 +722,6 @@ impl Workspace {
     }
 
     /// The active tab, when it is a table form.
-    #[cfg(test)]
     pub fn active_table_editor(&self) -> Option<&Entity<TableEditor>> {
         self.tabs.get(self.active_tab)?.table_editor()
     }
@@ -1251,10 +1250,10 @@ impl Workspace {
             OpenTab::Query(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Data(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.close_session(cx)),
-            OpenTab::Structure(_)
-            | OpenTab::TableEditor(_)
-            | OpenTab::Tasks(_)
-            | OpenTab::Diagram(_) => {}
+            // Its apply runs on a session of its own: stopped, not left to
+            // run with nobody to see it end (C3).
+            OpenTab::TableEditor(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            OpenTab::Structure(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {}
         }
         // A closed query tab can be opened again, with its text.
         if let OpenTab::Query(tab) = tab {
@@ -3025,6 +3024,9 @@ impl Workspace {
             tab.update(cx, |tab, cx| tab.cancel(cx));
         }
         if let Some(tab) = self.active_data_tab() {
+            tab.update(cx, |tab, cx| tab.cancel(cx));
+        }
+        if let Some(tab) = self.active_table_editor() {
             tab.update(cx, |tab, cx| tab.cancel(cx));
         }
     }

@@ -1629,3 +1629,30 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   check's `curl` already honours `HTTPS_PROXY` when Kerno is started from a shell that sets it.
 - `CLAUDE.md` §4 K and `docs/GOAL-3.md` are the owner's files: their proposed text is the appendix of
   `docs/plans/M12.md`, and nothing in M12 starts before the owner says so.
+
+
+## D-077 — Writes are cancelled, not timed out (K2, C3; 2026-11-17)
+
+- **No `lock_timeout`** (nor `lock_wait_timeout` on MySQL) is set on any session. A user may wait behind a
+  lock on purpose (a migration, a colleague's transaction); what was missing was the way out. Every write
+  of the data tab, the table form and the navigator now has a Cancel that calls `Session::cancel()` and
+  stops the statement on the server; Cmd+. and the status bar's Cancel reach the active data tab and table
+  form; closing a tab whose statement runs cancels it first. An explicit cancel is needed: dropping the
+  future does not reach the driver at all (`bridge::spawn` detaches the Tokio task), and on PostgreSQL an
+  abandoned statement inside a transaction block is left to finish on purpose.
+- **The navigator's Drop, Rename and Create run on a session of their own**, opened for the statement and
+  closed after it (as the maintenance dialog and the table form already did), no longer on the tree's
+  session or the connection's meta session. A cancel bumps the session's cancel count, which also stops
+  every statement queued behind on that session: on a shared session it would have failed the tree loads
+  waiting behind a `DROP` held by a lock, and those loads would have waited with it. The cost is one
+  connection per confirmed statement.
+- **A cancelled read is not an error.** The data tab says "Cancelled: the rows were not read" with a Reload
+  button, not the server's "canceling statement due to user request" followed by "Check the filter".
+- **Wording of a cancelled write:** "Cancelled: nothing was changed." when one transaction rolled back (the
+  data tab adds "The pending changes are kept."); on MySQL, whose DDL commits each statement, a table form
+  stopped after its first statement says "Cancelled at statement N of M; the statements before it were
+  applied." A cancel that lands after the last statement (during `COMMIT`) is ignored: the write
+  succeeded and says so.
+- The row being written shows what runs ("Dropping table t…") in place of its hint, with a "Cancel the
+  running statement" entry first in its menu and a notification with Cancel that stays until the statement
+  ends. No spinner: the app shows work as text everywhere else ("loading…", "applying…").

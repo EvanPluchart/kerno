@@ -4899,8 +4899,9 @@ fn a_slow_page_is_cancelled_and_the_tab_stays_usable(cx: &mut TestAppContext) {
     assert_eq!(app.data_state(cx), "loading");
     assert!(app.status_bar(cx).contains(&"running…".to_string()));
     app.press(cx, &["secondary-."]);
+    // Said as a cancel, not as a failure of the filter (C3).
     app.wait_until(cx, "the cancellation", |app, cx| {
-        app.data_state(cx).starts_with("failed")
+        app.data_state(cx) == "cancelled"
     });
     app.click(cx, "filter-clear");
     app.wait_for_rows(cx, &rows);

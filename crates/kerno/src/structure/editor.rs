@@ -3,6 +3,7 @@
 //! match it, written live. Apply shows them and asks before anything runs.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -166,6 +167,11 @@ pub struct TableEditor {
     next_id: u64,
     state: State,
     applying: bool,
+    /// The session of the apply in flight, once open: what Cancel stops (C3).
+    applying_session: Option<Arc<dyn Session>>,
+    /// Cancel was asked for the apply in flight; read between its
+    /// statements too, so that one sent after the cancel is not run.
+    cancel_requested: Arc<AtomicBool>,
     /// Why the last apply failed, with the statement that did.
     error: Option<String>,
     load: Option<Task<()>>,
@@ -219,6 +225,8 @@ impl TableEditor {
             next_id: 0,
             state: State::Waiting,
             applying: false,
+            applying_session: None,
+            cancel_requested: Arc::new(AtomicBool::new(false)),
             error: None,
             load: None,
             generation: 0,
@@ -984,6 +992,8 @@ impl TableEditor {
         let opening = self.session(cx);
         self.applying = true;
         self.error = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_requested = cancel.clone();
         let from = self.table.clone();
         let table = self.draft(cx).table;
         // One statement at a time on the session: after a reload in flight.
@@ -1005,9 +1015,11 @@ impl TableEditor {
             };
             let transactional = session.dialect().engine() == Engine::Postgres;
             let to_run = statements.clone();
+            // The editor holds the session while it runs, for Cancel (C3).
+            let _ = this.update(cx, |this, _| this.applying_session = Some(session.clone()));
             let running = cx.update(|_, cx| {
                 bridge::spawn(cx, async move {
-                    let outcome = run_statements(session.clone(), to_run).await;
+                    let outcome = run_statements(session.clone(), to_run, &cancel).await;
                     session.close().await;
                     outcome
                 })
@@ -1018,7 +1030,9 @@ impl TableEditor {
             let outcome = running.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.applying = false;
+                this.applying_session = None;
                 this.load = None;
+                let cancelled = this.cancel_requested.load(Ordering::Acquire);
                 match outcome {
                     Ok(()) => {
                         window.push_notification(
@@ -1041,12 +1055,24 @@ impl TableEditor {
                     Err((failed, error)) => {
                         let at = failed.and_then(|index| Some((index, statements.get(index)?)));
                         let partial = !transactional && failed.is_some_and(|index| index > 0);
-                        let mut message = if partial {
+                        let mut message = if cancelled {
+                            // C3: MySQL commits each statement as it goes.
+                            match failed {
+                                Some(index) if partial => format!(
+                                    "Cancelled at statement {} of {}; the statements before it \
+                                     were applied.",
+                                    index + 1,
+                                    statements.len()
+                                ),
+                                _ => "Cancelled: nothing was changed.".to_string(),
+                            }
+                        } else if partial {
                             "The statements before the one that failed were applied. ".to_string()
                         } else {
                             "Nothing was changed. ".to_string()
                         };
                         match at {
+                            _ if cancelled => {}
                             Some((index, sql)) => message.push_str(&format!(
                                 "Statement {} failed: {error}\n{sql}",
                                 index + 1
@@ -1063,6 +1089,24 @@ impl TableEditor {
                 }
             });
         }));
+        cx.notify();
+    }
+
+    /// Stops the apply in flight (Cancel, Cmd+.): its statement is
+    /// cancelled on the server, and none after it is sent (C3).
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.applying {
+            return;
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        if let Some(session) = self.applying_session.clone() {
+            bridge::spawn(cx, async move {
+                if let Err(error) = session.cancel().await {
+                    tracing::debug!(%error, "the statement could not be cancelled");
+                }
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -1159,6 +1203,27 @@ impl TableEditor {
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(reason)),
                 ),
+                None if self.applying => bar
+                    .child(
+                        div()
+                            .id("editor-applying")
+                            .test_support()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(if self.cancel_requested.load(Ordering::Acquire) {
+                                "Cancelling…"
+                            } else {
+                                "Applying…"
+                            }),
+                    )
+                    .child(
+                        Button::new("editor-cancel")
+                            .small()
+                            .label("Cancel")
+                            .tooltip("Stop the statement on the server")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
                 None => bar.child(
                     Button::new("editor-apply")
                         .primary()
@@ -1845,6 +1910,7 @@ fn hint(text: &'static str, cx: &App) -> impl IntoElement {
 async fn run_statements(
     session: Arc<dyn Session>,
     statements: Vec<String>,
+    cancel: &AtomicBool,
 ) -> Result<(), (Option<usize>, Error)> {
     // DDL is transactional on PostgreSQL only; MySQL commits each statement.
     let transactional = session.dialect().engine() == Engine::Postgres;
@@ -1854,7 +1920,13 @@ async fn run_statements(
             .map_err(|error| (None, error))?;
     }
     for (index, sql) in statements.iter().enumerate() {
-        if let Err(error) = exec::collect(session.clone(), sql.as_str()).await {
+        // A cancel that came between two statements stops the next one.
+        let outcome = if cancel.load(Ordering::Acquire) {
+            Err(Error::Cancelled)
+        } else {
+            exec::collect(session.clone(), sql.as_str()).await.map(drop)
+        };
+        if let Err(error) = outcome {
             if transactional && let Err(error) = exec::collect(session.clone(), "ROLLBACK").await {
                 tracing::warn!(%error, "rollback after a failed DDL statement did not succeed");
             }

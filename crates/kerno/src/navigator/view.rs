@@ -35,7 +35,7 @@ use kerno_core::sql::{
     call_routine, delete_template, insert_template, select_template, update_template,
 };
 use kerno_core::table_draft::TableChange;
-use kerno_core::{Session, exec};
+use kerno_core::{Error, Session, exec};
 
 use super::actions::{
     Action, FilterAction, Template, ToolEntry, ToolGroups, actions, create_template,
@@ -184,8 +184,29 @@ pub struct Navigator {
     /// Where the active query tab runs, kept up to date by the window: what
     /// "Set as default for this tab" changes.
     tab_target: Rc<RefCell<Option<Target>>>,
+    /// The confirmed statements running, each until it ends (C3).
+    writes: Vec<Write>,
+    /// The last key given to a [`Write`].
+    last_write: u64,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A confirmed statement the navigator is running: its row says so and
+/// offers Cancel, and so does a notification that stays until it ends (C3).
+struct Write {
+    key: u64,
+    connection: String,
+    /// The node it acts on (its id local to the connection).
+    node: String,
+    /// What the row and the notification say ("Dropping table t…").
+    doing: String,
+    /// Its session once open: what Cancel stops.
+    session: Option<Arc<dyn Session>>,
+    cancelled: bool,
+}
+
+/// Names the notifications of [`Write`]s.
+struct WriteNote;
 
 /// A table or view [`Navigator::reveal`] is opening the way to.
 #[derive(Debug, Clone)]
@@ -268,6 +289,8 @@ impl Navigator {
             filter_text: String::new(),
             folders_seen: folder_settings(cx),
             tab_target: Rc::default(),
+            writes: Vec::new(),
+            last_write: 0,
             _subscriptions: subscriptions,
         };
         navigator.sync(cx);
@@ -1184,7 +1207,7 @@ impl Navigator {
             (saved.config.name.clone(), saved.config.environment.clone());
         let view = cx.entity();
         let form = database_dialog::open(meta, window, cx, move |sql, window, cx| {
-            let (view, connection) = (view.clone(), connection.clone());
+            let (view, connection, node) = (view.clone(), connection.clone(), node.id.clone());
             sql_confirm::open(
                 Confirmation {
                     title: "Create database".into(),
@@ -1205,6 +1228,8 @@ impl Navigator {
                         release: None,
                         after: After::Reload,
                         done: "Created the database.".into(),
+                        node: node.clone(),
+                        doing: "Creating the database…".into(),
                     };
                     view.update(cx, |this, cx| this.execute(sql, plan, window, cx));
                 },
@@ -2127,12 +2152,27 @@ impl Navigator {
             (Some(ObjectRef::Database(name)), Action::Drop | Action::Rename) => Some(name.clone()),
             _ => None,
         };
+        let doing = match action {
+            Action::Drop | Action::DropCascade | Action::DropColumn => {
+                format!("Dropping {kind} {name}…")
+            }
+            Action::Rename | Action::RenameColumn => format!("Renaming {kind} {name}…"),
+            Action::RenameEnumValue => "Renaming the value…".into(),
+            Action::AddEnumValue => "Adding the value…".into(),
+            Action::InstallExtension => format!("Installing extension {name}…"),
+            Action::CreateSchema => "Creating the schema…".into(),
+            Action::CreateDatabase => "Creating the database…".into(),
+            Action::CreateEnum => "Creating the enum…".into(),
+            _ => "Running the statement…".into(),
+        };
         let plan = Plan {
             connection: connection.to_string(),
             database,
             release,
             after,
             done,
+            node: node.id.clone(),
+            doing,
         };
         let view = cx.entity();
         sql_confirm::open(
@@ -2155,7 +2195,11 @@ impl Navigator {
         );
     }
 
-    /// Runs a confirmed statement and shows what came of it.
+    /// Runs a confirmed statement on a session of its own, closed once it
+    /// ends, and shows what came of it. The node says it runs, and Cancel
+    /// (its menu, the notification) stops it on the server (C3): a session
+    /// of the tree's would also hold the loads queued behind a statement
+    /// waiting for a lock, and a cancel would fail them too.
     fn execute(&mut self, sql: String, plan: Plan, window: &mut Window, cx: &mut Context<Self>) {
         let Plan {
             connection,
@@ -2163,6 +2207,8 @@ impl Navigator {
             release,
             after,
             done,
+            node,
+            doing,
         } = plan;
         let Some(browse) = self.browse.get_mut(&connection) else {
             return;
@@ -2171,42 +2217,144 @@ impl Navigator {
             browse.sessions.remove(&released);
         }
         let generation = browse.generation;
-        let session = match &database {
-            Some(database) => self.session_for(&connection, database, cx),
-            None => match self.connections.read(cx).meta_session(&connection) {
-                Some(meta) => Task::ready(Ok(meta)),
-                None => return,
-            },
-        };
+        let opening = self
+            .connections
+            .read(cx)
+            .open_session(&connection, database, cx);
+        self.last_write += 1;
+        let key = self.last_write;
+        self.writes.push(Write {
+            key,
+            connection: connection.clone(),
+            node,
+            doing: doing.clone(),
+            session: None,
+            cancelled: false,
+        });
+        let view = cx.entity().downgrade();
+        window.push_notification(
+            Notification::info(SharedString::from(doing))
+                .id1::<WriteNote>(key as usize)
+                .action(move |_, _, _| {
+                    let view = view.clone();
+                    Button::new(("navigator-write-cancel", key as usize))
+                        .small()
+                        .label("Cancel")
+                        .on_click(move |_, _, cx| {
+                            if let Some(view) = view.upgrade() {
+                                view.update(cx, |this, cx| this.cancel_write(key, cx));
+                            }
+                        })
+                }),
+            cx,
+        );
+        cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = match session.await {
+            let outcome = match opening.await {
                 Err(error) => Err(error),
                 Ok(session) => {
-                    match cx.update(|_, cx| bridge::spawn(cx, exec::collect(session, sql))) {
-                        Ok(running) => running.await.map(|_| ()),
+                    // A Cancel that came while it opened: nothing is sent.
+                    let go_on = this.update(cx, |this, _| {
+                        match this.writes.iter_mut().find(|write| write.key == key) {
+                            Some(write) if !write.cancelled => {
+                                write.session = Some(session.clone());
+                                true
+                            }
+                            _ => false,
+                        }
+                    });
+                    let go_on = matches!(go_on, Ok(true));
+                    let running = cx.update(|_, cx| {
+                        bridge::spawn(cx, async move {
+                            let outcome = if go_on {
+                                exec::collect(session.clone(), sql).await.map(drop)
+                            } else {
+                                Err(Error::Cancelled)
+                            };
+                            session.close().await;
+                            outcome
+                        })
+                    });
+                    match running {
+                        Ok(running) => running.await,
                         Err(_) => return,
                     }
                 }
             };
-            let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(()) => {
-                    window.push_notification(Notification::success(SharedString::from(done)), cx);
-                    if this.live(&connection, generation).is_none() {
-                        return;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let cancelled = this.end_write(key, window, cx);
+                match outcome {
+                    Ok(()) => {
+                        window
+                            .push_notification(Notification::success(SharedString::from(done)), cx);
+                        if this.live(&connection, generation).is_none() {
+                            return;
+                        }
+                        match after {
+                            After::Reload => this.reload(&connection, cx),
+                            After::Refresh(Some(id)) => this.refresh(&connection, &id, cx),
+                            After::Refresh(None) => {}
+                        }
                     }
-                    match after {
-                        After::Reload => this.reload(&connection, cx),
-                        After::Refresh(Some(id)) => this.refresh(&connection, &id, cx),
-                        After::Refresh(None) => {}
-                    }
+                    // The server words a cancel its own way (an error on
+                    // PostgreSQL); the navigator knows it asked. One
+                    // statement, in auto-commit: it did not take effect.
+                    Err(_) if cancelled => window.push_notification(
+                        Notification::info("Cancelled: nothing was changed."),
+                        cx,
+                    ),
+                    Err(error) => window.push_notification(
+                        Notification::error(SharedString::from(error.to_string())),
+                        cx,
+                    ),
                 }
-                Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(error.to_string())),
-                    cx,
-                ),
             });
         })
         .detach();
+    }
+
+    /// Stops the write `key` on the server (C3).
+    pub fn cancel_write(&mut self, key: u64, cx: &mut Context<Self>) {
+        let Some(write) = self.writes.iter_mut().find(|write| write.key == key) else {
+            return;
+        };
+        write.cancelled = true;
+        if let Some(session) = write.session.clone() {
+            bridge::spawn(cx, async move {
+                if let Err(error) = session.cancel().await {
+                    tracing::debug!(%error, "the statement could not be cancelled");
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Forgets the write `key`, which ended; returns whether it was
+    /// cancelled.
+    fn end_write(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(at) = self.writes.iter().position(|write| write.key == key) else {
+            return false;
+        };
+        window.remove_notification1::<WriteNote>(key as usize, cx);
+        cx.notify();
+        self.writes.remove(at).cancelled
+    }
+
+    /// The write running on `node` of `connection`, if one is.
+    fn write_on(&self, connection: &str, node: &str) -> Option<&Write> {
+        self.writes
+            .iter()
+            .find(|write| write.connection == connection && write.node == node)
+    }
+
+    /// The writes running, by key, with what each says; for tests.
+    #[cfg(test)]
+    pub fn writes(&self) -> Vec<(u64, String)> {
+        self.writes
+            .iter()
+            .map(|write| (write.key, write.doing.clone()))
+            .collect()
     }
 
     /// Shows the folders, the connections and what each open one holds in
@@ -2695,12 +2843,9 @@ impl Navigator {
             }
             Some(RowId::Object { connection, local }) => {
                 let base = row(("node", index).into());
-                match self
-                    .tree(connection)
-                    .and_then(|tree| Some((tree, tree.node(local)?)))
-                {
-                    Some((tree, node)) => Self::clicks(view, base, index)
-                        .child(self.node_content(view, index, entry, tree, node, cx)),
+                match self.tree(connection).and_then(|tree| tree.node(local)) {
+                    Some(node) => Self::clicks(view, base, index)
+                        .child(self.node_content(view, index, entry, connection, node, cx)),
                     None => self.render_line(view, base, connection, local, entry, cx),
                 }
             }
@@ -3058,18 +3203,22 @@ impl Navigator {
         view: &Entity<Self>,
         index: usize,
         entry: &TreeEntry,
-        tree: &Tree,
+        connection: &str,
         node: &Node,
         cx: &App,
     ) -> impl IntoElement {
+        let tree = self.tree(connection);
         let theme = cx.theme();
+        let doing = self
+            .write_on(connection, &node.id)
+            .map(|write| write.doing.clone());
         let chevron = if entry.is_folder() {
             Self::chevron(view, ("node-chevron", index).into(), index, entry, cx)
         } else {
             div().flex_none().size_3().into_any_element()
         };
         let default = matches!(&node.kind, NodeKind::Object(ObjectRef::Database(name))
-            if tree.default_database() == Some(name.as_str()));
+            if tree.and_then(Tree::default_database) == Some(name.as_str()));
         h_flex()
             .w_full()
             .min_w_0()
@@ -3106,18 +3255,37 @@ impl Navigator {
                         .child("default"),
                 )
             })
-            .when_some(Self::row_hint(tree, node), |this, hint| {
+            // A statement running on it says so in place of the hint (C3).
+            .when_some(doing.clone(), |this, doing| {
                 this.child(
                     div()
+                        .id(("node-doing", index))
+                        .test_support()
                         .flex_1()
                         .min_w_0()
                         .truncate()
                         .text_right()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(hint)),
+                        .text_color(theme.warning)
+                        .child(SharedString::from(doing)),
                 )
             })
+            .when_some(
+                tree.and_then(|tree| Self::row_hint(tree, node))
+                    .filter(|_| doing.is_none()),
+                |this, hint| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_right()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(hint)),
+                    )
+                },
+            )
     }
 }
 
@@ -3138,6 +3306,10 @@ struct Plan {
     after: After,
     /// What to say once it ran.
     done: String,
+    /// The node it acts on, which says it runs meanwhile.
+    node: String,
+    /// What runs, in a few words ("Dropping table t…").
+    doing: String,
 }
 
 /// What to show again once a statement ran.
@@ -3325,6 +3497,20 @@ fn object_menu(
         Some(reason) => SharedString::from(format!("{label} ({reason})")),
         None => SharedString::from(label.to_string()),
     };
+    // A statement running on it can be stopped from here (C3).
+    if let Some(key) = navigator
+        .write_on(&connection, &node.id)
+        .map(|write| write.key)
+    {
+        let view = view.clone();
+        menu = menu
+            .item(
+                PopupMenuItem::new("Cancel the running statement").on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_write(key, cx))
+                }),
+            )
+            .separator();
+    }
     let id = id.to_string();
     let last = groups.len().saturating_sub(1);
     for (index, group) in groups.into_iter().enumerate() {

@@ -91,6 +91,8 @@ enum State {
         message: String,
         gone: bool,
     },
+    /// The user stopped the read (C3).
+    Cancelled,
 }
 
 /// How many rows the filter keeps in the whole table.
@@ -177,6 +179,9 @@ fn table_gone(error: &Error) -> bool {
     }
 }
 
+/// What a read stopped by Cancel says (C3).
+const CANCELLED: &str = "Cancelled: the rows were not read. Reload reads them again.";
+
 /// What the error state says: the server's message, then what to do.
 fn failure_text(message: &str, gone: bool) -> String {
     let advice = if gone {
@@ -245,6 +250,9 @@ pub struct DataTab {
     load: Option<Task<()>>,
     generation: u64,
     applying: bool,
+    /// Cancel was asked for the read or the apply in flight: its failure
+    /// is the cancel, not an error (C3).
+    cancel_requested: bool,
     /// The page read after an apply takes the keyboard, as the grid had it.
     refocus_grid: bool,
     /// Why the last apply changed nothing.
@@ -335,6 +343,7 @@ impl DataTab {
             load: None,
             generation: 0,
             applying: false,
+            cancel_requested: false,
             refocus_grid: false,
             apply_error: None,
             grid_subscriptions: Vec::new(),
@@ -641,7 +650,7 @@ impl DataTab {
 
     /// The last read failed: its error is shown instead of rows.
     fn read_failed(&self) -> bool {
-        matches!(self.state, State::Failed { .. })
+        matches!(self.state, State::Failed { .. } | State::Cancelled)
     }
 
     /// Why the rows cannot be edited, in a few words, when they cannot.
@@ -691,8 +700,17 @@ impl DataTab {
     /// Closes the tab's session now: the tab is closing, or its connection
     /// closed. What is on screen stays.
     pub fn close_session(&mut self, cx: &mut Context<Self>) {
+        // A statement still waiting (behind a lock, say) is stopped first,
+        // so nothing of a closed tab keeps running on the server (C3).
+        let busy = self.state == State::Loading || self.counting || self.applying;
         if let Some(session) = self.session.take() {
-            bridge::spawn(cx, async move { session.close().await }).detach();
+            bridge::spawn(cx, async move {
+                if busy && let Err(error) = session.cancel().await {
+                    tracing::debug!(%error, "the statement could not be cancelled");
+                }
+                session.close().await
+            })
+            .detach();
         }
     }
 
@@ -735,6 +753,7 @@ impl DataTab {
             return;
         }
         self.apply_error = None;
+        self.cancel_requested = false;
         let previous = self.load.take();
         let opening = self.session(cx);
         let table = self.table.clone();
@@ -756,6 +775,23 @@ impl DataTab {
                     return;
                 }
             };
+            // The tab holds its session before the first statement, so that
+            // Cancel reaches the first page too (C3); a Cancel that came
+            // while it was opening stops the read here.
+            let go_on = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return false;
+                }
+                this.session = Some(session.clone());
+                if this.cancel_requested {
+                    this.failed(generation, &Error::Cancelled, cx);
+                    return false;
+                }
+                true
+            });
+            if !matches!(go_on, Ok(true)) {
+                return;
+            }
             let reading = {
                 let (session, filter) = (session.clone(), filter.clone());
                 cx.update(|_, cx| {
@@ -861,6 +897,13 @@ impl DataTab {
         }
         self.counting = false;
         self.stop_auto_refresh(Some("the rows could not be read"), cx);
+        // The server words a cancel its own way (an error on PostgreSQL);
+        // the tab knows it asked.
+        if std::mem::take(&mut self.cancel_requested) || matches!(error, Error::Cancelled) {
+            self.state = State::Cancelled;
+            cx.notify();
+            return;
+        }
         let gone = table_gone(error);
         self.state = State::Failed {
             message: error.to_string(),
@@ -1347,9 +1390,12 @@ impl DataTab {
 
     /// Stops the statement the tab is waiting for.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
-        if let Some(session) = self.session.clone()
-            && (self.state == State::Loading || self.counting)
-        {
+        if !(self.state == State::Loading || self.counting || self.applying) {
+            return;
+        }
+        // Seen by a read whose session is still opening (C3).
+        self.cancel_requested = true;
+        if let Some(session) = self.session.clone() {
             bridge::spawn(cx, async move {
                 if let Err(error) = session.cancel().await {
                     tracing::debug!(%error, "the statement could not be cancelled");
@@ -1852,6 +1898,7 @@ impl DataTab {
         };
         self.applying = true;
         self.apply_error = None;
+        self.cancel_requested = false;
         let previous = self.load.take();
         let count = self.pending_count(cx);
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1866,6 +1913,7 @@ impl DataTab {
             let outcome = applying.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.applying = false;
+                let cancelled = std::mem::take(&mut this.cancel_requested);
                 match outcome {
                     Ok(()) => {
                         window.push_notification(
@@ -1881,6 +1929,13 @@ impl DataTab {
                         this.reload(window, cx);
                     }
                     // Nothing was written; the changes are still there.
+                    // One transaction, rolled back: the cancel undid it all (C3).
+                    Err(_) if cancelled => {
+                        this.apply_error = Some(
+                            "Cancelled: nothing was changed. The pending changes are kept.".into(),
+                        );
+                        cx.notify();
+                    }
                     Err(failure) => {
                         this.apply_error = Some(format!(
                             "Nothing was changed: {failure}. The pending changes are kept."
@@ -1910,6 +1965,7 @@ impl DataTab {
     pub fn advice(&self) -> String {
         match &self.state {
             State::Failed { message, gone } => failure_text(message, *gone),
+            State::Cancelled => CANCELLED.into(),
             _ => String::new(),
         }
     }
@@ -1921,6 +1977,7 @@ impl DataTab {
             State::Waiting => "waiting".into(),
             State::Loading => "loading".into(),
             State::Failed { message, .. } => format!("failed: {message}"),
+            State::Cancelled => "cancelled".into(),
             State::Ready => self.range_text(cx),
         }
     }
@@ -2308,7 +2365,7 @@ impl DataTab {
         let loading = self.state == State::Loading;
         let range = match (&self.state, &self.grid) {
             (State::Loading, None) => "Loading rows…".to_string(),
-            (State::Failed { .. }, _) | (_, None) => String::new(),
+            (State::Failed { .. } | State::Cancelled, _) | (_, None) => String::new(),
             _ => self.range_text(cx),
         };
         h_flex()
@@ -2355,7 +2412,7 @@ impl DataTab {
             .when(self.counting && !loading, |bar| bar.child("counting…"))
             .when(loading && self.grid.is_some(), |bar| bar.child("loading…"))
             .when(self.applying, |bar| bar.child("applying…"))
-            .when(loading || self.counting, |bar| {
+            .when(loading || self.counting || self.applying, |bar| {
                 bar.child(
                     Button::new("data-cancel")
                         .ghost()
@@ -2469,6 +2526,19 @@ impl DataTab {
                         self.table.name
                     ),
                     Some(connect),
+                    cx,
+                )
+            }
+            (State::Cancelled, _) => {
+                let reload = Button::new("data-retry")
+                    .outline()
+                    .label("Reload")
+                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx)));
+                self.render_notice(
+                    "data-cancelled",
+                    "Cancelled",
+                    CANCELLED.to_string(),
+                    Some(reload.into_any_element()),
                     cx,
                 )
             }

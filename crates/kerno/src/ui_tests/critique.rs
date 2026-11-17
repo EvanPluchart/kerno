@@ -180,3 +180,458 @@ fn quitting_from_a_dialog_asks_too(cx: &mut TestAppContext) {
     assert!(!app.dialog_open(cx));
     roll_back(&app, cx);
 }
+
+// K2: every write can be cancelled; the first page of a table too (C3) -------------
+
+/// A session of the test's own that holds a lock on `table` until dropped:
+/// on PostgreSQL `LOCK TABLE … IN ACCESS EXCLUSIVE MODE` in a transaction,
+/// on MySQL `LOCK TABLES … WRITE`. Any statement of the app on that table
+/// waits behind it. Dropping it releases the lock and closes the session,
+/// whether the test passed or not; a session that does not end in 15 s is
+/// terminated (its own, and no other).
+struct Locker {
+    engine: Engine,
+    id: String,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    done: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Locker {
+    fn start(engine: Engine, table: &str) -> Self {
+        use kerno_core::Driver as _;
+        let (own_id, lock) = match engine {
+            Engine::Postgres => (
+                "SELECT pg_backend_pid()",
+                vec![
+                    "BEGIN".to_string(),
+                    format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
+                ],
+            ),
+            Engine::MySql | Engine::MariaDb => (
+                "SELECT CONNECTION_ID()",
+                vec![format!("LOCK TABLES {table} WRITE")],
+            ),
+        };
+        let unlock = match engine {
+            Engine::Postgres => "ROLLBACK",
+            Engine::MySql | Engine::MariaDb => "UNLOCK TABLES",
+        };
+        let (locked, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let done = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let session = runtime.block_on(async {
+                let params = testing::params(engine);
+                let session = match engine {
+                    Engine::Postgres => kerno_postgres::PostgresDriver.connect(&params).await,
+                    Engine::MySql | Engine::MariaDb => {
+                        kerno_mysql::MysqlDriver.connect(&params).await
+                    }
+                }
+                .expect("the test server");
+                let id = kerno_core::exec::collect(session.clone(), own_id)
+                    .await
+                    .unwrap()
+                    .results[0]
+                    .rows()[0][0]
+                    .clone()
+                    .unwrap();
+                for sql in &lock {
+                    kerno_core::exec::collect(session.clone(), sql.as_str())
+                        .await
+                        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+                }
+                locked.send(id).unwrap();
+                session
+            });
+            // Held until the test lets go (or its end drops the sender).
+            let _ = released.recv();
+            runtime.block_on(async {
+                let _ = kerno_core::exec::collect(session.clone(), unlock).await;
+                session.close().await;
+            });
+        });
+        let id = held
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the lock");
+        Self {
+            engine,
+            id,
+            release: Some(release),
+            done: Some(done),
+        }
+    }
+
+    /// Whether the lock is still held.
+    fn holds(&self) -> bool {
+        self.done.as_ref().is_some_and(|done| !done.is_finished())
+    }
+
+    /// Whether a statement of another session waits for this lock: the one
+    /// a cancel is meant for. (Its text may not name the table: on
+    /// PostgreSQL the first statement to wait can be one that reads the
+    /// catalog by the table's oid.)
+    fn blocks(&self) -> bool {
+        let sql = match self.engine {
+            Engine::Postgres => format!(
+                "SELECT count(*) FROM pg_stat_activity WHERE {} = ANY(pg_blocking_pids(pid))",
+                self.id
+            ),
+            Engine::MySql | Engine::MariaDb => format!(
+                "SELECT count(*) FROM sys.schema_table_lock_waits WHERE blocking_pid = {}",
+                self.id
+            ),
+        };
+        on_server(self.engine, &sql) != "0"
+    }
+}
+
+impl Drop for Locker {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !done.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !done.is_finished() {
+            let sql = match self.engine {
+                Engine::Postgres => format!("SELECT pg_terminate_backend({})", self.id),
+                Engine::MySql | Engine::MariaDb => format!("KILL CONNECTION {}", self.id),
+            };
+            let engine = self.engine;
+            // A failure here must not abort a test that is already failing.
+            let _ = std::thread::spawn(move || on_server(engine, &sql)).join();
+        }
+        let _ = done.join();
+    }
+}
+
+/// The test's own table `<name>.t (id, v)` holding the row `(1, 'before')`,
+/// dropped when the test ends.
+fn k2_table(engine: Engine, name: &str) -> Scratch {
+    let (drop, create) = scratch_schema(engine, name);
+    let table = format!("CREATE TABLE {name}.t (id INT PRIMARY KEY, v VARCHAR(20))");
+    let row = format!("INSERT INTO {name}.t VALUES (1, 'before')");
+    Scratch::new(engine, &[&drop], &[&create, &table, &row])
+}
+
+/// The value of the row on the server.
+fn k2_value(engine: Engine, name: &str) -> String {
+    on_server(engine, &format!("SELECT v FROM {name}.t WHERE id = 1"))
+}
+
+/// The tree path of the table `<name>.t`.
+fn k2_path(engine: Engine, name: &str) -> Vec<&str> {
+    match engine {
+        Engine::Postgres => vec!["kerno", name, "Tables", "t"],
+        Engine::MySql | Engine::MariaDb => vec![name, "Tables", "t"],
+    }
+}
+
+/// Waits for a statement of the app to wait behind `locker`.
+fn wait_for_the_lock(app: &Fixture, cx: &mut TestAppContext, locker: &Locker) {
+    app.wait_until(cx, "a statement to wait for the lock", |_, _| {
+        locker.blocks()
+    });
+}
+
+/// Waits for the statement that waited behind `locker` to be gone from the
+/// server, the lock still held: it was stopped by the cancel, not by the
+/// lock's end.
+fn stopped_on_the_server(app: &Fixture, cx: &mut TestAppContext, locker: &Locker) {
+    app.wait_until(cx, "the statement to be gone from the server", |_, _| {
+        !locker.blocks()
+    });
+    assert!(
+        locker.holds(),
+        "stopped by the cancel, not by the lock's end"
+    );
+}
+
+/// C3: Apply behind a lock held by another session has a Cancel (the
+/// footer's, and Cmd+.): the UPDATE is stopped on the server, the one
+/// transaction rolls back, and the pending change is kept.
+#[gpui_kit::test]
+fn a_data_apply_behind_a_lock_is_cancelled_and_keeps_the_edits(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_apply";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        app.open_table(cx, name, "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        app.type_in_cell(cx, 0, 2, "after", "enter");
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        if engine == Engine::Postgres {
+            app.click(cx, "data-cancel");
+        } else {
+            app.press(cx, &["secondary-."]);
+        }
+        app.wait_until(cx, "the cancelled apply", |app, cx| {
+            let tab = app.data(cx);
+            cx.update(|cx| tab.read(cx).apply_error().map(str::to_string))
+                .is_some()
+        });
+        let tab = app.data(cx);
+        assert_eq!(
+            cx.update(|cx| tab.read(cx).apply_error().map(str::to_string)),
+            Some("Cancelled: nothing was changed. The pending changes are kept.".into()),
+            "{engine:?}"
+        );
+        stopped_on_the_server(&app, cx, &locker);
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        drop(locker);
+        assert_eq!(k2_value(engine, name), "before", "{engine:?}");
+        // Nothing of the tab holds the row: the same write goes in at once.
+        on_server(
+            engine,
+            &format!("UPDATE {name}.t SET v = 'outside' WHERE id = 1"),
+        );
+        assert_eq!(k2_value(engine, name), "outside", "{engine:?}");
+        app.click(cx, "data-discard");
+    }
+}
+
+/// C3: the table form's Apply behind a lock shows "Applying…" with Cancel,
+/// and Cmd+. reaches it too: the ALTER is stopped on the server and the
+/// form says nothing was changed.
+#[gpui_kit::test]
+fn a_structure_apply_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_alter";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        k2_alter_behind_a_lock(&app, cx, engine, name);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        app.click(cx, "editor-apply");
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        assert!(app.has(cx, "editor-applying"), "{engine:?}");
+        if engine == Engine::Postgres {
+            // The form has the keyboard.
+            let editor = app.editor(cx);
+            app.step(cx, |window, cx| {
+                editor.read(cx).focus_handle(cx).focus(window, cx)
+            });
+            app.press(cx, &["secondary-."]);
+        } else {
+            app.click(cx, "editor-cancel");
+        }
+        let editor = app.editor(cx);
+        app.wait_until(cx, "the cancelled apply", |_, cx| {
+            cx.update(|cx| editor.read(cx).error().is_some())
+        });
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).error().map(str::to_string)),
+            Some("Cancelled: nothing was changed.".into()),
+            "{engine:?}"
+        );
+        assert!(!app.has(cx, "editor-applying"), "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        // The column is not there, and nothing holds the table.
+        on_server(
+            engine,
+            &format!("ALTER TABLE {name}.t ADD COLUMN added INT"),
+        );
+    }
+}
+
+/// Opens the form of `<name>.t` and adds the column `added`, not applied.
+fn k2_alter_behind_a_lock(app: &Fixture, cx: &mut TestAppContext, engine: Engine, name: &str) {
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let target = Target {
+        connection,
+        database: None,
+        schema: None,
+    };
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_table_editor(
+                target,
+                name.to_string(),
+                Some(TableRef::new(name, "t")),
+                window,
+                cx,
+            );
+        })
+    });
+    app.wait_for_editor(cx);
+    app.click(cx, "editor-add-column");
+    app.fill_in(cx, ("column-name", 2usize), "added");
+    app.fill_in(cx, ("column-type", 2usize), "int");
+    let editor = app.editor(cx);
+    let statements = cx
+        .update(|cx| editor.read(cx).statements(cx))
+        .map(|(statements, _)| statements)
+        .unwrap_or_else(|problems| panic!("{engine:?}: {problems:?}"));
+    assert_eq!(statements.len(), 1, "{engine:?}: {statements:?}");
+}
+
+/// C3: Truncate from the navigator (its tools dialog) behind a lock is
+/// cancelled on the server; the rows stay.
+#[gpui_kit::test]
+fn a_navigator_truncate_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_truncate";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        let path = k2_path(engine, name);
+        app.open_path(cx, &path);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        let dialog = app
+            .tools_dialog(
+                cx,
+                &path,
+                Some(kerno_core::maintenance::Maintenance::Truncate(
+                    Default::default(),
+                )),
+            )
+            .expect("the dialog");
+        app.click(cx, "maintenance-run");
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        app.click(cx, "maintenance-cancel");
+        assert_eq!(app.wait_tool(cx, &dialog), "cancelled", "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        assert_eq!(k2_value(engine, name), "before", "{engine:?}");
+        app.click(cx, "maintenance-close");
+    }
+}
+
+/// C3: Drop from the navigator behind a lock: the row says "Dropping…", its
+/// menu and a notification offer Cancel, which stops the DROP on the
+/// server; the table stays.
+#[gpui_kit::test]
+fn a_navigator_drop_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_drop";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        let path = k2_path(engine, name);
+        app.open_path(cx, &path);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        app.act(cx, Action::Drop, &path);
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+        let writes = cx.update(|cx| navigator.read(cx).writes());
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(_, doing)| doing.as_str())
+                .collect::<Vec<_>>(),
+            ["Dropping table t…"],
+            "{engine:?}"
+        );
+        let row = app.tree_row(cx, &path);
+        assert!(app.has(cx, ("node-doing", row)), "{engine:?}");
+        if engine == Engine::Postgres {
+            // The notification's Cancel, once it has slid in.
+            cx.executor().advance_clock(Duration::from_secs(1));
+            app.click(cx, ("navigator-write-cancel", writes[0].0 as usize));
+        } else {
+            // The row's menu.
+            app.right_click(cx, ("node", row), None);
+            click_menu_entry(&app, cx, "Cancel the running statement");
+        }
+        app.wait_until(cx, "the cancelled drop", |_, cx| {
+            cx.update(|cx| navigator.read(cx).writes().is_empty())
+        });
+        assert!(!app.has(cx, ("node-doing", row)), "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        assert_eq!(k2_value(engine, name), "before", "{engine:?}");
+    }
+}
+
+/// C3: a table opened for the first time while another session locks it
+/// shows "Loading rows…" with a Cancel that works: the read is stopped on
+/// the server, the tab says "Cancelled" and Reload reads the rows.
+#[gpui_kit::test]
+fn the_first_page_of_a_table_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_first";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        app.open_table(cx, name, "t", RelationKind::Table);
+        wait_for_the_lock(&app, cx, &locker);
+        assert_eq!(app.data_state(cx), "loading", "{engine:?}");
+        app.click(cx, "data-cancel");
+        app.wait_until(cx, "the cancelled read", |app, cx| {
+            app.data_state(cx) == "cancelled"
+        });
+        assert!(app.has(cx, "data-cancelled"), "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        app.click(cx, "data-retry");
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+    }
+}
+
+/// C3: closing a tab while its statement waits for a lock stops the
+/// statement first: a table form that applies, a table's first page.
+/// Nothing of a closed tab keeps running.
+#[gpui_kit::test]
+fn closing_a_tab_that_applies_stops_the_statement(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k2_close";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        k2_alter_behind_a_lock(&app, cx, engine, name);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+
+        // The table form, applying.
+        app.click(cx, "editor-apply");
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        app.dispatch(cx, actions::CloseTab);
+        assert!(app.shows_label(cx, "Discard and close"), "{engine:?}");
+        app.click(cx, "ok");
+        assert!(app.titles(cx).is_empty(), "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+
+        // A table's first page, reading.
+        app.open_table(cx, name, "t", RelationKind::Table);
+        wait_for_the_lock(&app, cx, &locker);
+        app.dispatch(cx, actions::CloseTab);
+        assert!(app.titles(cx).is_empty(), "{engine:?}");
+        stopped_on_the_server(&app, cx, &locker);
+
+        drop(locker);
+        // Neither ran: the column is not there, nothing holds the table.
+        on_server(
+            engine,
+            &format!("ALTER TABLE {name}.t ADD COLUMN added INT"),
+        );
+    }
+}
