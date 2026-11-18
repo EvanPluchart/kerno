@@ -1656,3 +1656,25 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - The row being written shows what runs ("Dropping table t…") in place of its hint, with a "Cancel the
   running statement" entry first in its menu and a notification with Cancel that stays until the statement
   ends. No spinner: the app shows work as text everywhere else ("loading…", "applying…").
+
+## D-078 — A script's connection is the user's pick; the pickers accept a closed connection (K6, C6; 2026-11-18)
+
+- **The rule is the environment's rules plus the connection's read-only flag**
+  (`ConnectionConfig::binds_scripts_silently`): a file binds by itself only where no rule asks before a
+  statement runs or writes (`confirm_execute`, `confirm_writes_twice`) and the connection does not start or
+  stay read-only. The name never counts: the built-in staging, which has local's rules, binds silently; a user
+  who wants staging guarded gives it a rule. A read-only connection counts as guarded: it is how a user marks
+  a server not to be written to, and a script opened beside it is likely meant for another one.
+- **The connection pickers of a query tab (its toolbar's, the unbound bar's) and of the main toolbar accept a
+  connection that is not connected**, listed
+  "(not connected)": the tab binds to it and its first run connects it, as a tab of a closed connection
+  already did (DBeaver connects on execute). Before, such entries were greyed out, which made the connection
+  a script last ran on (rarely open when the file is opened again) impossible to pick from its own bar. The
+  editor's "Active connection" submenu still greys it out (its entries carry a reason that disables them).
+- **Deleting unbinds the connection's query tabs before the connection is closed**, so a statement they run
+  is stopped as deleted, not reported lost with "the connection is opened again by itself".
+- **A connection's other tabs follow the list, not the delete command**: they close when the connection has
+  left `Connections` (`ListChanged`), so a deletion refused by the storage leaves them open, and any later way
+  of removing a connection gets the same handling (query tabs left on it are unbound there too).
+- **Every unbound query tab shows the bar**, not only a file's: one unbound state, one way out.
+

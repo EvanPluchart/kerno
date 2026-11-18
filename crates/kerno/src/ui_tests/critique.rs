@@ -1760,3 +1760,499 @@ fn a_typed_begin_after_a_closed_connection_starts_its_own_log(cx: &mut TestAppCo
         roll_back(&app, cx);
     }
 }
+
+// K6: a script file never binds to a non-local connection silently; a deleted connection's tabs
+// (C6).
+
+/// Two saved connections to `engine`, named and in environments as given (the sidebar lists
+/// them in this order), with their passwords; none connected. Their ids, in that order.
+fn k6_app(
+    cx: &mut TestAppContext,
+    engine: Engine,
+    connections: [(&str, &str); 2],
+) -> (Fixture, [String; 2]) {
+    let storage = memory_storage();
+    let ids = connections.map(|(name, environment)| {
+        let config = ConnectionConfig {
+            name: name.into(),
+            environment: environment.into(),
+            ..testing::config(engine)
+        };
+        storage.save_connection(None, &config).unwrap()
+    });
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    for id in &ids {
+        kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
+    }
+    (app, ids)
+}
+
+/// Connects the connection listed at `index` (it becomes the one the navigator browses).
+fn k6_connect(app: &Fixture, cx: &mut TestAppContext, index: usize) {
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", index), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, index), Status::Connected { .. })
+    });
+}
+
+/// Makes `id` the connection the navigator browses.
+fn k6_browse(app: &Fixture, cx: &mut TestAppContext, id: &str) {
+    let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+    cx.update(|cx| navigator.update(cx, |navigator, cx| navigator.select_connection(id, cx)));
+}
+
+/// Opens the file at `path` as File ▸ Open does, and returns its tab.
+fn k6_open_file(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    path: &Path,
+) -> Entity<crate::query::tab::QueryTab> {
+    let opening = path.to_path_buf();
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_sql_file_from(opening, window, cx)
+        })
+    });
+    app.wait_until(cx, "the file's tab", |app, cx| {
+        let file = cx.update(|cx| {
+            (app.workspace.read(cx).active_query_tab())
+                .and_then(|tab| tab.read(cx).file().map(Path::to_path_buf))
+        });
+        file.as_deref() == Some(path)
+    });
+    app.tab(cx)
+}
+
+fn k6_connection(
+    tab: &Entity<crate::query::tab::QueryTab>,
+    cx: &mut TestAppContext,
+) -> Option<String> {
+    cx.update(|cx| tab.read(cx).connection_id().map(str::to_string))
+}
+
+fn k6_ran_on(cx: &mut TestAppContext, path: &Path) -> Option<String> {
+    cx.update(|cx| {
+        AppState::get(cx)
+            .settings
+            .script_connections
+            .get(path)
+            .cloned()
+    })
+}
+
+/// The vertical place of the entry of the open menu with this label.
+fn k6_menu_y(app: &Fixture, cx: &mut TestAppContext, label: &str) -> gpui_kit::Pixels {
+    menu_entry(app, cx, label)
+        .unwrap_or_else(|| panic!("no menu entry {label:?}"))
+        .y
+}
+
+/// C6: a `.sql` file opened beside a production connection opens unbound: its bar says so, Run,
+/// Run all and Explain run nothing and point at it, and its picker lists that connection first.
+/// Picked, the tab runs there with production's own confirmations; opened again beside a local
+/// connection, the file proposes the one it ran on first, still without binding.
+#[gpui_kit::test]
+fn a_script_opened_beside_a_production_connection_is_not_bound(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k6_prod";
+    let _scratch = quit_table(engine, name);
+    let (app, [local, production]) = k6_app(
+        cx,
+        engine,
+        [
+            ("kerno_ui_k6 a local", kerno_core::environment::LOCAL),
+            (
+                "kerno_ui_k6 b production",
+                kerno_core::environment::PRODUCTION,
+            ),
+        ],
+    );
+    k6_connect(&app, cx, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kerno_ui_k6_prod.sql");
+    std::fs::write(&path, format!("insert into {name}.t values (1)")).unwrap();
+
+    let tab = k6_open_file(&app, cx, &path);
+    assert_eq!(k6_connection(&tab, cx), None);
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).proposed().map(str::to_string)),
+        Some(production.clone())
+    );
+    assert!(app.shows_label(cx, "Pick a connection to run this script."));
+    assert_eq!(k6_ran_on(cx, &path), None);
+    app.press(cx, &["secondary-enter", "secondary-shift-enter"]);
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| tab.explain(false, window, cx))
+    });
+    assert!(
+        !app.dialog_open(cx),
+        "no confirmation: nothing was about to run"
+    );
+    assert_eq!(app.outcomes(cx), Vec::<String>::new());
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).messages()),
+        ["Warning: Nothing ran. Pick a connection to run this script."]
+    );
+    assert_eq!(
+        on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+        "0"
+    );
+
+    // The picker is one click away, the proposed connection first (it is second in the list).
+    app.click(cx, "unbound-pick");
+    assert!(
+        k6_menu_y(&app, cx, "kerno_ui_k6 b production")
+            < k6_menu_y(&app, cx, "kerno_ui_k6 a local (not connected)")
+    );
+    click_menu_entry(&app, cx, "kerno_ui_k6 b production");
+    assert_eq!(k6_connection(&tab, cx), Some(production.clone()));
+    assert!(!app.has(cx, "unbound-bar"));
+    assert_eq!(k6_ran_on(cx, &path), Some(production.clone()));
+
+    // Production's own confirmations apply to it, as to any tab of it.
+    app.press(cx, &["secondary-enter"]);
+    app.click(cx, "sql-confirm");
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the insert", |app, cx| {
+        app.outcomes(cx) == ["done, 1 affected"] && !app.running(cx)
+    });
+    app.dispatch(cx, actions::CommitTransaction);
+    app.wait_until(cx, "the commit", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle
+    });
+    assert_eq!(
+        on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+        "1"
+    );
+
+    // Opened again while a local connection is browsed: production is proposed first, the
+    // tab is not bound, to it or to the local one.
+    app.press(cx, &["secondary-w"]);
+    assert!(app.titles(cx).is_empty());
+    k6_connect(&app, cx, 0);
+    k6_browse(&app, cx, &local);
+    let tab = k6_open_file(&app, cx, &path);
+    assert_eq!(k6_connection(&tab, cx), None);
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).proposed().map(str::to_string)),
+        Some(production)
+    );
+    assert!(app.has(cx, "unbound-bar"));
+    app.click(cx, "tab-connection");
+    assert!(
+        k6_menu_y(&app, cx, "kerno_ui_k6 b production")
+            < k6_menu_y(&app, cx, "kerno_ui_k6 a local")
+    );
+    app.press(cx, &["escape"]);
+
+    // A connection that is not open can be picked (D-078): the first run opens it.
+    app.step(cx, |_, cx| {
+        app.connections
+            .update(cx, |connections, cx| connections.disconnect(&local, cx))
+    });
+    app.wait_until(cx, "the local connection closed", |app, cx| {
+        app.status(cx, 0) == Status::Disconnected
+    });
+    app.click(cx, "unbound-pick");
+    click_menu_entry(&app, cx, "kerno_ui_k6 a local (not connected)");
+    assert_eq!(k6_connection(&tab, cx), Some(local.clone()));
+    assert!(!app.has(cx, "unbound-bar"));
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, "select 1 as kerno_ui_k6_picked");
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the row from the local connection", |app, cx| {
+        app.outcomes(cx) == ["1 rows"] && !app.running(cx)
+    });
+    assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+}
+
+/// C6: beside a local connection a file opens bound to it, as before, and remembers it. The rules
+/// decide, not the environment's name: an environment of the user's that confirms writes twice
+/// opens the file unbound; the same environment without that rule binds it again.
+#[gpui_kit::test]
+fn a_script_opened_beside_a_local_connection_is_bound(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let app = connected(cx, engine);
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "select 1 as kerno_ui_k6_local").unwrap();
+        path
+    };
+
+    let first = file("kerno_ui_k6_a.sql");
+    let tab = k6_open_file(&app, cx, &first);
+    assert_eq!(k6_connection(&tab, cx), Some(id.clone()));
+    assert!(!app.has(cx, "unbound-bar"));
+    assert_eq!(k6_ran_on(cx, &first), Some(id.clone()));
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);
+
+    // An environment of the user's, named nothing like production.
+    let own = "kerno-ui-k6-careful";
+    let rules = |careful: bool| kerno_core::environment::EnvironmentRules {
+        confirm_writes_twice: careful,
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            settings
+                .environments
+                .push(kerno_core::environment::EnvironmentDef {
+                    id: own.into(),
+                    name: "Careful".into(),
+                    color_light: None,
+                    color_dark: None,
+                    tint: kerno_core::environment::Tint::None,
+                    rules: rules(true),
+                })
+        })
+    });
+    let config = ConnectionConfig {
+        environment: own.into(),
+        ..app.first_stored()
+    };
+    let saving = (id.clone(), config);
+    cx.update(|cx| {
+        app.connections.update(cx, |connections, cx| {
+            connections.save(
+                Some(saving.0),
+                saving.1,
+                testing::secrets(),
+                None,
+                false,
+                cx,
+            )
+        })
+    });
+    app.wait_until(cx, "the new environment", |app, cx| {
+        cx.update(|cx| app.connections.read(cx).saved()[0].config.environment == own)
+    });
+    let second = file("kerno_ui_k6_b.sql");
+    let tab = k6_open_file(&app, cx, &second);
+    assert_eq!(k6_connection(&tab, cx), None);
+    assert!(app.has(cx, "unbound-bar"));
+
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            for environment in &mut settings.environments {
+                if environment.id == own {
+                    environment.rules = rules(false);
+                }
+            }
+        })
+    });
+    let third = file("kerno_ui_k6_c.sql");
+    let tab = k6_open_file(&app, cx, &third);
+    assert_eq!(k6_connection(&tab, cx), Some(id));
+    assert!(!app.has(cx, "unbound-bar"));
+}
+
+/// C6: deleting a connection asks once about everything its tabs would lose (a transaction,
+/// pending edits, a table form's changes); Cancel deletes nothing. Confirmed, its query tabs stay,
+/// unbound, with their text, file and unsaved mark, a running statement stopped on the server, and
+/// say why; its data, structure and form tabs close; the other connection's tab keeps its own;
+/// nothing is bound in their place; a restart finds the same tabs.
+#[gpui_kit::test]
+fn deleting_a_connection_unbinds_its_query_tabs_and_closes_the_others(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k6_delete";
+        let marker = "kerno_ui_k6_delete_running";
+        let _scratch = k2_table(engine, name);
+        let (app, [deleted, kept]) = k6_app(
+            cx,
+            engine,
+            [
+                ("kerno_ui_k6 a deleted", kerno_core::environment::LOCAL),
+                ("kerno_ui_k6 b kept", kerno_core::environment::LOCAL),
+            ],
+        );
+        k6_connect(&app, cx, 1);
+        k6_connect(&app, cx, 0);
+        k6_browse(&app, cx, &deleted);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno_ui_k6_delete.sql");
+        std::fs::write(&path, "select 1").unwrap();
+
+        // On the connection deleted: a file's tab with unsaved text and a transaction, a tab
+        // running a statement, a table's rows with a change not applied, its structure, a form.
+        let script = k6_open_file(&app, cx, &path);
+        let insert = format!("insert into {name}.t values (2, 'two')");
+        app.open_transaction(cx, &insert);
+        assert!(cx.update(|cx| script.read(cx).unsaved()), "{engine:?}");
+        app.press(cx, &["secondary-t"]);
+        let running = app.tab(cx);
+        let sleep = match engine {
+            Engine::Postgres => format!("select '{marker}', pg_sleep(60)"),
+            Engine::MySql | Engine::MariaDb => format!("select '{marker}', sleep(60)"),
+        };
+        app.type_text(cx, &sleep);
+        app.press(cx, &["secondary-enter"]);
+        app.wait_until(cx, "the statement on the server", |_, _| {
+            running_on_server(engine, marker)
+        });
+        app.open_table(cx, name, "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–1 of 1");
+        app.type_in_cell(cx, 0, 2, "after", "enter");
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        app.open_structure(cx, name, "t", RelationKind::Table);
+        k2_alter_behind_a_lock(&app, cx, engine, name);
+        // A tab of it closed before: it can be reopened, unbound.
+        app.press(cx, &["secondary-t"]);
+        app.type_text(cx, "select 'kerno_ui_k6_closed'");
+        app.press(cx, &["secondary-w"]);
+        // On the other one: a tab, active.
+        k6_browse(&app, cx, &kept);
+        app.press(cx, &["secondary-t"]);
+        let other = app.tab(cx);
+        assert_eq!(k6_connection(&other, cx), Some(kept.clone()), "{engine:?}");
+        assert_eq!(app.titles(cx).len(), 6, "{engine:?}");
+
+        let delete = |app: &Fixture, cx: &mut TestAppContext| {
+            app.right_click(cx, ("connection", 0usize), None);
+            app.click_label(cx, "Delete…");
+            app.click(cx, "ok");
+        };
+        delete(&app, cx);
+        assert!(app.has(cx, "end-question"), "{engine:?}");
+        assert!(
+            app.shows_label(cx, "Delete “kerno_ui_k6 a deleted”?"),
+            "{engine:?}"
+        );
+        let mut lines = Vec::new();
+        for index in 0..8usize {
+            if app.has(cx, ("end-line", index)) {
+                lines.push(app.label_of(cx, ("end-line", index)));
+            }
+        }
+        for line in [
+            "“kerno_ui_k6_delete.sql”: a transaction is open.",
+            "1 pending change is discarded.",
+            "the changes not applied to the table are lost.",
+        ] {
+            assert!(
+                lines.iter().any(|shown| shown.contains(line)),
+                "{engine:?}: {line:?} in {lines:?}"
+            );
+        }
+        app.click(cx, "end-cancel");
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert_eq!(app.storage.connections().unwrap().len(), 2, "{engine:?}");
+        assert_eq!(app.titles(cx).len(), 6, "{engine:?}");
+        assert_eq!(
+            k6_connection(&script, cx),
+            Some(deleted.clone()),
+            "{engine:?}"
+        );
+        assert_eq!(
+            cx.update(|cx| script.read(cx).tx_state()),
+            kerno_core::TxState::Open,
+            "{engine:?}"
+        );
+
+        delete(&app, cx);
+        app.click(cx, "end-rollback");
+        app.wait_until(cx, "the deletion", |app, cx| {
+            cx.update(|cx| app.connections.read(cx).get(&deleted).is_none())
+        });
+        let titles = app.titles(cx);
+        assert_eq!(titles.len(), 3, "{engine:?}: {titles:?}");
+        assert_eq!(
+            app.active(cx),
+            Some(2),
+            "{engine:?}: the active tab stays active"
+        );
+        for tab in [&script, &running] {
+            assert_eq!(
+                k6_connection(tab, cx),
+                None,
+                "{engine:?}: nothing bound in its place"
+            );
+        }
+        assert_eq!(k6_connection(&other, cx), Some(kept.clone()), "{engine:?}");
+        let (file, unsaved, sql) = cx.update(|cx| {
+            let tab = script.read(cx);
+            (
+                tab.file().map(Path::to_path_buf),
+                tab.unsaved(),
+                tab.sql(cx),
+            )
+        });
+        assert_eq!(file.as_deref(), Some(path.as_path()), "{engine:?}");
+        assert!(unsaved, "{engine:?}");
+        assert_eq!(sql, insert, "{engine:?}");
+        app.wait_until(cx, "the statement stopped on the server", |_, _| {
+            !running_on_server(engine, marker)
+        });
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "1"
+        );
+        assert_eq!(k2_value(engine, name), "before", "{engine:?}");
+
+        // The statement stopped is not reported lost (the connection is not opened again).
+        app.press(cx, &["ctrl-tab", "ctrl-tab"]);
+        assert_eq!(app.active(cx), Some(1), "{engine:?}");
+        assert_eq!(app.outcomes(cx), Vec::<String>::new(), "{engine:?}");
+        app.press(cx, &["ctrl-tab"]);
+        // Its tab says why it runs nowhere, and a run says so too.
+        app.press(cx, &["ctrl-tab"]);
+        assert_eq!(app.active(cx), Some(0), "{engine:?}");
+        assert!(
+            app.shows_label(
+                cx,
+                "Its connection was deleted: pick another one to run this script."
+            ),
+            "{engine:?}"
+        );
+        app.press(cx, &["secondary-enter"]);
+        assert!(
+            cx.update(|cx| script.read(cx).messages()).contains(
+                &"Warning: Nothing ran. Its connection was deleted: pick another one to run this script."
+                    .to_string()
+            ),
+            "{engine:?}"
+        );
+        assert_eq!(k6_connection(&script, cx), None, "{engine:?}");
+
+        // The tab closed before comes back unbound, and goes again.
+        app.dispatch(cx, actions::ReopenClosedTab);
+        let reopened = app.tab(cx);
+        assert_eq!(app.titles(cx).len(), 4, "{engine:?}");
+        assert_eq!(
+            cx.update(|cx| reopened.read(cx).sql(cx)),
+            "select 'kerno_ui_k6_closed'",
+            "{engine:?}"
+        );
+        assert_eq!(k6_connection(&reopened, cx), None, "{engine:?}");
+        app.press(cx, &["secondary-w"]);
+
+        // A restart opens the same three tabs.
+        app.wait_until(cx, "the tabs to be stored", |app, cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            let stored = app.storage.tabs::<TabSnapshot>().unwrap();
+            stored.len() == 3
+                && matches!(
+                    &stored[..2],
+                    [
+                        TabSnapshot::Query { target: None, file: Some(_), unsaved: true, .. },
+                        TabSnapshot::Query { target: None, file: None, .. },
+                    ]
+                )
+                && matches!(&stored[2], TabSnapshot::Query { target: Some(target), .. } if target.connection == kept)
+        });
+    }
+}

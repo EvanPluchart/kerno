@@ -854,8 +854,9 @@ fn mode_menu(workspace: &Entity<Workspace>, menu: PopupMenu, cx: &mut App) -> Po
     menu
 }
 
-/// The saved connections; the active tab's ticked; those not open greyed,
-/// as the tab toolbar's selector.
+/// The saved connections, the active tab's ticked, as the tab toolbar's
+/// selector: the proposed one first while unbound, one not open said so and
+/// connected at the tab's first run (C6, D-078).
 fn connection_menu(workspace: &Entity<Workspace>, mut menu: PopupMenu, cx: &mut App) -> PopupMenu {
     let Some(tab) = workspace.read(cx).active_query_tab().cloned() else {
         return menu;
@@ -872,7 +873,6 @@ fn connection_menu(workspace: &Entity<Workspace>, mut menu: PopupMenu, cx: &mut 
         menu = menu.item(
             PopupMenuItem::new(SharedString::from(label))
                 .checked(checked)
-                .disabled(!connected)
                 // The one in use stays as it is (its database and schema).
                 .on_click(later(workspace, move |_, window, cx| {
                     if !checked {

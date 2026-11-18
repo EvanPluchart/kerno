@@ -531,3 +531,19 @@ Still open (for the owner):
   neither asked about nor discarded.
 - Seven UI tests (five on PostgreSQL and MySQL); each was seen failing with a part of the change disabled.
 - Limits and plan errors in the "Done:" line of K5 (`docs/plans/M12.md`).
+
+## 2026-11-18 — K6: a script file never binds to a non-local connection silently; a deleted connection's tabs (C6)
+
+- A `.sql` file opens on the connection it last ran on, else the one browsed, only where that binds silently
+  (`ConnectionConfig::binds_scripts_silently`: no `confirm_execute`, `confirm_writes_twice` or `read_only` rule,
+  not read-only); otherwise the tab opens unbound, with a "Pick a connection to run this script." bar and its
+  picker, the proposed connection first. Runs of an unbound tab run nothing and say so. A pick is remembered for
+  the file (`settings.script_connections`). The pickers accept a closed connection, connected at the first run
+  (D-078).
+- Deleting a connection asks once (a table form's changes included, `Asking::Deleting`); its query tabs are
+  unbound with their text before it closes (a running statement is stopped, not reported lost); once it has
+  left the list its other tabs close, the closed tabs and the stored tabs follow; nothing is rebound.
+- Three UI tests (one on PostgreSQL and MySQL), two unit tests; each UI test was seen failing with a part of the
+  change disabled (twelve mutations). One older test now expects the message of an unbound run.
+- Limits and plan errors in the "Done:" line of K6 (`docs/plans/M12.md`).
+

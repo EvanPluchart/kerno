@@ -129,6 +129,10 @@ pub struct Settings {
     /// The `.sql` files opened or saved last, the latest first (the main
     /// toolbar's New SQL editor lists them).
     pub recent_scripts: Vec<PathBuf>,
+    /// The connection each recent script last ran on, by path: proposed
+    /// first when it is opened again, bound only where it binds silently
+    /// (C6).
+    pub script_connections: BTreeMap<PathBuf, String>,
     /// How the open tabs are laid out (DBeaver #7114, #23248).
     pub tab_layout: TabLayout,
     /// A multi-statement run shows its results one under the other in one
@@ -211,6 +215,7 @@ impl Default for Settings {
             toolbar_visible: true,
             toolbar_hidden: BTreeSet::new(),
             recent_scripts: Vec::new(),
+            script_connections: BTreeMap::new(),
             tab_layout: TabLayout::SingleRow,
             stack_results: false,
             ai: kerno_core::ai::AiSettings::default(),
@@ -281,11 +286,18 @@ impl Settings {
     }
 
     /// Puts `path` first in the recent scripts, once, keeping the last
-    /// [`RECENT_SCRIPTS`].
-    pub fn remember_script(&mut self, path: PathBuf) {
+    /// [`RECENT_SCRIPTS`]; with `connection`, the one it runs on (`None`
+    /// keeps the one remembered).
+    pub fn remember_script(&mut self, path: PathBuf, connection: Option<String>) {
         self.recent_scripts.retain(|recent| *recent != path);
-        self.recent_scripts.insert(0, path);
+        self.recent_scripts.insert(0, path.clone());
         self.recent_scripts.truncate(RECENT_SCRIPTS);
+        if let Some(connection) = connection {
+            self.script_connections.insert(path, connection);
+        }
+        let recent = &self.recent_scripts;
+        self.script_connections
+            .retain(|path, _| recent.contains(path));
     }
 }
 
@@ -358,6 +370,7 @@ mod tests {
             toolbar_visible: false,
             toolbar_hidden: ["commit".to_string()].into(),
             recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
+            script_connections: [(PathBuf::from("/tmp/a.sql"), "c1".to_string())].into(),
             tab_layout: TabLayout::Vertical,
             stack_results: true,
             ai: kerno_core::ai::AiSettings {
@@ -375,9 +388,9 @@ mod tests {
     fn recent_scripts_keep_the_last_ten_latest_first_once_each() {
         let mut settings = Settings::default();
         for n in 0..12 {
-            settings.remember_script(PathBuf::from(format!("/s/{n}.sql")));
+            settings.remember_script(PathBuf::from(format!("/s/{n}.sql")), Some(format!("c{n}")));
         }
-        settings.remember_script(PathBuf::from("/s/5.sql"));
+        settings.remember_script(PathBuf::from("/s/5.sql"), None);
         let names: Vec<String> = settings
             .recent_scripts
             .iter()
@@ -398,6 +411,18 @@ mod tests {
                 "/s/2.sql"
             ]
         );
+        // C6: each keeps the connection it ran on (`None` keeps it); one
+        // that left the list leaves its connection behind.
+        let ran_on = |path: &str| {
+            settings
+                .script_connections
+                .get(&PathBuf::from(path))
+                .cloned()
+        };
+        assert_eq!(ran_on("/s/5.sql").as_deref(), Some("c5"));
+        assert_eq!(ran_on("/s/2.sql").as_deref(), Some("c2"));
+        assert_eq!(ran_on("/s/1.sql"), None);
+        assert_eq!(settings.script_connections.len(), RECENT_SCRIPTS);
     }
 
     #[test]

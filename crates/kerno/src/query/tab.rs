@@ -371,12 +371,24 @@ const STACK_HEADER: Pixels = px(28.);
 /// The lower edge of a stacked result's grid being dragged: its pane.
 struct StackResize(u64);
 
+/// The bar of an unbound query tab (C6).
+pub const UNBOUND_PICK: &str = "Pick a connection to run this script.";
+/// The bar of a query tab whose connection was deleted (C6).
+pub const UNBOUND_DELETED: &str =
+    "Its connection was deleted: pick another one to run this script.";
+
 pub struct QueryTab {
     title: SharedString,
     editor: Entity<EditorState>,
     connections: Entity<Connections>,
-    /// The connection, database and schema statements run on.
+    /// The connection, database and schema statements run on; `None`: the
+    /// tab is unbound and runs nothing until the user picks one (C6).
     target: Option<Target>,
+    /// Unbound: the connection the pickers list first (a script's last one,
+    /// or the one being browsed when it opened).
+    proposed: Option<String>,
+    /// Unbound: why, in the bar above the editor; the usual words if `None`.
+    unbound_why: Option<&'static str>,
     /// This tab's own session, opened at the first run.
     session: Option<Arc<dyn Session>>,
     /// The database and schema the session was last seen in (C6).
@@ -434,6 +446,10 @@ pub struct QueryTab {
     results_focus: FocusHandle,
     /// Bumped at every run and target change, so late answers are dropped.
     generation: u64,
+    /// Bumped at every target change only: the lists of the selectors are
+    /// read for a target, and a run does not make them late (a tab of a
+    /// closed connection connects, then runs, while they are read).
+    placed: u64,
     /// What completion offers; empty until loaded.
     catalog: SharedCatalog,
     /// The catalog being loaded. Replacing it drops the older load.
@@ -617,6 +633,8 @@ impl QueryTab {
             editor,
             connections,
             target,
+            proposed: None,
+            unbound_why: None,
             session: None,
             session_place: (None, None),
             databases: Vec::new(),
@@ -646,6 +664,7 @@ impl QueryTab {
             panels: Panels::Both,
             results_focus: cx.focus_handle(),
             generation: 0,
+            placed: 0,
             catalog: SharedCatalog::default(),
             catalog_load: None,
             source: None,
@@ -1018,12 +1037,53 @@ impl QueryTab {
         }
     }
 
+    /// Unbound (C6): the pickers list `connection` first.
+    pub fn propose(&mut self, connection: Option<String>, cx: &mut Context<Self>) {
+        self.proposed = connection;
+        cx.notify();
+    }
+
+    /// The connection the pickers list first while unbound; for tests.
+    #[cfg(test)]
+    pub fn proposed(&self) -> Option<&str> {
+        self.proposed.as_deref()
+    }
+
+    /// Its connection was deleted (C6): the tab keeps its text and file and
+    /// runs nowhere until the user picks another one; nothing is bound in
+    /// its place. What was running is stopped, as closing the tab does.
+    pub fn unbind_deleted(&mut self, cx: &mut Context<Self>) {
+        self.set_target(None, cx);
+        self.proposed = None;
+        self.unbound_why = Some(UNBOUND_DELETED);
+        cx.notify();
+    }
+
+    /// What the bar of an unbound tab says, and a run of it; `None` when
+    /// the tab is bound.
+    pub fn unbound_text(&self) -> Option<&'static str> {
+        self.target
+            .is_none()
+            .then(|| self.unbound_why.unwrap_or(UNBOUND_PICK))
+    }
+
     /// Runs on `target` from now on. What was running is stopped. On
     /// another connection without a transaction open, the tab takes that
-    /// connection's commit mode.
+    /// connection's commit mode. A file's tab remembers the connection for
+    /// the next time the file opens (C6).
     pub fn set_target(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
         if self.target == target {
             return;
+        }
+        if let (Some(file), Some(target)) = (&self.file, &target) {
+            let (file, connection) = (file.clone(), target.connection.clone());
+            AppState::update_settings(cx, |settings| {
+                settings.remember_script(file, Some(connection))
+            });
+        }
+        if target.is_some() {
+            self.proposed = None;
+            self.unbound_why = None;
         }
         let connection = |target: &Option<Target>| target.as_ref().map(|t| t.connection.clone());
         if connection(&self.target) != connection(&target) {
@@ -1046,6 +1106,7 @@ impl QueryTab {
         self.databases.clear();
         self.schemas.clear();
         self.generation += 1;
+        self.placed += 1;
         *self.catalog.borrow_mut() = Arc::default();
         self.catalog_load = None;
         self.complete_with(None, cx);
@@ -1130,7 +1191,7 @@ impl QueryTab {
         // schemas when the tab is in its database.
         let own_database = target.database.is_none() || target.database == meta.database();
         let wants_schemas = meta.dialect().has_schemas() && own_database;
-        let generation = self.generation;
+        let placed = self.placed;
         let listing = bridge::spawn(cx, async move {
             let databases = meta.databases().await?;
             let schemas = if wants_schemas {
@@ -1143,7 +1204,7 @@ impl QueryTab {
         cx.spawn(async move |this, cx| {
             if let Ok((databases, schemas)) = listing.await {
                 let _ = this.update(cx, |this, cx| {
-                    if this.generation != generation {
+                    if this.placed != placed {
                         return;
                     }
                     this.databases = databases
@@ -1252,19 +1313,15 @@ impl QueryTab {
             return Task::ready(Ok(session.clone()));
         }
         let Some(target) = self.target.clone() else {
-            return Task::ready(Err(Error::Config(
-                "choose a connection for this tab first".into(),
-            )));
+            return Task::ready(Err(Error::Config(UNBOUND_PICK.into())));
         };
         if !self.connected(cx) {
-            let name = self
-                .connections
-                .read(cx)
-                .get(&target.connection)
-                .map(|saved| saved.config.name.clone())
-                .unwrap_or_else(|| "this tab's connection".into());
+            let Some(saved) = self.connections.read(cx).get(&target.connection) else {
+                return Task::ready(Err(Error::Config(UNBOUND_DELETED.into())));
+            };
             return Task::ready(Err(Error::Closed(format!(
-                "“{name}” is not connected. Double-click it in the sidebar, then run again."
+                "“{}” is not connected. Double-click it in the sidebar, then run again.",
+                saved.config.name
             ))));
         }
         let opening =
@@ -1960,6 +2017,28 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Unbound (C6): nothing runs; the bar above the editor has the
+        // picker.
+        if let Some(text) = self.unbound_text() {
+            self.end_script(Stage::Failed, Some(text.to_string()), cx);
+            let message = format!("Nothing ran. {text}");
+            if self
+                .notices
+                .last()
+                .is_none_or(|last| last.message != message)
+            {
+                self.notices.push(Notice {
+                    severity: "Warning".into(),
+                    message,
+                    code: None,
+                    detail: None,
+                });
+            }
+            self.active_result = self.results.len();
+            self.show_results();
+            cx.notify();
+            return;
+        }
         if self.connect_first(
             Request::Launch {
                 scope,
@@ -3078,15 +3157,7 @@ impl QueryTab {
         let connections = self.connections.read(cx);
         let target = self.target.as_ref();
         Choices {
-            connections: connections
-                .saved()
-                .iter()
-                .map(|saved| {
-                    let connected =
-                        matches!(connections.status(&saved.id), Status::Connected { .. });
-                    (saved.id.clone(), saved.config.name.clone(), connected)
-                })
-                .collect(),
+            connections: self.connection_choices(cx),
             connection: target.map(|target| target.connection.clone()),
             databases: self.databases.clone(),
             database: target.and_then(|target| {
@@ -5039,9 +5110,7 @@ impl QueryTab {
     /// result being paged: the tab's connection, database and schema.
     fn own_session(&self, cx: &App) -> Task<kerno_core::Result<Arc<dyn Session>>> {
         let Some(target) = self.target.clone() else {
-            return Task::ready(Err(Error::Config(
-                "choose a connection for this tab first".into(),
-            )));
+            return Task::ready(Err(Error::Config(UNBOUND_PICK.into())));
         };
         let opening =
             self.connections
@@ -5480,6 +5549,61 @@ impl QueryTab {
 
     // Rendering ---------------------------------------------------------------
 
+    /// The connections the pickers offer, by id, name and whether connected:
+    /// the proposed one first while unbound (C6).
+    fn connection_choices(&self, cx: &App) -> Vec<(String, String, bool)> {
+        let connections = self.connections.read(cx);
+        let mut choices: Vec<(String, String, bool)> = connections
+            .saved()
+            .iter()
+            .map(|saved| {
+                (
+                    saved.id.clone(),
+                    saved.config.name.clone(),
+                    matches!(connections.status(&saved.id), Status::Connected { .. }),
+                )
+            })
+            .collect();
+        if self.target.is_none()
+            && let Some(at) = (self.proposed.as_ref())
+                .and_then(|proposed| choices.iter().position(|(id, _, _)| id == proposed))
+        {
+            let proposed = choices.remove(at);
+            choices.insert(0, proposed);
+        }
+        choices
+    }
+
+    /// Above the editor of an unbound tab (C6): why it runs nowhere, and
+    /// the picker one click away.
+    fn render_unbound_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let text = SharedString::from(self.unbound_text()?);
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .id("unbound-bar")
+                .test_support()
+                .aria_label(text.clone())
+                .flex_none()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.warning.opacity(0.12))
+                .text_sm()
+                .child(div().flex_1().min_w_0().child(text))
+                .child(
+                    Button::new("unbound-pick")
+                        .outline()
+                        .small()
+                        .label("Pick a connection")
+                        .dropdown_caret(true)
+                        .dropdown_menu(connection_menu(self.connection_choices(cx), cx.entity())),
+                ),
+        )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let connections = self.connections.read(cx);
@@ -5515,17 +5639,7 @@ impl QueryTab {
             .unwrap_or_else(|| "default schema".into());
 
         // What the menus offer, captured when they open.
-        let choices: Vec<(String, String, bool)> = connections
-            .saved()
-            .iter()
-            .map(|saved| {
-                (
-                    saved.id.clone(),
-                    saved.config.name.clone(),
-                    matches!(connections.status(&saved.id), Status::Connected { .. }),
-                )
-            })
-            .collect();
+        let choices = self.connection_choices(cx);
         let (databases, schemas) = (self.databases.clone(), self.schemas.clone());
         let running = matches!(self.activity, Activity::Running { .. });
         // Stop while a statement runs or rows are on their way; a result
@@ -5567,36 +5681,7 @@ impl QueryTab {
                             .child(connection_label),
                     )
                     .dropdown_caret(true)
-                    .dropdown_menu({
-                        let view = view.clone();
-                        move |mut menu, _, _| {
-                            for (id, name, connected) in &choices {
-                                let (view, id) = (view.clone(), id.clone());
-                                let label = if *connected {
-                                    name.clone()
-                                } else {
-                                    format!("{name} (not connected)")
-                                };
-                                menu = menu.item(
-                                    PopupMenuItem::new(SharedString::from(label))
-                                        .disabled(!connected)
-                                        .on_click(move |_, _, cx| {
-                                            view.update(cx, |this, cx| {
-                                                this.request_target(
-                                                    Some(Target {
-                                                        connection: id.clone(),
-                                                        database: None,
-                                                        schema: None,
-                                                    }),
-                                                    cx,
-                                                )
-                                            })
-                                        }),
-                                );
-                            }
-                            menu
-                        }
-                    }),
+                    .dropdown_menu(connection_menu(choices, view.clone())),
             )
             .when(self.target.is_some(), |this| {
                 this.child(
@@ -7178,6 +7263,42 @@ impl Focusable for QueryTab {
     }
 }
 
+/// A connection picker's menu: `choices` (id, name, connected) in order; a
+/// pick moves the tab there, asking first when a transaction is open. One
+/// not connected can be picked too: the tab's first run connects it, as a
+/// tab of a closed connection does (C6: a script's last connection is
+/// rarely open when the file is opened again).
+fn connection_menu(
+    choices: Vec<(String, String, bool)>,
+    view: Entity<QueryTab>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |mut menu, _, _| {
+        for (id, name, connected) in &choices {
+            let (view, id) = (view.clone(), id.clone());
+            let label = if *connected {
+                name.clone()
+            } else {
+                format!("{name} (not connected)")
+            };
+            menu = menu.item(PopupMenuItem::new(SharedString::from(label)).on_click(
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.request_target(
+                            Some(Target {
+                                connection: id.clone(),
+                                database: None,
+                                schema: None,
+                            }),
+                            cx,
+                        )
+                    })
+                },
+            ));
+        }
+        menu
+    }
+}
+
 impl Render for QueryTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The filter field shows the filter of the result on screen.
@@ -7361,6 +7482,7 @@ impl Render for QueryTab {
                 }),
             )
             .child(self.render_toolbar(cx))
+            .children(self.render_unbound_bar(cx))
             .child(match chrome {
                 Some(chrome) => v_flex()
                     .id("env-frame")

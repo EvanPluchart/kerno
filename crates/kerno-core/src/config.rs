@@ -483,6 +483,17 @@ impl ConnectionConfig {
         self.auto_commit.map_or(!rules.auto_commit, |auto| !auto)
     }
 
+    /// Whether a `.sql` file opened beside this connection may run on it
+    /// without the user picking it (C6): only when nothing of its
+    /// environment's rules asks before a statement runs or writes, and the
+    /// connection is not read-only. Decided by the rules, not the
+    /// environment's name, so a user's own environments follow (the
+    /// built-in staging, with local's rules, binds silently).
+    pub fn binds_scripts_silently(&self, environments: &[EnvironmentDef]) -> bool {
+        let rules = &environment::environment(environments, &self.environment).rules;
+        !(rules.confirm_execute || rules.confirm_writes_twice || rules.read_only || self.read_only)
+    }
+
     /// Checks the settings are complete enough to try a connection.
     pub fn validate(&self) -> Result<()> {
         let missing = |what: &str| Err(Error::Config(format!("{what} is required")));
@@ -2152,6 +2163,55 @@ mod tests {
         })
         .unwrap();
         assert!(import_connections_file(&hostile).is_err());
+    }
+
+    /// C6: a script binds silently only where no rule asks first; the
+    /// rules decide, not the environment's name.
+    #[test]
+    fn a_script_binds_silently_only_where_no_rule_asks_first() {
+        let mut environments = environment::builtin_environments();
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        let binds = |config: &ConnectionConfig, environments: &[EnvironmentDef]| {
+            config.binds_scripts_silently(environments)
+        };
+        assert!(binds(&config, &environments), "local");
+        config.environment = environment::STAGING.into();
+        assert!(binds(&config, &environments), "staging has local's rules");
+        config.environment = environment::PRODUCTION.into();
+        assert!(!binds(&config, &environments), "production");
+        // A user's own environment, by each rule alone.
+        for rule in ["confirm_execute", "confirm_writes_twice", "read_only"] {
+            let mut rules = environment::EnvironmentRules::default();
+            match rule {
+                "confirm_execute" => rules.confirm_execute = true,
+                "confirm_writes_twice" => rules.confirm_writes_twice = true,
+                _ => rules.read_only = true,
+            }
+            environments.push(EnvironmentDef {
+                id: format!("own-{rule}"),
+                name: "Own".into(),
+                color_light: None,
+                color_dark: None,
+                tint: environment::Tint::None,
+                rules,
+            });
+            config.environment = format!("own-{rule}");
+            assert!(!binds(&config, &environments), "{rule}");
+        }
+        // Production with its rules turned off binds as local does.
+        environments[2].rules = environment::EnvironmentRules::default();
+        config.environment = environment::PRODUCTION.into();
+        assert!(
+            binds(&config, &environments),
+            "production without its rules"
+        );
+        // An unknown id gets local's rules.
+        config.environment = "gone".into();
+        assert!(binds(&config, &environments), "unknown");
+        // The connection's own read-only flag counts too.
+        config.environment = environment::LOCAL.into();
+        config.read_only = true;
+        assert!(!binds(&config, &environments), "read-only");
     }
 
     /// J15: version 2 carries ids, environments and tasks; version 1 files

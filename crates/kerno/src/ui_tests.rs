@@ -2853,9 +2853,14 @@ fn a_running_statement_is_cancelled_and_the_window_stays_usable(cx: &mut TestApp
 fn a_tab_without_an_open_connection_says_what_to_do(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
     app.run_in_new_tab(cx, "select 1", "secondary-enter");
-    app.wait_until(cx, "the refusal", |app, cx| app.outcomes(cx).len() == 1);
-    assert_eq!(app.outcomes(cx), ["failed []"]);
-    assert!(app.has(cx, "result-error"));
+    // Nothing runs (C6): the messages and the bar above the editor say where to pick one.
+    let tab = app.tab(cx);
+    assert_eq!(app.outcomes(cx), Vec::<String>::new());
+    assert_eq!(
+        cx.update(|cx| tab.read(cx).messages()),
+        ["Warning: Nothing ran. Pick a connection to run this script."]
+    );
+    assert!(app.has(cx, "unbound-pick"));
 }
 
 #[gpui_kit::test]
@@ -8572,6 +8577,14 @@ fn running_in_a_tab_of_a_closed_connection_connects_first(cx: &mut TestAppContex
     });
     assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
     assert_eq!(app.result(cx, 0, 1).1, [cells(&["42"])]);
+    // The run that connected does not make the selectors' lists late.
+    let tab = app.tab(cx);
+    app.wait_until(cx, "the databases and schemas of the selectors", |_, cx| {
+        cx.update(|cx| {
+            let tab = tab.read(cx);
+            !tab.databases().is_empty() && tab.schemas().iter().any(|schema| schema == "public")
+        })
+    });
     app.wait_until(cx, "the history", |app, _| {
         !app.storage.history(None, "", 10).unwrap().is_empty()
     });

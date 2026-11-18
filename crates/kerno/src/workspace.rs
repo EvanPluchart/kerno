@@ -116,6 +116,9 @@ enum Asking {
     /// Only the transactions end (a switch to auto-commit): the sessions
     /// stay, so pending edits are neither asked about nor discarded.
     Transactions,
+    /// A connection is deleted (C6): as `Leaving`, and its table forms
+    /// close too, so they are asked about.
+    Deleting,
 }
 
 /// How often the transactions' ages are drawn again (K4): they read in
@@ -2056,6 +2059,33 @@ impl Workspace {
             .map(connection_target)
     }
 
+    /// Where a `.sql` file opened now runs (C6): on the connection it last
+    /// ran on, else the one being browsed, but only where that binds
+    /// silently (no rule of its environment asks first, not read-only).
+    /// Otherwise the tab opens unbound and proposes it: `(target, proposed)`.
+    /// Never another connection in its place.
+    fn script_target(&self, path: &Path, cx: &App) -> (Option<Target>, Option<String>) {
+        let state = AppState::get(cx);
+        let connections = self.connections.read(cx);
+        let candidate = (state.settings.script_connections.get(path))
+            .filter(|id| connections.get(id).is_some())
+            .cloned()
+            .or_else(|| self.default_target(cx).map(|target| target.connection));
+        let Some(id) = candidate else {
+            return (None, None);
+        };
+        let silent = connections.get(&id).is_some_and(|saved| {
+            saved
+                .config
+                .binds_scripts_silently(&state.settings.environments)
+        });
+        if silent {
+            (Some(connection_target(&id)), None)
+        } else {
+            (None, Some(id))
+        }
+    }
+
     /// Opens a tab holding `sql` and gives it the keyboard.
     pub fn open_query(
         &mut self,
@@ -2111,12 +2141,16 @@ impl Workspace {
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(sql) => {
-                    let target = this.default_target(cx);
+                    let (target, proposed) = this.script_target(&path, cx);
+                    let connection = target.as_ref().map(|target| target.connection.clone());
                     let tab = this.open_query(String::new(), &sql, target, window, cx);
                     AppState::update_settings(cx, |settings| {
-                        settings.remember_script(path.clone())
+                        settings.remember_script(path.clone(), connection)
                     });
-                    tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
+                    tab.update(cx, |tab, cx| {
+                        tab.set_file(path, false, cx);
+                        tab.propose(proposed, cx);
+                    });
                     this.schedule_save(cx);
                 }
                 Err(error) => {
@@ -2220,8 +2254,9 @@ impl Workspace {
             let outcome = writing.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(()) => {
+                    let connection = tab.read(cx).connection_id().map(str::to_string);
                     AppState::update_settings(cx, |settings| {
-                        settings.remember_script(path.clone())
+                        settings.remember_script(path.clone(), connection)
                     });
                     tab.update(cx, |tab, cx| tab.set_file(path, false, cx));
                     this.schedule_save(cx);
@@ -3166,7 +3201,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnectionsEvent::ListChanged => {}
+            ConnectionsEvent::ListChanged => self.drop_gone_connections(window, cx),
             ConnectionsEvent::StatusChanged { id } => {
                 if self.pending_editor.as_ref() == Some(id) {
                     match self.connections.read(cx).status(id) {
@@ -4412,18 +4447,59 @@ impl Workspace {
     }
 
     /// Deletes the connection `id` once what its tabs hold is ended, after
-    /// the alert that confirmed the deletion has closed.
+    /// the alert that confirmed the deletion has closed. Its query tabs are
+    /// unbound first, so a statement they run is stopped as deleted, not
+    /// reported lost by the disconnect; its other tabs follow once it is
+    /// gone from the list ([`Self::drop_gone_connections`]).
+    // ponytail: a deletion the storage refuses leaves its query tabs
+    // unbound (the connection stays, the user picks it again).
     fn delete_connection(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let action = format!("Delete “{}”", self.connection_name(&id, cx));
         let tabs = self.tabs_on(std::slice::from_ref(&id), cx);
         let then: Then = Box::new(move |this, _, cx| {
+            let queries = this.tabs_on(std::slice::from_ref(&id), cx);
+            for tab in queries.iter().filter_map(OpenTab::query) {
+                tab.update(cx, |tab, cx| tab.unbind_deleted(cx));
+            }
             this.connections
                 .update(cx, |connections, cx| connections.delete(&id, cx))
         });
         let workspace = cx.entity().downgrade();
         window.defer(cx, move |window, cx| {
-            let _ = workspace.update(cx, |this, cx| this.end_then(action, tabs, then, window, cx));
+            let _ = workspace.update(cx, |this, cx| {
+                this.ask_then(action, tabs, then, Asking::Deleting, window, cx)
+            });
         });
+    }
+
+    /// The tabs of a connection no longer in the list (C6): its query tabs
+    /// stay, unbound, with their text, file and unsaved mark, and say why;
+    /// the others close, since they cannot exist without it (closing stops
+    /// what they run, K2). Nothing is bound to another connection. The
+    /// closed tabs that can be reopened, and the stored tabs, follow.
+    fn drop_gone_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let connections = self.connections.read(cx);
+        let known = |id: &str| connections.get(id).is_some();
+        let gone: Vec<OpenTab> = (self.tabs.iter())
+            .filter(|tab| tab.connection(cx).is_some_and(|id| !known(&id)))
+            .cloned()
+            .collect();
+        let closed: Vec<TabSnapshot> = (self.closed.iter().cloned())
+            .filter_map(|snapshot| snapshot.without_gone_connection(known))
+            .collect();
+        let changed = closed != self.closed;
+        self.closed = closed;
+        if gone.is_empty() && !changed {
+            return;
+        }
+        let (queries, others): (Vec<OpenTab>, Vec<OpenTab>) =
+            gone.into_iter().partition(|tab| tab.query().is_some());
+        for tab in queries.iter().filter_map(OpenTab::query) {
+            tab.update(cx, |tab, cx| tab.unbind_deleted(cx));
+        }
+        self.close_now(&others, window, cx);
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     /// Saves the read-only flag of a connection; an open one reconnects, so
@@ -4586,10 +4662,10 @@ impl Workspace {
                     .map(move |loss| (title.clone(), loss))
             })
             .collect();
-        let question = if quitting {
-            tabs::quit_question(&losses)
-        } else {
-            tabs::end_question(&action, &losses)
+        let question = match asking {
+            Asking::Quitting => tabs::quit_question(&losses),
+            Asking::Deleting => tabs::delete_question(&action, &losses),
+            Asking::Leaving | Asking::Transactions => tabs::end_question(&action, &losses),
         };
         let Some((title, text, ending)) = question else {
             then(self, window, cx);

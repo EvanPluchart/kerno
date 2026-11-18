@@ -900,6 +900,16 @@ pub fn quit_question(losses: &[(String, Loss)]) -> Option<(String, String, Endin
     question("Quit Kerno", losses, true)
 }
 
+/// [`end_question`] for deleting a connection (C6): its table forms close
+/// with it, so they are asked about. Unsaved text is not: its query tabs
+/// stay, unbound, with their text.
+pub fn delete_question(
+    action: &str,
+    losses: &[(String, Loss)],
+) -> Option<(String, String, Ending)> {
+    question(action, losses, true)
+}
+
 fn question(
     action: &str,
     losses: &[(String, Loss)],
