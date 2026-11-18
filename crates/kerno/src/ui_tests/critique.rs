@@ -2256,3 +2256,50 @@ fn deleting_a_connection_unbinds_its_query_tabs_and_closes_the_others(cx: &mut T
         });
     }
 }
+
+/// C21: on MySQL 8.4 a `WHERE` in a comment for a newer version (`/*!90000 … */`) is skipped
+/// by the server, so the statement deletes every row: on a local connection it asks, as a
+/// `DELETE` without a `WHERE` does, and Cancel leaves the table as it was on the server. The
+/// comment sits before `ORDER BY`: the editor drops a comment that ends a statement from what
+/// it sends (and classifies), so there the question was already asked.
+#[gpui_kit::test]
+fn a_versioned_comment_where_still_asks(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k7";
+    let (drop, create) = scratch_schema(engine, name);
+    let table = format!("CREATE TABLE {name}.t (id INT PRIMARY KEY)");
+    let rows = format!("INSERT INTO {name}.t VALUES (1), (2)");
+    let _scratch = Scratch::new(engine, &[&drop], &[&create, &table, &rows]);
+    let app = connected(cx, engine);
+
+    app.run_in_new_tab(
+        cx,
+        &format!("DELETE FROM {name}.t /*!90000 WHERE id = 1 */ ORDER BY id"),
+        "secondary-enter",
+    );
+    assert!(app.has(cx, "sql-preview"));
+    assert_eq!(app.label_of(cx, "sql-title"), "Run this statement?");
+    app.click(cx, "sql-cancel");
+    assert!(!app.has(cx, "sql-preview"));
+    assert!(!app.running(cx));
+    assert_eq!(app.outcomes(cx), Vec::<String>::new());
+    assert_eq!(
+        on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+        "2"
+    );
+
+    // A comment the server runs is sent with its statement, where it ends it too: the server
+    // applies the WHERE, and one row goes, not all of them.
+    assert_eq!(
+        k5_run(
+            &app,
+            cx,
+            &format!("DELETE FROM {name}.t /*! WHERE id = 1 */")
+        ),
+        ["done, 1 affected"]
+    );
+    assert_eq!(on_server(engine, &format!("SELECT id FROM {name}.t")), "2");
+}

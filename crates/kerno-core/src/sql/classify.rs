@@ -17,7 +17,8 @@ pub struct StatementClass {
     /// It would change data or schema: blocked on a read-only connection.
     pub writes: bool,
     /// It can lose data at once (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE`
-    /// without `WHERE`, `ALTER ... DROP`): asks for confirmation.
+    /// without `WHERE`, `ALTER ... DROP`, a `MERGE` that deletes, or a
+    /// `PREPARE` of one of them): asks for confirmation.
     pub destructive: bool,
     /// Best guess: a result grid is expected.
     pub returns_rows: bool,
@@ -76,10 +77,14 @@ pub enum TxCommand {
 }
 
 /// A token that carries SQL meaning, and how many parentheses enclose it.
+#[derive(Clone, Copy)]
 struct Tok<'a> {
     kind: TokenKind,
     text: &'a str,
     depth: usize,
+    /// The versioned comment it was read from, numbered from 1, or 0: a
+    /// MySQL server may skip such a comment (see [`collect`]).
+    comment: u32,
 }
 
 impl Tok<'_> {
@@ -103,8 +108,25 @@ const QUERY_WORDS: &[&str] = &[
 /// `statement` is one statement, as [`super::split_statements`] cuts them.
 /// If it holds several anyway, it writes or destroys as soon as one of
 /// them does.
+///
+/// A versioned comment (`/*!80000 … */`, `/*M! … */`) runs on some servers
+/// and not on others, so the statement is read both ways: with every such
+/// comment and without any, and it writes or destroys as soon as one of
+/// the two readings does (C21). What it is (`kind`, `returns_rows`) is the
+/// reading with the comments.
 pub fn classify(statement: &str, rules: LexRules) -> StatementClass {
     let tokens = nested_tokens(statement, rules);
+    let mut class = classify_all(&tokens, rules);
+    if let Some(skipped) = without_versioned(&tokens) {
+        let more = classify_all(&skipped, rules);
+        class.writes |= more.writes;
+        class.destructive |= more.destructive;
+    }
+    class
+}
+
+/// [`classify`] on one reading of the tokens.
+fn classify_all(tokens: &[Tok], rules: LexRules) -> StatementClass {
     let mut parts = tokens
         .split(|token| token.kind == TokenKind::Semicolon)
         .filter(|part| !part.is_empty());
@@ -127,9 +149,29 @@ pub fn classify(statement: &str, rules: LexRules) -> StatementClass {
 /// parentheses around it (a parenthesis counts as outside itself).
 fn nested_tokens(statement: &str, rules: LexRules) -> Vec<Tok<'_>> {
     let mut tokens = Vec::new();
-    collect(statement, rules, &mut tokens);
+    collect(statement, rules, 0, &mut 0, &mut tokens);
+    set_depths(&mut tokens);
+    tokens
+}
+
+/// The tokens as a server that skips every versioned comment reads them,
+/// or `None` when there is no such comment.
+fn without_versioned<'a>(tokens: &[Tok<'a>]) -> Option<Vec<Tok<'a>>> {
+    if tokens.iter().all(|token| token.comment == 0) {
+        return None;
+    }
+    let mut kept: Vec<Tok> = tokens
+        .iter()
+        .filter(|token| token.comment == 0)
+        .copied()
+        .collect();
+    set_depths(&mut kept);
+    Some(kept)
+}
+
+fn set_depths(tokens: &mut [Tok]) {
     let mut depth = 0usize;
-    for token in &mut tokens {
+    for token in tokens {
         if token.kind == TokenKind::Punct && token.text == ")" {
             depth = depth.saturating_sub(1);
         }
@@ -138,7 +180,6 @@ fn nested_tokens(statement: &str, rules: LexRules) -> Vec<Tok<'_>> {
             depth += 1;
         }
     }
-    tokens
 }
 
 /// What [`single_table_select`] says of a statement that is no `SELECT`
@@ -182,6 +223,14 @@ const SET_RETURNING: &[&str] = &[
 /// what origins cannot see, such as a table joined to itself.
 pub fn single_table_select(statement: &str, rules: LexRules) -> Option<&'static str> {
     let tokens = nested_tokens(statement, rules);
+    // Either reading of a versioned comment may be the one that runs.
+    single_table_tokens(&tokens, rules).or_else(|| {
+        without_versioned(&tokens).and_then(|skipped| single_table_tokens(&skipped, rules))
+    })
+}
+
+/// [`single_table_select`] on one reading of the tokens.
+fn single_table_tokens(tokens: &[Tok], rules: LexRules) -> Option<&'static str> {
     let mut parts = tokens
         .split(|token| token.kind == TokenKind::Semicolon)
         .filter(|part| !part.is_empty());
@@ -260,22 +309,41 @@ pub fn single_table_select(statement: &str, rules: LexRules) -> Option<&'static 
     None
 }
 
-/// Appends the meaningful tokens of `source` to `out`. MySQL runs what is
-/// inside `/*! ... */` and `/*M! ... */` comments (dumps are full of
-/// them), so there the content of such a comment counts as SQL.
-fn collect<'a>(source: &'a str, rules: LexRules, out: &mut Vec<Tok<'a>>) {
+/// Appends the meaningful tokens of `source` to `out`, each marked with
+/// `comment`. MySQL runs what is inside `/*! ... */` comments (dumps are
+/// full of them), so there the content of such a comment counts as SQL.
+/// `/*!NNNNN ... */` runs only from server version NNNNN, and MariaDB's
+/// `/*M! ... */` only on MariaDB (MySQL skips it), so their tokens are
+/// marked with a number of their own (`last` counts them): a keyword there
+/// may make a statement more dangerous, never less (C21, D-079). On
+/// PostgreSQL rules they are plain comments.
+fn collect<'a>(
+    source: &'a str,
+    rules: LexRules,
+    comment: u32,
+    last: &mut u32,
+    out: &mut Vec<Tok<'a>>,
+) {
     for token in lex(source, rules) {
         let text = &source[token.range];
         match token.kind {
             TokenKind::BlockComment if rules.hash_comments => {
-                let code = text
-                    .strip_prefix("/*!")
-                    .or_else(|| text.strip_prefix("/*M!"));
+                let (code, mariadb) = match text.strip_prefix("/*M!") {
+                    Some(code) => (Some(code), true),
+                    None => (text.strip_prefix("/*!"), false),
+                };
                 if let Some(code) = code {
                     let code = code.strip_suffix("*/").unwrap_or(code);
                     // An optional version number comes first.
-                    let code = code.trim_start_matches(|c: char| c.is_ascii_digit());
-                    collect(code, rules, out);
+                    let body = code.trim_start_matches(|c: char| c.is_ascii_digit());
+                    let versioned = mariadb || body.len() < code.len();
+                    let inner = if versioned {
+                        *last += 1;
+                        *last
+                    } else {
+                        comment
+                    };
+                    collect(body, rules, inner, last, out);
                 }
             }
             kind if kind.is_trivia() => {}
@@ -283,6 +351,7 @@ fn collect<'a>(source: &'a str, rules: LexRules, out: &mut Vec<Tok<'a>>) {
                 kind,
                 text,
                 depth: 0,
+                comment,
             }),
         }
     }
@@ -342,17 +411,25 @@ fn classify_tokens(tokens: &[Tok], rules: LexRules) -> StatementClass {
         "INSERT" | "REPLACE" => class(Insert, true, false, top("RETURNING")),
         "UPDATE" => class(Update, true, !has_where(tokens, 0), top("RETURNING")),
         "DELETE" => class(Delete, true, !has_where(tokens, 0), top("RETURNING")),
-        "MERGE" => class(Merge, true, false, top("RETURNING")),
+        // `WHEN [NOT] MATCHED … THEN DELETE` deletes with no WHERE to
+        // review (C21); `delete` is reserved, so the pair is the action.
+        "MERGE" => {
+            let deletes = tokens
+                .windows(2)
+                .any(|pair| pair[0].is("THEN") && pair[1].is("DELETE") && pair[1].depth == base);
+            class(Merge, true, deletes, top("RETURNING"))
+        }
         "TRUNCATE" => class(Truncate, true, true, false),
         "DROP" => class(Ddl, true, true, false),
         "ALTER" => {
-            // Dropping a default or a NOT NULL loses no data.
+            // Dropping a default or a NOT NULL loses no data, when both
+            // words run together (not one in a versioned comment).
             let destroys = tokens.iter().enumerate().any(|(index, token)| {
                 token.is_any(&["TRUNCATE", "DISCARD"])
                     || token.is("DROP")
-                        && !tokens
-                            .get(index + 1)
-                            .is_some_and(|next| next.is_any(&["NOT", "DEFAULT"]))
+                        && !tokens.get(index + 1).is_some_and(|next| {
+                            next.comment == token.comment && next.is_any(&["NOT", "DEFAULT"])
+                        })
             });
             class(Ddl, true, destroys, false)
         }
@@ -410,25 +487,46 @@ fn classify_tokens(tokens: &[Tok], rules: LexRules) -> StatementClass {
             let writes = inner.writes || top("FROM") || top("PROGRAM") || !top("TO");
             class(Copy, writes, inner.destructive, false)
         }
+        // PostgreSQL: `PREPARE name [(types)] AS statement` does what its
+        // statement does, later, at `EXECUTE` (C21): the question is asked
+        // here. MySQL's `PREPARE name FROM '…'` (or `FROM @variable`) and
+        // `EXECUTE` hide the statement from a text classifier: they stay
+        // writes (read-only and production guard them), never known to
+        // destroy. So does `PREPARE TRANSACTION`.
+        "PREPARE" => {
+            let statement = tokens
+                .iter()
+                .position(|token| token.depth == base && token.is("AS"))
+                .map(|index| &tokens[index + 1..])
+                .filter(|statement| !statement.is_empty());
+            match statement {
+                Some(statement) => {
+                    let inner = classify_tokens(statement, rules);
+                    class(Other, inner.writes, inner.destructive, false)
+                }
+                None => other(true),
+            }
+        }
         "FETCH" | "HELP" => class(Other, false, false, true),
         "MOVE" | "CLOSE" | "DECLARE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "DISCARD"
         | "UNLOCK" => other(false),
         // MySQL table maintenance answers with a status table.
         "OPTIMIZE" | "REPAIR" | "CHECK" | "CHECKSUM" => class(Other, true, false, true),
-        // DO, EXECUTE, PREPARE, LOAD, GRANT, VACUUM ... and whatever is
+        // DO, EXECUTE, LOAD, GRANT, VACUUM ... and whatever is
         // not known: it may write.
         _ => other(true),
     }
 }
 
 /// Whether the `UPDATE` or `DELETE` at `index` has a `WHERE` of its own:
-/// one inside a subquery or another CTE does not count.
+/// one inside a subquery or another CTE does not count, nor one in a
+/// versioned comment the statement is not in (it may be skipped, C21).
 fn has_where(tokens: &[Tok], index: usize) -> bool {
-    let depth = tokens[index].depth;
+    let Tok { depth, comment, .. } = tokens[index];
     tokens[index + 1..]
         .iter()
         .take_while(|token| token.depth >= depth)
-        .any(|token| token.depth == depth && token.is("WHERE"))
+        .any(|token| token.depth == depth && token.comment == comment && token.is("WHERE"))
 }
 
 /// `WITH ...`: what the statement the CTEs lead to does, plus what any
@@ -456,7 +554,11 @@ fn with(tokens: &[Tok]) -> StatementClass {
     let mut writes = false;
     let mut destructive = false;
     for (index, token) in tokens.iter().enumerate() {
-        let after = |words: &[&str]| index > 0 && tokens[index - 1].is_any(words);
+        let after = |words: &[&str]| {
+            index > 0
+                && tokens[index - 1].comment == token.comment
+                && tokens[index - 1].is_any(words)
+        };
         // `insert(...)` and `replace(...)` are functions.
         if tokens
             .get(index + 1)
@@ -469,7 +571,9 @@ fn with(tokens: &[Tok]) -> StatementClass {
         let modifies = token.is("UPDATE") && !after(&["FOR", "KEY", "DO", "THEN"])
             || token.is("DELETE") && !after(&["THEN"]);
         writes |= modifies || token.is_any(&["INSERT", "MERGE"]);
-        destructive |= modifies && !has_where(tokens, index);
+        // A MERGE's `THEN DELETE` deletes with no WHERE to review (C21).
+        destructive |=
+            modifies && !has_where(tokens, index) || token.is("DELETE") && after(&["THEN"]);
     }
 
     if kind == Select {
@@ -630,12 +734,13 @@ mod tests {
             F,
             F,
         ),
+        // C21: a MERGE that deletes can delete without a WHERE to review.
         (
             "WITH s AS (SELECT 1 AS id) MERGE INTO t USING s ON t.id = s.id \
              WHEN MATCHED THEN DELETE",
             Merge,
             T,
-            F,
+            T,
             F,
         ),
         // INSERT.
@@ -695,6 +800,9 @@ mod tests {
             F,
             F,
         ),
+        // An explicit WHERE is the user's decision, whatever it says (D-079).
+        ("DELETE FROM t WHERE true", Delete, T, F, F),
+        ("UPDATE t SET a = 1 WHERE 1=1", Update, T, F, F),
         // TRUNCATE and DDL.
         ("TRUNCATE TABLE t", Truncate, T, T, F),
         ("truncate t", Truncate, T, T, F),
@@ -937,6 +1045,109 @@ mod tests {
         ("RESET search_path", Set, F, F, F),
         ("SHOW search_path", Show, F, F, T),
         ("FETCH 10 FROM c", Other, F, F, T),
+        // C21: a prepared statement is the statement it prepares, run later.
+        ("PREPARE p AS DELETE FROM t", Other, T, T, F),
+        ("PREPARE p AS DELETE FROM t WHERE id = $1", Other, T, F, F),
+        ("PREPARE p (int) AS UPDATE t SET a = $1", Other, T, T, F),
+        (
+            "prepare p (int, text) as update t set a = $1 where b = $2",
+            Other,
+            T,
+            F,
+            F,
+        ),
+        ("PREPARE p AS SELECT * FROM t", Other, F, F, F),
+        ("PREPARE p AS VALUES (1)", Other, F, F, F),
+        (
+            "PREPARE p AS INSERT INTO t VALUES (1) RETURNING id",
+            Other,
+            T,
+            F,
+            F,
+        ),
+        (
+            "PREPARE p AS WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            Other,
+            T,
+            T,
+            F,
+        ),
+        (
+            "PREPARE p AS MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE",
+            Other,
+            T,
+            T,
+            F,
+        ),
+        ("PREPARE p", Other, T, F, F),
+        ("PREPARE TRANSACTION 'x'", Other, T, F, F),
+        ("EXPLAIN ANALYZE EXECUTE p", Explain, T, F, T),
+        // C21: MERGE destroys when one of its actions deletes.
+        (
+            "MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE",
+            Merge,
+            T,
+            T,
+            F,
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND s.gone THEN DELETE",
+            Merge,
+            T,
+            T,
+            F,
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE",
+            Merge,
+            T,
+            T,
+            F,
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED AND s.a > 0 THEN UPDATE SET a = s.a \
+             WHEN MATCHED THEN DELETE \
+             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.a)",
+            Merge,
+            T,
+            T,
+            F,
+        ),
+        (
+            "MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE RETURNING *",
+            Merge,
+            T,
+            T,
+            T,
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DO NOTHING \
+             WHEN NOT MATCHED THEN DO NOTHING",
+            Merge,
+            T,
+            F,
+            F,
+        ),
+        (
+            "MERGE INTO t USING (SELECT id, \"delete\" FROM s WHERE note = 'then delete') s \
+             ON t.id = s.id WHEN MATCHED THEN UPDATE SET note = 'THEN DELETE' \
+             /* THEN DELETE */ -- THEN DELETE\n",
+            Merge,
+            T,
+            F,
+            F,
+        ),
+        (
+            "EXPLAIN ANALYZE MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE",
+            Explain,
+            T,
+            T,
+            T,
+        ),
+        // MySQL's executable comments are plain comments here.
+        ("DELETE FROM t /*!90000 WHERE id = 1 */", Delete, T, T, F),
+        ("DELETE FROM t /*! WHERE id = 1 */", Delete, T, T, F),
     ];
 
     const MYSQL: &[Case] = &[
@@ -1012,7 +1223,75 @@ mod tests {
         ("/*M!100100 DROP TABLE t */", Ddl, T, T, F),
         ("/* plain DROP TABLE t */", Other, F, F, F),
         ("SELECT /*! STRAIGHT_JOIN */ 1", Select, F, F, T),
+        // `/*! … */` runs on every MySQL and MariaDB server: its WHERE holds.
         ("DELETE FROM t /*! WHERE id = 1 */", Delete, T, F, F),
+        // C21: a versioned comment may not run (a newer version than the
+        // server's; `/*M!` on MySQL): its WHERE may not hold (D-079).
+        ("DELETE FROM t /*!90000 WHERE id = 1 */", Delete, T, T, F),
+        (
+            "UPDATE t SET a = 1 /*!999999 WHERE id = 1 */",
+            Update,
+            T,
+            T,
+            F,
+        ),
+        ("DELETE FROM t /*!80000 WHERE id = 1 */", Delete, T, T, F),
+        ("DELETE FROM t /*M!100100 WHERE id = 1 */", Delete, T, T, F),
+        ("DELETE FROM t /*M! WHERE id = 1 */", Delete, T, T, F),
+        (
+            "DELETE FROM t /*!90000 WHERE id = 1 */ ORDER BY id LIMIT 10",
+            Delete,
+            T,
+            T,
+            F,
+        ),
+        // A WHERE outside the comment is the user's own.
+        (
+            "DELETE FROM t WHERE /*!90000 id = 1 */ 1=1",
+            Delete,
+            T,
+            F,
+            F,
+        ),
+        (
+            "DELETE FROM t WHERE /*!90000 id = 1 AND */ 1 = 1",
+            Delete,
+            T,
+            F,
+            F,
+        ),
+        (
+            "DELETE FROM t WHERE id > 0 /*!90000 LIMIT 1 */",
+            Delete,
+            T,
+            F,
+            F,
+        ),
+        // A whole statement in one comment runs whole, or not at all.
+        ("/*!50000 DELETE FROM t */", Delete, T, T, F),
+        ("/*!50000 DELETE FROM t WHERE id = 1 */", Delete, T, F, F),
+        (
+            "/*!50000 DELETE FROM t */ /*!90000 WHERE id = 1 */",
+            Delete,
+            T,
+            T,
+            F,
+        ),
+        ("/*!40000 ALTER TABLE t DISABLE KEYS */", Ddl, T, F, F),
+        ("/*!90000 TRUNCATE t */", Truncate, T, T, F),
+        // What a skipped comment would hide counts too.
+        ("ALTER TABLE t DROP /*!90000 DEFAULT */ c", Ddl, T, T, F),
+        ("/*!90000 SELECT * FROM */ DELETE FROM t", Select, T, T, T),
+        (
+            "WITH x AS (SELECT 1) /*!90000 SELECT 1 FOR */ UPDATE t SET a = 1",
+            Select,
+            T,
+            T,
+            T,
+        ),
+        // A statement prepared from text cannot be read: it may write.
+        ("PREPARE p FROM 'delete from t'", Other, T, F, F),
+        ("EXECUTE p USING @a", Other, T, F, F),
         // Careful guesses.
         ("SELECT a INTO @v FROM t", Select, T, F, F),
         ("SELECT * FROM t INTO OUTFILE '/tmp/x'", Select, T, F, F),

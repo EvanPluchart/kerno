@@ -547,3 +547,19 @@ Still open (for the owner):
   change disabled (twelve mutations). One older test now expects the message of an unbound run.
 - Limits and plan errors in the "Done:" line of K6 (`docs/plans/M12.md`).
 
+
+## 2026-11-18 — K7: three classifier holes (C21)
+
+- `classify` reads a statement with a versioned comment (`/*!NNNNN … */`, `/*M! … */`) both ways, with and
+  without such comments, and asks as soon as one reading destroys; a `WHERE` (and the other words that make a
+  statement safer) counts only beside the keyword it protects, in the same comment or both outside one. A bare
+  `/*! … */` runs everywhere and keeps its `WHERE` (D-079).
+- PostgreSQL `PREPARE name [(types)] AS <statement>` is classified as its statement; `EXECUTE` and MySQL
+  `PREPARE … FROM '…'` stay writes. `MERGE … THEN DELETE` is destructive. `WHERE true`, `REPLACE INTO` and
+  `INSERT … ON CONFLICT` unchanged.
+- 43 new classifier rows (24 failed before the fix) and one UI test on MySQL 8.4, seen failing with the fix
+  disabled. The confirmation's explanation names a `MERGE` that deletes.
+- Found by the agent, fixed at review: the editor dropped the comments that open or end a statement, so a
+  trailing `/*! WHERE … */` was never sent (once confirmed, `DELETE FROM t /*! WHERE id = 1 */` deleted every
+  row) and a statement that is all comment (`/*!40101 SET NAMES utf8 */;`) never ran. On MySQL rules such a
+  comment is now statement text (`split.rs::runs_as_sql`). Limits and plan errors in the "Done:" line of K7 (`docs/plans/M12.md`).

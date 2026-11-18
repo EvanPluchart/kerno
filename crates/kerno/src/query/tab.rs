@@ -2246,8 +2246,8 @@ impl QueryTab {
                 count => format!("Run these {count} statements?"),
             },
             explanation: if destructive {
-                "It removes data or objects for good (a DROP, a TRUNCATE, an ALTER that drops, or a DELETE \
-                 or UPDATE without a WHERE). This cannot be undone."
+                "It removes data or objects for good (a DROP, a TRUNCATE, an ALTER that drops, a MERGE \
+                 that deletes, or a DELETE or UPDATE without a WHERE). This cannot be undone."
                     .to_string()
             } else if writes {
                 "It changes the database.".to_string()

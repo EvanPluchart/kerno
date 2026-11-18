@@ -54,10 +54,11 @@ pub fn split_statements(source: &str, rules: LexRules) -> Vec<StatementSpan> {
         if token.range.end <= cursor {
             continue;
         }
-        if token.kind.is_trivia() {
+        let runs = runs_as_sql(source, token, rules);
+        if token.kind.is_trivia() && !runs {
             continue;
         }
-        let opaque = matches!(token.kind, TokenKind::String | TokenKind::QuotedIdent);
+        let opaque = runs || matches!(token.kind, TokenKind::String | TokenKind::QuotedIdent);
         if rules.delimiter_command
             && !has_content
             && cursor <= token.range.start
@@ -131,6 +132,18 @@ fn delimiter_command(source: &str, token: &Token) -> Option<(String, usize)> {
     Some((delimiter.to_string(), line_end))
 }
 
+/// Whether `token` is a comment MySQL and MariaDB run as SQL: `/*! … */`,
+/// `/*!NNNNN … */` or MariaDB's `/*M! … */`. It is statement text, never
+/// trimmed (C21: cutting a trailing `/*! WHERE id = 1 */` would send a
+/// `DELETE` without its condition), and a statement when it stands alone
+/// (a dump's `/*!40101 SET … */;`). Elsewhere it is a comment.
+fn runs_as_sql(source: &str, token: &Token, rules: LexRules) -> bool {
+    let text = &source[token.range.clone()];
+    rules.hash_comments
+        && token.kind == TokenKind::BlockComment
+        && (text.starts_with("/*!") || text.starts_with("/*M!"))
+}
+
 /// Records the statement in `segment`, if it holds one.
 fn push_statement(
     source: &str,
@@ -144,14 +157,18 @@ fn push_statement(
     }
     // A segment can begin or end inside what was one token of the whole
     // text (a delimiter glued to a word), so it is lexed on its own.
-    let tokens = lex(&source[segment.clone()], rules);
-    let mut meaningful = tokens.iter().filter(|token| !token.kind.is_trivia());
+    let text = &source[segment.clone()];
+    let tokens = lex(text, rules);
+    let mut meaningful = tokens
+        .iter()
+        .filter(|token| !token.kind.is_trivia() || runs_as_sql(text, token, rules));
     let Some(first) = meaningful.next() else {
         return;
     };
     let last = meaningful.next_back().unwrap_or(first);
-    // Leading comments stay out; they are not part of what runs. Comments
-    // inside the statement (optimizer hints, MySQL `/*! */`) are kept.
+    // Leading and trailing comments stay out; they are not part of what
+    // runs. Comments inside the statement (optimizer hints) are kept, and
+    // MySQL's `/*! */` wherever it stands (see `runs_as_sql`).
     let start = segment.start + first.range.start;
     let end = segment.start + last.range.end;
     // The cursor belongs to the statement up to the end of the delimiter's line.
@@ -217,6 +234,39 @@ mod tests {
         assert_eq!(
             texts(source, LexRules::POSTGRES),
             vec!["select /*+ hint */ 1", "select 2"]
+        );
+    }
+
+    /// C21: MySQL and MariaDB run what is inside `/*! … */` and `/*M! … */`,
+    /// so such a comment is part of the statement wherever it stands, and a
+    /// statement of its own when it stands alone (a dump's first lines).
+    #[test]
+    fn mysql_executable_comments_are_statement_text() {
+        let source = "/* note */ DELETE FROM t /*! WHERE id = 1 */ -- why\n;\n\
+                      /*!40101 SET NAMES utf8 */;\n\
+                      /*M!100100 SET x = 1 */ ; /* plain */ ;\n\
+                      /*!50000 DELETE FROM t */ /*!90000 WHERE id = 1 */";
+        assert_eq!(
+            texts(source, LexRules::MYSQL),
+            vec![
+                "DELETE FROM t /*! WHERE id = 1 */",
+                "/*!40101 SET NAMES utf8 */",
+                "/*M!100100 SET x = 1 */",
+                "/*!50000 DELETE FROM t */ /*!90000 WHERE id = 1 */",
+            ]
+        );
+        // A `;` inside one does not split, as in any comment.
+        assert_eq!(
+            texts("/*!50003 SET a = 1; */ select 2", LexRules::MYSQL),
+            vec!["/*!50003 SET a = 1; */ select 2"]
+        );
+        // On PostgreSQL they are comments like any other.
+        assert_eq!(
+            texts(
+                "/*!40101 SET NAMES utf8 */; select 1 /*! x */",
+                LexRules::POSTGRES
+            ),
+            vec!["select 1"]
         );
     }
 

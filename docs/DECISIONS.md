@@ -1678,3 +1678,33 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   of removing a connection gets the same handling (query tabs left on it are unbound there too).
 - **Every unbound query tab shows the bar**, not only a file's: one unbound state, one way out.
 
+
+## D-079 — What the classifier counts as a WHERE, and versioned comments (K7, C21; 2026-11-18)
+
+- **An explicit `WHERE` is the user's decision, whatever it says**: `DELETE FROM t WHERE true` and
+  `UPDATE t SET a = 1 WHERE 1=1` stay non-destructive, as in DBeaver (`SQLQuery.isDeleteUpdateDangerous`
+  asks only when the parsed statement has no `WHERE` at all). Judging a condition's meaning would be a guess;
+  the question is for the statement that has none. `REPLACE INTO` and `INSERT … ON CONFLICT / ON DUPLICATE
+  KEY` stay non-destructive too: they act on keyed rows.
+- **A versioned comment may run or not, and the classifier takes the more dangerous reading.** MySQL runs
+  `/*!NNNNN … */` only from server version NNNNN, MariaDB runs `/*M! … */` and MySQL skips it, and Kerno lexes
+  MySQL and MariaDB with the same rules without knowing the server's version. So the classifier reads a
+  statement twice, with every such comment and without any (`classify::without_versioned`), and it writes
+  or destroys as soon as one reading does; its kind and whether rows come back are the reading with the
+  comments. On top of that, a keyword that makes a statement safer counts only beside the keyword it makes
+  safe, in the same comment or both outside one: a `WHERE` for its `UPDATE` or `DELETE`, `NOT` / `DEFAULT`
+  after `ALTER … DROP`, `FOR` / `KEY` / `DO` / `THEN` before an `UPDATE` in a `WITH`. Consequences:
+  `DELETE FROM t /*!80000 WHERE id = 1 */` asks even on a server that would run the comment (the version is
+  never compared), `/*!50000 DELETE FROM t WHERE id = 1 */` does not ask (the statement runs whole or not at
+  all), `DELETE FROM t WHERE /*!90000 id = 1 AND */ 1 = 1` does not ask (the `WHERE` outside is the user's).
+  The rule needs no server version and makes no statement less dangerous than either reading.
+- **A bare `/*! … */` is not versioned**: MySQL and MariaDB both always run it, so `DELETE FROM t /*! WHERE
+  id = 1 */` keeps its `WHERE`. A bare `/*M! … */` is versioned (MySQL skips it).
+- **`PREPARE name [(types)] AS statement` (PostgreSQL) is classified as its statement** (writes and destroys
+  as it does, kind `Other`, no rows): the question comes at `PREPARE`, the only time the text is there.
+  `EXECUTE` and MySQL's `PREPARE name FROM '…'` cannot be read: they stay writes, never known to destroy.
+- **A `MERGE` with a `THEN DELETE` action destroys** (`WHEN MATCHED`, with or without `AND`, and PostgreSQL
+  17's `WHEN NOT MATCHED BY SOURCE`): it deletes with no `WHERE` to review. `THEN UPDATE SET …`, `THEN INSERT`
+  and `DO NOTHING` do not: they change or add rows, they remove none (a `MERGE … ON true … THEN UPDATE`
+  changes every row without the question, as `INSERT … ON CONFLICT DO UPDATE` does; production and read-only
+  still guard it, it is a write).
