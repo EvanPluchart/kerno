@@ -518,3 +518,16 @@ Still open (for the owner):
   closes); the restored-tabs test is a negative check, the background-tab test a pin. Six status bar checks
   of older tests now match the start of the item ("transaction open · 12 s").
 - Limits and plan errors in the "Done:" line of K4 (`docs/plans/M12.md`).
+
+## 2026-11-18 — K5: switching to auto-commit or "Set as default" ends the transaction with a question (C15)
+
+- Every switch of a query tab to auto-commit goes through `QueryTab::request_manual_commit`: with a
+  transaction open, the window asks `end_then`'s question ("Switch “Query 1” to auto-commit?") and switches
+  once it is ended; Cancel keeps the mode and the transaction. Switching to manual commit asks nothing.
+- The idle rule watches any open transaction that wrote, in either mode: the transaction's log is now kept in
+  auto-commit too (a typed `BEGIN`), and a new transaction starts it empty. "Set as default" calls
+  `request_target`, the toolbar picker's path, and asks the same question.
+- Review fix: the switch ends the transaction only (`Asking::Transactions`); the edits waiting in a result are
+  neither asked about nor discarded.
+- Seven UI tests (five on PostgreSQL and MySQL); each was seen failing with a part of the change disabled.
+- Limits and plan errors in the "Done:" line of K5 (`docs/plans/M12.md`).

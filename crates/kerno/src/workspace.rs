@@ -106,6 +106,18 @@ const TAB_HEIGHT: gpui_kit::Pixels = px(32.);
 const TAB_ROWS: usize = 4;
 /// The list of every open tab gets a filter past this many.
 const FILTER_TABS_OVER: usize = 15;
+/// What an end question ([`Workspace::ask_then`]) is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    /// The sessions of the tabs close or move: everything they hold is lost.
+    Leaving,
+    /// Kerno quits: as `Leaving`, with a limit on each ROLLBACK.
+    Quitting,
+    /// Only the transactions end (a switch to auto-commit): the sessions
+    /// stay, so pending edits are neither asked about nor discarded.
+    Transactions,
+}
+
 /// How often the transactions' ages are drawn again (K4): they read in
 /// minutes, so a quarter of one is close enough.
 const TX_AGE_REFRESH: Duration = Duration::from_secs(15);
@@ -1182,6 +1194,9 @@ impl Workspace {
                     QueryTabEvent::SwitchTarget(target) => {
                         this.switch_target(tab.clone(), target.clone(), window, cx)
                     }
+                    QueryTabEvent::SwitchToAutoCommit => {
+                        this.switch_to_auto_commit(tab.clone(), window, cx)
+                    }
                     QueryTabEvent::Moved => this.schedule_save(cx),
                     QueryTabEvent::OpenQuery { title, sql } => {
                         let target = tab.read(cx).target().cloned();
@@ -1599,7 +1614,7 @@ impl Workspace {
             },
             TabAction::ManualCommit(manual) => {
                 if let Some(query) = query {
-                    query.update(cx, |query, cx| query.set_manual_commit(manual, cx));
+                    query.update(cx, |query, cx| query.request_manual_commit(manual, cx));
                 }
             }
             TabAction::Cancel => self.cancel_query(&CancelQuery, window, cx),
@@ -1969,8 +1984,10 @@ impl Workspace {
                         .is_some_and(|tab| tab.connection == target.connection)
                 });
                 match tab.cloned() {
+                    // The toolbar picker's path: with a transaction open,
+                    // the window asks how to end it first (C15).
                     Some(tab) => {
-                        tab.update(cx, |tab, cx| tab.set_target(Some(target.clone()), cx));
+                        tab.update(cx, |tab, cx| tab.request_target(Some(target.clone()), cx));
                         self.schedule_save(cx);
                     }
                     None => window.push_notification(
@@ -4476,6 +4493,23 @@ impl Workspace {
         self.end_then(action, vec![OpenTab::Query(tab)], then, window, cx);
     }
 
+    /// Puts a query tab in auto-commit once its open transaction is ended
+    /// (C15): Cancel keeps the mode and the transaction.
+    fn switch_to_auto_commit(
+        &mut self,
+        tab: Entity<QueryTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = format!("Switch “{}” to auto-commit", tab.read(cx).title());
+        let switched = tab.clone();
+        let then: Then = Box::new(move |_, _, cx| {
+            switched.update(cx, |tab, cx| tab.set_manual_commit(false, cx))
+        });
+        let tabs = vec![OpenTab::Query(tab)];
+        self.ask_then(action, tabs, then, Asking::Transactions, window, cx);
+    }
+
     /// The tabs working on the connections `ids`.
     fn tabs_on(&self, ids: &[String], cx: &App) -> Vec<OpenTab> {
         self.tabs
@@ -4496,7 +4530,7 @@ impl Workspace {
             "Quit Kerno".into(),
             self.tabs.clone(),
             then,
-            true,
+            Asking::Quitting,
             window,
             cx,
         );
@@ -4522,10 +4556,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.ask_then(action, tabs, then, false, window, cx);
+        self.ask_then(action, tabs, then, Asking::Leaving, window, cx);
     }
 
-    /// [`Self::end_then`]; `quitting`: each ROLLBACK waits at most
+    /// [`Self::end_then`]; when quitting, each ROLLBACK waits at most
     /// [`QUIT_ROLLBACK_LIMIT`] and one that fails or gets no answer does not
     /// hold the quit (the server rolls back when the session closes). A
     /// failed COMMIT still stops it.
@@ -4534,16 +4568,21 @@ impl Workspace {
         action: String,
         tabs: Vec<OpenTab>,
         then: Then,
-        quitting: bool,
+        asking: Asking,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let quitting = asking == Asking::Quitting;
         let losses: Vec<(String, Loss)> = tabs
             .iter()
             .flat_map(|tab| {
                 let title = tab.title(cx).to_string();
                 tab.losses(cx)
                     .into_iter()
+                    .filter(|loss| {
+                        asking != Asking::Transactions
+                            || matches!(loss, Loss::Transaction | Loss::FailedTransaction)
+                    })
                     .map(move |loss| (title.clone(), loss))
             })
             .collect();
@@ -4565,7 +4604,7 @@ impl Workspace {
                 if let Some(then) = then.borrow_mut().take() {
                     let tabs = tabs.clone();
                     let _ = workspace.update(cx, |this, cx| {
-                        this.finish_then(end, tabs, then, quitting, window, cx)
+                        this.finish_then(end, tabs, then, asking, window, cx)
                     });
                 }
             },
@@ -4651,17 +4690,18 @@ impl Workspace {
     /// Ends the transactions of `tabs` (commits them with `Some(true)`),
     /// waits for the server, discards the pending changes, then runs
     /// `then`. When a COMMIT or ROLLBACK fails, nothing else is done, but
-    /// for a ROLLBACK when `quitting` (see [`Self::ask_then`]).
+    /// for a ROLLBACK when quitting (see [`Self::ask_then`]). Pending changes
+    /// are kept when only the transactions end ([`Asking::Transactions`]).
     fn finish_then(
         &mut self,
         end: Option<bool>,
         tabs: Vec<OpenTab>,
         then: Then,
-        quitting: bool,
+        asking: Asking,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rolling_back_to_quit = quitting && end == Some(false);
+        let rolling_back_to_quit = asking == Asking::Quitting && end == Some(false);
         let limit = rolling_back_to_quit.then_some(QUIT_ROLLBACK_LIMIT);
         let endings: Vec<Task<Result<(), String>>> = match end {
             Some(commit) => tabs
@@ -4671,10 +4711,16 @@ impl Workspace {
                 .collect(),
             None => Vec::new(),
         };
-        let discarded: Vec<Entity<DataTab>> =
-            tabs.iter().filter_map(OpenTab::data).cloned().collect();
-        let queries: Vec<Entity<QueryTab>> =
-            tabs.iter().filter_map(OpenTab::query).cloned().collect();
+        // Pending changes go with the sessions, not with a transaction alone.
+        let kept = asking == Asking::Transactions;
+        let discarded: Vec<Entity<DataTab>> = (tabs.iter().filter(|_| !kept))
+            .filter_map(OpenTab::data)
+            .cloned()
+            .collect();
+        let queries: Vec<Entity<QueryTab>> = (tabs.iter().filter(|_| !kept))
+            .filter_map(OpenTab::query)
+            .cloned()
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
             let mut failures = Vec::new();
             for ending in endings {

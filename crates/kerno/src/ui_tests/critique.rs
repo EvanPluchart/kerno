@@ -1030,8 +1030,9 @@ fn the_transaction_badge_goes_when_it_ends(cx: &mut TestAppContext) {
         assert_eq!(k3_run(&app, cx, "commit"), ["done"], "{engine:?}");
         gone(&app, cx, "COMMIT typed");
 
-        // Moved off its session without a question (the schema tree's "Set as default", until
-        // K5): the session is closed with its transaction, and the next one is dated anew.
+        // Moved off its session by the setter itself (what follows the question of the picker
+        // and of "Set as default", K5): the session is closed with its transaction, and the
+        // next one is dated anew.
         app.open_transaction(cx, "select 1 as kerno_ui_k4_moved");
         later(&app, cx, 30);
         let tab = app.tab(cx);
@@ -1385,4 +1386,377 @@ fn restored_tabs_show_no_transaction(cx: &mut TestAppContext) {
     }
     assert!(!ages_refreshing(&app, cx));
     assert!(!app.status_says(cx, "transaction"));
+}
+
+// K5: switching to auto-commit or "Set as default" ends the transaction with a question (C15) --
+
+/// Runs `sql` in the active tab, in place of its text, answering the environment's
+/// confirmations (production asks before every execution, twice before a write), and gives
+/// what it produced.
+fn k5_run(app: &Fixture, cx: &mut TestAppContext, sql: &str) -> Vec<String> {
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, sql);
+    app.press(cx, &["secondary-enter"]);
+    while app.has(cx, "sql-confirm") {
+        app.click(cx, "sql-confirm");
+    }
+    app.wait_until(cx, sql, |app, cx| {
+        !app.running(cx) && !app.outcomes(cx).is_empty()
+    });
+    app.outcomes(cx)
+}
+
+fn manual_commit(app: &Fixture, cx: &mut TestAppContext) -> bool {
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.read(cx).manual_commit())
+}
+
+/// What the engine's `BEGIN` is.
+fn k5_begin(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "begin",
+        Engine::MySql | Engine::MariaDb => "start transaction",
+    }
+}
+
+/// C15: switching a tab to auto-commit with its transaction open asks how to end it (the
+/// palette's command, its key and the main toolbar's menu, and the tab's own menu): Enter and
+/// Cancel keep the mode and the transaction; Commit commits, then switches, and the next
+/// statement is committed as it runs.
+#[gpui_kit::test]
+fn switching_to_auto_commit_with_a_transaction_asks(cx: &mut TestAppContext) {
+    use kerno_core::TxState::{Idle, Open};
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = quit_table(engine, "kerno_ui_k5_auto");
+        let count = || on_server(engine, "SELECT count(*) FROM kerno_ui_k5_auto.t");
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        app.open_transaction(cx, "insert into kerno_ui_k5_auto.t values (1)");
+
+        app.dispatch(cx, actions::ToggleCommitMode);
+        for line in [
+            "Switch “Query 1” to auto-commit?",
+            "“Query 1”: a transaction is open.",
+        ] {
+            assert!(app.shows_label(cx, line), "{engine:?}: {line}");
+        }
+        app.press(cx, &["enter"]);
+        assert!(
+            app.has(cx, "end-question"),
+            "{engine:?}: Enter never answers"
+        );
+        app.click(cx, "end-cancel");
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert!(manual_commit(&app, cx), "{engine:?}: the mode is kept");
+        assert_eq!(app.tx_state(cx), Open, "{engine:?}: the transaction too");
+        assert_eq!(count(), "0", "{engine:?}");
+
+        // The tab's own menu goes the same way.
+        let tab = app.tab(cx);
+        app.step(cx, |_, cx| {
+            tab.update(cx, |tab, cx| tab.request_manual_commit(false, cx))
+        });
+        assert!(app.has(cx, "end-question"), "{engine:?}: the tab's menu");
+        app.click(cx, "end-commit");
+        app.wait_until(cx, "the commit, then the switch", |app, cx| {
+            app.tx_state(cx) == Idle && !manual_commit(app, cx)
+        });
+        assert_eq!(count(), "1", "{engine:?}");
+        // Auto-commit from now on: the next statement is committed as it runs.
+        assert_eq!(
+            k5_run(&app, cx, "insert into kerno_ui_k5_auto.t values (2)"),
+            ["done, 1 affected"],
+            "{engine:?}"
+        );
+        assert_eq!(app.tx_state(cx), Idle, "{engine:?}");
+        assert_eq!(count(), "2", "{engine:?}");
+        // Without a transaction, no question.
+        app.dispatch(cx, actions::ToggleCommitMode);
+        assert!(manual_commit(&app, cx), "{engine:?}");
+        app.dispatch(cx, actions::ToggleCommitMode);
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert!(!manual_commit(&app, cx), "{engine:?}");
+    }
+}
+
+/// C15: switching to auto-commit ends the transaction only. The session stays, so the edits
+/// waiting in a result are neither asked about nor discarded.
+#[gpui_kit::test]
+fn switching_to_auto_commit_keeps_the_edits_waiting_in_a_result(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let _scratch = g8_table(Engine::Postgres, "kerno_ui_k5_edits");
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(
+        cx,
+        "select id, name, qty from kerno_ui_k5_edits.t order by id",
+    );
+    assert_eq!(app.result_verdict(cx), None);
+    app.type_in_result(cx, 0, 2, "uno");
+    assert_eq!(app.result_pending(cx), 1);
+
+    app.dispatch(cx, actions::ToggleCommitMode);
+    assert!(app.shows_label(cx, "“Query 1”: a transaction is open."));
+    let waiting = "“Query 1”: 1 pending change is discarded.";
+    assert!(!app.shows_label(cx, waiting), "only the transaction");
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the rollback, then the switch", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle && !manual_commit(app, cx)
+    });
+    assert_eq!(app.result_pending(cx), 1, "the edit is still waiting");
+}
+
+/// C15: a failed transaction can only be rolled back: the question offers no Commit that
+/// works, and Roll back ends it, then switches.
+#[gpui_kit::test]
+fn switching_to_auto_commit_with_a_failed_transaction_only_rolls_back(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, "select 1 as kerno_ui_k5_failed");
+    assert_eq!(k5_run(&app, cx, "select 1/0"), ["failed [22012]"]);
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Failed);
+    app.dispatch(cx, actions::ToggleCommitMode);
+    assert!(app.shows_label(
+        cx,
+        "“Query 1”: a statement failed in its transaction, which can only be rolled back."
+    ));
+    // Commit is greyed: a click does nothing.
+    app.click(cx, "end-commit");
+    assert!(app.has(cx, "end-question"));
+    assert!(manual_commit(&app, cx));
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the rollback, then the switch", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle && !manual_commit(app, cx)
+    });
+}
+
+/// C15: a transaction begun by a typed `BEGIN` in auto-commit is not lost by switching to manual
+/// commit: no question, the transaction, its badge and its log go on.
+#[gpui_kit::test]
+fn switching_to_manual_commit_keeps_a_typed_begin(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = quit_table(engine, "kerno_ui_k5_manual");
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+        assert_eq!(k5_run(&app, cx, k5_begin(engine)), ["done"], "{engine:?}");
+        let insert = "insert into kerno_ui_k5_manual.t values (1)";
+        assert_eq!(k5_run(&app, cx, insert), ["done, 1 affected"], "{engine:?}");
+
+        app.dispatch(cx, actions::ToggleCommitMode);
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert!(manual_commit(&app, cx), "{engine:?}");
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        assert!(app.status_says(cx, "transaction open"), "{engine:?}");
+        let log = cx.update(|cx| {
+            tab.read(cx)
+                .transaction_log()
+                .iter()
+                .map(|entry| entry.sql.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(log, [k5_begin(engine), insert], "{engine:?}");
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_k5_manual.t"),
+            "0",
+            "{engine:?}"
+        );
+        roll_back(&app, cx);
+    }
+}
+
+/// C15: the schema tree's "Set as default" moves the active tab as the toolbar's picker does:
+/// at once without a transaction; with one, after the question (Cancel keeps the place and
+/// the transaction; Commit commits, then moves).
+#[gpui_kit::test]
+fn set_as_default_asks_before_rolling_back(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let (first, second) = ("kerno_ui_k5_default", "kerno_ui_k5_default_b");
+        let (drop_first, create_first) = scratch_schema(engine, first);
+        let (drop_second, create_second) = scratch_schema(engine, second);
+        let _scratch = Scratch::new(
+            engine,
+            &[&drop_first, &drop_second],
+            &[
+                &create_first,
+                &create_second,
+                "CREATE TABLE kerno_ui_k5_default.t (id INT PRIMARY KEY)",
+            ],
+        );
+        let count = || on_server(engine, "SELECT count(*) FROM kerno_ui_k5_default.t");
+        let (path, other, kind): (Vec<&str>, Vec<&str>, &str) = match engine {
+            Engine::Postgres => (vec!["kerno", first], vec!["kerno", second], "schema"),
+            Engine::MySql | Engine::MariaDb => (vec![first], vec![second], "database"),
+        };
+        let place = |app: &Fixture, cx: &mut TestAppContext| {
+            let tab = app.tab(cx);
+            cx.update(|cx| {
+                tab.read(cx).target().and_then(|target| match engine {
+                    Engine::Postgres => target.schema.clone(),
+                    Engine::MySql | Engine::MariaDb => target.database.clone(),
+                })
+            })
+        };
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        app.open_path(cx, &other);
+        app.open_path(cx, &path);
+
+        // No transaction: no question, the tab moves.
+        app.act(cx, Action::SetDefault, &path);
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert_eq!(place(&app, cx).as_deref(), Some(first), "{engine:?}");
+
+        app.open_transaction(cx, "insert into kerno_ui_k5_default.t values (1)");
+        app.act(cx, Action::SetDefault, &other);
+        for line in [
+            format!("Switch “Query 1” to the {kind} “{second}”?"),
+            "“Query 1”: a transaction is open.".to_string(),
+        ] {
+            assert!(app.shows_label(cx, &line), "{engine:?}: {line}");
+        }
+        app.click(cx, "end-cancel");
+        assert_eq!(place(&app, cx).as_deref(), Some(first), "{engine:?}");
+        assert_eq!(
+            app.tx_state(cx),
+            kerno_core::TxState::Open,
+            "{engine:?}: kept"
+        );
+
+        app.act(cx, Action::SetDefault, &other);
+        app.click(cx, "end-commit");
+        app.wait_until(cx, "the commit, then the move", |app, cx| {
+            app.tx_state(cx) == kerno_core::TxState::Idle
+                && place(app, cx).as_deref() == Some(second)
+        });
+        assert_eq!(count(), "1", "{engine:?}");
+    }
+}
+
+/// C15: the environment's idle rule watches a transaction begun by a `BEGIN` typed in an
+/// auto-commit tab, as it does in manual commit: one that only read is left alone, one that
+/// wrote is rolled back once idle for the period (production: 10 minutes), on the simulated
+/// clock.
+#[gpui_kit::test]
+fn an_explicit_begin_in_auto_commit_is_rolled_back_when_idle(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = quit_table(engine, "kerno_ui_k5_idle");
+        let config = ConnectionConfig {
+            environment: kerno_core::environment::PRODUCTION.into(),
+            ..testing::config(engine)
+        };
+        let app = connected_as(cx, config);
+        app.press(cx, &["secondary-t"]);
+        let tab = app.tab(cx);
+        // Production starts in manual commit.
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+        let rolled_back = |cx: &mut TestAppContext| {
+            cx.update(|cx| tab.read(cx).messages())
+                .iter()
+                .any(|message| message.contains("left idle for 10 minutes: it was rolled back"))
+        };
+
+        // One that only read is left alone.
+        assert_eq!(k5_run(&app, cx, k5_begin(engine)), ["done"], "{engine:?}");
+        assert_eq!(
+            k5_run(&app, cx, "select 1 as kerno_ui_k5_read"),
+            ["1 rows"],
+            "{engine:?}"
+        );
+        later(&app, cx, 601);
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        assert!(!rolled_back(cx), "{engine:?}");
+
+        // One that wrote is rolled back once idle for the period.
+        assert_eq!(
+            k5_run(&app, cx, "insert into kerno_ui_k5_idle.t values (1)"),
+            ["done, 1 affected"],
+            "{engine:?}"
+        );
+        later(&app, cx, 590);
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        later(&app, cx, 11);
+        app.wait_until(cx, "the idle rollback", |app, cx| {
+            app.tx_state(cx) == kerno_core::TxState::Idle && rolled_back(cx)
+        });
+        assert!(!app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        assert!(!manual_commit(&app, cx), "{engine:?}: still auto-commit");
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_k5_idle.t"),
+            "0",
+            "{engine:?}"
+        );
+    }
+}
+
+/// C15: a transaction begun by a `BEGIN` typed in auto-commit has a log of its own: nothing of
+/// one that ended out of sight (its connection closed under it, with no statement of the tab
+/// to see it) stays in it, so the idle rule never counts an earlier transaction's writes.
+#[gpui_kit::test]
+fn a_typed_begin_after_a_closed_connection_starts_its_own_log(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = quit_table(engine, "kerno_ui_k5_lost");
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+        let log = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                tab.read(cx)
+                    .transaction_log()
+                    .iter()
+                    .map(|entry| entry.sql.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let begin = k5_begin(engine);
+        assert_eq!(k5_run(&app, cx, begin), ["done"], "{engine:?}");
+        let insert = "insert into kerno_ui_k5_lost.t values (1)";
+        assert_eq!(k5_run(&app, cx, insert), ["done, 1 affected"], "{engine:?}");
+        assert_eq!(log(cx), [begin, insert], "{engine:?}");
+        // Closed by something that could not ask (a lost connection does the same).
+        let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+        app.step(cx, |_, cx| {
+            app.connections
+                .update(cx, |connections, cx| connections.disconnect(&id, cx))
+        });
+        app.wait_until(cx, "the transaction to be reported lost", |app, cx| {
+            app.tx_state(cx) == kerno_core::TxState::Idle
+                && app.status(cx, 0) == Status::Disconnected
+        });
+        app.step(cx, |_, cx| {
+            app.connections
+                .update(cx, |connections, cx| connections.connect(&id, cx))
+        });
+        app.wait_until(cx, "the connection", |app, cx| {
+            matches!(app.status(cx, 0), Status::Connected { .. })
+        });
+        assert_eq!(k5_run(&app, cx, begin), ["done"], "{engine:?}");
+        let read = "select 1 as kerno_ui_k5_lost";
+        assert_eq!(k5_run(&app, cx, read), ["1 rows"], "{engine:?}");
+        assert_eq!(log(cx), [begin, read], "{engine:?}");
+        roll_back(&app, cx);
+    }
 }

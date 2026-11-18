@@ -504,6 +504,9 @@ pub enum QueryTabEvent {
     /// The user chose another connection, database or schema while a
     /// transaction is open: the window asks how to end it, then switches.
     SwitchTarget(Option<Target>),
+    /// The user chose auto-commit while a transaction is open (C15): the
+    /// window asks how to end it, then switches.
+    SwitchToAutoCommit,
     /// Open a query tab holding `sql`, on this tab's connection, database
     /// and schema (statements written from rows of a result).
     OpenQuery { title: String, sql: String },
@@ -2836,12 +2839,20 @@ impl QueryTab {
             })
             .detach();
         }
-        // In manual commit the statement joins the transaction's log; one
-        // that ended the transaction (COMMIT typed, MySQL's DDL) empties it.
-        if self.manual_commit && !auto {
+        // A statement run in a transaction joins its log, in either commit
+        // mode (a `BEGIN` typed in auto-commit begins one, which the idle
+        // rule watches too, C15); one that ended the transaction (COMMIT
+        // typed, MySQL's DDL) empties it.
+        if !auto {
             if self.tx_state() == TxState::Idle {
                 self.tx_log.clear();
             } else {
+                // This statement began it (none was dated yet): nothing of
+                // an earlier one, ended out of sight (a lost session, a
+                // failed source rolled back), stays in its log.
+                if self.tx_started.is_none() {
+                    self.tx_log.clear();
+                }
                 self.tx_log.push(TxLogEntry::new(
                     &statement.sql,
                     self.lex_rules(cx),
@@ -3187,19 +3198,34 @@ impl QueryTab {
     }
 
     /// Statements run in a transaction the user ends (`true`), or each is
-    /// committed as it runs.
+    /// committed as it runs. Switches at once: what the user picks goes
+    /// through [`Self::request_manual_commit`].
     pub fn set_manual_commit(&mut self, manual: bool, cx: &mut Context<Self>) {
         self.manual_commit = manual;
         cx.notify();
     }
 
+    /// What every switch of the commit mode does (both toolbars, the status
+    /// bar, the palette and its key): to auto-commit with a transaction
+    /// open, lets the window ask how to end it first (C15), since later
+    /// statements would join it unseen; otherwise switches now. To manual
+    /// commit nothing is lost: an open transaction goes on.
+    pub fn request_manual_commit(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if !manual && self.manual_commit && self.tx_state() != TxState::Idle {
+            cx.emit(QueryTabEvent::SwitchToAutoCommit);
+        } else {
+            self.set_manual_commit(manual, cx);
+        }
+    }
+
     /// The period after which the environment rolls back this tab's open
-    /// transaction: in manual commit, while nothing runs, once a statement
-    /// of the transaction changed something (DBeaver's condition, ported
-    /// from `org.jkiss.dbeaver.model/.../runtime/jobs/DataSourceMonitorJob.java`:
+    /// transaction: in either commit mode (a `BEGIN` typed in auto-commit
+    /// too, C15), while nothing runs, once a statement of the transaction
+    /// changed something (DBeaver's condition, ported from
+    /// `org.jkiss.dbeaver.model/.../runtime/jobs/DataSourceMonitorJob.java`:
     /// a transaction that only read is left alone).
     fn idle_period(&self, cx: &App) -> Option<u32> {
-        if !self.manual_commit || self.running() || self.tx_state() == TxState::Idle {
+        if self.running() || self.tx_state() == TxState::Idle {
             return None;
         }
         let rules = self.lex_rules(cx);
@@ -5654,7 +5680,7 @@ impl QueryTab {
                                     "Auto-commit: every statement is committed as it runs",
                                 )
                                 .on_click(move |_, _, cx| {
-                                    auto.update(cx, |this, cx| this.set_manual_commit(false, cx))
+                                    auto.update(cx, |this, cx| this.request_manual_commit(false, cx))
                                 }),
                             )
                             .item(
@@ -5662,7 +5688,7 @@ impl QueryTab {
                                     "Manual commit: statements run in a transaction you end",
                                 )
                                 .on_click(move |_, _, cx| {
-                                    manual.update(cx, |this, cx| this.set_manual_commit(true, cx))
+                                    manual.update(cx, |this, cx| this.request_manual_commit(true, cx))
                                 }),
                             )
                         }
