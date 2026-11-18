@@ -834,3 +834,555 @@ fn set_search_path_in_a_tab_moves_its_picker_and_survives_a_reconnect(cx: &mut T
     }
     k3_moves_and_survives_a_reconnect(cx, Engine::Postgres, "kerno_ui_k3_other");
 }
+
+// K4: an open transaction is visible on every tab, with its age (C15, C21) ---------
+
+/// Whether the window redraws the transactions' ages (a timer alive only while one is open).
+fn ages_refreshing(app: &Fixture, cx: &mut TestAppContext) -> bool {
+    cx.update(|cx| app.workspace.read(cx).ages_refreshing())
+}
+
+/// What the transaction badge `id` says (its tooltip, for screen readers too); `None` when it
+/// is not drawn.
+fn badge(app: &Fixture, cx: &mut TestAppContext, id: (&'static str, usize)) -> Option<String> {
+    app.step(cx, |window, _| {
+        window
+            .try_find(id)
+            .map(|badge| badge.description().unwrap_or_default().to_string())
+    })
+}
+
+/// The tooltip of a badge with the default shortcuts of Commit (⌃4) and Roll back (⌃8), as the
+/// kit writes them on this system.
+fn tip(state: kerno_core::TxState, age: Duration) -> String {
+    let keys = |stroke: &'static str| {
+        gpui_kit::component::kbd::Kbd::format(&gpui_kit::Keystroke::parse(stroke).unwrap())
+    };
+    crate::tabs::transaction_tip(
+        state,
+        Some(age),
+        Some(&keys("ctrl-4")),
+        Some(&keys("ctrl-8")),
+    )
+}
+
+/// What the badge `id` said in the last frame the window drew by itself (`badge` draws one
+/// first): what the user sees when nothing but the app made the window draw.
+fn drawn(app: &Fixture, cx: &mut TestAppContext, id: (&'static str, usize)) -> Option<String> {
+    cx.update_window(app.window.into(), |_, window, _| {
+        window
+            .try_find(id)
+            .map(|badge| badge.description().unwrap_or_default().to_string())
+    })
+    .unwrap()
+}
+
+/// Moves the executor's clock (the ages, the ticker), then draws a frame.
+fn later(app: &Fixture, cx: &mut TestAppContext, seconds: u64) {
+    cx.executor().advance_clock(Duration::from_secs(seconds));
+    app.step(cx, |_, _| ());
+}
+
+/// C15: a transaction left open in a tab is seen from another tab: a badge on its tab in every
+/// layout of the tabs and in the list of every tab, its age and the real shortcuts of Commit and
+/// Roll back in its tooltip; the status bar of the tab on screen says nothing of it, the tab's
+/// own says its age. The ages are redrawn only while a transaction is open.
+#[gpui_kit::test]
+fn a_transaction_is_shown_on_its_tab_while_another_is_active(cx: &mut TestAppContext) {
+    use kerno_core::TxState::Open;
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        assert!(
+            !ages_refreshing(&app, cx),
+            "{engine:?}: no transaction, no timer"
+        );
+        assert_eq!(badge(&app, cx, ("tab-tx", 0)), None, "{engine:?}");
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_shown");
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::ZERO)),
+            "{engine:?}"
+        );
+        assert!(ages_refreshing(&app, cx), "{engine:?}");
+
+        // Another tab on screen: the first keeps its badge, the second has none, and the status
+        // bar speaks of the second.
+        app.press(cx, &["secondary-t"]);
+        assert_eq!(app.active(cx), Some(1), "{engine:?}");
+        later(&app, cx, 2 * 60 + 5);
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::from_secs(125))),
+            "{engine:?}"
+        );
+        assert_eq!(badge(&app, cx, ("tab-tx", 1)), None, "{engine:?}");
+        assert!(!app.status_says(cx, "transaction"), "{engine:?}");
+        for layout in [
+            &actions::TabsOnSeveralRows as &dyn gpui_kit::Action,
+            &actions::TabsAtTheSide,
+            &actions::TabsOnOneRow,
+        ] {
+            app.step(cx, |window, cx| {
+                window.dispatch_action(layout.boxed_clone(), cx)
+            });
+            assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}: {layout:?}");
+            assert!(!app.has(cx, ("tab-tx", 1usize)), "{engine:?}: {layout:?}");
+        }
+        app.click(cx, "tabs-overflow");
+        assert_eq!(
+            badge(&app, cx, ("all-tabs-tx", 0)),
+            Some(tip(Open, Duration::from_secs(125))),
+            "{engine:?}"
+        );
+        assert_eq!(badge(&app, cx, ("all-tabs-tx", 1)), None, "{engine:?}");
+        app.press(cx, &["escape"]);
+
+        // Back on the first tab: its status bar says for how long.
+        app.dispatch(cx, actions::PreviousTab);
+        assert_eq!(app.active(cx), Some(0), "{engine:?}");
+        assert!(
+            app.status_bar(cx)
+                .contains(&"transaction open · 2 min".to_string()),
+            "{engine:?}: {:?}",
+            app.status_bar(cx)
+        );
+        // Without any input, the timer draws the window again with the new age.
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert_eq!(
+            drawn(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::from_secs(185))),
+            "{engine:?}"
+        );
+
+        roll_back(&app, cx);
+        assert_eq!(badge(&app, cx, ("tab-tx", 0)), None, "{engine:?}");
+        assert!(
+            !ages_refreshing(&app, cx),
+            "{engine:?}: the timer went with it"
+        );
+        assert!(!app.status_says(cx, "transaction"), "{engine:?}");
+    }
+}
+
+/// C15: the badge, the age and the timer go however the transaction ends: Commit, a `COMMIT` or
+/// `ROLLBACK` typed after a `BEGIN` typed in auto-commit (the age starting at the `BEGIN`),
+/// closing the tab, disconnecting.
+#[gpui_kit::test]
+fn the_transaction_badge_goes_when_it_ends(cx: &mut TestAppContext) {
+    use kerno_core::TxState::{Idle, Open};
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let gone = |app: &Fixture, cx: &mut TestAppContext, how: &str| {
+            assert_eq!(app.tx_state(cx), Idle, "{engine:?}: {how}");
+            assert_eq!(badge(app, cx, ("tab-tx", 0)), None, "{engine:?}: {how}");
+            assert!(!ages_refreshing(app, cx), "{engine:?}: {how}");
+            assert!(!app.status_says(cx, "transaction"), "{engine:?}: {how}");
+        };
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+
+        // Commit.
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_commit");
+        later(&app, cx, 30);
+        app.dispatch(cx, actions::CommitTransaction);
+        app.wait_until(cx, "the commit", |app, cx| app.tx_state(cx) == Idle);
+        gone(&app, cx, "Commit");
+
+        // Typed in auto-commit: `BEGIN` opens it, its age starts there; `ROLLBACK` ends it.
+        let tab = app.tab(cx);
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+        let begin = match engine {
+            Engine::Postgres => "begin",
+            Engine::MySql | Engine::MariaDb => "start transaction",
+        };
+        assert_eq!(k3_run(&app, cx, begin), ["done"], "{engine:?}");
+        assert_eq!(app.tx_state(cx), Open, "{engine:?}");
+        assert!(ages_refreshing(&app, cx), "{engine:?}");
+        later(&app, cx, 42);
+        assert!(
+            app.status_bar(cx)
+                .contains(&"transaction open · 42 s".to_string()),
+            "{engine:?}: {:?}",
+            app.status_bar(cx)
+        );
+        assert_eq!(k3_run(&app, cx, "select 1"), ["1 rows"], "{engine:?}");
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::from_secs(42))),
+            "{engine:?}: a statement does not restart it"
+        );
+        assert_eq!(k3_run(&app, cx, "rollback"), ["done"], "{engine:?}");
+        gone(&app, cx, "ROLLBACK typed");
+        // The next one starts its own age.
+        assert_eq!(k3_run(&app, cx, begin), ["done"], "{engine:?}");
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::ZERO)),
+            "{engine:?}"
+        );
+        assert_eq!(k3_run(&app, cx, "commit"), ["done"], "{engine:?}");
+        gone(&app, cx, "COMMIT typed");
+
+        // Moved off its session without a question (the schema tree's "Set as default", until
+        // K5): the session is closed with its transaction, and the next one is dated anew.
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_moved");
+        later(&app, cx, 30);
+        let tab = app.tab(cx);
+        let target = cx.update(|cx| tab.read(cx).target().cloned());
+        app.step(cx, |_, cx| {
+            tab.update(cx, |tab, cx| tab.set_target(None, cx))
+        });
+        gone(&app, cx, "moved");
+        app.step(cx, |_, cx| {
+            tab.update(cx, |tab, cx| tab.set_target(target, cx))
+        });
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_moved_again");
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(Open, Duration::ZERO)),
+            "{engine:?}"
+        );
+        roll_back(&app, cx);
+
+        // Disconnecting asks, then rolls back.
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_disconnect");
+        assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        app.dispatch(cx, actions::DisconnectTabConnection);
+        app.click(cx, "end-rollback");
+        app.wait_until(cx, "the disconnection", |app, cx| {
+            app.status(cx, 0) == Status::Disconnected
+        });
+        gone(&app, cx, "disconnected");
+
+        // Closing the tab asks, then rolls back: no timer is left for a tab that is gone.
+        app.step(cx, |window, cx| {
+            window.double_click(("connection", 0usize), cx)
+        });
+        app.wait_until(cx, "the connection", |app, cx| {
+            matches!(app.status(cx, 0), Status::Connected { .. })
+        });
+        // A new tab, which has the keyboard (the sidebar took it).
+        app.press(cx, &["secondary-t"]);
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_close");
+        assert!(app.has(cx, ("tab-tx", 1usize)), "{engine:?}");
+        assert!(ages_refreshing(&app, cx), "{engine:?}");
+        app.press(cx, &["secondary-w"]);
+        assert!(app.shows_label(cx, "Roll back and close"), "{engine:?}");
+        app.click(cx, "ok");
+        assert_eq!(app.titles(cx), ["Query 1"], "{engine:?}");
+        assert!(!ages_refreshing(&app, cx), "{engine:?}: closed");
+    }
+}
+
+/// C15: a transaction that ends in a tab not on screen (its script commits once the user went
+/// to another tab) leaves the strip as it ends, without anything else drawing the window.
+#[gpui_kit::test]
+fn a_transaction_ended_behind_another_tab_leaves_the_strip(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_behind");
+        let first = app.tab(cx);
+        let sleep = match engine {
+            Engine::Postgres => "select pg_sleep(1) as kerno_ui_k4_behind;\ncommit",
+            Engine::MySql | Engine::MariaDb => "select sleep(1) as kerno_ui_k4_behind;\ncommit",
+        };
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, sleep);
+        app.press(cx, &["secondary-shift-enter"]);
+        app.press(cx, &["secondary-t"]);
+        assert_eq!(app.active(cx), Some(1), "{engine:?}");
+        assert!(drawn(&app, cx, ("tab-tx", 0)).is_some(), "{engine:?}");
+        app.wait_until(cx, "the commit behind the other tab", |app, cx| {
+            cx.update(|cx| first.read(cx).tx_state()) == kerno_core::TxState::Idle
+                && drawn(app, cx, ("tab-tx", 0)).is_none()
+        });
+        assert!(!ages_refreshing(&app, cx), "{engine:?}");
+    }
+}
+
+/// C15: a transaction is dated from its `BEGIN`, not from the end of the run that opened it: the
+/// clock moved while a later statement ran counts. A `BEGIN` typed at the head of a script, and
+/// the one manual commit sends before the first statement.
+#[gpui_kit::test]
+fn a_transaction_begun_in_a_script_is_dated_from_its_begin(cx: &mut TestAppContext) {
+    use kerno_core::TxState::Open;
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let (begin, sleep) = match engine {
+            Engine::Postgres => ("begin", "select pg_sleep(2) as kerno_ui_k4_script"),
+            Engine::MySql | Engine::MariaDb => {
+                ("start transaction", "select sleep(2) as kerno_ui_k4_script")
+            }
+        };
+        for manual in [false, true] {
+            app.press(cx, &["secondary-t"]);
+            let tab = app.tab(cx);
+            cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(manual, cx)));
+            let script = if manual {
+                sleep.to_string()
+            } else {
+                format!("{begin};\n{sleep}")
+            };
+            app.type_text(cx, &script);
+            app.press(cx, &["secondary-shift-enter"]);
+            // The tab has dated the transaction, its last statement still runs.
+            app.wait_until(cx, "the transaction dated, the run going on", |app, cx| {
+                cx.update(|cx| tab.read(cx).transaction_age(cx)).is_some() && app.running(cx)
+            });
+            cx.executor().advance_clock(Duration::from_secs(20));
+            app.wait_until(cx, "the end of the run", |app, cx| !app.running(cx));
+            let index = app.active(cx).unwrap();
+            assert_eq!(
+                badge(&app, cx, ("tab-tx", index)),
+                Some(tip(Open, Duration::from_secs(20))),
+                "{engine:?}, manual commit: {manual}"
+            );
+            roll_back(&app, cx);
+        }
+    }
+}
+
+/// C15: a transaction a statement made fail (PostgreSQL) keeps its badge, which says so, and the
+/// age of the transaction it was, back to a savepoint too; Roll back ends it.
+#[gpui_kit::test]
+fn a_failed_transaction_keeps_its_badge_and_its_age(cx: &mut TestAppContext) {
+    use kerno_core::TxState::Failed;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, "select 1 as kerno_ui_k4_failed");
+    assert_eq!(k3_run(&app, cx, "savepoint kerno_ui_k4_sp"), ["done"]);
+    later(&app, cx, 90);
+    assert_eq!(k3_run(&app, cx, "select 1/0"), ["failed [22012]"]);
+    assert_eq!(app.tx_state(cx), Failed);
+    assert_eq!(
+        badge(&app, cx, ("tab-tx", 0)),
+        Some(tip(Failed, Duration::from_secs(90)))
+    );
+    assert!(
+        app.status_bar(cx)
+            .contains(&"transaction failed: roll back · 1 min".to_string()),
+        "{:?}",
+        app.status_bar(cx)
+    );
+    // Back to the savepoint: open again, the same transaction, the same age.
+    assert_eq!(
+        k3_run(&app, cx, "rollback to savepoint kerno_ui_k4_sp"),
+        ["done"]
+    );
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Open);
+    assert_eq!(
+        badge(&app, cx, ("tab-tx", 0)),
+        Some(tip(kerno_core::TxState::Open, Duration::from_secs(90)))
+    );
+    roll_back(&app, cx);
+    assert_eq!(badge(&app, cx, ("tab-tx", 0)), None);
+    assert!(!ages_refreshing(&app, cx));
+}
+
+/// C15: a connection lost under a tab's transaction (the server rolled it back) takes its badge
+/// away, as soon as the tab learns it.
+#[gpui_kit::test]
+fn a_lost_connection_takes_the_badge_away(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let own = match engine {
+            Engine::Postgres => "select pg_backend_pid()::text",
+            Engine::MySql | Engine::MariaDb => "select connection_id()",
+        };
+        app.open_transaction(cx, own);
+        let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+        assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        on_server(
+            engine,
+            &match engine {
+                Engine::Postgres => format!("SELECT pg_terminate_backend({id})"),
+                Engine::MySql | Engine::MariaDb => format!("KILL {id}"),
+            },
+        );
+        k3_run(&app, cx, "select 1");
+        app.wait_until(cx, "the transaction to be reported lost", |app, cx| {
+            app.tx_state(cx) == kerno_core::TxState::Idle && !app.has(cx, ("tab-tx", 0usize))
+        });
+        assert!(!ages_refreshing(&app, cx), "{engine:?}");
+        // The connection comes back; the tab's next transaction starts its own age.
+        app.wait_until(cx, "the connection to come back", |app, cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            matches!(app.status(cx, 0), Status::Connected { .. })
+        });
+        later(&app, cx, 30);
+        app.open_transaction(cx, "select 1 as kerno_ui_k4_lost");
+        assert_eq!(
+            badge(&app, cx, ("tab-tx", 0)),
+            Some(tip(kerno_core::TxState::Open, Duration::ZERO)),
+            "{engine:?}"
+        );
+        roll_back(&app, cx);
+    }
+}
+
+/// C15: the environment's "close idle transactions" rule rolls back a transaction of a tab not
+/// on screen: its badge goes from the strip at once, and the timer with it.
+#[gpui_kit::test]
+fn the_idle_rule_takes_the_badge_off_a_tab_not_shown(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let _scratch = quit_table(engine, "kerno_ui_k4_idle");
+        let config = ConnectionConfig {
+            environment: kerno_core::environment::PRODUCTION.into(),
+            ..testing::config(engine)
+        };
+        let app = connected_as(cx, config);
+        app.press(cx, &["secondary-t"]);
+        app.type_text(cx, "insert into kerno_ui_k4_idle.t values (1)");
+        app.press(cx, &["secondary-enter"]);
+        // Production asks twice before a write.
+        app.click(cx, "sql-confirm");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the insert", |app, cx| {
+            app.outcomes(cx) == ["done, 1 affected"] && !app.running(cx)
+        });
+        assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        app.press(cx, &["secondary-t"]);
+        later(&app, cx, 590);
+        assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        later(&app, cx, 11);
+        app.wait_until(cx, "the idle rollback", |app, cx| {
+            !app.has(cx, ("tab-tx", 0usize))
+        });
+        assert_eq!(app.active(cx), Some(1), "{engine:?}: never shown");
+        assert!(!ages_refreshing(&app, cx), "{engine:?}");
+        assert_eq!(
+            on_server(engine, "SELECT count(*) FROM kerno_ui_k4_idle.t"),
+            "0",
+            "{engine:?}"
+        );
+    }
+}
+
+/// C15: the badge and the unsaved mark of one tab are two things, and the badge never pushes
+/// the close button away nor over the title's row, in each layout.
+#[gpui_kit::test]
+fn the_badge_and_the_unsaved_mark_stay_apart_from_the_close_button(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    cx.update(|cx| {
+        tab.update(cx, |tab, cx| {
+            tab.set_file("/kerno_ui_k4_a_long_file_name.sql".into(), true, cx)
+        })
+    });
+    app.open_transaction(cx, "select 1 as kerno_ui_k4_unsaved");
+    app.press(cx, &["secondary-t"]);
+    let labels = cx.update(|cx| app.workspace.read(cx).tab_labels(cx));
+    assert_eq!(labels[0], "kerno_ui_k4_a_long_file_name.sql •");
+    for layout in [
+        &actions::TabsOnOneRow as &dyn gpui_kit::Action,
+        &actions::TabsOnSeveralRows,
+        &actions::TabsAtTheSide,
+    ] {
+        app.step(cx, |window, cx| {
+            window.dispatch_action(layout.boxed_clone(), cx)
+        });
+        let (title, badge, close) = app.step(cx, |window, _| {
+            (
+                window.find(("tab-title", 0usize)).bounds(),
+                window.find(("tab-tx", 0usize)).bounds(),
+                window.find(("close-tab", 0usize)).bounds(),
+            )
+        });
+        assert!(
+            badge.size.width > gpui_kit::px(0.) && badge.left() >= title.left(),
+            "{layout:?}: {badge:?} in {title:?}"
+        );
+        assert!(
+            badge.right() <= close.left(),
+            "{layout:?}: the badge {badge:?} before the close button {close:?}"
+        );
+        // Centred on the title's line.
+        assert!(
+            badge.top() >= title.top() && badge.bottom() <= title.bottom(),
+            "{layout:?}: {badge:?} in {title:?}"
+        );
+    }
+    // At the side the title is cut, the badge and the close button stay in the row.
+    let (row, badge, close) = app.step(cx, |window, _| {
+        (
+            window.find(("tab-row", 0usize)).bounds(),
+            window.find(("tab-tx", 0usize)).bounds(),
+            window.find(("close-tab", 0usize)).bounds(),
+        )
+    });
+    assert!(badge.right() <= row.right() && close.right() <= row.right());
+    app.dispatch(cx, actions::TabsOnOneRow);
+    app.dispatch(cx, actions::PreviousTab);
+    roll_back(&app, cx);
+}
+
+/// C15: tabs restored after a restart have no session: no badge, no timer, even on a connected
+/// connection.
+#[gpui_kit::test]
+fn restored_tabs_show_no_transaction(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let storage = memory_storage();
+    let id = storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let tabs: Vec<TabSnapshot> = (0..2)
+        .map(|index| TabSnapshot::Query {
+            title: format!("Query {}", index + 1),
+            sql: "select 1 as kerno_ui_k4_restored".into(),
+            target: Some(Target {
+                connection: id.clone(),
+                database: None,
+                schema: None,
+            }),
+            file: None,
+            unsaved: false,
+            source: None,
+        })
+        .collect();
+    storage.save_tabs(&tabs).unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+    app.step(cx, |window, cx| {
+        window.double_click(("connection", 0usize), cx)
+    });
+    app.wait_until(cx, "the connection", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+    });
+    assert_eq!(app.titles(cx), ["Query 1", "Query 2"]);
+    for index in 0..2usize {
+        assert!(!app.has(cx, ("tab-tx", index)));
+    }
+    assert!(!ages_refreshing(&app, cx));
+    assert!(!app.status_says(cx, "transaction"));
+}

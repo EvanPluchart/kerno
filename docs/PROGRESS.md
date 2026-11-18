@@ -504,3 +504,17 @@ Still open (for the owner):
   PostgreSQL UI test and the driver test fail.
 - Limits and plan errors in the "Done:" line of K3 (`docs/plans/M12.md`).
 
+
+## 2026-11-18 — K4: an open transaction is visible on every tab, with its age (C15, C21)
+
+- A query tab holding a transaction shows a dot after its title (warning, danger once failed) in the strip,
+  the rows, the side list and the list of every tab; its tooltip gives the age and the keymap's shortcuts of
+  Commit and Roll back; the status bar says "transaction open · 4 min". The dot follows the session's own
+  state; the age (`QueryTab::tx_started`, executor clock) starts at the `BEGIN` and a failed transaction keeps
+  it. A 15 s redraw timer lives only while some tab holds a transaction.
+- Nine UI tests (six on PostgreSQL and MySQL) and two unit tests; the contrast test covers the dot's colours
+  on the seven tab surfaces. Each UI test but two was seen failing with a part of the change disabled (the
+  dot, the timer, the list's dot, the dating after `BEGIN` or after a statement, the clear when a session
+  closes); the restored-tabs test is a negative check, the background-tab test a pin. Six status bar checks
+  of older tests now match the start of the item ("transaction open · 12 s").
+- Limits and plan errors in the "Done:" line of K4 (`docs/plans/M12.md`).

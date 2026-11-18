@@ -404,6 +404,9 @@ pub struct QueryTab {
     isolation: Option<IsolationLevel>,
     /// The statements of the open transaction, in manual commit.
     tx_log: Vec<TxLogEntry>,
+    /// When the open transaction began, on the executor's clock (K4); a failed
+    /// one keeps the start of the transaction it was. See `note_transaction`.
+    tx_started: Option<Instant>,
     /// What was typed for each parameter last time, by its label.
     param_values: HashMap<String, String>,
     /// The editor shows where the last statement failed.
@@ -625,6 +628,7 @@ impl QueryTab {
             chosen_isolation: None,
             isolation: None,
             tx_log: Vec::new(),
+            tx_started: None,
             param_values: HashMap::new(),
             error_marked: false,
             file: None,
@@ -1336,6 +1340,8 @@ impl QueryTab {
     /// target, or its connection closed. Results on screen stay.
     pub fn close_session(&mut self, cx: &mut Context<Self>) {
         self.isolation = None;
+        // Its transaction ends with it: the next one starts its own age.
+        self.tx_started = None;
         if let Some(session) = self.session.take() {
             bridge::spawn(cx, async move {
                 // A transaction is rolled back before, not cancelled by, the
@@ -2486,7 +2492,12 @@ impl QueryTab {
                 }
                 // A new transaction: its log starts empty, whatever ended
                 // the last one (a lost connection, a rollback on close).
-                let _ = this.update(cx, |this, _| this.tx_log.clear());
+                // Its age starts here, before its first statement ends.
+                let _ = this.update(cx, |this, cx| {
+                    this.tx_log.clear();
+                    this.note_transaction(cx);
+                    cx.notify();
+                });
             }
             let mut changed_schema = false;
             let mut any_failed = false;
@@ -2763,6 +2774,8 @@ impl QueryTab {
             let _ = this.update(cx, |this, cx| {
                 this.activity = Activity::Idle;
                 this.run = None;
+                // After the rollback of a failed source, too.
+                this.note_transaction(cx);
                 let ended = if cancelled {
                     Stage::Cancelled
                 } else if any_failed && !continue_on_error {
@@ -2845,6 +2858,9 @@ impl QueryTab {
         {
             self.mark_error(origin, &statement.sql, position, &failure.message, cx);
         }
+        // A `BEGIN` typed in auto-commit opens one; a `COMMIT` typed, or
+        // MySQL's DDL, ends it.
+        self.note_transaction(cx);
         self.follow_session(cx);
     }
 
@@ -2975,6 +2991,30 @@ impl QueryTab {
         self.session
             .as_ref()
             .map_or(TxState::Idle, |session| session.tx_state())
+    }
+
+    /// Records when the tab's transaction began (K4): now, when one is open
+    /// and none was recorded; nothing once none is open. A transaction that
+    /// failed, or went back to a savepoint, keeps its start. The executor's
+    /// clock, so tests move it.
+    fn note_transaction(&mut self, cx: &App) {
+        if self.tx_state() == TxState::Idle {
+            self.tx_started = None;
+        } else if self.tx_started.is_none() {
+            self.tx_started = Some(cx.background_executor().now());
+        }
+    }
+
+    /// How long the tab's transaction has been open; `None` without one.
+    pub fn transaction_age(&self, cx: &App) -> Option<Duration> {
+        let started = self
+            .tx_started
+            .filter(|_| self.tx_state() != TxState::Idle)?;
+        Some(
+            cx.background_executor()
+                .now()
+                .saturating_duration_since(started),
+        )
     }
 
     /// Whether a statement holds the tab's session: running, or a result
@@ -3326,6 +3366,7 @@ impl QueryTab {
                 if outcome.is_ok() {
                     this.tx_log.clear();
                 }
+                this.note_transaction(cx);
                 // A `SET LOCAL search_path` ended with the transaction.
                 this.follow_session(cx);
                 cx.notify()
@@ -4073,6 +4114,8 @@ impl QueryTab {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.run = None;
                 this.activity = Activity::Idle;
+                // In manual commit the apply may have begun the transaction.
+                this.note_transaction(cx);
                 let Some(pane) = this.pane_mut(id) else {
                     return;
                 };

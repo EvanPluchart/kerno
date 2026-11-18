@@ -544,6 +544,17 @@ mod tests {
         assert!(failures.is_empty(), "below 4.5:1:\n{}", failures.join("\n"));
     }
 
+    /// Where a tab is drawn, in each layout of the tabs (J10).
+    const TAB_SURFACES: &[&str] = &[
+        "tab_bar.background",
+        "tab.background",
+        "tab.active.background",
+        "sidebar.background",
+        "list.hover.background",
+        "list.active.background",
+        "popover.background",
+    ];
+
     /// Things that are not text (tag dots, focus rings, borders of inputs):
     /// WCAG asks for 3:1 against what is next to them.
     #[test]
@@ -591,6 +602,11 @@ mod tests {
                     &["background", "table.active.background"],
                 ),
                 ("drag.border", &["background", "sidebar.background"]),
+                // The badge of a tab holding a transaction, failed or not
+                // (K4, C15): on every surface a tab is drawn on (the strip,
+                // the active tab, the side list, the list of every tab).
+                ("warning.background", TAB_SURFACES),
+                ("danger.background", TAB_SURFACES),
             ];
             for (indicator, surfaces) in indicators {
                 for surface in surfaces {

@@ -441,6 +441,14 @@ impl Fixture {
         cx.update(|cx| self.workspace.read(cx).status_text(cx))
     }
 
+    /// Whether an item of the status bar starts with `text` (an item may go
+    /// on with more: "transaction open · 12 s").
+    fn status_says(&self, cx: &mut TestAppContext, text: &str) -> bool {
+        self.status_bar(cx)
+            .iter()
+            .any(|item| item.starts_with(text))
+    }
+
     /// Opens a query tab, types `sql` and runs it with `keys`.
     fn run_in_new_tab(&self, cx: &mut TestAppContext, sql: &str, keys: &str) {
         self.press(cx, &["secondary-t"]);
@@ -2939,9 +2947,7 @@ fn manual_commit_keeps_changes_in_a_transaction_until_it_is_ended(cx: &mut TestA
         let _scratch = Scratch::new(engine, &[cleanup], &setup);
         let count = || server(&format!("SELECT count(*) FROM {table}"));
         let app = connected(cx, engine);
-        let open = |app: &Fixture, cx: &mut TestAppContext| {
-            app.status_bar(cx).contains(&"transaction open".to_string())
-        };
+        let open = |app: &Fixture, cx: &mut TestAppContext| app.status_says(cx, "transaction open");
 
         // Auto-commit: the row is there for everyone at once.
         app.run_in_new_tab(
@@ -2989,10 +2995,7 @@ fn manual_commit_keeps_changes_in_a_transaction_until_it_is_ended(cx: &mut TestA
             app.wait_until(cx, "the failure", |app, cx| {
                 app.outcomes(cx) == ["failed [22012]"]
             });
-            assert!(
-                app.status_bar(cx)
-                    .contains(&"transaction failed: roll back".to_string())
-            );
+            assert!(app.status_says(cx, "transaction failed: roll back"));
             app.click(cx, "tab-rollback");
             app.wait_until(cx, "the rollback", |app, cx| !app.has(cx, "tab-rollback"));
         }
@@ -6740,7 +6743,7 @@ fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) 
     app.wait_until(cx, "the insert", |app, cx| {
         app.outcomes(cx) == ["done, 1 affected"] && !app.running(cx)
     });
-    assert!(app.status_bar(cx).contains(&"transaction open".to_string()));
+    assert!(app.status_says(cx, "transaction open"));
     assert_eq!(open_on_server(), "1");
 
     // The status bar's items answer a right-click, and a click.
@@ -6855,7 +6858,7 @@ fn closing_rolls_back_and_discards_only_once_confirmed(cx: &mut TestAppContext) 
         app.active_query(cx).1,
         "insert into kerno_ui_close.entries values (2, 'open')"
     );
-    assert!(!app.status_bar(cx).contains(&"transaction open".to_string()));
+    assert!(!app.status_says(cx, "transaction open"));
 }
 
 // Navigator tree completeness (G10) ------------------------------------------
@@ -12454,7 +12457,7 @@ fn the_transaction_log_lists_the_statements_until_the_transaction_ends(cx: &mut 
         // Rollback empties it.
         app.click(cx, "tab-rollback");
         app.wait_until(cx, "the rollback", |app, cx| {
-            !app.status_bar(cx).contains(&"transaction open".to_string())
+            !app.status_says(cx, "transaction open")
         });
         assert!(log(cx).is_empty(), "{engine:?}");
         assert_eq!(

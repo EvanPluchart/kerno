@@ -106,6 +106,9 @@ const TAB_HEIGHT: gpui_kit::Pixels = px(32.);
 const TAB_ROWS: usize = 4;
 /// The list of every open tab gets a filter past this many.
 const FILTER_TABS_OVER: usize = 15;
+/// How often the transactions' ages are drawn again (K4): they read in
+/// minutes, so a quarter of one is close enough.
+const TX_AGE_REFRESH: Duration = Duration::from_secs(15);
 
 pub(crate) mod toolbar;
 pub(crate) mod updates;
@@ -417,10 +420,11 @@ pub struct Workspace {
     shown_tab: Rc<Cell<Option<EntityId>>>,
     /// The scroll of the tab strip.
     tab_scroll: ScrollHandle,
-    /// The active tab, the tab count, the layout and the active tab's label
-    /// the strip last scrolled for (a label that grows, an unsaved mark
-    /// added, can push its close button out of the strip).
-    revealed_tab: Option<(usize, usize, TabLayout, Option<SharedString>)>,
+    /// The active tab, the tab count, the layout, the active tab's label and
+    /// whether it shows a transaction badge, as the strip last scrolled for (a
+    /// label that grows, an unsaved mark or a badge added, can push its close
+    /// button out of the strip).
+    revealed_tab: Option<(usize, usize, TabLayout, Option<SharedString>, bool)>,
     /// The list of every open tab (J10) is open.
     all_tabs_open: bool,
     /// The filter of that list, shown when many tabs are open.
@@ -437,6 +441,10 @@ pub struct Workspace {
     /// Alive while the quit question is on screen (its dialog holds the
     /// other end): a second Quit does not ask again.
     quit_question: std::rc::Weak<()>,
+    /// Redraws the transactions' ages every [`TX_AGE_REFRESH`]; alive only
+    /// while some query tab holds a transaction (K4), so an idle window
+    /// wakes for nothing. It only redraws: it never touches a session.
+    tx_ticker: Option<Task<()>>,
     /// Quitting was decided (`cx.quit()` does nothing on the test platform).
     #[cfg(test)]
     quit_requested: bool,
@@ -513,6 +521,7 @@ impl Workspace {
             last_focus: None,
             multi_run: None,
             quit_question: std::rc::Weak::new(),
+            tx_ticker: None,
             #[cfg(test)]
             quit_requested: false,
             tab_subscriptions: Vec::new(),
@@ -3670,6 +3679,55 @@ impl Workspace {
         }
     }
 
+    /// The transaction tab `index` holds, and how long it has been open: a
+    /// query tab's own, read from its session; `None` without one. Other tabs
+    /// hold none between two actions (a table's Apply ends its own).
+    fn tx_badge(&self, index: usize, cx: &App) -> Option<(TxState, Option<Duration>)> {
+        let OpenTab::Query(tab) = self.tabs.get(index)? else {
+            return None;
+        };
+        let tab = tab.read(cx);
+        let state = tab.tx_state();
+        (state != TxState::Idle).then(|| (state, tab.transaction_age(cx)))
+    }
+
+    /// Starts the redraw of the ages when the first transaction opens, drops
+    /// it when the last one ends (K4). Called on each frame: a transaction
+    /// opened, ended or lost, a tab closed, all redraw the window.
+    fn watch_transactions(&mut self, cx: &mut Context<Self>) {
+        let open = (0..self.tabs.len()).any(|index| self.tx_badge(index, cx).is_some());
+        if open == self.tx_ticker.is_some() {
+            return;
+        }
+        self.tx_ticker = open.then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(TX_AGE_REFRESH).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
+    /// Whether the ages of open transactions are being redrawn; for tests.
+    #[cfg(test)]
+    pub fn ages_refreshing(&self) -> bool {
+        self.tx_ticker.is_some()
+    }
+
+    /// The badge of tab `index` when it holds a transaction: see [`tx_dot`].
+    fn render_tx_badge(
+        &self,
+        id: (&'static str, usize),
+        index: usize,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let (state, age) = self.tx_badge(index, cx)?;
+        Some(tx_dot(id, state, age, cx))
+    }
+
     /// What every layout draws of tab `index`: the connection's dot and
     /// engine logo, the title (in its environment's colour, with the tab's
     /// menu; underlined when active, in the strip and the rows) and its
@@ -3751,6 +3809,12 @@ impl Workspace {
                 ),
                 None => title.child(text),
             })
+            // After the title, outside the environment's tint; it keeps its
+            // size where the title is cut (the side list).
+            .children(
+                self.render_tx_badge(("tab-tx", index), index, cx)
+                    .map(|badge| div().flex_none().ml_1().child(badge)),
+            )
             .into_any_element();
         let close = Button::new(("close-tab", index))
             .ghost()
@@ -3773,6 +3837,10 @@ impl Workspace {
     /// checked; a filter above them when more than [`FILTER_TABS_OVER`]
     /// are open. A click shows the tab and scrolls the bar to it.
     fn render_all_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The transaction a tab holds, for the same badge as on the tab.
+        let transactions: Vec<Option<(TxState, Option<Duration>)>> = (0..self.tabs.len())
+            .map(|index| self.tx_badge(index, cx))
+            .collect();
         let entries: Vec<(usize, SharedString, Option<Engine>, Option<Hsla>)> = self
             .tabs
             .iter()
@@ -3901,7 +3969,10 @@ impl Workspace {
                                                     .truncate()
                                                     .child(label.clone())
                                                     .test_text(label.to_string()),
-                                            ),
+                                            )
+                                            .children(transactions[index].map(|(state, age)| {
+                                                tx_dot(("all-tabs-tx", index), state, age, cx)
+                                            })),
                                     )
                             }))
                             .when(filtering && !typed.is_empty(), |list| {
@@ -3984,18 +4055,16 @@ impl Workspace {
                 Some(theme.warning),
             ));
         }
-        match transaction {
-            TxState::Idle => {}
-            TxState::Open => items.push((
-                StatusItem::Transaction,
-                "transaction open".into(),
-                Some(theme.warning),
-            )),
-            TxState::Failed => items.push((
-                StatusItem::Transaction,
-                "transaction failed: roll back".into(),
-                Some(theme.danger),
-            )),
+        // With its age (K4): redrawn by the transactions' ticker.
+        let age = self
+            .active_query_tab()
+            .and_then(|tab| tab.read(cx).transaction_age(cx));
+        if let Some(text) = crate::tabs::transaction_status(transaction, age) {
+            let color = match transaction {
+                TxState::Failed => theme.danger,
+                _ => theme.warning,
+            };
+            items.push((StatusItem::Transaction, text, Some(color)));
         }
         if running {
             items.push((StatusItem::Running, "running…".into(), None));
@@ -4205,6 +4274,54 @@ impl Workspace {
                     }),
             )
     }
+}
+
+/// The badge of a tab holding a transaction (K4, C15): a dot in the warning
+/// colour (danger once the transaction failed), its tooltip saying for how
+/// long and how to end it. Not the unsaved mark (a "•" in the title's own
+/// colour) and never a bar at the tab's edge.
+fn tx_dot(
+    id: (&'static str, usize),
+    state: TxState,
+    age: Option<Duration>,
+    cx: &App,
+) -> AnyElement {
+    let color = match state {
+        TxState::Failed => cx.theme().danger,
+        _ => cx.theme().warning,
+    };
+    let tip = SharedString::from(crate::tabs::transaction_tip(
+        state,
+        age,
+        shortcut(&actions::CommitTransaction, cx).as_deref(),
+        shortcut(&actions::RollbackTransaction, cx).as_deref(),
+    ));
+    div()
+        .id(id)
+        .test_support()
+        .flex_none()
+        .size(px(7.))
+        .rounded_full()
+        .bg(color)
+        .aria_description(tip.clone())
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .into_any_element()
+}
+
+/// The shortcut of `action` in the keymap (the user's file applied), as the
+/// kit's tooltips write it; `None` when it has none. For a command bound
+/// outside any key context (Commit, Roll back): the last binding wins.
+fn shortcut(action: &dyn gpui_kit::Action, cx: &App) -> Option<String> {
+    use gpui_kit::AsKeystroke as _;
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action).next_back()?;
+    let strokes: Vec<String> = binding
+        .keystrokes()
+        .iter()
+        .map(|stroke| gpui_kit::component::kbd::Kbd::format(stroke.as_keystroke()))
+        .collect();
+    (!strokes.is_empty()).then(|| strokes.join(" "))
 }
 
 /// The status bar's warning when no system secret store is in use.
@@ -5223,6 +5340,7 @@ impl Render for Workspace {
             tab.reveal(window, cx);
         }
         self.keep_focus(window, cx);
+        self.watch_transactions(cx);
         // The active tab is scrolled into view whenever it or the tabs
         // change (a tab opened, restored, closed or activated by key); a
         // scroll of the strip by hand is left alone until then.
@@ -5231,6 +5349,7 @@ impl Render for Workspace {
             self.tabs.len(),
             AppState::get(cx).settings.tab_layout,
             self.tabs.get(self.active_tab).map(|tab| tab.label(cx)),
+            self.tx_badge(self.active_tab, cx).is_some(),
         );
         if self.revealed_tab.as_ref() != Some(&shown) {
             self.tab_scroll.scroll_to_item(self.active_tab);

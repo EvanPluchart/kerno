@@ -443,9 +443,7 @@ fn an_idle_transaction_is_rolled_back_after_the_period(cx: &mut TestAppContext) 
             ..testing::config(engine)
         };
         let app = connected_as(cx, config);
-        let open = |app: &Fixture, cx: &mut TestAppContext| {
-            app.status_bar(cx).contains(&"transaction open".to_string())
-        };
+        let open = |app: &Fixture, cx: &mut TestAppContext| app.status_says(cx, "transaction open");
         let rolled_back = |app: &Fixture, cx: &mut TestAppContext| {
             let tab = app.tab(cx);
             cx.update(|cx| tab.read(cx).messages())

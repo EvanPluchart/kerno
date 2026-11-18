@@ -982,6 +982,62 @@ pub fn close_question(
     Some((title, lines.join("\n"), ok))
 }
 
+/// How long a transaction has been open (K4, C15): seconds under a minute,
+/// minutes under an hour, then hours and minutes ("1 h 05 min"). Rounded
+/// down: a transaction is never shown older than it is.
+pub fn age_text(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3600 => format!("{} min", seconds / 60),
+        _ => format!("{} h {:02} min", seconds / 3600, seconds / 60 % 60),
+    }
+}
+
+/// What the status bar says of the active tab's transaction, with its age
+/// when it is known; nothing without one.
+pub fn transaction_status(state: TxState, age: Option<std::time::Duration>) -> Option<String> {
+    let text = match state {
+        TxState::Idle => return None,
+        TxState::Open => "transaction open",
+        TxState::Failed => "transaction failed: roll back",
+    };
+    Some(match age {
+        Some(age) => format!("{text} · {}", age_text(age)),
+        None => text.to_string(),
+    })
+}
+
+/// The tooltip of a tab's transaction badge (K4): how long it has been
+/// open and how to end it, with the shortcuts of Commit and Roll back when
+/// they have one. A failed transaction can only be rolled back.
+pub fn transaction_tip(
+    state: TxState,
+    age: Option<std::time::Duration>,
+    commit: Option<&str>,
+    rollback: Option<&str>,
+) -> String {
+    let with_keys = |name: &str, keys: Option<&str>| match keys {
+        Some(keys) => format!("{name} ({keys})"),
+        None => name.to_string(),
+    };
+    let open = match age {
+        Some(age) => format!("open for {}", age_text(age)),
+        None => "open".to_string(),
+    };
+    let rollback = with_keys("Roll back", rollback);
+    match state {
+        TxState::Idle => String::new(),
+        TxState::Open => format!(
+            "Transaction {open}: {} or {rollback}.",
+            with_keys("Commit", commit)
+        ),
+        TxState::Failed => {
+            format!("Transaction failed ({open}): a statement of it failed. {rollback}.")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,5 +1698,57 @@ mod tests {
         // A kind this version does not know is rejected, and the storage
         // layer then skips that tab instead of failing to start.
         assert!(serde_json::from_str::<TabSnapshot>(r#"{"kind":"from_the_future"}"#).is_err());
+    }
+
+    /// C15: the age of a transaction, rounded down, in one wording for the
+    /// tab's tooltip and the status bar.
+    #[test]
+    fn a_transaction_age_reads_in_seconds_minutes_then_hours() {
+        use std::time::Duration;
+        let age = |seconds| age_text(Duration::from_secs(seconds));
+        assert_eq!(age(0), "0 s");
+        assert_eq!(age(59), "59 s");
+        assert_eq!(age(60), "1 min");
+        assert_eq!(age(4 * 60 + 59), "4 min");
+        assert_eq!(age(3599), "59 min");
+        assert_eq!(age(3600), "1 h 00 min");
+        assert_eq!(age(3600 + 5 * 60 + 30), "1 h 05 min");
+        assert_eq!(age(26 * 3600 + 59 * 60), "26 h 59 min");
+        assert_eq!(age_text(Duration::from_millis(999)), "0 s");
+    }
+
+    /// C15: the status bar and the badge's tooltip name the state, the age and
+    /// the real shortcuts; nothing without a transaction.
+    #[test]
+    fn a_transaction_says_its_age_and_how_to_end_it() {
+        use std::time::Duration;
+        let four = Some(Duration::from_secs(4 * 60 + 2));
+        assert_eq!(transaction_status(TxState::Idle, four), None);
+        assert_eq!(
+            transaction_status(TxState::Open, four).as_deref(),
+            Some("transaction open · 4 min")
+        );
+        assert_eq!(
+            transaction_status(TxState::Failed, Some(Duration::from_secs(12))).as_deref(),
+            Some("transaction failed: roll back · 12 s")
+        );
+        assert_eq!(
+            transaction_status(TxState::Open, None).as_deref(),
+            Some("transaction open")
+        );
+        assert_eq!(
+            transaction_tip(TxState::Open, four, Some("⌃4"), Some("⌃8")),
+            "Transaction open for 4 min: Commit (⌃4) or Roll back (⌃8)."
+        );
+        // A shortcut taken out of the keymap is not invented.
+        assert_eq!(
+            transaction_tip(TxState::Open, None, None, Some("⌃8")),
+            "Transaction open: Commit or Roll back (⌃8)."
+        );
+        assert_eq!(
+            transaction_tip(TxState::Failed, four, Some("⌃4"), Some("⌃8")),
+            "Transaction failed (open for 4 min): a statement of it failed. Roll back (⌃8)."
+        );
+        assert_eq!(transaction_tip(TxState::Idle, four, None, None), "");
     }
 }
