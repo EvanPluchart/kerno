@@ -492,3 +492,15 @@ Still open (for the owner):
   runs elsewhere than its picker shows, and a reconnect silently goes back; a `.sql` file opened beside a
   production connection is bound to it; a start failure (downgrade, one bad saved row) quits without a
   window or a log.
+
+## 2026-11-18 — K3: a query tab follows its session's database and schema (C6)
+
+- `Session::schema()`; the PostgreSQL driver reads `current_schema()` at connect and after the statements
+  that may change it or end a transaction (`touches_session_state`), never after every statement.
+- A query tab moves its target (picker, status bar, stored tab) when its session moved, says so in the
+  messages, and a rebuilt session opens there. Three UI tests kill the tab's backend and ask the server where
+  the next session is; with the tab's follow disabled all three fail (first on the message; with only the
+  reconnect check kept, the server answers `kerno` / `public`), with the driver's read disabled the
+  PostgreSQL UI test and the driver test fail.
+- Limits and plan errors in the "Done:" line of K3 (`docs/plans/M12.md`).
+

@@ -379,6 +379,8 @@ pub struct QueryTab {
     target: Option<Target>,
     /// This tab's own session, opened at the first run.
     session: Option<Arc<dyn Session>>,
+    /// The database and schema the session was last seen in (C6).
+    session_place: (Option<String>, Option<String>),
     /// Databases of the connection and schemas of the database, for the
     /// selectors.
     databases: Vec<String>,
@@ -502,6 +504,9 @@ pub enum QueryTabEvent {
     /// Open a query tab holding `sql`, on this tab's connection, database
     /// and schema (statements written from rows of a result).
     OpenQuery { title: String, sql: String },
+    /// The tab's session moved to another database or schema (`USE`, `SET
+    /// search_path`), and the tab's target with it: the tab is stored again.
+    Moved,
 }
 
 impl EventEmitter<QueryTabEvent> for QueryTab {}
@@ -607,6 +612,7 @@ impl QueryTab {
             connections,
             target,
             session: None,
+            session_place: (None, None),
             databases: Vec::new(),
             schemas: Vec::new(),
             results: Vec::new(),
@@ -1317,6 +1323,7 @@ impl QueryTab {
                 }
                 _ => {
                     this.session = Some(session.clone());
+                    this.session_place = (session.database(), session.schema());
                     this.isolation = isolation;
                     session
                 }
@@ -2838,6 +2845,54 @@ impl QueryTab {
         {
             self.mark_error(origin, &statement.sql, position, &failure.message, cx);
         }
+        self.follow_session(cx);
+    }
+
+    /// C6: the session moved since it was last seen (`USE`, `SET
+    /// search_path`, the end of a transaction undoing a `SET LOCAL`): the
+    /// tab's target follows it and says so, so that the picker shows where
+    /// statements run and a new session (a reconnect, a toggle, a restart)
+    /// opens there again. Nothing is known when the session has no database
+    /// or no schema (no schema of the path exists): the target stays.
+    fn follow_session(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let now = (session.database(), session.schema());
+        let before = std::mem::replace(&mut self.session_place, now.clone());
+        let Some(target) = self.target.as_mut() else {
+            return;
+        };
+        let mut moves = Vec::new();
+        if let Some(database) = now.0
+            && before.0.as_ref() != Some(&database)
+            && target.database.as_ref() != Some(&database)
+        {
+            moves.push(format!("Now in database {database} (USE)."));
+            target.database = Some(database);
+        }
+        if let Some(schema) = now.1
+            && before.1.as_ref() != Some(&schema)
+            && target.schema.as_ref() != Some(&schema)
+        {
+            moves.push(format!("Now in schema {schema} (search_path)."));
+            target.schema = Some(schema);
+        }
+        if moves.is_empty() {
+            return;
+        }
+        for message in moves {
+            self.notices.push(Notice {
+                severity: "Info".into(),
+                message,
+                code: None,
+                detail: None,
+            });
+        }
+        // Completion searches the new place first.
+        self.load_catalog(cx);
+        cx.emit(QueryTabEvent::Moved);
+        cx.notify();
     }
 
     /// The statements run in the open transaction; none when no
@@ -3271,6 +3326,8 @@ impl QueryTab {
                 if outcome.is_ok() {
                     this.tx_log.clear();
                 }
+                // A `SET LOCAL search_path` ended with the transaction.
+                this.follow_session(cx);
                 cx.notify()
             });
             outcome

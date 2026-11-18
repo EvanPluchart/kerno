@@ -819,3 +819,52 @@ async fn the_isolation_level_is_set_for_this_session_only() {
     session.close().await;
     other.close().await;
 }
+
+/// C6: the session's schema follows `SET search_path`, `SET LOCAL` and the
+/// end of the transaction that undoes them; NULL when no schema of the
+/// path exists.
+#[tokio::test]
+async fn the_schema_follows_set_search_path() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("search_path");
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+    // Read at connect.
+    assert_eq!(session.schema().as_deref(), Some("public"));
+
+    exec_ok(&session, &format!("SET search_path TO {schema}, public")).await;
+    assert_eq!(session.schema().as_deref(), Some(schema.as_str()));
+    exec_ok(&session, "RESET search_path").await;
+    assert_eq!(session.schema().as_deref(), Some("public"));
+
+    // A `SET LOCAL` lasts until the transaction ends.
+    exec_ok(&session, "BEGIN").await;
+    exec_ok(&session, &format!("SET LOCAL search_path TO {schema}")).await;
+    assert_eq!(session.schema().as_deref(), Some(schema.as_str()));
+    exec_ok(&session, "ROLLBACK").await;
+    assert_eq!(session.schema().as_deref(), Some("public"));
+
+    // A plain `SET` inside a block that rolls back is undone too.
+    exec_ok(&session, "BEGIN").await;
+    exec_ok(&session, &format!("SET search_path TO {schema}")).await;
+    assert_eq!(session.schema().as_deref(), Some(schema.as_str()));
+    exec_ok(&session, "ROLLBACK").await;
+    assert_eq!(session.schema().as_deref(), Some("public"));
+
+    // Through set_config, and the first schema of the path that exists.
+    exec_ok(
+        &session,
+        &format!("SELECT set_config('search_path', 'kerno_test_missing, {schema}', false)"),
+    )
+    .await;
+    assert_eq!(session.schema().as_deref(), Some(schema.as_str()));
+    // No schema of the path exists: none.
+    exec_ok(&session, "SET search_path TO kerno_test_missing").await;
+    assert_eq!(session.schema(), None);
+
+    exec_ok(&session, "SET search_path TO public").await;
+    exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    session.close().await;
+}

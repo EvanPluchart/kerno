@@ -1173,6 +1173,7 @@ impl Workspace {
                     QueryTabEvent::SwitchTarget(target) => {
                         this.switch_target(tab.clone(), target.clone(), window, cx)
                     }
+                    QueryTabEvent::Moved => this.schedule_save(cx),
                     QueryTabEvent::OpenQuery { title, sql } => {
                         let target = tab.read(cx).target().cloned();
                         this.open_query(title.clone(), sql, target, window, cx);

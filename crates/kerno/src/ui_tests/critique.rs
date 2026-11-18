@@ -635,3 +635,202 @@ fn closing_a_tab_that_applies_stops_the_statement(cx: &mut TestAppContext) {
         );
     }
 }
+
+// K3: a query tab shows the database and schema its session is really in (C6) -----------------
+
+/// What moves the session to `place` on `engine`, and what reads back where it is, with the
+/// id of the server session that answers.
+fn k3_sql(engine: Engine, place: &str) -> (String, &'static str) {
+    match engine {
+        Engine::Postgres => (
+            format!("set search_path to {place}"),
+            "select current_schema(), pg_backend_pid()::text",
+        ),
+        Engine::MySql | Engine::MariaDb => {
+            (format!("use {place}"), "select database(), connection_id()")
+        }
+    }
+}
+
+/// Runs `sql` in the active tab, in place of its text, and gives what it produced.
+fn k3_run(app: &Fixture, cx: &mut TestAppContext, sql: &str) -> Vec<String> {
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, sql);
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, sql, |app, cx| {
+        !app.running(cx) && !app.outcomes(cx).is_empty()
+    });
+    app.outcomes(cx)
+}
+
+/// Where the active tab's session is, and its id on the server; after a lost connection, once
+/// the connection is back.
+fn k3_where(app: &Fixture, cx: &mut TestAppContext, engine: Engine) -> (String, String) {
+    let (_, read) = k3_sql(engine, "");
+    for _ in 0..3 {
+        if k3_run(app, cx, read) == ["1 rows"] {
+            let row = app.result(cx, 0, 1).1.remove(0);
+            return (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default(),
+            );
+        }
+        // The statement found the session gone: the connection opens again.
+        app.wait_until(cx, "the connection to come back", |app, cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            let connections = app.connections.read_with(cx, |connections, _| {
+                connections.reconnecting(&connections.saved()[0].id)
+            });
+            matches!(app.status(cx, 0), Status::Connected { .. }) && !connections
+        });
+    }
+    panic!("{engine:?}: {read} never answered");
+}
+
+/// C6: a `USE` (a `SET search_path` on PostgreSQL) run in a tab moves the tab's picker, status
+/// bar and stored target, says so, and leaves the other tabs alone; when the tab's server
+/// session is killed, the next one opens where the user was, as the server itself answers.
+fn k3_moves_and_survives_a_reconnect(cx: &mut TestAppContext, engine: Engine, place: &str) {
+    let (drop, create) = scratch_schema(engine, place);
+    let _scratch = Scratch::new(engine, &[&drop], &[&create]);
+    let app = connected(cx, engine);
+    app.press(cx, &["secondary-t"]);
+    let other = app.tab(cx);
+    // A session of its own, in the first place.
+    let (home, _) = k3_where(&app, cx, engine);
+    assert_ne!(home, place, "{engine:?}");
+    let other_target = cx.update(|cx| other.read(cx).target().cloned());
+    app.press(cx, &["secondary-t"]);
+    let tab = app.tab(cx);
+    let started = cx.update(|cx| tab.read(cx).target().cloned());
+    let (_, first_id) = k3_where(&app, cx, engine);
+    // A `SET` that moves nothing says nothing and changes nothing.
+    let unmoved = match engine {
+        Engine::Postgres => "set statement_timeout to 0",
+        Engine::MySql | Engine::MariaDb => "set @kerno_ui_k3 = 1",
+    };
+    assert_eq!(k3_run(&app, cx, unmoved), ["done"], "{engine:?}");
+    let messages = cx.update(|cx| tab.read(cx).messages());
+    assert!(
+        !messages.iter().any(|message| message.contains("Now in")),
+        "{engine:?}: {messages:?}"
+    );
+    assert_eq!(cx.update(|cx| tab.read(cx).target().cloned()), started);
+
+    let (moving, _) = k3_sql(engine, place);
+    assert_eq!(k3_run(&app, cx, &moving), ["done"], "{engine:?}");
+    let (what, how) = match engine {
+        Engine::Postgres => ("schema", "search_path"),
+        Engine::MySql | Engine::MariaDb => ("database", "USE"),
+    };
+    let messages = cx.update(|cx| tab.read(cx).messages());
+    assert!(
+        messages.contains(&format!("Info: Now in {what} {place} ({how}).")),
+        "{engine:?}: {messages:?}"
+    );
+    let picker = cx.update(|cx| {
+        app.workspace
+            .read(cx)
+            .picker_text(crate::workspace::toolbar::Item::Target, cx)
+    });
+    assert!(
+        picker.starts_with(&format!("{place}@")),
+        "{engine:?}: {picker}"
+    );
+    if engine != Engine::Postgres {
+        let status = app.status_bar(cx);
+        assert!(
+            status.iter().any(|item| item.contains(place)),
+            "{engine:?}: {status:?}"
+        );
+    }
+    // The other tab did not move.
+    assert_eq!(
+        cx.update(|cx| other.read(cx).target().cloned()),
+        other_target,
+        "{engine:?}"
+    );
+    // The stored tab opens there after a restart (stored on a thread of its own).
+    let stored_place = |app: &Fixture| {
+        let tabs = app.storage.tabs::<TabSnapshot>().unwrap();
+        tabs.into_iter().find_map(|tab| match tab {
+            TabSnapshot::Query { title, target, .. } if title == "Query 2" => {
+                target.and_then(|target| match engine {
+                    Engine::Postgres => target.schema,
+                    Engine::MySql | Engine::MariaDb => target.database,
+                })
+            }
+            _ => None,
+        })
+    };
+    app.wait_until(cx, "the tab to be stored", |app, cx| {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        stored_place(app).as_deref() == Some(place)
+    });
+
+    if engine == Engine::Postgres {
+        // A `SET LOCAL` lasts until the transaction ends: Roll back brings the tab back.
+        let picker = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                app.workspace
+                    .read(cx)
+                    .picker_text(crate::workspace::toolbar::Item::Target, cx)
+            })
+        };
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(true, cx)));
+        assert_eq!(
+            k3_run(&app, cx, "set local search_path to public"),
+            ["done"]
+        );
+        assert!(picker(cx).starts_with("public@"), "{}", picker(cx));
+        roll_back(&app, cx);
+        app.wait_until(cx, "the picker to come back", |_, cx| {
+            picker(cx).starts_with(&format!("{place}@"))
+        });
+        cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(false, cx)));
+    }
+
+    // The server kills the tab's session: the next one opens where the tab was.
+    let kill = match engine {
+        Engine::Postgres => format!("SELECT pg_terminate_backend({first_id})"),
+        Engine::MySql | Engine::MariaDb => format!("KILL {first_id}"),
+    };
+    on_server(engine, &kill);
+    let (now, second_id) = k3_where(&app, cx, engine);
+    assert_ne!(second_id, first_id, "{engine:?}: a new session");
+    assert_eq!(now, place, "{engine:?}");
+
+    // Choosing the first place in the picker goes back there.
+    app.step(cx, |_, cx| {
+        tab.update(cx, |tab, cx| tab.set_target(started, cx))
+    });
+    assert_eq!(k3_where(&app, cx, engine).0, home, "{engine:?}");
+}
+
+/// C6: `USE` on MySQL. (One engine per test: the stored tabs are the app's, and a workspace
+/// left from another engine's run would store its own over them.)
+#[gpui_kit::test]
+fn use_in_a_tab_moves_its_picker_and_survives_a_reconnect(cx: &mut TestAppContext) {
+    if !testing::available(Engine::MySql) {
+        return;
+    }
+    k3_moves_and_survives_a_reconnect(cx, Engine::MySql, "kerno_ui_k3_b");
+}
+
+/// C6: `USE` on MariaDB.
+#[gpui_kit::test]
+fn use_in_a_mariadb_tab_moves_its_picker_and_survives_a_reconnect(cx: &mut TestAppContext) {
+    if !testing::available(Engine::MariaDb) {
+        return;
+    }
+    k3_moves_and_survives_a_reconnect(cx, Engine::MariaDb, "kerno_ui_k3_b");
+}
+
+/// C6: `SET search_path` on PostgreSQL.
+#[gpui_kit::test]
+fn set_search_path_in_a_tab_moves_its_picker_and_survives_a_reconnect(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    k3_moves_and_survives_a_reconnect(cx, Engine::Postgres, "kerno_ui_k3_other");
+}

@@ -86,6 +86,14 @@ pub trait Session: Send + Sync + 'static {
     /// Database this session is in. On MySQL it follows `USE`.
     fn database(&self) -> Option<String>;
 
+    /// Schema this session is in: the first existing schema of the search
+    /// path on PostgreSQL (`current_schema()`), read at connect and again
+    /// after a statement that may change it. `None` where the engine has no
+    /// schemas, or when no schema of the path exists.
+    fn schema(&self) -> Option<String> {
+        None
+    }
+
     /// Transaction state after the last statement.
     fn tx_state(&self) -> TxState;
 

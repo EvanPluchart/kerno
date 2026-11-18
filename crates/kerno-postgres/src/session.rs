@@ -48,6 +48,8 @@ pub struct PgSession {
     cancels: AtomicU64,
     server: ServerInfo,
     database: String,
+    /// `current_schema()`, as last read (C6).
+    schema: std::sync::Mutex<Option<String>>,
     dialect: PgDialect,
 }
 
@@ -64,7 +66,8 @@ impl PgSession {
         let (client, events, cancel) = connect::open(params).await?;
         let rows = simple_rows(
             &client,
-            "SELECT current_setting('server_version_num'), version(), current_database()",
+            "SELECT current_setting('server_version_num'), version(), current_database(), \
+             current_schema()",
         )
         .await?;
         let row = rows
@@ -81,6 +84,7 @@ impl PgSession {
             },
         };
         let database = row.get(2).unwrap_or_default().to_string();
+        let schema = row.get(3).map(str::to_string);
         Ok(Self {
             link: Mutex::new(Link {
                 client: Some(client),
@@ -91,6 +95,7 @@ impl PgSession {
             cancels: AtomicU64::new(0),
             server,
             database,
+            schema: std::sync::Mutex::new(schema),
             dialect: PgDialect,
         })
     }
@@ -284,6 +289,46 @@ fn may_return_rows(sql: &str) -> bool {
     }
 }
 
+/// Whether a request may change the current schema (C6), so that it is read
+/// again after it: one of its statements starts with `SET` (search path,
+/// schema, role: `$user` follows the role) or `RESET`, `DISCARD`, `DO` or
+/// `CALL` (whose body may set it), or ends a transaction (`COMMIT`,
+/// `ROLLBACK`, `END`, `ABORT`, `PREPARE TRANSACTION`: a `SET` made inside
+/// the block, `LOCAL` or not, is undone by a rollback, a `SET LOCAL` by
+/// any end); or it calls `set_config` anywhere. A function called from a
+/// `SELECT` that sets it is not seen.
+fn touches_session_state(sql: &str) -> bool {
+    let mut at_start = true;
+    for token in lex(sql, kerno_core::sql::LexRules::POSTGRES) {
+        match token.kind {
+            kind if kind.is_trivia() => {}
+            TokenKind::Semicolon => at_start = true,
+            TokenKind::Word => {
+                let word = sql[token.range].to_ascii_uppercase();
+                let starts = matches!(
+                    word.as_str(),
+                    "SET"
+                        | "RESET"
+                        | "DISCARD"
+                        | "DO"
+                        | "CALL"
+                        | "COMMIT"
+                        | "ROLLBACK"
+                        | "END"
+                        | "ABORT"
+                        | "PREPARE"
+                );
+                if (at_start && starts) || word == "SET_CONFIG" {
+                    return true;
+                }
+                at_start = false;
+            }
+            _ => at_start = false,
+        }
+    }
+    false
+}
+
 /// How a statement moves the transaction state when it succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxEffect {
@@ -399,6 +444,13 @@ impl Session for PgSession {
         Some(self.database.clone())
     }
 
+    fn schema(&self) -> Option<String> {
+        self.schema
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn tx_state(&self) -> TxState {
         match self.tx_state.load(Ordering::Acquire) {
             TX_OPEN => TxState::Open,
@@ -436,6 +488,21 @@ impl Session for PgSession {
             return outcome;
         }
         self.set_tx_state(next_tx_state(self.tx_state(), effect, &outcome));
+        // A statement let go has returned above: it may still be running on
+        // the server, and a read would wait behind it.
+        if !matches!(outcome, Err(Error::Closed(_)))
+            && touches_session_state(sql)
+            && let Some(client) = link.client.as_ref()
+        {
+            // In a failed block the read fails too: the last value stays.
+            match simple_rows(client, "SELECT current_schema()").await {
+                Ok(rows) => {
+                    *self.schema.lock().unwrap_or_else(|e| e.into_inner()) =
+                        rows.first().and_then(|row| row.get(0)).map(str::to_string);
+                }
+                Err(error) => tracing::debug!(%error, "could not read the current schema"),
+            }
+        }
         outcome
     }
 
@@ -567,6 +634,49 @@ mod tests {
             ("", None),
         ] {
             assert_eq!(tx_effect(sql), expected, "{sql}");
+        }
+    }
+
+    /// C6: the statements after which the current schema is read again.
+    #[test]
+    fn statements_that_may_change_the_current_schema() {
+        for sql in [
+            "SET search_path TO other",
+            "set local search_path = a, b",
+            "SET SESSION search_path TO DEFAULT",
+            "set schema 'other'",
+            "SET ROLE someone",
+            "RESET search_path",
+            "reset all",
+            "DISCARD ALL",
+            "-- c\n/* c */ set search_path to x",
+            "SELECT 1; SET search_path TO x",
+            "COMMIT",
+            "rollback",
+            "ROLLBACK TO SAVEPOINT s",
+            "end",
+            "abort",
+            "PREPARE TRANSACTION 'x'",
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "CALL p()",
+            "SELECT set_config('search_path', 'x', false)",
+            "select 1 from t where pg_catalog.set_config('a.b', '1', true) <> ''",
+        ] {
+            assert!(touches_session_state(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 'SET search_path TO x'",
+            "SELECT \"set\" FROM t",
+            "UPDATE t SET a = 1",
+            "INSERT INTO t VALUES ('x; SET search_path TO y')",
+            "ALTER ROLE r SET search_path TO x",
+            "CREATE FUNCTION f() RETURNS int SET search_path = x AS 'select 1' LANGUAGE sql",
+            "BEGIN",
+            "SELECT 'set_config'",
+            "",
+            ";;",
+        ] {
+            assert!(!touches_session_state(sql), "{sql}");
         }
     }
 
