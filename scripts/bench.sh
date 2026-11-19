@@ -5,6 +5,11 @@
 #   scripts/bench.sh [runs] [startup-runs] [--only STEP] [--indicative]
 #                                  (default 5 runs of each measure, 30 of the
 #                                  startup: it is short and varies the most)
+#   scripts/bench.sh --report FILE (the table of a raw file kept from a run:
+#                                  builds and measures nothing)
+#
+# Exits 1 when a median misses its target, after printing the whole table
+# (CLAUDE.md §5: a regression must fail, not only print MISSED).
 #
 # STEP is one of: core (the targets of §5), and the cases competitors fail
 # (CLAUDE.md §4 J9): wide (300 columns), navigator (200 schemas, 1,200
@@ -37,11 +42,13 @@ cd "$(dirname "$0")/.."
 
 only=""
 indicative=0
+report_only=""
 positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --only) only="${2:?--only needs a step}"; shift 2 ;;
     --indicative) indicative=1; shift ;;
+    --report) report_only="${2:?--report needs a raw file}"; shift 2 ;;
     *) positional+=("$1"); shift ;;
   esac
 done
@@ -49,6 +56,82 @@ case "$only" in
   "" | core | wide | navigator | import | reconnect) ;;
   *) echo "unknown step $only (core, wide, navigator, import, reconnect)" >&2; exit 2 ;;
 esac
+
+# Prints the table of a raw file (one "label<TAB>ms<TAB>json" line per
+# output line of a run) with each median against its target, then fails
+# when one of them missed.
+report() {
+  python3 -I - "$1" <<'PY'
+import json, statistics, sys
+from collections import defaultdict
+
+values = defaultdict(list)
+for row in open(sys.argv[1]):
+    label, spawn_ms, line = row.rstrip("\n").split("\t", 2)
+    try:
+        data = json.loads(line)
+    except ValueError:
+        continue
+    if "error" in data:
+        print(f"error in {label}: {data['error']}")
+        continue
+    for key in ("outcome", "statuses"):
+        if key in data:
+            print(f"{label} {data['bench']} {key}: {data[key]}")
+    name = data["bench"] + (f".{data['pass']}" if "pass" in data else "")
+    if name == "startup":
+        values[(label, name, "spawn_to_interactive_ms")].append(float(spawn_ms))
+    for key, value in data.items():
+        if isinstance(value, dict):
+            for sub, number in value.items():
+                values[(label, name, f"{key}.{sub}")].append(number)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and not key.endswith("epoch_ms"):
+            values[(label, name, key)].append(value)
+
+targets = {
+    ("startup", "spawn_to_interactive_ms"): 400,
+    ("startup", "main_to_interactive_ms"): 400,
+    ("first_rows", "idle_rss_mb"): 150,
+    ("first_rows", "columns_to_frame_ms"): 150,
+    ("scroll.vertical", "interval_ms.avg"): 16,
+    ("scroll.horizontal", "interval_ms.avg"): 16,
+    ("navigator", "database_ms"): 300,
+    ("navigator", "schema_ms"): 500,
+    ("navigator", "tables_ms"): 500,
+    ("import", "cancel_ms"): 2000,
+    ("reconnect", "usable_after_back_ms"): 5000,
+}
+loads = defaultdict(list)
+for row in open(sys.argv[1]):
+    label, _, line = row.rstrip("\n").split("\t", 2)
+    if '"bench":"load"' in line:
+        loads[label].append(f"{json.loads(line)['load1']:g}")
+for label, per_run in loads.items():
+    print(f"load average per {label} run: {' '.join(per_run)}")
+missed = False
+print(f"{'run':<9} {'measure':<18} {'value':<26} {'median':>12} {'min-max':>24} {'target':>8}")
+for (label, name, key), numbers in values.items():
+    numbers = [n for n in numbers if n is not None]
+    if not numbers:
+        continue
+    target = targets.get((name, key))
+    median = statistics.median(numbers)
+    verdict = "" if target is None else (f"<= {target} " + ("met" if median <= target else "MISSED"))
+    missed |= target is not None and median > target
+    shown = lambda n: f"{n:.0f}" if float(n).is_integer() or abs(n) >= 1e5 else f"{n:g}"
+    span = f"{shown(min(numbers))}-{shown(max(numbers))}"
+    print(f"{label:<9} {name:<18} {key:<26} {shown(median):>12} {span:>24} {verdict:>8}")
+sys.exit(1 if missed else 0)
+PY
+}
+
+if [ -n "$report_only" ]; then
+  status=0
+  report "$report_only" || status=$?
+  exit "$status"
+fi
+
 runs="${positional[0]:-5}"
 startup_runs="${positional[1]:-30}"
 max_load=4
@@ -355,63 +438,8 @@ fi
 echo
 echo "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(date '+%Y-%m-%d %H:%M'), commit $(git rev-parse --short HEAD), load $(load1), $runs runs ($startup_runs of the startup), median (min-max)"
 [ "$indicative" = 1 ] && echo "INDICATIVE: measured on a busy machine (load $(load1)), not for publication"
-python3 -I - "$raw" <<'PY'
-import json, statistics, sys
-from collections import defaultdict
-
-values = defaultdict(list)
-for row in open(sys.argv[1]):
-    label, spawn_ms, line = row.rstrip("\n").split("\t", 2)
-    try:
-        data = json.loads(line)
-    except ValueError:
-        continue
-    if "error" in data:
-        print(f"error in {label}: {data['error']}")
-        continue
-    for key in ("outcome", "statuses"):
-        if key in data:
-            print(f"{label} {data['bench']} {key}: {data[key]}")
-    name = data["bench"] + (f".{data['pass']}" if "pass" in data else "")
-    if name == "startup":
-        values[(label, name, "spawn_to_interactive_ms")].append(float(spawn_ms))
-    for key, value in data.items():
-        if isinstance(value, dict):
-            for sub, number in value.items():
-                values[(label, name, f"{key}.{sub}")].append(number)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) \
-                and not key.endswith("epoch_ms"):
-            values[(label, name, key)].append(value)
-
-targets = {
-    ("startup", "spawn_to_interactive_ms"): 400,
-    ("startup", "main_to_interactive_ms"): 400,
-    ("first_rows", "idle_rss_mb"): 150,
-    ("first_rows", "columns_to_frame_ms"): 150,
-    ("scroll.vertical", "interval_ms.avg"): 16,
-    ("scroll.horizontal", "interval_ms.avg"): 16,
-    ("navigator", "database_ms"): 300,
-    ("navigator", "schema_ms"): 500,
-    ("navigator", "tables_ms"): 500,
-    ("import", "cancel_ms"): 2000,
-    ("reconnect", "usable_after_back_ms"): 5000,
-}
-loads = defaultdict(list)
-for row in open(sys.argv[1]):
-    label, _, line = row.rstrip("\n").split("\t", 2)
-    if '"bench":"load"' in line:
-        loads[label].append(f"{json.loads(line)['load1']:g}")
-for label, per_run in loads.items():
-    print(f"load average per {label} run: {' '.join(per_run)}")
-print(f"{'run':<9} {'measure':<18} {'value':<26} {'median':>12} {'min-max':>24} {'target':>8}")
-for (label, name, key), numbers in values.items():
-    numbers = [n for n in numbers if n is not None]
-    if not numbers:
-        continue
-    target = targets.get((name, key))
-    median = statistics.median(numbers)
-    verdict = "" if target is None else (f"<= {target} " + ("met" if median <= target else "MISSED"))
-    shown = lambda n: f"{n:.0f}" if float(n).is_integer() or abs(n) >= 1e5 else f"{n:g}"
-    span = f"{shown(min(numbers))}-{shown(max(numbers))}"
-    print(f"{label:<9} {name:<18} {key:<26} {shown(median):>12} {span:>24} {verdict:>8}")
-PY
+# The raw lines stay after the scratch goes: scripts/bench.sh --report reads them again.
+cp "$raw" target/bench-raw.tsv
+echo "raw lines kept in target/bench-raw.tsv"
+# Last: a miss makes the script exit 1 (set -e), the scratch removed by the trap.
+report "$raw"

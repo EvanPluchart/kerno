@@ -2973,7 +2973,8 @@ mod tests {
         }
     }
 
-    /// Run with `--nocapture` to see the timings.
+    /// C2: completion on 2,000 tables and a 2 kB statement stays under a loose bound. Run
+    /// with `--nocapture` to see the timings.
     #[test]
     fn a_large_catalog_and_a_long_statement_stay_fast() {
         let catalog = big_catalog();
@@ -3023,6 +3024,12 @@ mod tests {
             }
             let each = started.elapsed() / rounds;
             eprintln!("complete, {what}: {each:?} per call");
+            // C2: 0.3 to 1.9 ms a call in a debug build (2026-11-19, load 5 to 11). The
+            // bound catches a scan of the catalog per candidate (45 ms), not machine noise.
+            assert!(
+                each < std::time::Duration::from_millis(20),
+                "{what}: {each:?} per call"
+            );
             let first = completion
                 .items
                 .first()

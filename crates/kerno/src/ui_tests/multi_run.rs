@@ -10,7 +10,7 @@ use crate::multi_run::MultiRun;
 use super::*;
 
 /// The test server of `engine` saved as `name`, changed by `change`.
-fn saved(
+pub(super) fn saved(
     engine: Engine,
     name: &str,
     change: impl FnOnce(&mut ConnectionConfig),
@@ -24,7 +24,11 @@ fn saved(
 /// Opens the app with `configs` saved with their passwords, none connected,
 /// and a query tab "Script" holding `sql`, on no connection, then a tab
 /// "Other" after it; "Script" is the active tab.
-fn with_connections(cx: &mut TestAppContext, configs: &[ConnectionConfig], sql: &str) -> Fixture {
+pub(super) fn with_connections(
+    cx: &mut TestAppContext,
+    configs: &[ConnectionConfig],
+    sql: &str,
+) -> Fixture {
     let storage = memory_storage();
     let ids: Vec<String> = configs
         .iter()
@@ -47,7 +51,7 @@ fn with_connections(cx: &mut TestAppContext, configs: &[ConnectionConfig], sql: 
 }
 
 /// Opens "Run script on connections…" for the active tab.
-fn open_dialog(app: &Fixture, cx: &mut TestAppContext) {
+pub(super) fn open_dialog(app: &Fixture, cx: &mut TestAppContext) {
     app.step(cx, |window, cx| {
         window.dispatch_action(Box::new(actions::RunScriptOnConnections), cx)
     });
@@ -60,13 +64,13 @@ fn multi(app: &Fixture, cx: &mut TestAppContext) -> Entity<MultiRun> {
 }
 
 /// One line per target: `name: status · numbers · first error`.
-fn summary(app: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
+pub(super) fn summary(app: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
     let run = multi(app, cx);
     cx.update(|cx| run.read(cx).summary(cx))
 }
 
 /// Waits until no target waits or runs.
-fn wait_for_the_end(app: &Fixture, cx: &mut TestAppContext) {
+pub(super) fn wait_for_the_end(app: &Fixture, cx: &mut TestAppContext) {
     app.wait_until(cx, "every target to end", |app, cx| {
         let run = multi(app, cx);
         !cx.update(|cx| run.read(cx).in_progress())

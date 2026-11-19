@@ -34,6 +34,13 @@ first (a freshly built binary pays the system's one-time checks). The update che
 Five runs per measure, thirty for the start-up, which is short and varies the most; the table gives the
 median and the range.
 
+The table marks each median against its target, `met` or `MISSED`, and the script exits 1 after printing it
+when one is missed (K10, C1): a regression fails the run. On the numbers of this page a full run exits 1, for
+the bare binary's idle memory, 152.1 MB for 150 (D-082; the bundled app, 149.9 MB, is measured by hand). A
+measure whose every run failed ("error in …") has no row and does not fail the run. The raw lines are kept in
+`target/bench-raw.tsv`; `scripts/bench.sh --report FILE` prints their table again and builds and measures
+nothing.
+
 - **Start-up** (`KERNO_BENCH=startup`): from spawning the process to the second frame drawn. The first
   frame is on screen after 161 ms (133–447) from `main`; the app is counted interactive at the next frame,
   after macOS has activated it: 254 ms from `main`, 264 ms from the spawn. Kerno's own work before the first
@@ -158,6 +165,7 @@ machine (1-minute load 1.9 to 3.95), 2026-11-14.
 scripts/test-env.sh up          # the kerno-* containers
 scripts/bench.sh 5 30           # on a quiet machine, the Kerno window left visible
 scripts/bench.sh 5 --only wide  # one step alone: core, wide, navigator, import, reconnect
+scripts/bench.sh --report target/bench-raw.tsv  # the last run's table again (exit 1 on a miss)
 scripts/bundle-macos.sh         # then, for the bundled idle figure, the first_rows step on
                                 # dist/Kerno.app/Contents/MacOS/kerno (KERNO_BENCH=first_rows, see bench.sh)
 ```

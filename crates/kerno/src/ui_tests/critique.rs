@@ -2836,3 +2836,393 @@ fn a_refused_keychain_read_says_what_to_do(cx: &mut TestAppContext) {
     let password = testing::secrets().password.unwrap();
     assert!(!message.contains(password.expose()), "{message}");
 }
+
+// K10: pin what works but nothing tests (C3, C6, C21) ---------------------------------------
+
+/// A statement whose first page arrives at once and whose other 3,000 rows each take 20 ms on
+/// the server: "Fetch all" is still running when it is cancelled, nothing large is read, and
+/// one a failed run leaves behind ends within a minute.
+fn k10_slow_rows(engine: Engine, marker: &str) -> String {
+    match engine {
+        Engine::Postgres => format!(
+            "select g as {marker} from generate_series(1, 4000) g \
+             where g <= 1000 or (select true from pg_sleep(0.02 + g * 0))"
+        ),
+        Engine::MySql | Engine::MariaDb => format!(
+            "select id as {marker}, username from kerno_analytics.big_table \
+             where id <= 4000 and if(id <= 1000, 0, sleep(0.02)) = 0"
+        ),
+    }
+}
+
+/// A name for the statements of this test process alone: one a failed run left on the
+/// server (a MySQL `SLEEP` runs on after its client is gone) is not taken for this one.
+fn k10_marker(what: &str) -> String {
+    format!("kerno_ui_k10_{what}_{}", std::process::id())
+}
+
+/// Cancels the statement of the active tab once it runs on the server, waits for it to be
+/// gone there, and checks the same tab runs the next statement.
+fn k10_cancel(app: &Fixture, cx: &mut TestAppContext, engine: Engine, marker: &str) {
+    app.wait_until(cx, "the statement on the server", |app, cx| {
+        app.running(cx) && running_on_server(engine, marker)
+    });
+    app.press(cx, &["secondary-."]);
+    app.wait_until(cx, "the cancellation", |app, cx| !app.running(cx));
+    app.wait_until(cx, "the statement to be gone from the server", |_, _| {
+        !running_on_server(engine, marker)
+    });
+}
+
+/// C3: "Fetch all" in a query tab is cancelled on the server (Cmd+.): the statement is gone
+/// there, the rows that arrived are kept (marked incomplete, the server's cancellation after
+/// them), and the tab runs the next statement.
+#[gpui_kit::test]
+fn fetch_all_is_cancelled_on_the_server(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let marker = k10_marker("fetch");
+        let app = connected(cx, engine);
+        app.run_in_new_tab(cx, &k10_slow_rows(engine, &marker), "secondary-enter");
+        app.wait_until(cx, "the first page", |app, cx| {
+            app.outcomes(cx) == ["1000 rows, more"] && !app.running(cx)
+        });
+        app.click(cx, "fetch-all");
+        k10_cancel(&app, cx, engine, &marker);
+        // The rows that arrived are kept, marked incomplete; the server's cancellation follows.
+        let outcomes = app.outcomes(cx);
+        assert_eq!(outcomes.len(), 2, "{engine:?}: {outcomes:?}");
+        assert_eq!(outcomes[1], "cancelled", "{engine:?}");
+        let rows: usize = outcomes[0]
+            .strip_suffix(" rows, incomplete")
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("{engine:?}: {outcomes:?}"));
+        assert!(rows >= 1000, "{engine:?}: the rows that arrived are kept");
+        assert_eq!(
+            k3_run(&app, cx, "select 7 as seven"),
+            ["1 rows"],
+            "{engine:?}"
+        );
+    }
+}
+
+/// C3: EXPLAIN ANALYZE runs the statement, so it is cancelled on the server as a run is
+/// (MariaDB's form is `ANALYZE FORMAT=JSON`), and the tab runs the next statement.
+#[gpui_kit::test]
+fn an_explain_analyze_is_cancelled(cx: &mut TestAppContext) {
+    let marker = k10_marker("explain");
+    // 5,000 rows of 10 ms: 50 s, gone soon after a failed run.
+    let mysql = format!("select count(*) as {marker} from kerno.orders where sleep(0.01) = 0");
+    for (engine, slow) in [
+        (Engine::Postgres, format!("select pg_sleep(60) as {marker}")),
+        (Engine::MySql, mysql.clone()),
+        (Engine::MariaDb, mysql),
+    ] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        app.run_in_new_tab(cx, &slow, "secondary-shift-e");
+        k10_cancel(&app, cx, engine, &marker);
+        // MySQL may send the plan of what ran before the kill, then the kill's error.
+        let outcomes = app.outcomes(cx);
+        let (last, before) = outcomes.split_last().expect("an outcome");
+        assert_eq!(last, "cancelled", "{engine:?}: {outcomes:?}");
+        assert!(
+            before.iter().all(|outcome| outcome.starts_with("plan, ")),
+            "{engine:?}: {outcomes:?}"
+        );
+        assert_eq!(
+            k3_run(&app, cx, "select 7 as seven"),
+            ["1 rows"],
+            "{engine:?}"
+        );
+    }
+}
+
+/// C6: renaming a connection from the sidebar renames it wherever its tab shows it: the
+/// tab's connection picker (its menu), the main toolbar's pickers and the status bar.
+#[gpui_kit::test]
+fn renaming_a_connection_renames_its_tabs_picker(cx: &mut TestAppContext) {
+    use crate::workspace::toolbar::Item;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    let shown = |app: &Fixture, cx: &mut TestAppContext, name: &str| {
+        // The tab's own picker: its menu lists the connections, built when it opens.
+        app.click(cx, "tab-connection");
+        let listed = menu_entry(app, cx, name).is_some();
+        app.press(cx, &["escape"]);
+        let (connection, target) = cx.update(|cx| {
+            let workspace = app.workspace.read(cx);
+            (
+                workspace.picker_text(Item::Connection, cx),
+                workspace.picker_text(Item::Target, cx),
+            )
+        });
+        (
+            listed,
+            connection == name,
+            target.ends_with(&format!("@{name}")),
+            app.status_bar(cx).iter().any(|item| item == name),
+        )
+    };
+    let before = cx.update(|cx| app.connections.read(cx).saved()[0].config.name.clone());
+    assert_eq!(shown(&app, cx, &before), (true, true, true, true));
+
+    app.right_click(cx, ("connection", 0usize), None);
+    app.click_label(cx, "Rename…");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "kerno_ui_k10 renamed");
+    app.click(cx, "name-ok");
+    assert_eq!(
+        shown(&app, cx, "kerno_ui_k10 renamed"),
+        (true, true, true, true)
+    );
+    assert_eq!(shown(&app, cx, &before), (false, false, false, false));
+}
+
+/// The test's own table `<name>.t` holding the rows 1 and 2, dropped when the test ends.
+fn k10_table(engine: Engine, name: &str) -> Scratch {
+    let (drop, create) = scratch_schema(engine, name);
+    let table = format!("CREATE TABLE {name}.t (id INT PRIMARY KEY, v VARCHAR(20))");
+    let rows = format!("INSERT INTO {name}.t VALUES (1, 'one'), (2, 'two')");
+    Scratch::new(engine, &[&drop], &[&create, &table, &rows])
+}
+
+fn k10_count(engine: Engine, name: &str) -> String {
+    on_server(engine, &format!("SELECT count(*) FROM {name}.t"))
+}
+
+/// C21: EXPLAIN ANALYZE runs its statement, so on a local, writable connection the plan of a
+/// `DELETE` without a `WHERE` asks first, as running it does; Cancel runs nothing.
+#[gpui_kit::test]
+fn explain_analyze_of_a_delete_without_where_asks(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k10_plan_delete";
+        let _scratch = k10_table(engine, name);
+        let app = connected(cx, engine);
+        app.run_in_new_tab(cx, &format!("delete from {name}.t"), "secondary-shift-e");
+        assert!(app.has(cx, "sql-preview"), "{engine:?}");
+        assert!(!app.has(cx, "sql-production"), "{engine:?}");
+        assert_eq!(app.label_of(cx, "sql-title"), "Run this statement?");
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview"), "{engine:?}");
+        assert!(!app.running(cx), "{engine:?}");
+        assert_eq!(app.outcomes(cx), Vec::<String>::new(), "{engine:?}");
+        assert_eq!(k10_count(engine, name), "2", "{engine:?}");
+        // The plan of a statement that only reads runs without a question.
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, &format!("select * from {name}.t"));
+        app.press(cx, &["secondary-shift-e"]);
+        assert!(!app.has(cx, "sql-preview"), "{engine:?}");
+        app.wait_until(cx, "the plan", |app, cx| {
+            !app.running(cx) && !app.outcomes(cx).is_empty()
+        });
+    }
+}
+
+/// C21: a run on several connections asks each local, writable target before a `DELETE`
+/// without a `WHERE`, one at a time: Cancel skips that target only (its rows are all on the
+/// server), the other one, confirmed, deletes.
+#[gpui_kit::test]
+fn a_local_target_of_a_multi_run_asks_before_a_delete_without_where(cx: &mut TestAppContext) {
+    use super::multi_run::{open_dialog, saved, summary, wait_for_the_end, with_connections};
+    if ![Engine::Postgres, Engine::MySql]
+        .into_iter()
+        .all(testing::available)
+    {
+        return;
+    }
+    let name = "kerno_ui_k10_multi";
+    let _pg = k10_table(Engine::Postgres, name);
+    let _my = k10_table(Engine::MySql, name);
+    let configs = [
+        saved(Engine::Postgres, "local PG", |_| {}),
+        saved(Engine::MySql, "local MySQL", |_| {}),
+    ];
+    let app = with_connections(cx, &configs, &format!("DELETE FROM {name}.t"));
+    open_dialog(&app, cx);
+    app.click(cx, ("multi-connection", 0usize));
+    app.click(cx, ("multi-connection", 1usize));
+    app.click(cx, "multi-start");
+
+    app.wait_until(cx, "the first question", |app, cx| {
+        app.has(cx, "sql-preview")
+    });
+    assert_eq!(app.label_of(cx, "sql-title"), "Run this statement?");
+    assert!(!app.has(cx, "sql-production"));
+    let lines = summary(&app, cx);
+    assert!(
+        lines[0].ends_with("Waiting for your confirmation"),
+        "{lines:#?}"
+    );
+    assert_eq!(k10_count(Engine::Postgres, name), "2");
+    app.click(cx, "sql-cancel");
+
+    app.wait_until(cx, "the second question", |app, cx| {
+        summary(app, cx)[1].ends_with("Waiting for your confirmation")
+    });
+    assert!(app.has(cx, "sql-preview"));
+    app.click(cx, "sql-confirm");
+    wait_for_the_end(&app, cx);
+
+    let lines = summary(&app, cx);
+    assert_eq!(
+        lines[0], "local PG: Not run: confirmation declined",
+        "{lines:#?}"
+    );
+    assert!(lines[1].starts_with("local MySQL: Done"), "{lines:#?}");
+    assert_eq!(k10_count(Engine::Postgres, name), "2");
+    assert_eq!(k10_count(Engine::MySql, name), "0");
+}
+
+/// C21: Apply of a table's pending edits on a production connection asks twice, in order:
+/// the first confirmation only arms the second ("Run on Production"), refusing the second
+/// runs nothing and keeps the edit; confirming both applies it.
+#[gpui_kit::test]
+fn a_data_apply_on_production_asks_twice(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k10_prod";
+        let _scratch = k10_table(engine, name);
+        let value = || on_server(engine, &format!("SELECT v FROM {name}.t WHERE id = 1"));
+        let mut config = testing::config(engine);
+        config.environment = kerno_core::environment::PRODUCTION.into();
+        let app = connected_as(cx, config);
+        app.open_table(cx, name, "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        app.type_in_cell(cx, 0, 2, "changed", "enter");
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+
+        app.click(cx, "data-apply");
+        assert!(app.has(cx, "sql-production"), "{engine:?}");
+        assert_eq!(app.label_of(cx, "sql-confirm"), "Apply", "{engine:?}");
+        app.click(cx, "sql-confirm");
+        assert!(
+            app.has(cx, "sql-preview"),
+            "{engine:?}: one click is not enough"
+        );
+        assert_eq!(
+            app.label_of(cx, "sql-confirm"),
+            "Run on Production",
+            "{engine:?}"
+        );
+        assert_eq!(value(), "one", "{engine:?}");
+        app.click(cx, "sql-cancel");
+        assert!(!app.has(cx, "sql-preview"), "{engine:?}");
+        assert_eq!(value(), "one", "{engine:?}");
+        assert_eq!(app.pending(cx), 1, "{engine:?}: the edit is kept");
+
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the apply", |app, cx| app.pending(cx) == 0);
+        assert_eq!(value(), "changed", "{engine:?}");
+    }
+}
+
+// K10: what K1-K9 left read, not run ---------------------------------------------------------
+
+/// C6 (K3): the read-only toggle rebuilds the connection's sessions; a tab moved by `USE` (a
+/// `SET search_path` on PostgreSQL) opens its new session where it was moved, and a write is
+/// refused.
+#[gpui_kit::test]
+fn the_read_only_toggle_keeps_a_tab_where_it_was_moved(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let place = "kerno_ui_k10_moved";
+        let (drop, create) = scratch_schema(engine, place);
+        let _scratch = Scratch::new(engine, &[&drop], &[&create]);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let (moving, _) = k3_sql(engine, place);
+        assert_eq!(k3_run(&app, cx, &moving), ["done"], "{engine:?}");
+        let (_, first_id) = k3_where(&app, cx, engine);
+
+        app.dispatch(cx, actions::ToggleReadOnly);
+        app.wait_until(cx, "the reconnection", |app, cx| {
+            app.first_stored().read_only && matches!(app.status(cx, 0), Status::Connected { .. })
+        });
+        let (now, second_id) = k3_where(&app, cx, engine);
+        assert_ne!(second_id, first_id, "{engine:?}: a new session");
+        assert_eq!(now, place, "{engine:?}");
+        let write = format!("create table {place}.t (id int)");
+        assert_eq!(k3_run(&app, cx, &write), ["failed []"], "{engine:?}");
+        assert_eq!(
+            on_server(
+                engine,
+                &format!(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = '{place}'"
+                )
+            ),
+            "0",
+            "{engine:?}"
+        );
+    }
+}
+
+/// C14 (K9): the table form's Apply failure shows the server's hint: a column changed from
+/// text to `int` cannot be cast without `USING`, and PostgreSQL says how.
+#[gpui_kit::test]
+fn a_failed_table_form_apply_shows_the_server_hint(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k10_form";
+    let _scratch = k10_table(engine, name);
+    let app = connected(cx, engine);
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let target = Target {
+        connection,
+        database: None,
+        schema: None,
+    };
+    app.step(cx, |window, cx| {
+        app.workspace.update(cx, |workspace, cx| {
+            workspace.open_table_editor(
+                target,
+                name.to_string(),
+                Some(TableRef::new(name, "t")),
+                window,
+                cx,
+            );
+        })
+    });
+    app.wait_for_editor(cx);
+    app.fill_in(cx, ("column-type", 1usize), "int");
+    app.click(cx, "editor-apply");
+    app.click(cx, "sql-confirm");
+    let editor = app.editor(cx);
+    app.wait_until(cx, "the failed apply", |_, cx| {
+        cx.update(|cx| editor.read(cx).error().is_some())
+    });
+    let error = cx.update(|cx| editor.read(cx).error().map(str::to_string).unwrap());
+    assert!(error.contains("[42804]"), "{error}");
+    assert!(
+        error.contains("Hint: You might need to specify \"USING v::integer\"."),
+        "{error}"
+    );
+    assert_eq!(
+        on_server(
+            engine,
+            &format!(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_schema = '{name}' AND column_name = 'v'"
+            )
+        ),
+        "character varying"
+    );
+}

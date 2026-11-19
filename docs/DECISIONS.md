@@ -1781,3 +1781,15 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   never from the statement: PostgreSQL's driver marks a failed `COMMIT` idle (the server ended the block), MySQL
   reads the server's in-transaction flag with a ping after any failure. A `COMMIT` cut by a lost connection says
   that whether it was saved is not known, as a statement cut while running does.
+
+## D-082 — The bench fails on every missed target, the known idle-memory miss included (K10, C1, C2; 2026-11-19)
+
+- **`scripts/bench.sh` exits 1 when any median misses its target**, after printing the whole table. No target
+  is exempted: the bare binary's idle RSS, 152.1 MB on the last run for a 150 MB target (`docs/BENCH.md`, D-053),
+  makes a full run fail today. Exempting it, or raising the target, is the owner's decision on idle memory, which
+  K10 leaves separate; until then a red run says something true. `--only` steps without that measure are not
+  affected.
+- **The verdict can be read again without measuring**: `scripts/bench.sh --report FILE` prints the table of a
+  raw file and exits as a run would; a run keeps its raw lines in `target/bench-raw.tsv`. This is how the exit
+  code was tested, on hand-written files, without building or starting the app.
+- Nothing calls the script (`scripts/check.sh` and `scripts/release.sh` do not), so no other step changes.

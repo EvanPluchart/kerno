@@ -597,3 +597,20 @@ Still open (for the owner):
   unlock, or "Ask each time"); a task whose connection did not open says it as the window does.
 - Two core tests, four UI tests and one unit test; each UI test seen failing with its part disabled (five
   mutations). Limits and plan errors in the "Done:" line of K9.
+
+## 2026-11-19 — K10: pins for what worked but nothing tested (C1, C2, C3, C6, C21)
+
+- `scripts/bench.sh` exits 1 when a median misses its target, after the whole table, and `--report FILE`
+  prints the table of a raw file kept from a run (`target/bench-raw.tsv`) without measuring. Tested on
+  hand-written raw files only (the bench was not run): all met → 0, one missed → 1. On the last recorded
+  numbers a full run now exits 1, for the bare binary's idle memory (152.1 MB for 150): the target is left as
+  it is, the owner's decision (D-082).
+- Completion on 2,000 tables and a 2 kB statement asserts under 20 ms a call; measured 0.3 to 1.9 ms in a
+  debug build at a load of 5 to 11.
+- Eight UI tests: "Fetch all" and `EXPLAIN ANALYZE` cancelled on the server; renaming a connection renames
+  its tabs' picker; `EXPLAIN ANALYZE` of a `DELETE` without `WHERE` asks; each local target of a run on several
+  connections asks; a data Apply on production asks twice; and two taken from what K3 and K9 left untested (a
+  moved tab through the read-only toggle, the table form's hint). Each seen failing with a one-line mutation;
+  no product code changed.
+- `docs/COMPETITOR-ISSUES.md`: C1, C2, C6 and C21 now answered (9 answered, 5 gaps, 1 untested). Limits and
+  plan errors in the "Done:" line of K10 (`docs/plans/M12.md`).
