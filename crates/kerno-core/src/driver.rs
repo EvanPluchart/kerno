@@ -14,8 +14,8 @@ use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::exec::ExecSink;
 use crate::schema::{
-    DatabaseInfo, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects, ServerInfo, TableRef,
-    TableStructure,
+    Change, DatabaseInfo, Dependent, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects,
+    ServerInfo, TableRef, TableStructure,
 };
 use crate::sql::Catalog;
 
@@ -152,6 +152,18 @@ pub trait Session: Send + Sync + 'static {
     /// (database, on MySQL) with its relations, their columns and foreign
     /// keys, the routine names, and the search path.
     async fn completion_catalog(&self) -> Result<Catalog>;
+
+    /// What else `change` reaches, read from the catalog alone (C11): what a
+    /// `DROP … CASCADE` would drop with it, what refuses a plain drop, what
+    /// stays broken, what names the object in its source. Never runs the
+    /// change. [`crate::Error::Unsupported`] where the engine reads nothing
+    /// for this change: an empty list means "nothing else", not "not read".
+    async fn dependents(&self, change: &Change) -> Result<Vec<Dependent>> {
+        let _ = change;
+        Err(crate::Error::Unsupported(
+            "reading what depends on this object".into(),
+        ))
+    }
 
     // Administration ------------------------------------------------------
 

@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kerno_core::dialect::Dialect;
 use kerno_core::schema::{
-    ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, EventInfo,
-    ForeignKeyInfo, IndexInfo, RelationInfo, RelationKind, RoutineInfo, RoutineKind, SchemaObjects,
-    SequenceInfo, TableRef, TableStructure, TriggerInfo,
+    Change, ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, Dependent,
+    EventInfo, ForeignKeyInfo, IndexInfo, ObjectRef, RelationInfo, RelationKind, RoutineInfo,
+    RoutineKind, SchemaObjects, SequenceInfo, TableRef, TableStructure, Tie, TriggerInfo,
+    like_containing, mentions,
 };
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
@@ -989,6 +990,158 @@ async fn foreign_keys(session: &MysqlSession, filter: &str) -> Result<Vec<Foreig
         (&a.table.schema, &a.table.name, &a.name).cmp(&(&b.table.schema, &b.table.name, &b.name))
     });
     Ok(keys)
+}
+
+/// What else a change reaches (C11), from `information_schema` only.
+/// Neither engine has `CASCADE`: a plain `DROP TABLE` is refused while a
+/// foreign key of another table points at it (MySQL's error 3730, MariaDB's
+/// 1451; a table's own key to itself does not count), and the views over a
+/// table stay but stop working (error 1356 when read). MySQL lists them in
+/// `VIEW_TABLE_USAGE` (with the views over those views); MariaDB has no such
+/// table, so its view definitions are searched for the name. A rename leaves
+/// every view, routine, trigger and event that names the object broken (none
+/// follow it, checked on both servers): their source is searched.
+pub(crate) async fn dependents(session: &MysqlSession, change: &Change) -> Result<Vec<Dependent>> {
+    match change {
+        Change::Drop {
+            object: ObjectRef::Relation(table, kind @ (RelationKind::Table | RelationKind::View)),
+            ..
+        } => {
+            let mut found = Vec::new();
+            if *kind == RelationKind::Table {
+                let keys = session
+                    .query(&format!(
+                        "SELECT CONSTRAINT_NAME, CONSTRAINT_SCHEMA, TABLE_NAME \
+                         FROM information_schema.REFERENTIAL_CONSTRAINTS \
+                         WHERE UNIQUE_CONSTRAINT_SCHEMA = {schema} AND REFERENCED_TABLE_NAME = {name} \
+                           AND NOT (CONSTRAINT_SCHEMA = {schema} AND TABLE_NAME = {name})",
+                        schema = lit(session, &table.schema),
+                        name = lit(session, &table.name),
+                    ))
+                    .await?;
+                found.extend(keys.iter().map(|row| Dependent {
+                    kind: "foreign key".into(),
+                    name: format!("{} on {}.{}", text(row, 0), text(row, 1), text(row, 2)),
+                    tie: Tie::Blocks,
+                }));
+            }
+            if is_mariadb(session) {
+                found.extend(searched(session, &table.name, &["VIEWS"]).await?);
+            } else {
+                found.extend(views_over(session, table).await?);
+            }
+            sorted(found)
+        }
+        Change::Rename(
+            object @ (ObjectRef::Relation(..)
+            | ObjectRef::Sequence(_)
+            | ObjectRef::Event(_)
+            | ObjectRef::Index { .. }),
+        ) => sorted(
+            searched(
+                session,
+                object.name(),
+                &["VIEWS", "ROUTINES", "TRIGGERS", "EVENTS"],
+            )
+            .await?,
+        ),
+        _ => Err(Error::Unsupported(
+            "reading what depends on this object".into(),
+        )),
+    }
+}
+
+fn sorted(mut found: Vec<Dependent>) -> Result<Vec<Dependent>> {
+    found.sort_by(|a, b| (a.tie, &a.kind, &a.name).cmp(&(b.tie, &b.kind, &b.name)));
+    Ok(found)
+}
+
+/// The views over `table` on MySQL, and the views over those, from
+/// `VIEW_TABLE_USAGE` (MySQL 8.0.13 and later).
+async fn views_over(session: &MysqlSession, table: &TableRef) -> Result<Vec<Dependent>> {
+    let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut next = vec![(table.schema.clone(), table.name.clone())];
+    // ponytail: one query per level of views; a recursive CTE over
+    // information_schema if chains get deep.
+    while !next.is_empty() {
+        let used = next
+            .iter()
+            .map(|(schema, name)| {
+                format!(
+                    "(TABLE_SCHEMA = {} AND TABLE_NAME = {})",
+                    lit(session, schema),
+                    lit(session, name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let rows = session
+            .query(&format!(
+                "SELECT VIEW_SCHEMA, VIEW_NAME FROM information_schema.VIEW_TABLE_USAGE WHERE {used}"
+            ))
+            .await?;
+        next = rows
+            .iter()
+            .map(|row| (text(row, 0), text(row, 1)))
+            .filter(|view| found.insert(view.clone()))
+            .collect();
+    }
+    Ok(found
+        .into_iter()
+        .map(|(schema, name)| Dependent {
+            kind: "view".into(),
+            name: format!("{schema}.{name}"),
+            tie: Tie::Breaks,
+        })
+        .collect())
+}
+
+/// The views, routines, triggers or events (`catalogs`, tables of
+/// `information_schema`) of every database but the system ones whose source
+/// names `name` as a word: a text search (comments and strings count), not a
+/// parse.
+async fn searched(session: &MysqlSession, name: &str, catalogs: &[&str]) -> Result<Vec<Dependent>> {
+    let pattern = lit(session, &like_containing(&name.to_lowercase()));
+    let mut found = Vec::new();
+    for catalog in catalogs {
+        // kind, schema, name, the table a trigger is on, the source.
+        let (columns, source) = match *catalog {
+            "VIEWS" => ("'view', TABLE_SCHEMA, TABLE_NAME, NULL", "VIEW_DEFINITION"),
+            "ROUTINES" => (
+                "LOWER(ROUTINE_TYPE), ROUTINE_SCHEMA, ROUTINE_NAME, NULL",
+                "ROUTINE_DEFINITION",
+            ),
+            "TRIGGERS" => (
+                "'trigger', TRIGGER_SCHEMA, TRIGGER_NAME, EVENT_OBJECT_TABLE",
+                "ACTION_STATEMENT",
+            ),
+            _ => (
+                "'event', EVENT_SCHEMA, EVENT_NAME, NULL",
+                "EVENT_DEFINITION",
+            ),
+        };
+        let schema = columns.split(", ").nth(1).unwrap_or_default();
+        let rows = session
+            .query(&format!(
+                "SELECT {columns}, {source} FROM information_schema.{catalog} \
+                 WHERE {schema} NOT IN ({SYSTEM_DATABASES}) \
+                   AND LOWER({source}) LIKE {pattern} ESCAPE '!'"
+            ))
+            .await?;
+        found.extend(
+            rows.iter()
+                .filter(|row| mentions(&text(row, 4), name))
+                .map(|row| Dependent {
+                    kind: text(row, 0),
+                    name: match opt(row, 3) {
+                        Some(table) => format!("{} on {}.{table}", text(row, 2), text(row, 1)),
+                        None => format!("{}.{}", text(row, 1), text(row, 2)),
+                    },
+                    tie: Tie::Mentions,
+                }),
+        );
+    }
+    Ok(found)
 }
 
 #[cfg(test)]

@@ -85,7 +85,8 @@ gaps, K1-K10 for the next milestone and K11-K16 after it. What is left out of bo
   a display. Look at them on a real GNOME and KDE session (Wayland and X11, fractional scaling) with the
   Wayland check above.
 - **Smart rename in SQL (C11).** Renaming an alias or a CTE across a statement, from J7's occurrences. Low
-  demand in the sample; the "also dropped" list before a cascade (K14) comes first because it protects data.
+  demand in the sample; the "also dropped" list before a cascade came first because it protects data (done in
+  K14, D-086, with a text search of what names an object before a rename).
 - **AWS RDS IAM and 1Password against the real services (C18).** Tested with fakes; a real run needs the
   owner's accounts (CLAUDE.md §8).
 - **Idle memory margin (C1).** 149.9 MB for a 150 MB bar; the fix left is a second `unsafe` call, with the

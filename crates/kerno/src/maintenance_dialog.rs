@@ -22,14 +22,14 @@ use gpui_kit::{
 };
 use kerno_core::exec::{self, ExecEvent, RowLimit};
 use kerno_core::maintenance::{CheckOption, Maintenance};
-use kerno_core::schema::ObjectRef;
+use kerno_core::schema::{Change, ObjectRef};
 use kerno_core::{Error, Session};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge;
 use crate::connections::manager::Connections;
 use crate::query::tab::duration_text;
-use crate::sql_confirm::{self, Confirmation, Statement};
+use crate::sql_confirm::{self, Confirmation, Reach, Statement};
 use crate::theme;
 
 /// What the dialog is opened on.
@@ -321,22 +321,52 @@ impl MaintenanceDialog {
             Maintenance::Vacuum(o) => o.full,
             _ => false,
         };
+        let confirmation = Confirmation {
+            title: format!("{}?", self.title()),
+            explanation: explanation(tool, self.opening.kind, &self.opening.name),
+            statement: Statement::Fixed(sql.sql),
+            action: label(tool),
+            destructive,
+            connection: self.connection_name.clone(),
+            environment: self.environment.clone(),
+            writes: true,
+        };
+        // TRUNCATE … CASCADE: the tables it empties too, read on a session
+        // of its own in the table's database, closed once read (C11).
+        let reach = match (tool, &self.opening.object) {
+            (Maintenance::Truncate(options), ObjectRef::Relation(table, _)) if options.cascade => {
+                let change = Change::TruncateCascade(table.clone());
+                let opening = self.connections.read(cx).open_session(
+                    &self.opening.connection,
+                    Some(self.opening.database.clone()),
+                    cx,
+                );
+                Some(Reach {
+                    reading: cx.spawn(async move |_, cx| {
+                        let session = opening.await?;
+                        cx.update(|cx| {
+                            bridge::spawn(cx, async move {
+                                let found = session.dependents(&change).await;
+                                session.close().await;
+                                found
+                            })
+                        })
+                        .await
+                    }),
+                    empty: "No other table references it.".into(),
+                    waits: true,
+                })
+            }
+            _ => None,
+        };
         let view = cx.entity();
-        sql_confirm::open(
-            Confirmation {
-                title: format!("{}?", self.title()),
-                explanation: explanation(tool, self.opening.kind, &self.opening.name),
-                statement: Statement::Fixed(sql.sql),
-                action: label(tool),
-                destructive,
-                connection: self.connection_name.clone(),
-                environment: self.environment.clone(),
-                writes: true,
-            },
-            window,
-            cx,
-            move |sql, window, cx| view.update(cx, |this, cx| this.run(sql, window, cx)),
-        );
+        let run = move |sql, window: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| this.run(sql, window, cx))
+        };
+        match reach {
+            Some(reach) => sql_confirm::open_with_reach(confirmation, reach, window, cx, run),
+            None => sql_confirm::open(confirmation, window, cx, run),
+        }
     }
 
     /// Runs `sql` on a session of its own, opened on the object's database

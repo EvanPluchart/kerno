@@ -14,8 +14,8 @@ use kerno_core::config::ConnectParams;
 use kerno_core::dialect::Dialect;
 use kerno_core::exec::ExecSink;
 use kerno_core::schema::{
-    DatabaseInfo, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects, ServerInfo, TableRef,
-    TableStructure,
+    Change, DatabaseInfo, Dependent, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects,
+    ServerInfo, TableRef, TableStructure,
 };
 use kerno_core::sql::{Catalog, TokenKind, lex};
 use kerno_core::{
@@ -549,6 +549,10 @@ impl Session for PgSession {
 
     async fn completion_catalog(&self) -> Result<Catalog> {
         introspect::completion_catalog(self).await
+    }
+
+    async fn dependents(&self, change: &Change) -> Result<Vec<Dependent>> {
+        introspect::dependents(self, change).await
     }
 
     fn admin_query(&self, view: AdminView) -> Option<String> {

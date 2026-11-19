@@ -460,6 +460,97 @@ pub enum ObjectRef {
     Database(String),
 }
 
+impl ObjectRef {
+    /// The object's own name, without its schema or table.
+    pub fn name(&self) -> &str {
+        match self {
+            ObjectRef::Relation(table, _)
+            | ObjectRef::Sequence(table)
+            | ObjectRef::Type(table)
+            | ObjectRef::Event(table) => &table.name,
+            ObjectRef::Routine { name, .. }
+            | ObjectRef::Trigger { name, .. }
+            | ObjectRef::Index { name, .. }
+            | ObjectRef::Schema(name)
+            | ObjectRef::Database(name) => name,
+        }
+    }
+}
+
+/// What the navigator drops, renames or empties, for
+/// [`crate::Session::dependents`] (C11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// `DROP`, with `CASCADE` or not, of an object.
+    Drop { object: ObjectRef, cascade: bool },
+    /// `DROP EXTENSION`, with `CASCADE` or not (extensions are not
+    /// [`ObjectRef`]s).
+    DropExtension { name: String, cascade: bool },
+    /// `TRUNCATE … CASCADE` of a table.
+    TruncateCascade(TableRef),
+    /// A rename of an object.
+    Rename(ObjectRef),
+}
+
+/// What happens to a [`Dependent`] when the change runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Tie {
+    /// Dropped with it (`DROP … CASCADE`).
+    Dropped,
+    /// Emptied with it (`TRUNCATE … CASCADE`).
+    Emptied,
+    /// The server refuses the change while it exists.
+    Blocks,
+    /// Stays, but stops working.
+    Breaks,
+    /// Its source text names the object: found by a text search, not
+    /// parsed, so it may or may not break.
+    Mentions,
+}
+
+/// An object a change reaches besides its own target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependent {
+    /// What it is, in words: "view", "foreign key", "column", "function"…
+    pub kind: String,
+    /// Its name, qualified: "shop.order_totals", "orders_customer_id_fkey
+    /// on shop.orders".
+    pub name: String,
+    pub tie: Tie,
+}
+
+/// A `LIKE` pattern matching any text that contains `name`, with `!` as
+/// its escape character (`… LIKE <pattern> ESCAPE '!'`): the same on both
+/// engines whatever they do with backslashes. Quote it as a string.
+pub fn like_containing(name: &str) -> String {
+    let mut pattern = String::from("%");
+    for c in name.chars() {
+        if matches!(c, '!' | '%' | '_') {
+            pattern.push('!');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// Whether `source` names `name` as a word, ignoring case: an occurrence
+/// that no letter, digit, `_` or `$` touches on either side (`order` is in
+/// `"order" o`, not in `orders`). A text search: comments and strings count
+/// too.
+pub fn mentions(source: &str, name: &str) -> bool {
+    let (source, name) = (source.to_lowercase(), name.to_lowercase());
+    if name.is_empty() {
+        return false;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    source.match_indices(&name).any(|(at, _)| {
+        let before = source[..at].chars().next_back();
+        let after = source[at + name.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
 /// Version and identity of the connected server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
@@ -541,6 +632,28 @@ mod tests {
             structure.row_identity(),
             Some(vec!["b".to_string(), "c".to_string()])
         );
+    }
+
+    /// C11: the rename's text search finds a name as a word, in any case,
+    /// quoted or qualified, and not inside a longer name.
+    #[test]
+    fn a_name_is_mentioned_as_a_word() {
+        assert!(mentions("SELECT * FROM shop.Orders o", "orders"));
+        assert!(mentions("select * from `kerno`.`orders`", "orders"));
+        assert!(mentions("FROM \"orders\"", "orders"));
+        assert!(mentions("orders", "orders"));
+        assert!(!mentions("SELECT * FROM shop.orders_archive", "orders"));
+        assert!(!mentions("SELECT * FROM preorders", "orders"));
+        assert!(!mentions("SELECT $orders", "orders"));
+        assert!(!mentions("anything", ""));
+        // A second occurrence that is a word, after one that is not.
+        assert!(mentions("orders_x, orders", "orders"));
+    }
+
+    #[test]
+    fn like_patterns_escape_their_wildcards() {
+        assert_eq!(like_containing("order_totals"), "%order!_totals%");
+        assert_eq!(like_containing("a%b!c"), "%a!%b!!c%");
     }
 
     #[test]

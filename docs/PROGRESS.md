@@ -664,3 +664,26 @@ Still open (for the owner):
 - Tests: one `kerno-core`, five settings, three menu/palette, four UI (two on PostgreSQL pinning that production
   still asks twice with the setting off and local does not), each seen failing under a one-line mutation.
   `docs/COMPETITOR-ISSUES.md`: C4 and C5 answered, C20 still does not apply (13 answered, 2 gaps).
+
+## 2026-11-19 — K14: what a drop, a truncate or a rename reaches, before the user confirms (C11)
+
+- One driver method, `Session::dependents(&Change)`, default "not read" (Unsupported) so nothing is ever shown as
+  "nothing depends on it" without a read (D-086).
+- PostgreSQL: "Drop with cascade…" lists what the cascade drops with the object, by the server's own rule over
+  `pg_depend` (recursive, up from a part to its owner, normal dependencies only): views over views, another
+  table's foreign key as the constraint, functions on its row type, columns of a dropped type, defaults of a
+  sequence, triggers of a function; not a table's own indexes, constraints, triggers, owned sequences or
+  partitions. A plain Drop shows the same list as what the server refuses it for; the Truncate tool with Cascade
+  lists the tables it empties too. Compared with the server's own "drop cascades to" notice on 13 shapes, in a
+  transaction rolled back.
+- MySQL, MariaDB: a table's Drop lists the foreign keys of other tables that refuse it and the views over it that
+  break (MariaDB by a search of the definitions, said so). A rename lists what names the object in its source as a
+  text search: PL/pgSQL and quoted SQL bodies on PostgreSQL (its views follow), views, routines, triggers and events
+  on MySQL and MariaDB (nothing follows there, checked on both servers).
+- The confirmation draws the list under its explanation (count per kind, 8 lines then "and N more", Copy the
+  list); the button waits for it only where it is what the statement destroys (cascade, truncate cascade), at most
+  10 s; a failed read says so with the server's words and leaves the choice to the user.
+- Tests: four PostgreSQL and one MySQL/MariaDB driver test against what the servers do, four unit tests, eight UI
+  tests, each seen failing under a one-line mutation; the existing cascade UI test now waits for the list before
+  it clicks. `docs/COMPETITOR-ISSUES.md`: C11 answered (14 answered, 2 gaps, 3 do not apply, 1 not now). Limits
+  in the "Done:" line of K14 (`docs/plans/M12.md`).

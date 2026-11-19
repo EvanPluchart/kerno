@@ -1898,3 +1898,66 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   not walked.
 - **No "simple mode"** (C20): the default layout is the calm one and the toolbar's items can be hidden; a second
   mode would double what has to be tested.
+
+## D-086 — What a drop, a truncate or a rename reaches, read before the user confirms (K14, C11; 2026-11-19)
+
+- **One driver method**, `Session::dependents(&Change) -> Result<Vec<Dependent>>`; `Change` is `Drop { object,
+  cascade }`, `DropExtension { name, cascade }` (extensions are not `ObjectRef`s, and adding a variant there
+  would touch every exhaustive `match` on it), `TruncateCascade(table)` or `Rename(object)`. Each `Dependent`
+  carries its kind, its qualified name and its `Tie`: dropped with it, emptied with it, blocks the change,
+  stays broken, or mentions the name. The default is `Error::Unsupported`, never `Ok(vec![])`: an empty list
+  means "nothing else", and the dialog shows nothing where nothing was read. A missing target is an error ("the
+  object was not found …"), never an empty list.
+- **PostgreSQL drop: the server's own rule, from the catalog only.** A recursive query over `pg_depend` walks,
+  from the target, every object that depends on it at any depth and by any kind of dependency, and from each
+  object reached up to what it is an internal part of or the extension it belongs to (`'i'`, `'e'`: a view is
+  reached through its rewrite rule). Listed: what was reached only through normal dependencies or that way up,
+  which is what `findDependentObjects` (`catalog/dependency.c`) reports in its "drop cascades to" notice and
+  what a plain `DROP` is refused for. What was also reached by an automatic, internal, partition or extension
+  dependency goes with its owner without a word and is not listed: a table's indexes, its own constraints and
+  triggers, the sequences its columns own, a partition, an extension's members. A column whose whole table goes
+  is not listed apart. A foreign key of another table is listed as itself ("foreign key child_t_fk on
+  shop.child"): the cascade drops the constraint, not the table. Names come from `pg_identify_object` (always
+  qualified, not translated by the server's `lc_messages`, unlike `pg_describe_object`). Written from the
+  PostgreSQL docs and source, not ported (DBeaver's `PostgreDependency` reads one level of `pg_depend` for a
+  Dependencies folder of its tree, not for its delete confirmation), so no notice in `THIRD_PARTY_NOTICES.md`. The product never runs the drop to find out (no drop-and-rollback:
+  it would take an `ACCESS EXCLUSIVE` lock on a live database); only the tests do, on scratch objects, to
+  compare with the server's notice.
+- **The same list for a plain drop**, under "The server refuses the drop while these depend on it": it costs
+  nothing more and tells before the click that the drop will fail.
+- **TRUNCATE … CASCADE** (the Truncate tool with Cascade on): the tables holding a foreign key to it, and to
+  those, recursively (`heap_truncate_find_FKs`), read on a session of its own in the table's database, opened
+  when the confirmation opens and closed once read.
+- **MySQL and MariaDB**: no cascade. A table's plain Drop lists the foreign keys of other tables that point at it
+  (`REFERENTIAL_CONSTRAINTS`; a table's key to itself does not refuse anything) and the views over it: MySQL from
+  `VIEW_TABLE_USAGE`, with the views over those views, as "These stay but stop working"; MariaDB has no such table,
+  so its view definitions are searched for the name and said to be a text search. Other kinds of objects:
+  nothing read (Unsupported), nothing shown.
+- **Rename: only where a rename really leaves them broken, checked on the servers.** PostgreSQL views, defaults,
+  constraints, triggers and `BEGIN ATOMIC` bodies keep the object's oid and follow it: not listed. Bodies kept as
+  text (PL/pgSQL, a quoted SQL body) do not: `pg_proc.prosrc` of the current database is searched, `c` and
+  `internal` languages, system schemas and extension members left out. MySQL and MariaDB views, routines,
+  triggers and events follow nothing: their definitions in every non-system database are searched. The search
+  is a `LIKE … ESCAPE '!'` prefilter (the same on both engines whatever they do with backslashes; never a server
+  regex built from an identifier) and a word-boundary check in Rust (`schema::mentions`: no letter, digit, `_` or
+  `$` on either side, any case). Labelled "These mention its name (a text search: Kerno did not parse them)".
+  A column rename gets no list (a column name such as `id` is everywhere).
+- **The dialog.** A second entry point, `sql_confirm::open_with_reach`, rather than a field on the fourteen
+  `Confirmation` literals. The list loads off the UI thread on the tree's session of the database (so it is
+  quick and needs no new connection; the tree's loads of that database wait behind it). Under the explanation:
+  each tie under its heading with a count per kind ("Also dropped: 2 views, 1 foreign key"), at most 8 objects
+  drawn in all (with a production band and a full SQL preview the buttons stay about 110 px above the bottom of
+  an 800 px window, 40 px with 12 lines; 100 would push them out, as `a_long_list_keeps_the_buttons_in_the_window` shows), the rest "and N more", and **Copy the list** for all of it. Empty: the caller's sentence ("Nothing
+  else depends on it.", "No other table references it.", for a rename what the engine leaves to follow; on MySQL
+  and MariaDB "Nothing this user can see depends on it.": their `information_schema` shows only the objects the
+  user has a privilege on, and a routine's body only to its definer or with `SHOW_ROUTINE`, while
+  PostgreSQL's `pg_depend` and `prosrc` are readable by every role). A
+  failed read: "Kerno could not read what depends on it, so nothing is listed here." then the described error
+  (K9), and the button works. **The button waits only where the list is what the statement destroys** (Drop with
+  cascade, TRUNCATE … CASCADE): "Reading what depends on it…" with the button disabled, for at most 10 s, then
+  "Still reading what depends on it after 10 s. You can go on without the list." and it works; the list still
+  comes in when it arrives. A plain drop's and a rename's list are information (the server refuses a blocked
+  plain drop itself; K9 shows why): nothing is drawn while they load (most arrive in milliseconds; no line that
+  would vanish) and the button never waits, so K2's cancellable drop and K9's refused drop behave as before.
+  `read_only`, the environment's questions and the SQL preview are unchanged. A database's drop or rename reads
+  nothing: a session of the tree's inside it would keep PostgreSQL from dropping it.

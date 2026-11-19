@@ -30,12 +30,12 @@ use gpui_kit::{
 use kerno_core::browse::Filter;
 use kerno_core::config::{FolderLook, ObjectFilter, exact_mask, parent_folder};
 use kerno_core::maintenance::Maintenance;
-use kerno_core::schema::{ObjectRef, RelationKind, RoutineKind, TableRef};
+use kerno_core::schema::{Change, Dependent, ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
     call_routine, delete_template, insert_template, select_template, update_template,
 };
 use kerno_core::table_draft::TableChange;
-use kerno_core::{Error, Session, describe, exec};
+use kerno_core::{Engine, Error, Session, describe, exec};
 
 use super::actions::{
     Action, FilterAction, Template, ToolEntry, ToolGroups, actions, create_template,
@@ -55,7 +55,7 @@ use crate::export_dialog::{self, Source};
 use crate::folder_dialog::is_icon_name;
 use crate::maintenance_dialog::{self, MaintenanceDialog};
 use crate::sidebar::{DraggedConnection, Sidebar, Subject, set_collapsed};
-use crate::sql_confirm::{self, Confirmation, Statement};
+use crate::sql_confirm::{self, Confirmation, Reach, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
 use crate::theme;
@@ -1920,7 +1920,7 @@ impl Navigator {
                 (
                     format!("Rename {kind} “{name}”"),
                     format!(
-                        "Statements, views and functions that use the old name of the {kind} have to be changed too."
+                        "Statements that use the old name of the {kind} have to be changed too."
                     ),
                     Statement::Named {
                         label: "New name",
@@ -2213,25 +2213,80 @@ impl Navigator {
             doing,
             failed,
         };
+        // What else it reaches, read from the catalog while the dialog is
+        // open (C11). Not for a database: a session of the tree's inside it
+        // would keep PostgreSQL from dropping or renaming it.
+        let cascade = action == Action::DropCascade;
+        let change = match (action, &node.kind, &object) {
+            (_, _, Some(ObjectRef::Database(_))) => None,
+            (Action::Drop | Action::DropCascade, NodeKind::Extension { name, .. }, _) => {
+                Some(Change::DropExtension {
+                    name: name.clone(),
+                    cascade,
+                })
+            }
+            (Action::Drop | Action::DropCascade, _, Some(object)) => Some(Change::Drop {
+                object: object.clone(),
+                cascade,
+            }),
+            (Action::Rename, _, Some(object)) => Some(Change::Rename(object.clone())),
+            _ => None,
+        };
+        let reach = change.map(|change| {
+            // MySQL's information_schema shows only what the user may see:
+            // the empty line says so.
+            let empty = match (&change, dialect_of.engine()) {
+                (Change::Rename(_), Engine::Postgres) => {
+                    "No function or procedure body names it; views, defaults and triggers follow a rename on their own."
+                }
+                (Change::Rename(_), _) => "No view, routine, trigger or event this user can see names it.",
+                (_, Engine::Postgres) => "Nothing else depends on it.",
+                _ => "Nothing this user can see depends on it.",
+            };
+            Reach {
+                reading: self.dependents(connection, &node.database, change, cx),
+                empty: empty.into(),
+                // The list is what the cascade destroys: not confirmed blind.
+                waits: cascade,
+            }
+        });
+        let confirmation = Confirmation {
+            title,
+            explanation,
+            statement,
+            action: button,
+            destructive,
+            connection: connection_name,
+            environment,
+            writes: true,
+        };
         let view = cx.entity();
-        sql_confirm::open(
-            Confirmation {
-                title,
-                explanation,
-                statement,
-                action: button,
-                destructive,
-                connection: connection_name,
-                environment,
-                writes: true,
-            },
-            window,
-            cx,
-            move |sql, window, cx| {
-                let plan = plan.clone();
-                view.update(cx, |this, cx| this.execute(sql, plan, window, cx));
-            },
-        );
+        let run = move |sql, window: &mut Window, cx: &mut App| {
+            let plan = plan.clone();
+            view.update(cx, |this, cx| this.execute(sql, plan, window, cx));
+        };
+        match reach {
+            Some(reach) => sql_confirm::open_with_reach(confirmation, reach, window, cx, run),
+            None => sql_confirm::open(confirmation, window, cx, run),
+        }
+    }
+
+    /// What else `change` reaches, read on the tree's session of `database`
+    /// (C11): a catalog read, quick, but the tree's loads of that database
+    /// wait behind it.
+    fn dependents(
+        &mut self,
+        connection: &str,
+        database: &str,
+        change: Change,
+        cx: &mut Context<Self>,
+    ) -> Task<kerno_core::Result<Vec<Dependent>>> {
+        let session = self.session_for(connection, database, cx);
+        cx.spawn(async move |_, cx| {
+            let session = session.await?;
+            cx.update(|cx| bridge::spawn(cx, async move { session.dependents(&change).await }))
+                .await
+        })
     }
 
     /// Runs a confirmed statement on a session of its own, closed once it
@@ -3403,17 +3458,7 @@ fn kind_name(object: &ObjectRef) -> &'static str {
 
 /// The name of an object without its schema: what a rename starts from.
 fn plain_name(object: &ObjectRef) -> String {
-    match object {
-        ObjectRef::Relation(table, _)
-        | ObjectRef::Sequence(table)
-        | ObjectRef::Type(table)
-        | ObjectRef::Event(table) => table.name.clone(),
-        ObjectRef::Routine { name, .. }
-        | ObjectRef::Trigger { name, .. }
-        | ObjectRef::Index { name, .. }
-        | ObjectRef::Schema(name)
-        | ObjectRef::Database(name) => name.clone(),
-    }
+    object.name().to_string()
 }
 
 /// The glyph of a kind of node.

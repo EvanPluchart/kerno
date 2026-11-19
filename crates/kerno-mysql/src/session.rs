@@ -14,8 +14,8 @@ use kerno_core::config::ConnectParams;
 use kerno_core::dialect::Dialect;
 use kerno_core::exec::{ExecSink, Stopped};
 use kerno_core::schema::{
-    DatabaseInfo, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects, ServerInfo, TableRef,
-    TableStructure,
+    Change, DatabaseInfo, Dependent, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects,
+    ServerInfo, TableRef, TableStructure,
 };
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{Catalog, LexRules, TokenKind, lex};
@@ -616,6 +616,10 @@ impl Session for MysqlSession {
 
     async fn completion_catalog(&self) -> Result<Catalog> {
         introspect::completion_catalog(self).await
+    }
+
+    async fn dependents(&self, change: &Change) -> Result<Vec<Dependent>> {
+        introspect::dependents(self, change).await
     }
 
     fn admin_query(&self, view: AdminView) -> Option<String> {

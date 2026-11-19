@@ -11,10 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kerno_core::dialect::Dialect;
 use kerno_core::schema::{
-    ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, EventInfo,
-    ExtensionInfo, ForeignKeyInfo, IndexInfo, RelationInfo, RelationKind, RoutineInfo, RoutineKind,
-    SchemaInfo, SchemaObjects, SequenceInfo, TableRef, TableStructure, TriggerInfo, TypeInfo,
-    TypeShape,
+    Change, ColumnGeneration, ColumnInfo, ConstraintInfo, ConstraintKind, DatabaseInfo, Dependent,
+    EventInfo, ExtensionInfo, ForeignKeyInfo, IndexInfo, ObjectRef, RelationInfo, RelationKind,
+    RoutineInfo, RoutineKind, SchemaInfo, SchemaObjects, SequenceInfo, TableRef, TableStructure,
+    Tie, TriggerInfo, TypeInfo, TypeShape, like_containing, mentions,
 };
 use kerno_core::sql::{Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
 use kerno_core::{Error, Result};
@@ -699,6 +699,225 @@ pub(crate) async fn extensions(session: &PgSession) -> Result<Vec<ExtensionInfo>
             comment: opt(row, 4),
         })
         .collect())
+}
+
+/// What else a change reaches (C11), from the catalog only: nothing is
+/// dropped or locked to find out.
+///
+/// A drop follows `pg_depend` as the server's `findDependentObjects`
+/// (`catalog/dependency.c`, read in the PostgreSQL docs and source) does:
+/// from the target, every object that depends on it, at any depth, by any
+/// kind of dependency, and from each object reached to the object it is an
+/// internal part of or the extension it belongs to (`'i'`, `'e'`: a view's
+/// rewrite rule leads to the view). What the server reports in its "drop
+/// cascades to" notice, and so what a plain `DROP` refuses for, is what was
+/// reached only through normal dependencies or that way up: what was also
+/// reached through an automatic, internal, partition or extension one goes
+/// with its owner without a word (a table's indexes, its own constraints and
+/// triggers, the sequences its columns own) and is not listed; a column whose
+/// whole table goes is not listed apart.
+pub(crate) async fn dependents(session: &PgSession, change: &Change) -> Result<Vec<Dependent>> {
+    match change {
+        Change::Drop { object, cascade } => {
+            let target = target_sql(object)
+                .ok_or_else(|| Error::Unsupported("reading what depends on this object".into()))?;
+            cascade_of(session, &target, *cascade).await
+        }
+        Change::DropExtension { name, cascade } => {
+            let target = format!(
+                "SELECT 'pg_catalog.pg_extension'::pg_catalog.regclass::oid, e.oid \
+                 FROM pg_catalog.pg_extension e WHERE e.extname = {}",
+                lit(name)
+            );
+            cascade_of(session, &target, *cascade).await
+        }
+        Change::TruncateCascade(table) => {
+            let table = ObjectRef::Relation(table.clone(), RelationKind::Table);
+            let target = target_sql(&table).expect("a table has an oid");
+            let (_, oid) = target_of(session, &target).await?;
+            // TRUNCATE … CASCADE empties every table holding a foreign key to
+            // one it empties (`heap_truncate_find_FKs`), until none is left.
+            let sql = format!(
+                "WITH RECURSIVE emptied(oid) AS ( \
+                   SELECT {oid}::oid \
+                   UNION \
+                   SELECT k.conrelid FROM pg_catalog.pg_constraint k \
+                   JOIN emptied e ON k.confrelid = e.oid WHERE k.contype = 'f') \
+                 SELECT o.type, o.identity FROM emptied e, \
+                   LATERAL pg_catalog.pg_identify_object('pg_catalog.pg_class'::pg_catalog.regclass, e.oid, 0) o \
+                 WHERE e.oid <> {oid} ORDER BY 1, 2"
+            );
+            Ok(labelled(&session.query(&sql).await?, Tie::Emptied))
+        }
+        Change::Rename(object) => {
+            if matches!(object, ObjectRef::Database(_)) {
+                return Err(Error::Unsupported(
+                    "reading what names a database in another database".into(),
+                ));
+            }
+            // Views, defaults, constraints, triggers and `BEGIN ATOMIC`
+            // bodies keep the object's oid and follow a rename; a body kept as
+            // text (PL/pgSQL, a quoted SQL body) names it and does not.
+            let name = object.name();
+            let sql = format!(
+                "SELECT CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, o.identity, p.prosrc \
+                 FROM pg_catalog.pg_proc p \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                 JOIN pg_catalog.pg_language l ON l.oid = p.prolang, \
+                 LATERAL pg_catalog.pg_identify_object('pg_catalog.pg_proc'::pg_catalog.regclass, p.oid, 0) o \
+                 WHERE l.lanname NOT IN ('c', 'internal') \
+                   AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+                   AND p.prosrc ILIKE {} ESCAPE '!' AND {} \
+                 ORDER BY 1, 2",
+                lit(&like_containing(name)),
+                not_in_extension("pg_proc", "p.oid"),
+            );
+            Ok(session
+                .query(&sql)
+                .await?
+                .iter()
+                .filter(|row| mentions(row.get(2).unwrap_or_default(), name))
+                .map(|row| Dependent {
+                    kind: text(row, 0),
+                    name: text(row, 1),
+                    tie: Tie::Mentions,
+                })
+                .collect())
+        }
+    }
+}
+
+/// A query giving the catalog and the oid of `object`, matched by name, or
+/// `None` for what has neither on PostgreSQL (a database is dropped from
+/// outside it; events are MySQL's).
+fn target_sql(object: &ObjectRef) -> Option<String> {
+    let class = |schema: &str, name: &str| {
+        format!(
+            "SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid, c.oid \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {} AND c.relname = {}",
+            lit(schema),
+            lit(name)
+        )
+    };
+    Some(match object {
+        ObjectRef::Relation(table, _) | ObjectRef::Sequence(table) => {
+            class(&table.schema, &table.name)
+        }
+        ObjectRef::Index { table, name } => class(&table.schema, name),
+        ObjectRef::Routine {
+            schema,
+            name,
+            identity_arguments,
+            ..
+        } => format!(
+            "SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass::oid, p.oid \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = {} AND p.proname = {} \
+               AND pg_catalog.pg_get_function_identity_arguments(p.oid) = {}",
+            lit(schema),
+            lit(name),
+            lit(identity_arguments)
+        ),
+        ObjectRef::Type(ty) => format!(
+            "SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::oid, t.oid \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = {} AND t.typname = {}",
+            lit(&ty.schema),
+            lit(&ty.name)
+        ),
+        ObjectRef::Trigger { table, name } => format!(
+            "SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass::oid, t.oid \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {} AND c.relname = {} AND t.tgname = {}",
+            lit(&table.schema),
+            lit(&table.name),
+            lit(name)
+        ),
+        ObjectRef::Schema(schema) => format!(
+            "SELECT 'pg_catalog.pg_namespace'::pg_catalog.regclass::oid, n.oid \
+             FROM pg_catalog.pg_namespace n WHERE n.nspname = {}",
+            lit(schema)
+        ),
+        ObjectRef::Database(_) | ObjectRef::Event(_) => return None,
+    })
+}
+
+/// The catalog and oid `target` (a [`target_sql`]) finds; an error when the
+/// object is gone, never an empty list that would read as "nothing depends
+/// on it".
+async fn target_of(session: &PgSession, target: &str) -> Result<(String, String)> {
+    let rows = session.query(target).await?;
+    let row = rows.first().ok_or_else(|| {
+        Error::Db(Box::new(kerno_core::DbError::message(
+            "the object was not found: it may have been dropped or renamed meanwhile; refresh the tree"
+                .to_string(),
+        )))
+    })?;
+    Ok((text(row, 0), text(row, 1)))
+}
+
+/// What a `DROP` of `target` reaches; see [`dependents`].
+async fn cascade_of(session: &PgSession, target: &str, cascade: bool) -> Result<Vec<Dependent>> {
+    let (class, oid) = target_of(session, target).await?;
+    // `walk` holds each object once per kind of edge it was reached by
+    // (`R`: from a part to its owner), so it ends on cycles.
+    let sql = format!(
+        "WITH RECURSIVE walk(classid, objid, objsubid, edge) AS ( \
+           SELECT d.classid, d.objid, d.objsubid, d.deptype::text \
+           FROM pg_catalog.pg_depend d \
+           WHERE d.refclassid = {class} AND d.refobjid = {oid} AND d.classid <> 0 \
+           UNION \
+           SELECT next.classid, next.objid, next.objsubid, next.edge \
+           FROM walk w, LATERAL ( \
+             SELECT d.classid, d.objid, d.objsubid, d.deptype::text AS edge \
+             FROM pg_catalog.pg_depend d \
+             WHERE d.refclassid = w.classid AND d.refobjid = w.objid \
+               AND (w.objsubid = 0 OR d.refobjsubid = w.objsubid) AND d.classid <> 0 \
+             UNION ALL \
+             SELECT d.refclassid, d.refobjid, 0, 'R' \
+             FROM pg_catalog.pg_depend d \
+             WHERE d.classid = w.classid AND d.objid = w.objid AND d.deptype IN ('i', 'e') \
+           ) next \
+         ), reached AS ( \
+           SELECT classid, objid, objsubid, bool_and(edge IN ('n', 'R')) AS reported \
+           FROM walk \
+           WHERE NOT (classid = {class} AND objid = {oid}) \
+           GROUP BY 1, 2, 3 \
+         ) \
+         SELECT CASE \
+                  WHEN r.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                   AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k \
+                               WHERE k.oid = r.objid AND k.contype = 'f') THEN 'foreign key' \
+                  WHEN o.type = 'table column' THEN 'column' \
+                  ELSE o.type END, \
+                o.identity \
+         FROM reached r, \
+           LATERAL pg_catalog.pg_identify_object(r.classid, r.objid, r.objsubid) o \
+         WHERE r.reported \
+           AND NOT (r.objsubid <> 0 AND EXISTS ( \
+             SELECT 1 FROM reached w \
+             WHERE w.classid = r.classid AND w.objid = r.objid AND w.objsubid = 0)) \
+         ORDER BY 1, 2"
+    );
+    let tie = if cascade { Tie::Dropped } else { Tie::Blocks };
+    Ok(labelled(&session.query(&sql).await?, tie))
+}
+
+/// Rows of (kind, name) as [`Dependent`]s.
+fn labelled(rows: &[SimpleQueryRow], tie: Tie) -> Vec<Dependent> {
+    rows.iter()
+        .map(|row| Dependent {
+            kind: text(row, 0),
+            name: text(row, 1),
+            tie,
+        })
+        .collect()
 }
 
 #[cfg(test)]

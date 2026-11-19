@@ -7336,9 +7336,16 @@ fn a_drop_with_cascade_also_drops_what_depends_on_the_table(cx: &mut TestAppCont
         ("1".into(), "1".into())
     );
 
-    // With cascade, the table and the view go.
+    // With cascade, the table and the view go. The button waits for the list
+    // of what the cascade drops (C11).
     app.act(cx, Action::DropCascade, &table("t"));
     assert!(app.has(cx, "sql-preview"));
+    app.wait_until(cx, "the list of what the cascade drops", |app, cx| {
+        app.has(cx, "sql-reach")
+            && app
+                .label_of(cx, "sql-reach")
+                .contains("view kerno_ui_g10_cascade.v")
+    });
     app.click(cx, "sql-confirm");
     app.wait_until(cx, "the drop", |app, cx| !app.shows(cx, &table("t")));
     assert_eq!(

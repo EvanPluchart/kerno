@@ -3527,3 +3527,359 @@ fn the_connection_dialog_says_the_rules_of_its_environment(cx: &mut TestAppConte
     app.click(cx, "conn-env-edit");
     assert!(app.has(cx, "environments") && app.has(cx, "override-env-read-only"));
 }
+
+// K14 (C11): what else a drop, a truncate or a rename reaches -----------------------------------
+
+/// What the confirmation's list says, once it is drawn: every line, one per line.
+fn k14_reach(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
+    app.step(cx, |window, _| {
+        window
+            .try_find("sql-reach")
+            .map(|panel| panel.label().unwrap_or_default().to_string())
+    })
+}
+
+/// Whether the confirmation's button can be clicked.
+fn k14_can_confirm(app: &Fixture, cx: &mut TestAppContext) -> bool {
+    app.step(cx, |window, _| window.find("sql-confirm").disabled()) != Some(true)
+}
+
+/// Waits for the confirmation's list to hold `text`.
+fn k14_wait_for(app: &Fixture, cx: &mut TestAppContext, text: &str) -> String {
+    app.wait_until(cx, text, |app, cx| {
+        k14_reach(app, cx).is_some_and(|reach| reach.contains(text))
+    });
+    k14_reach(app, cx).unwrap()
+}
+
+/// The tree path of `<name>.<table>`.
+fn k14_path<'a>(engine: Engine, name: &'a str, table: &'a str) -> Vec<&'a str> {
+    match engine {
+        Engine::Postgres => vec!["kerno", name, "Tables", table],
+        Engine::MySql | Engine::MariaDb => vec![name, "Tables", table],
+    }
+}
+
+/// `<name>.<table>` with a view over it and a table holding a foreign key to it, `<name>.alone`
+/// that nothing uses, and on PostgreSQL a PL/pgSQL function naming `<table>`. A rename's text
+/// search reads every schema and database: a test that searches gives its table a name no
+/// other test uses.
+fn k14_schema(engine: Engine, name: &str, table: &str) -> Scratch {
+    let (drop, create) = scratch_schema(engine, name);
+    let mut setup = vec![
+        create,
+        format!("CREATE TABLE {name}.{table} (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {name}.alone (id INT PRIMARY KEY)"),
+        format!(
+            "CREATE TABLE {name}.child (id INT PRIMARY KEY, t_id INT, \
+             CONSTRAINT child_t_fk FOREIGN KEY (t_id) REFERENCES {name}.{table} (id))"
+        ),
+        format!("CREATE VIEW {name}.v AS SELECT id FROM {name}.{table}"),
+    ];
+    if engine == Engine::Postgres {
+        setup.push(format!(
+            "CREATE FUNCTION {name}.counted() RETURNS bigint LANGUAGE plpgsql AS \
+             $$BEGIN RETURN (SELECT count(*) FROM {name}.{table}); END$$"
+        ));
+    }
+    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+    Scratch::new(engine, &[&drop], &setup)
+}
+
+/// C11: "Drop with cascade…" on a table lists, before the user confirms, the view over it and
+/// the foreign key of another table that the cascade drops with it (the constraint, not the
+/// table); the button waits for the list. Confirmed, the server dropped exactly that.
+#[gpui_kit::test]
+fn a_cascade_drop_lists_the_view_and_the_foreign_key_before_confirm(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k14_cascade";
+    let _scratch = k14_schema(engine, name, "k14_t");
+    let app = connected(cx, engine);
+    let path = k14_path(engine, name, "k14_t");
+    app.open_path(cx, &path);
+    app.act(cx, Action::DropCascade, &path);
+    let reach = k14_wait_for(&app, cx, "Also dropped");
+    assert_eq!(
+        reach,
+        format!(
+            "Also dropped: 1 foreign key, 1 view\n\
+             foreign key child_t_fk on {name}.child\n\
+             view {name}.v"
+        )
+    );
+    assert!(k14_can_confirm(&app, cx));
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the drop", |_, _| {
+        on_server(
+            engine,
+            &format!("SELECT count(*) FROM pg_class WHERE relnamespace = '{name}'::regnamespace AND relname IN ('k14_t', 'v')"),
+        ) == "0"
+    });
+    assert_eq!(
+        on_server(
+            engine,
+            &format!(
+                "SELECT count(*) FROM pg_constraint WHERE conrelid = '{name}.child'::regclass \
+                 AND contype = 'f'"
+            )
+        ),
+        "0"
+    );
+    assert_eq!(
+        on_server(engine, &format!("SELECT count(*) FROM {name}.child")),
+        "0"
+    );
+}
+
+/// C11: a cascade on a table nothing depends on says so, in words, rather than an empty box.
+#[gpui_kit::test]
+fn a_cascade_drop_of_an_unused_table_says_nothing_depends_on_it(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k14_alone";
+    let _scratch = k14_schema(engine, name, "k14_t");
+    let app = connected(cx, engine);
+    let path = ["kerno", name, "Tables", "alone"];
+    app.open_path(cx, &path);
+    app.act(cx, Action::DropCascade, &path);
+    assert_eq!(
+        k14_wait_for(&app, cx, "Nothing"),
+        "Nothing else depends on it."
+    );
+    assert!(k14_can_confirm(&app, cx));
+    app.click(cx, "sql-cancel");
+}
+
+/// C11: when the list cannot be read (here the table was dropped behind the tree's back), the
+/// dialog says so and why, and the user can still decide: never a silent empty list.
+#[gpui_kit::test]
+fn a_list_that_cannot_be_read_says_so_and_lets_the_user_decide(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k14_gone";
+    let _scratch = k14_schema(engine, name, "k14_t");
+    let app = connected(cx, engine);
+    let path = ["kerno", name, "Tables", "alone"];
+    app.open_path(cx, &path);
+    on_server(engine, &format!("DROP TABLE {name}.alone"));
+    app.act(cx, Action::DropCascade, &path);
+    let reach = k14_wait_for(&app, cx, "could not read");
+    let lines: Vec<&str> = reach.lines().collect();
+    assert_eq!(
+        lines[0],
+        "Kerno could not read what depends on it, so nothing is listed here."
+    );
+    assert!(lines[1].contains("was not found"), "{reach}");
+    assert!(k14_can_confirm(&app, cx));
+    app.click(cx, "sql-cancel");
+}
+
+/// C11: while a cascade's list is read, its button waits and the dialog says why; after
+/// `REACH_WAIT` the user can go on without it. No server: the read never ends.
+#[gpui_kit::test]
+fn a_slow_list_holds_the_button_then_lets_go(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.step(cx, |window, cx| {
+        crate::sql_confirm::open_with_reach(
+            crate::sql_confirm::Confirmation {
+                title: "Drop table “t” with cascade?".into(),
+                explanation: "The table and every object that depends on it are removed.".into(),
+                statement: crate::sql_confirm::Statement::Fixed("DROP TABLE s.t CASCADE".into()),
+                action: "Drop with cascade",
+                destructive: true,
+                connection: "local".into(),
+                environment: "local".into(),
+                writes: true,
+            },
+            crate::sql_confirm::Reach {
+                reading: cx.background_spawn(std::future::pending()),
+                empty: "Nothing else depends on it.".into(),
+                waits: true,
+            },
+            window,
+            cx,
+            |_, _, _| panic!("not confirmed in this test"),
+        )
+    });
+    assert_eq!(
+        k14_reach(&app, cx).as_deref(),
+        Some("Reading what depends on it…")
+    );
+    assert!(!k14_can_confirm(&app, cx));
+    app.click(cx, "sql-confirm");
+    assert!(app.has(cx, "sql-reach"), "a held click does nothing");
+    cx.executor().advance_clock(crate::sql_confirm::REACH_WAIT);
+    assert_eq!(
+        k14_reach(&app, cx).as_deref(),
+        Some("Still reading what depends on it after 10 s. You can go on without the list.")
+    );
+    assert!(k14_can_confirm(&app, cx));
+    app.click(cx, "sql-cancel");
+}
+
+/// C11: MySQL and MariaDB have no cascade: the plain Drop of a table lists the foreign key of
+/// another table that the server refuses the drop for, and the view that stays but breaks
+/// (MariaDB: found by a search of the view definitions, said to be one). The button does not
+/// wait: the list is not what the drop destroys.
+#[gpui_kit::test]
+fn a_mysql_drop_lists_the_foreign_key_that_refuses_it(cx: &mut TestAppContext) {
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        if !testing::available(engine) {
+            continue;
+        }
+        let name = "kerno_ui_k14_fk";
+        let _scratch = k14_schema(engine, name, "k14_t");
+        let app = connected(cx, engine);
+        let path = k14_path(engine, name, "k14_t");
+        app.open_path(cx, &path);
+        app.act(cx, Action::Drop, &path);
+        let reach = k14_wait_for(&app, cx, "refuses");
+        let view = match engine {
+            Engine::MySql => format!("These stay but stop working: 1 view\nview {name}.v"),
+            _ => format!(
+                "These mention its name (a text search: Kerno did not parse them): 1 view\n\
+                 view {name}.v"
+            ),
+        };
+        assert_eq!(
+            reach,
+            format!(
+                "The server refuses the drop while these depend on it: 1 foreign key\n\
+                 foreign key child_t_fk on {name}.child\n{view}"
+            ),
+            "{engine:?}"
+        );
+        assert!(k14_can_confirm(&app, cx), "{engine:?}");
+        app.click(cx, "sql-cancel");
+    }
+}
+
+/// C11: the rename dialog lists what names the object in its source, said to be a text
+/// search: on PostgreSQL the PL/pgSQL function (the view follows a rename by itself and is
+/// not listed), on MySQL and MariaDB the view (none follows a rename there).
+#[gpui_kit::test]
+fn a_rename_lists_what_names_the_object(cx: &mut TestAppContext) {
+    for engine in ENGINES {
+        if !testing::available(engine) {
+            continue;
+        }
+        let name = "kerno_ui_k14_rename";
+        let _scratch = k14_schema(engine, name, "k14_renamed_t");
+        let app = connected(cx, engine);
+        let path = k14_path(engine, name, "k14_renamed_t");
+        app.open_path(cx, &path);
+        app.act(cx, Action::Rename, &path);
+        let reach = k14_wait_for(&app, cx, "mention");
+        let named = match engine {
+            Engine::Postgres => format!("1 function\nfunction {name}.counted()"),
+            _ => format!("1 view\nview {name}.v"),
+        };
+        assert_eq!(
+            reach,
+            format!("These mention its name (a text search: Kerno did not parse them): {named}"),
+            "{engine:?}"
+        );
+        app.click(cx, "sql-cancel");
+    }
+}
+
+/// C11: TRUNCATE … CASCADE lists the tables it empties too before the user confirms.
+#[gpui_kit::test]
+fn a_truncate_cascade_lists_the_tables_it_empties(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k14_truncate";
+    let _scratch = k14_schema(engine, name, "k14_t");
+    let app = connected(cx, engine);
+    let path = k14_path(engine, name, "k14_t");
+    app.open_path(cx, &path);
+    let dialog = app
+        .tools_dialog(
+            cx,
+            &path,
+            Some(kerno_core::maintenance::Maintenance::Truncate(
+                Default::default(),
+            )),
+        )
+        .expect("the dialog");
+    // Its third option, Cascade.
+    app.step(cx, |_, cx| {
+        dialog.update(cx, |dialog, cx| dialog.set_option(2, true, cx))
+    });
+    app.click(cx, "maintenance-run");
+    assert_eq!(
+        k14_wait_for(&app, cx, "Also emptied"),
+        format!("Also emptied: 1 table\ntable {name}.child")
+    );
+    app.click(cx, "sql-cancel");
+    app.click(cx, "maintenance-close");
+}
+
+/// C11: a long list on a production connection (its band and its "asked twice" line drawn
+/// too) leaves the dialog's buttons inside the window. No server: the list is given.
+#[gpui_kit::test]
+fn a_long_list_keeps_the_buttons_in_the_window(cx: &mut TestAppContext) {
+    use kerno_core::schema::{Dependent, Tie};
+    let app = open(cx, memory_storage());
+    let found: Vec<Dependent> = (0..40)
+        .map(|i| Dependent {
+            kind: if i < 20 { "foreign key" } else { "view" }.into(),
+            name: format!("fk_{i} on kerno.child_{i}"),
+            tie: if i < 20 { Tie::Blocks } else { Tie::Breaks },
+        })
+        .collect();
+    app.step(cx, |window, cx| {
+        crate::sql_confirm::open_with_reach(
+            crate::sql_confirm::Confirmation {
+                title: "Drop table “t”?".into(),
+                explanation: "The table and what it holds are removed for good. This cannot be \
+                              undone."
+                    .into(),
+                statement: crate::sql_confirm::Statement::Fixed(
+                    (0..20)
+                        .map(|i| format!("DROP TABLE kerno.t_{i};"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                action: "Drop",
+                destructive: true,
+                connection: "Reporting".into(),
+                environment: kerno_core::environment::PRODUCTION.into(),
+                writes: true,
+            },
+            crate::sql_confirm::Reach {
+                reading: gpui_kit::Task::ready(Ok(found)),
+                empty: "Nothing else depends on it.".into(),
+                waits: false,
+            },
+            window,
+            cx,
+            |_, _, _| {},
+        )
+    });
+    assert!(app.has(cx, "sql-reach") && app.has(cx, "sql-production"));
+    let (window, buttons) = app.step(cx, |window, _| {
+        (
+            window.viewport_size(),
+            ["sql-confirm", "sql-cancel"].map(|id| window.find(id).bounds()),
+        )
+    });
+    for bounds in buttons {
+        assert!(
+            bounds.bottom() <= window.height && bounds.top() >= gpui_kit::px(0.),
+            "{bounds:?} in {window:?}"
+        );
+    }
+    let reach = k14_reach(&app, cx).expect("the list");
+    assert!(reach.contains("and 12 more"), "{reach}");
+    app.click(cx, "sql-cancel");
+}
