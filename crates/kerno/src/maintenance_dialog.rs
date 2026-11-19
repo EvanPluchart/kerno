@@ -397,7 +397,7 @@ impl MaintenanceDialog {
                         Step::Done(elapsed)
                     }
                     Err(_) if this.cancel_requested => Step::Cancelled,
-                    Err(error) => Step::Failed(error_text(&error)),
+                    Err(error) => Step::Failed(kerno_core::describe(&error).to_string()),
                 };
                 cx.notify();
             });
@@ -454,17 +454,6 @@ impl MaintenanceDialog {
     pub fn report(&self) -> (Vec<Vec<String>>, Vec<String>) {
         (self.rows.clone(), self.notices.clone())
     }
-}
-
-/// An error with the server's detail and hint, when it gave them.
-fn error_text(error: &Error) -> String {
-    let mut text = error.to_string();
-    if let Error::Db(db) = error {
-        for extra in [&db.detail, &db.hint].into_iter().flatten() {
-            text.push_str(&format!(" {extra}"));
-        }
-    }
-    text
 }
 
 /// The work of one run, on the Tokio runtime: the statement, its events

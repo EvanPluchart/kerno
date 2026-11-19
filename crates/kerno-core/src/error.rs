@@ -127,6 +127,73 @@ impl From<DbError> for Error {
     }
 }
 
+/// An error as Kerno shows it (C14): the message as [`Error`]'s `Display`
+/// gives it (for the server's errors, its code in brackets after it), then
+/// the server's detail and hint when it gave them.
+///
+/// Shown to the user only: its `Display` can quote row values from the
+/// detail ("Key (email)=(a@b.c) already exists."), so it is never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Described {
+    /// What went wrong, with the server's code when there is one.
+    pub message: String,
+    /// The server's detail; `None` when empty or the message again.
+    pub detail: Option<String>,
+    /// The server's hint; `None` when empty or the message again.
+    pub hint: Option<String>,
+}
+
+impl Described {
+    /// A description from its parts; a detail or a hint that is empty or
+    /// says the message again is left out.
+    pub fn new(message: String, detail: Option<&str>, hint: Option<&str>) -> Self {
+        let keep = |extra: Option<&str>| {
+            extra
+                .map(str::trim)
+                .filter(|extra| !extra.is_empty() && *extra != message.trim())
+                .map(str::to_string)
+        };
+        Self {
+            detail: keep(detail),
+            hint: keep(hint),
+            message,
+        }
+    }
+
+    /// The lines Kerno shows, in order: the message, "Detail: …", "Hint: …".
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![self.message.clone()];
+        lines.extend(self.detail.iter().map(|detail| format!("Detail: {detail}")));
+        lines.extend(self.hint.iter().map(|hint| format!("Hint: {hint}")));
+        lines
+    }
+}
+
+/// The lines of [`Described::lines`], one per line of text.
+impl fmt::Display for Described {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.lines().join("\n"))
+    }
+}
+
+/// `error` as Kerno shows it: the server's detail and hint with the message
+/// of a [`Error::Db`]; the message alone for every other error, so a cancel
+/// or a lost connection keeps the words of whoever shows it.
+pub fn describe(error: &Error) -> Described {
+    match error {
+        Error::Db(db) => {
+            // Compared with the message without its code too.
+            let not_the_message = |extra: &&str| extra.trim() != db.message.trim();
+            Described::new(
+                db.to_string(),
+                db.detail.as_deref().filter(not_the_message),
+                db.hint.as_deref().filter(not_the_message),
+            )
+        }
+        other => Described::new(other.to_string(), None, None),
+    }
+}
+
 impl From<crate::ssh::SshError> for Error {
     fn from(error: crate::ssh::SshError) -> Self {
         Self::Ssh(Box::new(error))
@@ -160,6 +227,8 @@ pub enum FailureKind {
     SshHostKeyChanged,
     /// The SSH server could not open the way to the database.
     SshForward,
+    /// The saved password could not be read from the system secret store.
+    SecretStore,
     /// Anything else: only the raw message says what happened.
     Other,
 }
@@ -330,6 +399,8 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
         } else {
             other()
         }
+    } else if let Some(store) = raw.strip_prefix("secrets: ") {
+        secret_store_words(store)
     } else if raw.starts_with("TLS: ") {
         (
             FailureKind::Tls,
@@ -635,6 +706,57 @@ fn openssh_words(
         "OpenSSH could not open the tunnel.".to_string(),
         "Read ssh's message below.",
     )
+}
+
+/// What the system secret store is called on this platform.
+const SECRET_STORE: &str = if cfg!(target_os = "macos") {
+    "keychain"
+} else {
+    "secret store"
+};
+
+/// A read of the saved password that the secret store refused or could not
+/// serve (C14), from `secrets.rs`'s `secret_error` text: what the store
+/// said, never a secret. Each case names a next step.
+fn secret_store_words(text: &str) -> (FailureKind, String, String) {
+    let store = SECRET_STORE;
+    let ask = "or set Password to “Ask each time” in the connection's settings.";
+    let (headline, next) = if any(
+        text,
+        &[
+            // The prompt answered Deny (-128), or a wrong login password (-25293).
+            "User canceled",
+            "error code -128",
+            "passphrase you entered is not correct",
+            "error code -25293",
+        ],
+    ) {
+        (
+            format!("Kerno could not read the saved password: the {store} prompt was refused."),
+            format!("Connect again and choose Allow in the {store} prompt, {ask}"),
+        )
+    } else if any(
+        text,
+        &[
+            // keyring's NoStorageAccess: locked, read-only or missing.
+            "Couldn't access platform storage",
+            "interaction is not allowed",
+            "error code -25308",
+        ],
+    ) {
+        (
+            format!(
+                "Kerno could not read the saved password: the {store} is locked or cannot be used."
+            ),
+            format!("Unlock the {store}, then connect again, {ask}"),
+        )
+    } else {
+        (
+            format!("Kerno could not read the password from the {store}."),
+            format!("Allow Kerno in the {store} prompt, {ask}"),
+        )
+    };
+    (FailureKind::SecretStore, headline, next)
 }
 
 fn other() -> (FailureKind, String, String) {
@@ -998,6 +1120,117 @@ mod tests {
     fn the_raw_message_is_kept() {
         let raw = "could not connect: Connection refused (os error 61)";
         assert_eq!(explain(raw, &config()).raw, raw);
+    }
+
+    /// C14: the server's detail and hint come with its message and code, in
+    /// one order; nothing empty or said twice; other errors keep their words.
+    #[test]
+    fn describe_keeps_the_detail_and_the_hint() {
+        let db = |detail: Option<&str>, hint: Option<&str>| {
+            Error::from(DbError {
+                message: "cannot drop table t because other objects depend on it".into(),
+                code: Some("2BP01".into()),
+                detail: detail.map(str::to_string),
+                hint: hint.map(str::to_string),
+                ..DbError::default()
+            })
+        };
+        let full = describe(&db(
+            Some("view v depends on table t"),
+            Some("Use DROP ... CASCADE to drop the dependent objects too."),
+        ));
+        assert_eq!(
+            full.to_string(),
+            "cannot drop table t because other objects depend on it [2BP01]\n\
+             Detail: view v depends on table t\n\
+             Hint: Use DROP ... CASCADE to drop the dependent objects too."
+        );
+        assert_eq!(full.lines().len(), 3);
+        // Empty, blank or the message again: not repeated.
+        for extra in [
+            Some(""),
+            Some("  "),
+            Some("cannot drop table t because other objects depend on it"),
+            Some("cannot drop table t because other objects depend on it [2BP01]"),
+            None,
+        ] {
+            let described = describe(&db(extra, extra));
+            assert_eq!(
+                (described.detail, described.hint),
+                (None, None),
+                "{extra:?}"
+            );
+        }
+        // MySQL gives neither: its message and its code are kept.
+        let mysql = describe(&Error::from(DbError {
+            message: "Duplicate entry '1' for key 't.PRIMARY'".into(),
+            code: Some("1062 (23000)".into()),
+            ..DbError::default()
+        }));
+        assert_eq!(
+            mysql.to_string(),
+            "Duplicate entry '1' for key 't.PRIMARY' [1062 (23000)]"
+        );
+        // Not from a server: the message only, as Display gives it.
+        for error in [
+            Error::Cancelled,
+            Error::Closed("broken pipe".into()),
+            Error::Config("no host".into()),
+            Error::Storage("disk full".into()),
+            Error::io("reading ca.pem", std::io::Error::other("denied")),
+        ] {
+            let described = describe(&error);
+            assert_eq!(described.to_string(), error.to_string());
+            assert_eq!(described.lines(), vec![error.to_string()]);
+        }
+    }
+
+    /// C14: a read of the saved password that the secret store refused or
+    /// could not serve says what to do, from `secret_error`'s text, and
+    /// never more than the store's own message.
+    #[test]
+    fn a_secret_store_failure_names_the_next_step() {
+        let store = SECRET_STORE;
+        let cases = [
+            (
+                "secrets: could not read from the system secret store: Platform failure: User \
+                 canceled the operation.",
+                format!("Kerno could not read the saved password: the {store} prompt was refused."),
+                format!("Connect again and choose Allow in the {store} prompt"),
+            ),
+            (
+                "secrets: could not read from the system secret store: Platform failure: error \
+                 code -25293",
+                format!("Kerno could not read the saved password: the {store} prompt was refused."),
+                format!("Connect again and choose Allow in the {store} prompt"),
+            ),
+            (
+                "secrets: could not read from the system secret store: Couldn't access platform \
+                 storage: User interaction is not allowed.",
+                format!(
+                    "Kerno could not read the saved password: the {store} is locked or cannot be used."
+                ),
+                format!("Unlock the {store}, then connect again"),
+            ),
+            (
+                "secrets: could not address the system secret store: Value of 'user' is invalid",
+                format!("Kerno could not read the password from the {store}."),
+                format!("Allow Kerno in the {store} prompt"),
+            ),
+        ];
+        for (raw, headline, next) in cases {
+            let explained = explain(raw, &config());
+            assert_eq!(explained.kind, FailureKind::SecretStore, "{raw}");
+            assert_eq!(explained.headline, headline, "{raw}");
+            assert!(explained.next_step.starts_with(&next), "{raw}");
+            assert!(
+                explained
+                    .next_step
+                    .ends_with("or set Password to “Ask each time” in the connection's settings."),
+                "{raw}"
+            );
+            assert_eq!(explained.raw, raw);
+        }
     }
 
     #[test]

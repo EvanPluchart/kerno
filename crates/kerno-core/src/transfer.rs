@@ -821,7 +821,10 @@ impl TransferReport {
                 TableStatus::NotStarted => "not started".to_string(),
                 TableStatus::Copied => "copied".to_string(),
                 TableStatus::Skipped(why) => format!("skipped: {why}"),
-                TableStatus::Failed { error, .. } => format!("failed: {error}"),
+                // The server's detail and hint go on lines of their own (C14).
+                TableStatus::Failed { error, .. } => {
+                    format!("failed: {}", error.lines().next().unwrap_or_default())
+                }
                 TableStatus::Cancelled => "cancelled".to_string(),
             };
             lines.push(format!(
@@ -833,12 +836,11 @@ impl TransferReport {
                 table.read,
                 table.written,
             ));
-            if let TableStatus::Failed {
-                first_row: Some(row),
-                ..
-            } = &table.status
-            {
-                lines.push(format!("  First row of the failing batch: {row}"));
+            if let TableStatus::Failed { error, first_row } = &table.status {
+                lines.extend(error.lines().skip(1).map(|line| format!("  {line}")));
+                if let Some(row) = first_row {
+                    lines.push(format!("  First row of the failing batch: {row}"));
+                }
             }
             if !table.not_copied.is_empty() {
                 lines.push(format!("  Not copied: {}.", table.not_copied.join(", ")));
@@ -928,7 +930,11 @@ pub async fn run(
                 outcome.elapsed.as_secs_f64()
             ),
             TableStatus::Skipped(why) => format!("{name}: skipped, {why}."),
-            TableStatus::Failed { error, .. } => format!("{name}: failed, {error}."),
+            TableStatus::Failed { error, .. } => {
+                let (first, more) = error.split_once('\n').unwrap_or((error, ""));
+                let more = more.lines().map(|line| format!("\n  {line}"));
+                format!("{name}: failed, {first}.{}", more.collect::<String>())
+            }
             TableStatus::Cancelled => format!("{name}: cancelled."),
             TableStatus::NotStarted => format!("{name}: not started."),
         }));
@@ -958,12 +964,10 @@ fn failed(error: impl Into<String>) -> TableStatus {
     }
 }
 
-/// The server's message, or what went wrong.
+/// What went wrong: the server's message and code, then its detail and
+/// hint on lines of their own (C14).
 fn message(error: &Error) -> String {
-    match error.db() {
-        Some(db) => db.message.clone(),
-        None => error.to_string(),
-    }
+    crate::error::describe(error).to_string()
 }
 
 async fn run_sql(session: &Arc<dyn Session>, sql: &str) -> Result<()> {

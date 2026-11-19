@@ -337,14 +337,23 @@ impl TasksView {
                         then(this, window, cx);
                     }
                 }
+                // In plain words, as the window says it (C14); the raw
+                // message is in the window's own notification.
                 Status::Failed { message } => {
                     this.waiting = None;
-                    window.push_notification(
-                        Notification::error(SharedString::from(format!(
-                            "The task's connection did not open: {message}"
-                        ))),
-                        cx,
-                    );
+                    let text = match connections.read(cx).get(&id) {
+                        Some(saved) => {
+                            let explained = kerno_core::error::explain(&message, &saved.config);
+                            format!(
+                                "The task's connection did not open. {}\n{}",
+                                explained.headline, explained.next_step
+                            )
+                            .trim_end()
+                            .to_string()
+                        }
+                        None => format!("The task's connection did not open: {message}"),
+                    };
+                    window.push_notification(crate::error_notification(text), cx);
                 }
                 _ => {}
             },

@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use gpui_kit::base::actions::Confirm;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Entity, InteractiveElement as _, ParentElement as _, SharedString,
+    App, AppContext as _, Entity, InteractiveElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::Session;
@@ -122,9 +121,10 @@ pub fn open(
                     Ok(catalog) => relations(&catalog),
                     Err(error) => {
                         window.push_notification(
-                            Notification::error(SharedString::from(format!(
-                                "The tables could not be listed: {error}"
-                            ))),
+                            crate::error_notification(format!(
+                                "The tables could not be listed: {}",
+                                kerno_core::describe(&error)
+                            )),
                             cx,
                         );
                         Vec::new()

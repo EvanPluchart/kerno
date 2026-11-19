@@ -2549,3 +2549,290 @@ fn a_settings_save_failure_is_shown(cx: &mut TestAppContext) {
         notification_count(app, cx) == before
     });
 }
+
+// K9: the server's detail and hint on every error surface (C14) ----------------------------
+
+/// The error notifications this test's window has shown, oldest first.
+fn errors_shown() -> Vec<String> {
+    crate::ERRORS_SHOWN.with(|shown| shown.borrow().clone())
+}
+
+/// The test's own table `<name>.t (id, v)` holding the rows `(1, 'a')` and `(2, 'b')`,
+/// dropped when the test ends.
+fn k9_table(engine: Engine, name: &str) -> Scratch {
+    let (drop, create) = scratch_schema(engine, name);
+    let table = format!("CREATE TABLE {name}.t (id INT PRIMARY KEY, v VARCHAR(20))");
+    let rows = format!("INSERT INTO {name}.t VALUES (1, 'a'), (2, 'b')");
+    Scratch::new(engine, &[&drop], &[&create, &table, &rows])
+}
+
+/// C14: an Apply the server refuses for a duplicate key says what happened first, then the
+/// server's message with its code and, on PostgreSQL, its detail naming the key; MySQL gives
+/// no detail or hint: its message and its error number are kept, nothing else is invented.
+#[gpui_kit::test]
+fn a_duplicate_key_on_apply_shows_the_server_detail(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k9_dup";
+        let _scratch = k9_table(engine, name);
+        let app = connected(cx, engine);
+        app.open_table(cx, name, "t", RelationKind::Table);
+        app.wait_for_rows(cx, "Rows 1–2 of 2");
+        // The second row takes the key of the first.
+        app.type_in_cell(cx, 1, 1, "1", "enter");
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        app.click(cx, "data-apply");
+        app.click(cx, "sql-confirm");
+        let tab = app.data(cx);
+        app.wait_until(cx, "the refused apply", |_, cx| {
+            cx.update(|cx| tab.read(cx).apply_error().is_some())
+        });
+        let error = cx
+            .update(|cx| tab.read(cx).apply_error().map(str::to_string))
+            .unwrap();
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(
+            lines[0], "Nothing was changed: statement 1 failed. The pending changes are kept.",
+            "{engine:?}: {error}"
+        );
+        match engine {
+            Engine::Postgres => {
+                assert!(
+                    lines[1].starts_with("duplicate key value violates unique constraint")
+                        && lines[1].ends_with("[23505]"),
+                    "{error}"
+                );
+                assert_eq!(lines[2], "Detail: Key (id)=(1) already exists.", "{error}");
+                assert_eq!(lines.len(), 3, "{error}");
+            }
+            _ => {
+                assert!(
+                    lines[1].starts_with("Duplicate entry '1'")
+                        && lines[1].ends_with("[1062 (23000)]"),
+                    "{engine:?}: {error}"
+                );
+                assert_eq!(lines.len(), 2, "{engine:?}: {error}");
+            }
+        }
+        assert_eq!(app.pending(cx), 1, "{engine:?}");
+        assert_eq!(
+            on_server(
+                engine,
+                &format!("SELECT count(*) FROM {name}.t WHERE id = 1")
+            ),
+            "1"
+        );
+        app.click(cx, "data-discard");
+    }
+}
+
+/// C14: Drop on a table a view depends on: the notification says the table was not dropped,
+/// then PostgreSQL's message, its detail (the view) and its hint, which holds the fix
+/// (`DROP … CASCADE`). It stays until closed. (MySQL drops a table under a view without an
+/// error: no twin.)
+#[gpui_kit::test]
+fn dropping_a_table_with_dependents_shows_the_hint(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k9_drop";
+    let (drop, create) = scratch_schema(engine, name);
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop],
+        &[
+            &create,
+            &format!("CREATE TABLE {name}.t (id INT PRIMARY KEY)"),
+            &format!("CREATE VIEW {name}.v AS SELECT id FROM {name}.t"),
+        ],
+    );
+    let app = connected(cx, engine);
+    let path = k2_path(engine, name);
+    app.open_path(cx, &path);
+    let before = errors_shown().len();
+    app.act(cx, Action::Drop, &path);
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the refused drop", |_, _| errors_shown().len() > before);
+    let shown = errors_shown();
+    let text = shown.last().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "The table “t” was not dropped.", "{text}");
+    assert!(
+        lines[1].starts_with("cannot drop table") && lines[1].ends_with("[2BP01]"),
+        "{text}"
+    );
+    assert!(
+        lines[2].starts_with("Detail: view kerno_ui_k9_drop.v depends on table"),
+        "{text}"
+    );
+    assert!(lines[3].starts_with("Hint: Use DROP ... CASCADE"), "{text}");
+    assert_eq!(
+        on_server(
+            engine,
+            &format!("SELECT count(*) FROM pg_tables WHERE schemaname = '{name}'")
+        ),
+        "1"
+    );
+}
+
+/// C14, C15: a COMMIT the server refuses (a deferred unique constraint checked at commit)
+/// says first what came of the transaction, read from the session after the failure: rolled
+/// back, nothing saved; then the server's message and detail. The tab's badge and state
+/// agree: no transaction is open any more.
+#[gpui_kit::test]
+fn a_failed_commit_says_what_was_kept(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k9_commit";
+    let (drop, create) = scratch_schema(engine, name);
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop],
+        &[
+            &create,
+            &format!(
+                "CREATE TABLE {name}.t (id INT, CONSTRAINT one_id UNIQUE (id) DEFERRABLE \
+                 INITIALLY DEFERRED)"
+            ),
+            &format!("INSERT INTO {name}.t VALUES (1)"),
+        ],
+    );
+    let app = connected(cx, engine);
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, &format!("insert into {name}.t values (1)"));
+    let before = errors_shown().len();
+    app.dispatch(cx, actions::CommitTransaction);
+    app.wait_until(cx, "the refused commit", |_, _| {
+        errors_shown().len() > before
+    });
+    let shown = errors_shown();
+    let text = shown.last().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        "The commit failed: the transaction was rolled back by the server; nothing it changed \
+         was saved.",
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("duplicate key value violates unique constraint \"one_id\"")
+            && lines[1].ends_with("[23505]"),
+        "{text}"
+    );
+    assert_eq!(lines[2], "Detail: Key (id)=(1) already exists.", "{text}");
+    assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle);
+    assert!(!app.has(cx, ("tab-tx", 0usize)));
+    assert_eq!(
+        on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+        "1"
+    );
+}
+
+/// C14, C15: each outcome of a failed COMMIT or ROLLBACK, as the session reports it after the
+/// failure, on both engines' states; a connection lost during a COMMIT never claims to know.
+#[test]
+fn a_failed_end_of_transaction_says_its_outcome() {
+    use crate::query::tab::ending_failed;
+    use kerno_core::{DbError, Error, TxState};
+    let refused = Error::from(DbError {
+        message: "duplicate key value violates unique constraint \"u\"".into(),
+        code: Some("23505".into()),
+        detail: Some("Key (id)=(1) already exists.".into()),
+        ..DbError::default()
+    });
+    let first = |commit, error: &Error, after| {
+        ending_failed(commit, error, after)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert!(first(true, &refused, TxState::Idle).contains("rolled back by the server"));
+    for after in [TxState::Open, TxState::Failed] {
+        assert_eq!(
+            first(true, &refused, after),
+            "The commit failed; the transaction is still open."
+        );
+        assert_eq!(
+            first(false, &refused, after),
+            "The rollback failed; the transaction is still open."
+        );
+    }
+    assert!(first(false, &refused, TxState::Idle).contains("no longer open"));
+    let lost = Error::Closed("broken pipe".into());
+    assert!(first(true, &lost, TxState::Idle).contains("is not known"));
+    // The server's words follow, with the detail.
+    let text = ending_failed(true, &refused, TxState::Idle);
+    assert_eq!(
+        text.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "duplicate key value violates unique constraint \"u\" [23505]",
+            "Detail: Key (id)=(1) already exists."
+        ]
+    );
+}
+
+/// A secret store that refuses every read, as the macOS keychain does when its prompt is
+/// answered Deny (the words of `secrets.rs`'s `secret_error`).
+struct Refusing;
+
+impl kerno_core::secrets::SecretStore for Refusing {
+    fn get(&self, _: &str) -> kerno_core::Result<Option<Secret>> {
+        Err(kerno_core::Error::Secrets(
+            "could not read from the system secret store: Platform failure: User canceled the \
+             operation."
+                .into(),
+        ))
+    }
+    fn set(&self, _: &str, _: &Secret) -> kerno_core::Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &str) -> kerno_core::Result<()> {
+        Ok(())
+    }
+    fn is_persistent(&self) -> bool {
+        true
+    }
+}
+
+/// C14: a connect whose saved password the secret store refuses says so in plain words with
+/// the next step (Allow, or "Ask each time"), never the generic "The connection failed.", and
+/// never a secret.
+#[gpui_kit::test]
+fn a_refused_keychain_read_says_what_to_do(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let config = testing::config(Engine::Postgres);
+    let id = storage.save_connection(None, &config).unwrap();
+    let app = open(cx, storage);
+    cx.update(|cx| cx.global_mut::<AppState>().secrets = Arc::new(Refusing));
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |connections, cx| connections.connect(&id, cx))
+    });
+    app.wait_until(cx, "the refused read", |app, cx| {
+        matches!(app.status(cx, 0), Status::Failed { .. })
+    });
+    let Status::Failed { message } = app.status(cx, 0) else {
+        unreachable!()
+    };
+    assert!(message.starts_with("secrets: "), "{message}");
+    let explained = kerno_core::error::explain(&message, &config);
+    assert_eq!(
+        explained.kind,
+        kerno_core::error::FailureKind::SecretStore,
+        "{message}"
+    );
+    assert!(
+        explained
+            .next_step
+            .ends_with("or set Password to “Ask each time” in the connection's settings."),
+        "{explained:?}"
+    );
+    let password = testing::secrets().password.unwrap();
+    assert!(!message.contains(password.expose()), "{message}");
+}

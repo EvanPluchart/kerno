@@ -338,7 +338,7 @@ impl DiagramTab {
         if self.generation != generation || matches!(error, Error::Cancelled) {
             return;
         }
-        self.state = State::Failed(error.to_string());
+        self.state = State::Failed(kerno_core::describe(error).to_string());
         cx.notify();
     }
 
@@ -886,8 +886,11 @@ impl DiagramTab {
                 Self::render_notice(
                     "erd-error",
                     "The diagram could not be read",
-                    format!(
-                        "{error} Check that {schema} still exists and that this account can read its catalog, then try again."
+                    crate::advice_after(
+                        error,
+                        &format!(
+                            "Check that {schema} still exists and that this account can read its catalog, then try again."
+                        ),
                     ),
                     Some(retry),
                     cx,

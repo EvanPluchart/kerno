@@ -4806,10 +4806,15 @@ impl Workspace {
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 if rolling_back_to_quit && !failures.is_empty() {
-                    tracing::warn!(?failures, "quitting without the server's answer");
+                    // The outcome and the server's message, as before C14:
+                    // never its detail, which can quote row values.
+                    let logged: Vec<String> = (failures.iter())
+                        .map(|failure| failure.lines().take(2).collect::<Vec<_>>().join(" "))
+                        .collect();
+                    tracing::warn!(?logged, "quitting without the server's answer");
                 } else if !failures.is_empty() {
-                    let text = format!("{}. Nothing else was done.", failures.join("; "));
-                    window.push_notification(Notification::error(SharedString::from(text)), cx);
+                    let text = format!("{}\nNothing else was done.", failures.join("\n"));
+                    window.push_notification(crate::error_notification(text), cx);
                     return;
                 }
                 for tab in &discarded {

@@ -581,3 +581,19 @@ Still open (for the owner):
 - 11 core tests, 2 unit tests, 3 UI tests; each part seen failing with it disabled (13 mutations). The guide
   says where Kerno keeps its data, the backups and how to put one back (all three files).
 - Limits and plan errors in the "Done:" line of K8 (`docs/plans/M12.md`).
+
+## 2026-11-19 — K9: the server's detail and hint on every error surface (C14)
+
+- `kerno_core::describe` gives an error as Kerno shows it: message and code, then "Detail: …" and "Hint: …" on
+  lines of their own, nothing empty or repeated; any error not from a server keeps its words (D-081). The
+  transfer and the CSV import stop dropping the code, the detail and the hint.
+- Every surface a server error reaches uses it: data tab and result Apply ("Nothing was changed: statement 1
+  failed. The pending changes are kept." then the server's words), table form, structure tab, navigator writes
+  ("The table “t” was not dropped." then the hint "Use DROP ... CASCADE …") and node loads (tooltip), COMMIT and
+  ROLLBACK (the outcome first, from the session's state after the failure), transfer, import, maintenance, FDW,
+  administration, ER diagram, export, quick open. An error notification with more than one line stays until
+  closed. The inventory is in the "Done:" line of K9 (`docs/plans/M12.md`).
+- The secret store refusing the saved password at connect is told in plain words with the next step (Allow,
+  unlock, or "Ask each time"); a task whose connection did not open says it as the window does.
+- Two core tests, four UI tests and one unit test; each UI test seen failing with its part disabled (five
+  mutations). Limits and plan errors in the "Done:" line of K9.

@@ -69,6 +69,48 @@ use crate::state::{AppState, Startup};
 use crate::theme::Appearance;
 use crate::workspace::Workspace;
 
+/// An error notification (C14). One line: as the kit draws it. More (the
+/// server's message, detail and hint after Kerno's own words): the first line
+/// as its title, the rest below in the selectable text a connection failure
+/// uses, to copy a hint; it stays until closed, the hint often being the fix.
+pub(crate) fn error_notification(text: String) -> gpui_kit::component::notification::Notification {
+    use gpui_kit::IntoElement as _;
+    use gpui_kit::component::notification::{Notification, NotificationType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The kit's notifications have no label to read their text by.
+    #[cfg(test)]
+    ERRORS_SHOWN.with(|shown| shown.borrow_mut().push(text.clone()));
+    let Some((first, rest)) = text.split_once('\n') else {
+        return Notification::error(gpui_kit::SharedString::from(text));
+    };
+    // The text's element id, unique among the notifications on screen.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let id = format!("error-note-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let rest = rest.to_string();
+    Notification::new()
+        .with_type(NotificationType::Error)
+        .title(gpui_kit::SharedString::from(first.to_string()))
+        .content(move |_, _, cx| {
+            crate::connections::dialog::raw_message(&id, &rest, cx).into_any_element()
+        })
+        .autohide(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The texts of [`error_notification`]s made on this thread (a test's).
+    pub(crate) static ERRORS_SHOWN: std::cell::RefCell<Vec<String>> = Default::default();
+}
+
+/// An error's text with Kerno's advice after its first line (the message),
+/// before the server's detail and hint (C14).
+pub(crate) fn advice_after(error: &str, advice: &str) -> String {
+    match error.split_once('\n') {
+        Some((message, more)) => format!("{message} {advice}\n{more}"),
+        None => format!("{error} {advice}"),
+    }
+}
+
 /// What `kerno --help` prints.
 const USAGE: &str = "\
 Kerno, a fast, native database client.

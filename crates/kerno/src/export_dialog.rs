@@ -373,7 +373,7 @@ impl ExportDialog {
                             progress,
                         },
                         Err(Error::Cancelled) => State::Cancelled,
-                        Err(error) => State::Failed(error.to_string()),
+                        Err(error) => State::Failed(kerno_core::describe(&error).to_string()),
                     };
                     cx.notify();
                 });
@@ -796,7 +796,8 @@ impl Render for ExportDialog {
                 let (id, text) = match &self.state {
                     State::Failed(error) => (
                         "export-failed",
-                        format!("The export failed: {error}. No file was written."),
+                        // Plain words first, then the server's (C14).
+                        format!("The export failed. No file was written.\n{error}"),
                     ),
                     _ => (
                         "export-cancelled",

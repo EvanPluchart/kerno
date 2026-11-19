@@ -195,7 +195,7 @@ impl CreateDatabaseForm {
                             })
                             .collect(),
                     ),
-                    Err(error) => Choices::Failed(error.to_string()),
+                    Err(error) => Choices::Failed(kerno_core::describe(&error).to_string()),
                 },
             };
             let _ = this.update(cx, |this, cx| {
@@ -341,9 +341,10 @@ impl Render for CreateDatabaseForm {
         let statement = self.statement(cx);
         let status = match &self.choices {
             Choices::Loading => Some("Reading the server's roles, encodings and locales…".into()),
+            // Plain words first, then the server's (C14).
             Choices::Failed(error) => Some(format!(
-                "The server's lists could not be read ({error}): the database can still be made \
-                 with the server's defaults."
+                "The server's lists could not be read: the database can still be made with the \
+                 server's defaults.\n{error}"
             )),
             Choices::Ready(_) => None,
         };

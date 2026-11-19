@@ -533,11 +533,10 @@ fn read_error(path: &Path, error: CsvError) -> Error {
     }
 }
 
+/// The record the server refused: its message and code, then its detail
+/// and hint on lines of their own (C14).
 fn refused(line: u64, error: &Error) -> ImportFailure {
-    let message = match error.db() {
-        Some(db) => db.message.clone(),
-        None => error.to_string(),
-    };
+    let message = crate::error::describe(error).to_string();
     ImportFailure { line, message }
 }
 

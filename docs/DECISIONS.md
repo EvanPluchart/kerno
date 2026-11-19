@@ -1752,3 +1752,32 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **A failed settings save is shown once** (`Notification::error`, not hidden by itself): one notification for
   any number of failed saves (the same one, not pushed again: the kit restarts a toast pushed under the same id),
   removed by the next save that succeeds. The settings apply until Kerno quits.
+
+## D-081 — One wording for the server's errors, and when an error notification stays (K9, C14; 2026-11-19)
+
+- **The wording lives in `kerno-core`**: `describe(&Error) -> Described`, whose `Display` is the message (the
+  error's own `Display`, the server's code in brackets after it as every surface showed it: `[23505]`, `[1062
+  (23000)]`), then `Detail: …`, then `Hint: …`, one per line; a detail or hint that is empty, blank or the
+  message again is left out. The core needs it too (the transfer report, the CSV import's refused record), so the
+  plan's app-side `error_lines(&Described) -> Vec<SharedString>` was not written: GPUI draws a `\n` as a line
+  break in any text, notifications included, and `Described::lines()` serves the one panel that styles its lines
+  (the query tab's result, message in the danger colour). A surface with plain words says them first, then the
+  described error: on its own line ("The table “t” was not dropped.", "The commit failed: …") or before a colon
+  where the surface already read "X could not be read: msg"; Kerno's advice after a message goes before the
+  detail (`crate::advice_after`).
+- **`Display` of `DbError` and `Error` is unchanged.** It is what `tracing` writes (`%error`) and what
+  `explain`'s markers match; a detail can quote row values ("Key (email)=(a@b.c) already exists."), which is the
+  user's data shown to the user, never logged. `Described` is never logged; the quit path's `ROLLBACK` failures,
+  the one place a described text reached a log line, log their first two lines (outcome and message).
+- **An error notification with more than one line stays until it is closed** (`crate::error_notification`): the
+  hint is often the fix, and the kit hides an error after 5 s. Its first line (Kerno's plain words, or the message)
+  is the notification's title; the server's lines below are the selectable text the connection-failure
+  notification already uses (`connections::dialog::raw_message`, one element id per notification), so a hint
+  such as `DROP … CASCADE` can be copied. A one-line error stays as the kit draws it and hides itself.
+- **A row of a tree shows one line**: a failed node load shows "Could not read the objects of shop: msg [code]"
+  and its detail and hint in the row's tooltip; the connection's detail row (the database list, a connection
+  failure's raw text) shows its first line, all of it in its tooltip.
+- **A failed COMMIT or ROLLBACK says what came of the transaction from the session's state after the failure**,
+  never from the statement: PostgreSQL's driver marks a failed `COMMIT` idle (the server ended the block), MySQL
+  reads the server's in-transaction flag with a ping after any failure. A `COMMIT` cut by a lost connection says
+  that whether it was saved is not known, as a statement cut while running does.

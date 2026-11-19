@@ -282,7 +282,7 @@ impl ImportDialog {
                 this.columns = Some(
                     outcome
                         .map(|structure| structure.columns)
-                        .map_err(|error| error.to_string()),
+                        .map_err(|error| kerno_core::describe(&error).to_string()),
                 );
                 cx.notify();
             });
@@ -743,7 +743,7 @@ impl ImportDialog {
                             dropped: created_alone,
                         },
                         Err(error) => Step::Failed {
-                            report: error.to_string(),
+                            report: kerno_core::describe(&error).to_string(),
                             dropped: false,
                         },
                     };
@@ -1312,10 +1312,11 @@ impl Render for ImportDialog {
             Step::Cancelled | Step::Failed { .. } => {
                 let text = match &self.step {
                     Step::Failed { report, dropped } => {
+                        // Plain words first, then the server's (C14).
                         format!(
-                            "Nothing was imported: {report}.{}",
+                            "Nothing was imported{}.\n{report}",
                             if *dropped {
-                                " The new table was dropped."
+                                "; the new table was dropped"
                             } else {
                                 ""
                             }

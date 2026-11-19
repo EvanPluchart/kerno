@@ -1268,7 +1268,8 @@ fn item(node: &Node, filter: &str, tree: &Tree) -> Option<Item> {
     let children = match &node.children {
         Children::None => Vec::new(),
         Children::Unloaded | Children::Loading => vec![note(node, "Loading…")],
-        Children::Failed(message) => vec![note(node, message)],
+        // One row: the first line; the rest is in its tooltip (C14).
+        Children::Failed(message) => vec![note(node, message.lines().next().unwrap_or_default())],
         Children::Loaded(children) if children.is_empty() => vec![note(node, "Nothing here")],
         Children::Loaded(children) => {
             let object_filter = tree.active_filter(Some(&node.id));

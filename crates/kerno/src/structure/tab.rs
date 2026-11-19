@@ -26,7 +26,7 @@ use kerno_core::schema::{
     ColumnGeneration, ColumnInfo, ConstraintKind, ObjectRef, RelationKind, TableRef, TableStructure,
 };
 use kerno_core::table_draft::TableChange;
-use kerno_core::{Error, TxState, exec};
+use kerno_core::{Error, TxState, describe, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -323,7 +323,9 @@ impl StructureTab {
                     // The columns are worth showing when the DDL is not.
                     let ddl = match structure {
                         Ok(_) => session.ddl(&object).await.unwrap_or_else(|error| {
-                            format!("-- The DDL could not be read: {error}\n")
+                            // Each line a comment, the server's detail and hint too (C14).
+                            let lines = describe(&error).lines().join("\n-- ");
+                            format!("-- The DDL could not be read: {lines}\n")
                         }),
                         Err(_) => String::new(),
                     };
@@ -332,7 +334,7 @@ impl StructureTab {
                             exec::collect(session.clone(), sql)
                                 .await
                                 .map(properties_of)
-                                .map_err(|error| error.to_string()),
+                                .map_err(|error| describe(&error).to_string()),
                         ),
                         _ => None,
                     };
@@ -360,7 +362,7 @@ impl StructureTab {
         if self.generation != generation {
             return;
         }
-        self.state = State::Failed(error.to_string());
+        self.state = State::Failed(describe(error).to_string());
         cx.notify();
     }
 
@@ -497,9 +499,10 @@ impl StructureTab {
             let _ = this.update_in(cx, |this, window, cx| {
                 let notification = match outcome {
                     Ok(_) => Notification::success("Changed the comment."),
-                    Err(error) => Notification::error(SharedString::from(format!(
-                        "The comment was not changed: {error}"
-                    ))),
+                    Err(error) => crate::error_notification(format!(
+                        "The comment was not changed: {}",
+                        describe(&error)
+                    )),
                 };
                 window.push_notification(notification, cx);
                 this.reload(window, cx);
@@ -819,9 +822,12 @@ impl StructureTab {
                 self.render_notice(
                     "structure-error",
                     "The structure could not be read",
-                    format!(
-                        "{error} Check that the {} still exists, then try again.",
-                        self.noun()
+                    crate::advice_after(
+                        error,
+                        &format!(
+                            "Check that the {} still exists, then try again.",
+                            self.noun()
+                        ),
                     ),
                     Some(retry),
                     cx,
@@ -904,10 +910,13 @@ impl StructureTab {
                 return self.render_notice(
                     "structure-properties-error",
                     "The properties could not be read",
-                    format!(
-                        "{error} The account may lack the privilege to read the catalog: the \
-                         other sub-tabs may still show the {}.",
-                        self.noun()
+                    crate::advice_after(
+                        error,
+                        &format!(
+                            "The account may lack the privilege to read the catalog: the other \
+                             sub-tabs may still show the {}.",
+                            self.noun()
+                        ),
                     ),
                     Some(retry),
                     cx,

@@ -42,8 +42,8 @@ use kerno_core::editable::{self, Editable, ReadOnly, Source as EditSource};
 use kerno_core::environment;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{
-    CellValue, RowChange, RowSql, StatementClass, StatementKind, TxCommand, apply_edits,
-    apply_edits_in_transaction, classify,
+    ApplyFailure, CellValue, RowChange, RowSql, StatementClass, StatementKind, TxCommand,
+    apply_edits, apply_edits_in_transaction, classify,
 };
 use kerno_core::sql::{
     LexRules, Param, ParamKey, ParamValue, bind_params, change_case, find_params, format_cleanly,
@@ -51,8 +51,8 @@ use kerno_core::sql::{
 };
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
-    Dialect, Error, ExecEvent, IsolationLevel, Notice, Plan, ResultStore, RowLimit, Session,
-    TxState, exec,
+    Described, Dialect, Error, ExecEvent, IsolationLevel, Notice, Plan, ResultStore, RowLimit,
+    Session, TxState, describe, exec,
 };
 
 use super::comment;
@@ -178,6 +178,46 @@ impl From<&Error> for Failure {
             },
         }
     }
+}
+
+impl Failure {
+    /// The failure as every error surface shows it (C14): the message with
+    /// its code, then the detail and the hint.
+    pub fn described(&self) -> Described {
+        let message = match &self.code {
+            Some(code) => format!("{} [{code}]", self.message),
+            None => self.message.clone(),
+        };
+        Described::new(message, self.detail.as_deref(), self.hint.as_deref())
+    }
+}
+
+/// What a COMMIT or ROLLBACK that failed says (C14, C15): first what came
+/// of the transaction, from the session's state after the failure (`after`),
+/// then the server's message, detail and hint.
+pub fn ending_failed(commit: bool, error: &Error, after: TxState) -> String {
+    let outcome = match (commit, error, after) {
+        // The server may have saved it before the connection went.
+        (true, Error::Closed(_), _) => {
+            "The connection closed during the commit: whether the server saved the transaction \
+             is not known. Check before you run it again."
+        }
+        (true, _, TxState::Idle) => {
+            "The commit failed: the transaction was rolled back by the server; nothing it \
+             changed was saved."
+        }
+        (true, _, TxState::Open | TxState::Failed) => {
+            "The commit failed; the transaction is still open."
+        }
+        (false, _, TxState::Idle) => {
+            "The rollback failed, but the transaction is no longer open: nothing it changed was \
+             saved."
+        }
+        (false, _, TxState::Open | TxState::Failed) => {
+            "The rollback failed; the transaction is still open."
+        }
+    };
+    format!("{outcome}\n{}", describe(error))
 }
 
 /// What a statement cut off by a lost connection says: it is never run
@@ -3256,9 +3296,7 @@ impl QueryTab {
                 match outcome {
                     Ok(isolation) => this.isolation = isolation,
                     Err(error) => window.push_notification(
-                        Notification::error(SharedString::from(format!(
-                            "Isolation level: {error}"
-                        ))),
+                        crate::error_notification(format!("Isolation level: {}", describe(&error))),
                         cx,
                     ),
                 }
@@ -3402,9 +3440,7 @@ impl QueryTab {
                     );
                     cx.notify();
                 }
-                Err(error) => {
-                    window.push_notification(Notification::error(SharedString::from(error)), cx)
-                }
+                Err(error) => window.push_notification(crate::error_notification(error), cx),
             });
         })
         .detach();
@@ -3416,7 +3452,7 @@ impl QueryTab {
         cx.spawn_in(window, async move |_, cx| {
             if let Err(error) = ending.await {
                 let _ = cx.update(|window, cx| {
-                    window.push_notification(Notification::error(SharedString::from(error)), cx)
+                    window.push_notification(crate::error_notification(error), cx)
                 });
             }
         })
@@ -3443,10 +3479,12 @@ impl QueryTab {
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
         let ending = bridge::spawn(cx, async move {
             let ending = async {
-                exec::collect(session, sql)
+                // What came of the transaction is the session's state
+                // after the failure (C14).
+                exec::collect(session.clone(), sql)
                     .await
                     .map(drop)
-                    .map_err(|error| format!("{sql} failed: {error}"))
+                    .map_err(|error| ending_failed(commit, &error, session.tx_state()))
             };
             match limit {
                 Some(limit) => tokio::time::timeout(limit, ending)
@@ -3460,7 +3498,8 @@ impl QueryTab {
         cx.spawn(async move |this, cx| {
             let outcome = ending.await;
             let _ = this.update(cx, |this, cx| {
-                if outcome.is_ok() {
+                // A failed COMMIT the server rolled back ended it too.
+                if outcome.is_ok() || this.tx_state() == TxState::Idle {
                     this.tx_log.clear();
                 }
                 this.note_transaction(cx);
@@ -4177,8 +4216,13 @@ impl QueryTab {
             since: started,
         };
         self.run = Some(cx.spawn_in(window, async move |this, cx| {
+            // Every failure comes as one that changed nothing (C14).
+            let whole = |error| ApplyFailure {
+                statement: None,
+                error,
+            };
             let applied = match opening.await {
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(whole(error)),
                 Ok(session) => {
                     let applying = cx.update(|_, cx| {
                         bridge::spawn(cx, async move {
@@ -4189,9 +4233,7 @@ impl QueryTab {
                                 } else {
                                     "START TRANSACTION"
                                 };
-                                exec::collect(session.clone(), begin)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
+                                exec::collect(session.clone(), begin).await.map_err(whole)?;
                             }
                             let ran = if session.tx_state() == TxState::Idle {
                                 apply_edits(&session, &statements).await
@@ -4199,7 +4241,6 @@ impl QueryTab {
                                 apply_edits_in_transaction(&session, &statements).await
                             };
                             ran.map(|()| (statements, began))
-                                .map_err(|failure| failure.to_string())
                         })
                     });
                     let Ok(applying) = applying else {
@@ -4257,9 +4298,7 @@ impl QueryTab {
                     }
                     // Nothing was written; the changes are still there.
                     Err(failure) => {
-                        pane.apply_error = Some(format!(
-                            "Nothing was changed: {failure}. The pending changes are kept."
-                        ));
+                        pane.apply_error = Some(crate::data::tab::apply_failure_text(&failure));
                     }
                 }
                 cx.notify();
@@ -4762,7 +4801,7 @@ impl QueryTab {
                             if count == "1" { "" } else { "s" }
                         )
                     }
-                    Err(error) => format!("The rows could not be counted: {error}"),
+                    Err(error) => format!("The rows could not be counted: {}", describe(&error)),
                 };
                 window
                     .push_notification(Notification::info(SharedString::from(message.clone())), cx);
@@ -5308,9 +5347,10 @@ impl QueryTab {
                     }
                 }
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "The rows could not be counted: {error}"
-                    ))),
+                    crate::error_notification(format!(
+                        "The rows could not be counted: {}",
+                        describe(&error)
+                    )),
                     cx,
                 ),
             },
@@ -5373,9 +5413,10 @@ impl QueryTab {
                 Ok(listed) => distinct::values(&listed),
                 Err(error) => {
                     window.push_notification(
-                        Notification::error(SharedString::from(format!(
-                            "The values of {name} could not be read: {error}"
-                        ))),
+                        crate::error_notification(format!(
+                            "The values of {name} could not be read: {}",
+                            describe(&error)
+                        )),
                         cx,
                     );
                     return;
@@ -6024,30 +6065,20 @@ impl QueryTab {
                 .text_color(theme.warning)
                 .child("Cancelled. Rows that had arrived are kept in their result.")
                 .into_any_element(),
+            // The message in the danger colour, then its detail and hint.
             Outcome::Failed(failure) => v_flex()
                 .id("result-error")
                 .test_support()
                 .p_3()
                 .gap_1()
                 .text_sm()
-                .child(div().text_color(theme.danger).child(SharedString::from(
-                    match &failure.code {
-                        Some(code) => format!("{} [{code}]", failure.message),
-                        None => failure.message.clone(),
+                .children(failure.described().lines().into_iter().enumerate().map(
+                    |(index, line)| {
+                        div()
+                            .when(index == 0, |line| line.text_color(theme.danger))
+                            .child(SharedString::from(line))
                     },
-                )))
-                .children(
-                    failure
-                        .detail
-                        .clone()
-                        .map(|detail| div().child(SharedString::from(format!("Detail: {detail}")))),
-                )
-                .children(
-                    failure
-                        .hint
-                        .clone()
-                        .map(|hint| div().child(SharedString::from(format!("Hint: {hint}")))),
-                )
+                ))
                 .when(AppState::get(cx).settings.ai.enabled, |error| {
                     error.child(
                         div().pt_1().child(
@@ -6653,16 +6684,7 @@ impl QueryTab {
             )
             .into_any_element(),
             (Outcome::Failed(failure), None) => {
-                let mut text = match &failure.code {
-                    Some(code) => format!("{} [{code}]", failure.message),
-                    None => failure.message.clone(),
-                };
-                for (label, value) in [("Detail", &failure.detail), ("Hint", &failure.hint)] {
-                    if let Some(value) = value {
-                        text.push_str(&format!("\n{label}: {value}"));
-                    }
-                }
-                status(text, Some(danger)).into_any_element()
+                status(failure.described().to_string(), Some(danger)).into_any_element()
             }
             (Outcome::Rows(_), None) => div().into_any_element(),
         };
@@ -7067,21 +7089,10 @@ impl QueryTab {
                 }
             },
             Kind::ExplainError => match pane.map(|pane| (&pane.statement, &pane.outcome)) {
-                Some((sql, Outcome::Failed(failure))) => {
-                    let mut error = match &failure.code {
-                        Some(code) => format!("{} [{code}]", failure.message),
-                        None => failure.message.clone(),
-                    };
-                    for (label, text) in [("Detail", &failure.detail), ("Hint", &failure.hint)] {
-                        if let Some(text) = text {
-                            error.push_str(&format!("\n{label}: {text}"));
-                        }
-                    }
-                    AiAction::ExplainError {
-                        sql: sql.clone(),
-                        error,
-                    }
-                }
+                Some((sql, Outcome::Failed(failure))) => AiAction::ExplainError {
+                    sql: sql.clone(),
+                    error: failure.described().to_string(),
+                },
                 _ => {
                     say("No error on screen to explain.", window, cx);
                     return;

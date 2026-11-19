@@ -361,7 +361,7 @@ impl FdwDialog {
                         }
                         Loaded::Ready(listing)
                     }
-                    Err(error) => Loaded::Failed(error.to_string()),
+                    Err(error) => Loaded::Failed(kerno_core::describe(&error).to_string()),
                 };
                 cx.notify();
             });
@@ -473,14 +473,12 @@ impl FdwDialog {
                         );
                     }
                     Err(error) => {
-                        let mut text = error.to_string();
+                        // Detail and hint too (C14), masked as the message is.
+                        let mut text = kerno_core::describe(&error).to_string();
                         if !password.is_empty() {
                             text = text.replace(password.as_str(), "•••");
                         }
-                        window.push_notification(
-                            Notification::error(SharedString::from(masked(&text))),
-                            cx,
-                        );
+                        window.push_notification(crate::error_notification(masked(&text)), cx);
                     }
                 }
                 this.reload(cx);
@@ -518,7 +516,8 @@ impl FdwDialog {
                         let ran = running.await;
                         let _ = this.update(cx, |this, cx| {
                             if let Err(error) = ran {
-                                this.listing = Loaded::Failed(error.to_string());
+                                this.listing =
+                                    Loaded::Failed(kerno_core::describe(&error).to_string());
                                 cx.notify();
                             } else {
                                 this.reload(cx);

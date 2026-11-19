@@ -28,9 +28,9 @@ use kerno_core::browse::{
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
-use kerno_core::sql::{CellValue, RowChange, RowSql, apply_edits};
+use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits};
 use kerno_core::storage::TableLayout;
-use kerno_core::{Engine, Error, ResultStore, Session, TxState, exec};
+use kerno_core::{Engine, Error, ResultStore, Session, TxState, describe, exec};
 
 use crate::actions::CloseTab;
 use crate::bridge;
@@ -182,14 +182,35 @@ fn table_gone(error: &Error) -> bool {
 /// What a read stopped by Cancel says (C3).
 const CANCELLED: &str = "Cancelled: the rows were not read. Reload reads them again.";
 
-/// What the error state says: the server's message, then what to do.
+/// What the error state says: the server's message, then what to do, then
+/// the server's detail and hint on lines of their own (C14).
 fn failure_text(message: &str, gone: bool) -> String {
     let advice = if gone {
         "The table may have been dropped or renamed."
     } else {
         "Check the filter, then try again."
     };
-    format!("{} {advice}", sentence(message))
+    let (first, more) = message.split_once('\n').unwrap_or((message, ""));
+    let mut text = format!("{} {advice}", sentence(first));
+    if !more.is_empty() {
+        text.push('\n');
+        text.push_str(more);
+    }
+    text
+}
+
+/// What an apply that changed nothing says (C14): what happened in plain
+/// words, then the server's message, detail and hint. Shared with the
+/// edits of a query tab's result.
+pub fn apply_failure_text(failure: &ApplyFailure) -> String {
+    let what = match failure.statement {
+        Some(index) => format!("Nothing was changed: statement {} failed.", index + 1),
+        None => "Nothing was changed.".to_string(),
+    };
+    format!(
+        "{what} The pending changes are kept.\n{}",
+        describe(&failure.error)
+    )
 }
 
 /// The server's message as a sentence, before Kerno's advice.
@@ -906,7 +927,7 @@ impl DataTab {
         }
         let gone = table_gone(error);
         self.state = State::Failed {
-            message: error.to_string(),
+            message: describe(error).to_string(),
             gone,
         };
         if gone {
@@ -1303,9 +1324,10 @@ impl DataTab {
                     Ok(listed) => distinct::values(&listed),
                     Err(error) => {
                         window.push_notification(
-                            Notification::error(SharedString::from(format!(
-                                "The values of {name} could not be read: {error}"
-                            ))),
+                            crate::error_notification(format!(
+                                "The values of {name} could not be read: {}",
+                                describe(&error)
+                            )),
                             cx,
                         );
                         return;
@@ -1937,9 +1959,7 @@ impl DataTab {
                         cx.notify();
                     }
                     Err(failure) => {
-                        this.apply_error = Some(format!(
-                            "Nothing was changed: {failure}. The pending changes are kept."
-                        ));
+                        this.apply_error = Some(apply_failure_text(&failure));
                         cx.notify();
                     }
                 }

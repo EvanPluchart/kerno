@@ -2520,7 +2520,8 @@ fn error_text(error: &Error) -> String {
     match error {
         Error::Config(message) => message.clone(),
         Error::Unsupported(message) => format!("Not possible: {message}."),
-        other => other.to_string(),
+        // A server error with its detail and hint (C14).
+        other => kerno_core::describe(other).to_string(),
     }
 }
 
@@ -2860,8 +2861,9 @@ impl BackupDialog {
                 .test_support()
                 .text_sm()
                 .text_color(theme.danger)
-                .child(SharedString::from(format!(
-                    "The objects could not be read: {why}. A complete backup still works."
+                .child(SharedString::from(crate::advice_after(
+                    &format!("The objects could not be read: {why}"),
+                    "A complete backup still works.",
                 )))
                 .into_any_element(),
             Loaded::Ready(entries) => {
@@ -3009,7 +3011,7 @@ impl BackupDialog {
                 .text_sm()
                 .text_color(theme.danger)
                 .child(SharedString::from(format!(
-                    "The databases could not be read: {why}."
+                    "The databases could not be read: {why}"
                 )))
                 .into_any_element(),
             Loaded::Ready(databases) => div()

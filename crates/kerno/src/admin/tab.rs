@@ -40,7 +40,7 @@ use kerno_core::exec::Collected;
 use kerno_core::format::byte_size;
 use kerno_core::result::Column as ResultColumn;
 use kerno_core::sort::compare_cells;
-use kerno_core::{AdminView, Engine, Error, Session, TxState, TypeKind, exec};
+use kerno_core::{AdminView, Engine, Error, Session, TxState, TypeKind, describe, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -530,7 +530,7 @@ impl AdminTab {
         if error.is_disconnect() {
             self.close_session(cx);
         }
-        self.panes[pane as usize].state = PaneState::Failed(error.to_string());
+        self.panes[pane as usize].state = PaneState::Failed(describe(error).to_string());
         cx.notify();
     }
 
@@ -821,10 +821,10 @@ impl AdminTab {
                             Signal::Terminate => format!("Terminated session {id}."),
                         },
                     ),
-                    Err(error) => (true, format!("Session {id}: {error}")),
+                    Err(error) => (true, format!("Session {id}: {}", describe(&error))),
                 };
                 let notification = if failed {
-                    Notification::error(SharedString::from(text.clone()))
+                    crate::error_notification(text.clone())
                 } else {
                     Notification::success(SharedString::from(text.clone()))
                 };
@@ -1253,9 +1253,10 @@ impl AdminTab {
                         self.render_notice(
                             ("admin-error", pane as usize),
                             format!("The {} could not be read", pane.noun()),
-                            format!(
-                                "{error} The account may lack the privilege to read them: \
-                                 connect as a user who has it, then try again."
+                            crate::advice_after(
+                                error,
+                                "The account may lack the privilege to read them: connect as a \
+                                 user who has it, then try again.",
                             ),
                             Some(retry),
                             cx,

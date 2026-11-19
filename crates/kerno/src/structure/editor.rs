@@ -27,7 +27,7 @@ use kerno_core::table_draft::{
     AutoIncrement, CANNOT_MOVE_COLUMNS, ColumnDraft, ForeignKeyDraft, IndexDraft,
     REFERENTIAL_ACTIONS, TableChange, TableDraft, changes,
 };
-use kerno_core::{Engine, Error, Session, TxState, exec};
+use kerno_core::{Engine, Error, Session, TxState, describe, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -422,7 +422,7 @@ impl TableEditor {
         if self.generation != generation {
             return;
         }
-        self.state = State::Failed(error.to_string());
+        self.state = State::Failed(describe(error).to_string());
         cx.notify();
     }
 
@@ -1007,7 +1007,7 @@ impl TableEditor {
                 Err(error) => {
                     let _ = this.update(cx, |this, cx| {
                         this.applying = false;
-                        this.error = Some(format!("Nothing was changed: {error}"));
+                        this.error = Some(format!("Nothing was changed: {}", describe(&error)));
                         cx.notify();
                     });
                     return;
@@ -1073,11 +1073,13 @@ impl TableEditor {
                         };
                         match at {
                             _ if cancelled => {}
+                            // The server's detail and hint, then the statement (C14).
                             Some((index, sql)) => message.push_str(&format!(
-                                "Statement {} failed: {error}\n{sql}",
-                                index + 1
+                                "Statement {} failed: {}\n{sql}",
+                                index + 1,
+                                describe(&error)
                             )),
-                            None => message.push_str(&error.to_string()),
+                            None => message.push_str(&describe(&error).to_string()),
                         }
                         this.error = Some(message);
                         // What the form is compared with changed.
@@ -1850,7 +1852,10 @@ impl TableEditor {
             State::Failed(error) => self.render_notice(
                 "editor-failed",
                 "The table could not be read",
-                format!("{error} Check that it still exists, then open the form again."),
+                crate::advice_after(
+                    error,
+                    "Check that it still exists, then open the form again.",
+                ),
                 cx,
             ),
             State::Loading if self.columns.is_empty() => self.render_notice(

@@ -210,11 +210,9 @@ pub fn open(
     Some(view)
 }
 
+/// The error with its code, detail and hint (C14).
 fn error_text(error: &Error) -> String {
-    match error.db() {
-        Some(db) => db.message.clone(),
-        None => error.to_string(),
-    }
+    kerno_core::describe(error).to_string()
 }
 
 fn value(input: &Entity<InputState>, cx: &App) -> String {
@@ -636,7 +634,7 @@ impl TransferDialog {
         match self.page {
             Page::Tables => match &self.objects {
                 Loaded::Loading => Some("Reading the tables…".into()),
-                Loaded::Failed(why) => Some(format!("The tables could not be read: {why}.")),
+                Loaded::Failed(why) => Some(format!("The tables could not be read: {why}")),
                 Loaded::Ready(_) if self.picked.is_empty() => {
                     Some("Tick at least one table.".into())
                 }
@@ -758,10 +756,7 @@ impl TransferDialog {
         let sql = match transfer::statements(&plan, meta.dialect(), &self.existing) {
             Ok(sql) => format!("{};", sql.join(";\n\n")),
             Err(error) => {
-                window.push_notification(
-                    Notification::error(SharedString::from(error_text(&error))),
-                    cx,
-                );
+                window.push_notification(crate::error_notification(error_text(&error)), cx);
                 return;
             }
         };
@@ -1057,7 +1052,7 @@ impl TransferDialog {
                     .text_sm()
                     .text_color(theme.danger)
                     .child(SharedString::from(format!(
-                        "The tables could not be read: {why}."
+                        "The tables could not be read: {why}"
                     )))
                     .into_any_element();
             }

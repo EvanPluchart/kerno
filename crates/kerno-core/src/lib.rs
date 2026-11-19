@@ -47,7 +47,7 @@ pub use config::{
 pub use connector::{Connector, HostKeyStore};
 pub use dialect::{Dialect, IsolationLevel};
 pub use driver::{AdminView, Driver, Session, TxState};
-pub use error::{DbError, Error, Result};
+pub use error::{DbError, Described, Error, Result, describe};
 pub use exec::{ExecEvent, ExecSink, Execution, Notice, RowDemand, RowLimit};
 pub use plan::{Plan, PlanNode};
 pub use result::{BatchBuilder, Column, ColumnOrigin, ResultStore, RowBatch, TypeKind};

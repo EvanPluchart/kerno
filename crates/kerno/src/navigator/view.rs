@@ -35,7 +35,7 @@ use kerno_core::sql::{
     call_routine, delete_template, insert_template, select_template, update_template,
 };
 use kerno_core::table_draft::TableChange;
-use kerno_core::{Error, Session, exec};
+use kerno_core::{Error, Session, describe, exec};
 
 use super::actions::{
     Action, FilterAction, Template, ToolEntry, ToolGroups, actions, create_template,
@@ -487,7 +487,7 @@ impl Navigator {
                         }
                         this.advance_reveal(&connection, cx);
                     }
-                    Err(error) => browse.root = Root::Failed(error.to_string()),
+                    Err(error) => browse.root = Root::Failed(describe(&error).to_string()),
                 }
                 this.sync(cx);
             });
@@ -659,6 +659,13 @@ impl Navigator {
         };
         let session = self.session_for(connection, &load.database, cx);
         let connection = connection.to_string();
+        // What a failed load says on its row, then the server's words (C14).
+        let reading = match &load.what {
+            LoadKind::Schemas => "the schemas".to_string(),
+            LoadKind::Objects { schema } => format!("the objects of {schema}"),
+            LoadKind::Structure { table } => format!("the columns of {}", table.name),
+            LoadKind::Extensions => "the extensions".to_string(),
+        };
         cx.spawn(async move |this, cx| {
             let outcome = match session.await {
                 Err(error) => Err(error),
@@ -687,7 +694,9 @@ impl Navigator {
                 if let Some(browse) = this.live(&connection, generation) {
                     browse.tree.finish(
                         &load.id,
-                        outcome.map_err(|error: kerno_core::Error| error.to_string()),
+                        outcome.map_err(|error: kerno_core::Error| {
+                            format!("Could not read {reading}: {}", describe(&error))
+                        }),
                     );
                     this.advance_reveal(&connection, cx);
                     this.sync(cx);
@@ -1230,6 +1239,7 @@ impl Navigator {
                         done: "Created the database.".into(),
                         node: node.clone(),
                         doing: "Creating the database…".into(),
+                        failed: "The database was not created.".into(),
                     };
                     view.update(cx, |this, cx| this.execute(sql, plan, window, cx));
                 },
@@ -1503,10 +1513,8 @@ impl Navigator {
                     };
                     cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
                 }
-                Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(error.to_string())),
-                    cx,
-                ),
+                Err(error) => window
+                    .push_notification(crate::error_notification(describe(&error).to_string()), cx),
             });
         })
         .detach();
@@ -1572,10 +1580,11 @@ impl Navigator {
                     target,
                 }),
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
+                    crate::error_notification(format!(
                         "The statement for {} could not be written: {error}",
-                        table.name
-                    ))),
+                        table.name,
+                        error = describe(&error)
+                    )),
                     cx,
                 ),
             });
@@ -1652,9 +1661,10 @@ impl Navigator {
                     })
                 }
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "The call of {name} could not be written: {error}"
-                    ))),
+                    crate::error_notification(format!(
+                        "The call of {name} could not be written: {error}",
+                        error = describe(&error)
+                    )),
                     cx,
                 ),
             });
@@ -1709,9 +1719,10 @@ impl Navigator {
                     cx,
                 ),
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "The properties could not be read: {error}"
-                    ))),
+                    crate::error_notification(format!(
+                        "The properties could not be read: {error}",
+                        error = describe(&error)
+                    )),
                     cx,
                 ),
             });
@@ -1752,9 +1763,10 @@ impl Navigator {
                     target,
                 }),
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "The DDL of {name} could not be read: {error}"
-                    ))),
+                    crate::error_notification(format!(
+                        "The DDL of {name} could not be read: {error}",
+                        error = describe(&error)
+                    )),
                     cx,
                 ),
             });
@@ -1800,9 +1812,10 @@ impl Navigator {
                     schema,
                 }),
                 Err(error) => window.push_notification(
-                    Notification::error(SharedString::from(format!(
-                        "The source of {name} could not be read: {error}"
-                    ))),
+                    crate::error_notification(format!(
+                        "The source of {name} could not be read: {error}",
+                        error = describe(&error)
+                    )),
                     cx,
                 ),
             });
@@ -2152,18 +2165,43 @@ impl Navigator {
             (Some(ObjectRef::Database(name)), Action::Drop | Action::Rename) => Some(name.clone()),
             _ => None,
         };
-        let doing = match action {
-            Action::Drop | Action::DropCascade | Action::DropColumn => {
-                format!("Dropping {kind} {name}…")
-            }
-            Action::Rename | Action::RenameColumn => format!("Renaming {kind} {name}…"),
-            Action::RenameEnumValue => "Renaming the value…".into(),
-            Action::AddEnumValue => "Adding the value…".into(),
-            Action::InstallExtension => format!("Installing extension {name}…"),
-            Action::CreateSchema => "Creating the schema…".into(),
-            Action::CreateDatabase => "Creating the database…".into(),
-            Action::CreateEnum => "Creating the enum…".into(),
-            _ => "Running the statement…".into(),
+        let (doing, failed) = match action {
+            Action::Drop | Action::DropCascade | Action::DropColumn => (
+                format!("Dropping {kind} {name}…"),
+                format!("The {kind} “{name}” was not dropped."),
+            ),
+            Action::Rename | Action::RenameColumn => (
+                format!("Renaming {kind} {name}…"),
+                format!("The {kind} “{name}” was not renamed."),
+            ),
+            Action::RenameEnumValue => (
+                "Renaming the value…".into(),
+                "The value was not renamed.".into(),
+            ),
+            Action::AddEnumValue => (
+                "Adding the value…".into(),
+                "The value was not added.".into(),
+            ),
+            Action::InstallExtension => (
+                format!("Installing extension {name}…"),
+                format!("The extension “{name}” was not installed."),
+            ),
+            Action::CreateSchema => (
+                "Creating the schema…".into(),
+                "The schema was not created.".into(),
+            ),
+            Action::CreateDatabase => (
+                "Creating the database…".into(),
+                "The database was not created.".into(),
+            ),
+            Action::CreateEnum => (
+                "Creating the enum…".into(),
+                "The enum was not created.".into(),
+            ),
+            _ => (
+                "Running the statement…".into(),
+                "The statement failed.".into(),
+            ),
         };
         let plan = Plan {
             connection: connection.to_string(),
@@ -2173,6 +2211,7 @@ impl Navigator {
             done,
             node: node.id.clone(),
             doing,
+            failed,
         };
         let view = cx.entity();
         sql_confirm::open(
@@ -2209,6 +2248,7 @@ impl Navigator {
             done,
             node,
             doing,
+            failed,
         } = plan;
         let Some(browse) = self.browse.get_mut(&connection) else {
             return;
@@ -2303,8 +2343,10 @@ impl Navigator {
                         Notification::info("Cancelled: nothing was changed."),
                         cx,
                     ),
+                    // In plain words, then the server's own (C14): its hint
+                    // often holds the fix ("Use DROP … CASCADE …").
                     Err(error) => window.push_notification(
-                        Notification::error(SharedString::from(error.to_string())),
+                        crate::error_notification(format!("{failed}\n{}", describe(&error))),
                         cx,
                     ),
                 }
@@ -3179,21 +3221,35 @@ impl Navigator {
                 div()
                     .id(("connection-detail", at))
                     .min_w_0()
-                    .child(line_text(label.clone(), theme.muted_foreground))
+                    // One line in the row; all of it (a detail, a hint) in the tooltip.
+                    .child(line_text(
+                        SharedString::from(label.lines().next().unwrap_or_default().to_string()),
+                        theme.muted_foreground,
+                    ))
                     .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx)),
             ),
             _ => {
                 let failed = model::parent_of(local)
                     .and_then(|parent| self.tree(connection)?.node(parent))
-                    .is_some_and(|parent| matches!(parent.children, Children::Failed(_)));
-                row.child(line_text(
-                    label,
-                    if failed {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    },
-                ))
+                    .and_then(|parent| match &parent.children {
+                        Children::Failed(message) => Some(SharedString::from(message.clone())),
+                        _ => None,
+                    });
+                match failed {
+                    // The row shows the first line; the server's detail and
+                    // hint are in its tooltip (C14).
+                    Some(message) => row.child(
+                        div()
+                            .id(("node-failure", at))
+                            .test_support()
+                            .min_w_0()
+                            .child(line_text(label, theme.danger))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(message.clone()).build(window, cx)
+                            }),
+                    ),
+                    None => row.child(line_text(label, theme.muted_foreground)),
+                }
             }
         }
     }
@@ -3310,6 +3366,9 @@ struct Plan {
     node: String,
     /// What runs, in a few words ("Dropping table t…").
     doing: String,
+    /// What a failure says first, in plain words ("The table “t” was not
+    /// dropped."), before the server's message, detail and hint (C14).
+    failed: String,
 }
 
 /// What to show again once a statement ran.

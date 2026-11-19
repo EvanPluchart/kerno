@@ -315,9 +315,10 @@ impl AiPanel {
             let mut samples = Vec::new();
             for table in tables {
                 let sql = ai::sample_sql(session.dialect(), &table);
-                let collected = exec::collect(session.clone(), sql)
-                    .await
-                    .map_err(|error| format!("{}.{}: {error}", table.schema, table.name))?;
+                let collected = exec::collect(session.clone(), sql).await.map_err(|error| {
+                    let error = kerno_core::describe(&error);
+                    format!("{}.{}: {error}", table.schema, table.name)
+                })?;
                 let result = collected.results.into_iter().next().unwrap_or_default();
                 samples.push(Sample {
                     table,
