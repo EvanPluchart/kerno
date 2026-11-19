@@ -507,6 +507,8 @@ struct AiLog {
     requests: Vec<AiRequest>,
     /// The answers written back, once each was.
     answered: usize,
+    /// The requests whose client closed the connection before their answer.
+    closed: usize,
 }
 
 /// A fake OpenAI-compatible endpoint on `127.0.0.1` (J17): a `tokio` listener on a thread and
@@ -586,6 +588,11 @@ impl FakeAi {
     pub fn answered(&self) -> usize {
         self.log.lock().unwrap().answered
     }
+
+    /// The requests whose client closed the connection while it held the answer.
+    pub fn closed(&self) -> usize {
+        self.log.lock().unwrap().closed
+    }
 }
 
 async fn fake_ai_serve(
@@ -633,7 +640,22 @@ async fn fake_ai_serve(
         headers,
         body,
     });
-    tokio::time::sleep(delay).await;
+    // The delay, unless the client closes the connection first.
+    let held = tokio::time::sleep(delay);
+    tokio::pin!(held);
+    let gone = loop {
+        tokio::select! {
+            () = &mut held => break false,
+            read = stream.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => break true,
+                Ok(_) => {}
+            },
+        }
+    };
+    if gone {
+        log.lock().unwrap().closed += 1;
+        return;
+    }
     let reply = if models {
         serde_json::json!({"object": "list", "data": [{"id": "other-model"}, {"id": "fake-model"}]})
     } else {

@@ -574,6 +574,14 @@ impl Session for MysqlSession {
 
     async fn close(&self) {
         let conn = match self.link.try_lock() {
+            // A statement whose caller dropped it midway still runs on the
+            // server, which does not see the client leave while it waits
+            // for a lock (C3): stopped first.
+            Ok(mut link) if link.in_flight => {
+                self.kill_abandoned().await;
+                link.in_flight = false;
+                link.conn.take()
+            }
             Ok(mut link) => link.conn.take(),
             Err(_) => {
                 // A statement holds the connection: stop it first.
@@ -687,6 +695,73 @@ mod tests {
             ";;",
         ] {
             assert!(!touches_session_state(sql, rules), "{sql}");
+        }
+    }
+
+    /// C3: a read whose caller dropped it midway (a load stopped from the UI) is killed when
+    /// the session closes: the server does not see the client leave while the read waits for
+    /// a table lock. Fails with `close` taking the connection without the kill.
+    #[tokio::test]
+    async fn closing_after_a_dropped_read_stops_it_on_the_server() {
+        use kerno_core::testing;
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            if !testing::available(engine) {
+                continue;
+            }
+            let open = || async {
+                MysqlSession::connect(&testing::params(engine))
+                    .await
+                    .unwrap()
+            };
+            let (locker, watcher) = (open().await, open().await);
+            for sql in [
+                "DROP DATABASE IF EXISTS kerno_test_close",
+                "CREATE DATABASE kerno_test_close",
+                "CREATE TABLE kerno_test_close.t (id INT)",
+                "LOCK TABLES kerno_test_close.t WRITE",
+            ] {
+                locker.query(sql).await.unwrap();
+            }
+            let session = std::sync::Arc::new(open().await);
+            let id = session.connection_id;
+            let waiting = || async {
+                let sql = format!(
+                    "SELECT count(*) FROM information_schema.PROCESSLIST WHERE ID = {id} \
+                     AND INFO LIKE 'SELECT id FROM kerno_test_close%'"
+                );
+                watcher.query(&sql).await.unwrap()[0][0].clone().unwrap() != "0"
+            };
+            let reading = tokio::spawn({
+                let session = session.clone();
+                async move { session.query("SELECT id FROM kerno_test_close.t").await }
+            });
+            let started = std::time::Instant::now();
+            while !waiting().await {
+                assert!(started.elapsed() < Duration::from_secs(10), "{engine:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            reading.abort();
+            let _ = reading.await;
+            tokio::time::timeout(Duration::from_secs(5), session.close())
+                .await
+                .unwrap_or_else(|_| panic!("{engine:?}: the close waited for the statement"));
+            let closed = std::time::Instant::now();
+            let mut gone = false;
+            while closed.elapsed() < Duration::from_secs(3) {
+                if !waiting().await {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            locker.query("UNLOCK TABLES").await.unwrap();
+            locker
+                .query("DROP DATABASE kerno_test_close")
+                .await
+                .unwrap();
+            locker.close().await;
+            watcher.close().await;
+            assert!(gone, "{engine:?}: the read still waits on the server");
         }
     }
 }

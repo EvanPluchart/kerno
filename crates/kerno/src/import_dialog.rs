@@ -132,6 +132,9 @@ pub struct ImportDialog {
     session: Option<Arc<dyn Session>>,
     on_imported: Rc<Imported>,
     reading: Option<Task<()>>,
+    /// Set to stop the preview's scan in flight: a field changed and another one starts, or the
+    /// dialog closed (C3).
+    scan: Arc<AtomicBool>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -240,6 +243,7 @@ impl ImportDialog {
             session: None,
             on_imported,
             reading: None,
+            scan: Arc::default(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -348,10 +352,15 @@ impl ImportDialog {
         self.generation += 1;
         let generation = self.generation;
         let options = self.options(cx);
+        // A scan of a large file still running is of no use now.
+        self.scan.store(true, Ordering::Release);
+        let scan = Arc::new(AtomicBool::new(false));
+        self.scan = scan.clone();
         let reading = bridge::spawn_blocking(cx, move || {
             let preview =
                 preview(&path, &options, PREVIEW_ROWS).map_err(|error| error.to_string())?;
-            let records = count_records(&path, &options).map_err(|error| error.to_string())?;
+            let records =
+                count_records(&path, &options, &scan).map_err(|error| error.to_string())?;
             Ok(Read { preview, records })
         });
         self.reading = Some(cx.spawn(async move |this, cx| {
@@ -364,6 +373,12 @@ impl ImportDialog {
             });
         }));
         cx.notify();
+    }
+
+    /// The flag of the preview's scan in flight; for tests.
+    #[cfg(test)]
+    pub fn scan(&self) -> Arc<AtomicBool> {
+        self.scan.clone()
     }
 
     fn preview(&self) -> Option<&Read> {
@@ -1199,6 +1214,7 @@ impl Drop for ImportDialog {
     /// Closing the dialog stops an import that still runs.
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
+        self.scan.store(true, Ordering::Release);
     }
 }
 

@@ -198,7 +198,13 @@ struct Locker {
 
 impl Locker {
     fn start(engine: Engine, table: &str) -> Self {
+        Self::start_in(engine, None, table)
+    }
+
+    /// [`Locker::start`] on `database` of the test server (its own when `None`).
+    fn start_in(engine: Engine, database: Option<&str>, table: &str) -> Self {
         use kerno_core::Driver as _;
+        let database = database.map(str::to_string);
         let (own_id, lock) = match engine {
             Engine::Postgres => (
                 "SELECT pg_backend_pid()",
@@ -224,7 +230,10 @@ impl Locker {
                 .build()
                 .unwrap();
             let session = runtime.block_on(async {
-                let params = testing::params(engine);
+                let mut params = testing::params(engine);
+                if database.is_some() {
+                    params.database = database;
+                }
                 let session = match engine {
                     Engine::Postgres => kerno_postgres::PostgresDriver.connect(&params).await,
                     Engine::MySql | Engine::MariaDb => {
@@ -3882,4 +3891,443 @@ fn a_long_list_keeps_the_buttons_in_the_window(cx: &mut TestAppContext) {
     let reach = k14_reach(&app, cx).expect("the list");
     assert!(reach.contains("and 12 more"), "{reach}");
     app.click(cx, "sql-cancel");
+}
+
+// K15 (C3): the other long operations --------------------------------------------------------
+
+/// The table `<name>.t` of K2's tests, with a comment, on PostgreSQL. (MySQL's and MariaDB's
+/// catalog reads do not wait behind `LOCK TABLES … WRITE`: only a read of the rows does, so
+/// the tree, the structure tab and the table form are not held there.)
+fn k15_table(name: &str) -> Scratch {
+    let scratch = k2_table(Engine::Postgres, name);
+    on_server(
+        Engine::Postgres,
+        &format!("COMMENT ON TABLE {name}.t IS 'before'"),
+    );
+    scratch
+}
+
+/// C3: the structure tab of a table another session locks shows "Loading the structure…" with
+/// a Cancel that stops the read on the server (`pg_get_indexdef` waits for the lock); the tab
+/// says "Cancelled" and reads it again on request. Cmd+. does the same.
+#[gpui_kit::test]
+fn a_structure_read_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let name = "kerno_ui_k15_structure";
+    let _scratch = k15_table(name);
+    let app = connected(cx, Engine::Postgres);
+    for by_key in [false, true] {
+        let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+        app.open_structure(cx, name, "t", RelationKind::Table);
+        wait_for_the_lock(&app, cx, &locker);
+        let tab = app.structure(cx);
+        assert_eq!(cx.update(|cx| tab.read(cx).state()), "loading");
+        if by_key {
+            app.dispatch(cx, actions::CancelQuery);
+        } else {
+            app.click(cx, "structure-cancel");
+        }
+        assert_eq!(cx.update(|cx| tab.read(cx).state()), "cancelled");
+        assert!(app.has(cx, "structure-cancelled"));
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        app.click(cx, "structure-retry");
+        app.wait_for_structure(cx);
+        app.dispatch(cx, actions::CloseTab);
+    }
+}
+
+/// C3: the table form of a locked table shows "Loading the table…" with a Cancel, and Cmd+.
+/// reaches it too (`TableEditor::cancel` acted only while applying): the read is stopped on
+/// the server and "Read again" fills the form once the lock is gone.
+#[gpui_kit::test]
+fn a_table_form_read_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let name = "kerno_ui_k15_form";
+    let _scratch = k15_table(name);
+    let app = connected(cx, Engine::Postgres);
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    for by_key in [true, false] {
+        let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+        let target = Target {
+            connection: connection.clone(),
+            database: None,
+            schema: None,
+        };
+        app.step(cx, |window, cx| {
+            app.workspace.update(cx, |workspace, cx| {
+                workspace.open_table_editor(
+                    target,
+                    name.to_string(),
+                    Some(TableRef::new(name, "t")),
+                    window,
+                    cx,
+                );
+            })
+        });
+        wait_for_the_lock(&app, cx, &locker);
+        assert!(app.has(cx, "editor-loading"));
+        if by_key {
+            app.press(cx, &["secondary-."]);
+        } else {
+            app.click(cx, "editor-load-cancel");
+        }
+        assert!(app.has(cx, "editor-cancelled"), "by key: {by_key}");
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        app.click(cx, "editor-retry");
+        app.wait_for_editor(cx);
+        app.dispatch(cx, actions::CloseTab);
+    }
+}
+
+/// C3: closing a tab whose read waits for a lock stops the read on the server: the structure
+/// tab, the table form and the ER diagram (a closed tab left them waiting).
+#[gpui_kit::test]
+fn closing_a_tab_that_reads_stops_the_read(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let name = "kerno_ui_k15_close";
+    let _scratch = k15_table(name);
+    let app = connected(cx, Engine::Postgres);
+    app.open_path(cx, &["kerno", name]);
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+    for opening in ["structure", "form", "diagram"] {
+        match opening {
+            "structure" => app.open_structure(cx, name, "t", RelationKind::Table),
+            "form" => {
+                let target = Target {
+                    connection: connection.clone(),
+                    database: None,
+                    schema: None,
+                };
+                app.step(cx, |window, cx| {
+                    app.workspace.update(cx, |workspace, cx| {
+                        workspace.open_table_editor(
+                            target,
+                            name.to_string(),
+                            Some(TableRef::new(name, "t")),
+                            window,
+                            cx,
+                        );
+                    })
+                });
+            }
+            _ => app.act(cx, Action::ViewDiagram, &["kerno", name]),
+        }
+        wait_for_the_lock(&app, cx, &locker);
+        app.dispatch(cx, actions::CloseTab);
+        assert!(app.titles(cx).is_empty(), "{opening}");
+        stopped_on_the_server(&app, cx, &locker);
+    }
+}
+
+/// C3: "Set comment" behind a lock (a `COMMENT ON` waits for it; on MySQL the `ALTER … COMMENT`
+/// as well, and blocks every reader of the table meanwhile) runs with the tab marked running,
+/// and Cmd+. stops it on the server: the comment is unchanged.
+#[gpui_kit::test]
+fn setting_a_comment_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k15_comment";
+        let _scratch = k2_table(engine, name);
+        let app = connected(cx, engine);
+        app.open_structure(cx, name, "t", RelationKind::Table);
+        app.wait_for_structure(cx);
+        let locker = Locker::start(engine, &format!("{name}.t"));
+        app.on_structure(cx, |tab, window, cx| tab.edit_comment(window, cx));
+        app.fill_in(cx, "sql-name", "after");
+        app.click(cx, "sql-confirm");
+        wait_for_the_lock(&app, cx, &locker);
+        let tab = app.structure(cx);
+        assert!(cx.update(|cx| tab.read(cx).writing()), "{engine:?}");
+        assert!(
+            cx.update(|cx| tab.read(cx).status(cx).running),
+            "{engine:?}: the status bar says it runs"
+        );
+        app.dispatch(cx, actions::CancelQuery);
+        assert!(!cx.update(|cx| tab.read(cx).writing()), "{engine:?}");
+        // The kit's notifications carry no label: "Cancelled: the comment was not changed." is
+        // not read here. Nothing changed, so the structure is not read again (behind the lock).
+        stopped_on_the_server(&app, cx, &locker);
+        drop(locker);
+        let comment = match engine {
+            Engine::Postgres => {
+                format!("SELECT coalesce(obj_description('{name}.t'::regclass), '')")
+            }
+            _ => format!(
+                "SELECT TABLE_COMMENT FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = '{name}' AND TABLE_NAME = 't'"
+            ),
+        };
+        assert_eq!(on_server(engine, &comment), "", "{engine:?}");
+    }
+}
+
+/// C3: a read of the tree waiting for a lock (the objects of a schema: `pg_total_relation_size`
+/// waits for it) shows "Loading…" with a Cancel: its button, its row's menu ("Cancel loading")
+/// and Cmd+. on its row stop it on the server; the row says so in plain words, and the tree's
+/// other reads of that database run at once on a new session, the lock still held.
+#[gpui_kit::test]
+fn a_tree_read_behind_a_lock_is_cancelled_and_the_tree_reads_on(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let name = "kerno_ui_k15_tree";
+    let _scratch = k15_table(name);
+    let app = connected(cx, Engine::Postgres);
+    let schema = ["kerno", name];
+    app.open_path(cx, &schema);
+    let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+    let cancelled =
+        format!("Could not read the objects of {name}: cancelled. Refresh to try again.");
+    for (round, how) in ["button", "menu", "key"].into_iter().enumerate() {
+        if round == 0 {
+            app.toggle(cx, &schema);
+        } else {
+            app.act(cx, Action::Refresh, &schema);
+        }
+        wait_for_the_lock(&app, cx, &locker);
+        let row = app.tree_row(cx, &schema);
+        assert!(
+            app.tree(cx).iter().any(|line| line.trim() == "Loading…"),
+            "{how}: {:#?}",
+            app.tree(cx)
+        );
+        match how {
+            "button" => app.click(cx, ("node-load-cancel", row + 1)),
+            "menu" => {
+                app.right_click(cx, ("node", row), None);
+                click_menu_entry(&app, cx, "Cancel loading");
+            }
+            _ => {
+                app.click(cx, ("node", row));
+                app.press(cx, &["secondary-."]);
+            }
+        }
+        assert!(
+            app.tree(cx).iter().any(|line| line.trim() == cancelled),
+            "{how}: {:#?}",
+            app.tree(cx)
+        );
+        stopped_on_the_server(&app, cx, &locker);
+        // The same database reads on, the lock still held.
+        app.act(cx, Action::Refresh, &["kerno", "shop"]);
+        app.open_path(cx, &["kerno", "shop", "Tables", "customers"]);
+    }
+    drop(locker);
+    app.act(cx, Action::Refresh, &schema);
+    app.open_path(cx, &["kerno", name, "Tables", "t"]);
+}
+
+/// C3: a read of the tree that gets no answer in 30 s is stopped on the server, and its row
+/// says "the server took longer than 30 s". The bound is the test clock's, not a wait.
+#[gpui_kit::test]
+fn a_tree_read_that_takes_too_long_is_stopped(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let name = "kerno_ui_k15_slow";
+    let _scratch = k15_table(name);
+    let app = connected(cx, Engine::Postgres);
+    let schema = ["kerno", name];
+    app.open_path(cx, &schema);
+    let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+    app.toggle(cx, &schema);
+    wait_for_the_lock(&app, cx, &locker);
+    cx.executor().advance_clock(Duration::from_secs(29));
+    app.step(cx, |_, _| ());
+    assert!(locker.blocks(), "not before 30 s");
+    assert!(app.tree(cx).iter().any(|line| line.trim() == "Loading…"));
+    cx.executor().advance_clock(Duration::from_secs(2));
+    app.step(cx, |_, _| ());
+    let late = format!(
+        "Could not read the objects of {name}: the server took longer than 30 s. Refresh to try \
+         again."
+    );
+    assert!(
+        app.tree(cx).iter().any(|line| line.trim() == late),
+        "{:#?}",
+        app.tree(cx)
+    );
+    stopped_on_the_server(&app, cx, &locker);
+}
+
+/// C3, C11: the list of what a drop reaches is read on a session of its own (it held the
+/// tree's session, and the loads queued behind it); closing the dialog before it comes stops
+/// that read on the server. Held here by a lock on the catalog it reads, in a database of the
+/// test's own.
+#[gpui_kit::test]
+fn closing_the_drop_question_stops_the_read_of_what_it_reaches(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let database = "kerno_ui_k15_reach";
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")],
+        &[&format!("CREATE DATABASE {database}")],
+    );
+    on_database(
+        Engine::Postgres,
+        Some(database),
+        "CREATE TABLE public.t (id INT PRIMARY KEY)",
+    );
+    let app = connected(cx, Engine::Postgres);
+    let path = [database, "public", "Tables", "t"];
+    app.open_path(cx, &path);
+    let locker = Locker::start_in(Engine::Postgres, Some(database), "pg_catalog.pg_depend");
+    app.act(cx, Action::Drop, &path);
+    assert!(app.has(cx, "sql-confirm"));
+    wait_for_the_lock(&app, cx, &locker);
+    app.click(cx, "sql-cancel");
+    assert!(!app.dialog_open(cx));
+    stopped_on_the_server(&app, cx, &locker);
+}
+
+/// C3: a `.sql` file over the limit (20 MB; lowered here, no such file is written) is not put
+/// in the editor without asking: Enter answers nothing, Cancel opens nothing, "Open in the
+/// editor" opens it as any file, "Run with Execute script…" opens the Tools wizard on the
+/// active connection with the file chosen, and nothing in the editor.
+#[gpui_kit::test]
+fn a_large_script_file_asks_before_it_opens(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.update(|cx| {
+        app.workspace
+            .update(cx, |workspace, _| workspace.large_script = 1024)
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "select 1 as kerno_ui_k15_large;\n".repeat(100)).unwrap();
+        path
+    };
+    let open = |cx: &mut TestAppContext, path: &std::path::Path| {
+        let path = path.to_path_buf();
+        app.step(cx, |window, cx| {
+            app.workspace.update(cx, |workspace, cx| {
+                workspace.open_sql_file_from(path, window, cx)
+            })
+        });
+        app.wait_until(cx, "the question", |app, cx| app.has(cx, "large-script"));
+    };
+    let before = app.titles(cx);
+    let (first, second) = (write("kerno_ui_k15_one.sql"), write("kerno_ui_k15_two.sql"));
+
+    open(cx, &first);
+    assert!(app.shows_label(
+        cx,
+        "The editor keeps the whole text in memory and lays it out as you scroll: a file this \
+         large makes Kerno slow. Execute script runs it with the engine's own client (psql, \
+         mysql) without opening it, and shows its progress."
+    ));
+    app.press(cx, &["enter"]);
+    assert!(app.has(cx, "large-script"), "Enter answers nothing");
+    app.click(cx, "large-script-cancel");
+    assert!(!app.dialog_open(cx));
+    assert_eq!(app.titles(cx), before, "Cancel opens nothing");
+
+    open(cx, &first);
+    app.click(cx, "large-script-open");
+    app.wait_until(cx, "the file in a tab", |app, cx| {
+        app.titles(cx).len() == before.len() + 1
+    });
+    let (_, sql) = app.active_query(cx);
+    assert!(sql.starts_with("select 1 as kerno_ui_k15_large;"), "{sql}");
+
+    open(cx, &second);
+    app.click(cx, "large-script-run");
+    let wizard = cx
+        .update(|cx| app.workspace.read(cx).opened_wizard.clone())
+        .and_then(|wizard| wizard.upgrade())
+        .expect("the Execute script wizard");
+    assert_eq!(
+        cx.update(|cx| wizard.read(cx).file().map(std::path::Path::to_path_buf)),
+        Some(second.clone())
+    );
+    assert!(app.dialog_open(cx));
+    assert_eq!(
+        app.titles(cx).len(),
+        before.len() + 1,
+        "not opened in the editor"
+    );
+    app.press(cx, &["escape"]);
+}
+
+/// C3: changing a field of the CSV import stops the preview's scan of the file still running
+/// before it starts the next one (each scan counts every record: on a large file they piled
+/// up), and closing the dialog stops the last one. The count itself stops on the flag
+/// (`import::tests::a_stopped_count_ends_at_once`).
+#[gpui_kit::test]
+fn a_new_preview_of_a_csv_stops_the_scan_before_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kerno_ui_k15.csv");
+    std::fs::write(&path, "id;name\n1;a\n2;b\n").unwrap();
+    let dialog = app.import_dialog(cx, "public", None).expect("the dialog");
+    app.import_file(cx, &dialog, &path);
+    let mut scans = vec![cx.update(|cx| dialog.read(cx).scan())];
+    for click in [("import-delimiter", 0usize), ("import-delimiter", 1)] {
+        app.click(cx, click);
+        scans.push(cx.update(|cx| dialog.read(cx).scan()));
+    }
+    let set: Vec<bool> = scans
+        .iter()
+        .map(|scan| scan.load(std::sync::atomic::Ordering::Acquire))
+        .collect();
+    assert_eq!(set, [true, true, false], "each scan stopped by the next");
+    app.press(cx, &["escape"]);
+    app.wait_until(cx, "the dialog to close", |app, cx| !app.dialog_open(cx));
+    // The test's handle was the last one.
+    drop(dialog);
+    app.step(cx, |_, _| ());
+    assert!(
+        scans[2].load(std::sync::atomic::Ordering::Acquire),
+        "closing stops the last"
+    );
+}
+
+/// C3: the tree's sessions are its own now (D-087); dropping a database the tree has read from
+/// closes its session there first, so PostgreSQL drops it (it refuses a database another
+/// session is in).
+#[gpui_kit::test]
+fn a_database_the_tree_has_read_is_dropped_from_the_tree(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let database = "kerno_ui_k15_dropdb";
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")],
+        &[&format!("CREATE DATABASE {database}")],
+    );
+    on_database(
+        Engine::Postgres,
+        Some(database),
+        "CREATE TABLE public.t (id INT PRIMARY KEY)",
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.open_path(cx, &[database, "public", "Tables", "t"]);
+    app.act(cx, Action::Drop, &[database]);
+    app.click(cx, "sql-confirm");
+    app.wait_until(cx, "the database to go", |_, _| {
+        on_server(
+            Engine::Postgres,
+            &format!("SELECT count(*) FROM pg_database WHERE datname = '{database}'"),
+        ) == "0"
+    });
 }

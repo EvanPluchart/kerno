@@ -139,6 +139,8 @@ enum State {
     Loading,
     Ready,
     Failed(String),
+    /// The read was stopped before the form was filled (C3).
+    Cancelled,
 }
 
 /// What Apply would run, or why it cannot.
@@ -175,6 +177,8 @@ pub struct TableEditor {
     /// Why the last apply failed, with the statement that did.
     error: Option<String>,
     load: Option<Task<()>>,
+    /// What stops the read in flight on the server: Cancel, the tab closed (C3).
+    reading: bridge::Stop,
     generation: u64,
     /// The column to put the cursor in once the table is read: a name, or
     /// a new column when `None` (see [`TableEditor::focus_column`]).
@@ -229,6 +233,7 @@ impl TableEditor {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             error: None,
             load: None,
+            reading: bridge::Stop::default(),
             generation: 0,
             wanted: None,
             _subscriptions: vec![follow],
@@ -356,6 +361,8 @@ impl TableEditor {
         let previous = self.load.take();
         let opening = self.session(cx);
         let (table, schema) = (self.table.clone(), self.schema.clone());
+        let stop = bridge::Stop::default();
+        self.reading = stop.clone();
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
             if let Some(previous) = previous {
                 previous.await;
@@ -367,9 +374,10 @@ impl TableEditor {
                     return;
                 }
             };
-            // The session goes with the reading: it closes once read.
+            // The session goes with the reading: it closes once read, or
+            // when the read is stopped.
             let reading = cx.update(|_, cx| {
-                bridge::spawn(cx, async move {
+                stop.run(cx, session, move |session| async move {
                     let structure = match &table {
                         Some(table) => Some(session.table_structure(table).await),
                         None => None,
@@ -394,7 +402,10 @@ impl TableEditor {
             let Ok(reading) = reading else {
                 return;
             };
-            let outcome = reading.await;
+            // Stopped: `cancel` said so.
+            let Some(outcome) = reading.await else {
+                return;
+            };
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok(_) if this.generation != generation => {}
                 Ok((structure, tables)) => {
@@ -1098,6 +1109,15 @@ impl TableEditor {
     /// cancelled on the server, and none after it is sent (C3).
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if !self.applying {
+            // A read of the table, which a lock can hold as well.
+            if self.reading.busy() {
+                self.reading.stop(cx);
+                if self.state == State::Loading {
+                    self.generation += 1;
+                    self.state = State::Cancelled;
+                }
+                cx.notify();
+            }
             return;
         }
         self.cancel_requested.store(true, Ordering::Release);
@@ -1858,12 +1878,44 @@ impl TableEditor {
                 ),
                 cx,
             ),
-            State::Loading if self.columns.is_empty() => self.render_notice(
-                "editor-loading",
-                "Loading the table…",
-                format!("Reading {what}."),
-                cx,
-            ),
+            State::Cancelled => v_flex()
+                .size_full()
+                .child(self.render_notice(
+                    "editor-cancelled",
+                    "Cancelled",
+                    format!("{what} was not read."),
+                    cx,
+                ))
+                .child(
+                    h_flex().justify_center().pb_6().child(
+                        Button::new("editor-retry")
+                            .outline()
+                            .label("Read again")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.reload(false, window, cx)),
+                            ),
+                    ),
+                )
+                .into_any_element(),
+            State::Loading if self.columns.is_empty() => v_flex()
+                .size_full()
+                .child(self.render_notice(
+                    "editor-loading",
+                    "Loading the table…",
+                    format!("Reading {what}."),
+                    cx,
+                ))
+                // A lock held by another session can hold the read (C3).
+                .child(
+                    h_flex().justify_center().pb_6().child(
+                        Button::new("editor-load-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .tooltip("Stop the read on the server (Cmd+.)")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
+                )
+                .into_any_element(),
             _ => v_flex()
                 .size_full()
                 .child(

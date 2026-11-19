@@ -102,6 +102,8 @@ enum State {
     Loading,
     Ready,
     Failed(String),
+    /// The read was stopped before anything was shown (C3).
+    Cancelled,
 }
 
 /// The structure of one table or view.
@@ -127,6 +129,10 @@ pub struct StructureTab {
     state: State,
     /// The load in flight; the next one waits for it.
     load: Option<Task<()>>,
+    /// What stops the load in flight on the server: Cancel, the tab closed (C3).
+    stop: bridge::Stop,
+    /// What stops "Set comment" while it runs, which a lock can hold (C3).
+    writing: Option<bridge::Stop>,
     generation: u64,
     grid_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -169,6 +175,8 @@ impl StructureTab {
             section: COLUMNS_SECTION,
             state: State::Waiting,
             load: None,
+            stop: bridge::Stop::default(),
+            writing: None,
             generation: 0,
             grid_subscriptions: Vec::new(),
             _subscriptions: vec![follow],
@@ -258,7 +266,7 @@ impl StructureTab {
                     .and_then(|meta| meta.database())
             }),
             transaction: TxState::Idle,
-            running: self.state == State::Loading,
+            running: self.state == State::Loading || self.writing.is_some(),
             rows: None,
             elapsed: None,
             notices: 0,
@@ -273,6 +281,7 @@ impl StructureTab {
         self.hidden = true;
         self.generation += 1;
         self.load = None;
+        self.stop.stop(cx);
         self.state = State::Waiting;
         cx.notify();
     }
@@ -297,6 +306,8 @@ impl StructureTab {
         }
         self.state = State::Loading;
         let previous = self.load.take();
+        let stop = bridge::Stop::default();
+        self.stop = stop.clone();
         let opening = self.connections.read(cx).open_session(
             &self.target.connection,
             self.target.database.clone(),
@@ -316,9 +327,10 @@ impl StructureTab {
                     return;
                 }
             };
-            // The session goes with the reading: it closes once read.
+            // The session goes with the reading: it closes once read, or
+            // when the read is stopped.
             let reading = cx.update(|_, cx| {
-                bridge::spawn(cx, async move {
+                stop.run(cx, session, move |session| async move {
                     let structure = session.table_structure(&table).await;
                     // The columns are worth showing when the DDL is not.
                     let ddl = match structure {
@@ -345,7 +357,10 @@ impl StructureTab {
             let Ok(reading) = reading else {
                 return;
             };
-            let outcome = reading.await;
+            // Stopped: `cancel` said so.
+            let Some(outcome) = reading.await else {
+                return;
+            };
             let _ = this.update_in(cx, |this, window, cx| match outcome {
                 Ok((structure, ddl, properties)) if this.generation == generation => {
                     this.properties = properties;
@@ -363,6 +378,27 @@ impl StructureTab {
             return;
         }
         self.state = State::Failed(describe(error).to_string());
+        cx.notify();
+    }
+
+    /// Stops the read in flight and "Set comment" (Cancel, Cmd+., the tab
+    /// closed): its statement is stopped on the server, where a lock may
+    /// hold it (C3). A structure already shown stays.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if let Some(writing) = self.writing.take() {
+            writing.stop(cx);
+        }
+        if self.state != State::Loading {
+            cx.notify();
+            return;
+        }
+        self.stop.stop(cx);
+        self.generation += 1;
+        self.state = if self.grids.is_empty() {
+            State::Cancelled
+        } else {
+            State::Ready
+        };
         cx.notify();
     }
 
@@ -480,11 +516,14 @@ impl StructureTab {
             self.target.database.clone(),
             cx,
         );
+        let stop = bridge::Stop::default();
+        self.writing = Some(stop.clone());
+        cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let outcome = match opening.await {
                 Ok(session) => {
                     let Ok(running) = cx.update(|_, cx| {
-                        bridge::spawn(cx, async move {
+                        stop.run(cx, session, |session| async move {
                             let outcome = exec::collect(session.clone(), sql).await;
                             session.close().await;
                             outcome
@@ -494,18 +533,27 @@ impl StructureTab {
                     };
                     running.await
                 }
-                Err(error) => Err(error),
+                Err(error) => Some(Err(error)),
             };
             let _ = this.update_in(cx, |this, window, cx| {
+                this.writing = None;
+                let changed = outcome.is_some();
                 let notification = match outcome {
-                    Ok(_) => Notification::success("Changed the comment."),
-                    Err(error) => crate::error_notification(format!(
+                    Some(Ok(_)) => Notification::success("Changed the comment."),
+                    // A COMMENT is one statement: stopped, it changed nothing.
+                    None => Notification::warning("Cancelled: the comment was not changed."),
+                    Some(Err(error)) => crate::error_notification(format!(
                         "The comment was not changed: {}",
                         describe(&error)
                     )),
                 };
                 window.push_notification(notification, cx);
-                this.reload(window, cx);
+                // Stopped, nothing changed: what is shown stays true.
+                if changed {
+                    this.reload(window, cx);
+                } else {
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -615,7 +663,14 @@ impl StructureTab {
             State::Loading => "loading".into(),
             State::Ready => "ready".into(),
             State::Failed(error) => format!("failed: {error}"),
+            State::Cancelled => "cancelled".into(),
         }
+    }
+
+    /// Whether "Set comment" runs; for tests.
+    #[cfg(test)]
+    pub fn writing(&self) -> bool {
+        self.writing.is_some()
     }
 
     // Rendering ---------------------------------------------------------------
@@ -833,13 +888,39 @@ impl StructureTab {
                     cx,
                 )
             }
-            (_, true) => self.render_notice(
-                "structure-loading",
-                "Loading the structure…",
-                format!("Reading {}.{}.", self.table.schema, self.table.name),
-                None,
-                cx,
-            ),
+            (State::Cancelled, _) => {
+                let retry = Button::new("structure-retry")
+                    .outline()
+                    .label("Read again")
+                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx)))
+                    .into_any_element();
+                self.render_notice(
+                    "structure-cancelled",
+                    "Cancelled",
+                    format!(
+                        "The structure of {}.{} was not read.",
+                        self.table.schema, self.table.name
+                    ),
+                    Some(retry),
+                    cx,
+                )
+            }
+            (_, true) => {
+                // A lock held by another session can hold the read (C3).
+                let cancel = Button::new("structure-cancel")
+                    .ghost()
+                    .label("Cancel")
+                    .tooltip("Stop the read on the server (Cmd+.)")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                    .into_any_element();
+                self.render_notice(
+                    "structure-loading",
+                    "Loading the structure…",
+                    format!("Reading {}.{}.", self.table.schema, self.table.name),
+                    Some(cancel),
+                    cx,
+                )
+            }
             _ if self.section == DDL_SECTION => self.render_ddl(cx),
             _ if self.section == PROPERTIES_SECTION => self.render_properties(cx),
             _ => self.render_lists(cx),

@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -28,7 +28,7 @@ use kerno_core::browse::{
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
 use kerno_core::schema::{RelationKind, TableRef, TableStructure};
-use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits};
+use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits_until};
 use kerno_core::storage::TableLayout;
 use kerno_core::{Engine, Error, ResultStore, Session, TxState, describe, exec};
 
@@ -274,6 +274,9 @@ pub struct DataTab {
     /// Cancel was asked for the read or the apply in flight: its failure
     /// is the cancel, not an error (C3).
     cancel_requested: bool,
+    /// Cancel for the apply in flight, read between its statements: one that
+    /// lands between two (the server, idle, would ignore it) rolls back (C3).
+    apply_stop: Arc<AtomicBool>,
     /// The page read after an apply takes the keyboard, as the grid had it.
     refocus_grid: bool,
     /// Why the last apply changed nothing.
@@ -365,6 +368,7 @@ impl DataTab {
             generation: 0,
             applying: false,
             cancel_requested: false,
+            apply_stop: Arc::default(),
             refocus_grid: false,
             apply_error: None,
             grid_subscriptions: Vec::new(),
@@ -1417,6 +1421,9 @@ impl DataTab {
         }
         // Seen by a read whose session is still opening (C3).
         self.cancel_requested = true;
+        if self.applying {
+            self.apply_stop.store(true, Ordering::Release);
+        }
         if let Some(session) = self.session.clone() {
             bridge::spawn(cx, async move {
                 if let Err(error) = session.cancel().await {
@@ -1921,6 +1928,8 @@ impl DataTab {
         self.applying = true;
         self.apply_error = None;
         self.cancel_requested = false;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.apply_stop = stop.clone();
         let previous = self.load.take();
         let count = self.pending_count(cx);
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1928,7 +1937,9 @@ impl DataTab {
                 previous.await;
             }
             let Ok(applying) = cx.update(|_, cx| {
-                bridge::spawn(cx, async move { apply_edits(&session, &statements).await })
+                bridge::spawn(cx, async move {
+                    apply_edits_until(&session, &statements, &stop).await
+                })
             }) else {
                 return;
             };

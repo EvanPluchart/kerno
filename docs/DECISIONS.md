@@ -1961,3 +1961,67 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   would vanish) and the button never waits, so K2's cancellable drop and K9's refused drop behave as before.
   `read_only`, the environment's questions and the SQL preview are unchanged. A database's drop or rename reads
   nothing: a session of the tree's inside it would keep PostgreSQL from dropping it.
+
+## D-087 — The other long operations: how reads are stopped, the 30 s bound, large script files (K15, C3; 2026-11-19)
+
+- **One way to stop a read on a server session** (`bridge::Stop`): the read runs as a Tokio task whose abort
+  handle is kept; stopping aborts it where it waits, so a read queued behind it on the same session is never
+  sent, then closes the session, which stops the statement on the server (PostgreSQL: the cancel request in
+  `close`; MySQL, MariaDB: `close` now kills a statement whose caller dropped it midway, since the server does
+  not see the client leave while that statement waits for a lock). A plain `session.cancel()` was not enough
+  for reads: the introspection queries do not go through the drivers' cancel counter, and a cancel request
+  landing between two of a read's queries is ignored by an idle server, so the next query would be sent and
+  wait again; and a closed session alone does not stop a read queued on its lock (Tokio's mutex is first come,
+  first served). Used by the structure tab's read and its "Set comment", the table form's read, the ER
+  diagram's read and every read of the tree.
+- **The tree has sessions of its own** (one per database on PostgreSQL, one per connection on MySQL), no longer
+  the connection's meta session. A read waiting for a lock on the meta session also held its keep-alive ping
+  (two 5 s timeouts, `connections/manager.rs`), so the connection was declared lost and reconnected after about
+  10-15 s, and a stop could not close that session. The cost: one more server connection per connected
+  connection, from the moment it connects (the list of databases and the default database's schemas are read
+  on it), held while it stays connected; `ui_tests::restored_tabs_open_a_session_once_shown_and_structure_tabs_close_theirs`
+  and `ui_tests::every_owner_of_a_session_closes_it_when_it_goes_away` now count two sessions for a connected
+  connection, not one, each owner's on top. The idle memory of D-082 (152.1 MB for a 150 MB target,
+  one connection open) was not measured again: the app was not launched for K15, and a second session's
+  buffers can only add to it. Two reads that open the same key's session at once keep one; the other closes
+  once read.
+- **Timeout: a client-side clock, not `statement_timeout` / `max_execution_time`.** 30 s per read of the tree
+  (`LOAD_LIMIT` in `navigator/view.rs`), counted on the UI's clock from the moment it is asked for (its wait
+  behind other reads of the same session included), then the same stop as Cancel. Every read of the tree has
+  it: the rows' loads and the one-off reads (Generate, Show DDL, Edit source, Call, Properties), which end with
+  their usual notification and "the server took longer than 30 s. Try again." Server settings would change the session's state, cover only `SELECT` on MySQL, and need a reset
+  after each read; the clock costs nothing and the tests advance it (`advance_clock`), so no knob is added.
+  One constant, not a setting: no setting covers statement timeouts today, and Settings would gain a number few
+  would touch. The other tabs' reads have no clock: their Cancel (and Cmd+.) is on screen while they read.
+- **Messages, plain words first, on the row that was being filled**: "Could not read the objects of shop:
+  cancelled. Refresh to try again." and "Could not read the objects of shop: the server took longer than 30 s.
+  Refresh to try again." (the `reading` strings the row already used for failures; the list of databases says
+  "the databases", under "The databases could not be listed."). Every read queued on the same session ends
+  with it and says the same. The next read opens a new session.
+- **Where Cancel is**: a small "Cancel" button on the "Loading…" line (and on "Loading databases…"), "Cancel
+  loading" first in the row's menu, and Cmd+. with the row (or its line) selected; the tree takes Cmd+. only
+  when its selected row is being read, else it goes on to the active tab. The menu entry is built in the
+  closure of the row's menu, like K2's "Cancel the running statement": `menu_palette.rs` names both among the
+  closure-built entries (the palette's Cancel is Cmd+.); the K13 test is unchanged.
+- **K14's "what it reaches" list is read on a session of its own** (not the tree's): a slow read holds no
+  tree read behind it. The task holds the sending end of a channel; the dialog going (Cancel, the answer)
+  drops it, and the read is stopped on the server and its session closed. Its 10 s clock running out does
+  not stop it: the dialog still shows the list if it comes.
+- **Structure tab, table form, diagram**: Cancel on their "Loading…" screen, Cmd+. (now routed to the
+  structure tab and the diagram as well), and closing the tab stop the read on the server; a structure
+  already shown stays, else "Cancelled" with "Read again". "Set comment" marks the tab running; Cmd+. stops it
+  ("Cancelled: the comment was not changed.", the structure not read again).
+- **Data apply**: `apply_edits_until` reads the tab's Cancel before each statement and before `COMMIT`; a
+  cancel landing between two statements rolls the transaction back instead of letting the next ones run.
+- **AI Stop closes the connection**: `ureq` 3.5's `Agent::shutdown` (no new dependency), through
+  `ai::Stopper`; a request asked after the stop is not sent.
+- **CSV preview**: one flag per scan, set when a field changes (before the next scan starts) and when the dialog
+  closes; the count reads it at each record.
+- **ER layout** runs on Tokio's blocking pool, not on one of the runtime's three workers the drivers share, and
+  is skipped when the tab was closed or reloaded meanwhile; once started it runs to its end (it has no check
+  inside).
+- **A `.sql` file over 20 MB** (`LARGE_SCRIPT`, one constant) is not read before the user answers "“big.sql” is
+  34 MB": Cancel opens nothing; "Open in the editor" reads and opens it as any file; "Run with Execute
+  script…" opens the Tools wizard (Execute script) on the active tab's database, else the default connection's,
+  with the file chosen, and the wizard asks before it runs as it does from Tools (K6's rule: nothing binds
+  silently). Enter answers nothing. The threshold is lowered by the tests through a test-only field.

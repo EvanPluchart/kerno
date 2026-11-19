@@ -440,12 +440,13 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
     assert!(panel(&app, cx).is_none());
 }
 
-/// Stop drops the request being waited on, at once ("Stopped"); the next one goes without
-/// waiting for it; a stopped request's answer, when the fake finally sends it, is never shown
-/// and inserts nothing (`ureq` 3 cannot abort the call: it ends on its own thread).
+/// C3: Stop closes the request's connection at once ("Stopped"): the endpoint, holding the
+/// answer, sees the client go and never answers; the next request goes without waiting for
+/// the first; nothing is shown or inserted; a request after them is answered.
 #[gpui_kit::test]
 fn a_request_is_stopped(cx: &mut TestAppContext) {
-    let fake = FakeAi::start_with(ANSWER, Duration::from_secs(1));
+    // Holds every answer longer than the test lasts: only Stop can end these requests.
+    let fake = FakeAi::start_with(ANSWER, Duration::from_secs(120));
     let app = open(cx, memory_storage());
     app.press(cx, &["secondary-t"]);
     enable(cx, &fake.base(), true);
@@ -459,14 +460,16 @@ fn a_request_is_stopped(cx: &mut TestAppContext) {
         assert!(!cx.update(|cx| panel.read(cx).sending()));
         assert!(app.has(cx, "ai-stopped"), "says so at once");
         assert!(!app.has(cx, "ai-stop"));
+        app.wait_until(cx, "the endpoint to see the connection close", |_, _| {
+            fake.closed() == sent
+        });
     };
     send_and_stop(cx, 1);
-    // The next request goes while the first is still held by the server.
+    // The next request goes while nothing of the first is left.
     send_and_stop(cx, 2);
-    assert_eq!(fake.answered(), 0, "sent before the first answer came");
+    assert_eq!(fake.answered(), 0);
 
-    // Both answers come: neither is shown, Insert has nothing to insert.
-    app.wait_until(cx, "the held answers", |_, _| fake.answered() == 2);
+    // Nothing is shown, Insert has nothing to insert.
     let tab = app.tab(cx);
     let editor = cx.update(|cx| tab.read(cx).editor().clone());
     let before = cx.update(|cx| editor.read(cx).text().to_string());
@@ -480,10 +483,12 @@ fn a_request_is_stopped(cx: &mut TestAppContext) {
     assert!(answer(&app, cx).is_none() && failure(&app, cx).is_none());
     assert_eq!(cx.update(|cx| editor.read(cx).text().to_string()), before);
 
-    // A request after them is answered.
+    // A request after them is answered (by an endpoint that answers at once).
+    let quick = FakeAi::start(ANSWER);
+    enable(cx, &quick.base(), true);
     send_and_wait(&app, cx);
     assert_eq!(answer(&app, cx).as_deref(), Some(ANSWER));
-    assert_eq!(fake.answered(), 3);
+    assert_eq!((fake.answered(), quick.answered()), (0, 1));
 }
 
 /// The context is built from the tab's catalog on MySQL and MariaDB too: names and types,

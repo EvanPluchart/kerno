@@ -17,6 +17,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -474,6 +475,8 @@ pub enum AiError {
     Status(u16, String),
     /// The answer could not be read.
     Answer(String),
+    /// Stopped by the user: the connection was closed before the answer.
+    Stopped,
 }
 
 impl fmt::Display for AiError {
@@ -497,6 +500,7 @@ impl fmt::Display for AiError {
                 Ok(())
             }
             Self::Answer(why) => write!(f, "The answer could not be read: {why}"),
+            Self::Stopped => f.write_str("Stopped: the request was closed before its answer."),
         }
     }
 }
@@ -516,6 +520,47 @@ pub fn gate(settings: &AiSettings) -> Result<Endpoint, AiError> {
     Ok(endpoint)
 }
 
+/// What stops a request in flight (the panel's Stop): the request's connection is closed at
+/// once, so its call returns and the endpoint sees the client go, instead of an answer read
+/// up to [`TIMEOUT`] later (C3). A request sent after the stop is not sent at all.
+#[derive(Clone, Default)]
+pub struct Stopper(Arc<Mutex<Stopping>>);
+
+#[derive(Default)]
+struct Stopping {
+    stopped: bool,
+    agent: Option<ureq::Agent>,
+}
+
+impl Stopper {
+    /// Closes the connection of the request in flight, if one is.
+    pub fn stop(&self) {
+        let agent = {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stopped = true;
+            state.agent.take()
+        };
+        if let Some(agent) = agent {
+            agent.shutdown();
+        }
+    }
+
+    /// Keeps `agent` to stop it; `false` when stopped already.
+    fn hold(&self, agent: &ureq::Agent) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.stopped {
+            state.agent = Some(agent.clone());
+        }
+        !state.stopped
+    }
+}
+
 /// Sends `call` to the configured endpoint and returns the answer's body: the one function
 /// that opens a socket for the assistant. Refuses, before any connection, while the assistant
 /// is off, for a refused address and for an unconfirmed host other than this computer. The key
@@ -524,6 +569,16 @@ pub fn request(
     settings: &AiSettings,
     key: Option<&Secret>,
     call: &Call,
+) -> Result<String, AiError> {
+    request_until(settings, key, call, &Stopper::default())
+}
+
+/// [`request`], ended early by `stop` (its connection closed: [`AiError::Stopped`]).
+pub fn request_until(
+    settings: &AiSettings,
+    key: Option<&Secret>,
+    call: &Call,
+    stop: &Stopper,
 ) -> Result<String, AiError> {
     let endpoint = gate(settings)?;
     let agent = ureq::Agent::new_with_config(
@@ -537,6 +592,16 @@ pub fn request(
             .user_agent(format!("Kerno/{}", env!("CARGO_PKG_VERSION")))
             .build(),
     );
+    if !stop.hold(&agent) {
+        return Err(AiError::Stopped);
+    }
+    let stopped = |error| {
+        if stop.0.lock().map(|state| state.stopped).unwrap_or(true) {
+            AiError::Stopped
+        } else {
+            network(&endpoint.host, error)
+        }
+    };
     let bearer = key
         .filter(|key| !key.is_empty())
         .map(|key| format!("Bearer {}", key.expose()));
@@ -558,7 +623,7 @@ pub fn request(
             get.call()
         }
     };
-    let mut response = sent.map_err(|error| network(&endpoint.host, error))?;
+    let mut response = sent.map_err(stopped)?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
@@ -566,7 +631,7 @@ pub fn request(
         .limit(MAX_ANSWER)
         .lossy_utf8(true)
         .read_to_string()
-        .map_err(|error| network(&endpoint.host, error))?;
+        .map_err(stopped)?;
     if !(200..300).contains(&status) {
         let text: String = text.trim().chars().take(300).collect();
         return Err(AiError::Status(status, text));
@@ -597,7 +662,17 @@ pub fn chat(
     key: Option<&Secret>,
     payload: &Value,
 ) -> Result<String, AiError> {
-    let text = request(settings, key, &Call::Chat(payload.clone()))?;
+    chat_until(settings, key, payload, &Stopper::default())
+}
+
+/// [`chat`], ended early by `stop`.
+pub fn chat_until(
+    settings: &AiSettings,
+    key: Option<&Secret>,
+    payload: &Value,
+    stop: &Stopper,
+) -> Result<String, AiError> {
+    let text = request_until(settings, key, &Call::Chat(payload.clone()), stop)?;
     let answer: Value =
         serde_json::from_str(&text).map_err(|error| AiError::Answer(error.to_string()))?;
     answer

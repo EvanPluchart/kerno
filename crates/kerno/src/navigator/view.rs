@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::base::actions::{SelectLeft, SelectRight};
@@ -144,12 +145,26 @@ enum Root {
     Failed(String),
 }
 
+/// How long a read of the tree may take before it is stopped (C3, D-087).
+const LOAD_LIMIT: Duration = Duration::from_secs(30);
+
+/// The id [`Browse::loading`] gives the list of databases.
+const ROOT_LOAD: &str = "";
+
 /// What the tree holds of one connection while it is open.
 struct Browse {
     root: Root,
     tree: Tree,
-    /// Sessions by database, opened as databases are browsed.
+    /// The tree's own sessions, opened as databases are browsed: one per
+    /// database on PostgreSQL, one for the connection on MySQL (key `""`),
+    /// never the connection's meta session, whose keep-alive a read waiting
+    /// for a lock would hold, and which a stop could not close (C3, D-087).
     sessions: HashMap<String, Arc<dyn Session>>,
+    /// What stops the reads of each of those sessions, by the same key.
+    stops: HashMap<String, bridge::Stop>,
+    /// The reads in flight, by the node they fill ([`ROOT_LOAD`]: the
+    /// databases), each until it ends or its session is stopped.
+    loading: HashMap<String, Loading>,
     /// Given when the browse starts, so late answers to an older one are
     /// dropped.
     generation: u64,
@@ -207,6 +222,36 @@ struct Write {
 
 /// Names the notifications of [`Write`]s.
 struct WriteNote;
+
+/// A read of the tree in flight (C3).
+struct Loading {
+    /// The key of its session in [`Browse::sessions`].
+    session: String,
+    /// What it reads, for its row ("the objects of shop").
+    reading: String,
+}
+
+/// Why the reads of a session of the tree were stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    Cancelled,
+    TimedOut,
+}
+
+impl Halt {
+    /// What the row of a read stopped this way says, plain words first.
+    fn message(self, reading: &str) -> String {
+        match self {
+            Self::Cancelled => {
+                format!("Could not read {reading}: cancelled. Refresh to try again.")
+            }
+            Self::TimedOut => format!(
+                "Could not read {reading}: the server took longer than {} s. Refresh to try again.",
+                LOAD_LIMIT.as_secs()
+            ),
+        }
+    }
+}
 
 /// A table or view [`Navigator::reveal`] is opening the way to.
 #[derive(Debug, Clone)]
@@ -414,12 +459,12 @@ impl Navigator {
             }
             // Closed by the user: the row closes too.
             Status::Disconnected => {
-                self.browse.remove(id);
+                self.forget(id, cx);
                 self.expanded.remove(id);
             }
             // The row stays open, so what went wrong shows under it.
             Status::Failed { .. } => {
-                self.browse.remove(id);
+                self.forget(id, cx);
             }
             _ => {}
         }
@@ -451,26 +496,27 @@ impl Navigator {
         self.generation += 1;
         let generation = self.generation;
         let current = meta.database();
-        let mut sessions = HashMap::new();
-        // The connection's own session answers for its own database.
-        if let Some(database) = &current {
-            sessions.insert(database.clone(), meta.clone());
-        }
         let revealing = self
-            .browse
-            .remove(connection)
+            .forget(connection, cx)
             .and_then(|browse| browse.revealing);
         self.browse.insert(
             connection.to_string(),
             Browse {
                 root: Root::Loading,
                 tree: Tree::new(meta.dialect().has_schemas()),
-                sessions,
+                sessions: HashMap::new(),
+                stops: HashMap::new(),
+                loading: HashMap::new(),
                 generation,
                 revealing,
             },
         );
-        let listing = bridge::spawn(cx, async move { meta.databases().await });
+        // On the tree's session of the connection's own database.
+        let database = current.clone().unwrap_or_default();
+        self.track(connection, ROOT_LOAD, &database, "the databases".into(), cx);
+        let listing = self.read_on(connection, &database, cx, |session| async move {
+            session.databases().await
+        });
         let connection = connection.to_string();
         cx.spawn(async move |this, cx| {
             let outcome = listing.await;
@@ -478,6 +524,10 @@ impl Navigator {
                 let Some(browse) = this.live(&connection, generation) else {
                     return;
                 };
+                // Stopped: `stop_session` said so on the row.
+                if browse.loading.remove(ROOT_LOAD).is_none() {
+                    return;
+                }
                 match outcome {
                     Ok(databases) => {
                         browse.root = Root::Loaded;
@@ -616,40 +666,223 @@ impl Navigator {
         }
     }
 
-    /// The session of `connection` that answers for `database`, opened if
-    /// it is not yet.
-    fn session_for(
+    /// Stops the reads of the tree of `connection` and closes its sessions;
+    /// gives what it held.
+    fn forget(&mut self, connection: &str, cx: &App) -> Option<Browse> {
+        let browse = self.browse.remove(connection)?;
+        for stop in browse.stops.values() {
+            stop.stop(cx);
+        }
+        Some(browse)
+    }
+
+    /// The key of the tree's session that answers for `database`: the
+    /// database on PostgreSQL; on MySQL one session sees every database.
+    fn session_key(&self, connection: &str, database: &str, cx: &App) -> String {
+        if self.has_schemas(connection, cx) {
+            database.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Runs `work` on the tree's session of `connection` that answers for
+    /// `database`, opened if it is not yet: [`Self::stop_session`] stops it
+    /// there (`Error::Cancelled`), with every read queued behind it, and so
+    /// does [`LOAD_LIMIT`] running out (C3, D-087).
+    fn read_on<
+        T: Send + 'static,
+        F: std::future::Future<Output = kerno_core::Result<T>> + Send + 'static,
+    >(
         &mut self,
         connection: &str,
         database: &str,
         cx: &mut Context<Self>,
-    ) -> Task<kerno_core::Result<Arc<dyn Session>>> {
-        let closed = || kerno_core::Error::Closed("the connection is not open".into());
-        let Some(browse) = self.browse.get(connection) else {
-            return Task::ready(Err(closed()));
+        work: impl FnOnce(Arc<dyn Session>) -> F + 'static,
+    ) -> Task<kerno_core::Result<T>> {
+        let key = self.session_key(connection, database, cx);
+        let Some(browse) = self.browse.get_mut(connection) else {
+            return Task::ready(Err(Error::Closed("the connection is not open".into())));
         };
-        if let Some(session) = browse.sessions.get(database) {
-            return Task::ready(Ok(session.clone()));
-        }
         let generation = browse.generation;
-        let connections = self.connections.read(cx);
-        match connections.meta_session(connection) {
-            None => return Task::ready(Err(closed())),
-            // Without schemas, any session sees every database.
-            Some(meta) if !meta.dialect().has_schemas() => return Task::ready(Ok(meta)),
-            Some(_) => {}
-        }
-        let opening = connections.open_session(connection, Some(database.to_string()), cx);
-        let (connection, database) = (connection.to_string(), database.to_string());
-        cx.spawn(async move |this, cx| {
-            let session = opening.await?;
-            let _ = this.update(cx, |this, _| {
-                if let Some(browse) = this.live(&connection, generation) {
-                    browse.sessions.insert(database, session.clone());
+        let stop = browse.stops.entry(key.clone()).or_default().clone();
+        let opening = match browse.sessions.get(&key) {
+            Some(session) => Task::ready(Ok(session.clone())),
+            None => {
+                let database = (!key.is_empty()).then(|| database.to_string());
+                self.connections
+                    .read(cx)
+                    .open_session(connection, database, cx)
+            }
+        };
+        let connection = connection.to_string();
+        // The clock: a read with no answer in time stops its session, with
+        // what is queued on it; the rows they were filling say so.
+        let ended = Rc::new(std::cell::Cell::new(false));
+        let late = Rc::new(std::cell::Cell::new(false));
+        let timer = cx.background_executor().timer(LOAD_LIMIT);
+        cx.spawn({
+            let (ended, late, stop) = (ended.clone(), late.clone(), stop.clone());
+            let (connection, key) = (connection.clone(), key.clone());
+            async move |this, cx| {
+                timer.await;
+                // A stopped `Stop` is no longer the session's: nothing to do.
+                if ended.get() || stop.is_stopped() {
+                    return;
                 }
-            });
-            Ok(session)
+                late.set(true);
+                let _ = this.update(cx, |this, cx| {
+                    this.stop_session(&connection, &key, Halt::TimedOut, cx)
+                });
+            }
         })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let outcome = async {
+                let session = opening.await?;
+                // Kept for the next reads, unless stopped meanwhile or another
+                // opened at the same time is kept already.
+                let keep = this
+                    .update(cx, |this, _| {
+                        let Some(browse) = this.live(&connection, generation) else {
+                            return false;
+                        };
+                        if stop.is_stopped() {
+                            return false;
+                        }
+                        let kept = browse
+                            .sessions
+                            .entry(key)
+                            .or_insert_with(|| session.clone());
+                        Arc::ptr_eq(kept, &session)
+                    })
+                    .unwrap_or(false);
+                cx.update(|cx| {
+                    stop.run(cx, session, move |session| {
+                        let reading = work(session.clone());
+                        async move {
+                            let outcome = reading.await;
+                            // A session not kept holds no connection once read.
+                            if !keep {
+                                session.close().await;
+                            }
+                            outcome
+                        }
+                    })
+                })
+                .await
+                .unwrap_or(Err(Error::Cancelled))
+            }
+            .await;
+            ended.set(true);
+            match outcome {
+                Err(_) if late.get() => {
+                    Err(Error::Db(Box::new(kerno_core::DbError::message(format!(
+                        "the server took longer than {} s. Try again.",
+                        LOAD_LIMIT.as_secs()
+                    )))))
+                }
+                outcome => outcome,
+            }
+        })
+    }
+
+    /// Notes the read of node `id` (on the session of `database`): its row
+    /// says why when its session is stopped.
+    fn track(
+        &mut self,
+        connection: &str,
+        id: &str,
+        database: &str,
+        reading: String,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.session_key(connection, database, cx);
+        if let Some(browse) = self.browse.get_mut(connection) {
+            browse
+                .loading
+                .insert(id.to_string(), Loading { session, reading });
+        }
+    }
+
+    /// Stops every read of the tree's session `key` of `connection` and
+    /// closes it, which stops its statement on the server (C3); the rows
+    /// they were filling say why. The next read opens a new session.
+    fn stop_session(&mut self, connection: &str, key: &str, why: Halt, cx: &mut Context<Self>) {
+        let Some(browse) = self.browse.get_mut(connection) else {
+            return;
+        };
+        browse.sessions.remove(key);
+        if let Some(stop) = browse.stops.remove(key) {
+            stop.stop(cx);
+        }
+        let stopped: Vec<String> = browse
+            .loading
+            .iter()
+            .filter(|(_, loading)| loading.session == key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stopped {
+            let Some(loading) = browse.loading.remove(&id) else {
+                continue;
+            };
+            let message = why.message(&loading.reading);
+            if id == ROOT_LOAD {
+                browse.root = Root::Failed(message);
+            } else {
+                browse.tree.finish(&id, Err(message));
+            }
+        }
+        self.sync(cx);
+    }
+
+    /// The read filling the row `id` (an object row, its "Loading…" line,
+    /// a connection row or its "Loading databases…" line), when one runs:
+    /// its connection and the node it fills.
+    fn load_of_row(&self, id: &str) -> Option<(String, String)> {
+        let (connection, node) = match model::parse_row(id)? {
+            RowId::Connection(connection) => (connection, ROOT_LOAD),
+            RowId::Object { connection, local } if local == LINE_STATUS => (connection, ROOT_LOAD),
+            RowId::Object { connection, local } if model::is_note(local) => {
+                (connection, model::parent_of(local)?)
+            }
+            RowId::Object { connection, local } => (connection, local),
+            _ => return None,
+        };
+        self.browse
+            .get(connection)?
+            .loading
+            .contains_key(node)
+            .then(|| (connection.to_string(), node.to_string()))
+    }
+
+    /// Cancel on a loading row (its menu, its button, Cmd+.): stops the
+    /// read on the server, with those queued behind it on its session
+    /// (C3). Gives whether one ran.
+    pub fn cancel_load(&mut self, row: &str, cx: &mut Context<Self>) -> bool {
+        let Some((connection, node)) = self.load_of_row(row) else {
+            return false;
+        };
+        let Some(session) = self
+            .browse
+            .get(&connection)
+            .and_then(|browse| browse.loading.get(&node))
+            .map(|loading| loading.session.clone())
+        else {
+            return false;
+        };
+        self.stop_session(&connection, &session, Halt::Cancelled, cx);
+        true
+    }
+
+    /// Cmd+. in the tree: cancels the read of the selected row.
+    fn cancel_selected_load(&mut self, cx: &mut Context<Self>) -> bool {
+        let selected = self
+            .tree_state
+            .read(cx)
+            .selected_item()
+            .map(|item| item.id.to_string());
+        selected.is_some_and(|row| self.cancel_load(&row, cx))
     }
 
     /// Runs a load of `connection` on the session of its database.
@@ -657,8 +890,6 @@ impl Navigator {
         let Some(generation) = self.browse.get(connection).map(|browse| browse.generation) else {
             return;
         };
-        let session = self.session_for(connection, &load.database, cx);
-        let connection = connection.to_string();
         // What a failed load says on its row, then the server's words (C14).
         let reading = match &load.what {
             LoadKind::Schemas => "the schemas".to_string(),
@@ -666,41 +897,39 @@ impl Navigator {
             LoadKind::Structure { table } => format!("the columns of {}", table.name),
             LoadKind::Extensions => "the extensions".to_string(),
         };
+        self.track(connection, &load.id, &load.database, reading.clone(), cx);
+        let what = load.what.clone();
+        let fetching = self.read_on(connection, &load.database, cx, move |session| async move {
+            Ok(match what {
+                LoadKind::Schemas => Loaded::Schemas(session.schemas().await?),
+                LoadKind::Objects { schema } => {
+                    Loaded::Objects(Box::new(session.objects(&schema).await?))
+                }
+                LoadKind::Structure { table } => {
+                    Loaded::Structure(Box::new(session.table_structure(&table).await?))
+                }
+                LoadKind::Extensions => Loaded::Extensions(session.extensions().await?),
+            })
+        });
+        let connection = connection.to_string();
         cx.spawn(async move |this, cx| {
-            let outcome = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    let what = load.what.clone();
-                    let fetching = cx.update(|cx| {
-                        bridge::spawn(cx, async move {
-                            Ok(match what {
-                                LoadKind::Schemas => Loaded::Schemas(session.schemas().await?),
-                                LoadKind::Objects { schema } => {
-                                    Loaded::Objects(Box::new(session.objects(&schema).await?))
-                                }
-                                LoadKind::Structure { table } => Loaded::Structure(Box::new(
-                                    session.table_structure(&table).await?,
-                                )),
-                                LoadKind::Extensions => {
-                                    Loaded::Extensions(session.extensions().await?)
-                                }
-                            })
-                        })
-                    });
-                    fetching.await
-                }
-            };
+            let outcome = fetching.await;
             let _ = this.update(cx, |this, cx| {
-                if let Some(browse) = this.live(&connection, generation) {
-                    browse.tree.finish(
-                        &load.id,
-                        outcome.map_err(|error: kerno_core::Error| {
-                            format!("Could not read {reading}: {}", describe(&error))
-                        }),
-                    );
-                    this.advance_reveal(&connection, cx);
-                    this.sync(cx);
+                let Some(browse) = this.live(&connection, generation) else {
+                    return;
+                };
+                // Stopped: `stop_session` said so on the row.
+                if browse.loading.remove(&load.id).is_none() {
+                    return;
                 }
+                browse.tree.finish(
+                    &load.id,
+                    outcome.map_err(|error: kerno_core::Error| {
+                        format!("Could not read {reading}: {}", describe(&error))
+                    }),
+                );
+                this.advance_reveal(&connection, cx);
+                this.sync(cx);
             });
         })
         .detach();
@@ -1490,34 +1719,31 @@ impl Navigator {
         let table = self
             .relation_above(connection, &node.id)
             .map(|(table, _, _)| table);
-        let session = self.session_for(connection, &node.database, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = session.await;
-            let _ = this.update_in(cx, |_, window, cx| match outcome {
-                Ok(session) => {
-                    let dialect = session.dialect();
-                    let (title, sql) = match action {
-                        Action::CreateView => (
-                            "New view".to_string(),
-                            format!(
-                                "CREATE VIEW {} AS\nSELECT 1 AS one;\n",
-                                dialect.table_name(&TableRef::new(schema, "new_view"))
-                            ),
-                        ),
-                        // An empty tab that runs in this schema.
-                        Action::NewQueryHere => (schema.clone(), String::new()),
-                        _ => match create_template(action, dialect, &schema, table.as_ref()) {
-                            Some(template) => template,
-                            None => return,
-                        },
-                    };
-                    cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
-                }
-                Err(error) => window
-                    .push_notification(crate::error_notification(describe(&error).to_string()), cx),
-            });
-        })
-        .detach();
+        // The template needs the engine's dialect only: nothing is read.
+        let Some(meta) = self.meta(connection, cx) else {
+            window.push_notification(
+                crate::error_notification("The connection is not open.".into()),
+                cx,
+            );
+            return;
+        };
+        let dialect = meta.dialect();
+        let (title, sql) = match action {
+            Action::CreateView => (
+                "New view".to_string(),
+                format!(
+                    "CREATE VIEW {} AS\nSELECT 1 AS one;\n",
+                    dialect.table_name(&TableRef::new(schema, "new_view"))
+                ),
+            ),
+            // An empty tab that runs in this schema.
+            Action::NewQueryHere => (schema.clone(), String::new()),
+            _ => match create_template(action, dialect, &schema, table.as_ref()) {
+                Some(template) => template,
+                None => return,
+            },
+        };
+        cx.emit(NavigatorEvent::OpenQuery { title, sql, target });
     }
 
     /// Writes a statement for a table into a new query tab, which runs it
@@ -1537,37 +1763,21 @@ impl Navigator {
         let table = table.clone();
         let target = Some(Self::target_of(connection, node, false));
         let page_size = AppState::get(cx).settings.page_size;
-        let session = self.session_for(connection, &node.database, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let written = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    let table = table.clone();
-                    let writing = cx.update(|_, cx| {
-                        bridge::spawn(cx, async move {
-                            let structure = session.table_structure(&table).await?;
-                            let dialect = session.dialect();
-                            Ok(match template {
-                                Template::Select => select_template(
-                                    dialect,
-                                    &table,
-                                    &structure.columns,
-                                    u64::from(page_size),
-                                ),
-                                Template::Insert => {
-                                    insert_template(dialect, &table, &structure.columns)
-                                }
-                                Template::Update => update_template(dialect, &table, &structure),
-                                Template::Delete => delete_template(dialect, &table, &structure),
-                            })
-                        })
-                    });
-                    match writing {
-                        Ok(writing) => writing.await,
-                        Err(_) => return,
-                    }
+        let read = table.clone();
+        let writing = self.read_on(connection, &node.database, cx, move |session| async move {
+            let structure = session.table_structure(&read).await?;
+            let dialect = session.dialect();
+            Ok(match template {
+                Template::Select => {
+                    select_template(dialect, &read, &structure.columns, u64::from(page_size))
                 }
-            };
+                Template::Insert => insert_template(dialect, &read, &structure.columns),
+                Template::Update => update_template(dialect, &read, &structure),
+                Template::Delete => delete_template(dialect, &read, &structure),
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let written = writing.await;
             let _ = this.update_in(cx, |_, window, cx| match written {
                 Ok(sql) if run => cx.emit(NavigatorEvent::RunQuery {
                     title: table.name.clone(),
@@ -1615,42 +1825,29 @@ impl Navigator {
         let (schema, name, kind) = (schema.clone(), name.clone(), *kind);
         let identity = identity_arguments.clone();
         let target = Some(Self::target_of(connection, node, false));
-        let session = self.session_for(connection, &node.database, cx);
+        let routine = name.clone();
+        let writing = self.read_on(connection, &node.database, cx, move |session| async move {
+            let objects = session.objects(&schema).await?;
+            let arguments = objects
+                .routines
+                .iter()
+                .find(|found| {
+                    found.name == routine
+                        && found.kind == kind
+                        && found.identity_arguments == identity
+                })
+                .map(|found| found.arguments.clone())
+                .ok_or_else(|| kerno_core::Error::Config(format!("{routine} is gone")))?;
+            Ok(call_routine(
+                session.dialect(),
+                &schema,
+                &routine,
+                kind,
+                &arguments,
+            ))
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let written = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    let (schema, name) = (schema.clone(), name.clone());
-                    let writing = cx.update(|_, cx| {
-                        bridge::spawn(cx, async move {
-                            let objects = session.objects(&schema).await?;
-                            let arguments = objects
-                                .routines
-                                .iter()
-                                .find(|routine| {
-                                    routine.name == name
-                                        && routine.kind == kind
-                                        && routine.identity_arguments == identity
-                                })
-                                .map(|routine| routine.arguments.clone())
-                                .ok_or_else(|| {
-                                    kerno_core::Error::Config(format!("{name} is gone"))
-                                })?;
-                            Ok::<_, kerno_core::Error>(call_routine(
-                                session.dialect(),
-                                &schema,
-                                &name,
-                                kind,
-                                &arguments,
-                            ))
-                        })
-                    });
-                    match writing {
-                        Ok(writing) => writing.await,
-                        Err(_) => return,
-                    }
-                }
-            };
+            let written = writing.await;
             let _ = this.update_in(cx, |_, window, cx| match written {
                 Ok(sql) => {
                     let title = name.clone();
@@ -1686,31 +1883,18 @@ impl Navigator {
         };
         let object = object.clone();
         let title = format!("{} · properties", node.label);
-        let session = self.session_for(connection, &node.database, cx);
+        let reading = self.read_on(connection, &node.database, cx, move |session| async move {
+            let d = session.dialect();
+            let sql = match &object {
+                ObjectRef::Database(name) => d.database_properties_sql(name),
+                ObjectRef::Schema(name) => d.schema_properties_sql(name),
+                _ => None,
+            }
+            .ok_or_else(|| kerno_core::Error::Unsupported("properties of this object".into()))?;
+            exec::collect(session, sql).await
+        });
         cx.spawn_in(window, async move |_, cx| {
-            let read = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    let reading = cx.update(|_, cx| {
-                        bridge::spawn(cx, async move {
-                            let d = session.dialect();
-                            let sql = match &object {
-                                ObjectRef::Database(name) => d.database_properties_sql(name),
-                                ObjectRef::Schema(name) => d.schema_properties_sql(name),
-                                _ => None,
-                            }
-                            .ok_or_else(|| {
-                                kerno_core::Error::Unsupported("properties of this object".into())
-                            })?;
-                            exec::collect(session, sql).await
-                        })
-                    });
-                    match reading {
-                        Ok(reading) => reading.await,
-                        Err(_) => return,
-                    }
-                }
-            };
+            let read = reading.await;
             let _ = cx.update(|window, cx| match read {
                 Ok(collected) => crate::structure::tab::open_properties(
                     title,
@@ -1743,19 +1927,11 @@ impl Navigator {
         };
         let (object, name) = (object.clone(), node.label.clone());
         let target = Some(Self::target_of(connection, node, false));
-        let session = self.session_for(connection, &node.database, cx);
+        let reading = self.read_on(connection, &node.database, cx, move |session| async move {
+            session.ddl(&object).await
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let ddl = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    match cx.update(|_, cx| {
-                        bridge::spawn(cx, async move { session.ddl(&object).await })
-                    }) {
-                        Ok(reading) => reading.await,
-                        Err(_) => return,
-                    }
-                }
-            };
+            let ddl = reading.await;
             let _ = this.update_in(cx, |_, window, cx| match ddl {
                 Ok(sql) => cx.emit(NavigatorEvent::OpenQuery {
                     title: format!("DDL {name}"),
@@ -1788,22 +1964,12 @@ impl Navigator {
         };
         let (object, name) = (object.clone(), node.label.clone());
         let target = Some(Self::target_of(connection, node, false));
-        let session = self.session_for(connection, &node.database, cx);
+        let reading = self.read_on(connection, &node.database, cx, move |session| async move {
+            let ddl = session.ddl(&object).await?;
+            session.dialect().replace_source_sql(&object, &ddl)
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let script = match session.await {
-                Err(error) => Err(error),
-                Ok(session) => {
-                    match cx.update(|_, cx| {
-                        bridge::spawn(cx, async move {
-                            let ddl = session.ddl(&object).await?;
-                            session.dialect().replace_source_sql(&object, &ddl)
-                        })
-                    }) {
-                        Ok(reading) => reading.await,
-                        Err(_) => return,
-                    }
-                }
-            };
+            let script = reading.await;
             let _ = this.update_in(cx, |_, window, cx| match script {
                 Ok(sql) => cx.emit(NavigatorEvent::OpenSource {
                     title: name,
@@ -2271,9 +2437,10 @@ impl Navigator {
         }
     }
 
-    /// What else `change` reaches, read on the tree's session of `database`
-    /// (C11): a catalog read, quick, but the tree's loads of that database
-    /// wait behind it.
+    /// What else `change` reaches (C11), read on a session of its own
+    /// (C3): a slow read holds none of the tree's loads, and the dialog
+    /// going (closed, answered) stops it on the server and closes the
+    /// session; its clock running out leaves it to end on its own session.
     fn dependents(
         &mut self,
         connection: &str,
@@ -2281,11 +2448,28 @@ impl Navigator {
         change: Change,
         cx: &mut Context<Self>,
     ) -> Task<kerno_core::Result<Vec<Dependent>>> {
-        let session = self.session_for(connection, database, cx);
+        let database = self
+            .has_schemas(connection, cx)
+            .then(|| database.to_string());
+        let opening = self
+            .connections
+            .read(cx)
+            .open_session(connection, database, cx);
         cx.spawn(async move |_, cx| {
-            let session = session.await?;
-            cx.update(|cx| bridge::spawn(cx, async move { session.dependents(&change).await }))
-                .await
+            let session = opening.await?;
+            // Dropped with this task, when the dialog goes first.
+            let (_waiting, gone) = tokio::sync::oneshot::channel::<()>();
+            cx.update(|cx| {
+                bridge::spawn(cx, async move {
+                    let found = tokio::select! {
+                        found = session.dependents(&change) => found,
+                        _ = gone => Err(Error::Cancelled),
+                    };
+                    session.close().await;
+                    found
+                })
+            })
+            .await
         })
     }
 
@@ -2308,10 +2492,13 @@ impl Navigator {
         let Some(browse) = self.browse.get_mut(&connection) else {
             return;
         };
-        if let Some(released) = release {
-            browse.sessions.remove(&released);
-        }
         let generation = browse.generation;
+        // The tree's session on a database to drop would hold the drop.
+        if let Some(released) = release
+            && self.has_schemas(&connection, cx)
+        {
+            self.stop_session(&connection, &released, Halt::Cancelled, cx);
+        }
         let opening = self
             .connections
             .read(cx)
@@ -2943,7 +3130,7 @@ impl Navigator {
                 match self.tree(connection).and_then(|tree| tree.node(local)) {
                     Some(node) => Self::clicks(view, base, index)
                         .child(self.node_content(view, index, entry, connection, node, cx)),
-                    None => self.render_line(view, base, connection, local, entry, cx),
+                    None => self.render_line(view, base, index, connection, entry, cx),
                 }
             }
             Some(RowId::FolderNote(_)) | None => row(("node", index).into()).child(line_text(
@@ -3218,11 +3405,16 @@ impl Navigator {
         &self,
         view: &Entity<Self>,
         row: ListItem,
+        index: usize,
         connection: &str,
-        local: &str,
         entry: &TreeEntry,
         cx: &App,
     ) -> ListItem {
+        let row_id = entry.item().id.to_string();
+        let local = match model::parse_row(&row_id) {
+            Some(RowId::Object { local, .. }) => local,
+            _ => "",
+        };
         let theme = cx.theme();
         let label = entry.item().label.clone();
         let at = self
@@ -3303,6 +3495,28 @@ impl Navigator {
                                 Tooltip::new(message.clone()).build(window, cx)
                             }),
                     ),
+                    // "Loading…": a Cancel beside it while the read runs (C3).
+                    None if self.load_of_row(&row_id).is_some() => {
+                        let view = view.clone();
+                        row.child(
+                            h_flex()
+                                .gap_2()
+                                .child(line_text(label, theme.muted_foreground))
+                                .child(
+                                    Button::new(("node-load-cancel", index))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Cancel")
+                                        .tooltip("Stop the read on the server (Cmd+.)")
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            view.update(cx, |this, cx| {
+                                                this.cancel_load(&row_id, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                    }
                     None => row.child(line_text(label, theme.muted_foreground)),
                 }
             }
@@ -3568,6 +3782,18 @@ fn object_menu(
     cx: &mut App,
 ) -> PopupMenu {
     let navigator = view.read(cx);
+    // A read filling this row, or the node of this "Loading…" line, can be
+    // stopped from here (C3).
+    if navigator.load_of_row(id).is_some() {
+        let (view, id) = (view.clone(), id.to_string());
+        menu = menu
+            .item(
+                PopupMenuItem::new("Cancel loading").on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_load(&id, cx));
+                }),
+            )
+            .separator();
+    }
     let Some((connection, node)) = navigator.object(id) else {
         return menu;
     };
@@ -3760,6 +3986,13 @@ impl Render for Navigator {
                     .capture_action(cx.listener(|this, _: &SelectLeft, _, cx| {
                         cx.stop_propagation();
                         this.key_left(cx);
+                    }))
+                    // Cmd+. on a row being read stops the read (C3); else
+                    // it goes on to the active tab.
+                    .capture_action(cx.listener(|this, _: &crate::actions::CancelQuery, _, cx| {
+                        if this.cancel_selected_load(cx) {
+                            cx.stop_propagation();
+                        }
                     }))
                     .on_key_down(move |event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {

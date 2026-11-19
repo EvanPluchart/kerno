@@ -17,7 +17,10 @@
 //! Task… asks for both); the query tab's connection picker (`query::tab::connection_menu`) and
 //! the toolbar's lists (`workspace::toolbar`: the engines of New connection, the recent scripts
 //! of New SQL editor, the commit modes and isolation levels, the connection and the database /
-//! schema pickers, the items that did not fit, the toolbar's own right-click to hide items).
+//! schema pickers, the items that did not fit, the toolbar's own right-click to hide items); the
+//! schema tree's "Cancel the running statement" and "Cancel loading" (`navigator::view::
+//! object_menu`, shown only while a statement or a read runs on that row: they stop that row's
+//! work, which Cmd+. — the palette's Cancel — also does with the row selected).
 
 use crate::actions::COMMANDS;
 use crate::navigator::actions::{Action, FilterAction, Template, ToolEntry, tool_entries};

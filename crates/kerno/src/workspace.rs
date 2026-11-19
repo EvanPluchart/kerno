@@ -100,6 +100,10 @@ const QUIT_ROLLBACK_LIMIT: Duration = Duration::from_secs(3);
 /// How many closed query tabs can be reopened.
 const CLOSED_TABS: usize = 10;
 
+/// A `.sql` file larger than this is not put in the editor without asking: the editor holds
+/// and lays out the whole text on the UI thread (C3, D-087).
+const LARGE_SCRIPT: u64 = 20 * 1024 * 1024;
+
 /// The height of a tab of the kit (its default size), a row of the tabs.
 const TAB_HEIGHT: gpui_kit::Pixels = px(32.);
 /// The rows of tabs shown before they scroll.
@@ -460,6 +464,12 @@ pub struct Workspace {
     /// while some query tab holds a transaction (K4), so an idle window
     /// wakes for nothing. It only redraws: it never touches a session.
     tx_ticker: Option<Task<()>>,
+    /// [`LARGE_SCRIPT`], lowered by the tests (no file of 20 MB is written).
+    #[cfg(test)]
+    pub large_script: u64,
+    /// The last wizard opened to run a tool; for tests.
+    #[cfg(test)]
+    pub opened_wizard: Option<WeakEntity<BackupDialog>>,
     /// Quitting was decided (`cx.quit()` does nothing on the test platform).
     #[cfg(test)]
     quit_requested: bool,
@@ -539,6 +549,10 @@ impl Workspace {
             tx_ticker: None,
             #[cfg(test)]
             quit_requested: false,
+            #[cfg(test)]
+            large_script: LARGE_SCRIPT,
+            #[cfg(test)]
+            opened_wizard: None,
             tab_subscriptions: Vec::new(),
             _subscriptions: vec![
                 follow_system,
@@ -1281,7 +1295,10 @@ impl Workspace {
             // Its apply runs on a session of its own: stopped, not left to
             // run with nobody to see it end (C3).
             OpenTab::TableEditor(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
-            OpenTab::Structure(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {}
+            // Their reads, which a lock can hold, are stopped too.
+            OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            OpenTab::Tasks(_) => {}
         }
         // A closed query tab can be opened again, with its text.
         if let OpenTab::Query(tab) = tab {
@@ -2169,23 +2186,20 @@ impl Workspace {
             return;
         }
         let source = path.clone();
-        let reading = bridge::spawn_blocking(cx, move || std::fs::read_to_string(&source));
+        #[cfg(test)]
+        let large = self.large_script;
+        #[cfg(not(test))]
+        let large = LARGE_SCRIPT;
+        // A large file is not read at all before the user says what to do.
+        let reading = bridge::spawn_blocking(cx, move || match std::fs::metadata(&source) {
+            Ok(meta) if meta.len() > large => Ok(Err(meta.len())),
+            _ => std::fs::read_to_string(&source).map(Ok),
+        });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(sql) => {
-                    let (target, proposed) = this.script_target(&path, cx);
-                    let connection = target.as_ref().map(|target| target.connection.clone());
-                    let tab = this.open_query(String::new(), &sql, target, window, cx);
-                    AppState::update_settings(cx, |settings| {
-                        settings.remember_script(path.clone(), connection)
-                    });
-                    tab.update(cx, |tab, cx| {
-                        tab.set_file(path, false, cx);
-                        tab.propose(proposed, cx);
-                    });
-                    this.schedule_save(cx);
-                }
+                Ok(Err(size)) => this.ask_large_script(path, size, window, cx),
+                Ok(Ok(sql)) => this.open_script_text(path, &sql, window, cx),
                 Err(error) => {
                     // A recent script that went away leaves the list.
                     AppState::update_settings(cx, |settings| {
@@ -2202,6 +2216,149 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Opens `sql`, read from `path`, in a tab bound to the file (K6's rules for its connection).
+    fn open_script_text(
+        &mut self,
+        path: PathBuf,
+        sql: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (target, proposed) = self.script_target(&path, cx);
+        let connection = target.as_ref().map(|target| target.connection.clone());
+        let tab = self.open_query(String::new(), sql, target, window, cx);
+        AppState::update_settings(cx, |settings| {
+            settings.remember_script(path.clone(), connection)
+        });
+        tab.update(cx, |tab, cx| {
+            tab.set_file(path, false, cx);
+            tab.propose(proposed, cx);
+        });
+        self.schedule_save(cx);
+    }
+
+    /// A `.sql` file over [`LARGE_SCRIPT`]: asks whether to open it in the editor anyway or to
+    /// run it with Execute script (the engine's own client reads it, the editor never holds
+    /// it); Cancel opens nothing (C3). Enter answers nothing.
+    fn ask_large_script(
+        &mut self,
+        path: PathBuf,
+        size: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let title = SharedString::from(format!("“{name}” is {} MB", size.div_ceil(1024 * 1024)));
+        let text = SharedString::from(
+            "The editor keeps the whole text in memory and lays it out as you scroll: a file \
+             this large makes Kerno slow. Execute script runs it with the engine's own client \
+             (psql, mysql) without opening it, and shows its progress.",
+        );
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, path, text) = (workspace.clone(), path.clone(), text.clone());
+            dialog
+                .title(title.clone())
+                .w(px(500.))
+                .on_ok(|_, _, _| false)
+                .content(move |content, _, _| {
+                    let answer = |id: &'static str, label: &'static str, open: Option<bool>| {
+                        let (workspace, path) = (workspace.clone(), path.clone());
+                        Button::new(id).label(label).on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let path = path.clone();
+                            let _ = workspace.update(cx, |this, cx| match open {
+                                Some(true) => this.open_large_script(path, window, cx),
+                                Some(false) => this.run_large_script(path, window, cx),
+                                None => {}
+                            });
+                        })
+                    };
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id("large-script")
+                                    .test_support()
+                                    .aria_label(text.clone())
+                                    .text_sm()
+                                    .child(text.clone()),
+                            )
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(answer("large-script-cancel", "Cancel", None).ghost())
+                                    .child(
+                                        answer(
+                                            "large-script-open",
+                                            "Open in the editor",
+                                            Some(true),
+                                        )
+                                        .outline(),
+                                    )
+                                    .child(
+                                        answer(
+                                            "large-script-run",
+                                            "Run with Execute script…",
+                                            Some(false),
+                                        )
+                                        .primary(),
+                                    ),
+                            ),
+                    )
+                })
+        });
+    }
+
+    /// "Open in the editor" for a large file: read and opened as any other.
+    fn open_large_script(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let source = path.clone();
+        let reading = bridge::spawn_blocking(cx, move || std::fs::read_to_string(&source));
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| match outcome {
+                Ok(sql) => this.open_script_text(path, &sql, window, cx),
+                Err(error) => window.push_notification(
+                    Notification::error(SharedString::from(format!(
+                        "{} could not be opened: {error}",
+                        path.display()
+                    ))),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// "Run with Execute script…": the Tools wizard on the active tab's database (else the
+    /// default connection's), the file chosen; it asks before running, as it does from Tools.
+    fn run_large_script(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.target(cx))
+            .or_else(|| self.default_target(cx));
+        let Some(target) = target else {
+            window.push_notification(
+                Notification::warning(
+                    "Execute script: connect first, or right-click a database in the tree ▸ Tools.",
+                ),
+                cx,
+            );
+            return;
+        };
+        if let Some(dialog) =
+            self.open_tool_wizard(target, backup_dialog::Mode::ExecuteScript, window, cx)
+        {
+            dialog.update(cx, |dialog, cx| dialog.load_input(path, window, cx));
+        }
     }
 
     fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -2807,14 +2964,8 @@ impl Workspace {
         };
         if let Some(mode) = mode {
             let schema = target.schema.clone();
-            let workspace = cx.entity().downgrade();
-            if let Some(dialog) = self.open_wizard(target, mode, window, cx) {
+            if let Some(dialog) = self.open_tool_wizard(target, mode, window, cx) {
                 dialog.update(cx, |dialog, cx| {
-                    dialog.set_purpose(
-                        backup_dialog::Purpose::Run,
-                        move |cx| reload_tasks(&workspace, cx),
-                        cx,
-                    );
                     if mode == Mode::Backup {
                         if !tables.is_empty() {
                             dialog.only_tables(tables, cx);
@@ -2855,6 +3006,30 @@ impl Workspace {
             | ToolEntry::ExecuteScript
             | ToolEntry::Maintain(_) => {}
         }
+    }
+
+    /// The wizard of `mode` on `target`, to run now (not to save as a task).
+    fn open_tool_wizard(
+        &mut self,
+        target: Target,
+        mode: backup_dialog::Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<BackupDialog>> {
+        let workspace = cx.entity().downgrade();
+        let dialog = self.open_wizard(target, mode, window, cx)?;
+        dialog.update(cx, |dialog, cx| {
+            dialog.set_purpose(
+                backup_dialog::Purpose::Run,
+                move |cx| reload_tasks(&workspace, cx),
+                cx,
+            )
+        });
+        #[cfg(test)]
+        {
+            self.opened_wizard = Some(dialog.downgrade());
+        }
+        Some(dialog)
     }
 
     /// Tools ▸ Create new task…: the tool to make a task of, then its
@@ -3123,6 +3298,12 @@ impl Workspace {
         }
         if let Some(tab) = self.active_table_editor() {
             tab.update(cx, |tab, cx| tab.cancel(cx));
+        }
+        // Their reads too, which a lock can hold (C3).
+        match self.tabs.get(self.active_tab) {
+            Some(OpenTab::Structure(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            Some(OpenTab::Diagram(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            _ => {}
         }
     }
 

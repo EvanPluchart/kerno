@@ -819,6 +819,12 @@ impl BackupDialog {
 
     /// Takes `path` as the file to restore or run, shown in the file field.
     /// The opt-in to its client commands starts unchecked.
+    /// The file to restore or run, once chosen; for tests.
+    #[cfg(test)]
+    pub fn file(&self) -> Option<&std::path::Path> {
+        self.file.as_deref()
+    }
+
     pub fn load_input(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let shown = path.display().to_string();
         if self.file_field.read(cx).value() != shown {

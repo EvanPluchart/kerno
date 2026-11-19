@@ -8308,15 +8308,16 @@ fn restored_tabs_open_a_session_once_shown_and_structure_tabs_close_theirs(
     app.wait_until(cx, "the connection", |app, cx| {
         matches!(app.status(cx, 0), Status::Connected { .. })
     });
-    // The schema tree reads on the connection's own session meanwhile.
+    // The schema tree reads on a session of its own meanwhile (D-087: a
+    // read waiting for a lock there must not hold the connection's).
     app.wait_until(cx, "the schemas", |app, cx| {
         app.tree(cx).contains(&row(1, ROLE))
     });
-    // The connection holds one session; the tabs behind the query tab
-    // (which opens its own on its first run) hold none.
+    // The connection holds its session and the tree's; the tabs behind the
+    // query tab (which opens its own on its first run) hold none.
     app.step(cx, |_, _| ());
     let connection = sessions_of(ROLE);
-    assert_eq!(connection, 1);
+    assert_eq!(connection, 2);
     // Nor have they read anything.
     let (data, structure, admin) = cx.update(|cx| {
         let workspace = app.workspace.read(cx);
@@ -9078,7 +9079,8 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         // What each owner held while open, and what was left once it went.
         let mut open = Vec::new();
         let mut left = Vec::new();
-        left.push(("connected", settle(cx, engine, ROLE, (1, 0))));
+        // The connection holds its own session and the tree's (D-087).
+        left.push(("connected", settle(cx, engine, ROLE, (2, 0))));
 
         let ran = |app: &Fixture, cx: &mut TestAppContext| {
             app.run_in_new_tab(cx, &format!("select name from {items}"), "secondary-enter");
@@ -9111,9 +9113,9 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         };
 
         ran(&app, cx);
-        open.push(("query tab", settle(cx, engine, ROLE, (2, 0))));
+        open.push(("query tab", settle(cx, engine, ROLE, (3, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("query tab", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("query tab", settle(cx, engine, ROLE, (2, 0))));
 
         // A tab moved to another database, its results still on screen.
         ran(&app, cx);
@@ -9133,10 +9135,10 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
                     .iter()
                     .any(|outcome| outcome.contains("1 rows"))
         });
-        open.push(("moved query tab", settle(cx, engine, ROLE, (2, 0))));
+        open.push(("moved query tab", settle(cx, engine, ROLE, (3, 0))));
         drop(tab);
         app.press(cx, &["secondary-w"]);
-        left.push(("moved query tab", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("moved query tab", settle(cx, engine, ROLE, (2, 0))));
 
         // Moved with a transaction open: the old session goes, and with it
         // the transaction; the tab holds one in its new database (for
@@ -9149,16 +9151,16 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         };
         cx.update(|cx| tab.update(cx, |tab, cx| tab.set_target(Some(elsewhere), cx)));
         drop(tab);
-        left.push(("moved in a transaction", settle(cx, engine, ROLE, (2, 0))));
+        left.push(("moved in a transaction", settle(cx, engine, ROLE, (3, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("moved, then closed", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("moved, then closed", settle(cx, engine, ROLE, (2, 0))));
 
         in_transaction(&app, cx);
-        open.push(("manual commit", settle(cx, engine, ROLE, (2, 1))));
+        open.push(("manual commit", settle(cx, engine, ROLE, (3, 1))));
         app.press(cx, &["secondary-w"]);
         assert!(app.shows_label(cx, "Roll back and close"), "{engine:?}");
         app.click(cx, "ok");
-        left.push(("manual commit", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("manual commit", settle(cx, engine, ROLE, (2, 0))));
         assert_eq!(
             on_server(engine, &format!("SELECT count(*) FROM {items}")),
             "2"
@@ -9166,15 +9168,15 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
 
         app.open_table(cx, ROLE, "items", RelationKind::Table);
         app.wait_for_rows(cx, "Rows 1–2 of 2");
-        open.push(("data tab", settle(cx, engine, ROLE, (2, 0))));
+        open.push(("data tab", settle(cx, engine, ROLE, (3, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("data tab", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("data tab", settle(cx, engine, ROLE, (2, 0))));
 
         app.open_structure(cx, ROLE, "items", RelationKind::Table);
         app.wait_for_structure(cx);
-        open.push(("structure tab", settle(cx, engine, ROLE, (1, 0))));
+        open.push(("structure tab", settle(cx, engine, ROLE, (2, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("structure tab", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("structure tab", settle(cx, engine, ROLE, (2, 0))));
 
         app.step(cx, |window, cx| {
             app.workspace.update(cx, |workspace, cx| {
@@ -9188,15 +9190,15 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
             });
         });
         app.wait_for_editor(cx);
-        open.push(("table editor", settle(cx, engine, ROLE, (1, 0))));
+        open.push(("table editor", settle(cx, engine, ROLE, (2, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("table editor", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("table editor", settle(cx, engine, ROLE, (2, 0))));
 
         app.dispatch(cx, actions::OpenAdmin);
         app.wait_admin(cx, Pane::Sessions);
-        open.push(("admin tab", settle(cx, engine, ROLE, (2, 0))));
+        open.push(("admin tab", settle(cx, engine, ROLE, (3, 0))));
         app.press(cx, &["secondary-w"]);
-        left.push(("admin tab", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("admin tab", settle(cx, engine, ROLE, (2, 0))));
 
         let connections = app.connections.clone();
         let source = crate::export_dialog::Source::Query {
@@ -9208,9 +9210,9 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         .expect("the export dialog");
         app.export_to(cx, &dir.path().join("items.csv"));
         assert!(app.has(cx, "export-done"), "{engine:?}");
-        open.push(("export", settle(cx, engine, ROLE, (1, 0))));
+        open.push(("export", settle(cx, engine, ROLE, (2, 0))));
         app.click(cx, "export-close");
-        left.push(("export", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("export", settle(cx, engine, ROLE, (2, 0))));
 
         let file = dir.path().join("more.csv");
         std::fs::write(&file, "id,name\n20,c\n").unwrap();
@@ -9219,19 +9221,19 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
             .expect("the import dialog");
         app.import_file(cx, &dialog, &file);
         assert_eq!(app.run_import(cx, &dialog), "done: 1 rows", "{engine:?}");
-        open.push(("import", settle(cx, engine, ROLE, (1, 0))));
+        open.push(("import", settle(cx, engine, ROLE, (2, 0))));
         app.click(cx, "import-close");
-        left.push(("import", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("import", settle(cx, engine, ROLE, (2, 0))));
 
         app.backup_dialog(cx, database, false)
             .expect("the backup dialog");
-        open.push(("backup dialog", settle(cx, engine, ROLE, (1, 0))));
+        open.push(("backup dialog", settle(cx, engine, ROLE, (2, 0))));
         app.click(cx, "backup-close");
         // The dialogs do not give the keyboard back to the window.
         app.step(cx, |window, cx| {
             app.workspace.focus_handle(cx).focus(window, cx)
         });
-        left.push(("backup dialog", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("backup dialog", settle(cx, engine, ROLE, (2, 0))));
 
         // Several at once, one of them in a transaction.
         ran(&app, cx);
@@ -9242,12 +9244,12 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         app.wait_for_structure(cx);
         app.dispatch(cx, actions::OpenAdmin);
         app.wait_admin(cx, Pane::Sessions);
-        open.push(("all of them", settle(cx, engine, ROLE, (5, 1))));
+        open.push(("all of them", settle(cx, engine, ROLE, (6, 1))));
         app.press(cx, &["secondary-shift-w"]);
         assert!(app.shows_label(cx, "Roll back and close"), "{engine:?}");
         app.click(cx, "ok");
         assert!(app.titles(cx).is_empty(), "{engine:?}");
-        left.push(("close all", settle(cx, engine, ROLE, (1, 0))));
+        left.push(("close all", settle(cx, engine, ROLE, (2, 0))));
 
         // Tabs open when the connection is closed let their sessions go too.
         ran(&app, cx);
@@ -9256,7 +9258,7 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         app.wait_for_rows(cx, "Rows 1–3 of 3");
         app.dispatch(cx, actions::OpenAdmin);
         app.wait_admin(cx, Pane::Sessions);
-        open.push(("before disconnecting", settle(cx, engine, ROLE, (5, 1))));
+        open.push(("before disconnecting", settle(cx, engine, ROLE, (6, 1))));
         // The open transaction is asked about first: Cancel keeps every
         // session, the transaction still open.
         let disconnect = |app: &Fixture, cx: &mut TestAppContext| {
@@ -9269,7 +9271,7 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         };
         disconnect(&app, cx);
         app.click(cx, "end-cancel");
-        open.push(("disconnect cancelled", settle(cx, engine, ROLE, (5, 1))));
+        open.push(("disconnect cancelled", settle(cx, engine, ROLE, (6, 1))));
         // Rolled back, everything goes.
         disconnect(&app, cx);
         app.click(cx, "end-rollback");
@@ -9308,10 +9310,12 @@ fn every_owner_of_a_session_closes_it_when_it_goes_away(cx: &mut TestAppContext)
         let expected: Vec<_> = left
             .iter()
             .map(|(what, _)| {
+                // The connection's own session and the tree's (D-087), then
+                // what each owner held on top.
                 let sessions = match *what {
                     "disconnected" => 0,
-                    "moved in a transaction" => 2,
-                    _ => 1,
+                    "moved in a transaction" => 3,
+                    _ => 2,
                 };
                 (*what, (sessions, 0))
             })

@@ -101,8 +101,10 @@ pub fn preview(path: &Path, options: &CsvOptions, rows: usize) -> Result<CsvPrev
 /// The records of `path`, header left out, as an import reads them: the
 /// file is streamed, one record in memory at a time. Fails where the
 /// import would (a quote not closed, text not in the encoding). Reads the
-/// whole file: call it off the UI thread.
-pub fn count_records(path: &Path, options: &CsvOptions) -> Result<u64> {
+/// whole file: call it off the UI thread. Ends with [`Error::Cancelled`]
+/// once `stop` is set, checked at each record: the preview's scan of a
+/// large file, when a field changes and another scan starts (C3).
+pub fn count_records(path: &Path, options: &CsvOptions, stop: &AtomicBool) -> Result<u64> {
     let failed = |error| read_error(path, error);
     let mut reader = CsvReader::open(path, options).map_err(failed)?;
     if options.header {
@@ -110,6 +112,9 @@ pub fn count_records(path: &Path, options: &CsvOptions) -> Result<u64> {
     }
     let mut records = 0;
     while reader.next_record().map_err(failed)?.is_some() {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         records += 1;
     }
     Ok(records)
@@ -1137,11 +1142,21 @@ mod tests {
         let text = "id,note\r\n1,\"two\nlines\"\r\n\r\n2,\"a \"\"quote\"\"\"\n3,last";
         let path = file("a.csv", text.as_bytes());
         assert_eq!(
-            count_records(&path, &with_header(true, Encoding::Utf8)).unwrap(),
+            count_records(
+                &path,
+                &with_header(true, Encoding::Utf8),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             3
         );
         assert_eq!(
-            count_records(&path, &with_header(false, Encoding::Utf8)).unwrap(),
+            count_records(
+                &path,
+                &with_header(false, Encoding::Utf8),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             4
         );
         // UTF-16 with its byte order mark: the same records.
@@ -1151,18 +1166,55 @@ mod tests {
             .collect();
         let path = file("b.csv", &wide);
         assert_eq!(
-            count_records(&path, &with_header(true, Encoding::Utf16Le)).unwrap(),
+            count_records(
+                &path,
+                &with_header(true, Encoding::Utf16Le),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             1
         );
         let path = file("c.csv", b"");
         assert_eq!(
-            count_records(&path, &with_header(true, Encoding::Utf8)).unwrap(),
+            count_records(
+                &path,
+                &with_header(true, Encoding::Utf8),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
             0
         );
         // What stops an import stops the count, with its line.
         let path = file("d.csv", b"a\n1\n\"open\n");
-        let error = count_records(&path, &with_header(true, Encoding::Utf8)).unwrap_err();
+        let error = count_records(
+            &path,
+            &with_header(true, Encoding::Utf8),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("line 3"), "{error}");
+    }
+
+    /// C3: a scan whose flag is set stops at the next record (the preview's count, replaced by
+    /// another when a field changes), with `Cancelled`; an unset flag reads to the end.
+    #[test]
+    fn a_stopped_count_ends_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.csv");
+        std::fs::write(&path, "id\n".to_string() + &"1\n".repeat(10_000)).unwrap();
+        let header = CsvOptions {
+            header: true,
+            ..options(',', "")
+        };
+        let stopped = AtomicBool::new(true);
+        assert!(matches!(
+            count_records(&path, &header, &stopped),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            count_records(&path, &header, &AtomicBool::new(false)).unwrap(),
+            10_000
+        );
     }
 
     #[test]

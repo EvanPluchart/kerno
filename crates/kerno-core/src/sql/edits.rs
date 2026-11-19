@@ -8,6 +8,7 @@
 //! whole apply is rolled back.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dialect::Dialect;
 use crate::driver::{Session, TxState};
@@ -209,6 +210,17 @@ pub async fn apply_edits(
     session: &Arc<dyn Session>,
     statements: &[String],
 ) -> std::result::Result<(), ApplyFailure> {
+    apply_edits_until(session, statements, &AtomicBool::new(false)).await
+}
+
+/// [`apply_edits`], stopped by `stop`: read before each statement and before the `COMMIT`,
+/// so that a cancel landing between two statements (the server, idle then, ignores a cancel
+/// request) rolls back instead of letting the next ones run (C3).
+pub async fn apply_edits_until(
+    session: &Arc<dyn Session>,
+    statements: &[String],
+    stop: &AtomicBool,
+) -> std::result::Result<(), ApplyFailure> {
     let whole = |error: Error| ApplyFailure {
         statement: None,
         error,
@@ -224,7 +236,11 @@ pub async fn apply_edits(
     exec::collect(session.clone(), "START TRANSACTION")
         .await
         .map_err(whole)?;
-    match run_each(session, statements).await {
+    let failure = run_each(session, statements, stop).await.or_else(|| {
+        stop.load(Ordering::Acquire)
+            .then(|| whole(Error::Cancelled))
+    });
+    match failure {
         None => exec::collect(session.clone(), "COMMIT")
             .await
             .map(|_| ())
@@ -275,7 +291,7 @@ pub async fn apply_edits_in_transaction(
     exec::collect(session.clone(), format!("SAVEPOINT {SAVEPOINT}"))
         .await
         .map_err(whole)?;
-    let failure = run_each(session, statements).await;
+    let failure = run_each(session, statements, &AtomicBool::new(false)).await;
     let end = match failure {
         None => format!("RELEASE SAVEPOINT {SAVEPOINT}"),
         Some(_) => format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"),
@@ -300,8 +316,18 @@ pub async fn apply_edits_in_transaction(
 
 /// Runs `statements` one by one, each of which must change exactly one
 /// row; stops at the first that does not, and says which.
-async fn run_each(session: &Arc<dyn Session>, statements: &[String]) -> Option<ApplyFailure> {
+async fn run_each(
+    session: &Arc<dyn Session>,
+    statements: &[String],
+    stop: &AtomicBool,
+) -> Option<ApplyFailure> {
     for (index, sql) in statements.iter().enumerate() {
+        if stop.load(Ordering::Acquire) {
+            return Some(ApplyFailure {
+                statement: Some(index),
+                error: Error::Cancelled,
+            });
+        }
         let error = match exec::collect(session.clone(), sql.as_str()).await {
             Ok(collected) => {
                 let changed: u64 = collected

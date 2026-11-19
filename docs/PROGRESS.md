@@ -687,3 +687,25 @@ Still open (for the owner):
   tests, each seen failing under a one-line mutation; the existing cascade UI test now waits for the list before
   it clicks. `docs/COMPETITOR-ISSUES.md`: C11 answered (14 answered, 2 gaps, 3 do not apply, 1 not now). Limits
   in the "Done:" line of K14 (`docs/plans/M12.md`).
+
+## 2026-11-19 — K15: the other long operations (C3)
+
+- One way to stop a read on a server session (`bridge::Stop`, D-087): the read is aborted where it waits, then its
+  session is closed, which stops the statement on the server; MySQL's `close` kills a statement whose caller
+  dropped it midway.
+- The schema tree reads on sessions of its own: on the connection's meta session a read waiting for a lock held
+  the keep-alive ping, and the connection was taken for lost after 10-15 s (read, not run). Every read of the tree
+  has a 30 s clock and a Cancel ("Loading…" line, row menu, Cmd+.); the row says why in plain words and the tree
+  reads on at once. One more server connection per connected connection; idle memory not measured again.
+- The structure tab's, the table form's and the ER diagram's reads: Cancel, Cmd+. and closing the tab stop them on
+  the server. "Set comment" can be cancelled; a data apply's cancel between two statements rolls back. K14's list
+  is read on a session of its own and stopped when its dialog goes.
+- AI Stop closes the connection (`ureq`'s `Agent::shutdown`); a new CSV preview stops the scan before it; the ER
+  layout runs on the blocking pool; a `.sql` file over 20 MB asks before the editor reads it, or runs it with the
+  Execute script wizard.
+- Tests: three driver or core tests, eleven UI tests (the AI test now checks that the endpoint saw the connection
+  close), each seen failing under a one-line mutation; two tests that count the app's sessions now count two
+  per connected connection, not one.
+  `docs/COMPETITOR-ISSUES.md`: C3 answered (15 answered, 1 gap). Limits in the "Done:" line of K15
+  (`docs/plans/M12.md`): the FDW dialog, "List models", "Revert file", MySQL lock tests (its catalog reads never
+  waited).

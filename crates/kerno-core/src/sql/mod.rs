@@ -20,7 +20,8 @@ pub use complete::{
     CompletionItem, CompletionKind, complete,
 };
 pub use edits::{
-    ApplyFailure, CellValue, RowChange, apply_edits, apply_edits_in_transaction, edit_statements,
+    ApplyFailure, CellValue, RowChange, apply_edits, apply_edits_in_transaction, apply_edits_until,
+    edit_statements,
 };
 pub use format::{
     Comma, FormatOptions, Indent, KeywordCase, format_cleanly, format_sql, format_with,

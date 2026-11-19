@@ -144,7 +144,12 @@ pub struct Facts {
 
 enum Stage {
     Ready,
-    Sending { host: String, _task: Task<()> },
+    Sending {
+        host: String,
+        /// Closes the request's connection (Stop, C3).
+        stop: ai::Stopper,
+        _task: Task<()>,
+    },
     Answered(String),
     Failed(String),
     Stopped,
@@ -378,9 +383,11 @@ impl AiPanel {
         });
         let secrets = AppState::get(cx).secrets.clone();
         let key_name = ai::key_name(&endpoint.base);
+        let stop = ai::Stopper::default();
+        let stopper = stop.clone();
         let asking = bridge::spawn_blocking(cx, move || {
             let key: Option<Secret> = secrets.get(&key_name).ok().flatten();
-            ai::chat(&settings, key.as_ref(), &payload)
+            ai::chat_until(&settings, key.as_ref(), &payload, &stopper)
         });
         let task = cx.spawn_in(window, async move |this, cx| {
             let answer = asking.await;
@@ -397,18 +404,19 @@ impl AiPanel {
         });
         self.stage = Stage::Sending {
             host: endpoint.host,
+            stop,
             _task: task,
         };
         self.include_samples = false;
         cx.notify();
     }
 
-    /// Stops waiting: the answer, if it comes, is dropped (the request itself ends when the
-    /// server answers or after the 60 s timeout, on its own thread: `ureq` 3 has no way to
-    /// abort a call in flight). Dropping the task drops the wait on that thread, so nothing of
-    /// the late answer reaches the panel; a new request goes on a thread of its own.
+    /// Stops the request: its connection is closed at once (C3), so the endpoint sees the
+    /// client go and the call ends on its thread; nothing of an answer reaches the panel, and a
+    /// new request goes on a connection of its own.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.stage, Stage::Sending { .. }) {
+        if let Stage::Sending { stop, .. } = &self.stage {
+            stop.stop();
             self.generation += 1;
             self.stage = Stage::Stopped;
             cx.notify();
@@ -562,7 +570,7 @@ impl Render for AiPanel {
                 .test_support()
                 .text_xs()
                 .text_color(muted)
-                .child("Stopped. An answer that comes now is dropped.")
+                .child("Stopped: the request was closed, nothing was inserted.")
                 .into_any_element(),
             Stage::Failed(why) => div()
                 .id("ai-error")

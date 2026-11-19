@@ -9,7 +9,7 @@ use std::sync::Arc;
 use common::{exec_ok, run, scalar};
 use kerno_core::pending::Pending;
 use kerno_core::schema::{TableRef, TableStructure};
-use kerno_core::sql::{CellValue, RowChange, apply_edits, edit_statements};
+use kerno_core::sql::{CellValue, RowChange, apply_edits, apply_edits_until, edit_statements};
 use kerno_core::{ResultStore, Session, TxState, TypeKind};
 
 /// Every row of `table` as edit values, keyed by column name.
@@ -295,6 +295,30 @@ async fn a_failed_apply_changes_nothing() {
     // Same for a delete of a vanished row.
     let statements = generate(&[RowChange::Delete { key: key("404") }]);
     assert!(apply_edits(&session, &statements).await.is_err());
+    assert_eq!(snapshot().await, before);
+
+    // C3: a cancel that came before a statement was sent (between two of them the server,
+    // idle, ignores the cancel request) stops the apply there and rolls it back.
+    let statements = generate(&[
+        RowChange::Update {
+            key: key("1"),
+            set: set_text("changed"),
+        },
+        RowChange::Update {
+            key: key("2"),
+            set: set_text("changed"),
+        },
+    ]);
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let failure = apply_edits_until(&session, &statements, &stop)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.statement, Some(0));
+    assert!(
+        matches!(failure.error, kerno_core::Error::Cancelled),
+        "{failure}"
+    );
+    assert_eq!(session.tx_state(), TxState::Idle);
     assert_eq!(snapshot().await, before);
 
     // An update that sets a value to what it already is still counts as

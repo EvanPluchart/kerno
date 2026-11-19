@@ -118,6 +118,9 @@ pub struct DiagramTab {
     fit_pending: Rc<Cell<bool>>,
     /// Set to stop the load in flight (another load, the tab closed).
     cancel: Arc<AtomicBool>,
+    /// Stops the load's statement on the server too, where a lock may hold
+    /// it (C3).
+    stop: bridge::Stop,
     generation: u64,
     load: Vec<Task<()>>,
     /// The last export, for tests: its file or why it failed.
@@ -170,6 +173,7 @@ impl DiagramTab {
             canvas: Rc::default(),
             fit_pending: Rc::default(),
             cancel: Arc::default(),
+            stop: bridge::Stop::default(),
             generation: 0,
             load: Vec::new(),
             last_export: None,
@@ -239,7 +243,7 @@ impl DiagramTab {
     /// Reads nothing until shown (a restored tab): see `reveal`.
     pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
         self.hidden = true;
-        self.stop_loading();
+        self.stop_loading(cx);
         self.state = State::Waiting;
         cx.notify();
     }
@@ -251,17 +255,27 @@ impl DiagramTab {
         }
     }
 
-    fn stop_loading(&mut self) {
+    fn stop_loading(&mut self, cx: &App) {
         self.generation += 1;
         self.cancel.store(true, Ordering::Release);
+        self.stop.stop(cx);
         self.load.clear();
+    }
+
+    /// Stops the load in flight (Cmd+., the tab closed), on the server too.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Loading(_)) {
+            self.stop_loading(cx);
+            self.state = State::Failed("Cancelled: the tables were not read.".into());
+            cx.notify();
+        }
     }
 
     /// Reads the tables and lays them out again, on a session of its own
     /// that closes once they are read. Positions changed by dragging are
     /// lost.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.stop_loading();
+        self.stop_loading(cx);
         let generation = self.generation;
         if self.hidden || !self.connected(cx) {
             self.state = State::Waiting;
@@ -271,6 +285,8 @@ impl DiagramTab {
         self.state = State::Loading(Progress::default());
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = cancel.clone();
+        let stop = bridge::Stop::default();
+        self.stop = stop.clone();
         let opening = self.connections.read(cx).open_session(
             &self.target.connection,
             self.target.database.clone(),
@@ -297,23 +313,32 @@ impl DiagramTab {
                 }
             };
             let Ok(reading) = cx.update(|_, cx| {
-                bridge::spawn(cx, async move {
+                stop.run(cx, session, move |session| async move {
                     let tell = move |progress| {
                         let _ = sender.send(progress);
                     };
-                    let loaded = erd::load(session.clone(), &scope, tell, &cancel).await;
+                    let loaded = erd::load(session.clone(), &scope, tell, &cancel).await?;
                     session.close().await;
-                    // The layout too runs off the UI thread.
-                    loaded.map(|loaded| {
+                    // The layout is CPU work: on the blocking pool, not on
+                    // one of the runtime's three workers that the drivers
+                    // share (C3).
+                    tokio::task::spawn_blocking(move || {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(Error::Cancelled);
+                        }
                         let layout = erd::layout(&loaded.diagram);
                         let routes = routes_of(&loaded.diagram, &layout);
-                        (loaded, layout, routes)
+                        Ok((loaded, layout, routes))
                     })
+                    .await
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
                 })
             }) else {
                 return;
             };
-            let outcome = reading.await;
+            let Some(outcome) = reading.await else {
+                return;
+            };
             let _ = this.update(cx, |this, cx| match outcome {
                 Ok(_) if this.generation != generation => {}
                 Ok((loaded, layout, routes)) => {
