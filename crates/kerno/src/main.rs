@@ -22,6 +22,8 @@ mod library;
 mod local_clients_view;
 mod logging;
 mod maintenance_dialog;
+#[cfg(test)]
+mod menu_palette;
 mod multi_run;
 mod navigator;
 mod open_url;
@@ -410,7 +412,7 @@ fn command(id: &str) -> MenuItem {
         .unwrap_or_else(|| panic!("no command {id}"));
     let local = matches!(
         found.context,
-        Some("Navigator" | "ConnectionList" | "DataTable")
+        Some("Navigator" | "ConnectionList" | "DataTable" | "Settings")
     );
     MenuItem::Action {
         name: found.label.into(),
@@ -443,6 +445,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("About Kerno", About),
                 separator(),
                 MenuItem::action("Settings…", OpenSettings),
+                command("search_settings"),
                 command("open_keymap_file"),
                 separator(),
                 MenuItem::action("Quit Kerno", Quit),
@@ -458,6 +461,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Save", SaveFile),
                 MenuItem::action("Save As…", SaveFileAs),
                 command("revert_file"),
+                command("apply_source"),
                 command("copy_tab_file_path"),
                 command("reveal_tab_file"),
                 separator(),
@@ -558,10 +562,18 @@ fn menus() -> Vec<Menu> {
                 command("previous_result_tab"),
                 command("toggle_pinned_result"),
                 command("close_result_tab"),
+                command("close_other_result_tabs"),
+                command("close_result_tabs_to_the_left"),
+                command("close_result_tabs_to_the_right"),
+                command("close_all_result_tabs"),
+                command("unpin_all_result_tabs"),
+                command("rename_result_tab"),
+                command("copy_result_statement"),
                 command("fetch_more_rows"),
                 command("fetch_all_rows"),
                 separator(),
                 MenuItem::action("Cancel Running Statement", CancelQuery),
+                command("show_messages"),
                 separator(),
                 MenuItem::action("Query History", ShowHistory),
                 MenuItem::action("Saved Queries", ShowSavedQueries),
@@ -614,6 +626,15 @@ fn menus() -> Vec<Menu> {
                 command("show_aggregate_panel"),
                 command("show_columns_panel"),
                 command("reset_table_layout"),
+                command("copy_column_name"),
+                command("revert_selected_rows"),
+                command("show_all_columns"),
+                command("fit_all_column_widths"),
+                command("generate_select_by_key"),
+                command("generate_select_in"),
+                command("generate_row_insert"),
+                command("generate_row_update"),
+                command("generate_row_delete"),
             ],
         ),
         // The connection of the active tab, as DBeaver's Database menu.
@@ -663,6 +684,12 @@ fn menus() -> Vec<Menu> {
                         command("edit_connection"),
                         command("duplicate_connection"),
                         command("delete_connection"),
+                        command("new_connection_in_folder"),
+                        command("new_subfolder"),
+                        command("disconnect_folder"),
+                        command("paste_connection"),
+                        command("copy_connection_url"),
+                        command("copy_connection_host"),
                         separator(),
                         command("new_connection_folder"),
                         command("refresh_connections"),
@@ -689,6 +716,33 @@ fn menus() -> Vec<Menu> {
                         command("execute_routine"),
                         command("add_column_to_object"),
                         command("backup_object"),
+                        command("open_object_data"),
+                        command("open_object_structure"),
+                        command("show_object_ddl"),
+                        command("edit_object_source"),
+                        command("generate_select"),
+                        command("generate_insert"),
+                        command("generate_update"),
+                        command("generate_delete"),
+                        command("drop_object_cascade"),
+                        command("create_table"),
+                        command("create_view"),
+                        command("create_schema"),
+                        command("create_database"),
+                        command("create_function"),
+                        command("create_procedure"),
+                        command("create_sequence"),
+                        command("create_trigger"),
+                        command("create_event"),
+                        command("create_enum"),
+                        command("add_enum_value"),
+                        command("rename_enum_value"),
+                        command("install_extension"),
+                        command("export_object"),
+                        command("import_csv_into_object"),
+                        command("rename_column"),
+                        command("drop_column"),
+                        command("reveal_referenced_table"),
                         separator(),
                         command("hide_object_in_tree"),
                         command("show_only_object_in_tree"),

@@ -4593,6 +4593,9 @@ impl QueryTab {
                 cx.notify();
             }
             TabAction::Rename => self.rename_result(id, window, cx),
+            // A result without a statement (a failed connection) copies
+            // nothing: its menu greys the entry, the palette's command lands here.
+            TabAction::CopyStatement if self.results[index].statement.is_empty() => {}
             TabAction::CopyStatement => cx.write_to_clipboard(ClipboardItem::new_string(
                 self.results[index].statement.clone(),
             )),

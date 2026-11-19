@@ -679,40 +679,87 @@ impl ConnectionDialog {
     fn environment_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let environments = AppState::get(cx).settings.environments.clone();
         let dark = cx.theme().is_dark();
+        let muted = cx.theme().muted_foreground;
         let known = environments
             .iter()
             .any(|def| def.id == self.form.environment);
+        let chips = environments
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, def)| {
+                let selected = def.id == self.form.environment;
+                let dot = def.color(dark).map(|color| {
+                    div()
+                        .flex_none()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(gpui_kit::rgb(color))
+                });
+                theme::chip(("conn-env", index), selected)
+                    .small()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .children(dot)
+                            .child(SharedString::from(def.name.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.form.environment = def.id.clone();
+                        if this.editing.is_none() {
+                            this.form.read_only = def.rules.read_only;
+                        }
+                        cx.notify();
+                    }))
+            });
+        // What the chosen environment does (C5), beside its chips: the
+        // General tab is tall already, so the line takes no row of its own.
+        let rules = environment::describe(environment::environment(
+            &environments,
+            &self.form.environment,
+        ));
         v_flex()
             .gap_1()
             .child(
                 h_flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(environments.into_iter().enumerate().map(|(index, def)| {
-                        let selected = def.id == self.form.environment;
-                        let dot = def.color(dark).map(|color| {
-                            div()
-                                .flex_none()
-                                .size(px(8.))
-                                .rounded_full()
-                                .bg(gpui_kit::rgb(color))
-                        });
-                        theme::chip(("conn-env", index), selected)
-                            .small()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .children(dot)
-                                    .child(SharedString::from(def.name.clone())),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.form.environment = def.id.clone();
-                                if this.editing.is_none() {
-                                    this.form.read_only = def.rules.read_only;
-                                }
-                                cx.notify();
-                            }))
-                    })),
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child("Environment"),
+                    )
+                    .child(
+                        Button::new("conn-env-edit")
+                            .ghost()
+                            .xsmall()
+                            .label("Edit environments…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                crate::settings_view::SettingsView::open(
+                                    this.connections.clone(),
+                                    crate::settings_view::Section::Environments,
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(h_flex().flex_none().gap_1().children(chips))
+                    .child(
+                        div()
+                            .id("conn-env-rules")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(rules.clone()))
+                            .test_text(rules),
+                    ),
             )
             .when(!known, |this| {
                 this.child(
@@ -978,7 +1025,7 @@ impl ConnectionDialog {
                 h_flex()
                     .gap_3()
                     .items_start()
-                    .child(div().flex_1().child(self.field(
+                    .child(div().flex_1().min_w_0().child(self.field(
                         "Name",
                         None,
                         Input::new(&self.inputs.name).id("conn-name"),
@@ -996,15 +1043,10 @@ impl ConnectionDialog {
                                 cx,
                             ),
                         ),
-                    ),
+                    )
+                    .child(self.field("Colour", None, h_flex().gap_1().children(swatches), cx)),
             )
-            .child(
-                h_flex()
-                    .gap_6()
-                    .items_start()
-                    .child(self.field("Colour", None, h_flex().gap_1().children(swatches), cx))
-                    .child(self.field("Environment", None, environments, cx)),
-            )
+            .child(environments)
             .child(
                 h_flex()
                     .gap_3()

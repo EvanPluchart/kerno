@@ -14,6 +14,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [AI assistant and what it sends](#ai-assistant-and-what-it-sends)
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
+- [Settings, environments and what wins](#settings-environments-and-what-wins)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
@@ -157,6 +158,41 @@ Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Chec
 click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
 [architecture notes](ARCHITECTURE.md#the-update-check) give the details.
 
+## Settings, environments and what wins
+
+Settings (Cmd+,) opens with the keyboard in its search field: type a word ("dark", "font size", "autocommit",
+"confirm", "vim", "pg_dump") and only the settings whose label, description or usual synonyms start with it
+stay, from every section, under their section's name; each works where it is found. Cmd+F gives the search the
+keyboard again, Escape empties it (and closes Settings when it is empty); a word that matches nothing says so
+and offers to clear the search. Environments, Local clients and AI are views of their own: the search lists
+them with an **Open** button. The command **Find a Setting…** in the palette opens Settings the same way.
+
+A muted line under a setting says what can override it, in the same shape everywhere ("… wins: …"), worked out
+from your environments as they stand:
+
+- **Confirmations ▸ Ask before running a statement … without a WHERE** covers statements run from a query tab
+  (a statement, a selection, a script, EXPLAIN ANALYZE, a run on several connections). A drop or a truncate
+  from the tree, and the changes applied from a grid or a table form, always show their SQL first. An environment whose rules confirm every statement or ask twice
+  before writes asks whatever this says; with the setting off, these statements run without asking in the others
+  (with the built-ins: Production still asks, Local and Staging run the statement).
+- **Ask before closing a tab …**: an open transaction always asks.
+- **Grid ▸ Show the results of a script one under the other**: a result's "Open in its own tab" wins for its
+  query tab until the next run.
+- **Updates ▸ Check for updates**: `KERNO_NO_UPDATE_CHECK` wins.
+- **Local clients**: a connection's own client (its Advanced tab, or "Local client…" in a wizard) wins over the
+  default chosen there.
+- **Environments**: a connection's own "New query tabs start in" (Advanced tab) wins over the auto-commit rule
+  unless it says "From the environment"; the read-only rule only sets a new connection's Read-only switch, and
+  the switch wins; "Confirm every statement" and "Ask a second time" win over Settings ▸ Confirmations.
+
+The connection dialog says under the Environment field what the chosen environment does ("Production: asks
+before every statement run from an editor, twice before any write, starts query tabs in manual commit, rolls
+back a transaction left idle for 10 min."), and **Edit environments…** opens them.
+
+Every entry of a context menu and every toolbar button is also a command of the palette (Cmd+K), except the
+ones that only make sense where they are: one entry per connection, database, schema, folder or foreign key,
+the value or column under the pointer, the text field's own Cut, Copy and Paste.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
@@ -278,6 +314,7 @@ reachable from the command palette.
 | -------- | ------ |
 | Cmd+K | Command palette |
 | Cmd+, | Settings |
+| Cmd+F | Find a setting (in Settings) |
 | Cmd+N | New connection |
 | Cmd+P | Open table (quick open) |
 | Cmd+B | Toggle sidebar |

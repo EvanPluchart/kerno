@@ -1860,3 +1860,41 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Classify**: `BEGIN NOT ATOMIC …` is no longer a transaction `BEGIN` (it would have shown a transaction that
   is not there): kind `Other`, a write, destructive as its statements are. A `CREATE` with a body stays a
   write, not destructive, no rows (unchanged: the body is stored).
+
+## D-085 — Settings' search, the "what wins" lines, and which menu entries are commands (K13, C4, C5, C20; 2026-11-19)
+
+- **One declaration per row**: `settings_view::ROWS` (a static table: kind, section, element id, label,
+  description, keywords) is what the view draws, section by section, and what the search reads; `render_row`
+  draws a row from its kind, with its label, its description and its override line. The sub-views
+  (Environments, Local clients, AI) are one row each: drawn as the view, found by their keywords, and in the
+  search's results a line with **Open**. The environments' rule labels are one const list
+  (`environments_view::RULE_LABELS`) the form draws and the search reads. Chosen over a rewrite into a generic
+  settings model: the controls stay as they were (ids kept, so every earlier UI test still clicks them).
+- **Search**: each word typed must start a word of the row (section name, label, description, keywords), so
+  "rap" does not find "wrap" and "font size" finds the three sizes and not ligatures. The tab bar stays and the
+  body keeps its 400 px, so nothing moves while rows hide; the results are grouped under their section's name.
+  Settings opens with the keyboard in the search; Escape empties a search that holds text (the kit's
+  `clean_on_escape`, switched on only while text is typed) and closes Settings on an empty one; ⌘F is a command
+  (`search_settings`, "Find a Setting…") bound in a new `Settings` key context, so it is in the keymap file and
+  the palette, and the menu bar carries it through `RunCommand` (as the other local commands) so ⌘F elsewhere
+  keeps its meaning.
+- **Override lines** say "<who> wins: <what it does>." and are worked out from the code that decides, not
+  written from the plan: `confirm_destructive`'s names the environments whose rules ask anyway
+  (`confirm_execute` or `confirm_writes_twice`, `QueryTab::execute`) and those where these statements run without asking with it off,
+  from the environments as they stand (the static line it replaces said "production asks twice … whatever is
+  chosen here", false once the user unticks production's rule). Only the settings something overrides carry one
+  (pinned by `only_what_can_be_overridden_has_a_line`). Nothing changes behaviour.
+- **The connection dialog's line** is `environment::describe`, a pure function of the rules (with the name):
+  "no rule of its own; only Settings ▸ Confirmations asks" rather than the plan's "statements run without
+  asking", which is false while that setting is on.
+- **Menu entries and commands**: a menu entry gets a command when it acts on the tree's selected node or
+  folder, the active tab, the result or grid on screen, and its handler is one line (`on_tree`, `on_subject`,
+  `on_grid`, `perform_on_active_result`) and its target refuses what the menu greys: 51 commands added (and
+  Find a Setting…). An entry that only makes sense where it is (one of a
+  list, the value or column under the pointer, the text field's own Cut/Copy/Paste, a status bar item's own
+  text) is an exception with its reason in `menu_palette.rs`; three wait for a check their menu has and the target
+  does not ("Run again" only on an incomplete result; "Filter by this value" and "Exclude this value" greyed on a
+  binary or JSON value). Menus built from closures are named in that file,
+  not walked.
+- **No "simple mode"** (C20): the default layout is the calm one and the toolbar's items can be hidden; a second
+  mode would double what has to be tested.

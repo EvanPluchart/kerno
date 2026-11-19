@@ -134,6 +134,44 @@ impl EnvironmentDef {
     }
 }
 
+/// What an environment's rules make Kerno do, in one line, for the
+/// connection dialog: "Production: asks before every statement run from an
+/// editor, twice before any write, …". An environment without a rule says
+/// that Settings ▸ Confirmations alone asks.
+pub fn describe(def: &EnvironmentDef) -> String {
+    let rules = &def.rules;
+    let mut parts: Vec<String> = Vec::new();
+    if rules.confirm_execute {
+        parts.push("asks before every statement run from an editor".into());
+    }
+    if rules.confirm_writes_twice {
+        parts.push(if rules.confirm_execute {
+            "twice before any write".into()
+        } else {
+            "asks twice before any write".into()
+        });
+    }
+    if !rules.auto_commit {
+        parts.push("starts query tabs in manual commit".into());
+    }
+    if rules.read_only {
+        parts.push("starts new connections read-only".into());
+    }
+    if let Some(seconds) = rules.close_idle_transactions.filter(|seconds| *seconds > 0) {
+        parts.push(format!(
+            "rolls back a transaction left idle for {} min",
+            seconds.div_ceil(60)
+        ));
+    }
+    if parts.is_empty() {
+        return format!(
+            "{}: no rule of its own; only Settings ▸ Confirmations asks.",
+            def.name
+        );
+    }
+    format!("{}: {}.", def.name, parts.join(", "))
+}
+
 /// Whether `id` names a built-in environment.
 pub fn is_builtin(id: &str) -> bool {
     matches!(id, LOCAL | STAGING | PRODUCTION)
@@ -303,6 +341,51 @@ mod tests {
         assert!(builtins.iter().all(|def| def.rules.confirm_edits));
         assert_eq!(environment(&builtins, LOCAL).tint, Tint::None);
         assert_eq!(environment(&builtins, STAGING).tint, Tint::Soft);
+    }
+
+    /// C5: the connection dialog says what the chosen environment does.
+    #[test]
+    fn the_rules_are_described_in_one_line() {
+        let builtins = builtin_environments();
+        assert_eq!(
+            describe(environment(&builtins, PRODUCTION)),
+            "Production: asks before every statement run from an editor, twice before any \
+             write, starts query tabs in manual commit, rolls back a transaction left idle \
+             for 10 min."
+        );
+        for (id, name) in [(LOCAL, "Local"), (STAGING, "Staging")] {
+            assert_eq!(
+                describe(environment(&builtins, id)),
+                format!("{name}: no rule of its own; only Settings ▸ Confirmations asks.")
+            );
+        }
+        let mut own = EnvironmentDef {
+            id: "qa".into(),
+            name: "QA".into(),
+            color_light: None,
+            color_dark: None,
+            tint: Tint::None,
+            rules: EnvironmentRules::default(),
+        };
+        assert_eq!(
+            describe(&own),
+            "QA: no rule of its own; only Settings ▸ Confirmations asks."
+        );
+        own.rules.confirm_writes_twice = true;
+        own.rules.read_only = true;
+        // An imported period need not be whole minutes: rounded up.
+        own.rules.close_idle_transactions = Some(90);
+        assert_eq!(
+            describe(&own),
+            "QA: asks twice before any write, starts new connections read-only, rolls back a \
+             transaction left idle for 2 min."
+        );
+        // A zero period is no rule (the tab never arms it).
+        own.rules = EnvironmentRules {
+            close_idle_transactions: Some(0),
+            ..EnvironmentRules::default()
+        };
+        assert!(describe(&own).contains("no rule of its own"));
     }
 
     #[test]

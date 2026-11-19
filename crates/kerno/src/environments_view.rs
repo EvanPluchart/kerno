@@ -4,6 +4,7 @@
 //! name, colours, tint and rules. Every change applies at once to the open
 //! windows and is stored.
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -22,6 +23,36 @@ use crate::theme;
 
 /// The idle period a rule starts with when it is turned on, in seconds.
 const IDLE_DEFAULT: u32 = 600;
+
+const AUTO_COMMIT: &str = "Auto-commit by default (otherwise query tabs start in manual commit)";
+const CONFIRM_EXECUTE: &str = "Confirm every statement run from an editor";
+const CONFIRM_EDITS: &str =
+    "Confirm data edits (always: changes are shown as SQL before they apply)";
+const WRITES_TWICE: &str = "Ask a second time before any statement that writes";
+const READ_ONLY: &str = "New connections start read-only";
+const CLOSE_IDLE: &str = "Roll back a transaction left idle for";
+
+/// The rules' labels, as drawn: Settings' search finds the environments
+/// by them too.
+pub(crate) const RULE_LABELS: [&str; 6] = [
+    AUTO_COMMIT,
+    CONFIRM_EXECUTE,
+    CONFIRM_EDITS,
+    WRITES_TWICE,
+    READ_ONLY,
+    CLOSE_IDLE,
+];
+
+/// What wins over a rule, or what a rule wins over (C5), under it: from
+/// `ConnectionConfig::starts_in_manual_commit`, `QueryTab::execute` and
+/// `sql_confirm` (the second question), and the connection dialog (the
+/// read-only rule presets a new connection's switch).
+const AUTO_COMMIT_WINS: &str =
+    "A connection's own commit mode wins over this default (its Advanced tab).";
+const CONFIRMATIONS_LOSE: &str =
+    "This rule wins over Settings ▸ Confirmations: it asks even when that is off.";
+const READ_ONLY_WINS: &str =
+    "A connection's Read-only switch wins: this rule only presets it on new ones.";
 
 /// One of the colours of an environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +418,18 @@ impl EnvironmentsView {
                 })
         };
         let idle = def.rules.close_idle_transactions.is_some();
+        // The line under a rule saying what wins (C5).
+        let wins = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .test_support()
+                // Tight under its rule, which it is about.
+                .mt(px(-6.))
+                .text_xs()
+                .text_color(muted)
+                .child(text)
+                .test_text(text)
+        };
         let tints = Tint::ALL
             .iter()
             .enumerate()
@@ -433,42 +476,47 @@ impl EnvironmentsView {
             .child(div().pt_1().font_weight(FontWeight::MEDIUM).child("Rules"))
             .child(rule(
                 "env-auto-commit",
-                "Auto-commit by default (otherwise query tabs start in manual commit)",
+                AUTO_COMMIT,
                 def.rules.auto_commit,
                 |rules, on| rules.auto_commit = on,
                 cx,
             ))
+            .child(wins("override-env-auto-commit", AUTO_COMMIT_WINS))
             .child(rule(
                 "env-confirm-execute",
-                "Confirm every statement run from an editor",
+                CONFIRM_EXECUTE,
                 def.rules.confirm_execute,
                 |rules, on| rules.confirm_execute = on,
                 cx,
             ))
+            .child(wins("override-env-confirm-execute", CONFIRMATIONS_LOSE))
             .child(
                 // Kerno always shows pending changes as SQL before applying
                 // them (CLAUDE.md §1): the rule is on and cannot be turned off.
                 Checkbox::new("env-confirm-edits")
-                    .label(
-                        "Confirm data edits (always: changes are shown as SQL before they apply)",
-                    )
+                    .label(CONFIRM_EDITS)
                     .checked(true)
                     .disabled(true),
             )
             .child(rule(
                 "env-confirm-writes-twice",
-                "Ask a second time before any statement that writes",
+                WRITES_TWICE,
                 def.rules.confirm_writes_twice,
                 |rules, on| rules.confirm_writes_twice = on,
                 cx,
             ))
+            .child(wins(
+                "override-env-confirm-writes-twice",
+                CONFIRMATIONS_LOSE,
+            ))
             .child(rule(
                 "env-read-only",
-                "New connections start read-only",
+                READ_ONLY,
                 def.rules.read_only,
                 |rules, on| rules.read_only = on,
                 cx,
             ))
+            .child(wins("override-env-read-only", READ_ONLY_WINS))
             .child(
                 h_flex()
                     .gap_2()
@@ -476,7 +524,7 @@ impl EnvironmentsView {
                         // Turned on, the rule takes the minutes in the field.
                         let (view, minutes) = (cx.entity(), self.idle_minutes.clone());
                         Checkbox::new("env-close-idle")
-                            .label("Roll back a transaction left idle for")
+                            .label(CLOSE_IDLE)
                             .checked(idle)
                             .on_click(move |on, _, cx| {
                                 let seconds = minutes
@@ -505,9 +553,8 @@ impl EnvironmentsView {
                     .child("minutes"),
             )
             .child(div().text_xs().text_color(muted).child(
-                "In a manual-commit tab, once the transaction changed something; never while a \
-                 statement runs. A connection's own commit mode and read-only flag win over \
-                 these defaults.",
+                "In a query tab whose open transaction changed something, in either commit \
+                 mode; never while a statement runs.",
             ))
             .into_any_element()
     }

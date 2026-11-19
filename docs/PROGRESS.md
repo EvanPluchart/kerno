@@ -642,3 +642,25 @@ Still open (for the owner):
   `sql_hard_inputs` probes, and one UI test per engine typing a routine and checking its body on the server; the
   ones holding a body seen failing before. `docs/COMPETITOR-ISSUES.md`: C9 answered (11 answered, 3 gaps, 1
   untested). Limits in the "Done:" line of K12 (`docs/plans/M12.md`).
+
+## 2026-11-19 — K13: search in Settings, what wins, every menu entry in the palette (C4, C5, C20)
+
+- Settings opens with the keyboard in a search field: each word typed must start a word of a row's section,
+  label, description or keywords; matches from every section show under their section's name and work there;
+  Environments, Local clients and AI are found by their words and open; no match says so with Clear search;
+  Escape empties the search, then closes Settings; ⌘F ("Find a Setting…", also in the palette) gives it the
+  keyboard. One declaration per row (`settings_view::ROWS`) draws the row and is searched (D-085).
+- A muted "… wins: …" line under each setting something overrides, worked out from the code: the destructive
+  confirmation names the environments whose rules ask anyway and those where nothing asks with it off, and says
+  it covers query-tab runs; closing a tab, stacked results, update checks, Local clients, and the environments'
+  commit mode, read-only preset and confirmations say theirs. No behaviour changed.
+- The connection dialog says what the chosen environment does beside its chips (`environment::describe`), with
+  Edit environments…; Colour moved beside Folder so the General tab does not grow.
+- Every entry of the data-built context menus and every toolbar button reaches a palette command, or is an
+  exception with its reason (`menu_palette.rs`, exhaustive `match`es); 51 commands added (tree create, generate,
+  DDL, column and enum edits; result-tab closes; generated row SQL; folder entries; Apply source; Show
+  messages), each checked against what its menu greys. "Run again" and the grid's filter by this value wait for
+  that check; closure-built menus are named, not walked.
+- Tests: one `kerno-core`, five settings, three menu/palette, four UI (two on PostgreSQL pinning that production
+  still asks twice with the setting off and local does not), each seen failing under a one-line mutation.
+  `docs/COMPETITOR-ISSUES.md`: C4 and C5 answered, C20 still does not apply (13 answered, 2 gaps).

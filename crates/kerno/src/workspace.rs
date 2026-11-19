@@ -65,8 +65,8 @@ use crate::erd_tab::{DiagramTab, DiagramTabEvent};
 use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
-use crate::navigator::actions::FilterAction;
 use crate::navigator::actions::ToolEntry;
+use crate::navigator::actions::{FilterAction, Template};
 use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
@@ -86,7 +86,7 @@ use gpui_kit::component::Disableable as _;
 use kerno_core::browse::Filter;
 use kerno_core::erd::Scope as DiagramScope;
 use kerno_core::schema::{RelationKind, TableRef};
-use kerno_core::sql::CellValue;
+use kerno_core::sql::{CellValue, RowSql};
 use kerno_core::storage::SavedQuery;
 use kerno_core::{Engine, TxState};
 
@@ -1813,7 +1813,12 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        crate::settings_view::SettingsView::open(self.connections.clone(), window, cx);
+        crate::settings_view::SettingsView::open(
+            self.connections.clone(),
+            crate::settings_view::Section::Appearance,
+            window,
+            cx,
+        );
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
@@ -2027,6 +2032,34 @@ impl Workspace {
         }
         navigator.update(cx, |navigator, cx| {
             navigator.perform_on_selected(action, window, cx)
+        });
+    }
+
+    /// Runs a sidebar menu entry on the folder or connection selected in
+    /// the tree, as its menu does (the sidebar refuses an entry that is not
+    /// that subject's).
+    fn on_subject(&mut self, action: SidebarAction, window: &mut Window, cx: &mut Context<Self>) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        match navigator.read(cx).selected_subject(cx) {
+            Some(subject) => self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.perform(&subject, action, window, cx)
+            }),
+            None => window.push_notification(
+                Notification::warning("Select a connection in the sidebar first."),
+                cx,
+            ),
+        }
+    }
+
+    /// Runs an entry of the menu of the sidebar's empty area.
+    fn on_subject_of_list(
+        &mut self,
+        action: SidebarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.perform(&Subject::List, action, window, cx)
         });
     }
 
@@ -4937,7 +4970,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
         use crate::query::grid::CopyFormat;
-        root.on_action(cx.listener(|_, command: &actions::RunCommand, window, cx| {
+        root.on_action(
+            // The settings, opened with the keyboard in their search; open
+            // already, their own handler takes the action.
+            cx.listener(|this, _: &actions::SearchSettings, window, cx| {
+                this.open_settings(&OpenSettings, window, cx)
+            }),
+        )
+        .on_action(cx.listener(|_, command: &actions::RunCommand, window, cx| {
             if let Some(found) = actions::COMMANDS
                 .iter()
                 .find(|found| found.id == command.id)
@@ -5760,6 +5800,275 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &crate::actions::ClearObjectFilter, window, cx| {
                     this.filter_in_tree(FilterAction::Clear, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::OpenObjectData, window, cx| {
+                    this.on_tree(TreeAction::OpenData, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::OpenObjectStructure, window, cx| {
+                    this.on_tree(TreeAction::OpenStructure, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowObjectDdl, window, cx| {
+                    this.on_tree(TreeAction::ShowDdl, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::EditObjectSource, window, cx| {
+                    this.on_tree(TreeAction::EditSource, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateSelect, window, cx| {
+                    this.on_tree(TreeAction::Generate(Template::Select), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateInsert, window, cx| {
+                    this.on_tree(TreeAction::Generate(Template::Insert), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateUpdate, window, cx| {
+                    this.on_tree(TreeAction::Generate(Template::Update), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateDelete, window, cx| {
+                    this.on_tree(TreeAction::Generate(Template::Delete), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::DropObjectCascade, window, cx| {
+                    this.on_tree(TreeAction::DropCascade, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateTable, window, cx| {
+                    this.on_tree(TreeAction::CreateTable, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateView, window, cx| {
+                    this.on_tree(TreeAction::CreateView, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateSchema, window, cx| {
+                    this.on_tree(TreeAction::CreateSchema, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateDatabase, window, cx| {
+                    this.on_tree(TreeAction::CreateDatabase, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateFunction, window, cx| {
+                    this.on_tree(TreeAction::CreateFunction, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateProcedure, window, cx| {
+                    this.on_tree(TreeAction::CreateProcedure, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateSequence, window, cx| {
+                    this.on_tree(TreeAction::CreateSequence, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateTrigger, window, cx| {
+                    this.on_tree(TreeAction::CreateTrigger, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateEvent, window, cx| {
+                    this.on_tree(TreeAction::CreateEvent, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CreateEnum, window, cx| {
+                    this.on_tree(TreeAction::CreateEnum, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::AddEnumValue, window, cx| {
+                    this.on_tree(TreeAction::AddEnumValue, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::RenameEnumValue, window, cx| {
+                    this.on_tree(TreeAction::RenameEnumValue, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::InstallExtension, window, cx| {
+                    this.on_tree(TreeAction::InstallExtension, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ExportObject, window, cx| {
+                    this.on_tree(TreeAction::Export, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::ImportCsvIntoObject, window, cx| {
+                    this.on_tree(TreeAction::ImportCsv, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::RenameColumn, window, cx| {
+                    this.on_tree(TreeAction::RenameColumn, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::DropColumn, window, cx| {
+                    this.on_tree(TreeAction::DropColumn, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::RevealReferencedTable, window, cx| {
+                    this.on_tree(TreeAction::RevealTable, window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::CloseOtherResultTabs, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::CloseOthers, window, cx)
+                    })
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::CloseResultTabsToTheLeft, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::CloseToLeft, window, cx)
+                    })
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::CloseResultTabsToTheRight, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::CloseToRight, window, cx)
+                    })
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CloseAllResultTabs, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::CloseAll, window, cx)
+                    })
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::UnpinAllResultTabs, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::UnpinAll, window, cx)
+                    })
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::RenameResultTab, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::Rename, window, cx)
+                    })
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::CopyResultStatement, window, cx| {
+                    this.on_query(window, cx, |tab, window, cx| {
+                        tab.perform_on_active_result(TabAction::CopyStatement, window, cx)
+                    })
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ApplySource, window, cx| {
+                    this.on_query(window, cx, QueryTab::apply_source)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowMessages, window, cx| {
+                    this.perform(None, TabAction::ShowMessages, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::PasteConnection, window, cx| {
+                    this.on_subject_of_list(SidebarAction::Paste, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CopyConnectionUrl, window, cx| {
+                    this.on_subject(SidebarAction::CopyUrl, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CopyConnectionHost, window, cx| {
+                    this.on_subject(SidebarAction::CopyHost, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CopyColumnName, window, cx| {
+                    this.on_grid(GridAction::CopyColumnName, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::RevertSelectedRows, window, cx| {
+                    this.on_grid(GridAction::RevertRow, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ShowAllColumns, window, cx| {
+                    this.on_grid(GridAction::ShowAll(0), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::FitAllColumnWidths, window, cx| {
+                    this.on_grid(GridAction::FitAllWidths, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::GenerateSelectByKey, window, cx| {
+                    this.on_grid(GridAction::Generate(RowSql::SelectByKey), window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateSelectIn, window, cx| {
+                    this.on_grid(GridAction::Generate(RowSql::SelectIn), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateRowInsert, window, cx| {
+                    this.on_grid(GridAction::Generate(RowSql::Insert), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateRowUpdate, window, cx| {
+                    this.on_grid(GridAction::Generate(RowSql::Update), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateRowDelete, window, cx| {
+                    this.on_grid(GridAction::Generate(RowSql::Delete), window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::NewConnectionInFolder, window, cx| {
+                    this.on_subject(SidebarAction::NewConnectionHere, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::NewSubfolder, window, cx| {
+                    this.on_subject(SidebarAction::NewSubfolder, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::DisconnectFolder, window, cx| {
+                    this.on_subject(SidebarAction::Disconnect, window, cx)
                 }),
             )
             .on_action(cx.listener(|this, _: &RenameObject, window, cx| {

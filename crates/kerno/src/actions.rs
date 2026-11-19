@@ -235,6 +235,110 @@ gpui_kit::actions!(
         ToggleMainToolbar,
         /// Opens the settings.
         OpenSettings,
+        /// Opens the settings with the keyboard in their search (C5).
+        SearchSettings,
+        /// Copies the name of the selected cell's column.
+        CopyColumnName,
+        /// Drops the pending changes of the selected rows.
+        RevertSelectedRows,
+        /// Shows the hidden columns of the grid on screen.
+        ShowAllColumns,
+        /// Fits every column of the grid on screen to its values.
+        FitAllColumnWidths,
+        /// Writes a SELECT by key for each selected row in a query tab.
+        GenerateSelectByKey,
+        /// Writes one SELECT … IN for the selected rows in a query tab.
+        GenerateSelectIn,
+        /// Writes an INSERT for each selected row in a query tab.
+        GenerateRowInsert,
+        /// Writes an UPDATE by key for each selected row in a query tab.
+        GenerateRowUpdate,
+        /// Writes a DELETE by key for each selected row in a query tab.
+        GenerateRowDelete,
+        /// Opens the dialog to add a connection in the folder selected in the sidebar.
+        NewConnectionInFolder,
+        /// Makes a folder in the folder selected in the sidebar.
+        NewSubfolder,
+        /// Disconnects every open connection of the folder selected in the sidebar.
+        DisconnectFolder,
+        /// Opens the rows of the table or view selected in the schema tree.
+        OpenObjectData,
+        /// Opens the structure of the object selected in the schema tree.
+        OpenObjectStructure,
+        /// Shows the DDL of the object selected in the schema tree.
+        ShowObjectDdl,
+        /// Opens the source of the view or routine selected in the schema tree, to change it.
+        EditObjectSource,
+        /// Writes a SELECT of the table selected in the schema tree in a new query tab.
+        GenerateSelect,
+        /// Writes an INSERT into the table selected in the schema tree in a new query tab.
+        GenerateInsert,
+        /// Writes an UPDATE of the table selected in the schema tree in a new query tab.
+        GenerateUpdate,
+        /// Writes a DELETE from the table selected in the schema tree in a new query tab.
+        GenerateDelete,
+        /// Drops the object selected in the schema tree and what depends on it (PostgreSQL).
+        DropObjectCascade,
+        /// Writes a CREATE TABLE in the schema selected in the schema tree.
+        CreateTable,
+        /// Writes a CREATE VIEW in the schema selected in the schema tree.
+        CreateView,
+        /// Creates a schema in the database selected in the schema tree.
+        CreateSchema,
+        /// Creates a database on the server of the node selected in the schema tree.
+        CreateDatabase,
+        /// Writes a CREATE FUNCTION in the schema selected in the schema tree.
+        CreateFunction,
+        /// Writes a CREATE PROCEDURE in the schema selected in the schema tree.
+        CreateProcedure,
+        /// Writes a CREATE SEQUENCE in the schema selected in the schema tree.
+        CreateSequence,
+        /// Writes a CREATE TRIGGER on the table or schema selected in the schema tree.
+        CreateTrigger,
+        /// Writes a CREATE EVENT in the database selected in the schema tree (MySQL).
+        CreateEvent,
+        /// Creates an enum type in the schema selected in the schema tree.
+        CreateEnum,
+        /// Adds a value to the enum selected in the schema tree.
+        AddEnumValue,
+        /// Renames the enum value selected in the schema tree.
+        RenameEnumValue,
+        /// Installs the extension selected in the schema tree.
+        InstallExtension,
+        /// Writes the rows of the table selected in the schema tree to a file.
+        ExportObject,
+        /// Imports a CSV file into the table selected in the schema tree.
+        ImportCsvIntoObject,
+        /// Renames the column selected in the schema tree.
+        RenameColumn,
+        /// Drops the column selected in the schema tree.
+        DropColumn,
+        /// Selects the table a foreign key selected in the schema tree points to.
+        RevealReferencedTable,
+        /// Closes the result tabs but the one on screen and the pinned ones.
+        CloseOtherResultTabs,
+        /// Closes the unpinned result tabs left of the one on screen.
+        CloseResultTabsToTheLeft,
+        /// Closes the unpinned result tabs right of the one on screen.
+        CloseResultTabsToTheRight,
+        /// Closes every unpinned result tab.
+        CloseAllResultTabs,
+        /// Unpins every result tab of the active query tab.
+        UnpinAllResultTabs,
+        /// Renames the result tab on screen.
+        RenameResultTab,
+        /// Copies the statement of the result tab on screen.
+        CopyResultStatement,
+        /// Applies the source of the view or routine being edited, after showing it.
+        ApplySource,
+        /// Shows the messages of the active query tab's last run.
+        ShowMessages,
+        /// Saves a copy of the connection copied last.
+        PasteConnection,
+        /// Copies the URL of the connection selected in the sidebar, without its password.
+        CopyConnectionUrl,
+        /// Copies the host of the connection selected in the sidebar.
+        CopyConnectionHost,
         /// Follows the system's light or dark appearance.
         UseSystemTheme,
         /// Switches to the light theme.
@@ -621,6 +725,54 @@ pub const COMMANDS: &[Command] = &[
         "ConnectionList"
     ),
     command!(
+        "new_connection_in_folder",
+        "New Connection in Selected Folder…",
+        "Connections",
+        [],
+        ["add", "group", "directory"],
+        NewConnectionInFolder
+    ),
+    command!(
+        "new_subfolder",
+        "New Folder in Selected Folder…",
+        "Connections",
+        [],
+        ["group", "directory", "organize"],
+        NewSubfolder
+    ),
+    command!(
+        "disconnect_folder",
+        "Disconnect Selected Folder",
+        "Connections",
+        [],
+        ["close", "group", "directory"],
+        DisconnectFolder
+    ),
+    command!(
+        "paste_connection",
+        "Paste Copied Connection",
+        "Connections",
+        [],
+        ["duplicate", "clone", "copy"],
+        PasteConnection
+    ),
+    command!(
+        "copy_connection_url",
+        "Copy URL of Selected Connection",
+        "Connections",
+        [],
+        ["address", "link", "clipboard"],
+        CopyConnectionUrl
+    ),
+    command!(
+        "copy_connection_host",
+        "Copy Host of Selected Connection",
+        "Connections",
+        [],
+        ["server", "address", "clipboard"],
+        CopyConnectionHost
+    ),
+    command!(
         "open_connection",
         "Open Selected Connection",
         "Connections",
@@ -779,6 +931,62 @@ pub const COMMANDS: &[Command] = &[
         ["result tab"],
         CloseResultTab,
         "QueryTab"
+    ),
+    command!(
+        "close_other_result_tabs",
+        "Close Other Result Tabs",
+        "Query",
+        [],
+        ["result tab"],
+        CloseOtherResultTabs
+    ),
+    command!(
+        "close_result_tabs_to_the_left",
+        "Close Result Tabs to the Left",
+        "Query",
+        [],
+        ["result tab"],
+        CloseResultTabsToTheLeft
+    ),
+    command!(
+        "close_result_tabs_to_the_right",
+        "Close Result Tabs to the Right",
+        "Query",
+        [],
+        ["result tab"],
+        CloseResultTabsToTheRight
+    ),
+    command!(
+        "close_all_result_tabs",
+        "Close All Result Tabs",
+        "Query",
+        [],
+        ["result tab"],
+        CloseAllResultTabs
+    ),
+    command!(
+        "unpin_all_result_tabs",
+        "Unpin All Result Tabs",
+        "Query",
+        [],
+        ["result tab", "pinned"],
+        UnpinAllResultTabs
+    ),
+    command!(
+        "rename_result_tab",
+        "Rename Result Tab…",
+        "Query",
+        [],
+        ["result tab", "title"],
+        RenameResultTab
+    ),
+    command!(
+        "copy_result_statement",
+        "Copy Statement of Result Tab",
+        "Query",
+        [],
+        ["result tab", "sql", "query"],
+        CopyResultStatement
     ),
     command!(
         "next_result_tab",
@@ -1163,6 +1371,78 @@ pub const COMMANDS: &[Command] = &[
         ResetTableLayout
     ),
     command!(
+        "copy_column_name",
+        "Copy Column Name",
+        "Data",
+        [],
+        ["header", "clipboard"],
+        CopyColumnName
+    ),
+    command!(
+        "revert_selected_rows",
+        "Revert Selected Rows",
+        "Data",
+        [],
+        ["undo", "pending", "discard"],
+        RevertSelectedRows
+    ),
+    command!(
+        "show_all_columns",
+        "Show All Columns",
+        "Data",
+        [],
+        ["hidden", "unhide"],
+        ShowAllColumns
+    ),
+    command!(
+        "fit_all_column_widths",
+        "Fit All Column Widths",
+        "Data",
+        [],
+        ["resize", "autosize", "width"],
+        FitAllColumnWidths
+    ),
+    command!(
+        "generate_select_by_key",
+        "Generate SELECT by Key for Selected Rows",
+        "Data",
+        [],
+        ["sql", "rows"],
+        GenerateSelectByKey
+    ),
+    command!(
+        "generate_select_in",
+        "Generate SELECT … IN for Selected Rows",
+        "Data",
+        [],
+        ["sql", "rows"],
+        GenerateSelectIn
+    ),
+    command!(
+        "generate_row_insert",
+        "Generate INSERT for Selected Rows",
+        "Data",
+        [],
+        ["sql", "rows"],
+        GenerateRowInsert
+    ),
+    command!(
+        "generate_row_update",
+        "Generate UPDATE for Selected Rows",
+        "Data",
+        [],
+        ["sql", "rows"],
+        GenerateRowUpdate
+    ),
+    command!(
+        "generate_row_delete",
+        "Generate DELETE for Selected Rows",
+        "Data",
+        [],
+        ["sql", "rows"],
+        GenerateRowDelete
+    ),
+    command!(
         "copy_row_numbers",
         "Copy Row Numbers",
         "Data",
@@ -1422,6 +1702,14 @@ pub const COMMANDS: &[Command] = &[
         ["reload", "discard", "undo changes", "file"],
         RevertFile
     ),
+    command!(
+        "apply_source",
+        "Apply Source…",
+        "Editor",
+        [],
+        ["view", "routine", "function", "procedure", "definition"],
+        ApplySource
+    ),
     // DBeaver's Ctrl+Alt+Shift+W (`word.wrap`).
     // J19 (DBeaver #37897, #8219; Beekeeper #317): off by default.
     command!(
@@ -1465,6 +1753,14 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["several", "multiple", "summary", "servers"],
         ShowMultiRun
+    ),
+    command!(
+        "show_messages",
+        "Show Messages of the Last Run",
+        "Query",
+        [],
+        ["notices", "warnings", "server", "output"],
+        ShowMessages
     ),
     command!(
         "explain_statement",
@@ -1921,6 +2217,222 @@ pub const COMMANDS: &[Command] = &[
         ["object filter", "remove", "reset", "schema tree"],
         ClearObjectFilter
     ),
+    command!(
+        "open_object_data",
+        "Open Data of Selected Object",
+        "Navigator",
+        [],
+        ["rows", "table", "view", "browse"],
+        OpenObjectData
+    ),
+    command!(
+        "open_object_structure",
+        "Open Structure of Selected Object",
+        "Navigator",
+        [],
+        ["columns", "indexes", "keys", "constraints"],
+        OpenObjectStructure
+    ),
+    command!(
+        "show_object_ddl",
+        "Show DDL of Selected Object",
+        "Navigator",
+        [],
+        ["create", "definition", "script"],
+        ShowObjectDdl
+    ),
+    command!(
+        "edit_object_source",
+        "Edit Source of Selected View or Routine",
+        "Navigator",
+        [],
+        ["definition", "function", "procedure", "body"],
+        EditObjectSource
+    ),
+    command!(
+        "generate_select",
+        "Generate SELECT for Selected Table",
+        "Navigator",
+        [],
+        ["sql", "template", "query"],
+        GenerateSelect
+    ),
+    command!(
+        "generate_insert",
+        "Generate INSERT for Selected Table",
+        "Navigator",
+        [],
+        ["sql", "template"],
+        GenerateInsert
+    ),
+    command!(
+        "generate_update",
+        "Generate UPDATE for Selected Table",
+        "Navigator",
+        [],
+        ["sql", "template"],
+        GenerateUpdate
+    ),
+    command!(
+        "generate_delete",
+        "Generate DELETE for Selected Table",
+        "Navigator",
+        [],
+        ["sql", "template"],
+        GenerateDelete
+    ),
+    command!(
+        "drop_object_cascade",
+        "Drop Selected Object With Cascade…",
+        "Navigator",
+        [],
+        ["delete", "remove", "dependent"],
+        DropObjectCascade
+    ),
+    command!(
+        "create_table",
+        "Create Table…",
+        "Navigator",
+        [],
+        ["new", "schema"],
+        CreateTable
+    ),
+    command!(
+        "create_view",
+        "Create View…",
+        "Navigator",
+        [],
+        ["new", "schema"],
+        CreateView
+    ),
+    command!(
+        "create_schema",
+        "Create Schema…",
+        "Navigator",
+        [],
+        ["new", "namespace"],
+        CreateSchema
+    ),
+    command!(
+        "create_database",
+        "Create Database…",
+        "Navigator",
+        [],
+        ["new", "catalog"],
+        CreateDatabase
+    ),
+    command!(
+        "create_function",
+        "Create Function…",
+        "Navigator",
+        [],
+        ["new", "routine"],
+        CreateFunction
+    ),
+    command!(
+        "create_procedure",
+        "Create Procedure…",
+        "Navigator",
+        [],
+        ["new", "routine"],
+        CreateProcedure
+    ),
+    command!(
+        "create_sequence",
+        "Create Sequence…",
+        "Navigator",
+        [],
+        ["new", "serial", "identity"],
+        CreateSequence
+    ),
+    command!(
+        "create_trigger",
+        "Create Trigger…",
+        "Navigator",
+        [],
+        ["new"],
+        CreateTrigger
+    ),
+    command!(
+        "create_event",
+        "Create Event…",
+        "Navigator",
+        [],
+        ["new", "scheduler", "mysql"],
+        CreateEvent
+    ),
+    command!(
+        "create_enum",
+        "Create Enum…",
+        "Navigator",
+        [],
+        ["new", "type"],
+        CreateEnum
+    ),
+    command!(
+        "add_enum_value",
+        "Add Value to Selected Enum…",
+        "Navigator",
+        [],
+        ["type", "label"],
+        AddEnumValue
+    ),
+    command!(
+        "rename_enum_value",
+        "Rename Selected Enum Value…",
+        "Navigator",
+        [],
+        ["type", "label"],
+        RenameEnumValue
+    ),
+    command!(
+        "install_extension",
+        "Install Selected Extension…",
+        "Navigator",
+        [],
+        ["create extension", "postgresql"],
+        InstallExtension
+    ),
+    command!(
+        "export_object",
+        "Export Selected Table…",
+        "Navigator",
+        [],
+        ["csv", "json", "xlsx", "sql", "file"],
+        ExportObject
+    ),
+    command!(
+        "import_csv_into_object",
+        "Import CSV Into Selected Table…",
+        "Navigator",
+        [],
+        ["file", "load", "rows"],
+        ImportCsvIntoObject
+    ),
+    command!(
+        "rename_column",
+        "Rename Selected Column…",
+        "Navigator",
+        [],
+        ["alter", "name"],
+        RenameColumn
+    ),
+    command!(
+        "drop_column",
+        "Drop Selected Column…",
+        "Navigator",
+        [],
+        ["alter", "remove", "delete"],
+        DropColumn
+    ),
+    command!(
+        "reveal_referenced_table",
+        "Show Referenced Table in Tree",
+        "Navigator",
+        [],
+        ["foreign key", "navigate"],
+        RevealReferencedTable
+    ),
     command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
     command!(
         "previous_tab",
@@ -1994,6 +2506,17 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-,"],
         ["preferences", "options"],
         OpenSettings
+    ),
+    // ⌘F while the settings have the keyboard; from the palette or the menu
+    // bar, it opens them there.
+    command!(
+        "search_settings",
+        "Find a Setting…",
+        "Kerno",
+        ["secondary-f"],
+        ["preferences", "options", "search", "settings"],
+        SearchSettings,
+        "Settings"
     ),
     command!(
         "open_keymap_file",

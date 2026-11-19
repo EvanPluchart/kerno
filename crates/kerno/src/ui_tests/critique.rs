@@ -3352,3 +3352,178 @@ fn a_mysql_procedure_typed_without_delimiter_is_one_statement(cx: &mut TestAppCo
 fn a_mariadb_procedure_typed_without_delimiter_is_one_statement(cx: &mut TestAppContext) {
     k12_a_routine_typed_without_delimiter(cx, Engine::MariaDb);
 }
+
+/// Whether the window's last frame painted `text`.
+fn k13_paints(app: &Fixture, cx: &mut TestAppContext, text: &str) -> bool {
+    app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .iter()
+            .any(|painted| painted.text() == text)
+    })
+}
+
+/// C5: typing in Settings' search keeps the rows whose words start with what is typed, from
+/// every section, under their section's name, each working where it is found and with its
+/// override line; a word that matches nothing says so and offers to clear; clearing (the
+/// button, Escape) gives the sections back, and Escape on an empty search closes Settings; ⌘F
+/// gives the search the keyboard; a section that is a view of its own is found and opens.
+#[gpui_kit::test]
+fn typing_in_the_settings_search_filters_the_rows_and_clearing_restores_them(
+    cx: &mut TestAppContext,
+) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-,"]);
+    assert!(app.has(cx, "settings-search") && app.has(cx, "row-appearance"));
+    // The search has the keyboard as Settings opens.
+    app.type_text(cx, "vim");
+    assert!(app.has(cx, "settings-vim-mode"));
+    assert!(app.has(cx, ("settings-found", 2usize)), "under Editor");
+    for gone in [
+        "row-appearance",
+        "settings-soft-wrap",
+        "row-ui-font",
+        "settings-confirm-destructive",
+    ] {
+        assert!(!app.has(cx, gone), "{gone}");
+    }
+    // A row found works where it is, from the keyboard: Tab leaves the search for it.
+    app.press(cx, &["tab", "space"]);
+    assert!(settings_now(cx).vim_mode);
+    // ⌘F gives the search the keyboard back; a keyword finds a row of another section, with
+    // the line saying what wins over it.
+    app.press(cx, &["secondary-f", "secondary-a"]);
+    app.type_text(cx, "where");
+    assert!(app.has(cx, "settings-confirm-destructive"));
+    assert!(app.has(cx, "override-settings-confirm-destructive"));
+    assert!(k13_paints(
+        &app,
+        cx,
+        "Production wins: its rules ask anyway. With this off, they run without asking in Local \
+         and Staging."
+    ));
+    assert!(!app.has(cx, "settings-vim-mode"));
+    // Nothing matches: said, with the way back.
+    app.type_text(cx, "zzz");
+    assert!(app.has(cx, "settings-no-match"));
+    app.click(cx, "settings-search-clear");
+    assert!(!app.has(cx, "settings-no-match") && app.has(cx, "row-appearance"));
+    // Escape clears what is typed and keeps Settings open.
+    app.type_text(cx, "font size");
+    assert!(
+        app.has(cx, "row-ui-font")
+            && app.has(cx, "row-grid-font")
+            && !app.has(cx, "row-appearance")
+    );
+    app.press(cx, &["escape"]);
+    assert!(app.dialog_open(cx) && app.has(cx, "row-appearance") && !app.has(cx, "row-ui-font"));
+    // A section that is a view of its own is found by its words, and opens.
+    app.type_text(cx, "pg_dump");
+    app.click(cx, ("settings-open", 5usize));
+    assert!(app.has(cx, "local-clients") && app.has(cx, "override-local-clients"));
+    assert!(
+        !app.has(cx, ("settings-open", 5usize)),
+        "the search is emptied"
+    );
+    // Escape on an empty search closes Settings, as before.
+    app.press(cx, &["secondary-f", "escape"]);
+    assert!(!app.dialog_open(cx));
+}
+
+/// C5: the line under "Ask before running…" is true: with the setting turned off, production's
+/// rules still ask, twice (a DELETE without WHERE writes), and nothing runs on Cancel.
+#[gpui_kit::test]
+fn with_the_confirmation_off_production_still_asks_twice(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let _scratch = quit_table(engine, "kerno_ui_k13_prod");
+    on_server(engine, "INSERT INTO kerno_ui_k13_prod.t VALUES (1), (2)");
+    let config = ConnectionConfig {
+        environment: kerno_core::environment::PRODUCTION.into(),
+        ..testing::config(engine)
+    };
+    let app = connected_as(cx, config);
+    // Turned off where the search finds it.
+    app.press(cx, &["secondary-,"]);
+    app.type_text(cx, "where");
+    app.click(cx, "settings-confirm-destructive");
+    assert!(!settings_now(cx).confirm_destructive);
+    app.step(cx, |window, cx| {
+        use gpui_kit::component::WindowExt as _;
+        window.close_dialog(cx)
+    });
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "delete from kerno_ui_k13_prod.t");
+    app.press(cx, &["secondary-enter"]);
+    assert!(
+        app.has(cx, "sql-confirm"),
+        "production asks whatever the setting says"
+    );
+    app.click(cx, "sql-confirm");
+    assert!(
+        app.has(cx, "sql-confirm"),
+        "and asks a second time: it writes"
+    );
+    app.click(cx, "sql-cancel");
+    assert!(!app.running(cx));
+    assert_eq!(
+        on_server(engine, "SELECT count(*) FROM kerno_ui_k13_prod.t"),
+        "2"
+    );
+}
+
+/// C5, the hole the line names: with the setting turned off, a local connection runs a DELETE
+/// without WHERE at once (nothing of local's rules asks).
+#[gpui_kit::test]
+fn with_the_confirmation_off_local_runs_without_asking(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let _scratch = quit_table(engine, "kerno_ui_k13_local");
+    on_server(engine, "INSERT INTO kerno_ui_k13_local.t VALUES (1), (2)");
+    let app = connected(cx, engine);
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.confirm_destructive = false));
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "delete from kerno_ui_k13_local.t");
+    app.press(cx, &["secondary-enter"]);
+    assert!(!app.has(cx, "sql-confirm"));
+    app.wait_until(cx, "the delete", |app, cx| {
+        !app.running(cx) && !app.outcomes(cx).is_empty()
+    });
+    assert_eq!(
+        on_server(engine, "SELECT count(*) FROM kerno_ui_k13_local.t"),
+        "0"
+    );
+}
+
+/// C5: the connection dialog says what the chosen environment does, from its rules as they
+/// stand, and changes with the pick; "Edit environments…" opens them in Settings.
+#[gpui_kit::test]
+fn the_connection_dialog_says_the_rules_of_its_environment(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let local = "Local: no rule of its own; only Settings ▸ Confirmations asks.";
+    let production = "Production: asks before every statement run from an editor, twice before \
+                      any write, starts query tabs in manual commit, rolls back a transaction \
+                      left idle for 10 min.";
+    app.press(cx, &["secondary-n"]);
+    assert!(app.has(cx, "conn-env-rules"));
+    assert!(k13_paints(&app, cx, local));
+    app.click(cx, ("conn-env", 2usize));
+    assert!(k13_paints(&app, cx, production) && !k13_paints(&app, cx, local));
+    // An edited rule shows at once.
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            settings.environments[2].rules.close_idle_transactions = None
+        })
+    });
+    assert!(k13_paints(
+        &app,
+        cx,
+        "Production: asks before every statement run from an editor, twice before any write, \
+         starts query tabs in manual commit."
+    ));
+    app.click(cx, "conn-env-edit");
+    assert!(app.has(cx, "environments") && app.has(cx, "override-env-read-only"));
+}

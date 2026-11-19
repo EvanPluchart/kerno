@@ -301,9 +301,17 @@ impl Render for LocalClientsView {
             .child(div().text_xs().text_color(muted).child(
                 "The client tools backup, restore and Execute script run. Found in Homebrew \
                      (every installed version), Postgres.app, the EDB and Linux package folders \
-                     and $PATH. A connection can use another one (Advanced tab, or “Local \
-                     client…” in a wizard).",
+                     and $PATH.",
             ))
+            .child(
+                div()
+                    .id("override-local-clients")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(crate::settings_view::LOCAL_CLIENT_OVERRIDE)
+                    .test_text(crate::settings_view::LOCAL_CLIENT_OVERRIDE),
+            )
             .children(body)
             .when_some(self.error.clone(), |this, error| {
                 this.child(
