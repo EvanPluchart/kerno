@@ -490,7 +490,7 @@ pub fn unix_time_hint(text: &str) -> Option<String> {
 /// The proleptic Gregorian date `days` after 1970-01-01. Howard Hinnant's
 /// `civil_from_days` (public domain, "chrono-Compatible Low-Level Date
 /// Algorithms").
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097);

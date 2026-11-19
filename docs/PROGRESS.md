@@ -563,3 +563,21 @@ Still open (for the owner):
   trailing `/*! WHERE … */` was never sent (once confirmed, `DELETE FROM t /*! WHERE id = 1 */` deleted every
   row) and a statement that is all comment (`/*!40101 SET NAMES utf8 */;`) never ran. On MySQL rules such a
   comment is now statement text (`split.rs::runs_as_sql`). Limits and plan errors in the "Done:" line of K7 (`docs/plans/M12.md`).
+
+## 2026-11-18 — K8: Kerno never vanishes at start; the store is copied before a migration (C16, C14)
+
+- A failure between the data folder and the main window opens a small window (`start_failure.rs`): what
+  happened in plain words, what to do, the raw error, and Open data folder / Start fresh (move data aside) /
+  Quit as they apply; it is logged, the logger now starting first from the paths alone. The text follows a
+  typed error: `storage::OpenError` (newer schema, damaged, in use, not writable, copy failed, migration
+  failed), the app's `NoDataDir`, `kerno_core::Error` (D-080).
+- "Start fresh" renames `kerno.db` with its `-wal` and `-shm` to `kerno-moved-<time>-schema<N>.sqlite3`, all or
+  none, deletes nothing, and starts Kerno in the same run; offered when the data is the problem, never while
+  another Kerno answers on that data folder's socket (checked at open and at the click).
+- Before a migration an existing store is copied with `VACUUM INTO` to `backups/kerno-<time>-schema<N>.sqlite3`,
+  checked, the three newest kept; a failed copy stops the migration. The pending migrations run in one
+  transaction (they ran one each). One unreadable saved connection is hidden, kept and named once after start.
+  A failed settings save shows one notification until a save works.
+- 11 core tests, 2 unit tests, 3 UI tests; each part seen failing with it disabled (13 mutations). The guide
+  says where Kerno keeps its data, the backups and how to put one back (all three files).
+- Limits and plan errors in the "Done:" line of K8 (`docs/plans/M12.md`).

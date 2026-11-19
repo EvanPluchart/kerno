@@ -2303,3 +2303,249 @@ fn a_versioned_comment_where_still_asks(cx: &mut TestAppContext) {
     );
     assert_eq!(on_server(engine, &format!("SELECT id FROM {name}.t")), "2");
 }
+
+// K8 -----------------------------------------------------------------------------------------
+
+/// The start-failure window `error` opens on the data under `paths`.
+fn k8_failure_window(
+    cx: &mut TestAppContext,
+    paths: &AppPaths,
+    error: &anyhow::Error,
+) -> gpui_kit::AnyWindowHandle {
+    cx.update(|cx| {
+        let before = cx.windows().len();
+        crate::start_failure::open(error, Some(paths.clone()), None, cx);
+        let windows = cx.windows();
+        assert_eq!(windows.len(), before + 1, "the window opened");
+        *windows.last().unwrap()
+    })
+}
+
+/// Runs `look` in `window` after a frame.
+fn k8_in<R>(
+    cx: &mut TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    look: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) -> R,
+) -> R {
+    let seen = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            look(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    seen
+}
+
+/// The ids of the start-failure window's buttons that are shown.
+fn k8_buttons(cx: &mut TestAppContext, window: gpui_kit::AnyWindowHandle) -> Vec<&'static str> {
+    k8_in(cx, window, |window, _| {
+        [
+            "start-failure-folder",
+            "start-failure-fresh",
+            "start-failure-quit",
+        ]
+        .into_iter()
+        .filter(|id| window.try_find(*id).is_some())
+        .collect()
+    })
+}
+
+/// A data directory whose store was written by a newer Kerno (schema 999), and why it does
+/// not open.
+fn k8_newer_store() -> (tempfile::TempDir, AppPaths, anyhow::Error) {
+    let data = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(data.path().to_path_buf());
+    let storage = Storage::open(&paths.database()).unwrap();
+    storage
+        .save_connection(None, &ConnectionConfig::new(Engine::Postgres))
+        .unwrap();
+    drop(storage);
+    kerno_core::storage::set_schema_for_tests(&paths.database(), 999).unwrap();
+    let error = crate::load(&paths)
+        .err()
+        .expect("a newer store does not open");
+    (data, paths, error)
+}
+
+/// C16: a store written by a newer Kerno opens the start-failure window instead of nothing:
+/// what happened, what to do, the raw error, and its three buttons. "Start fresh" moves the
+/// store aside (renamed, with the schema it had) and starts Kerno on a new one in the same run.
+#[gpui_kit::test]
+fn a_start_failure_opens_a_window_that_says_what_happened(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (data, paths, error) = k8_newer_store();
+    let window = k8_failure_window(cx, &paths, &error);
+    let failure = crate::start_failure::start_failure(&error);
+    assert!(failure.headline.contains("newer Kerno"), "{failure:?}");
+    k8_in(cx, window, |window, _| {
+        use gpui_kit::test::TestQueryExt as _;
+        for text in [&failure.headline, &failure.next_step, &failure.raw] {
+            assert!(window.try_find_by_label(text).is_some(), "{text}");
+        }
+        assert!(failure.raw.contains("schema 999"), "{failure:?}");
+    });
+    assert_eq!(
+        k8_buttons(cx, window),
+        [
+            "start-failure-folder",
+            "start-failure-fresh",
+            "start-failure-quit"
+        ]
+    );
+
+    k8_in(cx, window, |window, cx| {
+        window.click("start-failure-fresh", cx)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while cx.update(|cx| !cx.has_global::<crate::start_failure::tests::Started>()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Kerno never started fresh"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (connections, database) = cx.update(|cx| {
+        let started = cx.global::<crate::start_failure::tests::Started>();
+        (started.connections, started.database.clone())
+    });
+    assert_eq!((connections, database), (0, paths.database()));
+    assert!(
+        cx.update(|cx| cx.windows().is_empty()),
+        "the failure window closed"
+    );
+    let moved: Vec<String> = std::fs::read_dir(data.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("kerno-moved-"))
+        .collect();
+    // The store, and its write-ahead log and index when there are, under one new name.
+    let stores: Vec<&String> = moved
+        .iter()
+        .filter(|name| name.ends_with(".sqlite3"))
+        .collect();
+    assert_eq!(stores.len(), 1, "{moved:?}");
+    assert!(stores[0].ends_with("-schema999.sqlite3"), "{moved:?}");
+    assert!(
+        moved
+            .iter()
+            .all(|name| name.starts_with(stores[0].as_str())),
+        "{moved:?}"
+    );
+    // Nothing was deleted: back at the schema this build reads (4, which the store had before
+    // it was marked 999), the moved store still holds its connection.
+    let moved_store = data.path().join(stores[0]);
+    kerno_core::storage::set_schema_for_tests(&moved_store, 4).unwrap();
+    assert_eq!(
+        Storage::open(&moved_store)
+            .unwrap()
+            .connections()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// C16: while another Kerno has the data open, "Start fresh" is not offered: moving the store
+/// would pull it from under that one.
+#[gpui_kit::test]
+fn start_fresh_is_not_offered_while_another_kerno_has_the_data(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (data, paths, error) = k8_newer_store();
+    let socket = kerno_core::instance::socket_path(&paths.data_dir);
+    let in_use = |cx: &mut TestAppContext, window| {
+        k8_in(cx, window, |window, _| {
+            use gpui_kit::test::TestQueryExt as _;
+            window
+                .try_find_by_label(
+                    "Another Kerno is using this data: quit it before starting fresh.",
+                )
+                .is_some()
+        })
+    };
+    // Another Kerno opens the data while the window is up: the click moves nothing.
+    let window = k8_failure_window(cx, &paths, &error);
+    assert!(k8_buttons(cx, window).contains(&"start-failure-fresh"));
+    let other = kerno_core::instance::listen(&socket)
+        .unwrap()
+        .expect("the socket is free");
+    k8_in(cx, window, |window, cx| {
+        window.click("start-failure-fresh", cx)
+    });
+    assert_eq!(
+        k8_buttons(cx, window),
+        ["start-failure-folder", "start-failure-quit"]
+    );
+    assert!(in_use(cx, window));
+    assert!(paths.database().exists());
+    assert!(std::fs::read_dir(data.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("kerno-moved-")
+    }));
+
+    // Running already when the window opens: not offered at all.
+    let window = k8_failure_window(cx, &paths, &error);
+    assert_eq!(
+        k8_buttons(cx, window),
+        ["start-failure-folder", "start-failure-quit"]
+    );
+    assert!(in_use(cx, window));
+    drop(other);
+}
+
+/// C16: a settings save that fails shows one notification, however many saves fail after it
+/// (a slider dragged); the next save that succeeds takes it away.
+#[gpui_kit::test]
+fn a_settings_save_failure_is_shown(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    let app = open(cx, storage.clone());
+    storage.refuse_writes(true).unwrap();
+    let before = notification_count(&app, cx);
+    for size in 0..20 {
+        cx.update(|cx| AppState::update_settings(cx, |settings| settings.page_size = 100 + size));
+    }
+    app.wait_until(cx, "the failed save is shown", |app, cx| {
+        notification_count(app, cx) == before + 1
+    });
+    fn shown(app: &Fixture, cx: &mut TestAppContext) -> Vec<gpui_kit::EntityId> {
+        use gpui_kit::component::WindowExt as _;
+        app.step(cx, |window, cx| {
+            window
+                .notifications(cx)
+                .iter()
+                .map(|note| note.entity_id())
+                .collect()
+        })
+    }
+    let first = shown(&app, cx);
+    for size in 0..20 {
+        cx.update(|cx| AppState::update_settings(cx, |settings| settings.page_size = 200 + size));
+        app.wait_until(cx, "the save ended", |_, cx| {
+            cx.update(crate::state::settings_idle)
+        });
+    }
+    // One notification for all of them, the same one, not shown again at each save (the kit's
+    // notifications carry no label to read their text by: the wording is in
+    // `state::show_save_outcome`).
+    assert_eq!(shown(&app, cx), first);
+    assert_eq!(notification_count(&app, cx), before + 1);
+    assert_ne!(
+        Settings::load(&storage).page_size,
+        219,
+        "nothing was written"
+    );
+
+    storage.refuse_writes(false).unwrap();
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.page_size = 300));
+    app.wait_until(cx, "the save that worked", |_, _| {
+        Settings::load(&storage).page_size == 300
+    });
+    app.wait_until(cx, "the notification goes", |app, cx| {
+        cx.executor().advance_clock(Duration::from_secs(1));
+        notification_count(app, cx) == before
+    });
+}

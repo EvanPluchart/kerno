@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -94,6 +94,81 @@ const MIGRATIONS: &[&str] = &[
 
 /// How many filters [`Storage::filters`] keeps for one key.
 pub const FILTERS_KEPT: usize = 20;
+
+/// Copies of the store taken before a migration that are kept, the newest.
+pub const BACKUPS_KEPT: usize = 3;
+
+/// Why Kerno's store did not open (K8, C16): the start-failure window says
+/// it in plain words and offers what helps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenProblem {
+    /// Written by a newer Kerno: `schema` is the store's, `known` the
+    /// newest this build reads.
+    Newer { schema: usize, known: usize },
+    /// Not a SQLite file, or a damaged one.
+    Damaged,
+    /// Another program holds a lock on it.
+    InUse,
+    /// The file or its folder cannot be created, read or written
+    /// (permissions, a full disk, a disk error).
+    NotWritable,
+    /// The copy taken before a migration failed: nothing was migrated.
+    CopyFailed,
+    /// A migration failed: it was rolled back, the store is as it was.
+    MigrationFailed,
+    /// Anything else SQLite reported.
+    Other,
+}
+
+/// What kept [`Storage::open`] from opening the store.
+#[derive(Debug)]
+pub struct OpenError {
+    pub problem: OpenProblem,
+    /// The underlying message, for the log and the window's details.
+    pub message: String,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl OpenError {
+    fn new(problem: OpenProblem, message: impl Into<String>) -> Self {
+        Self {
+            problem,
+            message: message.into(),
+        }
+    }
+
+    /// A SQLite error, classified by its code; `fallback` when the code
+    /// says nothing about the file.
+    fn sqlite(fallback: OpenProblem, context: &str, error: rusqlite::Error) -> Self {
+        let problem = match error.sqlite_error_code() {
+            Some(ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => OpenProblem::Damaged,
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => OpenProblem::InUse,
+            Some(
+                ErrorCode::ReadOnly
+                | ErrorCode::CannotOpen
+                | ErrorCode::PermissionDenied
+                | ErrorCode::DiskFull
+                | ErrorCode::SystemIoFailure,
+            ) => OpenProblem::NotWritable,
+            _ => fallback,
+        };
+        Self::new(problem, format!("{context}: {error}"))
+    }
+}
+
+/// Creating or tightening the store's files failed.
+impl From<Error> for OpenError {
+    fn from(error: Error) -> Self {
+        Self::new(OpenProblem::NotWritable, error.to_string())
+    }
+}
 
 /// A connection as stored: its id and its settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,11 +313,11 @@ pub fn now_ms() -> i64 {
 
 impl Storage {
     /// Opens (creating it and its directory if needed) the store at `path`
-    /// and brings its schema up to date.
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
+    /// and brings its schema up to date. An existing store is copied to
+    /// `backups/` beside it before a migration runs (see [`migrate`]).
+    pub fn open(path: &Path) -> std::result::Result<Self, OpenError> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        if !parent.exists() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::io(format!("creating {}", parent.display()), error))?;
             restrict(parent, 0o700)?;
@@ -255,28 +330,44 @@ impl Storage {
             create_private(path)?;
         }
         restrict(path, 0o600)?;
-        let connection = Connection::open(path).map_err(storage_error)?;
+        let fail = |context: &str| {
+            let context = format!("{context} {}", path.display());
+            move |error| OpenError::sqlite(OpenProblem::Other, &context, error)
+        };
+        let connection = Connection::open(path).map_err(fail("opening"))?;
         // WAL: readers never block the writer, and a crash cannot corrupt
         // the file.
         connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(storage_error)?;
-        Self::prepare(connection)
+            .map_err(fail("reading"))?;
+        Self::prepare(connection, Some(&parent.join(BACKUPS_DIR)))
     }
 
     /// A store that lives in memory, for tests.
     pub fn in_memory() -> Result<Self> {
-        Self::prepare(Connection::open_in_memory().map_err(storage_error)?)
+        Self::prepare(Connection::open_in_memory().map_err(storage_error)?, None)
+            .map_err(|error| Error::Storage(error.message))
     }
 
-    fn prepare(mut connection: Connection) -> Result<Self> {
+    fn prepare(
+        mut connection: Connection,
+        backups: Option<&Path>,
+    ) -> std::result::Result<Self, OpenError> {
         connection
             .pragma_update(None, "foreign_keys", "ON")
-            .map_err(storage_error)?;
-        migrate(&mut connection)?;
+            .map_err(|error| OpenError::sqlite(OpenProblem::Other, "reading the store", error))?;
+        migrate(&mut connection, MIGRATIONS, backups)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Makes every later write fail, as a store on a read-only disk does,
+    /// for the tests of what the app shows then (`PRAGMA query_only`, this
+    /// store's connection only).
+    #[cfg(feature = "test-support")]
+    pub fn refuse_writes(&self, refuse: bool) -> Result<()> {
+        self.with(|c| c.pragma_update(None, "query_only", refuse))
     }
 
     fn with<T>(&self, work: impl FnOnce(&mut Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -289,8 +380,17 @@ impl Storage {
 
     // Connections -----------------------------------------------------------
 
-    /// Saved connections, in the order the user arranged them.
+    /// Saved connections, in the order the user arranged them, without the
+    /// ones that cannot be read (see [`Storage::connections_and_unreadable`]).
     pub fn connections(&self) -> Result<Vec<SavedConnection>> {
+        self.connections_and_unreadable()
+            .map(|(connections, _)| connections)
+    }
+
+    /// Saved connections, and how many rows could not be read (written by
+    /// a newer Kerno, or damaged). Such a row is skipped, never deleted: no
+    /// write touches it, so a newer Kerno still finds it (K8, C16).
+    pub fn connections_and_unreadable(&self) -> Result<(Vec<SavedConnection>, usize)> {
         let rows = self.with(|c| {
             c.prepare("SELECT id, config FROM connections ORDER BY position, created_at")?
                 .query_map([], |row| {
@@ -298,14 +398,21 @@ impl Storage {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })?;
-        rows.into_iter()
-            .map(|(id, json)| {
-                let config = serde_json::from_str(&json).map_err(|error| {
-                    Error::Storage(format!("stored connection {id} is unreadable: {error}"))
-                })?;
-                Ok(SavedConnection { id, config })
+        let total = rows.len();
+        let connections: Vec<SavedConnection> = rows
+            .into_iter()
+            .filter_map(|(id, json)| match serde_json::from_str(&json) {
+                Ok(config) => Some(SavedConnection { id, config }),
+                Err(error) => {
+                    // Where it fails, not the message: serde quotes values.
+                    let (line, column) = (error.line(), error.column());
+                    tracing::warn!(%id, line, column, "a saved connection cannot be read; skipped");
+                    None
+                }
             })
-            .collect()
+            .collect();
+        let unreadable = total - connections.len();
+        Ok((connections, unreadable))
     }
 
     /// Stores a connection. With `id` it replaces that connection; without,
@@ -924,24 +1031,231 @@ fn restrict(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<()> {
-    let version: usize = connection
+/// The folder beside the store that holds the copies taken before a
+/// migration.
+pub const BACKUPS_DIR: &str = "backups";
+
+/// Brings the store to the last of `migrations`. Every pending migration
+/// runs in one transaction: a failure leaves the store as it was. Before it,
+/// an existing store (schema above 0) is copied into `backups` when given
+/// (a file store; a new one has nothing to lose); a failed copy stops here.
+fn migrate(
+    connection: &mut Connection,
+    migrations: &[&str],
+    backups: Option<&Path>,
+) -> std::result::Result<(), OpenError> {
+    let read = |error| OpenError::sqlite(OpenProblem::Other, "reading the schema version", error);
+    let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-        .map_err(storage_error)? as usize;
-    if version > MIGRATIONS.len() {
+        .map_err(read)?
+        .max(0) as usize;
+    let known = migrations.len();
+    if version > known {
+        return Err(OpenError::new(
+            OpenProblem::Newer {
+                schema: version,
+                known,
+            },
+            format!(
+                "this data was written by a newer version of Kerno (schema {version}, this version knows {known})"
+            ),
+        ));
+    }
+    if version == known {
+        return Ok(());
+    }
+    if version > 0
+        && let Some(backups) = backups
+    {
+        copy_store(connection, backups, version)?;
+    }
+    let fail = |error| OpenError::sqlite(OpenProblem::MigrationFailed, "updating the store", error);
+    let tx = connection.transaction().map_err(fail)?;
+    for (index, migration) in migrations.iter().enumerate().skip(version) {
+        tx.execute_batch(migration).map_err(fail)?;
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .map_err(fail)?;
+    }
+    tx.commit().map_err(fail)
+}
+
+/// A UTC time, to the millisecond, that sorts as text:
+/// `20261118-165701-042`.
+fn stamp() -> String {
+    let ms = now_ms();
+    let (seconds, millis) = (ms.div_euclid(1000), ms.rem_euclid(1000));
+    let (days, time) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    let (year, month, day) = crate::format::civil_from_days(days);
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}-{millis:03}",
+        time / 3600,
+        time % 3600 / 60,
+        time % 60
+    )
+}
+
+/// Whether `name` is one of the copies [`copy_store`] writes:
+/// `kerno-<stamp>-schema<N>.sqlite3`. Only these are ever deleted.
+fn is_backup_name(name: &str) -> bool {
+    let Some(middle) = name
+        .strip_prefix("kerno-")
+        .and_then(|rest| rest.strip_suffix(".sqlite3"))
+    else {
+        return false;
+    };
+    let Some((stamp, schema)) = middle.split_once("-schema") else {
+        return false;
+    };
+    let digits = |text: &str, count: usize| {
+        text.len() == count && text.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let parts: Vec<&str> = stamp.split('-').collect();
+    matches!(parts.as_slice(), [date, time, millis]
+        if digits(date, 8) && digits(time, 6) && digits(millis, 3))
+        && !schema.is_empty()
+        && schema.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Copies the store at schema `version` into `dir` with `VACUUM INTO` (a
+/// consistent copy that includes the write-ahead log), checks that the copy
+/// opens at that schema, then keeps the [`BACKUPS_KEPT`] newest copies. The
+/// name holds the time first so that name order is time order.
+fn copy_store(
+    connection: &Connection,
+    dir: &Path,
+    version: usize,
+) -> std::result::Result<(), OpenError> {
+    let failed = |what: String| {
+        OpenError::new(
+            OpenProblem::CopyFailed,
+            format!("copying the store before updating it: {what}"),
+        )
+    };
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| failed(format!("creating {}: {error}", dir.display())))?;
+        restrict(dir, 0o700).map_err(|error| failed(error.to_string()))?;
+    }
+    let target = dir.join(format!("kerno-{}-schema{version}.sqlite3", stamp()));
+    // An empty file of the user's alone, never an existing one: VACUUM INTO
+    // fills it and keeps its mode.
+    create_private(&target).map_err(|error| failed(error.to_string()))?;
+    let copied = (|| {
+        let path = target
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", target.display()))?;
+        connection
+            .execute("VACUUM INTO ?1", [path])
+            .map_err(|error| error.to_string())?;
+        let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+        let (schema, check): (i64, String) = copy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .and_then(|schema| {
+                copy.query_row("PRAGMA quick_check", [], |row| row.get(0))
+                    .map(|check| (schema, check))
+            })
+            .map_err(|error| error.to_string())?;
+        if schema != version as i64 || check != "ok" {
+            return Err(format!(
+                "the copy reads schema {schema} and checks “{check}”, not schema {version} and “ok”"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        // Only the file this call created.
+        let _ = std::fs::remove_file(&target);
+        return Err(failed(format!("{}: {error}", target.display())));
+    }
+    prune_backups(dir);
+    Ok(())
+}
+
+/// Removes the copies beyond the [`BACKUPS_KEPT`] newest. Files of any
+/// other name are left alone; a failure is logged, never fatal.
+fn prune_backups(dir: &Path) {
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| is_backup_name(name))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "could not list the store's backups");
+            return;
+        }
+    };
+    names.sort();
+    let old = names.len().saturating_sub(BACKUPS_KEPT);
+    for name in &names[..old] {
+        if let Err(error) = std::fs::remove_file(dir.join(name)) {
+            tracing::warn!(%error, name, "could not remove an old backup of the store");
+        }
+    }
+}
+
+/// Marks the store at `path` as written at schema `version`, as a newer
+/// Kerno would leave it, for the tests of the start-failure window.
+#[cfg(feature = "test-support")]
+pub fn set_schema_for_tests(path: &Path, version: i64) -> Result<()> {
+    Connection::open(path)
+        .and_then(|store| store.pragma_update(None, "user_version", version))
+        .map_err(storage_error)
+}
+
+/// "Start fresh" (K8): renames the store at `database` and its `-wal`,
+/// `-shm` and `-journal` files to `kerno-moved-<stamp>-schema<N>.sqlite3`
+/// (with the same suffixes, so SQLite still pairs them) in the same folder,
+/// and returns the new path of the store. Nothing is deleted. If one rename
+/// fails, those done are undone. The caller makes sure no Kerno has the
+/// store open.
+pub fn move_aside(database: &Path) -> Result<PathBuf> {
+    move_aside_as(database, &stamp())
+}
+
+fn move_aside_as(database: &Path, stamp: &str) -> Result<PathBuf> {
+    // Read through SQLite, which reads the write-ahead log too; closed
+    // before the renames.
+    let schema = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|store| store.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)))
+        .map_or_else(|_| "unknown".to_string(), |schema| schema.to_string());
+    let target = database.with_file_name(format!("kerno-moved-{stamp}-schema{schema}.sqlite3"));
+    let with = |path: &Path, suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let moves: Vec<(PathBuf, PathBuf)> = ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| (with(database, suffix), with(&target, suffix)))
+        .filter(|(from, _)| from.exists())
+        .collect();
+    if let Some((_, taken)) = moves.iter().find(|(_, to)| to.exists()) {
         return Err(Error::Storage(format!(
-            "this data was written by a newer version of Kerno (schema {version}, this version knows {})",
-            MIGRATIONS.len()
+            "{} exists already: nothing was moved",
+            taken.display()
         )));
     }
-    for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
-        let tx = connection.transaction().map_err(storage_error)?;
-        tx.execute_batch(migration).map_err(storage_error)?;
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .map_err(storage_error)?;
-        tx.commit().map_err(storage_error)?;
+    for (done, (from, to)) in moves.iter().enumerate() {
+        if let Err(error) = std::fs::rename(from, to) {
+            let mut undone = true;
+            for (from, to) in moves[..done].iter().rev() {
+                if let Err(error) = std::fs::rename(to, from) {
+                    undone = false;
+                    tracing::error!(%error, file = %to.display(), "could not move a store file back");
+                }
+            }
+            let outcome = match undone {
+                true => "nothing was moved",
+                false => "some files could not be moved back: see the log",
+            };
+            return Err(Error::io(
+                format!("moving {} aside ({outcome})", from.display()),
+                error,
+            ));
+        }
     }
-    Ok(())
+    Ok(target)
 }
 
 /// What replaces the error text of a statement that contained a secret:
@@ -1429,6 +1743,13 @@ mod tests {
         drop(raw);
         let error = Storage::open(&path).unwrap_err();
         assert!(error.to_string().contains("newer version"), "{error}");
+        assert_eq!(
+            error.problem,
+            OpenProblem::Newer {
+                schema: 999,
+                known: MIGRATIONS.len()
+            }
+        );
     }
 
     #[test]
@@ -1715,30 +2036,354 @@ mod tests {
         assert!(storage.tasks().unwrap().iter().all(|t| t.id != first));
     }
 
+    /// A store at schema 2, as Kerno 0.1 wrote it, with one connection
+    /// (`kept`) and one filter.
+    fn store_at_schema_2(path: &Path) {
+        let mut raw = Connection::open(path).unwrap();
+        raw.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let tx = raw.transaction().unwrap();
+        for migration in &MIGRATIONS[..2] {
+            tx.execute_batch(migration).unwrap();
+        }
+        tx.pragma_update(None, "user_version", 2).unwrap();
+        tx.execute(
+            "INSERT INTO connections (id, position, config, created_at, updated_at)
+             VALUES ('kept', 1, ?1, 1, 1)",
+            [serde_json::to_string(&config("kept")).unwrap()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO filter_history (key, filter, used_at) VALUES ('t', 'id = 1', 1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn schema_of(path: &Path) -> i64 {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// C16: before a migration, the store is copied into `backups/`; the
+    /// copy opens at the old schema, with the old data.
+    #[test]
+    fn a_migration_copies_the_store_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        store_at_schema_2(&path);
+        let _storage = Storage::open(&path).unwrap();
+        let backups = dir.path().join(BACKUPS_DIR);
+        let names = names_in(&backups);
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(is_backup_name(&names[0]), "{names:?}");
+        assert!(names[0].ends_with("-schema2.sqlite3"), "{names:?}");
+        let copy = backups.join(&names[0]);
+        assert_eq!(schema_of(&copy), 2);
+        let config: String = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row(
+                "SELECT config FROM connections WHERE id = 'kept'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(config.contains("kept"));
+        assert_eq!(schema_of(&path), MIGRATIONS.len() as i64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&copy), 0o600);
+            assert_eq!(mode(&backups), 0o700);
+        }
+    }
+
+    /// C16: a new store and one at the current schema are not copied.
+    #[test]
+    fn a_new_or_current_store_is_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        drop(Storage::open(&path).unwrap());
+        drop(Storage::open(&path).unwrap());
+        assert!(!dir.path().join(BACKUPS_DIR).exists());
+    }
+
+    /// C16: the three newest copies are kept, by name; files of any other
+    /// name in `backups/` are never touched.
+    #[test]
+    fn only_three_backups_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join(BACKUPS_DIR);
+        std::fs::create_dir(&backups).unwrap();
+        let old = [
+            "kerno-20200101-000000-000-schema1.sqlite3",
+            "kerno-20200102-000000-000-schema1.sqlite3",
+            "kerno-20200103-000000-000-schema10.sqlite3",
+            "kerno-20200104-000000-000-schema2.sqlite3",
+        ];
+        let others = [
+            "kerno-mine.sqlite3",
+            "notes.txt",
+            "kerno-20190101-000000-000-schema1.sqlite3.keep",
+            "kerno-20190101-000000-000-schema1.sqlite3-wal",
+        ];
+        for name in old.iter().chain(&others) {
+            std::fs::write(backups.join(name), "x").unwrap();
+        }
+        let path = dir.path().join("kerno.db");
+        store_at_schema_2(&path);
+        drop(Storage::open(&path).unwrap());
+        let names = names_in(&backups);
+        let kept: Vec<&String> = names.iter().filter(|name| is_backup_name(name)).collect();
+        assert_eq!(kept.len(), BACKUPS_KEPT, "{names:?}");
+        assert_eq!(kept[0], old[2]);
+        assert_eq!(kept[1], old[3]);
+        assert!(kept[2].ends_with("-schema2.sqlite3") && !old.contains(&kept[2].as_str()));
+        for other in others {
+            assert!(
+                names.iter().any(|name| name == other),
+                "{other} was removed"
+            );
+        }
+    }
+
+    /// C16: when the copy cannot be written, nothing is migrated.
+    #[test]
+    fn a_failed_copy_leaves_the_store_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        store_at_schema_2(&path);
+        // A file where the folder goes.
+        std::fs::write(dir.path().join(BACKUPS_DIR), "not a folder").unwrap();
+        let error = Storage::open(&path).unwrap_err();
+        assert_eq!(error.problem, OpenProblem::CopyFailed, "{error}");
+        assert_eq!(schema_of(&path), 2);
+    }
+
+    /// C16: a copy that does not open at the schema it was taken at is removed and refused,
+    /// so the migration does not run.
+    #[test]
+    fn a_copy_that_does_not_check_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        store_at_schema_2(&path);
+        let raw = Connection::open(&path).unwrap();
+        let backups = dir.path().join(BACKUPS_DIR);
+        // The store is at schema 2: a copy said to be at schema 3 does not check.
+        let error = copy_store(&raw, &backups, 3).unwrap_err();
+        assert_eq!(error.problem, OpenProblem::CopyFailed, "{error}");
+        assert!(error.message.contains("not schema 3"), "{error}");
+        assert_eq!(names_in(&backups), Vec::<String>::new());
+        copy_store(&raw, &backups, 2).unwrap();
+        assert_eq!(names_in(&backups).len(), 1);
+    }
+
+    /// C16: a migration that fails half-way leaves the store as it was:
+    /// every pending migration runs in one transaction.
+    #[test]
+    fn a_failed_migration_leaves_the_store_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        store_at_schema_2(&path);
+        let mut raw = Connection::open(&path).unwrap();
+        let migrations = [
+            MIGRATIONS[0],
+            MIGRATIONS[1],
+            "CREATE TABLE kerno_test_added (x INTEGER);",
+            "CREATE TABLE kerno_test_broken (",
+        ];
+        let error =
+            migrate(&mut raw, &migrations, Some(&dir.path().join(BACKUPS_DIR))).unwrap_err();
+        assert_eq!(error.problem, OpenProblem::MigrationFailed, "{error}");
+        drop(raw);
+        assert_eq!(schema_of(&path), 2);
+        let added: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'kerno_test_added'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(added, 0);
+        // The copy was taken first.
+        assert_eq!(names_in(&dir.path().join(BACKUPS_DIR)).len(), 1);
+    }
+
+    /// C16: a file that is not a database, and one that is locked, say so.
+    #[test]
+    fn a_damaged_or_locked_store_says_which() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        let error = Storage::open(&path).unwrap_err();
+        assert_eq!(error.problem, OpenProblem::Damaged, "{error}");
+
+        // Another program in an exclusive transaction (a rollback journal:
+        // readers wait too).
+        let path = dir.path().join("locked.db");
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = {
+            let mut raw = Connection::open(&path).unwrap();
+            raw.busy_timeout(std::time::Duration::ZERO).unwrap();
+            migrate(&mut raw, MIGRATIONS, None).unwrap_err()
+        };
+        assert_eq!(error.problem, OpenProblem::InUse, "{error}");
+        holder.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// C16: one unreadable connection row is skipped and counted, never
+    /// deleted, and writes to the other connections leave it as it was.
+    #[test]
+    fn an_unreadable_connection_row_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        let storage = Storage::open(&path).unwrap();
+        let first = storage.save_connection(None, &config("first")).unwrap();
+        let second = storage.save_connection(None, &config("second")).unwrap();
+        const BROKEN: &str = r#"{"engine":"oracle","name":"from a newer Kerno"}"#;
+        storage
+            .with(|c| {
+                c.execute(
+                    "UPDATE connections SET config = ?1 WHERE id = ?2",
+                    params![BROKEN, second],
+                )
+            })
+            .unwrap();
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        let (connections, unreadable) = storage.connections_and_unreadable().unwrap();
+        assert_eq!(unreadable, 1);
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, first);
+        assert_eq!(storage.connections().unwrap(), connections);
+        storage
+            .save_connection(Some(&first), &config("renamed"))
+            .unwrap();
+        storage.save_connection(None, &config("third")).unwrap();
+        storage.forget_unknown_connections().unwrap();
+        let third = storage.connections().unwrap()[1].id.clone();
+        storage.delete_connection(&third).unwrap();
+        let kept: String = storage
+            .with(|c| {
+                c.query_row(
+                    "SELECT config FROM connections WHERE id = ?1",
+                    [&second],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(kept, BROKEN);
+    }
+
+    /// C16: "Start fresh" renames the store, whose name then says when and
+    /// from which schema, and the store opens there with its data.
+    #[test]
+    fn starting_fresh_moves_the_store_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        let storage = Storage::open(&path).unwrap();
+        let id = storage.save_connection(None, &config("kept")).unwrap();
+        drop(storage);
+        let moved = move_aside(&path).unwrap();
+        assert!(!path.exists());
+        let name = moved.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("kerno-moved-"), "{name}");
+        assert!(
+            name.ends_with(&format!("-schema{}.sqlite3", MIGRATIONS.len())),
+            "{name}"
+        );
+        assert_eq!(moved.parent(), path.parent());
+        assert_eq!(
+            Storage::open(&moved).unwrap().connections().unwrap()[0].id,
+            id
+        );
+        assert!(
+            Storage::open(&path)
+                .unwrap()
+                .connections()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// C16: when one of the store's files cannot be renamed, the others are
+    /// put back: nothing is half-moved.
+    #[test]
+    fn starting_fresh_moves_every_file_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kerno.db");
+        std::fs::write(&path, "not a database").unwrap();
+        std::fs::write(dir.path().join("kerno.db-wal"), "wal").unwrap();
+        // A time this long makes the store's new name 254 bytes, the longest a file name can
+        // be, and its log's 258: the second rename fails after the first was done.
+        let stamp = "1".repeat(220);
+        let target = format!("kerno-moved-{stamp}-schemaunknown.sqlite3");
+        assert_eq!(target.len(), 254);
+        let error = move_aside_as(&path, &stamp).unwrap_err();
+        assert!(error.to_string().contains("nothing was moved"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a database");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kerno.db-wal")).unwrap(),
+            "wal"
+        );
+        // (Reading its schema may have made the -shm index SQLite keeps beside a log.)
+        let names = names_in(dir.path());
+        assert!(
+            names.iter().all(|name| !name.starts_with("kerno-moved-")),
+            "{names:?}"
+        );
+
+        // A name already taken: nothing is overwritten, nothing moves.
+        let taken = dir
+            .path()
+            .join("kerno-moved-20261118-120000-000-schemaunknown.sqlite3-wal");
+        std::fs::write(&taken, "someone's").unwrap();
+        let error = move_aside_as(&path, "20261118-120000-000").unwrap_err();
+        assert!(error.to_string().contains("nothing was moved"), "{error}");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "someone's");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a database");
+    }
+
+    /// The copies' names sort by time, whatever the schema numbers.
+    #[test]
+    fn backup_names_are_recognised_exactly() {
+        let name = format!("kerno-{}-schema12.sqlite3", stamp());
+        assert!(is_backup_name(&name), "{name}");
+        for other in [
+            "kerno-schema2-20261118-120000-000.sqlite3",
+            "kerno-20261118-120000-000-schema.sqlite3",
+            "kerno-20261118-12000-000-schema2.sqlite3",
+            "kerno-moved-20261118-120000-000-schema2.sqlite3",
+            "kerno-20261118-120000-000-schema2.sqlite3-wal",
+            "kerno.db",
+        ] {
+            assert!(!is_backup_name(other), "{other}");
+        }
+    }
+
     #[test]
     fn a_store_at_version_2_gains_the_tasks_table_and_keeps_its_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kerno.db");
-        {
-            let mut raw = Connection::open(&path).unwrap();
-            let tx = raw.transaction().unwrap();
-            for migration in &MIGRATIONS[..2] {
-                tx.execute_batch(migration).unwrap();
-            }
-            tx.pragma_update(None, "user_version", 2).unwrap();
-            tx.execute(
-                "INSERT INTO connections (id, position, config, created_at, updated_at)
-                 VALUES ('kept', 1, ?1, 1, 1)",
-                [serde_json::to_string(&config("kept")).unwrap()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO filter_history (key, filter, used_at) VALUES ('t', 'id = 1', 1)",
-                [],
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
+        store_at_schema_2(&path);
         let storage = Storage::open(&path).unwrap();
         assert_eq!(storage.connections().unwrap()[0].config.name, "kept");
         assert_eq!(storage.filters("t").unwrap(), ["id = 1"]);

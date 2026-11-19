@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use gpui_kit::{App, BorrowAppContext as _, Global, Task};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::{App, BorrowAppContext as _, Global, SharedString, Task};
 use kerno_core::secrets::{self, SecretStore};
 use kerno_core::storage::{AppPaths, SavedConnection, Storage};
 
@@ -39,29 +41,45 @@ pub struct Startup {
     pub storage: Arc<Storage>,
     pub settings: Settings,
     pub connections: Vec<SavedConnection>,
+    /// Saved connections that could not be read: hidden, kept in the store.
+    pub unreadable_connections: usize,
     pub tabs: Vec<crate::tabs::TabSnapshot>,
     /// Index of the tab that was active.
     pub active_tab: usize,
 }
 
 impl Startup {
-    /// Opens the store and reads what the first frame needs.
-    pub fn load() -> anyhow::Result<Self> {
-        let paths = AppPaths::locate()?;
+    /// Opens the store under `paths` and reads what the first frame needs.
+    pub fn load(paths: &AppPaths) -> anyhow::Result<Self> {
         let storage = Arc::new(Storage::open(&paths.database())?);
         let settings = Settings::load(&storage);
-        let connections = storage.connections()?;
+        let (connections, unreadable_connections) = storage.connections_and_unreadable()?;
         let tabs = storage.tabs()?;
         let active_tab = storage.setting(ACTIVE_TAB_KEY)?.unwrap_or(0);
         Ok(Self {
-            paths,
+            paths: paths.clone(),
             storage,
             settings,
             connections,
+            unreadable_connections,
             tabs,
             active_tab,
         })
     }
+}
+
+/// What the main window says once when saved connections could not be
+/// read (K8, C16), or nothing.
+pub fn unreadable_notice(count: usize) -> Option<String> {
+    let (what, is) = match count {
+        0 => return None,
+        1 => ("1 saved connection".to_string(), "is"),
+        _ => (format!("{count} saved connections"), "are"),
+    };
+    Some(format!(
+        "{what} could not be read and {is} hidden. Nothing was deleted: the data file \
+         still holds them, and the Kerno that wrote them can read them."
+    ))
 }
 
 impl AppState {
@@ -93,26 +111,74 @@ impl AppState {
             change(&mut state.settings);
             (state.storage.clone(), state.settings.clone())
         });
-        let saver = cx.default_global::<SettingsSaver>().0.clone();
+        let saver = cx.default_global::<SettingsSaver>().saver.clone();
         let start = {
             let mut pending = saver.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.latest = Some(settings);
             !std::mem::replace(&mut pending.writing, true)
         };
         // One writer at a time; it writes the newest value until none is
-        // left, so a change made while it writes is written after.
+        // left, so a change made while it writes is written after. How the
+        // last write ended is shown (K8).
         if start {
-            bridge::spawn_blocking(cx, move || while saver.write_next(&storage, true) {}).detach();
+            let writing = bridge::spawn_blocking(cx, move || {
+                let mut last = None;
+                while let Some(written) = saver.write_next(&storage, true) {
+                    last = Some(written);
+                }
+                last
+            });
+            cx.spawn(async move |cx| {
+                if let Some(written) = writing.await {
+                    cx.update(|cx| show_save_outcome(written, cx));
+                }
+            })
+            .detach();
         }
     }
 
     /// Writes the settings not stored yet; for quitting.
     pub fn flush_settings(cx: &mut App) -> Task<()> {
-        let saver = cx.default_global::<SettingsSaver>().0.clone();
+        let saver = cx.default_global::<SettingsSaver>().saver.clone();
         let storage = Self::get(cx).storage.clone();
         bridge::spawn_blocking(cx, move || {
             saver.write_next(&storage, false);
         })
+    }
+}
+
+/// No settings write is pending or running, for tests.
+#[cfg(test)]
+pub fn settings_idle(cx: &mut App) -> bool {
+    cx.default_global::<SettingsSaver>().saver.idle()
+}
+
+/// The notification of a settings save that failed.
+struct SettingsNotSaved;
+
+/// A failed save shows one notification, however many saves fail after it
+/// (a slider dragged); the next save that succeeds takes it away (K8, C16).
+fn show_save_outcome(written: Result<(), String>, cx: &mut App) {
+    let failing = written.is_err();
+    if cx.default_global::<SettingsSaver>().failure_shown == failing {
+        return;
+    }
+    let Some(window) = cx.windows().into_iter().next() else {
+        return;
+    };
+    let shown = window.update(cx, |_, window, cx| match written {
+        Err(error) => window.push_notification(
+            Notification::error(SharedString::from(format!(
+                "Settings could not be saved: {error}. They apply until Kerno quits."
+            )))
+            .id::<SettingsNotSaved>()
+            .autohide(false),
+            cx,
+        ),
+        Ok(()) => window.remove_notification::<SettingsNotSaved>(cx),
+    });
+    if shown.is_ok() {
+        cx.default_global::<SettingsSaver>().failure_shown = failing;
     }
 }
 
@@ -134,9 +200,9 @@ struct Saver {
 }
 
 impl Saver {
-    /// Writes the newest pending value. Returns whether one was written;
-    /// when none is left and `writer` is set, the writer stops.
-    fn write_next(&self, storage: &Storage, writer: bool) -> bool {
+    /// Writes the newest pending value, and says how that went; `None` when
+    /// none was pending (then, with `writer` set, the writer stops).
+    fn write_next(&self, storage: &Storage, writer: bool) -> Option<Result<(), String>> {
         let _writing = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let next = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,13 +212,11 @@ impl Saver {
             }
             next
         };
-        let Some(settings) = next else {
-            return false;
-        };
-        if let Err(error) = settings.save(storage) {
+        let settings = next?;
+        Some(settings.save(storage).map_err(|error| {
             tracing::error!(%error, "could not store the settings");
-        }
-        true
+            error.to_string()
+        }))
     }
 
     #[cfg(test)]
@@ -162,9 +226,12 @@ impl Saver {
     }
 }
 
-/// The one [`Saver`] of the app.
+/// The one [`Saver`] of the app, and whether a failed save is on screen.
 #[derive(Default)]
-struct SettingsSaver(Arc<Saver>);
+struct SettingsSaver {
+    saver: Arc<Saver>,
+    failure_shown: bool,
+}
 
 impl Global for SettingsSaver {}
 
@@ -176,6 +243,23 @@ mod tests {
     use kerno_core::secrets::MemorySecretStore;
 
     use super::*;
+
+    /// C16: hidden connections are named, in the singular or the plural.
+    #[test]
+    fn unreadable_connections_are_named() {
+        assert_eq!(unreadable_notice(0), None);
+        let one = unreadable_notice(1).unwrap();
+        assert!(
+            one.starts_with("1 saved connection could not be read and is hidden."),
+            "{one}"
+        );
+        assert!(one.contains("Nothing was deleted"), "{one}");
+        let two = unreadable_notice(2).unwrap();
+        assert!(
+            two.starts_with("2 saved connections could not be read and are hidden."),
+            "{two}"
+        );
+    }
 
     #[gpui_kit::test]
     fn quick_changes_reach_storage_in_order(cx: &mut TestAppContext) {
@@ -210,7 +294,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 cx.run_until_parked();
-                let idle = cx.update(|cx| cx.global::<SettingsSaver>().0.idle());
+                let idle = cx.update(|cx| cx.global::<SettingsSaver>().saver.idle());
                 if idle {
                     break;
                 }

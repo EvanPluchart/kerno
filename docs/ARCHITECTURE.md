@@ -181,9 +181,16 @@ directory (`AppPaths`). `KERNO_DATA_DIR` puts everything under one directory, wh
 real app use. It holds connections (without secrets), history, saved queries, open tabs and settings. The API
 is synchronous; callers run it through `bridge::spawn_blocking`. Migrations are a versioned list of SQL
 strings applied in order, with `PRAGMA user_version` recording how many ran; a database newer than the code
-is refused. There are three migrations: 1 the initial schema (connections, history, saved queries, open tabs, settings),
-2 the filters last applied to each table's data and query result, 3 saved tasks. Add a migration by appending to
-`MIGRATIONS`, never editing an earlier entry.
+is refused. There are four migrations: 1 the initial schema (connections, history, saved queries, open tabs, settings),
+2 the filters last applied to each table's data and query result, 3 saved tasks, 4 table layouts. Add a migration by appending to
+`MIGRATIONS`, never editing an earlier entry. The pending migrations run in one transaction (a failure leaves the
+store as it was), after `VACUUM INTO` has copied an existing store to `backups/kerno-<UTC time>-schema<N>.sqlite3`
+and the copy was opened at schema N; the three newest copies are kept, and only files of that name are ever
+removed. A failed copy stops the migration (K8, D-080). `Storage::open` returns an `OpenError` whose `OpenProblem`
+(newer, damaged, in use, not writable, copy failed, migration failed) is what the start-failure window
+(`crates/kerno/src/start_failure.rs`) explains. A saved connection row that does not parse is skipped and counted
+(`connections_and_unreadable`), never rewritten. "Start fresh" is `storage::move_aside`: the store and its `-wal`,
+`-shm` and `-journal` files renamed together, or none of them.
 
 ## Client tools, local clients and saved tasks
 

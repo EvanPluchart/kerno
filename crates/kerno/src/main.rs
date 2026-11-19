@@ -32,6 +32,7 @@ mod settings;
 mod settings_view;
 mod sidebar;
 mod sql_confirm;
+mod start_failure;
 mod state;
 mod structure;
 mod tabs;
@@ -114,57 +115,100 @@ fn main() {
         }
     };
     bench::init();
+    // The only place that looks the data directory up: everything below is
+    // handed these paths.
+    let paths = AppPaths::locate();
     // One running instance: it opens the URL and comes to the front.
     if let Some(url) = &url
-        && let Ok(paths) = AppPaths::locate()
+        && let Ok(paths) = &paths
         && instance::send(&instance::socket_path(&paths.data_dir), url.expose()).is_ok()
     {
         return;
     }
+    // The log first (K8): it needs only the paths, so every start failure
+    // below is in it. Without it Kerno still runs, and says why on stderr.
+    let log = paths
+        .as_ref()
+        .ok()
+        .and_then(|paths| match logging::start(&paths.logs()) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                eprintln!("kerno: no log this run: {error:#}");
+                None
+            }
+        });
     // Kerno's own files are read on another thread while the platform
     // starts up, so the first frame has the saved tabs and the right theme
     // without the UI thread ever touching the disk. The instance socket
     // lives in the data directory in use (a `KERNO_DATA_DIR` run has its
     // own).
-    let startup = std::thread::spawn(|| {
-        Startup::load().map(|startup| {
-            let socket = instance::socket_path(&startup.paths.data_dir);
-            let listener = instance::listen(&socket);
-            // What a run that crashed left of its unsaved connections (J4);
-            // only by the instance that holds the socket: a second one
-            // beside it must not touch the first one's.
-            if matches!(listener, Ok(Some(_)))
-                && let Err(error) = startup.storage.forget_unknown_connections()
-            {
-                eprintln!("kerno: could not forget the unsaved connections: {error}");
-            }
-            (startup, listener)
-        })
-    });
+    let paths = paths.map_err(|error| start_failure::NoDataDir(error.to_string()));
+    let loading = paths
+        .clone()
+        .map(|paths| std::thread::spawn(move || load(&paths)));
 
     gpui_kit::application()
         .with_assets(engine_logo::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            let started = startup
-                .join()
-                .map_err(|_| anyhow::anyhow!("reading Kerno's data panicked"))
-                .and_then(|startup| startup)
-                .and_then(|(startup, listener)| start(startup, listener, url, cx));
-            if let Err(error) = started {
-                eprintln!("Kerno could not start: {error:#}");
-                cx.quit();
+            if let Some(log) = log {
+                logging::keep(log, cx);
+            }
+            // One window at a time (the main one, or the start failure's):
+            // closing the last one ends the app.
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let loaded = loading.map_err(anyhow::Error::new).and_then(|loading| {
+                loading
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("reading Kerno's data panicked"))?
+            });
+            // A start that fails shows why, and offers what helps (K8).
+            let paths = paths.ok();
+            match loaded {
+                Ok((startup, listener)) => {
+                    if let Err(error) = start(startup, listener, url, cx) {
+                        start_failure::open(&error, paths, None, cx);
+                    }
+                }
+                Err(error) => start_failure::open(&error, paths, url, cx),
             }
         });
 }
 
+/// The instance socket: `Some` when this instance holds it.
+type Listener = std::io::Result<Option<UnixListener>>;
+/// What [`load`] reads before the first frame.
+type Loaded = (Startup, Listener);
+
+/// Opens Kerno's data under `paths` and takes the instance socket; off the
+/// UI thread.
+fn load(paths: &AppPaths) -> anyhow::Result<Loaded> {
+    Startup::load(paths).map(|startup| {
+        let socket = instance::socket_path(&startup.paths.data_dir);
+        let listener = instance::listen(&socket);
+        // What a run that crashed left of its unsaved connections (J4);
+        // only by the instance that holds the socket: a second one
+        // beside it must not touch the first one's.
+        if matches!(listener, Ok(Some(_)))
+            && let Err(error) = startup.storage.forget_unknown_connections()
+        {
+            tracing::warn!(%error, "could not forget the unsaved connections");
+        }
+        (startup, listener)
+    })
+}
+
 fn start(
     startup: Startup,
-    listener: std::io::Result<Option<UnixListener>>,
+    listener: Listener,
     url: Option<Secret>,
     cx: &mut App,
 ) -> anyhow::Result<()> {
-    logging::init(&startup.paths.logs(), cx)?;
     // Without the socket this window still works; later URLs open a window
     // of their own.
     let listener = listener.unwrap_or_else(|error| {
@@ -203,13 +247,6 @@ fn start(
     })
     .detach();
     cx.set_menus(menus());
-    // One window: closing it ends the app.
-    cx.on_window_closed(|cx, _| {
-        if cx.windows().is_empty() {
-            cx.quit();
-        }
-    })
-    .detach();
 
     let mut window_size = size(px(1280.), px(800.));
     if let Some(display) = cx.primary_display() {
@@ -233,6 +270,7 @@ fn start(
     };
     let Startup {
         connections,
+        unreadable_connections,
         tabs,
         active_tab,
         ..
@@ -302,6 +340,16 @@ fn start(
         workspace.focus_handle(cx).focus(window, cx);
         for problem in keymap_problems {
             window.push_notification(format!("{}: {problem}", keymap_file.display()), cx);
+        }
+        // Once per start (K8, C16).
+        if let Some(text) = state::unreadable_notice(unreadable_connections) {
+            window.push_notification(
+                gpui_kit::component::notification::Notification::warning(
+                    gpui_kit::SharedString::from(text),
+                )
+                .autohide(false),
+                cx,
+            );
         }
         workspace
     })?;

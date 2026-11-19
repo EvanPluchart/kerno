@@ -23,16 +23,28 @@ struct LogWriter(#[allow(dead_code)] WorkerGuard);
 
 impl Global for LogWriter {}
 
-/// Starts logging into `directory`.
-pub fn init(directory: &Path, cx: &mut App) -> anyhow::Result<()> {
+/// Starts logging into `directory`, before anything else runs (K8: a start
+/// failure is logged); [`keep`] the result once the app runs.
+pub fn start(directory: &Path) -> anyhow::Result<WorkerGuard> {
     // KERNO_LOG overrides the level, e.g. KERNO_LOG=kerno=debug.
     let filter =
         EnvFilter::try_from_env("KERNO_LOG").unwrap_or_else(|_| EnvFilter::new("warn,kerno=info"));
-    init_with(directory, filter, cx)
+    start_with(directory, filter)
 }
 
-/// [`init`] with this filter.
+/// Keeps the writer [`start`] made until the app quits.
+pub fn keep(guard: WorkerGuard, cx: &mut App) {
+    cx.set_global(LogWriter(guard));
+}
+
+/// [`start`] with this filter, kept in `cx`.
+#[cfg(test)]
 pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::Result<()> {
+    keep(start_with(directory, filter)?, cx);
+    Ok(())
+}
+
+fn start_with(directory: &Path, filter: EnvFilter) -> anyhow::Result<WorkerGuard> {
     std::fs::create_dir_all(directory)?;
     // Logs name hosts, databases and users: the directory is the user's alone.
     #[cfg(unix)]
@@ -57,8 +69,7 @@ pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::R
                 .with_ansi(false),
         )
         .try_init()?;
-    cx.set_global(LogWriter(guard));
-    Ok(())
+    Ok(guard)
 }
 
 /// Writes the lines not written yet and stops logging, as quitting does.

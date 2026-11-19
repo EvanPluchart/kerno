@@ -1708,3 +1708,47 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   and `DO NOTHING` do not: they change or add rows, they remove none (a `MERGE … ON true … THEN UPDATE`
   changes every row without the question, as `INSERT … ON CONFLICT DO UPDATE` does; production and read-only
   still guard it, it is a write).
+
+## D-080 — What Kerno does when it cannot start, and the copy before a migration (K8, C16, C14; 2026-11-18)
+
+- **The start-failure window** (`crates/kerno/src/start_failure.rs`): any failure between the data directory and
+  the main window opens a small window instead of quitting: a headline in plain words, the next step, the raw
+  error, and the buttons that apply (Open data folder, Start fresh (move data aside), Quit). The text is chosen by
+  `start_failure(&anyhow::Error)` from a typed error: `storage::OpenError`'s `OpenProblem` (classified in
+  `storage.rs` from SQLite's error code, where the code still exists), `kerno_core::Error::Io` / `Storage`, an
+  app-side `NoDataDir`. No new variant in `kerno_core::Error` (K9 owns `error.rs`).
+- **"Start fresh" is offered only when the data is the problem and moving it helps**: a newer schema, a damaged
+  or non-SQLite file, a migration that failed (rolled back; the copy is in `backups/`, so moving the store aside
+  loses nothing), another SQLite error while opening, a list that cannot be read. Never for a store another
+  program locks, a data folder that cannot be written (the rename would fail too), a failed backup copy (the
+  store is healthy: free the disk), a home folder that cannot be found, or anything after the store opened (the
+  theme, the window): moving the data would not help there. It is also not offered while another Kerno answers
+  on the instance socket of that data folder, checked when the window opens and again at the click (a plain
+  second launch has no URL to hand over, so it reaches the store): moving the store would pull it from under the
+  running one. Restoring by hand names the three files: SQLite applies a `-wal` left beside the file put back.
+- **"Start fresh" renames, in the same folder, all of the store's files or none**: `kerno.db` and its `-wal`,
+  `-shm`, `-journal` become `kerno-moved-<UTC time>-schema<N>.sqlite3` with the same suffixes (SQLite still pairs
+  them; a store in use keeps its recent writes in the `-wal`), `N` read through SQLite read-only (it
+  reads the log; "unknown" when unreadable). A target that exists refuses the move; a rename that fails undoes
+  the ones done. Settings, folders and environments live in the store and move with it; `known_hosts`,
+  `folder-icons/`, `logs/`, `keymap.json` and the keychain stay. Kerno then loads a new store and starts in the
+  same run; the main window says where the old data went.
+- **The copy before a migration**: `VACUUM INTO` (no new cargo feature) into an empty 0600 file created first
+  (`backups/` is 0700), then the copy is opened read-only and must read the old schema and pass `PRAGMA
+  quick_check`; else the copy is removed and the migration does not run (`OpenProblem::CopyFailed`). Only an
+  existing store (schema above 0) about to migrate is copied. **The name puts the time first,
+  `kerno-<YYYYMMDD-HHMMSS-mmm UTC>-schema<N>.sqlite3`**, so name order is time order; the plan's
+  `kerno-schema<N>-<time>` sorts `schema10` before `schema2`. The three newest are kept; only names matching
+  that pattern exactly are ever removed.
+- **Every pending migration runs in one transaction**, where each ran in its own before: a failure at the third
+  of two pending left the store half-migrated, "as it was" now holds.
+- **One unreadable connection row is skipped and counted, never deleted** (`connections_and_unreadable`); no
+  write rewrites it (updates and deletes are by id, positions are never renumbered), and an import of a
+  connection with the same id fails on the key rather than replacing it. The log names the row's id and where
+  the JSON fails, never serde's message (it quotes values).
+- **The logger starts first**, in `main()`, with only the paths; a log directory that cannot be made leaves the
+  run without a log (stderr says so) and is not a start failure. A failure before the platform runs (no
+  display, no GPU) cannot have a window: stderr and the log are all there is.
+- **A failed settings save is shown once** (`Notification::error`, not hidden by itself): one notification for
+  any number of failed saves (the same one, not pushed again: the kit restarts a toast pushed under the same id),
+  removed by the next save that succeeds. The settings apply until Kerno quits.

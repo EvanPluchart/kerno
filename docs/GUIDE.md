@@ -14,6 +14,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [AI assistant and what it sends](#ai-assistant-and-what-it-sends)
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
+- [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
 - [Checks and releases](#checks-and-releases)
@@ -155,6 +156,31 @@ drivers are built in: nothing is downloaded to connect). Turn it off in
 Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
 click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
 [architecture notes](ARCHITECTURE.md#the-update-check) give the details.
+
+## Where Kerno keeps its data
+
+Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
+tabs, history, saved queries and tasks) is in one SQLite file, `kerno.db`, in its data folder:
+`~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux. Beside it: `logs/` (a file a
+day, the last seven), `known_hosts` (the SSH host keys you accepted in Kerno), `folder-icons/`, and
+`backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Passwords are in
+the system keychain, never in this folder. `KERNO_DATA_DIR=<folder>` puts all of it in another folder for a
+run.
+
+Before a new version of Kerno changes the layout of `kerno.db`, it copies the file into `backups/` as
+`kerno-<date>-<time>-schema<N>.sqlite3` (UTC, `N` the layout it had) and keeps the three newest; if the copy
+cannot be written, Kerno does not change the file and says why. To go back to an older Kerno, quit Kerno,
+move `kerno.db`, `kerno.db-wal` and `kerno.db-shm` aside together (SQLite would apply a `-wal` left behind to
+the file you put in), and copy the backup in as `kerno.db`.
+
+When Kerno cannot start (data written by a newer Kerno, a damaged file, a folder it cannot write), it opens a
+window that says what happened and what to do, with the error below it, instead of quitting. **Open data
+folder** shows the folder; **Start fresh (move data aside)**, offered when the data itself is the problem,
+renames `kerno.db` and its `-wal` and `-shm` files to `kerno-moved-<date>-<time>-schema<N>.sqlite3` in the same
+folder, deletes nothing, and starts Kerno on a new, empty file; the keychain is not touched. To use the moved
+data again, quit Kerno and rename those files back to `kerno.db`, `kerno.db-wal` and `kerno.db-shm`. A saved
+connection that this Kerno cannot read (written by a newer one) is hidden and named in a notification at
+start, never deleted.
 
 ## Install
 
