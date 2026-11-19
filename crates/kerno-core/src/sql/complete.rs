@@ -206,14 +206,20 @@ pub fn complete(
     typing = typing.map(|index| index - low);
 
     let mut depth = Vec::with_capacity(toks.len());
+    let mut close = vec![toks.len(); toks.len()];
+    let mut open = Vec::new();
     let mut level = 0u32;
-    for tok in &toks {
+    for (index, tok) in toks.iter().enumerate() {
         if tok.punct(")") {
             level = level.saturating_sub(1);
+            if let Some(at) = open.pop() {
+                close[at] = index;
+            }
         }
         depth.push(level);
         if tok.punct("(") {
             level += 1;
+            open.push(index);
         }
     }
 
@@ -229,9 +235,11 @@ pub fn complete(
     Query {
         toks,
         depth,
+        close,
         n,
         typing,
         catalog,
+        mysql: rules.backtick_identifiers,
     }
     .offer(&mut sink);
     sink.prefix.append(&mut sink.inner);
@@ -356,21 +364,119 @@ impl Name<'_> {
             candidate.eq_ignore_ascii_case(&self.text)
         }
     }
+
+    /// Whether two names of the statement are the same: exactly when either
+    /// is quoted, whatever the case otherwise.
+    fn same(&self, other: &Name) -> bool {
+        if self.quoted || other.quoted {
+            self.text == other.text
+        } else {
+            self.text.eq_ignore_ascii_case(&other.text)
+        }
+    }
 }
 
-/// A relation the statement names in FROM, JOIN, UPDATE or INSERT INTO.
+/// How many queries deep the columns of a derived relation are worked out:
+/// a CTE or a subquery inside a subquery ... Deeper ones have unknown columns.
+const DEPTH: u8 = 8;
+
+/// One output column of a CTE or a subquery, in select-list order.
+#[derive(Clone)]
+enum Out<'a> {
+    /// A column: its name when the user can write it (an alias, a column's
+    /// own name; `None` for an unnamed expression), and its type when it is
+    /// a catalog column passed through.
+    Column(Option<Cow<'a, str>>, Option<&'a str>),
+    /// Any number of columns nobody knows: `*` over a function or an unknown table.
+    Unknown,
+}
+
+/// A CTE in scope and its output columns.
+struct Cte<'a> {
+    name: Name<'a>,
+    columns: Vec<Out<'a>>,
+}
+
+/// `body` renamed by an explicit column list (`x(a, b) AS (...)`, `AS s(a, b)`):
+/// the list names the first columns whatever the body is; the rest keep their
+/// names when their places are known.
+fn rename<'a>(body: Vec<Out<'a>>, list: Vec<Cow<'a, str>>) -> Vec<Out<'a>> {
+    let mut rest = body.into_iter();
+    let mut known = true;
+    let mut out = Vec::new();
+    for name in list {
+        let data_type = match rest.next().filter(|_| known) {
+            Some(Out::Column(_, data_type)) => data_type,
+            Some(Out::Unknown) => {
+                known = false;
+                None
+            }
+            None => None,
+        };
+        out.push(Out::Column(Some(name), data_type));
+    }
+    if known {
+        out.extend(rest);
+    }
+    out
+}
+
+/// A relation the statement names in FROM, JOIN, UPDATE, INSERT INTO or
+/// DELETE ... USING.
 struct Relation<'a> {
     /// How the statement refers to it, as written: its alias, else its name.
     written: &'a str,
     qualifier: Name<'a>,
     aliased: bool,
     /// Its catalog entry. `None` for a CTE, a subquery, a function, or a
-    /// table the catalog does not have: the columns are unknown.
+    /// table the catalog does not have.
     found: Option<(&'a CatalogSchema, &'a CatalogRelation)>,
+    /// The output columns of a CTE or a subquery; empty for a catalog
+    /// relation and when nothing is known.
+    derived: Vec<Out<'a>>,
     /// 0 for the query the cursor is in, 1 for the one around it, ...
     level: usize,
     /// Index of its first token.
     at: usize,
+}
+
+impl<'a> Relation<'a> {
+    /// The named columns it offers, with their types when known.
+    fn columns(&self) -> impl Iterator<Item = (&str, Option<&'a str>)> + '_ {
+        let catalog = self.found.into_iter().flat_map(|(_, relation)| {
+            relation
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), Some(column.data_type.as_str())))
+        });
+        catalog.chain(named(&self.derived))
+    }
+
+    /// What `*` over it gives.
+    fn expand(&self) -> Vec<Out<'a>> {
+        match self.found {
+            Some((_, relation)) if !relation.columns.is_empty() => catalog_columns(relation)
+                .map(|(name, data_type)| Out::Column(Some(Cow::Borrowed(name)), data_type))
+                .collect(),
+            None if !self.derived.is_empty() => self.derived.clone(),
+            _ => vec![Out::Unknown],
+        }
+    }
+}
+
+/// The columns of `outs` that have a name, with their types.
+fn named<'s, 'a>(outs: &'s [Out<'a>]) -> impl Iterator<Item = (&'s str, Option<&'a str>)> {
+    outs.iter().filter_map(|out| match out {
+        Out::Column(Some(name), data_type) => Some((name.as_ref(), *data_type)),
+        _ => None,
+    })
+}
+
+fn catalog_columns(relation: &CatalogRelation) -> impl Iterator<Item = (&str, Option<&str>)> {
+    relation
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), Some(column.data_type.as_str())))
 }
 
 /// A query the cursor is in: the statement, or a subquery in parentheses.
@@ -537,6 +643,45 @@ const POSTGRES_ONLY: &[&str] = &[
     "ALTER COLUMN",
 ];
 const MYSQL_ONLY: &[&str] = &["DESCRIBE", "USE", "MODIFY COLUMN"];
+/// Words between SELECT and its first item.
+const SELECT_MODIFIERS: &[&str] = &[
+    "DISTINCT",
+    "ALL",
+    "DISTINCTROW",
+    "HIGH_PRIORITY",
+    "STRAIGHT_JOIN",
+    "SQL_SMALL_RESULT",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+    "SQL_NO_CACHE",
+    "SQL_CALC_FOUND_ROWS",
+];
+/// Words that end a select or RETURNING list.
+const AFTER_SELECT_LIST: &[&str] = &[
+    "FROM", "INTO", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW", "FOR", "OFFSET",
+    "FETCH",
+];
+/// Words a name after them is an operand of, not an alias (`x IS NULL`, `count(*) OVER w`).
+const BEFORE_OPERAND_NAME: &[&str] = &[
+    "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "COLLATE", "ESCAPE", "SIMILAR",
+    "TO", "OVER", "DISTINCT", "ALL", "ANY", "SOME", "EXISTS", "CASE", "WHEN", "THEN", "ELSE",
+    "INTERVAL", "AT", "ZONE", "BINARY", "AS",
+];
+/// Words that are values, never a column.
+const LITERAL_WORDS: &[&str] = &["NULL", "TRUE", "FALSE", "UNKNOWN"];
+/// Words that end an expression and are never its alias (`INTERVAL 1 DAY`).
+const NOT_AN_ALIAS: &[&str] = &[
+    "END",
+    "YEAR",
+    "MONTH",
+    "WEEK",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "QUARTER",
+    "MICROSECOND",
+];
 
 /// Built-in functions worth offering everywhere; a short list on purpose.
 const FUNCTIONS: &[&str] = &[
@@ -878,14 +1023,14 @@ impl Sink<'_> {
         }
     }
 
-    /// The columns of one relation, unqualified.
-    fn columns(&mut self, relation: &CatalogRelation) {
-        for column in &relation.columns {
-            self.offer(&column.name, |sink| CompletionItem {
-                label: column.name.clone(),
-                insert: sink.ident(&column.name),
+    /// Columns (name, type), unqualified.
+    fn columns<'c>(&mut self, columns: impl Iterator<Item = (&'c str, Option<&'c str>)>) {
+        for (name, data_type) in columns {
+            self.offer(name, |sink| CompletionItem {
+                label: name.to_string(),
+                insert: sink.ident(name),
                 kind: CompletionKind::Column,
-                detail: Some(column.data_type.clone()),
+                detail: data_type.map(str::to_string),
             });
         }
     }
@@ -893,24 +1038,20 @@ impl Sink<'_> {
     /// The columns of the relations of the innermost query; a name that
     /// several of them have is qualified.
     fn scope_columns(&mut self, scope: &[Relation]) {
-        let known = || {
-            scope
-                .iter()
-                .filter(|relation| relation.level == 0)
-                .filter_map(|relation| relation.found.map(|(_, found)| (relation, found)))
-        };
+        let here = || scope.iter().filter(|relation| relation.level == 0);
         let mut seen: HashMap<&str, u32> = HashMap::new();
-        if known().nth(1).is_some() {
-            for column in known().flat_map(|(_, found)| &found.columns) {
-                *seen.entry(column.name.as_str()).or_default() += 1;
+        let with_columns = || here().filter(|relation| relation.columns().next().is_some());
+        if with_columns().nth(1).is_some() {
+            for (name, _) in here().flat_map(Relation::columns) {
+                *seen.entry(name).or_default() += 1;
             }
         }
-        for (relation, found) in known() {
-            for column in &found.columns {
-                let shared = seen.get(column.name.as_str()).is_some_and(|&n| n > 1);
-                self.offer(&column.name, |sink| {
-                    let mut label = column.name.clone();
-                    let mut insert = sink.ident(&column.name);
+        for relation in here() {
+            for (name, data_type) in relation.columns() {
+                let shared = seen.get(name).is_some_and(|&n| n > 1);
+                self.offer(name, |sink| {
+                    let mut label = name.to_string();
+                    let mut insert = sink.ident(name);
                     if shared {
                         label = format!("{}.{label}", relation.written);
                         insert = format!("{}.{insert}", relation.written);
@@ -919,7 +1060,7 @@ impl Sink<'_> {
                         label,
                         insert,
                         kind: CompletionKind::Column,
-                        detail: Some(column.data_type.clone()),
+                        detail: data_type.map(str::to_string),
                     }
                 });
             }
@@ -950,11 +1091,16 @@ struct Query<'a> {
     /// Parenthesis depth of each token; a parenthesis has the depth of what
     /// is around it.
     depth: Vec<u32>,
+    /// For each `(`, the index of its `)`, or the token count when it is
+    /// not closed.
+    close: Vec<usize>,
     /// How many tokens come before the cursor and the word being typed.
     n: usize,
     /// Index of the word being typed.
     typing: Option<usize>,
     catalog: &'a Catalog,
+    /// MySQL keeps unquoted names as written; PostgreSQL folds them.
+    mysql: bool,
 }
 
 impl<'a> Query<'a> {
@@ -968,9 +1114,7 @@ impl<'a> Query<'a> {
 
     /// Index of the parenthesis closing the one at `open`, or the token count.
     fn close_of(&self, open: usize) -> usize {
-        (open + 1..self.toks.len())
-            .find(|&index| self.depth[index] == self.depth[open] && self.toks[index].punct(")"))
-            .unwrap_or(self.toks.len())
+        self.close[open]
     }
 
     /// Parenthesis depth just before token `pos`.
@@ -1026,43 +1170,232 @@ impl<'a> Query<'a> {
         start..end
     }
 
-    /// The names `WITH` defines at the start of `block`.
-    fn cte_names(&self, block: &Block, names: &mut Vec<Name<'a>>) {
-        let mut index = block.start;
-        if !self.word(index, "WITH") {
-            return;
-        }
-        index += 1;
-        if self.word(index, "RECURSIVE") {
+    /// Reads the `WITH` list at `start` and pushes each CTE with its
+    /// columns onto `ctes`, in order, each computed with the ones before it
+    /// in scope. A CTE whose body holds the cursor ends the list (the later
+    /// ones are not in scope there) unless the list is `RECURSIVE`, where
+    /// every CTE sees all of them. Returns the index of the query that
+    /// follows, `None` when the list is unfinished.
+    fn with_clause(&self, start: usize, ctes: &mut Vec<Cte<'a>>, budget: u8) -> Option<usize> {
+        let mut index = start + 1;
+        let recursive = self.word(index, "RECURSIVE");
+        if recursive {
             index += 1;
         }
         loop {
-            let Some(name) = self.toks.get(index).filter(|tok| tok.is_name()) else {
-                return;
-            };
-            if Some(index) != self.typing {
-                names.push(name.name());
-            }
+            let name = self.toks.get(index).filter(|tok| tok.is_name())?;
+            let named_at = index;
             index += 1;
+            let mut list = None;
             if self.punct(index, "(") {
+                list = Some(self.names_in(index));
                 index = self.close_of(index) + 1;
             }
             if !self.word(index, "AS") {
-                return;
+                return None;
             }
             index += 1;
             while self.word(index, "NOT") || self.word(index, "MATERIALIZED") {
                 index += 1;
             }
             if !self.punct(index, "(") {
-                return;
+                return None;
             }
-            index = self.close_of(index) + 1;
+            let open = index;
+            let close = self.close_of(open);
+            if open < self.n && self.n <= close && !recursive {
+                return None;
+            }
+            let body = self.query_columns(open + 1..close, self.depth[open] + 1, ctes, budget);
+            if Some(named_at) != self.typing {
+                ctes.push(Cte {
+                    name: name.name(),
+                    columns: match list {
+                        Some(list) => rename(body, list),
+                        None => body,
+                    },
+                });
+            }
+            index = close + 1;
             if !self.punct(index, ",") {
-                return;
+                return Some(index);
             }
             index += 1;
         }
+    }
+
+    /// The names of the column list `(a, b)` opening at `open`.
+    fn names_in(&self, open: usize) -> Vec<Cow<'a, str>> {
+        (open + 1..self.close_of(open))
+            .filter(|&index| {
+                self.depth[index] == self.depth[open] + 1
+                    && self.toks[index].is_name()
+                    && (self.punct(index - 1, "(") || self.punct(index - 1, ","))
+            })
+            .map(|index| self.output_name(&self.toks[index]))
+            .collect()
+    }
+
+    /// The name the server gives a column written `tok`: PostgreSQL folds
+    /// an unquoted name to lower case, MySQL keeps it.
+    fn output_name(&self, tok: &Tok<'a>) -> Cow<'a, str> {
+        let name = tok.name();
+        if name.quoted || self.mysql || !name.text.bytes().any(|b| b.is_ascii_uppercase()) {
+            name.text
+        } else {
+            Cow::Owned(name.text.to_ascii_lowercase())
+        }
+    }
+
+    /// The output columns of the query in `range` (tokens at depth `base`):
+    /// a `WITH` first, then the select list of its first branch, or the
+    /// `RETURNING` list of an `INSERT`, `UPDATE` or `DELETE`. Nested
+    /// queries take one unit of `budget`; without any, nothing is known.
+    fn query_columns(
+        &self,
+        range: Range<usize>,
+        base: u32,
+        ctes: &mut Vec<Cte<'a>>,
+        budget: u8,
+    ) -> Vec<Out<'a>> {
+        let Some(budget) = budget.checked_sub(1) else {
+            return vec![Out::Unknown];
+        };
+        let mark = ctes.len();
+        let mut start = range.start;
+        if start < range.end && self.word(start, "WITH") {
+            start = self.with_clause(start, ctes, budget).unwrap_or(range.end);
+        }
+        let columns = if start < range.end && self.punct(start, "(") {
+            // `(SELECT ...) UNION ...`: the first branch.
+            let close = self.close_of(start).min(range.end);
+            self.query_columns(start + 1..close, base + 1, ctes, budget)
+        } else {
+            let end = (start..range.end)
+                .find(|&index| {
+                    self.depth[index] == base
+                        && self.toks[index].is_any(&["UNION", "INTERSECT", "EXCEPT"])
+                })
+                .unwrap_or(range.end);
+            let list = if start < end && self.word(start, "SELECT") {
+                Some(start + 1)
+            } else {
+                (start..end)
+                    .find(|&index| self.depth[index] == base && self.word(index, "RETURNING"))
+                    .map(|index| index + 1)
+            };
+            match list {
+                Some(first) => {
+                    let mut scope = Vec::new();
+                    self.collect(start..end, base, 0, ctes, &mut scope, budget);
+                    self.select_list(first..end, base, &scope)
+                }
+                // VALUES, TABLE t, or nothing yet.
+                None => vec![Out::Unknown],
+            }
+        };
+        ctes.truncate(mark);
+        columns
+    }
+
+    /// The output columns of the select or RETURNING list starting at
+    /// `range.start`, over the relations of `scope`.
+    fn select_list(&self, range: Range<usize>, base: u32, scope: &[Relation<'a>]) -> Vec<Out<'a>> {
+        let mut start = range.start;
+        while start < range.end && self.toks[start].is_any(SELECT_MODIFIERS) {
+            start += 1;
+            // PostgreSQL's `DISTINCT ON (...)`.
+            if self.word(start, "ON") && self.punct(start + 1, "(") {
+                start = self.close_of(start + 1) + 1;
+            }
+        }
+        let end = (start..range.end)
+            .find(|&index| self.depth[index] == base && self.toks[index].is_any(AFTER_SELECT_LIST))
+            .unwrap_or(range.end);
+        let mut out = Vec::new();
+        let mut item = start;
+        for index in start..=end {
+            if index < end && !(self.depth[index] == base && self.punct(index, ",")) {
+                continue;
+            }
+            if item < index {
+                self.select_item(item..index, scope, &mut out);
+            }
+            item = index + 1;
+        }
+        out
+    }
+
+    /// One item of a select list: `*`, `t.*`, `expr [AS] alias`, a column.
+    fn select_item(&self, range: Range<usize>, scope: &[Relation<'a>], out: &mut Vec<Out<'a>>) {
+        let toks = &self.toks[range];
+        // Whether the tokens are a path of names: `c`, `t.c`, `s.t.c`.
+        let path = |toks: &[Tok<'a>]| {
+            toks.iter().enumerate().all(|(index, tok)| {
+                if index % 2 == 0 {
+                    tok.is_name() && !tok.is_any(LITERAL_WORDS)
+                } else {
+                    tok.punct(".")
+                }
+            }) && toks.len() % 2 == 1
+        };
+        let star = toks.last().is_some_and(|tok| tok.punct("*"));
+        if star
+            && (toks.len() == 1
+                || (toks[toks.len() - 2].punct(".") && path(&toks[..toks.len() - 2])))
+        {
+            let qualifier = toks.len().checked_sub(3).map(|last| toks[last].name());
+            let mut any = false;
+            for relation in scope {
+                if qualifier
+                    .as_ref()
+                    .is_none_or(|name| name.same(&relation.qualifier))
+                {
+                    out.extend(relation.expand());
+                    any = true;
+                }
+            }
+            if !any {
+                out.push(Out::Unknown);
+            }
+            return;
+        }
+        let mut expr = toks;
+        let mut alias = None;
+        if let [.., before, last] = toks
+            && last.is_name()
+        {
+            let implicit = match before.kind {
+                TokenKind::Word => !before.is_any(BEFORE_OPERAND_NAME),
+                TokenKind::Punct => before.punct(")") || before.punct("]"),
+                TokenKind::QuotedIdent | TokenKind::String | TokenKind::Number => true,
+                _ => false,
+            };
+            if before.is("AS") {
+                alias = Some(last);
+                expr = &toks[..toks.len() - 2];
+            } else if implicit && !last.is_any(LITERAL_WORDS) && !last.is_any(NOT_AN_ALIAS) {
+                alias = Some(last);
+                expr = &toks[..toks.len() - 1];
+            }
+        }
+        let column = (!expr.is_empty() && path(expr)).then(|| &expr[expr.len() - 1]);
+        let data_type = column.and_then(|column| {
+            let name = column.name();
+            let qualifier = expr.len().checked_sub(3).map(|last| expr[last].name());
+            scope
+                .iter()
+                .filter(|relation| {
+                    qualifier
+                        .as_ref()
+                        .is_none_or(|q| q.same(&relation.qualifier))
+                })
+                .flat_map(Relation::columns)
+                .find(|(candidate, _)| name.matches(candidate))
+                .and_then(|(_, data_type)| data_type)
+        });
+        let name = alias.or(column).map(|tok| self.output_name(tok));
+        out.push(Out::Column(name, data_type));
     }
 
     /// Looks `path` (`table`, `schema.table`) up in the catalog. An
@@ -1070,7 +1403,7 @@ impl<'a> Query<'a> {
     fn resolve(
         &self,
         path: &[Name<'a>],
-        ctes: &[Name<'a>],
+        ctes: &[Cte<'a>],
     ) -> Option<(&'a CatalogSchema, &'a CatalogRelation)> {
         let (schema, name) = match path {
             [name] => (None, name),
@@ -1090,21 +1423,26 @@ impl<'a> Query<'a> {
                     .find(|s| schema.matches(&s.name))?;
                 relation_in(schema)
             }
-            None if ctes.iter().any(|cte| cte.matches(&name.text)) => None,
+            None if ctes.iter().any(|cte| cte.name.same(name)) => None,
             None => path_schemas(self.catalog).find_map(relation_in),
         }
     }
 
     /// Adds to `scope` the relations named in `range` at depth `base`.
+    /// `budget` bounds how deep the columns of its subqueries are worked out.
     fn collect(
         &self,
         range: Range<usize>,
         base: u32,
         level: usize,
-        ctes: &[Name<'a>],
+        ctes: &mut Vec<Cte<'a>>,
         scope: &mut Vec<Relation<'a>>,
+        budget: u8,
     ) {
         let mut index = range.start;
+        // `USING` names relations in `DELETE ... USING` and `MERGE ... USING`,
+        // never in `JOIN ... USING (...)` or `CREATE INDEX ... USING btree`.
+        let mut using = false;
         while index < range.end {
             let tok = &self.toks[index];
             if self.depth[index] != base || tok.kind != TokenKind::Word {
@@ -1117,14 +1455,16 @@ impl<'a> Query<'a> {
                 "JOIN" => (false, false),
                 "INTO" => (false, true),
                 "UPDATE" if !self.not_a_statement(index) => (true, false),
-                _ => {
+                "USING" if using && !self.punct(index + 1, "(") => (true, false),
+                word => {
+                    using |= matches!(word, "DELETE" | "MERGE");
                     index += 1;
                     continue;
                 }
             };
             index += 1;
             loop {
-                index = self.table_reference(index, into, level, ctes, scope);
+                index = self.table_reference(index, into, level, ctes, scope, budget);
                 if list && index < range.end && self.punct(index, ",") {
                     index += 1;
                 } else {
@@ -1149,8 +1489,9 @@ impl<'a> Query<'a> {
         mut index: usize,
         into: bool,
         level: usize,
-        ctes: &[Name<'a>],
+        ctes: &mut Vec<Cte<'a>>,
         scope: &mut Vec<Relation<'a>>,
+        budget: u8,
     ) -> usize {
         while self.word(index, "ONLY") || self.word(index, "LATERAL") {
             index += 1;
@@ -1161,7 +1502,10 @@ impl<'a> Query<'a> {
         // is finished (not the word being typed, no dangling dot).
         let mut known = true;
         let mut complete = true;
+        // The `(` of a subquery.
+        let mut subquery = None;
         if self.punct(index, "(") {
+            subquery = Some(index);
             index = self.close_of(index) + 1;
             known = false;
         } else {
@@ -1191,6 +1535,7 @@ impl<'a> Query<'a> {
             }
         }
         let mut alias = None;
+        let mut list = None;
         if !(into && self.punct(index, "(")) {
             if self.word(index, "AS") {
                 index += 1;
@@ -1207,6 +1552,7 @@ impl<'a> Query<'a> {
             }
             // The column names of a derived table: `(...) AS t (a, b)`.
             if alias.is_some() && !known && self.punct(index, "(") {
+                list = Some(self.names_in(index));
                 index = self.close_of(index) + 1;
             }
         }
@@ -1217,15 +1563,32 @@ impl<'a> Query<'a> {
         };
         if complete {
             let names: Vec<Name> = path.iter().map(|&part| self.toks[part].name()).collect();
+            let mut found = None;
+            let mut derived = Vec::new();
+            if let Some(open) = subquery {
+                let close = self.close_of(open);
+                derived = self.query_columns(open + 1..close, self.depth[open] + 1, ctes, budget);
+            } else if !known {
+                // A function: only a column list names its columns.
+                derived = vec![Out::Unknown];
+            } else if let [name] = names.as_slice()
+                && let Some(cte) = ctes.iter().rev().find(|cte| cte.name.same(name))
+            {
+                derived = cte.columns.clone();
+            } else {
+                found = self.resolve(&names, ctes);
+            }
+            match list {
+                Some(list) => derived = rename(derived, list),
+                None if subquery.is_none() && !known => derived.clear(),
+                None => {}
+            }
             scope.push(Relation {
                 written: self.toks[qualifier].text,
                 qualifier: self.toks[qualifier].name(),
                 aliased: alias.is_some(),
-                found: if known {
-                    self.resolve(&names, ctes)
-                } else {
-                    None
-                },
+                found,
+                derived,
                 level,
                 at,
             });
@@ -1297,13 +1660,17 @@ impl<'a> Query<'a> {
     /// Offers everything that fits at the cursor.
     fn offer(&self, sink: &mut Sink) {
         let blocks = self.blocks();
+        // Outermost first: an inner CTE is pushed later and found first.
         let mut ctes = Vec::new();
-        for block in &blocks {
-            self.cte_names(block, &mut ctes);
+        for block in blocks.iter().rev() {
+            if self.word(block.start, "WITH") {
+                self.with_clause(block.start, &mut ctes, DEPTH);
+            }
         }
         let mut scope = Vec::new();
         for (level, block) in blocks.iter().enumerate() {
-            self.collect(self.segment(block), block.base, level, &ctes, &mut scope);
+            let segment = self.segment(block);
+            self.collect(segment, block.base, level, &mut ctes, &mut scope, DEPTH);
         }
         let block = &blocks[0];
         let segment = self.segment(block);
@@ -1409,7 +1776,7 @@ impl<'a> Query<'a> {
         path: &[Name<'a>],
         table: bool,
         scope: &[Relation<'a>],
-        ctes: &[Name<'a>],
+        ctes: &[Cte<'a>],
     ) {
         let schema_named =
             |name: &Name| self.catalog.schemas.iter().find(|s| name.matches(&s.name));
@@ -1420,27 +1787,21 @@ impl<'a> Query<'a> {
                 }
             }
             [name] => {
-                let in_scope = scope.iter().find(|relation| {
-                    if name.quoted || relation.qualifier.quoted {
-                        relation.qualifier.text == name.text
-                    } else {
-                        relation.qualifier.text.eq_ignore_ascii_case(&name.text)
-                    }
-                });
+                let in_scope = scope.iter().find(|relation| relation.qualifier.same(name));
                 if let Some(relation) = in_scope {
-                    // Nothing rather than wrong columns for a CTE or a subquery.
-                    if let Some((_, found)) = relation.found {
-                        sink.columns(found);
-                    }
+                    sink.columns(relation.columns());
+                } else if let Some(cte) = ctes.iter().rev().find(|cte| cte.name.same(name)) {
+                    // A CTE the query does not name yet (`WITH x AS (...) SELECT x.`).
+                    sink.columns(named(&cte.columns));
                 } else if let Some(schema) = schema_named(name) {
                     sink.schema(schema, true);
                 } else if let Some((_, found)) = self.resolve(path, ctes) {
-                    sink.columns(found);
+                    sink.columns(catalog_columns(found));
                 }
             }
             [_, _, ..] if !table => {
                 if let Some((_, found)) = self.resolve(path, &[]) {
-                    sink.columns(found);
+                    sink.columns(catalog_columns(found));
                 }
             }
             _ => {}
@@ -1448,8 +1809,8 @@ impl<'a> Query<'a> {
     }
 
     /// CTE names, the relations of the search path, then the schemas.
-    fn offer_relations(&self, sink: &mut Sink, ctes: &[Name<'a>]) {
-        for cte in ctes {
+    fn offer_relations(&self, sink: &mut Sink, ctes: &[Cte<'a>]) {
+        for Cte { name: cte, .. } in ctes {
             sink.offer(&cte.text, |sink| CompletionItem {
                 label: cte.text.to_string(),
                 insert: sink.ident(&cte.text),
@@ -2181,24 +2542,354 @@ mod tests {
         );
     }
 
+    /// Labels and details, all of them.
+    fn shown(completion: &Completion) -> Vec<(&str, Option<&str>)> {
+        completion
+            .items
+            .iter()
+            .map(|item| (item.label.as_str(), item.detail.as_deref()))
+            .collect()
+    }
+
+    /// Asserts that `sql` offers exactly the columns `expected`, on both rule sets.
+    #[track_caller]
+    fn both(sql: &str, expected: &[&str]) {
+        for rules in [LexRules::POSTGRES, LexRules::MYSQL] {
+            assert_eq!(labels(&run(sql, rules)), expected, "{sql} ({rules:?})");
+        }
+    }
+
+    const ORDER_NAMES: &[&str] = &["id", "customer_id", "status", "placed_at", "total"];
+
+    /// C8 (K11): after `x.`, a CTE, a CTE with a column list, a CTE built on another, a
+    /// subquery alias and a `LATERAL` alias offer their output columns.
     #[test]
-    fn columns_of_ctes_and_subqueries_are_unknown() {
-        nothing(&pg(
-            "WITH recent AS (SELECT * FROM shop.orders) SELECT * FROM recent r WHERE r.|",
-        ));
-        nothing(&pg(
-            "WITH recent AS (SELECT * FROM shop.orders) SELECT recent.| FROM recent",
-        ));
+    fn columns_of_ctes_and_subqueries_are_known() {
+        let cte = "WITH x AS (SELECT id, status FROM shop.orders) ";
+        both(&format!("{cte}SELECT x.| FROM x"), &["id", "status"]);
+        // The text cut at the cursor: no FROM yet.
+        both(&format!("{cte}SELECT x.|"), &["id", "status"]);
+        // Text after the cursor, an alias of the CTE, a CTE named in WHERE.
+        both(
+            &format!("{cte}SELECT x.| FROM x WHERE x.id > 1 ORDER BY 1"),
+            &["id", "status"],
+        );
+        both(
+            &format!("{cte}SELECT * FROM x r WHERE r.|"),
+            &["id", "status"],
+        );
+        // A plain column keeps its catalog type; nothing else gets one.
+        assert_eq!(
+            shown(&pg(
+                "WITH x AS (SELECT id, total AS t, count(*) AS n FROM shop.orders) SELECT x.|"
+            )),
+            [
+                ("id", Some("bigint")),
+                ("t", Some("numeric(12,2)")),
+                ("n", None)
+            ]
+        );
+        // An explicit column list renames by position, types kept.
+        assert_eq!(
+            shown(&pg(
+                "WITH x(a, b) AS (SELECT id, status FROM shop.orders) SELECT x.| FROM x"
+            )),
+            [("a", Some("bigint")), ("b", Some("shop.order_status"))]
+        );
+        both(
+            "WITH x(a, b) AS (SELECT id, status FROM shop.orders) SELECT x.| FROM x",
+            &["a", "b"],
+        );
+        // Unnamed items still take their place; a shorter list leaves the rest.
+        both(
+            "WITH x(a, b) AS (SELECT count(*), 1 + 1 FROM shop.orders) SELECT x.|",
+            &["a", "b"],
+        );
+        both(
+            "WITH x(a) AS (SELECT id, status FROM shop.orders) SELECT x.|",
+            &["a", "status"],
+        );
+        // A CTE built on another, its type followed through.
+        let chained = "WITH x AS (SELECT id, status FROM shop.orders), y AS (SELECT status FROM x) SELECT y.| FROM y";
+        both(chained, &["status"]);
+        assert_eq!(shown(&pg(chained)), [("status", Some("shop.order_status"))]);
+        // A subquery alias, and its own column list.
+        both(
+            "SELECT s.| FROM (SELECT id AS k FROM shop.orders) s",
+            &["k"],
+        );
+        both(
+            "SELECT * FROM (SELECT id, status FROM shop.orders) AS s (a, b) WHERE s.|",
+            &["a", "b"],
+        );
+        // A LATERAL subquery (PostgreSQL; MySQL 8.0.14 has it too).
+        both(
+            "SELECT l.| FROM shop.orders o JOIN LATERAL (SELECT product_id AS lid FROM shop.order_items i WHERE i.order_id = o.id) l ON true",
+            &["lid"],
+        );
         // A CTE hides the table of the same name.
-        nothing(&pg(
+        both(
             "WITH customers AS (SELECT 1 AS x) SELECT customers.| FROM customers",
+            &["x"],
+        );
+        // Still nothing: a function without a column list, an alias nobody defined.
+        nothing(&pg("SELECT * FROM generate_series(1, 3) g WHERE g.|"));
+        nothing(&pg("SELECT * FROM shop.orders o WHERE x.|"));
+    }
+
+    /// C8 (K11): the output name of each select item, as the engine names it.
+    #[test]
+    fn a_derived_relation_has_the_output_names_of_its_select_list() {
+        // `*` and `t.*` through the catalog, with their types.
+        both(
+            "WITH r AS (SELECT * FROM shop.orders) SELECT r.| FROM r",
+            ORDER_NAMES,
+        );
+        assert_eq!(
+            shown(&pg("WITH r AS (SELECT * FROM shop.orders) SELECT r.|"))[0],
+            ("id", Some("bigint"))
+        );
+        both(
+            "WITH r AS (SELECT o.*, c.email FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id) SELECT r.|",
+            &["id", "customer_id", "status", "placed_at", "total", "email"],
+        );
+        // `*` through another derived relation.
+        both(
+            "WITH x AS (SELECT id AS k FROM shop.orders), y AS (SELECT * FROM x) SELECT y.|",
+            &["k"],
+        );
+        // Aliases, bare and qualified columns; no engine-made names (`count`, `?column?`).
+        let list = "id, total AS t, o.status, count(*), count(*) AS n, 1 + 1, placed_at p";
+        let completion = pg(&format!(
+            "SELECT s.| FROM (SELECT {list}, \"Quoted Name\" FROM shop.orders o) s"
+        ));
+        assert_eq!(
+            labels(&completion),
+            ["id", "t", "status", "n", "p", "Quoted Name"]
+        );
+        assert_eq!(completion.items[5].insert, "\"Quoted Name\"");
+        let completion = my(&format!(
+            "SELECT s.| FROM (SELECT {list}, `Quoted Name` FROM orders o) s"
+        ));
+        assert_eq!(
+            labels(&completion),
+            ["id", "t", "status", "n", "p", "Quoted Name"]
+        );
+        assert_eq!(completion.items[5].insert, "`Quoted Name`");
+        // A column named like a keyword is a column; `INTERVAL '1' DAY` names nothing.
+        assert_eq!(
+            labels(&pg(
+                "SELECT s.| FROM (SELECT day, placed_at + INTERVAL '1' DAY, NULL FROM t) s"
+            )),
+            ["day"]
+        );
+        // PostgreSQL folds unquoted names to lower case; MySQL keeps them.
+        assert_eq!(
+            labels(&pg(
+                "SELECT s.| FROM (SELECT Total AS Big FROM shop.orders) s"
+            )),
+            ["big"]
+        );
+        assert_eq!(
+            labels(&my("SELECT s.| FROM (SELECT Total AS Big FROM orders) s")),
+            ["Big"]
+        );
+        // Set operations: the names of the first branch.
+        both(
+            "SELECT u.| FROM (SELECT id AS k FROM shop.orders UNION SELECT id FROM shop.customers) u",
+            &["k"],
+        );
+        both(
+            "SELECT u.| FROM ((SELECT id AS k FROM shop.orders) UNION (SELECT id FROM shop.customers)) u",
+            &["k"],
+        );
+        // A column list on VALUES or a function: the list (PostgreSQL).
+        assert_eq!(
+            labels(&pg("SELECT v.| FROM (VALUES (1, 2)) AS v(a, b)")),
+            ["a", "b"]
+        );
+        assert_eq!(
+            labels(&pg("SELECT g.| FROM generate_series(1, 3) AS g(n)")),
+            ["n"]
+        );
+        // Data-modifying CTEs: the RETURNING list (PostgreSQL).
+        assert_eq!(
+            labels(&pg(
+                "WITH d AS (DELETE FROM shop.orders WHERE total = 0 RETURNING id, status) SELECT d.| FROM d"
+            )),
+            ["id", "status"]
+        );
+        assert_eq!(
+            labels(&pg(
+                "WITH i AS (INSERT INTO shop.orders (id) VALUES (1) RETURNING *) SELECT i.| FROM i"
+            )),
+            ORDER_NAMES
+        );
+        assert_eq!(
+            shown(&pg(
+                "WITH u AS (UPDATE shop.orders o SET total = 0 RETURNING o.total AS t, now() AS at) SELECT u.|"
+            )),
+            [("t", Some("numeric(12,2)")), ("at", None)]
+        );
+    }
+
+    /// C8 (K11): the cursor in an unfinished statement offers what is known, never
+    /// something wrong.
+    #[test]
+    fn unfinished_ctes_offer_what_is_known() {
+        // The CTE's own select is unfinished.
+        both(
+            "WITH x AS (SELECT id, total + FROM shop.orders) SELECT x.|",
+            &["id"],
+        );
+        both(
+            "WITH x AS (SELECT id, status FROM shop.orders WHERE) SELECT x.|",
+            &["id", "status"],
+        );
+        both(
+            "WITH x AS (SELECT id, FROM shop.orders) SELECT x.|",
+            &["id"],
+        );
+        // A CTE never closed holds the cursor: nothing is defined yet.
+        nothing(&pg(
+            "WITH x AS (SELECT id, status FROM shop.orders SELECT x.|",
+        ));
+        // Typing a column of the CTE.
+        assert_eq!(
+            labels(&pg(
+                "WITH x AS (SELECT id, status FROM shop.orders) SELECT x.st|"
+            )),
+            ["status"]
+        );
+    }
+
+    /// C8 (K11): which names a query sees.
+    #[test]
+    fn ctes_and_derived_tables_follow_the_scope_rules() {
+        // Without RECURSIVE a CTE sees the ones before it only, not itself.
+        nothing(&pg(
+            "WITH r AS (SELECT 1 AS n UNION ALL SELECT r.| FROM r) SELECT 1",
         ));
         nothing(&pg(
-            "SELECT * FROM (SELECT id FROM shop.orders) sub WHERE sub.|",
+            "WITH a AS (SELECT b.| FROM b), b AS (SELECT 1 AS k) SELECT 1",
         ));
-        nothing(&pg("SELECT * FROM generate_series(1, 3) g WHERE g.|"));
-        // An alias nobody defined.
-        nothing(&pg("SELECT * FROM shop.orders o WHERE x.|"));
+        // With RECURSIVE it sees itself (the first branch names it) and the later ones.
+        both(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT r.| FROM r WHERE n < 5) SELECT * FROM r",
+            &["n"],
+        );
+        both(
+            "WITH RECURSIVE a AS (SELECT b.| FROM b), b AS (SELECT 1 AS k) SELECT 1",
+            &["k"],
+        );
+        both(
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r) SELECT r.| FROM r",
+            &["n"],
+        );
+        // An inner CTE shadows an outer one of the same name.
+        both(
+            "WITH x AS (SELECT id FROM shop.orders) SELECT * FROM (WITH x AS (SELECT email FROM shop.customers) SELECT x.| FROM x) s",
+            &["email"],
+        );
+        // An inner WITH sees the outer CTEs, types followed through.
+        let nested = "WITH x AS (SELECT id FROM shop.orders) SELECT * FROM (WITH y AS (SELECT id AS k FROM x) SELECT y.| FROM y) s";
+        assert_eq!(shown(&pg(nested)), [("k", Some("bigint"))]);
+        // A correlated subquery sees the outer relations, CTEs included.
+        both(
+            "WITH x AS (SELECT id, status FROM shop.orders) SELECT * FROM x WHERE EXISTS (SELECT 1 FROM shop.customers c WHERE c.id = x.|)",
+            &["id", "status"],
+        );
+        // A LATERAL subquery sees the FROM items before it.
+        both(
+            "SELECT * FROM (SELECT id AS k FROM shop.orders) s JOIN LATERAL (SELECT s.| FROM shop.customers) l ON true",
+            &["k"],
+        );
+        // An inner derived table's alias shadows an outer one.
+        both(
+            "SELECT * FROM (SELECT id AS k FROM shop.orders) s WHERE EXISTS (SELECT 1 FROM (SELECT email FROM shop.customers) s WHERE s.|)",
+            &["email"],
+        );
+    }
+
+    /// C8 (K11): a CTE's or a subquery's columns are offered unqualified as a table's are.
+    #[test]
+    fn derived_columns_are_offered_unqualified() {
+        for rules in [LexRules::POSTGRES, LexRules::MYSQL] {
+            starts(
+                &run(
+                    "WITH x AS (SELECT id, status FROM shop.orders) SELECT | FROM x",
+                    rules,
+                ),
+                &[("id", Column), ("status", Column), ("x", Alias)],
+            );
+            // A name a table of the query also has is qualified.
+            starts(
+                &run(
+                    "WITH x AS (SELECT id, status FROM shop.orders) SELECT | FROM x JOIN shop.customers c ON c.id = x.id",
+                    rules,
+                ),
+                &[
+                    ("x.id", Column),
+                    ("status", Column),
+                    ("c.id", Column),
+                    ("email", Column),
+                ],
+            );
+            starts(
+                &run(
+                    "SELECT * FROM (SELECT id AS k FROM shop.orders) s WHERE |",
+                    rules,
+                ),
+                &[("k", Column), ("s", Alias)],
+            );
+        }
+    }
+
+    /// C8 (K11): `DELETE … USING` names relations as FROM does; MySQL's multi-table
+    /// `DELETE` and `UPDATE` name theirs with FROM and JOIN.
+    #[test]
+    fn delete_using_and_multi_table_statements_name_their_relations() {
+        let customer = [
+            "id",
+            "email",
+            "full_name",
+            "phone",
+            "is_active",
+            "created_at",
+        ];
+        both(
+            "DELETE FROM shop.orders USING shop.customers x WHERE x.|",
+            &customer,
+        );
+        both(
+            "DELETE FROM shop.orders o USING shop.customers x WHERE x.id = o.customer_id AND o.|",
+            ORDER_NAMES,
+        );
+        both(
+            "DELETE o FROM shop.orders o JOIN shop.customers x ON x.id = o.customer_id WHERE x.|",
+            &customer,
+        );
+        both(
+            "UPDATE shop.orders o JOIN shop.customers x ON x.id = o.customer_id SET x.|",
+            &customer,
+        );
+        assert_eq!(
+            labels(&pg(
+                "MERGE INTO shop.orders o USING shop.customers x ON x.id = o.customer_id WHEN MATCHED AND x.|"
+            )),
+            customer
+        );
+        // `USING` elsewhere names no relation.
+        let completion = pg("SELECT * FROM shop.orders o JOIN shop.customers c USING (id) WHERE |");
+        let aliases: Vec<&str> = completion
+            .items
+            .iter()
+            .filter(|item| item.kind == Alias)
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(aliases, ["o", "c"]);
+        let completion = pg("CREATE INDEX i ON shop.orders USING btree (id) WHERE |");
+        assert!(!labels(&completion).contains(&"btree"), "{completion:?}");
     }
 
     #[test]
@@ -2797,6 +3488,26 @@ mod tests {
             let completion = complete(text, cursor, &catalog, LexRules::MYSQL, &my_quote);
             assert!(completion.replace.end <= text.len());
         }
+        // Nesting far past the depth bound: no panic, no endless walk.
+        let mut derived = String::from("shop.orders");
+        let mut with = String::from("SELECT 1 AS k");
+        for _ in 0..200 {
+            derived = format!("(SELECT * FROM {derived}) s");
+            with = format!("WITH a AS ({with}) SELECT * FROM a");
+        }
+        for sql in [
+            format!("SELECT s.| FROM {derived}"),
+            format!("{with} WHERE a.|"),
+        ] {
+            for rules in [LexRules::POSTGRES, LexRules::MYSQL] {
+                assert!(run(&sql, rules).items.len() <= MAX_ITEMS);
+            }
+        }
+        // Within it, the columns come through.
+        both(
+            "WITH a AS (WITH a AS (WITH a AS (SELECT 1 AS k) SELECT * FROM a) SELECT * FROM a) SELECT a.|",
+            &["k"],
+        );
         // An empty catalog offers keywords and functions only.
         let empty = Catalog::default();
         let completion = complete("SELECT * FROM ", 14, &empty, LexRules::POSTGRES, &pg_quote);
@@ -2839,6 +3550,10 @@ mod tests {
             "using",
             "begin",
             "delimiter",
+            "recursive",
+            "lateral",
+            "returning",
+            "merge",
             "shop",
             "orders",
             "customers",
@@ -3012,8 +3727,18 @@ mod tests {
             ("JOIN zzz|", "", "no match at all"),
             ("WHERE rout|", "routine_000", "routines"),
         ];
-        for (tail, expected, what) in cases {
-            let sql = format!("{statement}{tail}");
+        // K11: ten CTEs, each on the one before; a walk that redoes the chain shows here.
+        let mut chained = String::from("WITH c0 AS (SELECT * FROM big.table_0000)");
+        for index in 1..10 {
+            chained.push_str(&format!(", c{index} AS (SELECT * FROM c{})", index - 1));
+        }
+        let chained = format!("{chained}\n{statement}JOIN c9 ON c9.col_00 = t0.col_00 WHERE c9.|");
+        let mut sqls: Vec<(String, &str, &str)> = cases
+            .iter()
+            .map(|(tail, expected, what)| (format!("{statement}{tail}"), *expected, *what))
+            .collect();
+        sqls.push((chained, "col_00", "ten chained CTEs"));
+        for (sql, expected, what) in sqls {
             let cursor = sql.find('|').expect("cursor");
             let text = sql.replace('|', "");
             let rounds = 200;

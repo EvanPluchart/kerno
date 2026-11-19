@@ -614,3 +614,15 @@ Still open (for the owner):
   no product code changed.
 - `docs/COMPETITOR-ISSUES.md`: C1, C2, C6 and C21 now answered (9 answered, 5 gaps, 1 untested). Limits and
   plan errors in the "Done:" line of K10 (`docs/plans/M12.md`).
+
+## 2026-11-19 — K11: completion knows the columns of CTEs, subqueries and `LATERAL` (C8)
+
+- After `x.`, a CTE (column list, built on another CTE, `RECURSIVE`), a subquery alias, a `LATERAL` subquery,
+  `VALUES`/a function with a column list, a data-modifying CTE (`RETURNING`) and a relation of `DELETE … USING`
+  offer their output columns; unqualified too, ranked and qualified as a table's. Computed in `complete.rs` on
+  the same tolerant tokens, once per CTE, eight queries deep at most; names and scope rules in D-083.
+- Engine-made names of unaliased expressions are not offered on purpose. Not covered: a column alias list on a
+  real table, a function or `VALUES` in FROM without a column list (the "Done:" line of K11).
+- Six core tests and six `sql_hard_inputs` probes, all seen failing before; one UI test types a CTE on
+  PostgreSQL and MySQL. Completion timing unchanged (0.3 to 1 ms a call in a debug build, ten chained CTEs
+  included). `docs/COMPETITOR-ISSUES.md`: C8 answered (10 answered, 4 gaps, 1 untested).

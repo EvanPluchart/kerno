@@ -1793,3 +1793,37 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   raw file and exits as a run would; a run keeps its raw lines in `target/bench-raw.tsv`. This is how the exit
   code was tested, on hand-written files, without building or starting the app.
 - Nothing calls the script (`scripts/check.sh` and `scripts/release.sh` do not), so no other step changes.
+
+## D-083 — What completion knows of a CTE or a subquery, and what it leaves out (K11, C8; 2026-11-19)
+
+- **One resolver, extended**: a relation of the statement (`Relation` in `sql/complete.rs`) carries either its
+  catalog entry or the output columns of the CTE or subquery it is (`Out`: a name or none, a type or none, or
+  "any number of unknown columns" for a `*` nothing can expand). They are computed on the tolerant token stream
+  the file already uses, not with `sqlparser`: the statement under the cursor is unfinished by definition. The
+  CTEs of every `WITH` around the cursor are computed once, outermost first and in list order, each with the
+  ones before it in scope, and kept on one stack an inner `WITH` pushes onto and truncates back; a reference
+  reads the stored columns and never walks the body again, so ten chained CTEs cost what one does.
+- **Output names** are the ones a user writes: an item's alias (`AS c` or bare `c`), else a column's own name
+  (`t.d` gives `d`); PostgreSQL folds an unquoted name to lower case, MySQL keeps it as written, a quoted one is
+  kept exactly and inserted quoted. **Engine-made names are not offered** (`count(*)` is "count" on PostgreSQL and
+  "count(*)" on MySQL, `1 + 1` is "?column?" or "1 + 1"): they differ per engine, they are rarely what the user
+  means to write, and offering them would invite `x."?column?"`. Such an item still takes its place, so a column
+  list renames the right columns. `*` and `t.*` expand through the catalog or the inner derived relation; one
+  that cannot (a function) ends what is known of the positions.
+- **An explicit column list** (`x(a, b) AS (…)`, `(…) AS s(a, b)`, `VALUES … AS v(a, b)`, `f() AS g(a, b)`)
+  always names the first columns, whatever the body; the later columns keep their names only when their places
+  are known. Set operations: the first branch names the columns. Data-modifying CTEs: the `RETURNING` list.
+- **Type detail**: a derived column shows the type of the catalog column it passes through (`id`, `t.total AS
+  t`, through any number of CTEs), nothing otherwise. No guessing from an expression.
+- **Scope**: a CTE is visible in the main query and in the CTEs after it; with `RECURSIVE` in all of them and
+  in itself (its first branch names it). A CTE whose body holds the cursor hides itself and the later ones
+  unless the list is `RECURSIVE`. An inner CTE or alias shadows an outer one; a subquery in `WHERE` or `SELECT`
+  sees the outer relations, and so does any subquery in FROM, `LATERAL` or not (the server refuses a
+  non-`LATERAL` one that uses them; offering them costs nothing). `WITH x AS (…) SELECT x.` without a FROM yet
+  offers the CTE's columns, as a table of the search path is offered today.
+- **`USING` names relations only after `DELETE` or `MERGE`** of the same query, never followed by `(`: `CREATE
+  INDEX … USING btree (…) WHERE …` would otherwise make `btree` a relation; `JOIN … USING (id)` and `ALTER …
+  USING expr` stay as they were.
+- **Bounds**: eight queries deep (`DEPTH`); deeper, the columns are unknown. Matching parentheses are computed
+  once per call, so no walk scans forward for its `)`. Work per call grows with the statement's length times the
+  depth; the K10 timing test has a ten-chained-CTE input and stays where it was (0.4 ms a call).

@@ -3226,3 +3226,31 @@ fn a_failed_table_form_apply_shows_the_server_hint(cx: &mut TestAppContext) {
         "character varying"
     );
 }
+
+/// C8 (K11): typing a CTE in a query tab, `x.` lists the CTE's columns and Enter writes the
+/// first one. One engine per test: in the app opened second in one test context, Enter
+/// accepted the item and then also wrote a newline (seen, not explained).
+fn k11_cte_columns_in_the_editor(cx: &mut TestAppContext, engine: Engine, table: &str) {
+    if !testing::available(engine) {
+        return;
+    }
+    let app = connected(cx, engine);
+    new_tab_with_catalog(&app, cx);
+    let typed = format!("with x as (select id, status from {table}) select x.");
+    app.type_text(cx, &typed);
+    let (open, items) = completion_menu(&app, cx);
+    assert!(open, "{items:?}");
+    assert_eq!(items, ["id", "status"]);
+    app.press(cx, &["enter"]);
+    assert_eq!(app.active_query(cx).1, format!("{typed}id"));
+}
+
+#[gpui_kit::test]
+fn a_cte_typed_in_the_editor_offers_its_columns(cx: &mut TestAppContext) {
+    k11_cte_columns_in_the_editor(cx, Engine::Postgres, "shop.orders");
+}
+
+#[gpui_kit::test]
+fn a_cte_typed_in_a_mysql_editor_offers_its_columns(cx: &mut TestAppContext) {
+    k11_cte_columns_in_the_editor(cx, Engine::MySql, "orders");
+}

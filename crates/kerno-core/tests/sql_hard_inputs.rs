@@ -1,8 +1,8 @@
 //! Hard inputs for completion, statement splitting and the formatter, from
 //! the audit of the DBeaver critique (docs/research/dbeaver-critique.md,
 //! rows C8, C9, C10; triage in docs/COMPETITOR-ISSUES.md). Each test pins a
-//! case Kerno already gets right. The cases it gets wrong are items of
-//! docs/plans/M12.md, not tests here.
+//! case Kerno gets right: the ones it got wrong at the audit became items of
+//! docs/plans/M12.md, and each lands here once fixed (the C8 probes of K11).
 
 use kerno_core::schema::RelationKind;
 use kerno_core::sql::{
@@ -416,4 +416,62 @@ fn c8_update_from_aliased_pg() {
         PG,
         &["uid", "ref"],
     );
+}
+
+// K11: the audit's failing C8 probes, now answered (docs/plans/M12.md).
+#[test]
+fn c8_cte_columns() {
+    for rules in [PG, MY] {
+        offers(
+            "WITH x AS (SELECT id, name FROM t) SELECT x.| FROM x",
+            rules,
+            &["id", "name"],
+        );
+        // Cut at the cursor.
+        offers(
+            "WITH x AS (SELECT id, name FROM t) SELECT x.|",
+            rules,
+            &["id", "name"],
+        );
+    }
+}
+#[test]
+fn c8_cte_column_list() {
+    for rules in [PG, MY] {
+        offers(
+            "WITH x(a, b) AS (SELECT id, name FROM t) SELECT x.| FROM x",
+            rules,
+            &["a", "b"],
+        );
+    }
+}
+#[test]
+fn c8_cte_on_a_cte() {
+    for rules in [PG, MY] {
+        offers(
+            "WITH x AS (SELECT id, name FROM t), y AS (SELECT name FROM x) SELECT y.| FROM y",
+            rules,
+            &["name"],
+        );
+    }
+}
+#[test]
+fn c8_subquery_alias() {
+    for rules in [PG, MY] {
+        offers("SELECT s.| FROM (SELECT id AS k FROM t) s", rules, &["k"]);
+    }
+}
+#[test]
+fn c8_join_lateral_pg() {
+    offers(
+        "SELECT l.| FROM t JOIN LATERAL (SELECT uid AS lid FROM u WHERE u.uid = t.id) l ON true",
+        PG,
+        &["lid"],
+    );
+}
+#[test]
+fn c8_delete_using_aliased() {
+    for rules in [PG, MY] {
+        offers("DELETE FROM t USING u x WHERE x.|", rules, &["uid", "ref"]);
+    }
 }
