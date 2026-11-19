@@ -44,14 +44,27 @@ pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::R
     Ok(())
 }
 
-fn start_with(directory: &Path, filter: EnvFilter) -> anyhow::Result<WorkerGuard> {
+/// Creates the log directory, the user's alone: logs name hosts, databases
+/// and users. The data folder above it too when this is what creates it:
+/// the log starts before the store (K8), which would have created that
+/// folder for the user alone and leaves an existing one as it is.
+fn make_private(directory: &Path) -> std::io::Result<()> {
+    let new_parent = directory.parent().filter(|parent| !parent.exists());
     std::fs::create_dir_all(directory)?;
-    // Logs name hosts, databases and users: the directory is the user's alone.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        for directory in new_parent.into_iter().chain([directory]) {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = new_parent;
+    Ok(())
+}
+
+fn start_with(directory: &Path, filter: EnvFilter) -> anyhow::Result<WorkerGuard> {
+    make_private(directory)?;
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("kerno")
@@ -76,4 +89,30 @@ fn start_with(directory: &Path, filter: EnvFilter) -> anyhow::Result<WorkerGuard
 #[cfg(test)]
 pub fn flush(cx: &mut App) {
     cx.remove_global::<LogWriter>();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// The log starts before the store: when it is what creates the data
+    /// folder, that folder is the user's alone, as the store makes it; one
+    /// that exists keeps its mode.
+    #[test]
+    fn the_data_folder_the_log_creates_is_the_user_s_alone() {
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let scratch = tempfile::tempdir().unwrap();
+        let data = scratch.path().join("Kerno");
+        super::make_private(&data.join("logs")).unwrap();
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&data.join("logs")), 0o700);
+
+        let existing = scratch.path().join("mine");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::make_private(&existing.join("logs")).unwrap();
+        assert_eq!(mode(&existing), 0o755);
+        assert_eq!(mode(&existing.join("logs")), 0o700);
+    }
 }
