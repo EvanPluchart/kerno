@@ -626,3 +626,19 @@ Still open (for the owner):
 - Six core tests and six `sql_hard_inputs` probes, all seen failing before; one UI test types a CTE on
   PostgreSQL and MySQL. Completion timing unchanged (0.3 to 1 ms a call in a debug build, ten chained CTEs
   included). `docs/COMPETITOR-ISSUES.md`: C8 answered (10 answered, 4 gaps, 1 untested).
+
+## 2026-11-19 — K12: `BEGIN ATOMIC` and MySQL `BEGIN … END` bodies stay one statement (C9)
+
+- A routine typed without `DELIMITER` is one statement to the split: PostgreSQL `CREATE FUNCTION | PROCEDURE …
+  BEGIN ATOMIC … END`, MySQL and MariaDB `CREATE PROCEDURE | FUNCTION | TRIGGER | EVENT … BEGIN … END` (nested
+  blocks, labels, handlers, `END IF` and the other `END <word>` forms, `CASE … END` expressions), and MariaDB's
+  `BEGIN NOT ATOMIC … END`. Run script, run selection and run at cursor send it whole; a bare `BEGIN` still
+  splits; under `DELIMITER` nothing changed (dumps included). Tracked in the split's one pass (`Blocks`), rules in
+  D-084: an `END` closes only after a `;`, so `CASE` needs no tracking and `end` as a MySQL name does not close.
+- A body not yet closed holds the rest of the text (nothing after it runs on its own; the server's syntax error
+  shows). `classify` no longer takes `BEGIN NOT ATOMIC` for a transaction. Split timing unchanged (about 15 ms for
+  20,000 statements in a debug build; a 20,000-line body never closed, about 45 ms).
+- Five split tests, a completion pin (a body completes statement by statement), three classify rows, five
+  `sql_hard_inputs` probes, and one UI test per engine typing a routine and checking its body on the server; the
+  ones holding a body seen failing before. `docs/COMPETITOR-ISSUES.md`: C9 answered (11 answered, 3 gaps, 1
+  untested). Limits in the "Done:" line of K12 (`docs/plans/M12.md`).

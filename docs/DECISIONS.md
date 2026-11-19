@@ -1827,3 +1827,36 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
 - **Bounds**: eight queries deep (`DEPTH`); deeper, the columns are unknown. Matching parentheses are computed
   once per call, so no walk scans forward for its `)`. Work per call grows with the statement's length times the
   depth; the K10 timing test has a ten-chained-CTE input and stays where it was (0.4 ms a call).
+
+## D-084 — When a routine body stays one statement without `DELIMITER` (K12, C9; 2026-11-19)
+
+- **Where**: in the one pass of `split_statements` (`Blocks` in `sql/split.rs`), only while the separator is
+  `;`. Under any `DELIMITER xx` the delimiter alone decides, as before: a body cut by its own delimiter stays
+  cut, and mysqldump's `DELIMITER ;;` files split exactly as they did (their `/*!50003 CREATE … END */` are
+  opaque comments anyway, K7). Written from the grammars (PostgreSQL's `routine_body_stmt_list`, MySQL's
+  compound statements, MariaDB's `BEGIN NOT ATOMIC`); DBeaver's `SQLScriptParser.java` was read, not ported
+  (it counts every `BEGIN` and `CASE` and pops on any `END`; its MySQL dialect declares no block words).
+- **When a block opens**: only in a statement that starts `CREATE [OR REPLACE] [DEFINER = user] [AGGREGATE]
+  PROCEDURE | FUNCTION | TRIGGER | EVENT` (a few tokens read ahead; `CREATE TABLE event (…)` is not one), or,
+  on MySQL rules, with `BEGIN NOT ATOMIC` (MariaDB's anonymous block; MySQL refuses it, one error). On
+  PostgreSQL at `BEGIN ATOMIC`, once. On MySQL and MariaDB at a `BEGIN` outside parentheses, nested ones too,
+  unless it reads as a name: after a punctuation other than `)` or `:` (`NEW.begin`, `a, begin`, `(begin`), after
+  one of `SELECT RETURN DECLARE AS ON FROM WHERE AND OR NOT BY SET INTO WHEN IN IS LIKE DISTINCT JOIN`, or before
+  a punctuation or `;` (`begin.t`, `BEGIN;`). `lbl:BEGIN` (one token to the lexer) opens too. A bare `BEGIN`,
+  `BEGIN WORK`, `BEGIN TRANSACTION`, `BEGIN ISOLATION LEVEL …` is never in a routine's statement: it splits.
+- **What closes**: `END` after a `;` or after the `BEGIN` / `ATOMIC` of an empty block, unless followed by `IF`,
+  `LOOP`, `WHILE`, `REPEAT`, `CASE` or `FOR`. Every statement of a body ends with `;` in both grammars, the `END`
+  of a `CASE … END` expression follows an expression, and `end` as a name follows something else (`start, end`,
+  `AS end`): so no `CASE`, `IF`, `LOOP`, `WHILE` or `REPEAT` tracking, and labels after `END` change nothing.
+  Chosen over counting `CASE` because MySQL does not reserve `END` (`SELECT start, end FROM t` is legal) and a
+  counter would close the block there. The price: a body whose last statement lacks its `;` (`… SELECT 2 END`) is
+  never closed; the server refuses it anyway.
+- **After the final `END`**: the statement ends at the next `;`. Text between them stays in the statement (the
+  server refuses it on PostgreSQL; `END lbl` is MySQL's label). The body never reopens.
+- **A body never closed** (still being typed) runs to the end of the text, one statement: nothing after it runs
+  on its own, never an inner `DELETE` without its routine. Run script and run at cursor send it; the server
+  answers with a syntax error ("syntax error at end of input", MySQL's "near ''"), shown on that one result. A
+  runaway block stays linear (20,000 lines in about 45 ms in a debug build).
+- **Classify**: `BEGIN NOT ATOMIC …` is no longer a transaction `BEGIN` (it would have shown a transaction that
+  is not there): kind `Other`, a write, destructive as its statements are. A `CREATE` with a body stays a
+  write, not destructive, no rows (unchanged: the body is stored).

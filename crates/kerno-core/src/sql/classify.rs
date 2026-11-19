@@ -434,6 +434,19 @@ fn classify_tokens(tokens: &[Tok], rules: LexRules) -> StatementClass {
             class(Ddl, true, destroys, false)
         }
         "CREATE" | "RENAME" | "COMMENT" => class(Ddl, true, false, false),
+        // MariaDB's anonymous block `BEGIN NOT ATOMIC … END` runs its
+        // statements at once (C9): not a transaction; it writes, and destroys
+        // as its first statement does (the others are the next parts).
+        "BEGIN"
+            if tokens.get(1).is_some_and(|token| token.is("NOT"))
+                && tokens.get(2).is_some_and(|token| token.is("ATOMIC")) =>
+        {
+            let destroys = tokens
+                .get(3..)
+                .filter(|statement| !statement.is_empty())
+                .is_some_and(|statement| classify_tokens(statement, rules).destructive);
+            class(Other, true, destroys, false)
+        }
         "BEGIN" => tx(TxCommand::Begin),
         "START" if tokens.get(1).is_some_and(|token| token.is("TRANSACTION")) => {
             tx(TxCommand::Begin)
@@ -1000,6 +1013,14 @@ mod tests {
         ("COPY (SELECT 1) TO PROGRAM 'cat'", Copy, T, F, F),
         ("ANALYZE VERBOSE t", Other, T, F, F),
         ("DO $$ BEGIN DELETE FROM t; END $$", Other, T, F, F),
+        // C9 (K12): a `BEGIN ATOMIC` body is stored with its function.
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC DELETE FROM t; SELECT 1; END",
+            Ddl,
+            T,
+            F,
+            F,
+        ),
         ("SELECT $$ drop table t $$", Select, F, F, T),
         ("SELECT $tag$ ; delete from t; $tag$", Select, F, F, T),
         (
@@ -1309,6 +1330,10 @@ mod tests {
             F,
             F,
         ),
+        // C9 (K12): MariaDB's anonymous block runs at once: not a transaction, and what it
+        // holds counts.
+        ("BEGIN NOT ATOMIC SELECT 1; END", Other, T, F, F),
+        ("BEGIN NOT ATOMIC DELETE FROM t; END", Other, T, T, F),
         ("FLUSH PRIVILEGES", Other, T, F, F),
         ("KILL QUERY 12", Other, T, F, F),
         ("XA COMMIT 'x'", Other, T, F, F),

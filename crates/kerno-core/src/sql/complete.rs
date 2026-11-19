@@ -192,7 +192,8 @@ pub fn complete(
             text: &text[token.range.clone()],
         });
     }
-    // Inside a routine body (MySQL, under a custom delimiter) semicolons
+    // Inside a routine body (one statement to the split: under a custom
+    // delimiter, or a `BEGIN … END` / `BEGIN ATOMIC` body, C9) semicolons
     // still separate statements.
     let semicolon = |tok: &Tok| tok.kind == TokenKind::Semicolon;
     let low = toks[..n].iter().rposition(semicolon).map_or(0, |i| i + 1);
@@ -3428,6 +3429,57 @@ mod tests {
         nothing(&my("DELIMITER |"));
         nothing(&my("SELECT 1;\nDELIMITER $$|"));
         starts(&my("DELIMITER $$\n|"), &[("SELECT", Keyword)]);
+    }
+
+    /// C9 (K12): a routine body written without `DELIMITER` is one statement
+    /// to the split; completion still reads its inner statements one by one,
+    /// as under a custom delimiter.
+    #[test]
+    fn bodies_without_a_delimiter_complete_statement_by_statement() {
+        for (create, rules) in [
+            (
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC ",
+                LexRules::POSTGRES,
+            ),
+            ("CREATE PROCEDURE p() BEGIN ", LexRules::MYSQL),
+        ] {
+            let body = |inner: &str| run(&format!("{create}{inner} END; SELECT 3;"), rules);
+            assert_eq!(
+                labels(&body("SELECT 1; SELECT * FROM shop.orders o WHERE o.|;")),
+                ORDER_NAMES,
+                "{create}"
+            );
+            // `o` belongs to the inner statement before.
+            assert!(
+                body("SELECT * FROM shop.orders o; SELECT o.|;")
+                    .items
+                    .is_empty(),
+                "{create}"
+            );
+            assert_eq!(labels(&body("SELECT 1; UPD|")), ["UPDATE"], "{create}");
+            assert_eq!(
+                body("SELECT 1; |")
+                    .items
+                    .first()
+                    .map(|item| item.label.as_str()),
+                Some("SELECT"),
+                "{create}"
+            );
+            // K11's CTE columns inside a body.
+            assert_eq!(
+                labels(&body(
+                    "SELECT 1; WITH x AS (SELECT id, status FROM shop.orders) SELECT x.| FROM x;"
+                )),
+                ["id", "status"],
+                "{create}"
+            );
+            // The first inner statement, read with the routine's header before it.
+            assert_eq!(
+                labels(&body("SELECT * FROM shop.orders o WHERE o.|;")),
+                ORDER_NAMES,
+                "{create}"
+            );
+        }
     }
 
     #[test]

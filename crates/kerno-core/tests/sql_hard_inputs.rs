@@ -179,6 +179,43 @@ fn c9_mysql_procedure_with_delimiter_my() {
     );
 }
 #[test]
+fn c9_begin_atomic_pg() {
+    // Failed at the audit: four statements (K12).
+    splits(
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END; SELECT 3;",
+        PG,
+        &[
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END",
+            "SELECT 3",
+        ],
+    );
+}
+#[test]
+fn c9_mysql_procedure_without_delimiter_my() {
+    // Failed at the audit: four statements (K12).
+    splits(
+        "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END; SELECT 3;",
+        MY,
+        &[
+            "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+            "SELECT 3",
+        ],
+    );
+}
+#[test]
+fn c9_bare_begin_is_a_transaction() {
+    splits(
+        "BEGIN; SELECT 1; COMMIT;",
+        PG,
+        &["BEGIN", "SELECT 1", "COMMIT"],
+    );
+    splits(
+        "BEGIN; SELECT 1; COMMIT;",
+        MY,
+        &["BEGIN", "SELECT 1", "COMMIT"],
+    );
+}
+#[test]
 fn c9_semicolon_in_line_comment_pg() {
     splits("SELECT 1 -- a;b\n; SELECT 2", PG, &["SELECT 1", "SELECT 2"]);
 }
@@ -259,6 +296,27 @@ fn c9_at_cursor_inside_do_body_pg() {
     assert_eq!(
         at(source, cursor, PG).as_deref(),
         Some("DO $$ BEGIN RAISE NOTICE 'a;b'; END $$")
+    );
+}
+
+#[test]
+fn c9_at_cursor_inside_begin_atomic_pg() {
+    // Failed at the audit: `SELECT 2` alone (K12).
+    let source = "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END; SELECT 3;";
+    let cursor = source.find("SELECT 2").unwrap() + 2;
+    assert_eq!(
+        at(source, cursor, PG).as_deref(),
+        Some("CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END")
+    );
+}
+#[test]
+fn c9_at_cursor_inside_mysql_procedure_my() {
+    // Failed at the audit: `SELECT 2` alone (K12).
+    let source = "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END; SELECT 3;";
+    let cursor = source.find("SELECT 2").unwrap() + 2;
+    assert_eq!(
+        at(source, cursor, MY).as_deref(),
+        Some("CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END")
     );
 }
 

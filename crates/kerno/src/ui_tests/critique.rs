@@ -3254,3 +3254,101 @@ fn a_cte_typed_in_the_editor_offers_its_columns(cx: &mut TestAppContext) {
 fn a_cte_typed_in_a_mysql_editor_offers_its_columns(cx: &mut TestAppContext) {
     k11_cte_columns_in_the_editor(cx, Engine::MySql, "orders");
 }
+
+// K12 ----------------------------------------------------------------------------------------
+
+/// C9 (K12): a routine whose body holds several statements, typed in a query tab without
+/// `DELIMITER` (`BEGIN ATOMIC … END` on PostgreSQL, `BEGIN … END` on MySQL and MariaDB), is
+/// sent whole. Run as a script it is one statement before `SELECT 3`, and its `DELETE` is
+/// stored, not run on its own (nothing asks, the row stays); run from the cursor on a line of
+/// its body, the whole `CREATE` runs again. Each time the server holds the routine with both
+/// statements of its body.
+fn k12_a_routine_typed_without_delimiter(cx: &mut TestAppContext, engine: Engine) {
+    if !testing::available(engine) {
+        return;
+    }
+    let name = "kerno_ui_k12";
+    let (drop, create) = scratch_schema(engine, name);
+    let table = format!("CREATE TABLE {name}.t (id INT PRIMARY KEY)");
+    let row = format!("INSERT INTO {name}.t VALUES (1)");
+    let _scratch = Scratch::new(engine, &[&drop], &[&create, &table, &row]);
+    let (routine, definition, drop_routine) = match engine {
+        Engine::Postgres => (
+            format!("CREATE FUNCTION {name}.f() RETURNS int LANGUAGE sql\nBEGIN ATOMIC"),
+            format!("SELECT pg_get_functiondef('{name}.f()'::regprocedure)"),
+            format!("DROP FUNCTION {name}.f()"),
+        ),
+        Engine::MySql | Engine::MariaDb => (
+            format!("CREATE PROCEDURE {name}.p()\nBEGIN"),
+            format!(
+                "SELECT ROUTINE_DEFINITION FROM information_schema.ROUTINES \
+                 WHERE ROUTINE_SCHEMA = '{name}' AND ROUTINE_NAME = 'p'"
+            ),
+            format!("DROP PROCEDURE {name}.p"),
+        ),
+    };
+    let script = format!("{routine}\n  DELETE FROM {name}.t;\n  SELECT 2;\nEND;\nSELECT 3;");
+    let stored = |what: &str| {
+        let body = on_server(engine, &definition);
+        assert!(
+            body.contains(&format!("DELETE FROM {name}.t")) && body.contains("SELECT 2"),
+            "{engine:?} {what}: {body}"
+        );
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "1",
+            "{engine:?} {what}"
+        );
+    };
+    let app = connected(cx, engine);
+
+    app.run_in_new_tab(cx, &script, "secondary-shift-enter");
+    assert!(
+        !app.has(cx, "sql-preview"),
+        "{engine:?}: nothing to confirm"
+    );
+    app.wait_until(cx, "the script", |app, cx| {
+        !app.running(cx) && app.outcomes(cx).len() == 2
+    });
+    assert_eq!(app.outcomes(cx), ["done", "1 rows"], "{engine:?}");
+    stored("run as a script");
+
+    on_server(engine, &drop_routine);
+    let tab = app.tab(cx);
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.editor().update(cx, |editor, cx| {
+                // On `  SELECT 2;`, inside the body.
+                editor.set_cursor_position(
+                    gpui_kit::component::input::Position::new(3, 4),
+                    window,
+                    cx,
+                )
+            })
+        })
+    });
+    app.press(cx, &["secondary-enter"]);
+    assert!(
+        !app.has(cx, "sql-preview"),
+        "{engine:?}: nothing to confirm"
+    );
+    app.wait_until(cx, "the statement at the cursor", |app, cx| {
+        !app.running(cx) && app.outcomes(cx) == ["done"]
+    });
+    stored("run from the cursor");
+}
+
+#[gpui_kit::test]
+fn a_begin_atomic_function_typed_without_delimiter_is_one_statement(cx: &mut TestAppContext) {
+    k12_a_routine_typed_without_delimiter(cx, Engine::Postgres);
+}
+
+#[gpui_kit::test]
+fn a_mysql_procedure_typed_without_delimiter_is_one_statement(cx: &mut TestAppContext) {
+    k12_a_routine_typed_without_delimiter(cx, Engine::MySql);
+}
+
+#[gpui_kit::test]
+fn a_mariadb_procedure_typed_without_delimiter_is_one_statement(cx: &mut TestAppContext) {
+    k12_a_routine_typed_without_delimiter(cx, Engine::MariaDb);
+}
