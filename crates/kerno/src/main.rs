@@ -32,6 +32,7 @@ mod query;
 mod quick_open;
 mod settings;
 mod settings_view;
+mod shortcuts_view;
 mod sidebar;
 mod sql_confirm;
 mod start_failure;
@@ -290,7 +291,8 @@ fn start(
         }
     })
     .detach();
-    cx.set_menus(menus());
+    // The menu bar was set by `bind_keys`, which builds it again whenever
+    // the shortcuts change (K20).
 
     let mut window_size = size(px(1280.), px(800.));
     if let Some(display) = cx.primary_display() {
@@ -435,7 +437,9 @@ fn menu(name: &str, items: Vec<MenuItem>) -> Menu {
     }
 }
 
-/// The native menu bar: every command of `actions::COMMANDS` is in it.
+/// The native menu bar: every command of `actions::COMMANDS` is in it. Its
+/// shortcut column is read from the key bindings when it is set:
+/// `actions::apply_keymap` sets it again after each change.
 fn menus() -> Vec<Menu> {
     let separator = MenuItem::separator;
     vec![
@@ -446,6 +450,7 @@ fn menus() -> Vec<Menu> {
                 separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 command("search_settings"),
+                command("open_keyboard_shortcuts"),
                 command("open_keymap_file"),
                 separator(),
                 MenuItem::action("Quit Kerno", Quit),
@@ -512,6 +517,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Follow System Appearance", UseSystemTheme),
                 MenuItem::action("Light Appearance", UseLightTheme),
                 MenuItem::action("Dark Appearance", UseDarkTheme),
+                command("toggle_theme"),
                 separator(),
                 command("zoom_in"),
                 command("zoom_out"),

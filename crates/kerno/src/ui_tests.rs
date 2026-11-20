@@ -59,6 +59,7 @@ mod portability;
 mod reconnect;
 mod reorder;
 mod script_progress;
+mod shortcuts;
 mod sidebar_tree;
 mod tabs_v11;
 mod tasks;
@@ -11219,6 +11220,13 @@ fn a_bad_keymap_file_is_reported_and_the_defaults_stay(cx: &mut TestAppContext) 
     let problems = cx.update(|cx| actions::bind_keys(&file, cx));
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("not valid JSON"), "{problems:?}");
+    // The app goes on with its keys (the JSON error left the defaults).
+    app.press(cx, &["secondary-t"]);
+    assert_eq!(app.titles(cx), ["Query 1"]);
+    // A bad entry: its command has no key (the entry replaces the defaults,
+    // as `problems_in_the_keymap_file_are_reported_not_fatal` pins), the
+    // others keep theirs. Binding again replaces Kerno's keys (K20): before,
+    // the first call's keys stayed underneath.
     std::fs::write(
         &file,
         r#"{"bindings": {"new_query_tab": "secondary-entr", "no_such": "f2"}}"#,
@@ -11226,9 +11234,10 @@ fn a_bad_keymap_file_is_reported_and_the_defaults_stay(cx: &mut TestAppContext) 
     .unwrap();
     let problems = cx.update(|cx| actions::bind_keys(&file, cx));
     assert_eq!(problems.len(), 2, "{problems:?}");
-    // The app goes on with its keys.
     app.press(cx, &["secondary-t"]);
     assert_eq!(app.titles(cx), ["Query 1"]);
+    app.press(cx, &["secondary-w"]);
+    assert_eq!(app.titles(cx), Vec::<String>::new());
 }
 
 #[gpui_kit::test]

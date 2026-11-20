@@ -8,7 +8,10 @@ use std::path::Path;
 use std::rc::Rc;
 
 use gpui_kit::base::input::ShowCompletions;
-use gpui_kit::{Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke, OperatingSystem};
+use gpui_kit::{
+    Action, App, KeyBinding, KeyBindingContextPredicate, KeyBindingMetaIndex, Keystroke,
+    OperatingSystem,
+};
 use serde::Deserialize;
 
 gpui_kit::actions!(
@@ -345,6 +348,10 @@ gpui_kit::actions!(
         UseLightTheme,
         /// Switches to the dark theme.
         UseDarkTheme,
+        /// Switches to the opposite of the theme on screen, light or dark (K20).
+        ToggleTheme,
+        /// Opens Settings ▸ Shortcuts (K20).
+        OpenKeyboardShortcuts,
         /// Shows the version and licence.
         About,
         /// Asks GitHub whether a newer release is out.
@@ -587,11 +594,12 @@ pub const COMMANDS: &[Command] = &[
         ["close", "folders", "sidebar"],
         CollapseConnectionFolders
     ),
+    // DataGrip's Synchronize (⌘⌥Y, Ctrl+Alt+Y): DBeaver has no key for it (K20).
     command!(
         "refresh_schema_tree",
         "Refresh Schema Tree",
         "Connections",
-        [],
+        ["secondary-alt-y"],
         ["reload", "navigator", "objects"],
         RefreshSchemaTree
     ),
@@ -1155,11 +1163,12 @@ pub const COMMANDS: &[Command] = &[
         DeleteRows,
         "DataTable"
     ),
+    // DataGrip's Set NULL (⌘⌥N); DBeaver has none (K20).
     command!(
         "set_null",
         "Set Selected Cells to NULL",
         "Data",
-        [],
+        ["cmd-alt-n"],
         ["null", "empty"],
         SetNull
     ),
@@ -1378,11 +1387,12 @@ pub const COMMANDS: &[Command] = &[
         ["header", "clipboard"],
         CopyColumnName
     ),
+    // DataGrip's Revert Selected (⌘⌥Z) (K20).
     command!(
         "revert_selected_rows",
         "Revert Selected Rows",
         "Data",
-        [],
+        ["cmd-alt-z"],
         ["undo", "pending", "discard"],
         RevertSelectedRows
     ),
@@ -1754,11 +1764,12 @@ pub const COMMANDS: &[Command] = &[
         ["several", "multiple", "summary", "servers"],
         ShowMultiRun
     ),
+    // DBeaver's `ui.editors.sql.show.output` (Ctrl+Shift+O) (K20).
     command!(
         "show_messages",
         "Show Messages of the Last Run",
         "Query",
-        [],
+        ["ctrl-shift-o"],
         ["notices", "warnings", "server", "output"],
         ShowMessages
     ),
@@ -1819,11 +1830,12 @@ pub const COMMANDS: &[Command] = &[
         [],
         CloseTab
     ),
+    // Safari's Close Other Tabs (⌥⌘W) (K20).
     command!(
         "close_other_tabs",
         "Close Other Tabs",
         "Tabs",
-        [],
+        ["secondary-alt-w"],
         ["keep"],
         CloseOtherTabs
     ),
@@ -1867,11 +1879,13 @@ pub const COMMANDS: &[Command] = &[
         ["copy", "clone"],
         DuplicateTab
     ),
+    // Browsers' Reopen Closed Tab (⌘⇧T); Ctrl+Shift+T is the query tab's
+    // Maximize Results Panel, so not `secondary` (K20).
     command!(
         "reopen_closed_tab",
         "Reopen Closed Tab",
         "Tabs",
-        [],
+        ["cmd-shift-t"],
         ["undo close", "restore"],
         ReopenClosedTab
     ),
@@ -1897,7 +1911,10 @@ pub const COMMANDS: &[Command] = &[
         "commit_transaction",
         "Commit Transaction",
         "Query",
-        ["ctrl-4"],
+        // DBeaver's other keys, Ctrl+Alt+Shift+K and R: digits sit behind
+        // Shift on an AZERTY keyboard (K20). The last key is the one menus
+        // and tooltips show: Ctrl+4 stays it.
+        ["ctrl-alt-shift-k", "ctrl-4"],
         ["end", "save"],
         CommitTransaction
     ),
@@ -1905,7 +1922,7 @@ pub const COMMANDS: &[Command] = &[
         "rollback_transaction",
         "Roll Back Transaction",
         "Query",
-        ["ctrl-8"],
+        ["ctrl-alt-shift-r", "ctrl-8"],
         ["rollback", "undo", "abort"],
         RollbackTransaction
     ),
@@ -1975,11 +1992,12 @@ pub const COMMANDS: &[Command] = &[
         ["settings", "properties"],
         EditTabConnection
     ),
+    // DBeaver's `ui.dashboard.open` (Ctrl+Alt+Shift+B) (K20).
     command!(
         "open_admin",
         "Server Administration",
         "Server",
-        [],
+        ["ctrl-alt-shift-b"],
         [
             "sessions",
             "processes",
@@ -2123,11 +2141,12 @@ pub const COMMANDS: &[Command] = &[
         ReadObjectInConsole
     ),
     // DBeaver's "View Diagram" (`ui.editors.erd`), J18.
+    // DataGrip's Show Diagram (⌥⇧⌘U) for the key (K20).
     command!(
         "view_diagram",
         "View ER Diagram",
         "Navigator",
-        [],
+        ["cmd-alt-shift-u"],
         [
             "erd",
             "entity relationship",
@@ -2433,12 +2452,21 @@ pub const COMMANDS: &[Command] = &[
         ["foreign key", "navigate"],
         RevealReferencedTable
     ),
-    command!("next_tab", "Next Tab", "Tabs", ["ctrl-tab"], [], NextTab),
+    // Safari's and Chrome's ⌥⌘→, Linux browsers' Ctrl+PageDown (K20), before
+    // Ctrl+Tab, which menus show (the last key is the one shown).
+    command!(
+        "next_tab",
+        "Next Tab",
+        "Tabs",
+        ["cmd-alt-right", "ctrl-pagedown", "ctrl-tab"],
+        [],
+        NextTab
+    ),
     command!(
         "previous_tab",
         "Previous Tab",
         "Tabs",
-        ["ctrl-shift-tab"],
+        ["cmd-alt-left", "ctrl-pageup", "ctrl-shift-tab"],
         [],
         PreviousTab
     ),
@@ -2491,6 +2519,23 @@ pub const COMMANDS: &[Command] = &[
         ["appearance"],
         UseDarkTheme
     ),
+    // The owner's request of 2026-11-20 (K20): ⌘⇧D / Ctrl+Shift+D, free in
+    // Kerno, the kit's inputs and macOS; D for dark.
+    command!(
+        "toggle_theme",
+        "Theme: Switch Light and Dark",
+        "View",
+        ["secondary-shift-d"],
+        [
+            "appearance",
+            "toggle",
+            "dark mode",
+            "light mode",
+            "night",
+            "day"
+        ],
+        ToggleTheme
+    ),
     command!(
         "open_command_palette",
         "Command Palette",
@@ -2517,6 +2562,21 @@ pub const COMMANDS: &[Command] = &[
         ["preferences", "options", "search", "settings"],
         SearchSettings,
         "Settings"
+    ),
+    command!(
+        "open_keyboard_shortcuts",
+        "Keyboard Shortcuts…",
+        "Kerno",
+        [],
+        [
+            "shortcuts",
+            "keys",
+            "bindings",
+            "keyboard",
+            "keymap",
+            "hotkeys"
+        ],
+        OpenKeyboardShortcuts
     ),
     command!(
         "open_keymap_file",
@@ -2553,11 +2613,17 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /// The system `secondary-` resolves against: Cmd on macOS, Ctrl elsewhere.
-const HOST_OS: OperatingSystem = if cfg!(target_os = "macos") {
+pub(crate) const HOST_OS: OperatingSystem = if cfg!(target_os = "macos") {
     OperatingSystem::Mac
 } else {
     OperatingSystem::Linux
 };
+
+/// Marks every binding Kerno adds, so a new keymap replaces them while the
+/// kit's own (text inputs, lists, dialogs) stay where they are. The kit's
+/// `NoAction` bindings carry no meta (0) and out-rank any meta, as they did
+/// when Kerno's bindings had none (D-089).
+const KERNO_BINDING: KeyBindingMetaIndex = KeyBindingMetaIndex(0x4b45);
 
 /// The user's keymap file: `{"bindings": {"<command id>": <keys>}}`, where
 /// keys are a shortcut, a list of shortcuts, or `null` to leave the command
@@ -2575,34 +2641,57 @@ enum KeysEntry {
     Many(Vec<String>),
 }
 
+/// The entries of a keymap file, per command id: its shortcuts, `None` for
+/// `null` (no shortcut).
+pub type Overrides = BTreeMap<String, Option<Vec<String>>>;
+
+/// The entries of the keymap file `text` (empty: none); an error when it is
+/// not a keymap file.
+pub fn overrides(text: &str) -> Result<Overrides, String> {
+    if text.trim().is_empty() {
+        return Ok(Overrides::new());
+    }
+    let file = serde_json::from_str::<KeymapFile>(text)
+        .map_err(|error| format!("the keymap file is not valid JSON: {error}"))?;
+    Ok(file
+        .bindings
+        .into_iter()
+        .map(|(id, keys)| {
+            let keys = keys.map(|keys| match keys {
+                KeysEntry::One(key) => vec![key],
+                KeysEntry::Many(keys) => keys,
+            });
+            (id, keys)
+        })
+        .collect())
+}
+
+/// The shortcuts of `command`: its entry in `overrides`, else its defaults.
+pub fn keys_in_effect(command: &Command, overrides: &Overrides) -> Vec<String> {
+    match overrides.get(command.id) {
+        None => command.keys.iter().map(|key| key.to_string()).collect(),
+        Some(keys) => keys.clone().unwrap_or_default(),
+    }
+}
+
 /// The shortcuts in effect: defaults, replaced per command by the user's
 /// overrides. Returns `(shortcut, command id)` pairs and what was wrong
 /// with the overrides, if anything.
-fn effective_bindings(overrides: &str) -> (Vec<(String, &'static str)>, Vec<String>) {
+fn effective_bindings(text: &str) -> (Vec<(String, &'static str)>, Vec<String>) {
     let mut problems = Vec::new();
-    let file = if overrides.trim().is_empty() {
-        KeymapFile::default()
-    } else {
-        serde_json::from_str::<KeymapFile>(overrides).unwrap_or_else(|error| {
-            problems.push(format!("the keymap file is not valid JSON: {error}"));
-            KeymapFile::default()
-        })
-    };
-    for id in file.bindings.keys() {
+    let overrides = overrides(text).unwrap_or_else(|problem| {
+        problems.push(problem);
+        Overrides::new()
+    });
+    for id in overrides.keys() {
         if !COMMANDS.iter().any(|command| command.id == id) {
             problems.push(format!("unknown command \"{id}\""));
         }
     }
 
-    let mut bindings = Vec::new();
+    let mut bindings: Vec<(String, &'static str)> = Vec::new();
     for command in COMMANDS {
-        let keys: Vec<String> = match file.bindings.get(command.id) {
-            None => command.keys.iter().map(|key| key.to_string()).collect(),
-            Some(None) => Vec::new(),
-            Some(Some(KeysEntry::One(key))) => vec![key.clone()],
-            Some(Some(KeysEntry::Many(keys))) => keys.clone(),
-        };
-        for key in keys {
+        for key in keys_in_effect(command, &overrides) {
             // A shortcut may be a sequence of keystrokes separated by spaces.
             let valid = !key.trim().is_empty() && key.split_whitespace().all(is_shortcut);
             if valid {
@@ -2616,13 +2705,14 @@ fn effective_bindings(overrides: &str) -> (Vec<(String, &'static str)>, Vec<Stri
         }
     }
 
-    // The same shortcut on two commands of one context: the later one would
-    // silently win.
-    let mut seen: BTreeMap<(Option<&str>, &str), &str> = BTreeMap::new();
-    for (key, id) in &bindings {
-        if let Some(other) = seen.insert((context_of(id), key.as_str()), id)
-            && other != *id
-        {
+    // One keystroke for two commands that can both answer it: one of them
+    // would silently win.
+    for (index, (key, id)) in bindings.iter().enumerate() {
+        if let Some((_, other)) = bindings[..index].iter().find(|(other_key, other)| {
+            other != id
+                && contexts_overlap(context_of(id), context_of(other))
+                && same_keys(key, other_key, HOST_OS)
+        }) {
             problems.push(format!(
                 "\"{key}\" is bound to both \"{other}\" and \"{id}\""
             ));
@@ -2639,37 +2729,397 @@ fn context_of(id: &str) -> Option<&'static str> {
         .and_then(|command| command.context)
 }
 
+/// Key contexts drawn inside another: a results grid (`DataTable`,
+/// `query/grid_view.rs`) and its find bar (`GridFind`, `query/find.rs`) sit
+/// in a query tab (`QueryTab`), the find bar beside the grid.
+const NESTED: &[(&str, &str)] = &[
+    ("QueryTab", "DataTable"),
+    ("QueryTab", "GridFind"),
+    ("DataTable", "GridFind"),
+];
+
+/// Whether the keys of two contexts can both apply where the keyboard is: a
+/// key with no context works everywhere; `QueryTab > mode == editor` is in
+/// `QueryTab`; the schema tree, the settings and a grid are apart.
+pub(crate) fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
+    fn root(context: &str) -> &str {
+        context.split_whitespace().next().unwrap_or(context)
+    }
+    match (a.map(root), b.map(root)) {
+        (None, _) | (_, None) => true,
+        (Some(a), Some(b)) => {
+            a == b || NESTED.iter().any(|pair| *pair == (a, b) || *pair == (b, a))
+        }
+    }
+}
+
+/// Whether two shortcuts are the same keystrokes on `os` (`secondary-k` is
+/// `cmd-k` on macOS, `ctrl-k` elsewhere).
+pub(crate) fn same_keys(a: &str, b: &str, os: OperatingSystem) -> bool {
+    let resolved = |key: &str| -> Option<Vec<String>> {
+        key.split_whitespace()
+            .map(|stroke| {
+                Keystroke::parse_with_os(stroke, os)
+                    .ok()
+                    .map(|stroke| stroke.unparse(os))
+            })
+            .collect()
+    };
+    matches!((resolved(a), resolved(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// The commands that already answer `key` where `id` would: the same
+/// keystrokes on `os`, in key contexts that can both apply. Two commands of
+/// disjoint contexts (F4 in the tree and in the editor) may share a key.
+pub fn conflicts(
+    id: &str,
+    key: &str,
+    overrides: &Overrides,
+    os: OperatingSystem,
+) -> Vec<&'static Command> {
+    let context = context_of(id);
+    COMMANDS
+        .iter()
+        .filter(|command| command.id != id && contexts_overlap(context, command.context))
+        .filter(|command| {
+            keys_in_effect(command, overrides)
+                .iter()
+                .any(|other| same_keys(other, key, os))
+        })
+        .collect()
+}
+
 /// Whether `stroke` is a keystroke Kerno will bind: modifiers followed by
 /// one character or a named key. GPUI's parser accepts any word as a key
 /// name, so a typo such as `secondary-entr` would otherwise be bound to a
 /// key that does not exist, silently.
 fn is_shortcut(stroke: &str) -> bool {
-    const NAMED: &[&str] = &[
-        "enter",
-        "tab",
-        "escape",
-        "space",
-        "backspace",
-        "delete",
-        "insert",
-        "up",
-        "down",
-        "left",
-        "right",
-        "home",
-        "end",
-        "pageup",
-        "pagedown",
-    ];
     let Ok(parsed) = Keystroke::parse_with_os(stroke, HOST_OS) else {
         return false;
     };
     let key = parsed.key.as_str();
-    let function_key = key
-        .strip_prefix('f')
+    key.chars().count() == 1 || NAMED_KEYS.contains(&key) || is_function_key(key)
+}
+
+/// The keys bound by name besides F1 to F24.
+const NAMED_KEYS: &[&str] = &[
+    "enter",
+    "tab",
+    "escape",
+    "space",
+    "backspace",
+    "delete",
+    "insert",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+];
+
+fn is_function_key(key: &str) -> bool {
+    key.strip_prefix('f')
         .and_then(|number| number.parse::<u8>().ok())
-        .is_some_and(|number| (1..=24).contains(&number));
-    key.chars().count() == 1 || NAMED.contains(&key) || function_key
+        .is_some_and(|number| (1..=24).contains(&number))
+}
+
+/// The modifiers that make a shortcut of a key that types, said on the page.
+pub const RECORD_RULE: &str = if cfg!(target_os = "macos") {
+    "A shortcut needs ⌘ or ⌃ with a letter, a digit or a sign (⌥ or ⇧ alone would type a \
+     character); ⌥ is enough with an arrow, Enter, Tab or another named key; F1 to F24 work \
+     alone. A key the text fields use (⌘C, ⌘Z, ⌥←…) is kept for them. Escape cancels."
+} else {
+    "A shortcut needs Ctrl or Super with a letter, a digit or a sign (Alt or Shift alone would \
+     type a character); Alt is enough with an arrow, Enter, Tab or another named key; F1 to F24 \
+     work alone. A key the text fields use (Ctrl+C, Ctrl+Z, Ctrl+Left…) is kept for them. Escape \
+     cancels."
+};
+
+/// The kit's own binding of `key` (a text field's, the editor's, a list's or
+/// a dialog's), by its action's name. A command bound everywhere would take
+/// that key from them: GPUI ranks a binding with no key context with the
+/// deepest context, and Kerno binds after the kit, so its key wins in every
+/// field (D-089).
+pub fn kit_binding_of(key: &str, cx: &App) -> Option<String> {
+    let strokes = key
+        .split_whitespace()
+        .map(|stroke| Keystroke::parse_with_os(stroke, HOST_OS))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    keymap
+        .bindings()
+        .filter(|binding| binding.meta() != Some(KERNO_BINDING))
+        .filter(|binding| !binding.action().as_any().is::<gpui_kit::NoAction>())
+        .find(|binding| binding.match_keystrokes(&strokes) == Some(false))
+        .map(|binding| {
+            let name = binding.action().name();
+            name.rsplit("::").next().unwrap_or(name).to_string()
+        })
+}
+
+/// The kit's binding of `key` that a command with no key context must leave
+/// alone; `None` when the kit has none, or when a default with no context
+/// already wins over it (⌘↵ runs the statement, ⌘. cancels it: the fields
+/// lost those keys already, so another command may take them).
+pub fn kept_for_the_kit(key: &str, cx: &App) -> Option<String> {
+    let taken = COMMANDS
+        .iter()
+        .filter(|command| command.context.is_none())
+        .flat_map(|command| command.keys)
+        .any(|default| same_keys(default, key, HOST_OS));
+    if taken {
+        return None;
+    }
+    kit_binding_of(key, cx)
+}
+
+/// The keymap file's spelling of a keystroke pressed on `os`, which reads
+/// back as the same keystroke: Cmd on macOS and Ctrl elsewhere are written
+/// `secondary-`, as the defaults are. Fn is left out: macOS sets it on the
+/// arrows and the F keys, which the defaults bind without it.
+pub fn file_form(stroke: &Keystroke, os: OperatingSystem) -> String {
+    let modifiers = stroke.modifiers;
+    // `secondary-` first, as the defaults write it.
+    let (secondary, other, other_name) = if os == OperatingSystem::Mac {
+        (modifiers.platform, modifiers.control, "ctrl-")
+    } else {
+        (modifiers.control, modifiers.platform, "cmd-")
+    };
+    let mut form = String::new();
+    for (on, name) in [
+        (secondary, "secondary-"),
+        (other, other_name),
+        (modifiers.alt, "alt-"),
+        (modifiers.shift, "shift-"),
+    ] {
+        if on {
+            form.push_str(name);
+        }
+    }
+    form.push_str(&stroke.key);
+    form
+}
+
+/// The shortcut a keystroke pressed on the page records for a command of
+/// `context` (`None`: everywhere), in the file's spelling; why not, when it
+/// would eat typing: a key that types text needs Cmd or Ctrl; a named key
+/// (Enter, an arrow) needs a modifier unless the command's keys work only in
+/// a part of the window that takes no text; F keys always work.
+pub fn recorded_key(
+    stroke: &Keystroke,
+    context: Option<&str>,
+    os: OperatingSystem,
+) -> Result<String, String> {
+    let modifiers = stroke.modifiers;
+    let key = stroke.key.as_str();
+    let shown = shown(&file_form(stroke, os));
+    let primary = modifiers.platform || modifiers.control;
+    if is_function_key(key) {
+        // Fine alone.
+    } else if NAMED_KEYS.contains(&key) {
+        if context.is_none() && !(primary || modifiers.alt) {
+            return Err(format!(
+                "{shown} alone moves or edits text in the editor and the fields: hold a modifier with it."
+            ));
+        }
+    } else if key.chars().count() == 1 {
+        if !primary {
+            return Err(format!(
+                "{shown} types a character: hold {} with it.",
+                if os == OperatingSystem::Mac {
+                    "⌘ or ⌃"
+                } else {
+                    "Ctrl or Super"
+                }
+            ));
+        }
+    } else {
+        return Err(format!("{shown} is not a key Kerno can bind."));
+    }
+    Ok(file_form(stroke, os))
+}
+
+/// A shortcut as the tooltips and the palette write it: ⌘⇧K on macOS,
+/// Ctrl+Shift+K elsewhere; a sequence with spaces.
+pub fn shown(key: &str) -> String {
+    key.split_whitespace()
+        .map(|stroke| match Keystroke::parse_with_os(stroke, HOST_OS) {
+            Ok(stroke) => gpui_kit::component::kbd::Kbd::format(&stroke),
+            Err(_) => stroke.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The lowercase words of `text`: runs of letters and digits.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// The words of a search for a shortcut: ⌘, Cmd, Command, Super and Win
+/// are `cmd`; ⌃, Ctrl and Control `ctrl`; ⌥, Alt, Opt and Option `alt`; ⇧
+/// `shift`; `secondary` is the system's; `+` and `-` separate.
+pub fn query_words(query: &str, os: OperatingSystem) -> Vec<String> {
+    let mut spaced = String::new();
+    for c in query.chars() {
+        match c {
+            '⌘' => spaced.push_str(" cmd "),
+            '⌃' => spaced.push_str(" ctrl "),
+            '⌥' => spaced.push_str(" alt "),
+            '⇧' => spaced.push_str(" shift "),
+            '+' | '-' => spaced.push(' '),
+            c => spaced.push(c),
+        }
+    }
+    let secondary = if os == OperatingSystem::Mac {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    spaced
+        .split_whitespace()
+        .map(|word| {
+            let word = word.to_lowercase();
+            match word.as_str() {
+                "command" | "super" | "win" => "cmd".to_string(),
+                "control" => "ctrl".to_string(),
+                "option" | "opt" => "alt".to_string(),
+                "secondary" => secondary.to_string(),
+                _ => word,
+            }
+        })
+        .collect()
+}
+
+/// The words a shortcut is found by: its modifiers (`ctrl`, `alt`, `shift`,
+/// `cmd`) and its key, keystroke after keystroke.
+fn key_words(key: &str, os: OperatingSystem) -> Vec<String> {
+    let mut found = Vec::new();
+    for stroke in key.split_whitespace() {
+        let Ok(stroke) = Keystroke::parse_with_os(stroke, os) else {
+            continue;
+        };
+        let modifiers = stroke.modifiers;
+        for (on, name) in [
+            (modifiers.control, "ctrl"),
+            (modifiers.alt, "alt"),
+            (modifiers.shift, "shift"),
+            (modifiers.platform, "cmd"),
+        ] {
+            if on {
+                found.push(name.to_string());
+            }
+        }
+        found.push(stroke.key.to_lowercase());
+    }
+    found
+}
+
+/// Whether Settings ▸ Shortcuts lists `command` (with `keys` in effect) for
+/// `query`: every word typed starts a word of its name, group, keywords or
+/// id; or every word is in one of its shortcuts (`cmd k`, `⌘K`); or both,
+/// the longer words naming it and the others in one shortcut
+/// (`palette cmd`). A lone letter or a modifier is taken for a key there.
+pub fn command_matches(
+    command: &Command,
+    keys: &[String],
+    query: &str,
+    os: OperatingSystem,
+) -> bool {
+    let terms = query_words(query, os);
+    let names: Vec<String> = [command.label, command.group, command.id]
+        .into_iter()
+        .chain(command.keywords.iter().copied())
+        .flat_map(words)
+        .collect();
+    let names_it = |term: &String| names.iter().any(|name| name.starts_with(term.as_str()));
+    let in_one_key = |rest: &[&String]| {
+        keys.iter().any(|key| {
+            let found = key_words(key, os);
+            rest.iter().all(|term| found.contains(term))
+        })
+    };
+    if terms.iter().all(names_it) {
+        return true;
+    }
+    let all: Vec<&String> = terms.iter().collect();
+    if in_one_key(&all) {
+        return true;
+    }
+    let keyish = |term: &String| {
+        term.chars().count() == 1 || ["cmd", "ctrl", "alt", "shift"].contains(&term.as_str())
+    };
+    let rest: Vec<&String> = terms
+        .iter()
+        .filter(|term| keyish(term) || !names_it(term))
+        .collect();
+    in_one_key(&rest)
+}
+
+/// One change Settings ▸ Shortcuts makes to the keymap file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeymapChange {
+    /// These shortcuts for the command; its entry goes when they are its
+    /// defaults.
+    Set(&'static str, Vec<String>),
+    /// The command back to its default shortcuts: its entry goes.
+    Reset(&'static str),
+    /// Every command back to its defaults: `bindings` emptied.
+    ResetAll,
+}
+
+/// The keymap file `text` with `change` made, everything else in it kept as
+/// it was (other entries, `about`, keys Kerno does not know, their order);
+/// no file (`None`) starts from the example. Refused when `text` is not a
+/// keymap file: a file Kerno cannot read is never overwritten.
+pub fn changed_keymap(text: Option<&str>, change: &KeymapChange) -> Result<String, String> {
+    let base = match text {
+        Some(text) if !text.trim().is_empty() => text.to_string(),
+        _ => keymap_example(),
+    };
+    overrides(&base)?;
+    let mut root: serde_json::Value = serde_json::from_str(&base)
+        .map_err(|error| format!("the keymap file is not valid JSON: {error}"))?;
+    let file = root
+        .as_object_mut()
+        .ok_or("the keymap file is not a JSON object")?;
+    let bindings = file
+        .entry("bindings")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("the keymap file's \"bindings\" is not an object")?;
+    match change {
+        KeymapChange::Set(id, keys) => {
+            let defaults = COMMANDS
+                .iter()
+                .find(|command| command.id == *id)
+                .map(|command| command.keys);
+            if defaults.is_some_and(|defaults| *keys == defaults) {
+                bindings.shift_remove(*id);
+            } else {
+                let value = match keys.as_slice() {
+                    [] => serde_json::Value::Null,
+                    [key] => serde_json::Value::String(key.clone()),
+                    keys => serde_json::json!(keys),
+                };
+                bindings.insert(id.to_string(), value);
+            }
+        }
+        KeymapChange::Reset(id) => {
+            bindings.shift_remove(*id);
+        }
+        KeymapChange::ResetAll => bindings.clear(),
+    }
+    serde_json::to_string_pretty(&root)
+        .map(|text| text + "\n")
+        .map_err(|error| error.to_string())
 }
 
 /// What "Open Keymap File" writes when there is no keymap file yet: valid
@@ -2693,8 +3143,9 @@ pub fn keymap_example() -> String {
             "Kerno's keymap. Each entry of \"bindings\" replaces the shortcuts of one command:",
             "one shortcut, a list of shortcuts, or null to leave the command without one.",
             "\"secondary\" is Cmd on macOS and Ctrl elsewhere; a sequence is keys separated by spaces.",
-            "Example: \"new_query_tab\": \"secondary-shift-t\", \"close_tab\": [\"secondary-w\", \"ctrl-f4\"], \"toggle_sidebar\": null",
-            "The commands and their default shortcuts are listed below. Changes apply when Kerno starts again."
+            "Example: \"new_query_tab\": \"secondary-alt-shift-t\", \"close_tab\": [\"secondary-w\", \"ctrl-f4\"], \"toggle_sidebar\": null",
+            "Settings ▸ Shortcuts changes this file and applies at once; a change typed here applies when Kerno starts again or when Settings is opened.",
+            "The commands and their default shortcuts are listed below."
         ],
         "bindings": {},
         "commands": commands,
@@ -2705,17 +3156,35 @@ pub fn keymap_example() -> String {
 /// Binds every command's shortcut, applying the user's keymap file when it
 /// exists. Returns what was wrong with that file, for the app to show.
 pub fn bind_keys(keymap_file: &Path, cx: &mut App) -> Vec<String> {
-    let overrides = match std::fs::read_to_string(keymap_file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    match std::fs::read_to_string(keymap_file) {
+        Ok(text) => apply_keymap(&text, cx),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => apply_keymap("", cx),
         Err(error) => {
-            let problem = format!("could not read {}: {error}", keymap_file.display());
-            bind(&effective_bindings("").0, cx);
-            return vec![problem];
+            apply_keymap("", cx);
+            vec![format!("could not read {}: {error}", keymap_file.display())]
         }
+    }
+}
+
+/// Replaces Kerno's key bindings with those of the keymap file's `text`, at
+/// once and as often as needed: the kit's bindings stay, in their place, and
+/// the menu bar is built again so its shortcut column follows. Returns what
+/// was wrong with `text` (its valid entries apply, defaults elsewhere).
+pub fn apply_keymap(text: &str, cx: &mut App) -> Vec<String> {
+    let (bindings, problems) = effective_bindings(text);
+    let kept: Vec<KeyBinding> = {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        keymap
+            .bindings()
+            .filter(|binding| binding.meta() != Some(KERNO_BINDING))
+            .cloned()
+            .collect()
     };
-    let (bindings, problems) = effective_bindings(&overrides);
+    cx.clear_key_bindings();
+    cx.bind_keys(kept);
     bind(&bindings, cx);
+    cx.set_menus(crate::menus());
     problems
 }
 
@@ -2730,7 +3199,7 @@ fn bind(bindings: &[(String, &'static str)], cx: &mut App) {
             .and_then(|context| KeyBindingContextPredicate::parse(context).ok())
             .map(Rc::new);
         match KeyBinding::load(key, (command.action)(), context, false, None, cx) {
-            Ok(binding) => key_bindings.push(binding),
+            Ok(binding) => key_bindings.push(binding.with_meta(KERNO_BINDING)),
             // Already validated; a failure here is a shortcut this keyboard
             // layout cannot produce.
             Err(error) => tracing::warn!(%error, key, command = id, "shortcut not bound"),
@@ -2738,17 +3207,41 @@ fn bind(bindings: &[(String, &'static str)], cx: &mut App) {
     }
     // Cmd+Enter in Open Table opens the structure (`quick_open.rs`): a key of
     // that dialog, as Enter and the arrows are the list's own.
-    key_bindings.push(KeyBinding::new(
-        if cfg!(target_os = "macos") {
-            "cmd-enter"
-        } else {
-            "ctrl-enter"
-        },
-        gpui_kit::base::actions::Confirm { secondary: true },
-        Some("QuickOpen"),
-    ));
+    key_bindings.push(
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            gpui_kit::base::actions::Confirm { secondary: true },
+            Some("QuickOpen"),
+        )
+        .with_meta(KERNO_BINDING),
+    );
     cx.bind_keys(key_bindings);
 }
+
+/// The defaults K20 added (DBeaver, DataGrip, macOS and browser
+/// conventions; the source is named at each command).
+#[cfg(test)]
+pub(crate) const K20_DEFAULTS: &[(&str, &str)] = &[
+    ("toggle_theme", "secondary-shift-d"),
+    ("refresh_schema_tree", "secondary-alt-y"),
+    ("set_null", "cmd-alt-n"),
+    ("revert_selected_rows", "cmd-alt-z"),
+    ("show_messages", "ctrl-shift-o"),
+    ("close_other_tabs", "secondary-alt-w"),
+    ("reopen_closed_tab", "cmd-shift-t"),
+    ("open_admin", "ctrl-alt-shift-b"),
+    ("view_diagram", "cmd-alt-shift-u"),
+    ("commit_transaction", "ctrl-alt-shift-k"),
+    ("rollback_transaction", "ctrl-alt-shift-r"),
+    ("next_tab", "cmd-alt-right"),
+    ("next_tab", "ctrl-pagedown"),
+    ("previous_tab", "cmd-alt-left"),
+    ("previous_tab", "ctrl-pageup"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -2781,14 +3274,17 @@ mod tests {
     fn overrides_replace_defaults_per_command() {
         let (bindings, problems) = effective_bindings(
             r#"{"bindings": {
-                "new_query_tab": "secondary-shift-t",
+                "new_query_tab": "secondary-alt-shift-t",
                 "close_tab": ["secondary-w", "ctrl-f4"],
                 "toggle_sidebar": null,
                 "about": "f1"
             }}"#,
         );
         assert_eq!(problems, Vec::<String>::new());
-        assert_eq!(keys_of(&bindings, "new_query_tab"), ["secondary-shift-t"]);
+        assert_eq!(
+            keys_of(&bindings, "new_query_tab"),
+            ["secondary-alt-shift-t"]
+        );
         assert_eq!(keys_of(&bindings, "close_tab"), ["secondary-w", "ctrl-f4"]);
         assert_eq!(keys_of(&bindings, "toggle_sidebar"), Vec::<String>::new());
         assert_eq!(keys_of(&bindings, "about"), ["f1"]);
@@ -3011,8 +3507,8 @@ mod tests {
     fn the_new_commands_have_their_keys() {
         let (bindings, _) = effective_bindings("");
         for (id, keys) in [
-            ("commit_transaction", &["ctrl-4"][..]),
-            ("rollback_transaction", &["ctrl-8"]),
+            ("commit_transaction", &["ctrl-alt-shift-k", "ctrl-4"][..]),
+            ("rollback_transaction", &["ctrl-alt-shift-r", "ctrl-8"]),
             ("toggle_commit_mode", &["ctrl-alt-a"]),
             ("quick_open", &["secondary-p"]),
             ("focus_navigator_filter", &["secondary-alt-f"]),
@@ -3057,5 +3553,359 @@ mod tests {
         ] {
             assert!(!is_shortcut(bad), "{bad}");
         }
+    }
+
+    /// K20: the new defaults are bound, and none takes a key of the kit's
+    /// text inputs and editor (`gpui-base`), of the system (macOS, the
+    /// Linux desktops), of vim mode (Ctrl+R and plain characters), or one
+    /// behind Shift or Option on an AZERTY keyboard (digits and signs).
+    #[test]
+    fn the_new_defaults_are_bound_and_take_no_reserved_key() {
+        let (bindings, problems) = effective_bindings("");
+        assert_eq!(problems, Vec::<String>::new());
+        for (id, key) in K20_DEFAULTS {
+            assert!(
+                keys_of(&bindings, id).iter().any(|each| each == key),
+                "{id} {key}"
+            );
+        }
+        const RESERVED: &[&str] = &[
+            // The kit's inputs and editor.
+            "cmd-shift-z",
+            "cmd-shift-f",
+            "cmd-shift-up",
+            "cmd-shift-down",
+            "cmd-alt-i",
+            "cmd-alt-up",
+            "cmd-alt-down",
+            "ctrl-cmd-space",
+            "shift-cmd-right",
+            "shift-cmd-left",
+            "ctrl-shift-i",
+            "ctrl-shift-e",
+            "ctrl-shift-a",
+            "ctrl-alt-up",
+            "ctrl-alt-down",
+            "ctrl-o",
+            "ctrl-g",
+            "ctrl-h",
+            "ctrl-e",
+            "ctrl-a",
+            "ctrl-f",
+            "ctrl-y",
+            "ctrl-z",
+            "alt-left",
+            "alt-right",
+            "cmd-left",
+            "cmd-right",
+            "ctrl-home",
+            "ctrl-end",
+            // macOS.
+            "cmd-h",
+            "cmd-m",
+            "cmd-q",
+            "cmd-tab",
+            "cmd-space",
+            "cmd-alt-d",
+            "cmd-alt-h",
+            "cmd-alt-m",
+            "cmd-alt-escape",
+            "cmd-shift-q",
+            "ctrl-cmd-q",
+            "ctrl-cmd-f",
+            "cmd-shift-3",
+            "cmd-shift-4",
+            "cmd-shift-5",
+            "cmd-shift-/",
+            "ctrl-up",
+            "ctrl-down",
+            "ctrl-left",
+            "ctrl-right",
+            "ctrl-f2",
+            "ctrl-f3",
+            "ctrl-f4",
+            "ctrl-f5",
+            "ctrl-f6",
+            "ctrl-f7",
+            "ctrl-f8",
+            // Linux desktops.
+            "ctrl-alt-t",
+            "ctrl-alt-l",
+            "ctrl-alt-d",
+            "ctrl-alt-delete",
+            "ctrl-alt-left",
+            "ctrl-alt-right",
+            "alt-tab",
+            "alt-f4",
+            // Vim mode.
+            "ctrl-r",
+        ];
+        for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
+            for (id, key) in K20_DEFAULTS {
+                for reserved in RESERVED {
+                    assert!(
+                        !same_keys(key, reserved, os),
+                        "{os:?}: {id} takes {reserved}"
+                    );
+                }
+                let stroke = Keystroke::parse_with_os(key, os).unwrap();
+                let modifiers = stroke.modifiers;
+                assert!(
+                    modifiers.platform || modifiers.control,
+                    "{id}: {key} needs Cmd or Ctrl"
+                );
+                assert!(
+                    stroke.key.chars().all(|c| c.is_ascii_lowercase())
+                        && (stroke.key.len() == 1 || NAMED_KEYS.contains(&stroke.key.as_str())),
+                    "{id}: {key} is not a letter or a named key"
+                );
+            }
+        }
+    }
+
+    /// K20: under the conflict rule of Settings ▸ Shortcuts, no two default
+    /// keys answer the same keystroke where both apply, on either system.
+    #[test]
+    fn no_two_defaults_conflict_on_either_system() {
+        let (bindings, _) = effective_bindings("");
+        for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
+            for (index, (key, id)) in bindings.iter().enumerate() {
+                for (other_key, other) in &bindings[..index] {
+                    assert!(
+                        other == id
+                            || !contexts_overlap(context_of(id), context_of(other))
+                            || !same_keys(key, other_key, os),
+                        "{os:?}: {key} of {id} and {other_key} of {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// K20: a conflict is a keystroke two commands would both answer: same
+    /// keystroke on the system, contexts that can both apply. F4 of the tree
+    /// and F4 of the editor are not one.
+    #[test]
+    fn conflicts_follow_the_keystroke_and_the_contexts() {
+        let none = Overrides::new();
+        let ids = |found: Vec<&'static Command>| -> Vec<&str> {
+            found.into_iter().map(|command| command.id).collect()
+        };
+        let mac = OperatingSystem::Mac;
+        // A global key and another global command.
+        assert_eq!(
+            ids(conflicts("about", "secondary-b", &none, mac)),
+            ["toggle_sidebar"]
+        );
+        // Spelt differently, same keystroke on macOS only.
+        assert_eq!(
+            ids(conflicts("about", "cmd-b", &none, mac)),
+            ["toggle_sidebar"]
+        );
+        assert!(conflicts("about", "cmd-b", &none, OperatingSystem::Linux).is_empty());
+        // The command's own key is not a conflict.
+        assert!(conflicts("toggle_sidebar", "secondary-b", &none, mac).is_empty());
+        // Disjoint contexts: the tree's F4 is not the editor's.
+        assert!(conflicts("edit_object", "f4", &none, mac).is_empty());
+        // A global key would be shadowed in the tree, the list and the editor.
+        assert_eq!(ids(conflicts("about", "f4", &none, mac)).len(), 3);
+        assert_eq!(
+            ids(conflicts("rename_object", "f4", &none, mac)),
+            ["edit_object"]
+        );
+        // A grid of a query tab answers the query tab's keys too.
+        assert_eq!(
+            ids(conflicts("set_default", "ctrl-shift-p", &none, mac)),
+            ["toggle_pinned_result"]
+        );
+        // Not between the settings and a grid.
+        assert!(conflicts("search_settings", "secondary-z", &none, mac).is_empty());
+        // The user's entries count: a key moved away is free, one added taken.
+        let mut moved = Overrides::new();
+        moved.insert("toggle_sidebar".into(), Some(vec!["f9".into()]));
+        assert!(conflicts("about", "secondary-b", &moved, mac).is_empty());
+        assert_eq!(
+            ids(conflicts("about", "f9", &moved, mac)),
+            ["toggle_sidebar"]
+        );
+        assert!(contexts_overlap(
+            Some("QueryTab > mode == editor"),
+            Some("QueryTab")
+        ));
+        assert!(!contexts_overlap(Some("Navigator"), Some("Settings")));
+        assert!(contexts_overlap(None, Some("Navigator")));
+    }
+
+    /// K20: what is recorded is written so that it reads back as the same
+    /// keystroke, Cmd (macOS) or Ctrl (elsewhere) as `secondary-`, Fn left
+    /// out.
+    #[test]
+    fn a_recorded_keystroke_round_trips_through_the_file() {
+        for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
+            for typed in [
+                "cmd-shift-k",
+                "ctrl-k",
+                "ctrl-alt-shift-b",
+                "cmd-alt-left",
+                "f5",
+                "shift-f4",
+                "ctrl-cmd-t",
+                "cmd--",
+                "alt-enter",
+                "ctrl-pagedown",
+            ] {
+                let stroke = Keystroke::parse_with_os(typed, os).unwrap();
+                let written = file_form(&stroke, os);
+                let read = Keystroke::parse_with_os(&written, os).unwrap();
+                assert_eq!(
+                    read.unparse(os),
+                    stroke.unparse(os),
+                    "{os:?} {typed} → {written}"
+                );
+            }
+        }
+        let mac = |key| Keystroke::parse_with_os(key, OperatingSystem::Mac).unwrap();
+        assert_eq!(
+            file_form(&mac("cmd-shift-k"), OperatingSystem::Mac),
+            "secondary-shift-k"
+        );
+        assert_eq!(file_form(&mac("ctrl-k"), OperatingSystem::Mac), "ctrl-k");
+        let linux = Keystroke::parse_with_os("ctrl-shift-k", OperatingSystem::Linux).unwrap();
+        assert_eq!(
+            file_form(&linux, OperatingSystem::Linux),
+            "secondary-shift-k"
+        );
+        let mut fn_arrow = mac("cmd-up");
+        fn_arrow.modifiers.function = true;
+        assert_eq!(file_form(&fn_arrow, OperatingSystem::Mac), "secondary-up");
+    }
+
+    /// K20: a key that types needs Cmd or Ctrl; a named key a modifier
+    /// unless the command's keys work only outside text; F keys alone.
+    #[test]
+    fn only_keys_that_do_not_eat_typing_are_recorded() {
+        let os = OperatingSystem::Mac;
+        let record = |key: &str, context| {
+            recorded_key(&Keystroke::parse_with_os(key, os).unwrap(), context, os)
+        };
+        assert_eq!(record("cmd-shift-k", None), Ok("secondary-shift-k".into()));
+        assert_eq!(record("ctrl-k", None), Ok("ctrl-k".into()));
+        assert_eq!(record("f6", None), Ok("f6".into()));
+        assert_eq!(record("alt-up", None), Ok("alt-up".into()));
+        assert_eq!(record("enter", Some("DataTable")), Ok("enter".into()));
+        for typing in ["k", "shift-k", "alt-k", "alt-shift-k", "1", "shift-1"] {
+            let refused = record(typing, None).unwrap_err();
+            assert!(refused.contains("types a character"), "{typing}: {refused}");
+            // Not in a grid either: its letters start an edit.
+            assert!(record(typing, Some("DataTable")).is_err(), "{typing}");
+        }
+        for named in ["enter", "backspace", "up", "shift-tab"] {
+            assert!(record(named, None).is_err(), "{named}");
+        }
+    }
+
+    /// K20: the page's changes keep everything else in the file: the other
+    /// entries, keys Kerno does not know, their order; defaults written
+    /// remove the entry; a file that is not a keymap is never rewritten.
+    #[test]
+    fn changing_the_keymap_keeps_the_rest_of_the_file() {
+        let text = r#"{
+  "mine": {"note": "kept"},
+  "bindings": {
+    "about": "f1",
+    "toggle_sidebar": null
+  },
+  "zzz": [1, 2]
+}"#;
+        let set = changed_keymap(
+            Some(text),
+            &KeymapChange::Set("quit", vec!["secondary-shift-q".into(), "f12".into()]),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&set).unwrap();
+        assert_eq!(value["mine"]["note"], "kept");
+        assert_eq!(value["zzz"], serde_json::json!([1, 2]));
+        assert_eq!(value["bindings"]["about"], "f1");
+        assert!(value["bindings"]["toggle_sidebar"].is_null());
+        assert_eq!(
+            value["bindings"]["quit"],
+            serde_json::json!(["secondary-shift-q", "f12"])
+        );
+        let order: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(order, ["mine", "bindings", "zzz"]);
+        assert_eq!(
+            overrides(&set).unwrap()["quit"],
+            Some(vec!["secondary-shift-q".to_string(), "f12".to_string()])
+        );
+        // One key is written as a string, none as null.
+        let one =
+            changed_keymap(Some(&set), &KeymapChange::Set("about", vec!["f2".into()])).unwrap();
+        assert!(one.contains("\"about\": \"f2\""), "{one}");
+        let unbound = changed_keymap(Some(text), &KeymapChange::Set("quit", vec![])).unwrap();
+        assert_eq!(overrides(&unbound).unwrap()["quit"], None);
+        // No shortcut for a command that has none by default: no entry.
+        let none = changed_keymap(Some(&set), &KeymapChange::Set("about", vec![])).unwrap();
+        assert!(!overrides(&none).unwrap().contains_key("about"));
+        // Its defaults again: no entry, the command is not marked changed.
+        let back = changed_keymap(
+            Some(&set),
+            &KeymapChange::Set("quit", vec!["secondary-q".into()]),
+        )
+        .unwrap();
+        assert!(!overrides(&back).unwrap().contains_key("quit"));
+        let reset = changed_keymap(Some(&set), &KeymapChange::Reset("about")).unwrap();
+        assert!(!overrides(&reset).unwrap().contains_key("about"));
+        assert!(overrides(&reset).unwrap().contains_key("quit"));
+        let all = changed_keymap(Some(&set), &KeymapChange::ResetAll).unwrap();
+        assert!(overrides(&all).unwrap().is_empty());
+        assert!(all.contains("\"mine\""));
+        // No file yet: the example, with the change.
+        let fresh = changed_keymap(None, &KeymapChange::Set("about", vec!["f1".into()])).unwrap();
+        assert!(fresh.contains("\"about\"") && fresh.contains("\"commands\""));
+        assert_eq!(overrides(&fresh).unwrap().len(), 1);
+        // Not a keymap: refused.
+        for bad in ["{ not json", r#"{"bindings": 3}"#, "[1]"] {
+            assert!(
+                changed_keymap(Some(bad), &KeymapChange::ResetAll).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// K20: the page's filter finds a command by its name, group, keywords
+    /// and by its shortcut, typed as words or as symbols.
+    #[test]
+    fn commands_are_found_by_name_and_by_shortcut() {
+        let os = OperatingSystem::Mac;
+        let found = |query: &str| -> Vec<&'static str> {
+            COMMANDS
+                .iter()
+                .filter(|command| {
+                    let keys: Vec<String> = command.keys.iter().map(|k| k.to_string()).collect();
+                    command_matches(command, &keys, query, os)
+                })
+                .map(|command| command.id)
+                .collect()
+        };
+        assert!(found("theme switch").contains(&"toggle_theme"));
+        assert!(found("dark mode").contains(&"toggle_theme"));
+        for query in ["cmd k", "⌘K", "Command+K", "secondary-k", "CMD K"] {
+            assert_eq!(found(query), ["open_command_palette"], "{query}");
+        }
+        assert_eq!(found("⌘⇧D"), ["toggle_theme"]);
+        // Ctrl is not Cmd on macOS: Ctrl+Alt+Shift+K commits.
+        assert_eq!(found("ctrl k"), ["commit_transaction"]);
+        // A word of the name and the key together.
+        assert_eq!(found("palette cmd"), ["open_command_palette"]);
+        assert!(found("zzz").is_empty());
+        assert_eq!(found("").len(), COMMANDS.len());
+        assert_eq!(
+            query_words("⌃⌥⇧⌘F5", os),
+            ["ctrl", "alt", "shift", "cmd", "f5"]
+        );
+        assert_eq!(
+            query_words("secondary-k", OperatingSystem::Linux),
+            ["ctrl", "k"]
+        );
     }
 }

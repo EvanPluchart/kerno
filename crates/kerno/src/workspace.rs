@@ -489,9 +489,7 @@ impl Workspace {
     ) -> Self {
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let follow_system = cx.observe_window_appearance(window, |_, window, cx| {
-            if AppState::get(cx).appearance() == Appearance::System {
-                theme::apply(Appearance::System, Some(window), cx);
-            }
+            system_appearance_changed(window, cx)
         });
         // Text typed in the last moments before quitting is not lost.
         let flush_on_quit = cx.on_app_quit(|this, cx| {
@@ -1827,6 +1825,42 @@ impl Workspace {
 
     fn use_dark_theme(&mut self, _: &UseDarkTheme, window: &mut Window, cx: &mut Context<Self>) {
         Self::set_appearance(Appearance::Dark, window, cx);
+    }
+
+    /// Switches to the opposite of the theme on screen and keeps that as the
+    /// choice: from "Follow system" showing dark, Light; "Follow system"
+    /// comes back from Settings or its command (K20).
+    pub(crate) fn toggle_theme(window: &mut Window, cx: &mut App) {
+        let opposite = if cx.theme().is_dark() {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        };
+        Self::set_appearance(opposite, window, cx);
+    }
+
+    fn toggle_theme_command(
+        &mut self,
+        _: &actions::ToggleTheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        Self::toggle_theme(window, cx);
+    }
+
+    /// Settings ▸ Shortcuts (K20).
+    fn open_keyboard_shortcuts(
+        &mut self,
+        _: &actions::OpenKeyboardShortcuts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::settings_view::SettingsView::open(
+            self.connections.clone(),
+            crate::settings_view::Section::Shortcuts,
+            window,
+            cx,
+        );
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -5597,6 +5631,14 @@ fn open_wizard_with(
     )
 }
 
+/// The system's light or dark appearance changed: the theme follows it in
+/// "Follow system" only; a Light or Dark choice stays.
+pub(crate) fn system_appearance_changed(window: &mut Window, cx: &mut App) {
+    if AppState::get(cx).appearance() == Appearance::System {
+        theme::apply(Appearance::System, Some(window), cx);
+    }
+}
+
 /// Quit asks first what it would end (C15). The workspace answers it when it
 /// is on the keyboard's path; this, when it is not (a dialog or the palette
 /// has the keyboard, the menu bar with nothing focused): it hands Quit to the
@@ -5806,6 +5848,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::use_system_theme))
             .on_action(cx.listener(Self::use_light_theme))
             .on_action(cx.listener(Self::use_dark_theme))
+            .on_action(cx.listener(Self::toggle_theme_command))
+            .on_action(cx.listener(Self::open_keyboard_shortcuts))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::about))
             .on_action(cx.listener(Self::check_for_updates))

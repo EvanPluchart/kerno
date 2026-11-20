@@ -2087,3 +2087,110 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   when nothing answers) before the connection is reopened, where it reopened at once.
 - **No second notice**: whichever learns first (the tab's check, a statement, the connection's keep-alive)
   drops the tab's session and its record of a transaction, so the others find nothing to say.
+
+## D-089 — Shortcuts changed while Kerno runs, recorded and checked for conflicts; the theme switch; more defaults (K20; 2026-11-20)
+
+The owner's request of 2026-11-20: three theme modes with the system's by default (already there), a key to
+switch between light and dark, a Settings page that lists and changes the shortcuts, and more shortcuts.
+
+- **Rebinding without a restart.** GPUI (`gpui-pre` 0.3.12 under `gpui-kit` 0.9.1) has `App::bind_keys`, which
+  adds bindings (at one depth of the key contexts the later binding wins), and `clear_key_bindings`, which
+  empties the whole keymap: the kit's own bindings (text inputs, lists, dialogs, a popover's `NoAction`s)
+  included. Kerno tags every binding it adds with one `KeyBindingMetaIndex` (`actions::KERNO_BINDING`);
+  `actions::apply_keymap` keeps the bindings without that tag, clears, puts them back in their order, then binds
+  Kerno's anew, after them as before. The meta matters only to `NoAction` (one of meta m hides the bindings of
+  meta ≥ m at its depth): the kit's carry none (0), so Kerno's tagged bindings are hidden exactly where its
+  untagged ones were. `bind_keys` at start goes through the same function, so a second call replaces Kerno's keys
+  instead of stacking them (`a_bad_keymap_file_is_reported_and_the_defaults_stay` relied on the stacking; it now
+  pins the replacement).
+- **What follows at once**: the keys (the keymap is read at each keystroke); every place that shows a shortcut
+  (`workspace::shortcut`, the kit's `Kbd::binding_for_action` in tooltips, the palette's hints, which the kit
+  reads at each render and measures again when they change); the native menu bar's shortcut column:
+  `App::set_menus` reads the keymap only when it is called, so `apply_keymap` calls it again (`crate::menus()`).
+  The menu bar is checked by code, not by a test: the test platform keeps the menus, not their key equivalents.
+  A change typed in `keymap.json` by hand applies when Kerno starts or when Settings opens (its Shortcuts page reads
+  and applies the file); there is no file watcher.
+- **Recording** uses `App::intercept_keystrokes`: interceptors run before any binding or field, and
+  `stop_propagation` there keeps the keystroke from every action and from text input (Escape too, which cancels
+  rather than closing Settings). The page owns the subscription and holds itself weakly in it: Settings closed
+  while recording drops it and the keyboard is back (a test). A lone modifier released is ignored. What is
+  written is GPUI's own `Keystroke`, modifiers and key (never `key_char`), in the file's spelling
+  (`actions::file_form`): Cmd on macOS and Ctrl elsewhere as `secondary-` first, as the defaults are; Fn left
+  out (macOS sets it on the arrows and the F keys, which the defaults bind without it); it reads back as the
+  same keystroke on both systems (a test). Shown with `Kbd::format`, as the tooltips.
+- **What can be recorded** (`actions::recorded_key`, said on the page): a key that types (letter, digit, sign)
+  needs Cmd or Ctrl: Option or Shift alone types a character on a Mac and the global binding would take it from
+  the editor; a grid starts an edit on a letter. A named key (Enter, Tab, an arrow, Delete, Home…) needs Cmd,
+  Ctrl or Alt, unless the command's keys work only in a part of the window that takes no text (the tree, a
+  grid). F1 to F24 work alone. Escape alone cancels, so it cannot be recorded from the page (the file takes it).
+- **The kit's keys stay the kit's.** GPUI ranks a binding with no key context with the deepest context, and
+  ties go to the binding added later: Kerno binds after the kit, so a command bound everywhere wins over a
+  text field's own key in every field (⌘C would stop copying). A command with no context cannot take a key the
+  kit binds (`actions::kit_binding_of`, read from the live keymap, Kerno's tagged bindings left out): "⌘C is the
+  text fields' Copy: a command that works everywhere would take it from them." A command of the tree or a grid
+  may (the field inside it is deeper and keeps its key). Two global defaults already win over a kit key, by
+  design and pinned by a test: ⌘↵ (Run Statement over the kit's Confirm) and ⌘. (Cancel over the editor's
+  ToggleCodeActions); those keys may be given to another command, the fields having lost them already. The same
+  live check pins the new defaults. A recording
+  stops when Settings shows another section or its search changes, so no keystroke is taken with nothing on
+  screen saying why.
+- **Conflicts** (`actions::conflicts`): two commands conflict when one shortcut resolves to the same keystrokes
+  on the system and their key contexts can both apply: one has no context, both have the same root context
+  (`QueryTab > mode == editor` is in `QueryTab`), or one is drawn inside the other, from an explicit table
+  (`actions::NESTED`: `DataTable` and `GridFind` in `QueryTab`, `GridFind` beside `DataTable`), since nesting
+  cannot be read from the strings. The tree, the settings and a grid are apart: F4 stays the tree's, the
+  sidebar's and the editor's. The page asks ("⌘B is already the shortcut of “Toggle Sidebar” (View). Replace
+  takes it from it and gives it to “About Kerno”.") with Replace or Cancel; Replace takes the key from the other
+  commands in the same write. The check of the file at start now uses the same rule (it caught only two commands
+  of one context before): a hand-written file giving one key to a global and a grid command is reported. A test
+  checks that no two defaults conflict under this rule on macOS and on Linux.
+- **One file.** A change edits `keymap.json` in place (`actions::changed_keymap`; serde_json keeps the order):
+  the command's entry is set (one key as a string, several as a list, none as `null`) or removed when it equals
+  the defaults, so "Changed" is exact; Reset all empties `bindings`; `about`, `commands`, the other entries and
+  keys Kerno does not know stay. No file yet: the example is written first, with the change. A file that does
+  not parse (or whose `bindings` is not an object) is said on the page with Open keymap file and is neither
+  applied nor written. Writes run off the UI thread, one writer, in the order made, each reading the file again
+  and making its change there (a hand edit made meanwhile stays), through a temporary file renamed over it; while
+  writes are pending, Settings opened again takes the page's last text instead of the file. A failed write is a
+  notification; the change works until Kerno quits or Settings reads the file again. Keys added beside an older
+  default come before it (Commit, Roll back, Next and Previous Tab): the last key bound is the one the menus and
+  the tooltips show, so they still say ⌃4, ⌃8, ⌃⇥.
+- **The theme switch**: `toggle_theme`, "Theme: Switch Light and Dark" (View menu beside the three theme
+  entries, the palette), ⌘⇧D / Ctrl+Shift+D: free in Kerno, the kit's inputs and macOS, a letter (AZERTY), D for
+  dark. It reads the theme on screen (`cx.theme().is_dark()`), not the setting, and stores the opposite as Light
+  or Dark: from Follow system showing dark, Light. Follow system comes back from Settings or its command. It
+  works with Settings open too (the Theme row redraws at once). The system's appearance is followed in Follow
+  system only (`workspace::system_appearance_changed`, the observer's body; GPUI's `simulate_appearance_change`
+  is crate-private, so the test calls it as the window would).
+- **New defaults**, each with its source beside it in `actions.rs`, all with Cmd or Ctrl and a letter, an arrow
+  or Page Up/Down (no digit or sign: AZERTY puts digits behind Shift), none on a key of the kit's inputs, macOS,
+  the Linux desktops' usual ones or vim mode (`the_new_defaults_are_bound_and_take_no_reserved_key`), none bound
+  by the kit in the live keymap, each reaching its command in the SQL editor and in a text field
+  (`the_new_defaults_win_in_the_editor_and_in_a_text_field`):
+
+  | Command | Key | Source |
+  |---|---|---|
+  | Theme: Switch Light and Dark | ⌘⇧D, Ctrl+Shift+D | new (owner's request) |
+  | Next / Previous Tab | ⌘⌥→ / ⌘⌥←, Ctrl+PageDown / Ctrl+PageUp | Safari and Chrome; Linux browsers |
+  | Close Other Tabs | ⌘⌥W, Ctrl+Alt+W | Safari |
+  | Reopen Closed Tab | ⌘⇧T (Super+Shift+T on Linux) | browsers; not `secondary`: Ctrl+Shift+T is the query tab's Maximize Results Panel |
+  | Commit / Roll Back Transaction (second keys) | ⌃⌥⇧K / ⌃⌥⇧R | DBeaver's `core.commit` / `core.rollback` second keys |
+  | Show Messages of the Last Run | ⌃⇧O | DBeaver's `ui.editors.sql.show.output` |
+  | Server Administration | ⌃⌥⇧B | DBeaver's `ui.dashboard.open` |
+  | Refresh Schema Tree | ⌘⌥Y, Ctrl+Alt+Y | DataGrip's Synchronize (DBeaver has none) |
+  | Set Selected Cells to NULL | ⌘⌥N | DataGrip's Set NULL |
+  | Revert Selected Rows | ⌘⌥Z | DataGrip's Revert Selected |
+  | View ER Diagram | ⌘⌥⇧U | DataGrip's Show Diagram |
+
+  Fifteen keys on thirteen commands, fewer than the "few dozen" aimed at: of the 145 commands without a key, most
+  act on one selected thing from a menu (create, generate, tools, one result tab) and have no key in DBeaver,
+  DataGrip or macOS; inventing keys for them would take keys users may want and add conflicts. Not taken, with
+  the reason: DBeaver's Ctrl+S / Ctrl+R for Apply / Discard (⌘S already applies in a grid; ⌘R refreshes),
+  Ctrl+Shift+D for Open Table (that is the theme switch on Linux), Alt with a letter alone (types a character on
+  a Mac, and vim mode reads it), ⌃F2/⌃F3 (macOS focus keys). The page is where "plenty of keybindings" comes
+  from: every command takes one there.
+- **Kept**: Open Keymap File (command, Kerno and Help menus, the button at the bottom of Settings, and the page's
+  button when the file cannot be used): the file stays the user's to edit and to copy to another computer. A new
+  command "Keyboard Shortcuts…" opens Settings on the page (Kerno menu, palette). The page is a section of
+  Settings, appended last so the sections before it keep their places, and one row of `settings_view::ROWS`
+  (found by "keymap", "shortcut", "hotkeys"…).

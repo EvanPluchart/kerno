@@ -729,3 +729,26 @@ Still open (for the owner):
 - Tests: five driver tests (PostgreSQL, MySQL, MariaDB) and eight UI tests, each seen failing under a one-line
   mutation. `docs/COMPETITOR-ISSUES.md`: C15 answered (16 answered, no gap). Limits in the "Done:" line of K16
   (`docs/plans/M12.md`).
+
+## 2026-11-20 — K20: a theme switch, Settings ▸ Shortcuts, more default shortcuts (the owner's request)
+
+- The three theme modes were there (Follow system by default, followed while Kerno runs); now pinned by a test
+  of the observer's body (Follow system only). New command "Theme: Switch Light and Dark" (⌘⇧D, View menu,
+  palette, also inside Settings): the opposite of the theme on screen, kept as Light or Dark.
+- Settings ▸ Shortcuts (last section; "Keyboard Shortcuts…" in the Kerno menu and the palette): every command by
+  group with its shortcuts, "Changed" on the user's, a filter by name, group or shortcut (⌘K, `cmd k`); change by
+  pressing the new keystroke (caught before any binding by `App::intercept_keystrokes`; a key that would type
+  is refused with the reason, and so is a text field's own key such as ⌘C for a command that works everywhere,
+  which would win over it in every field; Escape cancels), Add, ×, Reset to default, Reset all… (asked); a key
+  another command answers asks Replace or Cancel. Changes apply at once without a restart: Kerno's bindings carry a
+  meta tag, so they are replaced and the kit's stay; the menu bar is set again for its shortcut column. They go
+  to `keymap.json`, edited in place by one background writer (the rest of the file kept); a file that cannot be
+  used is said on the page and never written. Open Keymap File stays. D-089.
+- The check of the keymap file at start uses the page's conflict rule (two commands whose contexts can both
+  apply), not only one context.
+- Fifteen new default keys on thirteen commands, from DBeaver, DataGrip and macOS or browser conventions
+  (letters, arrows, Page Up/Down with Cmd or Ctrl: nothing behind Shift or Option on AZERTY), checked against the
+  kit's input keys, macOS and Linux desktop keys and vim mode, and seen winning in the editor and in a text field.
+- Tests: seven unit tests in `actions.rs`, fourteen UI tests in `ui_tests/shortcuts.rs`, each seen failing under a
+  mutation (`docs/plans/M12.md`, K20); `a_bad_keymap_file_is_reported_and_the_defaults_stay` now pins that a
+  second binding replaces the first (it relied on keys stacking). Capture of the page to take.

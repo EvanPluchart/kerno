@@ -321,7 +321,7 @@ reachable from the command palette.
 | Cmd+Alt+F | Filter the schema tree |
 | Cmd+T | New query tab |
 | Cmd+W / Cmd+Shift+W | Close tab / close all tabs |
-| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
+| Ctrl+Tab / Ctrl+Shift+Tab, also Cmd+Alt+Right / Left (Super on Linux) and Ctrl+PageDown / PageUp | Next / previous tab |
 | Cmd+O | Open SQL file |
 | Cmd+S / Cmd+Shift+S | Save / save as |
 | Cmd+Enter | Run statement |
@@ -370,24 +370,53 @@ reachable from the command palette.
 | Ctrl+G / Ctrl+Shift+G | Go to row / go to column |
 | Ctrl+F11 | Filter by distinct values of the column |
 | Cmd+= / Cmd+- / Cmd+0 (or Alt+0 / Alt+9) | Grid text larger / smaller / usual |
+| Cmd+Shift+D | Switch between the light and the dark theme (the theme shown; Settings ▸ Appearance ▸ Follow system goes back to the system's) |
+| Cmd+Alt+W | Close the other tabs |
+| Cmd+Shift+T (macOS; Super+Shift+T on Linux) | Reopen the tab closed last |
+| Ctrl+Alt+Shift+K / Ctrl+Alt+Shift+R | Commit / roll back the transaction (beside Ctrl+4 / Ctrl+8, easier on an AZERTY keyboard) |
+| Ctrl+Shift+O | Show the messages of the last run |
+| Cmd+Alt+Y | Refresh the schema tree |
+| Cmd+Alt+N (macOS; Super+Alt+N on Linux) | Set the selected cells to NULL |
+| Cmd+Alt+Z (macOS; Super+Alt+Z on Linux) | Revert the selected rows |
+| Cmd+Alt+Shift+U (macOS; Super+Alt+Shift+U on Linux) | View the ER diagram |
+| Ctrl+Alt+Shift+B | Server administration |
 | Cmd+Q | Quit |
 
-These are the defaults in `crates/kerno/src/actions.rs`; the full list is the command palette, and the
-keymap file below lists every command id with its shortcuts.
+These are the defaults in `crates/kerno/src/actions.rs` (the source of each, DBeaver, DataGrip or a macOS
+convention, is named beside it there); Settings ▸ Shortcuts lists every command with the shortcuts in
+effect.
 
 ### Changing shortcuts
 
-The command "Open Keymap File" (command palette) creates `keymap.json` in Kerno's config directory (the
-platform's config directory for "Kerno") if it does not exist, with every command id and its default
-shortcut listed under `commands` for reference. Each entry of `bindings` replaces the shortcuts of one
-command: one shortcut, a list of shortcuts, or `null` for none. `secondary` means Cmd on macOS and Ctrl on
-Linux; a sequence of keystrokes is separated by spaces. Changes apply at the next start, and problems in
-the file are reported when Kerno starts.
+**Settings ▸ Shortcuts** (also "Keyboard Shortcuts…" in the Kerno menu and the palette) lists every command
+by group with its shortcuts; the ones you changed say "Changed". The filter takes a word of a command's name
+or group, or a shortcut, typed as the tooltips write it (⌘K) or in words (`cmd k`, `ctrl shift d`).
+
+- **Change** a shortcut: click it, then press the new one with its modifiers. **Add** records one more,
+  **×** removes one, **Reset to default** gives the command its defaults back, **Reset all…** (asked first)
+  every command.
+- What can be recorded: a letter, a digit or a sign needs Cmd or Ctrl (Option or Shift alone would type a
+  character); Alt is enough with an arrow, Enter, Tab or another named key, and a command of the schema tree or
+  a grid may take a named key alone; F1 to F24 work alone. A key the text fields use (Cmd+C, Cmd+Z,
+  Alt+Left…) stays theirs for a command that works everywhere. Escape cancels the recording.
+- A shortcut another command already answers where this one would is never taken silently: the page names
+  that command and asks, **Replace** (it loses the shortcut) or **Cancel**. Commands of parts of the window
+  that never have the keyboard together may share one (F4 in the schema tree and in the editor).
+- A change works at once: the keys, the tooltips, the palette and the menu bar's shortcuts.
+
+Changes are stored in `keymap.json`, in Kerno's config directory (the platform's config directory for
+"Kerno"), which stays yours to edit: the page changes only the entries of the commands you change and keeps
+the rest of the file. "Open Keymap File" (Kerno menu, palette, the button at the bottom of Settings) creates
+it with every command id and its default shortcuts under `commands`. Each entry of `bindings` replaces the
+shortcuts of one command: one shortcut, a list of shortcuts, or `null` for none. `secondary` means Cmd on
+macOS and Ctrl on Linux; a sequence of keystrokes is separated by spaces. A change typed in the file applies
+when Kerno starts or when Settings opens; problems in it are reported then. A file Kerno cannot
+read is said on the page, which then changes nothing until it is fixed.
 
 ```json
 {
   "bindings": {
-    "new_query_tab": "secondary-shift-t",
+    "new_query_tab": "secondary-alt-shift-t",
     "close_tab": ["secondary-w", "ctrl-f4"],
     "toggle_sidebar": null
   }

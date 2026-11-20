@@ -1,5 +1,6 @@
 //! The settings (Cmd+,): appearance, fonts, editor, grid, confirmations,
-//! tools, and the keymap file. Each choice applies at once and is stored.
+//! tools, environments, updates, AI and the keyboard shortcuts. Each choice
+//! applies at once and is stored.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestTextExt as _;
@@ -24,6 +25,7 @@ use crate::local_clients_view::LocalClientsView;
 use crate::settings::{
     CODE_FONT_SIZES, PAGE_SIZES, Settings, TabLayout, TableDoubleClick, UI_FONT_SIZES,
 };
+use crate::shortcuts_view::ShortcutsView;
 use crate::state::AppState;
 use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
@@ -40,9 +42,11 @@ pub(crate) enum Section {
     Environments,
     Updates,
     Ai,
+    Shortcuts,
 }
 
-pub(crate) const SECTIONS: [(Section, &str); 9] = [
+/// Shortcuts comes last: the sections before it keep their places (K20).
+pub(crate) const SECTIONS: [(Section, &str); 10] = [
     (Section::Appearance, "Appearance"),
     (Section::Fonts, "Fonts"),
     (Section::Editor, "Editor"),
@@ -52,6 +56,7 @@ pub(crate) const SECTIONS: [(Section, &str); 9] = [
     (Section::Environments, "Environments"),
     (Section::Updates, "Updates"),
     (Section::Ai, "AI"),
+    (Section::Shortcuts, "Shortcuts"),
 ];
 
 /// What a row of the settings draws.
@@ -82,6 +87,7 @@ pub(crate) enum Kind {
     Environments,
     Updates,
     Ai,
+    Shortcuts,
 }
 
 /// One setting, declared once: the view draws it from here and the search
@@ -408,6 +414,25 @@ pub(crate) static ROWS: &[Row] = &[
             "api key",
         ],
     },
+    // K20: the owner's request of 2026-11-20.
+    Row {
+        kind: Kind::Shortcuts,
+        section: Section::Shortcuts,
+        key: "shortcuts",
+        label: "Keyboard shortcuts",
+        description: "Every command and its shortcuts: change, add or remove one, or go back to \
+             the defaults. They are stored in the keymap file.",
+        keywords: &[
+            "keys",
+            "keymap",
+            "keybindings",
+            "bindings",
+            "hotkeys",
+            "shortcut",
+            "accelerators",
+            "keystroke",
+        ],
+    },
 ];
 
 impl Row {
@@ -686,6 +711,7 @@ pub struct SettingsView {
     local_clients: Entity<LocalClientsView>,
     environments: Entity<EnvironmentsView>,
     ai: Entity<crate::ai_view::AiSettingsView>,
+    shortcuts: Entity<ShortcutsView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -733,8 +759,9 @@ impl SettingsView {
         let subscriptions = vec![
             // Escape clears what is typed; on an empty field it closes the
             // settings, as before.
-            cx.subscribe(&search, |_, input, event: &InputEvent, cx| {
+            cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    this.stop_recording(cx);
                     input.update(cx, |input, _| {
                         let typed = !input.value().is_empty();
                         input.set_clean_on_escape(typed)
@@ -772,6 +799,7 @@ impl SettingsView {
         let local_clients = cx.new(LocalClientsView::new);
         let environments = cx.new(|cx| EnvironmentsView::new(connections, window, cx));
         let ai = cx.new(|cx| crate::ai_view::AiSettingsView::new(window, cx));
+        let shortcuts = cx.new(|cx| ShortcutsView::new(window, cx));
         Self {
             section: Section::Appearance,
             search,
@@ -780,6 +808,7 @@ impl SettingsView {
             local_clients,
             environments,
             ai,
+            shortcuts,
             _subscriptions: subscriptions,
         }
     }
@@ -947,8 +976,16 @@ impl SettingsView {
         self.search.read(cx).focus_handle(cx).focus(window, cx);
     }
 
+    /// A shortcut being recorded stops when the page leaves the screen: no
+    /// keystroke is taken with nothing on screen saying why.
+    fn stop_recording(&self, cx: &mut Context<Self>) {
+        self.shortcuts
+            .update(cx, |shortcuts, cx| shortcuts.stop_recording(cx));
+    }
+
     /// Shows `section`, the search emptied.
     fn show(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_recording(cx);
         self.section = section;
         self.clear_search(window, cx);
     }
@@ -1102,7 +1139,7 @@ impl SettingsView {
             Kind::Updates => Self::toggle(row, settings.check_updates, |settings, on| {
                 settings.check_updates = on
             }),
-            Kind::LocalClients | Kind::Environments | Kind::Ai if searching => {
+            Kind::LocalClients | Kind::Environments | Kind::Ai | Kind::Shortcuts if searching => {
                 let section = row.section;
                 let index = SECTIONS
                     .iter()
@@ -1131,6 +1168,7 @@ impl SettingsView {
             Kind::LocalClients => return self.local_clients.clone().into_any_element(),
             Kind::Environments => return self.environments.clone().into_any_element(),
             Kind::Ai => return self.ai.clone().into_any_element(),
+            Kind::Shortcuts => return self.shortcuts.clone().into_any_element(),
         };
         let invalid = row.kind == Kind::PageSize && !self.page_size_valid(cx);
         v_flex()
@@ -1255,9 +1293,13 @@ impl Render for SettingsView {
             .id("settings")
             .test_support()
             .key_context("Settings")
-            .on_action(cx.listener(|this, _: &actions::SearchSettings, window, cx| {
-                this.focus_search(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &actions::SearchSettings, window, cx| {
+                    this.focus_search(window, cx)
+                }),
+            )
+            // The theme switch works here too, the Theme row showing it.
+            .on_action(|_: &actions::ToggleTheme, window, cx| Workspace::toggle_theme(window, cx))
             .gap_3()
             .text_sm()
             .child(
@@ -1303,13 +1345,10 @@ impl Render for SettingsView {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("Shortcuts are changed in the keymap file; changes apply when Kerno starts again."),
-                    )
+                    .child(div().flex_1().text_xs().text_color(muted).child(
+                        "Shortcuts are changed in Shortcuts, above, or by hand in the \
+                                 keymap file (read when Kerno starts and when Settings opens).",
+                    ))
                     .child(
                         Button::new("open-keymap-file")
                             .ghost()
