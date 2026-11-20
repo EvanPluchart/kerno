@@ -1,6 +1,8 @@
 //! The value viewer: one cell in full, as text, as indented JSON or as a
-//! hex dump; and the value panel, which edits a cell that takes typed
-//! values (DBeaver's `row.edit`, Shift+Enter).
+//! hex dump; and the value editor dialog, which edits a cell that takes
+//! typed values (DBeaver's `row.edit`, Shift+Enter). The docked value panel
+//! (`super::value_panel`, K17) draws and saves values with the same
+//! functions.
 
 use std::rc::Rc;
 
@@ -22,10 +24,10 @@ use kerno_core::{Column, TypeKind};
 
 /// The most a view draws: beyond it the text is cut and says so (the
 /// clipboard gets everything).
-const MAX_SHOWN_BYTES: usize = 256 * 1024;
+pub(super) const MAX_SHOWN_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
+pub(super) enum View {
     Text,
     Json,
     Hex,
@@ -109,14 +111,14 @@ pub fn edit(
 }
 
 /// What an integer cell that looks like a Unix time is (Beekeeper #941).
-fn time_hint(column: &Column, value: Option<&[u8]>) -> Option<String> {
+pub(super) fn time_hint(column: &Column, value: Option<&[u8]>) -> Option<String> {
     (column.kind == TypeKind::Integer)
         .then(|| unix_time_hint(std::str::from_utf8(value?).ok()?))
         .flatten()
 }
 
 /// The line that says what time an integer is.
-fn hint_line(hint: Option<String>, cx: &App) -> Option<impl IntoElement> {
+pub(super) fn hint_line(hint: Option<String>, cx: &App) -> Option<impl IntoElement> {
     hint.map(|hint| {
         div()
             .id("value-unix-time")
@@ -156,18 +158,14 @@ impl ValueEditor {
     /// except in a text column, as when typing in the cell.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = self.text.read(cx).value().to_string();
-        if typed != self.shown {
-            if self.kind == TypeKind::Json
-                && !typed.is_empty()
-                && let Err(error) = serde_json::from_str::<serde_json::Value>(&typed)
-            {
-                self.problem = Some(format!("This is not valid JSON: {error}."));
+        match saved_value(&typed, &self.shown, &self.fetched, self.kind) {
+            Err(problem) => {
+                self.problem = Some(problem);
                 cx.notify();
                 return;
             }
-            if let Some(value) = super::grid::typed_value(&typed, &self.fetched, self.kind) {
-                (self.save.apply)(value, window, cx);
-            }
+            Ok(Some(value)) => (self.save.apply)(value, window, cx),
+            Ok(None) => {}
         }
         window.close_dialog(cx);
     }
@@ -186,14 +184,41 @@ impl ValueEditor {
                 self.text
                     .update(cx, |state, cx| state.set_value(text, window, cx));
             }
-            None => {
-                let error = serde_json::from_str::<serde_json::Value>(&typed)
-                    .err()
-                    .map_or_else(String::new, |error| format!(": {error}"));
-                self.problem = Some(format!("This is not valid JSON{error}."));
-            }
+            None => self.problem = Some(json_problem(&typed)),
         }
         cx.notify();
+    }
+}
+
+/// What saving `typed` gives, in an editor that showed `shown` of a cell
+/// holding `fetched`: no change (`None`) when the text is as shown; for a
+/// JSON column, why the text is not JSON (with where the parser stopped),
+/// and nothing is written; else as typing in the cell ([`super::grid::typed_value`]:
+/// emptied text is NULL except in a text column).
+pub(super) fn saved_value(
+    typed: &str,
+    shown: &str,
+    fetched: &str,
+    kind: TypeKind,
+) -> Result<Option<CellValue>, String> {
+    if typed == shown {
+        return Ok(None);
+    }
+    if kind == TypeKind::Json
+        && !typed.is_empty()
+        && serde_json::from_str::<serde_json::Value>(typed).is_err()
+    {
+        return Err(json_problem(typed));
+    }
+    Ok(super::grid::typed_value(typed, fetched, kind))
+}
+
+/// Why `text` is not JSON, with the line and column where the parser
+/// stopped.
+pub(super) fn json_problem(text: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(_) => String::new(),
+        Err(error) => format!("This is not valid JSON: {error}."),
     }
 }
 
@@ -307,7 +332,9 @@ fn show(
 /// The views of a value, the first shown first, and the value indented
 /// when JSON is one of them: only for a JSON column, or a text that holds a
 /// JSON object or array (a number, a string or a boolean is no document).
-fn views_for(column: &Column, value: Option<&[u8]>) -> (Vec<View>, Option<String>) {
+/// Indenting a large document takes a while: the value panel calls this off
+/// the UI thread.
+pub(super) fn views_for(column: &Column, value: Option<&[u8]>) -> (Vec<View>, Option<String>) {
     let text = value.and_then(|bytes| std::str::from_utf8(bytes).ok());
     let document = |text: &str| matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['));
     let json = text
@@ -327,14 +354,45 @@ fn views_for(column: &Column, value: Option<&[u8]>) -> (Vec<View>, Option<String
     (views, json)
 }
 
+/// What a view of a value shows; the hex dump of its first bytes only.
+pub(super) fn view_text(bytes: &[u8], view: View, json: Option<&str>) -> String {
+    match view {
+        View::Json => json.unwrap_or_default().to_string(),
+        View::Hex => hex_dump(&bytes[..bytes.len().min(MAX_SHOWN_BYTES / 4)]),
+        View::Text => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Where a text too long to draw is cut, on a character boundary.
+pub(super) fn cut_at(text: &str) -> Option<usize> {
+    (text.len() > MAX_SHOWN_BYTES).then(|| {
+        let mut end = MAX_SHOWN_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    })
+}
+
+/// The size of a value, and when only its start is shown.
+pub(super) fn size_line(size: Option<u64>, cut: bool) -> String {
+    match (size, cut) {
+        (None, _) => "No value".to_string(),
+        (Some(size), false) => byte_size(size),
+        (Some(size), true) => format!(
+            "{}; the first {} are shown, Copy takes all of it",
+            byte_size(size),
+            byte_size(MAX_SHOWN_BYTES as u64)
+        ),
+    }
+}
+
 impl ValueViewer {
     /// What the current view shows, and what "Copy" copies.
     fn shown(&self) -> String {
-        match (&self.value, self.view) {
-            (None, _) => String::new(),
-            (Some(_), View::Json) => self.json.clone().unwrap_or_default(),
-            (Some(bytes), View::Hex) => hex_dump(&bytes[..bytes.len().min(MAX_SHOWN_BYTES / 4)]),
-            (Some(bytes), View::Text) => String::from_utf8_lossy(bytes).into_owned(),
+        match &self.value {
+            None => String::new(),
+            Some(bytes) => view_text(bytes, self.view, self.json.as_deref()),
         }
     }
 }
@@ -348,14 +406,7 @@ impl Render for ValueViewer {
             .position(|view| *view == self.view)
             .unwrap_or(0);
         let text = self.shown();
-        // Cut on a character boundary.
-        let cut = (text.len() > MAX_SHOWN_BYTES).then(|| {
-            let mut end = MAX_SHOWN_BYTES;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            end
-        });
+        let cut = cut_at(&text);
         let body = match (&self.value, cut) {
             (None, _) => div()
                 .italic()
@@ -417,17 +468,12 @@ impl Render for ValueViewer {
             .child(
                 h_flex()
                     .justify_between()
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(
-                        SharedString::from(match (size, cut) {
-                            (None, _) => "No value".to_string(),
-                            (Some(size), None) => byte_size(size),
-                            (Some(size), Some(_)) => format!(
-                                "{}; the first {} are shown, Copy takes all of it",
-                                byte_size(size),
-                                byte_size(MAX_SHOWN_BYTES as u64)
-                            ),
-                        }),
-                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(size_line(size, cut.is_some()))),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -475,5 +521,52 @@ mod tests {
         // NULL: the text view says so.
         let null = views_for(&Column::new("c", "t", TypeKind::Integer), None).0;
         assert_eq!(null, [Text]);
+    }
+
+    /// K17: what Set (the panel) and Save (the dialog) make of the text.
+    #[test]
+    fn saving_refuses_broken_json_and_says_where() {
+        let shown = "{\n  \"a\": 1\n}";
+        // As shown: no change, even though it differs from what is stored.
+        assert_eq!(
+            saved_value(shown, shown, "{\"a\": 1}", TypeKind::Json),
+            Ok(None)
+        );
+        // Broken JSON is refused with the line and column it breaks at.
+        let problem = saved_value("{\n  \"a\": 1,\n}", shown, "", TypeKind::Json).unwrap_err();
+        assert!(problem.starts_with("This is not valid JSON: "), "{problem}");
+        assert!(problem.contains("line 3 column 1"), "{problem}");
+        // Valid JSON is written as typed.
+        assert_eq!(
+            saved_value("[1, 2]", shown, "", TypeKind::Json),
+            Ok(Some(CellValue::Text("[1, 2]".into())))
+        );
+        // Emptied: NULL, except in a text column, where it is ''.
+        assert_eq!(
+            saved_value("", shown, "x", TypeKind::Json),
+            Ok(Some(CellValue::Null))
+        );
+        assert_eq!(
+            saved_value("", "x", "x", TypeKind::Text),
+            Ok(Some(CellValue::Text(String::new())))
+        );
+        // Text is not checked as JSON.
+        assert_eq!(
+            saved_value("{", "", "", TypeKind::Text),
+            Ok(Some(CellValue::Text("{".into())))
+        );
+    }
+
+    #[test]
+    fn long_text_is_cut_on_a_character_boundary() {
+        let text = "é".repeat(MAX_SHOWN_BYTES);
+        let end = cut_at(&text).unwrap();
+        assert!(end <= MAX_SHOWN_BYTES && text.is_char_boundary(end));
+        assert_eq!(cut_at("short"), None);
+        assert_eq!(size_line(None, false), "No value");
+        assert_eq!(
+            size_line(Some(300 * 1024), true),
+            "300 kB; the first 256 kB are shown, Copy takes all of it"
+        );
     }
 }

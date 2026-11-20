@@ -15,6 +15,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
+- [The value panel](#the-value-panel)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
@@ -193,6 +194,19 @@ Every entry of a context menu and every toolbar button is also a command of the 
 ones that only make sense where they are: one entry per connection, database, schema, folder or foreign key,
 the value or column under the pointer, the text field's own Cut, Copy and Paste.
 
+## The value panel
+
+⌃⌥V or F7 (or "Value" in the footer of a result or a table, or "Toggle Value Panel" in the palette and the Data menu)
+shows the selected cell whole at the right of the grid, in every query tab and table tab, and follows the
+selection: JSON indented and highlighted, long text wrapped, binary as a hex dump, NULL told from an empty
+string, the column's name and type above. Drag its left edge to change its width; Kerno keeps it, and whether
+the panel is shown, for the next start. Where the cell takes a value, edit it there: Set or Cmd+Enter makes the
+text a pending change (reviewed and applied with the grid's other changes), Escape drops it and gives the
+keyboard back to the grid; JSON that does not parse is refused with where it breaks. Text you have not set
+keeps the panel on its cell while you move around the grid. With the panel shown, a double click or Shift+Enter
+on a cell puts the keyboard in the panel; with it hidden, Shift+Enter opens the value in a dialog as before, as
+does "View value" in a cell's menu.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
@@ -364,7 +378,8 @@ reachable from the command palette.
 | Escape | Revert the selected cells (grid) |
 | Cmd+Z | Undo the last pending change (grid) |
 | Cmd+Shift+C | Copy the selection with column names (grid) |
-| Shift+Enter | View or edit the value of the selected cell |
+| Shift+Enter | View or edit the value of the selected cell (in the value panel when it is shown) |
+| ⌃⌥V or F7 | Show or hide the value panel beside the grids (on a Mac keyboard F7 needs Fn) |
 | Tab | Toggle record view (grids) |
 | Ctrl+Alt+Left / Right | Previous / next row (Add Shift for the first / last row) |
 | Ctrl+G / Ctrl+Shift+G | Go to row / go to column |

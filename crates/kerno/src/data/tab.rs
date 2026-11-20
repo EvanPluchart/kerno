@@ -42,6 +42,7 @@ use crate::query::edit;
 use crate::query::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
+use crate::query::value_panel::{self, ValuePanel};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
@@ -290,6 +291,8 @@ pub struct DataTab {
     /// Counts the layouts given to be written: a delayed write that is
     /// not the last one gives up.
     layout_writes: Arc<AtomicU64>,
+    /// The selected cell's value beside the grid, while shown (K17).
+    value_panel: Option<Entity<ValuePanel>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -374,6 +377,7 @@ impl DataTab {
             grid_subscriptions: Vec::new(),
             layout: None,
             layout_seen: 0,
+            value_panel: None,
             layout_writes: Arc::new(AtomicU64::new(0)),
             _subscriptions: subscriptions,
         };
@@ -1986,6 +1990,12 @@ impl DataTab {
     }
 
     /// The grid, once rows are read.
+    /// The value panel, while shown; for tests.
+    #[cfg(test)]
+    pub fn value_panel(&self) -> Option<Entity<ValuePanel>> {
+        self.value_panel.clone()
+    }
+
     pub fn grid(&self) -> Option<Entity<TableState<Grid>>> {
         self.grid.clone()
     }
@@ -2466,6 +2476,9 @@ impl DataTab {
                     .tooltip("One row as a list of its columns, or the grid again (Tab)")
                     .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
             }))
+            .when(self.grid.is_some(), |footer| {
+                footer.child(value_panel::button("data-value-panel", cx))
+            })
             .children(
                 self.grid
                     .as_ref()
@@ -2606,7 +2619,7 @@ impl DataTab {
                 let empty = table.read(cx).delegate().total_rows() == 0;
                 let rows = crate::query::grid_view::render(table, cx);
                 let theme = cx.theme();
-                div()
+                let area = div()
                     .size_full()
                     .relative()
                     .child(rows)
@@ -2630,7 +2643,8 @@ impl DataTab {
                                 }),
                         )
                     })
-                    .into_any_element()
+                    .into_any_element();
+                value_panel::beside(area, self.value_panel.as_ref(), cx)
             }
         }
     }
@@ -2804,10 +2818,13 @@ impl Focusable for DataTab {
 }
 
 impl Render for DataTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let read_only = self.grid.as_ref().and_then(|_| self.read_only_reason(cx));
+        let grid = self.grid.clone();
+        let why = read_only.clone().map(SharedString::from);
+        value_panel::sync(&mut self.value_panel, grid.as_ref(), why, window, cx);
         let theme = cx.theme();
         let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
-        let read_only = self.grid.as_ref().and_then(|_| self.read_only_reason(cx));
         v_flex()
             .id("data-tab")
             .test_support()

@@ -22,8 +22,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable as _,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
-    SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, Window, div,
-    font, px,
+    SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity,
+    Window, div, font, px,
 };
 use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
@@ -40,6 +40,8 @@ pub(super) const MAX_CELL_CHARS: usize = 300;
 /// Why rows take no change while the find shows matching rows only: they
 /// are shown out of their place.
 const FILTERED: &str = "matching rows only";
+/// Why the rows of a grid take no change, when its owner gave no reason.
+pub(super) const NOT_EDITABLE: &str = "These rows cannot be edited.";
 
 /// Results up to this many rows are sorted at once; larger ones off the UI
 /// thread.
@@ -957,6 +959,8 @@ pub struct Grid {
     pub(super) find: Option<super::find::Find>,
     /// Counts the changes to the columns shown (hidden, pinned, moved).
     layout_version: u64,
+    /// The value panel following this grid, while one does (K17).
+    pub(super) value_panel: Option<WeakEntity<super::value_panel::ValuePanel>>,
 }
 
 impl Grid {
@@ -998,6 +1002,7 @@ impl Grid {
             layout_version: 0,
             generation: 0,
             widths: HashMap::new(),
+            value_panel: None,
         }
     }
 
@@ -1077,6 +1082,7 @@ impl Grid {
             layout_version: 0,
             generation: 0,
             widths: HashMap::new(),
+            value_panel: None,
             store,
         }
     }
@@ -1298,7 +1304,7 @@ impl Grid {
     /// Whether a cell of the grid can be typed in, and if not, why.
     pub fn editable(&self, row: usize, column: usize) -> Result<(), &'static str> {
         let Some(edits) = &self.edits else {
-            return Err("These rows cannot be edited.");
+            return Err(NOT_EDITABLE);
         };
         if self.filtered().is_some() {
             return Err("Matching rows only are shown: turn it off in the find bar to edit.");
@@ -1575,6 +1581,10 @@ impl Grid {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // The value panel, when shown, has the value already (K17).
+        if Self::focus_value_panel(table, window, cx) {
+            return;
+        }
         if let Some((row, column)) = table.read(cx).selected_cell() {
             Self::open_value(table, row, column, true, window, cx);
         }
@@ -1800,11 +1810,7 @@ impl Grid {
                 super::viewer::Save {
                     nullable: grid.nullable(source),
                     apply: Rc::new(move |value, _: &mut Window, cx: &mut App| {
-                        table.update(cx, |table, cx| {
-                            table.delegate_mut().choose(row, source, value);
-                            table.refresh(cx);
-                            cx.notify();
-                        })
+                        Self::set_value(&table, row, source, value, cx)
                     }),
                 }
             });
@@ -1812,6 +1818,38 @@ impl Grid {
         // from a key or from a menu.
         let back = table.read(cx).focus_handle(cx);
         super::viewer::edit(&described, value.as_deref(), save, back, window, cx);
+    }
+
+    /// Makes `value` the pending value of a cell, as one change: what the
+    /// value editor dialog and the value panel save.
+    pub fn set_value(
+        table: &Entity<TableState<Self>>,
+        row: usize,
+        source: usize,
+        value: CellValue,
+        cx: &mut App,
+    ) {
+        table.update(cx, |table, cx| {
+            table.delegate_mut().choose(row, source, value);
+            table.refresh(cx);
+            cx.notify();
+        })
+    }
+
+    /// Gives the keyboard to the value panel's editor, when a panel shows
+    /// this grid's selected cell whole (K17). Returns whether it did.
+    pub fn focus_value_panel(
+        table: &Entity<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let panel = table
+            .read(cx)
+            .delegate()
+            .value_panel
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
+        panel.is_some_and(|panel| panel.update(cx, |panel, cx| panel.focus_editor(window, cx)))
     }
 
     /// Whether the server has, or may have, rows that were not asked for.

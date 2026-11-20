@@ -5386,6 +5386,9 @@ impl Workspace {
                 settings.selection_stats = !settings.selection_stats
             });
         }))
+        .on_action(cx.listener(|_, _: &actions::ToggleValuePanel, window, cx| {
+            crate::query::value_panel::toggle(window, cx)
+        }))
         .on_action(
             cx.listener(|this, _: &actions::ShowAggregatePanel, window, cx| {
                 this.on_grid(GridAction::Panel(Panel::Aggregate), window, cx)

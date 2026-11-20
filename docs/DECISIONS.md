@@ -2194,3 +2194,43 @@ switch between light and dark, a Settings page that lists and changes the shortc
   command "Keyboard Shortcuts…" opens Settings on the page (Kerno menu, palette). The page is a section of
   Settings, appended last so the sections before it keep their places, and one row of `settings_view::ROWS`
   (found by "keymap", "shortcut", "hotkeys"…).
+
+## D-090 — The value panel: one per tab, a global switch, F7, Set or Cmd+Enter (K17; 2026-11-20)
+
+- **Where it lives**: one `ValuePanel` per query tab and per data tab (not per grid), made when the setting
+  shows it and dropped when it hides it, so a hidden panel costs one setting read per frame of the tab and the
+  1M-row scroll bench is untouched (off by default). Per tab rather than per grid: a query tab's stacked results
+  (J11) get one panel beside the list that follows the focused result, not one squeezed beside each short grid;
+  and text not set can outlive its grid (the page read again) long enough to be kept. The grid holds a weak
+  handle to the panel following it, for the double click and Shift+Enter.
+- **One switch for every grid, stored with the settings** (`value_panel`, `value_panel_width`), as the
+  selection statistics' switch: DBeaver remembers its panels per presentation, not per table, and J6's
+  per-table layouts would leave a query's results (no table) without a place. The width is written when a drag
+  of the kit's `h_resizable` handle ends (`ResizablePanelEvent::Resized`), clamped to 240-900 pt; a panel already
+  made keeps its width until it is made again.
+- **F7**, DBeaver's key for its panels (`org.jkiss.dbeaver.core.resultset.grid.togglePreview`, also Ctrl+7):
+  free in Kerno, the kit's inputs and editor, and vim mode; a function key, the same on AZERTY; on a Mac
+  keyboard with media keys it is Fn+F7 unless the function keys are set as standard keys. Context-less, so it
+  works with the keyboard in the editor; the command is "Toggle Value Panel", last of the Data group.
+  Review addition: a second default, Ctrl+Alt+V, bound last so that menus and tooltips show it: the key that
+  works as is on a Mac keyboard.
+- **The editor**: the kit's code editor (`EditorState`, the SQL editor's component; the dialog's plain
+  `Textarea` has no highlighting), `language("json")` for JSON (tree-sitter JSON is in the kit's `tree-sitter`
+  feature; folding on), plain text otherwise, soft wrap except for hex, no line numbers, read-only (still
+  selectable and copyable) where the cell takes no value. Focus: the grid keeps the keyboard and its arrows while
+  the panel only shows; a double click or Shift+Enter gives it to the panel's editor; Escape gives it back. Tab
+  stays the editor's (it indents JSON).
+- **Commit and abandon**: Set or Cmd+Enter writes the text as one pending change (the dialog's path,
+  `Grid::set_value`); JSON is checked first (`viewer::saved_value`: refused with the parser's line and column,
+  nothing written). Cmd+Enter is taken by the panel before "Run statement" (which, bound without context, wins
+  over the kit's own Cmd+Enter in an input). Blur never writes: half-typed text is never written because the
+  selection moved. While the text differs from the value the panel stays on its cell and says so; Escape (or
+  Discard) drops it, as Escape drops a cell's inline edit. If the rows it was for go, it is put on the clipboard
+  and a notification says so, rather than dropped silently or written.
+- **Refusals** are the tab's words, not the grid's generic "These rows cannot be edited.": the data tab's
+  `read_only_reason`, a result's `ReadOnly` (or "Wait a moment…" while its table is read), handed to the panel as
+  the tab draws; `Grid::editable`'s own sentences where it has one.
+- **Layout**: the grid keeps at least 240 pt; when the area is narrower than the grid's minimum plus the panel's,
+  the panel is not drawn (and the double click and Shift+Enter go back to the inline editor and the dialog) until
+  the window is wider again. A text column holding JSON is shown indented when read-only but as stored when it
+  can be edited, so that Set never re-indents a user's text.

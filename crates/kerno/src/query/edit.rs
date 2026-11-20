@@ -237,7 +237,8 @@ pub fn edit_cell(table: &Table, row: usize, column: usize, window: &mut Window, 
 }
 
 /// A double click on a cell: types in it, or shows the whole value of one
-/// that cannot be typed in. A boolean that takes a value is toggled by the
+/// that cannot be typed in; the value panel's editor takes it when the
+/// panel is shown. A boolean that takes a value is toggled by the
 /// click on it already selected, not by a double click.
 pub fn double_click(table: &Table, row: usize, column: usize, window: &mut Window, cx: &mut App) {
     let grid = table.read(cx).delegate();
@@ -245,7 +246,8 @@ pub fn double_click(table: &Table, row: usize, column: usize, window: &mut Windo
         .value_at(row, column)
         .is_some_and(|(column, _)| column.kind == TypeKind::Boolean)
         && grid.editable(row, column).is_ok();
-    if !toggled {
+    // With the value panel shown, the value is edited there (K17).
+    if !toggled && !Grid::focus_value_panel(table, window, cx) {
         edit_cell(table, row, column, window, cx);
     }
 }

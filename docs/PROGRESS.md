@@ -752,3 +752,19 @@ Still open (for the owner):
 - Tests: seven unit tests in `actions.rs`, fourteen UI tests in `ui_tests/shortcuts.rs`, each seen failing under a
   mutation (`docs/plans/M12.md`, K20); `a_bad_keymap_file_is_reported_and_the_defaults_stay` now pins that a
   second binding replaces the first (it relied on keys stacking). Capture of the page to take.
+
+## 2026-11-20 — K17: a value panel docked beside the grid (the owner's request of 2026-11-18)
+
+- `query/value_panel.rs`: the selected cell whole at the right of every query tab's results and every data
+  tab's rows (F7, "Toggle Value Panel", the footers' "Value" button); shown or not and its width kept with the
+  settings (D-090). It follows the selection from the grid's store: JSON indented and highlighted in the kit's
+  code editor, long text wrapped, binary as hex, NULL apart from the empty string, the Unix-time line, real
+  empty states; large values laid out off the UI thread.
+- Edits through the dialog's path: Set or Cmd+Enter (never "Run statement"), Set NULL, Format / Compact JSON;
+  broken JSON refused with its line and column; the tab's reason when the rows take no value. Typed text holds
+  the panel on its cell while the selection moves, and goes to the clipboard with a notification if its rows
+  go. A double click or Shift+Enter focuses the panel when shown.
+- `viewer.rs`'s renderers and save rule became functions the dialog and the panel share.
+- Tests: three unit tests (one extended), three UI tests on PostgreSQL and MySQL, each seen failing under a
+  one-line mutation. Captures `m12-value-panel-json-{light,dark}` to take. Limits in the "Done:" line of K17
+  (`docs/plans/M12.md`).

@@ -629,6 +629,7 @@ fn menus() -> Vec<Menu> {
                 command("find_previous_in_results"),
                 separator(),
                 command("toggle_selection_stats"),
+                command("toggle_value_panel"),
                 command("show_aggregate_panel"),
                 command("show_columns_panel"),
                 command("reset_table_layout"),

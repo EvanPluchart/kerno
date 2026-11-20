@@ -65,6 +65,7 @@ use super::occurrences::Occurrences;
 use super::params;
 use super::plan_view;
 use super::tx_log::{self, TxLogEntry};
+use super::value_panel::{self, ValuePanel};
 use crate::actions::{
     self, CountStatementRows, ExplainAnalyze, ExplainStatement, FindInEditor, FormatSql,
     MaximizeResultsPanel, NextStatement, PreviousStatement, ReplaceInEditor, RunAll, RunFromCursor,
@@ -617,6 +618,8 @@ pub struct QueryTab {
     script: Option<ScriptRun>,
     /// The AI assistant's panel at the side, while open (J17).
     ai: Option<Entity<crate::ai_view::AiPanel>>,
+    /// The value of the selected cell beside the results, while shown (K17).
+    value_panel: Option<Entity<ValuePanel>>,
     /// Vim mode (J19), only while Settings ▸ Editor turns it on.
     pub(super) vim: Option<super::vim::VimEditor>,
     _subscriptions: Vec<Subscription>,
@@ -804,6 +807,7 @@ impl QueryTab {
             tx_lost: false,
             script: None,
             ai: None,
+            value_panel: None,
             vim: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
         };
@@ -4590,6 +4594,12 @@ impl QueryTab {
         }
     }
 
+    /// The value panel, while shown; for tests.
+    #[cfg(test)]
+    pub fn value_panel(&self) -> Option<Entity<ValuePanel>> {
+        self.value_panel.clone()
+    }
+
     /// The grid of the result on screen, when it holds rows.
     pub fn active_grid(&self) -> Option<Entity<TableState<Grid>>> {
         self.results
@@ -7235,6 +7245,9 @@ impl QueryTab {
                     .tooltip("One row as a list of its columns, or the grid again (Tab)")
                     .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
             }))
+            .when(grid.is_some(), |this| {
+                this.child(value_panel::button("result-value-panel", cx))
+            })
             .children(
                 grid.as_ref()
                     .map(|table| super::grid_view::SelectionStats::of(table, cx)),
@@ -7564,6 +7577,10 @@ fn connection_menu(
 
 impl Render for QueryTab {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The value panel follows the result on screen (the focused one
+        // among stacked results).
+        let (grid, why) = (self.active_grid(), self.result_edits().err().flatten());
+        value_panel::sync(&mut self.value_panel, grid.as_ref(), why, window, cx);
         // The filter field shows the filter of the result on screen.
         let filterable = self
             .results
@@ -7698,6 +7715,10 @@ impl Render for QueryTab {
             } else {
                 self.render_results(cx).into_any_element()
             });
+        // Beside the results, outside their keys: typing in the panel is
+        // not typing in the grid.
+        let results =
+            value_panel::beside(results.into_any_element(), self.value_panel.as_ref(), cx);
         // The environment's colour frames the editor and the results.
         let chrome = self
             .target

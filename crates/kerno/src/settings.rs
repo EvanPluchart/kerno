@@ -141,6 +141,10 @@ pub struct Settings {
     /// The AI assistant (J17): off until the user turns it on; its key is in
     /// the secret store, never here.
     pub ai: kerno_core::ai::AiSettings,
+    /// The value panel shows the selected cell beside every grid (K17).
+    pub value_panel: bool,
+    /// Its width, in points.
+    pub value_panel_width: f32,
 }
 
 /// How the open tabs are laid out above (or beside) the tab on screen.
@@ -176,6 +180,8 @@ pub const UI_FONT_SIZES: std::ops::RangeInclusive<f32> = 12.0..=18.0;
 pub const CODE_FONT_SIZES: std::ops::RangeInclusive<f32> = 11.0..=20.0;
 /// The sizes a page of rows may have.
 pub const PAGE_SIZES: std::ops::RangeInclusive<u32> = 100..=10_000;
+/// The widths the value panel may have, in points.
+pub const VALUE_PANEL_WIDTHS: std::ops::RangeInclusive<f32> = 240.0..=900.0;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -219,6 +225,8 @@ impl Default for Settings {
             tab_layout: TabLayout::SingleRow,
             stack_results: false,
             ai: kerno_core::ai::AiSettings::default(),
+            value_panel: false,
+            value_panel_width: 380.0,
         }
     }
 }
@@ -258,6 +266,11 @@ impl Settings {
             self.grid_font_size,
             &CODE_FONT_SIZES,
             default.grid_font_size,
+        );
+        self.value_panel_width = clamp(
+            self.value_panel_width,
+            &VALUE_PANEL_WIDTHS,
+            default.value_panel_width,
         );
         self.format = self.format.sanitized();
         if !matches!(self.tab_size, 2 | 4) {
@@ -379,6 +392,8 @@ mod tests {
                 model: "llama3.2".into(),
                 confirmed: ["https://api.example.com/v1".to_string()].into(),
             },
+            value_panel: true,
+            value_panel_width: 512.0,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

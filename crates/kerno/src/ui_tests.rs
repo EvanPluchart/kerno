@@ -69,6 +69,7 @@ mod toolbar;
 mod tools_menu;
 mod transfer;
 mod updates;
+mod value_panel;
 mod vim;
 mod visual4;
 mod xlsx;

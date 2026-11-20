@@ -441,6 +441,8 @@ gpui_kit::actions!(
         /// Shows the figures of the selected cells in the grid's footer, or
         /// stops.
         ToggleSelectionStats,
+        /// Shows the selected cell's value beside the grid, or hides it (K17).
+        ToggleValuePanel,
         /// Shows count, sum, average, minimum and maximum of the selection.
         ShowAggregatePanel,
         /// Lists the columns of the result with their types and keys.
@@ -1525,6 +1527,19 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["load", "csv", "insert rows", "spreadsheet"],
         ImportCsv
+    ),
+    // F7 is DBeaver's key for its panels (`resultset.grid.togglePreview`).
+    // On a Mac keyboard F7 is a media key unless Fn is held: Ctrl+Alt+V is
+    // the key that works as is, and the one menus and tooltips show.
+    command!(
+        "toggle_value_panel",
+        "Toggle Value Panel",
+        "Data",
+        ["f7", "ctrl-alt-v"],
+        [
+            "value", "viewer", "json", "preview", "cell", "panels", "editor"
+        ],
+        ToggleValuePanel
     ),
     // The editor binds its own search keys (Cmd+F, Cmd+Shift+F) while it has
     // the focus; these make the panel reachable from the palette and the menu.
