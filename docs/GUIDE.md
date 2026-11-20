@@ -15,6 +15,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
+- [Rows by pages](#rows-by-pages)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
@@ -65,6 +66,11 @@ the front. `kerno --version` and `kerno --help` print and exit.
 
 Leave the password out of the URL: other programs running as your user can read a command line (`ps`). Without
 one, Kerno asks for it when the server wants it.
+
+In the connection dialog, **pasting** a URL in "Fill from a connection URL" fills the fields below at once (a URL
+of another engine switches the engine); a URL typed there fills on Fill or Enter. The URL's fields replace the
+form's, a URL without a port meaning the engine's standard port; the fields it does not name (the name, the
+folder, a user or database it leaves out) keep what you typed. The field's example follows the chosen engine.
 
 ## Move your setup to another computer
 
@@ -194,6 +200,21 @@ back a transaction left idle for 10 min."), and **Edit environments…** opens t
 Every entry of a context menu and every toolbar button is also a command of the palette (Cmd+K), except the
 ones that only make sense where they are: one entry per connection, database, schema, folder or foreign key,
 the value or column under the pointer, the text field's own Cut, Copy and Paste.
+
+## Rows by pages
+
+A query result arrives 1,000 rows at a time (Settings ▸ Grid ▸ "Rows fetched per page"). Its footer says "1,000
+rows fetched, more on the server" while the server holds more. Scrolling to the last rows, with the mouse or
+the keyboard (Page Down, the arrows), fetches the next page by itself, once each time the end is reached: the
+footer says "fetching more…" meanwhile, and Stop (⌘.) cancels it. "Fetch more" (Ctrl+Alt+N) and "Fetch all"
+(Ctrl++) stay in the footer. Settings ▸ Grid ▸ "Fetch the next rows when scrolling reaches the end of a
+result" turns the automatic fetch off, for a slow link. It also waits while the find shows matching rows only
+and while the rows are sorted in Kerno (a result the server cannot read again in another order), where new rows
+would land out of place.
+
+A table opened from the tree is read by pages instead, ordered and filtered by the server: the footer at the
+bottom right says "Page 2 of 13" (or "of about 13" when the count is the server's estimate) and "Next 1,000
+rows", outlined while there is a next page, turns it; "Previous 1,000 rows" goes back.
 
 ## The value panel
 

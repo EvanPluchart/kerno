@@ -78,6 +78,7 @@ pub(crate) enum Kind {
     Formatter,
     FormatOnSave,
     PageSize,
+    FetchOnScroll,
     NullText,
     TimeZone,
     StackResults,
@@ -266,6 +267,22 @@ pub(crate) static ROWS: &[Row] = &[
         description: "From 100 to 10,000. The next query result and the next table opened use it; \
              a table already open keeps its size until it is opened again.",
         keywords: &["page size", "fetch", "limit", "paging"],
+    },
+    Row {
+        kind: Kind::FetchOnScroll,
+        section: Section::Grid,
+        key: "settings-fetch-on-scroll",
+        label: "Fetch the next rows when scrolling reaches the end of a result",
+        description: "Off, a result fetches more only from Fetch more and Fetch all: for a slow \
+             link. A table's data keeps its pages.",
+        keywords: &[
+            "load more",
+            "auto fetch",
+            "autofetch",
+            "next page",
+            "infinite scroll",
+            "segment",
+        ],
     },
     Row {
         kind: Kind::NullText,
@@ -1108,6 +1125,9 @@ impl SettingsView {
                         .child(Input::new(&self.page_size).small()),
                 )
                 .into_any_element(),
+            Kind::FetchOnScroll => Self::toggle(row, settings.fetch_on_scroll, |settings, on| {
+                settings.fetch_on_scroll = on
+            }),
             Kind::NullText => h_flex()
                 .gap_2()
                 .child(label(row.label))

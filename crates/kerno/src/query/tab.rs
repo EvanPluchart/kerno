@@ -7141,7 +7141,11 @@ impl QueryTab {
                     Some(total) => {
                         format!("first {count} of {} rows", plan_view::number(total as f64))
                     }
-                    None if more => format!("first {count} rows; more on the server"),
+                    None if more => format!("{count} rows fetched, more on the server"),
+                    // The next page is on its way (K21).
+                    None if grid.has_more_coming() => {
+                        format!("{count} rows fetched, fetching more…")
+                    }
                     None => format!("{count} rows so far"),
                 };
                 // Which order the rows are in, as DBeaver's smart ordering

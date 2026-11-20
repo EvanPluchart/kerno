@@ -802,3 +802,19 @@ Still open (for the owner):
 - Tests: eleven unit tests of the tree, twelve UI tests in `ui_tests/split.rs` (three on PostgreSQL), each seen
   failing under a mutation. Captures `m12-split-views-{light,dark}` to take. Limits in the "Done:" line of K19
   (`docs/plans/M12.md`).
+
+## 2026-11-20 — K21: the first outside user's feedback
+
+- A colleague of the owner, first time, beside DBeaver: Fill was not understood, the URL example stayed
+  `postgres://` on MySQL, "no load more", the light grid "all white" (and "ultra fast": nothing made slower).
+- Connection dialog: the URL example follows the engine (at open and on each change); a hint under the field; a
+  pasted URL fills the form at once, a typed one waits for Fill or Enter; a line says when the form was filled.
+- Results: the fetch at the end of a scroll already existed (M5); the footer now says "1,000 rows fetched, more on
+  the server" and "fetching more…", a setting turns the automatic fetch off (DBeaver has one), and it waits while
+  rows are sorted in Kerno on an incomplete result. A table's pager says "Page 2 of 13" and "Next 1,000 rows",
+  outlined while there is one, and wraps in a narrow group.
+- Light theme: stripe, grid lines, header and hover darker (ratios in D-093), dark unchanged; every grid striped,
+  a table's data included.
+- Tests: three unit tests (one extended), seven UI tests in `ui_tests/feedback.rs` (fetch on PostgreSQL and MySQL),
+  each seen failing under a mutation. Captures `m12-light-grid-{light,dark}`, `m12-connection-url-{light,dark}`
+  to take.

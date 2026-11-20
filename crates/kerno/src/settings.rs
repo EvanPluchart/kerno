@@ -49,6 +49,9 @@ pub struct Settings {
     pub appearance: Appearance,
     /// Rows fetched per page of a result.
     pub page_size: u32,
+    /// A result fetches its next page when scrolling reaches its last
+    /// fetched rows (DBeaver's `resultset.autofetch.next.segment`, K21).
+    pub fetch_on_scroll: bool,
     /// Ask before running a destructive statement typed in the editor.
     pub confirm_destructive: bool,
     /// Whether the sidebar is shown.
@@ -188,6 +191,7 @@ impl Default for Settings {
         Self {
             appearance: Appearance::System,
             page_size: 1_000,
+            fetch_on_scroll: true,
             confirm_destructive: true,
             sidebar_visible: true,
             table_double_click: TableDoubleClick::Data,
@@ -325,6 +329,7 @@ mod tests {
         let changed = Settings {
             appearance: Appearance::Dark,
             page_size: 250,
+            fetch_on_scroll: false,
             confirm_destructive: false,
             sidebar_visible: false,
             table_double_click: TableDoubleClick::Structure,
@@ -476,6 +481,8 @@ mod tests {
         let loaded = Settings::load(&storage);
         assert_eq!(loaded.appearance, Appearance::Light);
         assert_eq!(loaded.page_size, Settings::default().page_size);
+        // A result fetches its next page at the end of a scroll (K21).
+        assert!(loaded.fetch_on_scroll);
         // Settings stored before the double-click choice existed open data.
         assert_eq!(loaded.table_double_click, TableDoubleClick::Data);
         // And ask before a tab with pending work is closed.

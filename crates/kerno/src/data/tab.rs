@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -2017,6 +2018,18 @@ impl DataTab {
 
     // Rendering ---------------------------------------------------------------
 
+    /// "Page 2 of 13", "Page 2 of about 13", or "Page 2" when the rows
+    /// were not counted.
+    fn page_text(&self) -> String {
+        let page = format!("Page {}", number((self.page + 1) as f64));
+        let pages = |total: u64| number(total.div_ceil(self.page_size.max(1)).max(1) as f64);
+        match self.total {
+            Some(Total::Exact(total)) => format!("{page} of {}", pages(total)),
+            Some(Total::About(total)) => format!("{page} of about {}", pages(total)),
+            None => page,
+        }
+    }
+
     /// "Rows 1–1,000 of 12,345".
     fn range_text(&self, cx: &App) -> String {
         let fetched = self.fetched(cx);
@@ -2397,6 +2410,9 @@ impl DataTab {
             .id("data-footer")
             .test_support()
             .flex_none()
+            // A narrow group of a split (K19) keeps the pager in reach: it
+            // goes to a second line instead of off the edge.
+            .flex_wrap()
             .px_3()
             .py_1()
             .gap_3()
@@ -2469,18 +2485,40 @@ impl DataTab {
                     .map(|table| crate::query::grid_view::SelectionStats::of(table, cx)),
             )
             .child(div().flex_1())
-            // No pages to turn when the rows could not be read.
+            // No pages to turn when the rows could not be read. The way on
+            // says what it shows and stands out while there is one (K21: a
+            // first user missed it at the end of a page).
             .when(!self.read_failed(), |footer| {
+                let has_next = self.has_next(cx) && !loading;
+                let page = SharedString::from(self.page_text());
+                let size = number(self.page_size as f64);
+                // The last page of a counted table says how many it holds.
+                let next = match self.total {
+                    Some(Total::Exact(total)) => {
+                        let shown = (self.page + 1) * self.page_size;
+                        total.saturating_sub(shown).clamp(1, self.page_size)
+                    }
+                    _ => self.page_size,
+                };
+                let next = format!(
+                    "{} row{}",
+                    number(next as f64),
+                    if next == 1 { "" } else { "s" }
+                );
                 footer
-                    .child(SharedString::from(format!(
-                        "Page {}",
-                        number((self.page + 1) as f64)
-                    )))
+                    .child(
+                        div()
+                            .id("data-page")
+                            .test_support()
+                            .child(page.clone())
+                            .test_text(page),
+                    )
                     .child(
                         Button::new("data-previous")
                             .ghost()
                             .xsmall()
-                            .label("Previous")
+                            .label(SharedString::from(format!("Previous {size} rows")))
+                            .tooltip("The previous page of rows")
                             .disabled(self.page == 0 || loading)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.turn_page(-1, window, cx)),
@@ -2488,10 +2526,11 @@ impl DataTab {
                     )
                     .child(
                         Button::new("data-next")
-                            .ghost()
+                            .map(|button| if has_next { button.outline() } else { button.ghost() })
                             .xsmall()
-                            .label("Next")
-                            .disabled(!self.has_next(cx) || loading)
+                            .label(SharedString::from(format!("Next {next}")))
+                            .tooltip("The next page of rows (this table's data is read by pages)")
+                            .disabled(!has_next)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.turn_page(1, window, cx)),
                             ),

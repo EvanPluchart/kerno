@@ -2990,9 +2990,11 @@ impl TableDelegate for Grid {
         match self.pending() {
             Some(pending) if pending.is_new(fetched, row) => tr.bg(theme.success.opacity(0.22)),
             Some(pending) if pending.is_deleted(row) => tr.bg(theme.danger.opacity(0.18)),
-            // A result is striped here, not by the table: the table's own
+            // Rows are striped here, not by the table: the table's own
             // stripes fill the pane below the last row with empty rows.
-            _ if self.table.is_none() && row % 2 == 1 => tr.bg(theme.table_even),
+            // Every grid is (a table's data too, K21: a page of white rows
+            // read as one block in the light theme).
+            _ if row % 2 == 1 => tr.bg(theme.table_even),
             _ => tr,
         }
     }
@@ -3226,10 +3228,18 @@ impl TableDelegate for Grid {
             .into_any_element()
     }
 
-    // While the find shows matching rows only, reaching its last row asks
-    // for nothing: "Fetch all" in the find bar does.
-    fn has_more(&self, _: &App) -> bool {
-        Grid::has_more(self) && self.filtered().is_none()
+    // Whether reaching the last fetched rows asks for the next page (the
+    // kit asks only once the visible rows are within its threshold of the
+    // end, so the per-frame cost stays one comparison). Not while the find
+    // shows matching rows only ("Fetch all" in the find bar does), nor
+    // while the rows are sorted here (new rows would land after the sorted
+    // ones), nor when Settings turns it off (K21). One page per reach: once
+    // asked, `Grid::has_more` is false until the page is here.
+    fn has_more(&self, cx: &App) -> bool {
+        Grid::has_more(self)
+            && self.filtered().is_none()
+            && self.order.is_none()
+            && crate::state::AppState::get(cx).settings.fetch_on_scroll
     }
 
     fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {

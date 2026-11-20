@@ -5,7 +5,9 @@ use gpui_kit::TestSupportExt as _;
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    Input, InputEditsEvent, InputEvent, InputState, Textarea, TextareaState,
+};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::switch::Switch;
@@ -83,6 +85,35 @@ fn database_placeholder(engine: Engine) -> &'static str {
     }
 }
 
+/// The URL field's placeholder: the chosen engine's scheme and standard
+/// port (K21: a MySQL form showed a `postgres://` example).
+fn url_placeholder(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "postgres://user:password@host:5432/database",
+        Engine::MySql => "mysql://user:password@host:3306/database",
+        Engine::MariaDb => "mariadb://user:password@host:3306/database",
+    }
+}
+
+/// What the URL field says under it: how it fills the form (K21: a first
+/// user did not see that Fill fills the fields below).
+const URL_HINT: &str = "Paste one to fill the fields below; a typed one fills on Fill or Enter.";
+
+/// What the URL field says once a URL filled the form, until it changes.
+const URL_FILLED: &str = "Filled from the URL: check the fields below.";
+
+/// Whether an edit of the URL field fills the form by itself: one edit put
+/// in more than one character at once (a paste; typing puts in one), and
+/// the field now holds a URL with a host, or something with a scheme that
+/// cannot be read, whose reason Fill would show. A typed or partial URL
+/// waits for Fill or Enter.
+fn fills_on_paste(inserted: usize, text: &str) -> bool {
+    inserted > 1
+        && text.contains("://")
+        && kerno_core::config::parse_connection_url(text)
+            .map_or(true, |parsed| parsed.host.is_some())
+}
+
 /// The text fields. Everything else lives in [`ConnectionForm`].
 struct Inputs {
     engine_filter: Entity<InputState>,
@@ -152,6 +183,8 @@ pub struct ConnectionDialog {
     /// "Run now" of the password command (J3).
     run: RunState,
     running_command: Option<Task<()>>,
+    /// The last URL filled the form; said under the field until it changes.
+    url_filled: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -260,7 +293,7 @@ impl ConnectionDialog {
         let engine_filter = text("", "Search engines");
         let name = text(&form.name, "A name for the sidebar");
         let group = text(&form.group, "No folder");
-        let url = text("", "postgres://user:password@host:5432/database");
+        let url = text("", url_placeholder(form.engine));
         let host = text(&form.host, "localhost");
         let port = text(&form.port, "");
         let user = text(&form.user, "");
@@ -325,11 +358,29 @@ impl ConnectionDialog {
                 this.apply_url(window, cx);
             }
         });
+        // A pasted URL fills the form at once (K21); a typed one waits.
+        let fill_on_paste = cx.subscribe_in(
+            &url,
+            window,
+            |this, input, event: &InputEditsEvent, window, cx| {
+                let inserted = event
+                    .edits()
+                    .iter()
+                    .map(|(edit, _)| edit.new_end_byte.saturating_sub(edit.start_byte))
+                    .max()
+                    .unwrap_or(0);
+                this.url_filled = false;
+                let text = input.read(cx).value().to_string();
+                if fills_on_paste(inserted, &text) {
+                    this.apply_url(window, cx);
+                }
+            },
+        );
         let refilter = cx.observe(&engine_filter, |_, _, cx| cx.notify());
         // What reaches the server changed: the list read before is another
         // server's or another login's. It is read again only when asked
         // for: nothing is sent to a server while the user types.
-        let mut subscriptions = vec![fill_on_enter, refilter];
+        let mut subscriptions = vec![fill_on_enter, fill_on_paste, refilter];
         for input in [&host, &port, &user, &password] {
             subscriptions.push(cx.subscribe(input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -384,6 +435,7 @@ impl ConnectionDialog {
             choosing_client: None,
             run: RunState::NotRun,
             running_command: None,
+            url_filled: false,
             ssh_aliases: Vec::new(),
             loading_aliases: openssh.and_then(|env| {
                 let file = env.aliases_from?;
@@ -526,6 +578,10 @@ impl ConnectionDialog {
         i.database.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx)
         });
+        let placeholder = url_placeholder(form.engine);
+        i.url.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
+        });
         if i.options.read(cx).value().as_ref() != form.options {
             let options = form.options.clone();
             i.options
@@ -556,6 +612,7 @@ impl ConnectionDialog {
                 self.inputs
                     .url
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                self.url_filled = true;
             }
             Err(error) => {
                 self.errors.push(error);
@@ -955,6 +1012,7 @@ impl ConnectionDialog {
                         let selected = engine == self.form.engine;
                         h_flex()
                             .id(SharedString::from(format!("engine-{}", engine_key(engine))))
+                            .test_support()
                             .w(px(168.))
                             .p_2()
                             .gap_2()
@@ -1004,22 +1062,63 @@ impl ConnectionDialog {
         v_flex()
             .gap_3()
             .child(
-                self.field(
-                    "Fill from a connection URL",
-                    Some(Field::Url),
-                    h_flex()
-                        .gap_2()
-                        .child(Input::new(&self.inputs.url).id("conn-url").flex_1())
-                        .child(
-                            Button::new("conn-url-apply")
-                                .outline()
-                                .label("Fill")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.apply_url(window, cx)),
-                                ),
-                        ),
-                    cx,
-                ),
+                // The hint sits on the label's line: the dialog grows no
+                // taller (its buttons stay in a short window).
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_baseline()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Fill from a connection URL"),
+                            )
+                            .child({
+                                let hint = SharedString::from(if self.url_filled {
+                                    URL_FILLED
+                                } else {
+                                    URL_HINT
+                                });
+                                div()
+                                    .id("conn-url-hint")
+                                    .test_support()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(hint.clone())
+                                    .test_text(hint)
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Input::new(&self.inputs.url).id("conn-url").flex_1())
+                            .child(
+                                Button::new("conn-url-apply")
+                                    .outline()
+                                    .label("Fill")
+                                    .tooltip(
+                                        "Fill the fields below from the URL; the fields it does \
+                                         not name keep their values",
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.apply_url(window, cx)
+                                    })),
+                            ),
+                    )
+                    .children(self.error_for(Field::Url).map(|message| {
+                        div()
+                            .id("conn-field-error")
+                            .test_support()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(message)
+                    })),
             )
             .child(
                 h_flex()
@@ -2061,4 +2160,35 @@ fn plain_markdown(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K21: the URL example follows the engine, scheme and standard port.
+    #[test]
+    fn the_url_placeholder_follows_the_engine() {
+        for engine in Engine::ALL {
+            let placeholder = url_placeholder(engine);
+            let parsed = kerno_core::config::parse_connection_url(placeholder).unwrap();
+            assert_eq!(parsed.engine, engine, "{placeholder}");
+            assert_eq!(parsed.port, Some(engine.default_port()), "{placeholder}");
+        }
+    }
+
+    /// K21: a paste of a URL with a host fills; typing never does, nor a
+    /// paste of a part; a scheme that cannot be read fills to say why.
+    #[test]
+    fn only_a_pasted_url_fills_by_itself() {
+        let url = "mysql://root@db.example.com:3306/shop";
+        assert!(fills_on_paste(url.len(), url));
+        // Typed: one character per edit, even the last one.
+        assert!(!fills_on_paste(1, url));
+        // A paste that leaves no URL, or one without a host yet.
+        assert!(!fills_on_paste(9, "localhost"));
+        assert!(!fills_on_paste(11, "postgres://"));
+        // An unknown scheme: Fill says why.
+        assert!(fills_on_paste(20, "sqlserver://db:1433/x"));
+    }
 }

@@ -2340,3 +2340,66 @@ switch between light and dark, a Settings page that lists and changes the shortc
   is mended, never refused (`Layout::restore`: unknown and repeated tabs dropped, empty groups closed, the tabs
   it does not place added to the first group, nonsense shares made even, past four groups one group). No start
   error is added (K8).
+
+## D-093 — The first outside user's feedback: URL paste, the fetch at the end, a light grid with structure (K21; 2026-11-20)
+
+- **The URL field: a hint and fill-on-paste, both.** Beside the field's label, always: "Paste one to fill the fields below; a typed one fills on Fill or Enter." (on the label's line, so the dialog grows no taller); after a
+  fill: "Filled from the URL: check the fields below." A paste fills at
+  once: one edit of the field (`InputEditsEvent`) that put in more than one character, after which the field
+  holds a URL with a host, or text with `://` that does not parse, whose reason the field then shows as Fill
+  would (`fills_on_paste`, a pure function). Typing puts in one character per edit, so a URL typed key by key,
+  partial or whole, never fills by itself (a half-typed `mysql://root@d` parses, with host `d`). The kit's
+  `Paste` action is not seen from outside the input (it handles it), hence the edits event. Its placeholder is
+  the engine's (`postgres://…:5432`, `mysql://…:3306`, `mariadb://…:3306`), set at open (an edited MySQL
+  connection too) and on every engine change. `ConnectionForm::apply_url` is unchanged: it switches the engine
+  to the URL's, replaces the fields the URL names, keeps the others (name, folder, colour, environment, a user
+  or database the URL leaves out) and puts the engine's standard port when the URL has none, which may replace a
+  typed port: a URL without a port means that port (libpq, MySQL), so this is kept and said in the guide.
+- **The fetch at the end already existed** (the kit's `TableDelegate::load_more`, called while the visible rows
+  are within 20 of the last; `Grid::load_more` asks one page; since M5, pinned by
+  `scrolling_to_the_end_of_a_result_fetches_the_next_page`). What was missing was seeing it. Trigger kept as is:
+  the kit's 20-row threshold, a cheap comparison in the list's layout callback; the delegate's `has_more` is
+  asked only past it. One page per reach of the end: once a page is asked, `Grid::has_more` is false until its
+  rows are here (`row_count >= requested`), so the end reached again meanwhile asks nothing, and when they are
+  here the end has moved 1,000 rows down. The page size is at least 100 (`PAGE_SIZES`), more than a screen, so
+  the loop "until the viewport is full" does not happen. DBeaver's trigger (`SpreadsheetPresentation`, the last
+  row painted and `resultset.autofetch.next.segment`) is the same idea; no code ported.
+- **Not by itself** while the find shows matching rows only (as before), nor while the rows are sorted in Kerno
+  on an incomplete result (only where the server cannot read it again in another order, a `SHOW` for instance):
+  a new page would land after the sorted rows. Fetch more and Fetch all still do.
+- **A setting, as DBeaver has one** ("Auto-fetch next page", on by default): Settings ▸ Grid ▸ "Fetch the next rows
+  when scrolling reaches the end of a result", on by default, `fetch_on_scroll`; found by "load more", "auto
+  fetch", "next page". It gates only the delegate's `has_more`, never `Grid::has_more` (the buttons, the summary,
+  `incomplete()`). The hot path is unchanged: no new per-frame work before the kit's threshold comparison; past
+  it, one read of a global and a field. The 1M-row and 300-column benches were not run.
+- **The footer says it**: "1,000 rows fetched, more on the server" (was "first 1,000 rows; more on the server"),
+  "1,000 rows fetched, fetching more…" while a page is on its way (rows asked, statement still open), and "N rows
+  so far" kept for a result whose statement let go (a script's statement after its first page).
+- **A table's data keeps its pages** (§4 E1). Its pager said "Page 1  Previous  Next" in small ghost buttons at the
+  far right, after Record, Value and the selection figures. Now "Page 1 of 13" ("of about 13" on an estimate,
+  "Page 1" when not counted), "Previous 1,000 rows", and "Next 1,000 rows", outlined while there is a next page (before the last page of a counted table, what it
+holds: "Next 50 rows");
+  the footer wraps in a narrow group of a split (K19) instead of cutting the pager off.
+- **The light grid.** Tokens only, light theme only; dark unchanged (WCAG ratios):
+
+  | token (light) | before | after | on `table.background` #FFFFFF, before → after | dark, for reference |
+  |---|---|---|---|---|
+  | `table.even.background` (stripe) | `#FAFBFC` | `#F4F6F8` | 1.04 → 1.08 | 1.03 |
+  | `table.row.border` (grid lines) | `#E8EBEF` | `#DDE1E6` (the `border` token) | 1.20 → 1.31 (1.21 on the stripe) | 1.21 |
+  | `table.head.background` | `#F6F7F8` | `#EEF0F2` (the `muted.background` token) | 1.07 → 1.14 | 1.04 |
+  | `table.hover.background` | `#F3F5F7` | `#EBEEF1` | 1.09 → 1.17 (1.08 on the stripe) | 1.11 |
+
+  The stripe had to move, so hover moved below it to stay distinct. Text: foreground 16.3:1 on the stripe,
+  muted 5.5:1, header text 5.2:1 on the header, Olive 5.7:1 on the stripe: AA everywhere. Ratios that match the
+  dark theme's were not enough on a white field (the dark ones read because the lines are lighter than a dark
+  surface); light is now above dark on every pair. The selected cell keeps its Lime wash `#F1F8D6` (brand rule):
+  1.01:1 on the new stripe, so a selected cell on a striped row is told by its Olive frame (5.7:1 on the stripe)
+  and its hue, which the test pins, not by its fill. The find's match tint `#DFE4D1` is 1.20:1 on the stripe
+  (1.30 on white, its pinned floor) and keeps its hue and the current match's frame. `table.head` also paints the
+  find bar and the ER diagram's table headers (and their SVG/PNG export): slightly darker there too.
+- **Every grid is striped.** `Grid::render_tr` striped a result only when it was no table's (`self.table.is_none()`,
+  since `5f38692`, whose reason was the kit's filler rows under a short result, which the grid's own stripes do
+  not draw): a table's data tab, the grid a first user most likely opened, and an editable one-table result were
+  plain white. The condition is gone, so results and table data look alike; one comparison less per row. The
+  structure and administration tables (their own delegates) take the new lines, header and hover from the same
+  tokens and stay unstriped, as before.

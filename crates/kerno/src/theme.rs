@@ -637,6 +637,57 @@ mod tests {
         }
     }
 
+    /// K21: the grids have visible rows and columns. A first user found the
+    /// light grid "all white": stripes at 1.04:1 and lines at 1.20:1 on
+    /// white. The light theme now sits above the dark one, whose ratios no
+    /// one complained about (stripe 1.03, line 1.21, header 1.04): the
+    /// floors below are the light values chosen, rounded down, and the
+    /// dark ones as they are. A selected cell on a striped row is told by
+    /// its Olive (light) or Lime (dark) frame, not by its Lime wash, which
+    /// is a brand rule (1.01:1 on the light stripe): the frame is pinned.
+    #[test]
+    fn the_grid_rows_and_columns_are_visible() {
+        let floors: [(&str, &str, f64, f64); 7] = [
+            // (one, other, light floor, dark floor)
+            ("table.even.background", "table.background", 1.08, 1.03),
+            ("table.row.border", "table.background", 1.30, 1.20),
+            ("table.row.border", "table.even.background", 1.20, 1.17),
+            ("table.head.background", "table.background", 1.14, 1.03),
+            ("table.row.border", "table.head.background", 1.14, 1.20),
+            ("table.hover.background", "table.background", 1.16, 1.10),
+            (
+                "table.hover.background",
+                "table.even.background",
+                1.07,
+                1.07,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let dark = theme.mode == "dark";
+            for (one, other, light_floor, dark_floor) in floors {
+                let floor = if dark { dark_floor } else { light_floor };
+                let ratio = contrast(&theme.colors[one], &theme.colors[other]);
+                if ratio < floor {
+                    failures.push(format!(
+                        "{}: {one} on {other} is {ratio:.3}:1, under {floor}",
+                        theme.name
+                    ));
+                }
+            }
+            for row in ["table.even.background", "table.hover.background"] {
+                let ratio = contrast(&theme.colors["table.active.border"], &theme.colors[row]);
+                if ratio < 3.0 {
+                    failures.push(format!(
+                        "{}: the selected cell's frame on {row} is {ratio:.2}:1",
+                        theme.name
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// The SQL editor: its text, its line numbers and every syntax colour
     /// must be readable on the editor background and on the active line.
     #[test]

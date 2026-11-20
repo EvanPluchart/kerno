@@ -48,6 +48,7 @@ mod editing_v11;
 mod editor_v11;
 mod environments;
 mod erd;
+mod feedback;
 mod fk_preview;
 mod folders;
 mod grid_v11;
@@ -4502,6 +4503,8 @@ fn a_table_is_read_in_pages_sorted_and_filtered_by_the_server(cx: &mut TestAppCo
         app.click(cx, "data-next");
         app.wait_for_rows(cx, "Rows 101–200 of 250");
         assert_eq!(app.data_rows(cx)[0][0], "101");
+        // K21: the way on says what the last page holds.
+        assert_eq!(app.label_of(cx, "data-next"), "Next 50 rows");
         app.click(cx, "data-next");
         app.wait_for_rows(cx, "Rows 201–250 of 250");
         // There is no page after the last.
@@ -14575,7 +14578,7 @@ fn a_result_header_shows_name_and_type_whole_and_keeps_them_when_read_again(
     assert!(!app.has(cx, "tab-cancel"));
     assert_eq!(
         app.label_of(cx, "result-summary"),
-        "first 1,000 rows; more on the server"
+        "1,000 rows fetched, more on the server"
     );
     // Each column is first drawn wide enough for its name, its type and
     // the values of the first page (a `timestamptz` whole).
