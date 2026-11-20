@@ -166,7 +166,7 @@ or why not, in plain words first and the server's own message under it:
 
 - the host was not found ("Is this computer on the network that serves it, or on its VPN?");
 - the connection was refused on that port, or no answer came in time;
-- the certificate was issued by an authority the computer does not trust (named, with how to trust it);
+- the server presented a certificate the computer does not trust: the issuer it names is shown as unverified, and Kerno says to get the authority's certificate from the administrator, not from the server, or to send nothing if this was not expected;
 - the key was refused (401, 403): check the key saved for it;
 - nothing at that address (404): check the address; if only the list of models is missing, type the model.
 

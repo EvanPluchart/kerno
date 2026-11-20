@@ -2496,9 +2496,14 @@ holds: "Next 50 rows");
   error), `ai/tls.rs` makes one more TLS handshake to the same host and port, after the same gate, with a
   verifier that notes the server certificate's issuer (`x509-cert`, already in the tree through
   `tokio-postgres-rustls`) and refuses it: the handshake fails, nothing but the TLS greeting is sent, no key,
-  5 s at most. It is the one connection besides `ai::send`. The message: "The certificate of {host} was issued
-  by “{issuer}”, which this computer does not trust. Kerno trusts the certificates the system trusts: add that
-  authority to the system's trust store (Keychain Access on macOS), then test again."
+  5 s at most. It is the one connection besides `ai::send`. The issuer's name comes from a certificate nobody
+  verified, so the message shows it as what the server claims and never as a reason to trust it (security
+  review of the commit): "{host} presented a certificate this computer does not trust. It names “{issuer}” as
+  its issuer, a name Kerno could not verify: whoever answers at this address chose it. If {host} belongs to
+  your organisation and has an authority of its own, get that authority's certificate from its administrator,
+  not from this server, and add it to the system's trust store… If you did not expect this, the connection may
+  be intercepted: send nothing." Not done: the certificate's fingerprint for a check out of band, and reading
+  the issuer on the very connection that failed (the second handshake resolves the host again).
 - **omp's YAML: `serde-saphyr` 1.3** (MIT OR Apache-2.0, maintained, `#![forbid(unsafe_code)]`), already in
   `Cargo.lock` with the same default features through gpui-component's i18n macro; now also linked into the app.
   No `unsafe-libyaml`, and not `serde_yaml` (deprecated) or a hand parser (the file is the company kit's: flow

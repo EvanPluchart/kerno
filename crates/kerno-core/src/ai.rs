@@ -706,14 +706,25 @@ fn network(endpoint: &Endpoint, error: ureq::Error, timeout: Duration) -> AiErro
         ureq::Error::ConnectionFailed => refused(),
         ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => refused(),
         ureq::Error::BodyExceedsLimit(_) => format!("The answer of {host} is too large."),
+        // The issuer's name comes from a certificate nobody verified: it is
+        // shown as what the server claims, never as a reason to trust it, and
+        // the authority to add is the administrator's, not the one presented
+        // (an interceptor writes any name it likes).
         error if tls::unknown_issuer(error) => {
-            let issuer = tls::issuer(host, endpoint.port, Duration::from_secs(5))
-                .map(|name| format!("“{name}”"))
-                .unwrap_or_else(|| "an authority".into());
+            let claimed = tls::issuer(host, endpoint.port, Duration::from_secs(5))
+                .map(|name| {
+                    format!(
+                        " It names “{name}” as its issuer, a name Kerno could not verify: \
+                         whoever answers at this address chose it."
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                "The certificate of {host} was issued by {issuer}, which this computer does not \
-                 trust. Kerno trusts the certificates the system trusts: add that authority to \
-                 the system's trust store (Keychain Access on macOS), then test again."
+                "{host} presented a certificate this computer does not trust.{claimed} If \
+                 {host} belongs to your organisation and has an authority of its own, get that \
+                 authority's certificate from its administrator, not from this server, and add \
+                 it to the system's trust store (Keychain Access on macOS), then test again. If \
+                 you did not expect this, the connection may be intercepted: send nothing."
             )
         }
         error if tls::tls_error(error).is_some() => format!(
@@ -1213,11 +1224,19 @@ mod tests {
         assert!(matches!(error, AiError::Network(_)), "{error:?}");
         assert!(
             text.starts_with(
-                "The certificate of 127.0.0.1 was issued by “Kerno Test CA”, which this \
-                 computer does not trust. Kerno trusts the certificates the system trusts"
+                "127.0.0.1 presented a certificate this computer does not trust. It names \
+                 “Kerno Test CA” as its issuer, a name Kerno could not verify"
             ),
             "{text}"
         );
+        // The name a server claims is never a reason to trust it: the user is sent to the
+        // administrator, and told the connection may be intercepted.
+        assert!(
+            text.contains("from its administrator, not from this server"),
+            "{text}"
+        );
+        assert!(text.contains("may be intercepted"), "{text}");
+        assert!(!text.contains("add that authority"), "{text}");
         assert!(!text.contains("sk-tls"), "{text}");
     }
 }
