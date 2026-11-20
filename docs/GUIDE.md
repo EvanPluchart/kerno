@@ -100,7 +100,8 @@ Leave the password out of the URL: other programs running as your user can read 
 one, Kerno asks for it when the server wants it.
 
 In the connection dialog, **pasting** a URL in "Fill from a connection URL" fills the fields below at once (a URL
-of another engine switches the engine); a URL typed there fills on Fill or Enter. The URL's fields replace the
+of another engine switches the engine); a URL typed there fills on Fill or Enter, and Fill with the field empty
+takes the URL in the clipboard. The URL's fields replace the
 form's, a URL without a port meaning the engine's standard port; the fields it does not name (the name, the
 folder, a user or database it leaves out) keep what you typed. The field's example follows the chosen engine.
 

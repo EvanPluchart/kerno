@@ -62,11 +62,47 @@ fn editing_a_mysql_connection_shows_a_mysql_example(cx: &mut TestAppContext) {
 /// says so; a pasted URL fills the form at once (another engine's switches
 /// it) and leaves alone what it does not name; a typed URL, partial or
 /// whole, waits for Fill or Enter.
+/// The owner's test of 2026-11-20: Fill with nothing typed takes the URL in the clipboard
+/// (one click pastes and fills); with no URL there, it says so instead of doing nothing.
+/// Fails with `apply_url` returning on an empty field.
+#[gpui_kit::test]
+fn fill_on_an_empty_field_takes_the_url_in_the_clipboard(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-n"]);
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("not a url".into()));
+    app.click(cx, "conn-url-apply");
+    assert!(app.has(cx, "conn-field-error"), "it says there is no URL");
+    assert!(!paints(&app, cx, "Filled from the URL"));
+
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+        "mysql://app:secret@db.example.com:3307/shop".into(),
+    ));
+    app.click(cx, "conn-url-apply");
+    assert!(paints(&app, cx, "Filled from the URL"));
+    assert!(!app.has(cx, "conn-field-error"));
+    assert_eq!(url_field(&app, cx).1, "");
+    app.click(cx, "conn-name");
+    app.type_text(cx, "Clip");
+    app.click(cx, "conn-save");
+    app.wait_until(cx, "the connection to be stored", |app, _| {
+        !app.storage.connections().unwrap().is_empty()
+    });
+    let stored = app.first_stored();
+    assert_eq!(
+        (stored.engine, stored.host.as_str(), stored.port),
+        (Engine::MySql, "db.example.com", 3307)
+    );
+}
+
 #[gpui_kit::test]
 fn a_pasted_url_fills_the_form_and_a_typed_one_waits(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
     app.press(cx, &["secondary-n"]);
-    assert!(paints(&app, cx, "Paste one to fill the fields below"));
+    assert!(paints(
+        &app,
+        cx,
+        "Paste a URL, or click Fill to use the clipboard's"
+    ));
     app.click(cx, "conn-name");
     app.type_text(cx, "Mine");
 

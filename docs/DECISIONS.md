@@ -2343,7 +2343,14 @@ switch between light and dark, a Settings page that lists and changes the shortc
 
 ## D-093 — The first outside user's feedback: URL paste, the fetch at the end, a light grid with structure (K21; 2026-11-20)
 
-- **The URL field: a hint and fill-on-paste, both.** Beside the field's label, always: "Paste one to fill the fields below; a typed one fills on Fill or Enter." (on the label's line, so the dialog grows no taller); after a
+- **Fill takes the clipboard when the field is empty** (the owner's test of the build, 2026-11-20: "if I click
+  it with nothing, it does not paste what my clipboard holds, and if I paste, the rest fills without my
+  clicking: what is the button for?"). One click now pastes and fills; with no URL in the clipboard it says
+  "Nothing to fill from: paste or type a connection URL here (the clipboard holds none)." instead of doing
+  nothing. The hint became "Paste a URL, or click Fill to use the clipboard's: it fills the fields below."
+  (`ui_tests::feedback::fill_on_an_empty_field_takes_the_url_in_the_clipboard`, seen failing with the old
+  return on an empty field).
+- **The URL field: a hint and fill-on-paste, both.** Beside the field's label, at first: "Paste one to fill the fields below; a typed one fills on Fill or Enter." (on the label's line, so the dialog grows no taller); after a
   fill: "Filled from the URL: check the fields below." A paste fills at
   once: one edit of the field (`InputEditsEvent`) that put in more than one character, after which the field
   holds a URL with a host, or text with `://` that does not parse, whose reason the field then shows as Fill

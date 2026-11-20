@@ -97,7 +97,12 @@ fn url_placeholder(engine: Engine) -> &'static str {
 
 /// What the URL field says under it: how it fills the form (K21: a first
 /// user did not see that Fill fills the fields below).
-const URL_HINT: &str = "Paste one to fill the fields below; a typed one fills on Fill or Enter.";
+const URL_HINT: &str =
+    "Paste a URL, or click Fill to use the clipboard's: it fills the fields below.";
+
+/// What Fill says with nothing typed and no URL in the clipboard.
+const NO_URL: &str =
+    "Nothing to fill from: paste or type a connection URL here (the clipboard holds none).";
 
 /// What the URL field says once a URL filled the form, until it changes.
 const URL_FILLED: &str = "Filled from the URL: check the fields below.";
@@ -600,12 +605,28 @@ impl ConnectionDialog {
     }
 
     fn apply_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self.inputs.url.read(cx).value().to_string();
+        let mut url = self.inputs.url.read(cx).value().to_string();
+        self.errors.retain(|error| error.field != Field::Url);
+        // Fill on an empty field takes the URL in the clipboard: one click
+        // pastes and fills (the owner's test of 2026-11-20: "if I click it
+        // with nothing, it does not paste what my clipboard holds").
         if url.trim().is_empty() {
-            return;
+            url = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !url.contains("://") {
+                self.errors.push(FieldError {
+                    field: Field::Url,
+                    message: NO_URL.into(),
+                });
+                cx.notify();
+                return;
+            }
         }
         let mut form = self.read_form(cx);
-        self.errors.retain(|error| error.field != Field::Url);
         match form.apply_url(&url) {
             Ok(()) => {
                 self.show_form(form, window, cx);
@@ -1103,7 +1124,8 @@ impl ConnectionDialog {
                                     .outline()
                                     .label("Fill")
                                     .tooltip(
-                                        "Fill the fields below from the URL; the fields it does \
+                                        "Fill the fields below from the URL typed here, or from \
+                                         the clipboard when this is empty; the fields it does \
                                          not name keep their values",
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
