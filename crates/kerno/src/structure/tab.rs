@@ -802,6 +802,8 @@ impl StructureTab {
             })
             .collect();
         TabBar::new("structure-sections")
+            // The sub-tabs a narrow group cuts off stay one click away.
+            .menu(true)
             .selected_index(self.section)
             .on_click(cx.listener(|this, index: &usize, _, cx| this.select(*index, cx)))
             .children(SECTIONS.iter().zip(counts).map(|((label, _), count)| {

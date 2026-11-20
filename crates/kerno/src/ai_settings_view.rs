@@ -125,6 +125,9 @@ pub struct AiSettingsView {
     add_key: Entity<InputState>,
     adding: bool,
     add_error: Option<String>,
+    /// The saved endpoint that already has the address typed by hand: Add refused, and
+    /// offers to change that one instead.
+    add_same: Option<String>,
     /// Why List models failed.
     models_error: Option<String>,
     /// What happened to a key or an import last.
@@ -162,8 +165,14 @@ impl AiSettingsView {
         let add_address = input("https://llm.example.lan/v1", false, window, cx);
         let add_key = input("Only if it asks for one", true, window, cx);
         let subscriptions = vec![
-            cx.subscribe(&model, |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
+            // What is typed filters the list; it becomes the model when confirmed (Enter, or
+            // leaving the field), never while typed: "qwen" is no model.
+            cx.subscribe(&model, |this, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    this.models_error = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
                     let text = input.read(cx).value().trim().to_string();
                     if text != AppState::get(cx).settings.ai.model {
                         AppState::update_settings(cx, |settings| {
@@ -171,17 +180,21 @@ impl AiSettingsView {
                             settings.ai.set_model(&text)
                         });
                     }
-                    this.models_error = None;
                     cx.notify();
                 }
+                InputEvent::Focus => {}
             }),
             cx.subscribe_in(&key, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.save_key(window, cx);
                 }
             }),
-            cx.subscribe(&add_address, |_, _, event: &InputEvent, cx| {
+            cx.subscribe(&add_address, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
+                    // An offer to change a saved endpoint was for the address as it was.
+                    if this.add_same.take().is_some() {
+                        this.add_error = None;
+                    }
                     cx.notify();
                 }
             }),
@@ -195,6 +208,7 @@ impl AiSettingsView {
             add_key,
             adding: false,
             add_error: None,
+            add_same: None,
             models_error: None,
             key_note: None,
             detected: None,
@@ -516,11 +530,23 @@ impl AiSettingsView {
     fn toggle_add(&mut self, cx: &mut Context<Self>) {
         self.adding = !self.adding;
         self.add_error = None;
+        self.add_same = None;
         cx.notify();
     }
 
-    /// Saves the endpoint typed by hand, and its key.
+    /// Saves the endpoint typed by hand, and its key; an address already saved is refused
+    /// with the name of the endpoint that has it ([`Self::change_same`] changes that one).
     pub fn add_by_hand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_typed(false, window, cx)
+    }
+
+    /// Gives the saved endpoint with the typed address the name and key typed, as the user
+    /// chose after Add said the address was saved.
+    pub fn change_same(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_typed(true, window, cx)
+    }
+
+    fn save_typed(&mut self, over: bool, window: &mut Window, cx: &mut Context<Self>) {
         let address = self.add_address.read(cx).value().to_string();
         let found = match endpoints::normalize(&address) {
             Ok(found) => found,
@@ -536,6 +562,18 @@ impl AiSettingsView {
         } else {
             name
         };
+        let same = (Self::settings(cx).endpoints.iter())
+            .find(|saved| saved.base == found.base)
+            .map(|saved| saved.name.clone());
+        if let Some(same) = same.filter(|_| !over) {
+            self.add_error = Some(format!(
+                "“{same}” already has this address. Type another one, or change “{same}” with \
+                 the name and key typed here."
+            ));
+            self.add_same = Some(same);
+            cx.notify();
+            return;
+        }
         let key = self.add_key.read(cx).value().trim().to_string();
         let base = found.base.clone();
         AppState::update_settings(cx, |settings| {
@@ -554,6 +592,7 @@ impl AiSettingsView {
         }
         self.adding = false;
         self.add_error = None;
+        self.add_same = None;
         cx.notify();
     }
 
@@ -931,9 +970,19 @@ impl Render for AiSettingsView {
                 .child(what)
                 .children(self.add_error.clone().map(|why| {
                     div()
+                        .id("ai-add-refused")
+                        .test_support()
                         .text_xs()
                         .text_color(danger)
-                        .child(SharedString::from(why))
+                        .child(SharedString::from(why.clone()))
+                        .test_text(why)
+                }))
+                .children(self.add_same.clone().map(|same| {
+                    Button::new("ai-add-change")
+                        .outline()
+                        .small()
+                        .label(SharedString::from(format!("Change “{same}”")))
+                        .on_click(cx.listener(|this, _, window, cx| this.change_same(window, cx)))
                 }))
                 .child(
                     h_flex()

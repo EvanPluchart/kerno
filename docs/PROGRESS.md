@@ -874,3 +874,40 @@ Still open (for the owner):
   not connected opens a tab without a connection; the window's size is not restored after a restart; with a
   very long data directory the instance socket's path is too long and `kerno <url>` does not reach the running
   instance (a warning in the log).
+
+## 2026-11-20 — The second real-app pass, in the foreground, and what it found
+
+- The pass (an agent driving its own instance, window in front, on a scratch data directory): the 55 points the
+  first pass left, plus the four fixes of `1b8a375`. 50 passed, 3 partly, 2 failed; no crash, no password in a
+  log, nothing left running. Not run, the owner's: the system appearance (`k20-system`), the shortcuts on a
+  physical AZERTY keyboard, the import from omp and the test of the work proxy, and the points of after the
+  release. The AI points ran against a fake endpoint on loopback.
+- Behaviour, fixed: "Insert" put the assistant's SQL at the caret with nothing around it
+  (`…restart_check_oneSELECT * FROM…`): a selection is replaced, at a caret the SQL gets its own line
+  (`ai::placed`), and the panel shows and copies the answer without its code fences (`ai::unfenced`). The value
+  panel took a width `fit` had squeezed it to for the user's (450 kept as 308) and did not grow back: an event
+  that answers a fit is never saved, and one fit runs at a time. A panel with no room is said on its button
+  (warning outline, "No room for the value panel in this group: widen it"). The status bar showed the time since
+  the run after a later page (34 s for a 28 ms statement): a statement's time stops at its first page, in the
+  status bar and the history; its row count takes the thousands separator. Settings ▸ Shortcuts: "1 changed
+  command loses its changes"; a conflict question goes when its row changes another way. Settings ▸ AI: adding
+  an address already saved names the endpoint that has it and asks, instead of renaming it silently; the model
+  field saves on Enter, on leaving the field or on a pick, not at each key. Sidebar: a filter that matches
+  nothing loaded says so and names Quick Open; a load the user cancelled reads "Cancelled. Expand again to
+  load.", muted, not as an error.
+- Layout in a half-width group, fixed: the result's filter bar, edit bar and footer wrap (Apply was cut to "A",
+  Delete and Set NULL dropped out, the WHERE field shrank to "Filter tl": it keeps 180 px); the same for the
+  table's raw filter and the selection's figures; the sub-tabs of the structure and administration tabs get the
+  kit's menu that lists them all; an empty administration list wraps. The commit-mode menu was not clipped: the
+  kit caps a menu at 31.25 rem and one entry was longer; it reads "Manual commit: changes wait for Commit or
+  Rollback".
+- Light grid: the kit paints a table's selection at 20 % opacity at most, so the Lime wash came out grey on a
+  stripe, and the header was 1.05:1 against a stripe. The selection is written so that it paints the Lime wash
+  (`#B9DC3233`), the header is `#E4E8EC`, the row line `#D3D8DE`; the theme tests read the selection as painted.
+- Left to the owner: in the dark theme the same cap makes a selected row's tint about 1.02:1 against its row
+  (the cell's outline is what shows), and `a_selected_row_stands_out_in_the_dark_theme` reads the colour as
+  written, not as painted; list and sidebar selections are capped the same way; muted text (NULL) under a
+  selected cell stays under AA (about 3.6–4.0:1); Import and Detect still merge into an endpoint with the same
+  address without asking; a paged result's time no longer counts a later "fetch all".
+- Tests: 2 unit tests in kerno-core, 13 UI and theme tests added and 3 rewritten, each seen failing under a
+  mutation.

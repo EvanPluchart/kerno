@@ -627,6 +627,91 @@ fn the_value_panel_stays_inside_a_narrow_group(cx: &mut TestAppContext) {
     assert_eq!(px(remembered), wide);
 }
 
+/// Real-app pass: a group narrowed by its divider squeezed the value panel and the squeezed
+/// width replaced the user's (450 became 300, then 241), so the panel never grew back. Only
+/// a drag of the panel's own divider changes the width kept; the group widened again, the
+/// panel is back at it.
+#[gpui_kit::test]
+fn a_squeezed_value_panel_grows_back_and_keeps_the_users_width(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(1400.), px(800.)));
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.value_panel_width = 450.));
+    app.open_table(cx, "shop", "orders", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1")
+    });
+    app.press(cx, &["f7"]);
+    app.wait_until(cx, "the value panel", |app, cx| app.has(cx, "value-panel"));
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let remembered =
+        |cx: &mut TestAppContext| cx.update(|cx| AppState::get(cx).settings.value_panel_width);
+    let drag_divider = |cx: &mut TestAppContext, share: f32| {
+        let area = bounds(&app, cx, ("tab-split", 1usize));
+        let divider = bounds(&app, cx, ("tab-divider", 9usize)).center();
+        let to = point(area.left() + area.size.width * share, divider.y);
+        app.step(cx, |window, cx| window.drag(divider, to, cx));
+        for _ in 0..5 {
+            app.step(cx, |window, _| window.refresh());
+        }
+    };
+    // Narrowed in steps, as a hand drags.
+    for share in [0.65, 0.6, 0.55, 0.5] {
+        drag_divider(cx, share);
+    }
+    let width = bounds(&app, cx, "value-panel").size.width;
+    assert!(width < px(450.), "squeezed: {width:?}");
+    assert_eq!(remembered(cx), 450., "a squeeze is not the user's width");
+    drag_divider(cx, 0.8);
+    app.wait_until(cx, "the panel back at its width", |app, cx| {
+        (bounds(app, cx, "value-panel").size.width - px(450.)).abs() < px(2.)
+    });
+    assert_eq!(remembered(cx), 450.);
+}
+
+/// Real-app pass: at 960 px with two groups the value panel had no room and was not drawn,
+/// while its "Value" button stayed pressed and nothing said why. The button says it: another
+/// look, the reason in its tooltip; with room again it is the plain pressed button.
+#[gpui_kit::test]
+fn a_value_panel_without_room_says_so_on_its_button(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(960.), px(800.)));
+    app.open_table(cx, "shop", "orders", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1")
+    });
+    app.press(cx, &["f7"]);
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let tip = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |window, _| {
+            let node = window.find("data-value-panel");
+            (
+                node.description().unwrap_or_default().to_string(),
+                node.selected(),
+            )
+        })
+    };
+    app.wait_until(cx, "the button to say there is no room", |app, cx| {
+        tip(app, cx).0.contains(crate::query::value_panel::NO_ROOM)
+    });
+    assert!(!app.has(cx, "value-panel"));
+    assert_ne!(tip(&app, cx).1, Some(true), "not drawn as shown");
+    cx.simulate_window_resize(app.window.into(), size(px(1800.), px(800.)));
+    app.wait_until(cx, "the panel drawn", |app, cx| app.has(cx, "value-panel"));
+    app.wait_until(cx, "the plain button", |app, cx| {
+        !tip(app, cx).0.contains(crate::query::value_panel::NO_ROOM)
+    });
+}
+
 /// The owner's test of the build (2026-11-20): a table's toolbar in a narrow group drew over the
 /// group beside it ("Set NULL", "Structure", "Export" on top of the other tab's connection
 /// picker). It wraps inside its own group, as a query tab's does. Fails without `flex_wrap` on
@@ -696,4 +781,298 @@ fn the_toolbar_of_a_narrow_group_keeps_run_in_reach(cx: &mut TestAppContext) {
         holding, 2,
         "a Run button is cut off: {buttons:?} in {areas:?}"
     );
+}
+
+/// Whether `inner` lies within `outer` (a pixel of rounding allowed).
+fn lies_in(inner: Bounds<Pixels>, outer: Bounds<Pixels>) -> bool {
+    inner.left() >= outer.left() - px(1.)
+        && inner.right() <= outer.right() + px(1.)
+        && inner.top() >= outer.top() - px(1.)
+        && inner.bottom() <= outer.bottom() + px(1.)
+}
+
+/// The figures of the selection of `grid` shown in its footer.
+fn figures(cx: &mut TestAppContext, grid: &Entity<TableState<Grid>>) -> Option<String> {
+    cx.update(|cx| {
+        crate::query::grid_view::SelectionStats::of(grid, cx)
+            .read(cx)
+            .text()
+    })
+}
+
+/// The real-app pass of 2026-11-20: with an editable result and its value panel in a half-width
+/// group, "Apply" was cut to "A" at the panel's edge, Delete and Set NULL dropped out of the edit
+/// bar, the WHERE field read "Filter tl" and Export in the footer was cut. Every bar of the
+/// result wraps inside the result's own width: each control lies within it, the condition keeps
+/// a usable width. Fails without `flex_wrap` on the edit bar (Apply at the panel's edge).
+#[gpui_kit::test]
+fn the_bars_of_a_result_stay_inside_a_half_width_group(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    // A long name: "Rows of …" is longer than the result is wide.
+    let schema = "kerno_ui_narrow_result_of_a_table_with_a_long_name";
+    let _scratch = g8_table(Engine::Postgres, schema);
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(1280.), px(800.)));
+    app.run_in_new_tab(
+        cx,
+        &format!("select id, name, qty from {schema}.t order by id"),
+        "secondary-enter",
+    );
+    app.wait_until(cx, "the result", |app, cx| app.outcomes(cx) == ["4 rows"]);
+    assert_eq!(app.result_verdict(cx), None);
+    // A change waiting (Discard, Review SQL, Apply), a range selected (Delete, Set NULL, the
+    // figures of the selection), the value panel open.
+    app.type_in_result(cx, 0, 2, "uno");
+    let grid = app.result_grid(cx, 0);
+    select_cell(&app, cx, &grid, (0, 1));
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(3, 3)));
+    app.click(cx, "result-value-panel");
+    app.wait_until(cx, "the value panel", |app, cx| app.has(cx, "value-panel"));
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let left = groups(&app, cx)[0];
+    let group = bounds(&app, cx, ("tab-group", left));
+    let results = bounds(&app, cx, "results");
+    assert!(lies_in(results, group), "{results:?} in {group:?}");
+    let panel = app.step(cx, |window, _| {
+        window
+            .try_find("value-panel")
+            .filter(|panel| panel.visible())
+            .map(|panel| panel.bounds())
+    });
+    assert!(panel.is_some(), "the value panel beside the result");
+    for id in [
+        "result-filter",
+        "result-filter-history",
+        "result-filter-apply",
+        "result-edit-table",
+        "result-add-row",
+        "result-delete",
+        "result-set-null",
+        "result-pending",
+        "result-discard",
+        "result-review",
+        "result-apply",
+        "result-summary",
+        "result-record",
+        "result-value-panel",
+        "selection-stats",
+        "result-export",
+    ] {
+        let control = bounds(&app, cx, id);
+        assert!(
+            lies_in(control, results),
+            "{id} is drawn outside the result: {control:?} in {results:?}"
+        );
+    }
+    assert!(bounds(&app, cx, "result-filter").size.width >= px(150.));
+    assert!(figures(cx, &grid).is_some_and(|line| line.starts_with("12 cells")));
+}
+
+/// The real-app pass of 2026-11-20: in a narrow group, the WHERE field of a table squeezed to a
+/// few letters and the figures of a selection ran past the group's edge. The filter bar and the
+/// footer wrap; the figures wrap inside the footer. Fails without the field's least width (the
+/// condition squeezed) or without `min_w_0` on the figures (their line past the edge).
+#[gpui_kit::test]
+fn the_filter_and_figures_of_a_table_stay_inside_a_narrow_group(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(1000.), px(800.)));
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1")
+    });
+    let grid = app.data_grid(cx);
+    select_cell(&app, cx, &grid, (0, 1));
+    cx.update(|cx| grid.update(cx, |table, _| table.delegate_mut().extend_to(5, 3)));
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let left = groups(&app, cx)[0];
+    let group = bounds(&app, cx, ("tab-group", left));
+    for id in [
+        "filter-add",
+        "filter-raw",
+        "filter-history",
+        "filter-apply",
+        "data-footer",
+        "data-record",
+        "data-next",
+    ] {
+        let control = bounds(&app, cx, id);
+        assert!(
+            lies_in(control, group),
+            "{id} is drawn outside its group: {control:?} in {group:?}"
+        );
+    }
+    let raw = bounds(&app, cx, "filter-raw");
+    assert!(
+        raw.size.width >= px(150.),
+        "the condition is squeezed: {raw:?}"
+    );
+    let line = bounds(&app, cx, "selection-stats");
+    assert!(
+        lies_in(line, group),
+        "the figures past the edge: {line:?} in {group:?}"
+    );
+    assert!(figures(cx, &grid).is_some_and(|line| line.starts_with("18 cells")));
+}
+
+/// The real-app pass of 2026-11-20: in a narrow group the sub-tabs of a table's structure
+/// ("Properties", "Columns", … "DDL") and of the administration ("Settings (27") were cut at the
+/// group's edge with no way to the hidden ones. Each bar has the kit's overflow menu, inside the
+/// group, listing every sub-tab. Fails without `.menu(true)` on the bars.
+#[gpui_kit::test]
+fn the_sub_tabs_of_a_narrow_group_stay_in_reach(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    // Opens the menu of the sub-tabs of the tab in the left group.
+    let more = |app: &Fixture, cx: &mut TestAppContext, bar: &'static str| {
+        let left = groups(app, cx)[0];
+        let group = bounds(app, cx, ("tab-group", left));
+        let button = app.step(cx, |window, _| window.within(bar).find("more").bounds());
+        assert!(
+            lies_in(button, group),
+            "the sub-tabs' menu of {bar} is outside its group: {button:?} in {group:?}"
+        );
+        app.step(cx, |window, cx| window.within(bar).click("more", cx));
+    };
+
+    app.open_structure(cx, "shop", "customers", RelationKind::Table);
+    app.wait_for_structure(cx);
+    let structure = app.structure(cx);
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    more(&app, cx, "structure-sections");
+    click_menu_entry(&app, cx, "DDL");
+    assert_eq!(
+        cx.update(|cx| structure.read(cx).section()),
+        crate::structure::tab::DDL_SECTION
+    );
+
+    // The structure goes; the administration takes the left group.
+    app.press(cx, &["secondary-alt-shift-n"]);
+    app.press(cx, &["secondary-w"]);
+    app.dispatch(cx, actions::OpenAdmin);
+    let admin = app.admin(cx);
+    app.wait_admin(cx, Pane::Sessions);
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    more(&app, cx, "admin-sections");
+    let last = cx
+        .update(|cx| admin.read(cx).section_titles(cx))
+        .pop()
+        .unwrap();
+    click_menu_entry(&app, cx, &last);
+    assert_eq!(cx.update(|cx| admin.read(cx).section()), SETTINGS);
+}
+
+/// The real-app pass of 2026-11-20: an empty administration list said why on one unwrapped
+/// line centred over the whole list, cut at both ends in a half-width group ("k. A session
+/// shows here…"). It wraps inside the list. Fails with the empty state as a flex row.
+#[gpui_kit::test]
+fn an_empty_admin_list_wraps_inside_a_narrow_group(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.dispatch(cx, actions::OpenLockManager);
+    app.wait_admin(cx, Pane::Locks);
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let left = groups(&app, cx)[0];
+    let group = bounds(&app, cx, ("tab-group", left));
+    assert!(app.has(cx, ("admin-empty", Pane::Locks as usize)));
+    let text = bounds(&app, cx, ("admin-empty-text", Pane::Locks as usize));
+    assert!(lies_in(text, group), "{text:?} in {group:?}");
+    // The bar above it ("Filter l" beside the buttons): the buttons go to a second line.
+    for id in ["admin-filter", "admin-cancel", "admin-terminate"] {
+        let control = bounds(&app, cx, id);
+        assert!(lies_in(control, group), "{id}: {control:?} in {group:?}");
+    }
+    let filter = bounds(&app, cx, "admin-filter");
+    assert!(
+        filter.size.width >= px(150.),
+        "the filter is squeezed: {filter:?}"
+    );
+}
+
+/// The real-app pass of 2026-11-20 read the commit-mode menu as cut ("…in a transaction you
+/// end"): the menu is drawn above the groups and kept inside the window, not cut by its group,
+/// but its sentence seemed to stop short. It now says what ends the transaction, and every menu
+/// of a query tab's toolbar in the right-hand group of a narrow window shows each entry whole,
+/// inside the window. The kit caps a menu at 31.25 rem (406 px with a 13 px interface): fails
+/// with an entry longer than that ("…until you commit or roll back", cut at 400 of 519 px).
+#[gpui_kit::test]
+fn the_menus_of_a_query_tab_in_the_right_group_show_their_whole_text(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(960.), px(800.)));
+    app.press(cx, &["secondary-t", "secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let right = groups(&app, cx)[1];
+    let popup = gpui_kit::ElementId::Name("popup-menu".into());
+    // How wide an entry's label is, in the menu's text size.
+    let needs = |label: &str, cx: &mut TestAppContext| -> Pixels {
+        app.step(cx, |window, cx| {
+            let text = cx.text_system();
+            let font = text.resolve_font(&gpui_kit::font(cx.theme().font_family.clone()));
+            let size = window.rem_size() * 0.875;
+            label
+                .chars()
+                .map(|c| {
+                    text.advance(font, size, c)
+                        .map_or(px(0.), |advance| advance.width)
+                })
+                .sum()
+        })
+    };
+    for id in [
+        "tab-connection",
+        "tab-database",
+        "tab-schema",
+        "tab-commit-mode",
+        "tab-explain",
+        "tab-run-menu",
+    ] {
+        app.step(cx, |window, cx| {
+            window.within(("tab-group", right)).click(id, cx)
+        });
+        let (screen, menu, entries) = app.step(cx, |window, _| {
+            use gpui_kit::test::TestQueryExt as _;
+            let menu = window.find("popup-menu").bounds();
+            let entries: Vec<(String, Bounds<Pixels>)> = window
+                .elements()
+                .into_iter()
+                .filter(|entry| entry.path().contains(&popup))
+                .filter_map(|entry| Some((entry.label()?.to_string(), entry.bounds())))
+                .filter(|(label, _)| !label.is_empty())
+                .collect();
+            (
+                Bounds::new(Point::default(), window.viewport_size()),
+                menu,
+                entries,
+            )
+        });
+        assert!(lies_in(menu, screen), "{id}: {menu:?} past the window");
+        assert!(!entries.is_empty(), "{id}: no entry");
+        for (label, at) in entries {
+            let needed = needs(&label, cx);
+            assert!(
+                lies_in(at, menu) && at.size.width >= needed,
+                "{id}: “{label}” cut: {at:?} (needs {needed:?}) in {menu:?}"
+            );
+        }
+        app.press(cx, &["escape"]);
+    }
 }

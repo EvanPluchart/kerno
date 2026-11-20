@@ -420,6 +420,65 @@ mod tests {
         super::contrast(hex(a), hex(b))
     }
 
+    /// The most of `table.active.background` the kit lets through: it draws
+    /// a selected cell's or row's tint at most 20 % opaque, whatever the file
+    /// says (gpui-component's `clamp_alpha` in `theme/schema.rs`).
+    const ACTIVE_ALPHA: f64 = 0.2;
+
+    /// `table.active.background` as painted over `row`, as `0xRRGGBB`.
+    fn selected_on(theme: &ThemeEntry, row: &str) -> u32 {
+        let tint = &theme.colors["table.active.background"];
+        let digits = tint.trim_start_matches('#');
+        let alpha = match digits.get(6..8) {
+            Some(alpha) => f64::from(u8::from_str_radix(alpha, 16).unwrap()) / 255.0,
+            None => 1.0,
+        };
+        super::mix(hex(&theme.colors[row]), hex(tint), alpha.min(ACTIVE_ALPHA))
+    }
+
+    /// A colour of the theme as it is painted: the selection's tint over a
+    /// plain row, every other colour as written.
+    fn color(theme: &ThemeEntry, key: &str) -> String {
+        match key {
+            "table.active.background" => {
+                format!("#{:06X}", selected_on(theme, "table.background"))
+            }
+            _ => theme.colors[key].clone(),
+        }
+    }
+
+    /// CIE76 colour difference of two `0xRRGGBB` colours (sRGB, D65): about
+    /// 2 is the least an eye tells apart, 10 and over reads as another colour.
+    /// Tints of the same lightness differ by hue, which a contrast ratio
+    /// does not see.
+    fn delta_e(a: u32, b: u32) -> f64 {
+        let lab = |rgb: u32| {
+            let channel = |shift: u32| {
+                let value = f64::from((rgb >> shift) & 0xFF) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, b) = (channel(16), channel(8), channel(0));
+            let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.950_47;
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.088_83;
+            let f = |t: f64| {
+                if t > 0.008_856 {
+                    t.cbrt()
+                } else {
+                    7.787 * t + 16.0 / 116.0
+                }
+            };
+            let (fx, fy, fz) = (f(x), f(y), f(z));
+            (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+        };
+        let ((l1, a1, b1), (l2, a2, b2)) = (lab(a), lab(b));
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
     fn themes() -> Vec<ThemeEntry> {
         serde_json::from_str::<ThemeFile>(THEME_JSON)
             .unwrap()
@@ -532,7 +591,7 @@ mod tests {
         let mut failures = Vec::new();
         for theme in themes() {
             for (text, surface) in pairs {
-                let ratio = contrast(&theme.colors[text], &theme.colors[surface]);
+                let ratio = contrast(&color(&theme, text), &color(&theme, surface));
                 if ratio < 4.5 {
                     failures.push(format!(
                         "{}: {text} on {surface} is {ratio:.2}:1",
@@ -610,7 +669,7 @@ mod tests {
             ];
             for (indicator, surfaces) in indicators {
                 for surface in surfaces {
-                    let ratio = contrast(&theme.colors[indicator], &theme.colors[*surface]);
+                    let ratio = contrast(&color(&theme, indicator), &color(&theme, surface));
                     if ratio < 3.0 {
                         failures.push(format!(
                             "{}: {indicator} on {surface} is {ratio:.2}:1",
@@ -682,6 +741,56 @@ mod tests {
                         "{}: the selected cell's frame on {row} is {ratio:.2}:1",
                         theme.name
                     ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The real-app pass of 2026-11-20, light theme: the grid's header was
+    /// the grey of a stripe (1.05:1), and a selected cell or row looked like
+    /// a stripe, told only by its Olive frame: the kit paints the selection's
+    /// tint at 20 %, so the Lime wash written in the file came out grey. The
+    /// header has its own tone, and the selection as painted is the Lime wash
+    /// (`assets/brand/BRAND.md`) on a plain row, still lime on a stripe or a
+    /// hovered row, apart from all three, its text readable.
+    #[test]
+    fn the_light_grid_header_and_selection_stand_apart() {
+        let themes = themes();
+        let light = &themes[0];
+        assert_eq!(light.mode, "light");
+        let rows = [
+            "table.background",
+            "table.even.background",
+            "table.hover.background",
+        ];
+        let mut failures = Vec::new();
+        for row in &rows[..2] {
+            let ratio = contrast(&light.colors["table.head.background"], &light.colors[*row]);
+            if ratio < 1.12 {
+                failures.push(format!("the header on {row} is {ratio:.3}:1"));
+            }
+        }
+        let wash = selected_on(light, "table.background");
+        if delta_e(wash, 0xF1F8D6) > 2.0 {
+            failures.push(format!(
+                "a selection on a plain row is #{wash:06X}, not the Lime wash"
+            ));
+        }
+        for row in rows {
+            let shown = selected_on(light, row);
+            for other in rows {
+                let difference = delta_e(shown, hex(&light.colors[other]));
+                if difference < 10.0 {
+                    failures.push(format!(
+                        "a selection on {row} (#{shown:06X}) is {difference:.1} from {other}"
+                    ));
+                }
+            }
+            for text in ["foreground", "muted.foreground", "link"] {
+                let ratio = super::contrast(hex(&light.colors[text]), shown);
+                if ratio < 4.5 {
+                    failures.push(format!("{text} on a selection on {row} is {ratio:.2}:1"));
                 }
             }
         }
@@ -835,7 +944,9 @@ mod tests {
         }
         assert_eq!(dark["primary.foreground"], INK);
         assert_eq!(light["list.active.background"], LIME_WASH);
-        assert_eq!(light["table.active.background"], LIME_WASH);
+        // Painted at 20 % by the kit, the grid's selection comes out as the
+        // wash on a plain row.
+        assert_eq!(color(&themes[0], "table.active.background"), LIME_WASH);
         // Lime never carries text or a ring on a light surface.
         for (key, hex) in light {
             if key.starts_with("button.primary") {

@@ -232,6 +232,46 @@ fn reset_gives_the_default_back_and_reset_all_asks(cx: &mut TestAppContext) {
     });
 }
 
+/// Real-app pass: the question about a shortcut already taken stayed on screen after the
+/// row's "Reset to default"; "Reset all…" said "1 changed command lose their changes". The
+/// question goes with anything that ends its recording; the sentence agrees with its count.
+#[gpui_kit::test]
+fn the_question_goes_when_its_row_changes_and_reset_all_agrees(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    open_shortcuts(&app, cx);
+    filter(&app, cx, "About Kerno");
+    app.click(cx, "shortcut-about-add");
+    app.press(cx, &["f6"]);
+    assert!(app.has(cx, "shortcut-about-changed"));
+    app.click(cx, "shortcuts-reset-all");
+    let question = text_of(&app, cx, "shortcuts-reset-all-question");
+    assert!(
+        question.contains("1 changed command loses its changes."),
+        "{question}"
+    );
+    app.click(cx, "shortcuts-reset-all-cancel");
+    // The question, then the row's Reset to default.
+    app.click(cx, "shortcut-about-add");
+    app.press(cx, &["secondary-b"]);
+    assert!(app.has(cx, "shortcut-question"));
+    app.click(cx, "shortcut-about-reset");
+    assert!(!app.has(cx, "shortcut-question"));
+    // The question, then Reset all…, then the filter.
+    app.click(cx, "shortcut-about-add");
+    app.press(cx, &["f6"]);
+    app.click(cx, "shortcut-about-add");
+    app.press(cx, &["secondary-b"]);
+    assert!(app.has(cx, "shortcut-question"));
+    app.click(cx, "shortcuts-reset-all");
+    assert!(!app.has(cx, "shortcut-question"));
+    app.click(cx, "shortcuts-reset-all-cancel");
+    app.click(cx, "shortcut-about-add");
+    app.press(cx, &["secondary-b"]);
+    assert!(app.has(cx, "shortcut-question"));
+    filter(&app, cx, "About");
+    assert!(!app.has(cx, "shortcut-question"));
+}
+
 /// K20: a keymap file Kerno cannot read is said on the page, with a button
 /// to open it, and is neither rewritten nor applied.
 #[gpui_kit::test]

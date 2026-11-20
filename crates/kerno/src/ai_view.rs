@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
@@ -528,7 +529,8 @@ impl AiPanel {
     }
 
     /// Puts the answer's SQL in the editor as one undoable edit, selected, and runs nothing:
-    /// at the cursor for "Write SQL", after the text as a new statement for a proposed fix.
+    /// for "Write SQL" in place of the selection or on its own line at the cursor
+    /// ([`ai::placed`]), after the text as a new statement for a proposed fix.
     pub fn insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(answer) = self.answer() else {
             return;
@@ -536,15 +538,18 @@ impl AiPanel {
         let sql = ai::sql_block(answer);
         let at_end = !matches!(self.action, Action::WriteSql { .. });
         self.editor.update(cx, |editor, cx| {
-            let at = if at_end {
-                editor.text().len()
+            let (range, text, start) = if at_end {
+                let at = editor.text().len();
+                let prefix = if at > 0 { "\n\n" } else { "" };
+                (at..at, format!("{prefix}{sql}"), prefix.len())
             } else {
-                editor.cursor()
+                let range = editor.selected_range();
+                let (text, start) = ai::placed(&editor.text().to_string(), range.clone(), &sql);
+                (range, text, start)
             };
-            let prefix = if at_end && at > 0 { "\n\n" } else { "" };
-            editor.set_selected_range(at..at, cx);
-            editor.insert(format!("{prefix}{sql}"), window, cx);
-            let start = at + prefix.len();
+            editor.set_selected_range(range.clone(), cx);
+            editor.replace(text, window, cx);
+            let start = range.start + start;
             editor.set_selected_range(start..start + sql.len(), cx);
         });
         let focus = self.editor.read(cx).focus_handle(cx);
@@ -668,7 +673,8 @@ impl Render for AiPanel {
                     Action::ExplainError { .. } => Some("Insert as new statement"),
                     _ => None,
                 };
-                let copied = answer.clone();
+                let shown = ai::unfenced(answer);
+                let copied = shown.clone();
                 v_flex()
                     .gap_2()
                     .child(
@@ -680,7 +686,8 @@ impl Render for AiPanel {
                             .border_1()
                             .border_color(border)
                             .text_sm()
-                            .child(SharedString::from(answer.clone())),
+                            .test_text(shown.clone())
+                            .child(SharedString::from(shown)),
                     )
                     .child(
                         h_flex()

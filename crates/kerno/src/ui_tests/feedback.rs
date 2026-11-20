@@ -223,6 +223,38 @@ fn reaching_the_end_fetches_the_next_page_once(cx: &mut TestAppContext) {
     }
 }
 
+/// Real-app pass: after the next page came, the status bar said "2000 rows · 34.45 s", the
+/// time since the run started, while the statement took 28 ms. It keeps the statement's own
+/// time through every page, as the footer does, and writes the rows as the footer does.
+#[gpui_kit::test]
+fn the_status_bar_keeps_the_statements_time_after_more_pages(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let grid = first_page(&app, cx, big_query(Engine::Postgres));
+    // The rows item and the time after it.
+    let rows_and_time = |app: &Fixture, cx: &mut TestAppContext| {
+        let status = app.status_bar(cx);
+        let at = (status.iter())
+            .position(|item| item.ends_with(" rows"))
+            .expect("a rows item");
+        (status[at].clone(), status.get(at + 1).cloned())
+    };
+    let (rows, time) = rows_and_time(&app, cx);
+    assert_eq!(rows, "1,000 rows");
+    assert!(time.is_some());
+    // The user reads a while before scrolling.
+    std::thread::sleep(Duration::from_millis(1100));
+    app.step(cx, |_, cx| {
+        grid.update(cx, |table, cx| table.scroll_to_row(999, cx))
+    });
+    app.wait_until(cx, "the second page", |app, cx| {
+        app.outcomes(cx) == ["2000 rows, more"]
+    });
+    assert_eq!(rows_and_time(&app, cx), ("2,000 rows".to_string(), time));
+}
+
 /// K21: a complete result fetches nothing at its end; a page asked for and
 /// not yet here is not asked again.
 #[gpui_kit::test]

@@ -58,18 +58,26 @@ pub fn toggle(window: &mut Window, cx: &mut App) {
     window.refresh();
 }
 
-/// The grids' "Value" button.
-pub fn button(id: &'static str, cx: &App) -> Button {
-    Button::new(id)
-        .ghost()
-        .xsmall()
-        .label("Value")
-        .selected(AppState::get(cx).settings.value_panel)
-        .tooltip_with_action(
+/// What the "Value" button says while the panel is on but its area is too
+/// narrow to draw it.
+pub const NO_ROOM: &str = "No room for the value panel in this group: widen it";
+
+/// The grids' "Value" button, for the tab's `panel`: pressed while the panel
+/// shows; outlined in the warning colour, the reason in its tooltip, while it
+/// is on but has no room to be drawn.
+pub fn button(id: &'static str, panel: Option<&Entity<ValuePanel>>, cx: &App) -> Button {
+    let on = AppState::get(cx).settings.value_panel;
+    let no_room = on && panel.is_some_and(|panel| panel.read(cx).collapsed);
+    let button = Button::new(id).xsmall().label("Value");
+    let (button, tip) = match no_room {
+        true => (button.warning().outline(), NO_ROOM),
+        false => (
+            button.ghost().selected(on),
             "Show the selected cell's whole value beside the grid",
-            &actions::ToggleValuePanel,
-            None,
-        )
+        ),
+    };
+    button
+        .tooltip_with_action(tip, &actions::ToggleValuePanel, None)
         .on_click(|_, window, cx| toggle(window, cx))
 }
 
@@ -291,17 +299,16 @@ impl ValuePanel {
                 },
             ),
             // The width is kept once a drag ends; not the width `fit` gave
-            // the panel to keep it inside a narrow area.
+            // the panel to keep it inside a narrow area. Each `resize_panel`
+            // sends one event, and it is `fit`'s whatever width it reports:
+            // the kit keeps the grid at its minimum, so a squeeze can end
+            // narrower than `fit` asked (real-app pass: 450 was kept as 308).
             cx.subscribe(&split, |this, split, _: &ResizablePanelEvent, cx| {
+                if this.fit_to.take().is_some() {
+                    return;
+                }
                 if let Some(width) = split.read(cx).sizes().get(1) {
                     let width = f32::from(*width);
-                    if this
-                        .fit_to
-                        .take()
-                        .is_some_and(|fit| (fit - width).abs() < 1.)
-                    {
-                        return;
-                    }
                     this.fitted = false;
                     let width = width.clamp(*VALUE_PANEL_WIDTHS.start(), *VALUE_PANEL_WIDTHS.end());
                     AppState::update_settings(cx, |settings| settings.value_panel_width = width);
@@ -508,6 +515,12 @@ impl ValuePanel {
     /// there is room. The kit keeps a fixed panel's width whatever the
     /// container, so without this the panel is drawn past the area's edge.
     fn fit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // One resize at a time, and `fitted` left as it is until it lands:
+        // set from a later, wider area it would forget that the panel is
+        // narrower than its width and never grow it back.
+        if self.fit_to.is_some() {
+            return;
+        }
         let (container, current) = {
             let split = self.split.read(cx);
             (
@@ -531,7 +544,7 @@ impl ValuePanel {
             return;
         };
         self.fitted = target < wanted;
-        if (target - current).abs() < 1. || self.fit_to.is_some() {
+        if (target - current).abs() < 1. {
             return;
         }
         self.fit_to = Some(target);

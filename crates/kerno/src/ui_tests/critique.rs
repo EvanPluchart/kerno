@@ -4087,8 +4087,9 @@ fn a_tree_read_behind_a_lock_is_cancelled_and_the_tree_reads_on(cx: &mut TestApp
     let schema = ["kerno", name];
     app.open_path(cx, &schema);
     let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
-    let cancelled =
-        format!("Could not read the objects of {name}: cancelled. Refresh to try again.");
+    // Real-app pass: it was a red line, cut at the sidebar's width; a cancel the user asked
+    // for is not a failure: short, muted.
+    let cancelled = crate::navigator::view::CANCELLED_LOAD;
     for (round, how) in ["button", "menu", "key"].into_iter().enumerate() {
         if round == 0 {
             app.toggle(cx, &schema);
@@ -4117,6 +4118,10 @@ fn a_tree_read_behind_a_lock_is_cancelled_and_the_tree_reads_on(cx: &mut TestApp
             app.tree(cx).iter().any(|line| line.trim() == cancelled),
             "{how}: {:#?}",
             app.tree(cx)
+        );
+        assert!(
+            app.has(cx, ("node-cancelled", 0usize)) && !app.has(cx, ("node-failure", 0usize)),
+            "{how}: not drawn as a failure"
         );
         stopped_on_the_server(&app, cx, &locker);
         // The same database reads on, the lock still held.

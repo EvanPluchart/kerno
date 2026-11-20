@@ -397,6 +397,8 @@ fn the_model_is_picked_from_a_filtered_list_and_kept_per_endpoint(cx: &mut TestA
     }
     assert!(text_of(&app, cx, "ai-model-list").contains("Qwen · gpu1 · high (qwen-high)"));
     type_in(&app, cx, "ai-model", "high");
+    // Typed, it filters; it is not the model (real-app pass: "qwen" became the model).
+    assert_eq!(settings_now(cx).ai.model, "");
     assert!(app.has(cx, ("ai-model", 1usize)));
     assert!(!app.has(cx, ("ai-model", 0usize)) && !app.has(cx, ("ai-model", 2usize)));
     app.tap(cx, ("ai-model", 1usize));
@@ -406,10 +408,43 @@ fn the_model_is_picked_from_a_filtered_list_and_kept_per_endpoint(cx: &mut TestA
     assert_eq!(settings_now(cx).ai.model, "llama3.2");
     app.tap(cx, ("ai-use", 0usize));
     assert_eq!(settings_now(cx).ai.model, "qwen-high");
-    // A model the list does not hold, typed.
+    // A model the list does not hold, typed: the model once Enter confirms it.
     type_in(&app, cx, "ai-model", "deepseek-r1-local");
+    assert_eq!(settings_now(cx).ai.model, "qwen-high");
+    app.press(cx, &["enter"]);
     assert_eq!(settings_now(cx).ai.model, "deepseek-r1-local");
     assert_eq!(settings_now(cx).ai.endpoints[0].model, "deepseek-r1-local");
+}
+
+/// Real-app pass: "Add by hand" with an address already saved replaced that endpoint ("Fake
+/// local" became "Fake two") without a word. Add refuses and names the endpoint; changing it
+/// is the user's choice.
+#[gpui_kit::test]
+fn adding_an_address_already_saved_names_its_endpoint_first(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    with_endpoints(
+        cx,
+        vec![saved("Fake local", "http://127.0.0.1:9/v1", "", &[])],
+    );
+    open_ai(&app, cx);
+    app.tap(cx, "ai-add");
+    type_in(&app, cx, "ai-add-name", "Fake two");
+    type_in(&app, cx, "ai-add-address", "http://127.0.0.1:9");
+    app.tap(cx, "ai-add-save");
+    let names = |cx: &mut TestAppContext| {
+        (settings_now(cx).ai.endpoints.iter())
+            .map(|saved| saved.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(cx), ["Fake local"]);
+    assert!(
+        text_of(&app, cx, "ai-add-refused").contains("“Fake local” already has this address"),
+        "{}",
+        text_of(&app, cx, "ai-add-refused")
+    );
+    app.tap(cx, "ai-add-change");
+    assert_eq!(names(cx), ["Fake two"]);
+    assert!(!app.has(cx, "ai-add-refused"));
 }
 
 /// K23: the settings an earlier Kerno stored (one address, its model) open as one saved

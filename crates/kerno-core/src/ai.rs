@@ -854,6 +854,39 @@ pub fn sql_block(answer: &str) -> String {
     answer.trim().to_string()
 }
 
+/// An answer as the panel shows it: the lines of its code fences (```sql, ```) taken out, the
+/// code and the prose around it kept.
+pub fn unfenced(answer: &str) -> String {
+    let lines: Vec<&str> = (answer.lines())
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect();
+    lines.join("\n").trim().to_string()
+}
+
+/// What Write SQL puts in the editor's `text` over `range`, and where the SQL starts in it: a
+/// selection is replaced by the SQL; at a caret the SQL goes on its own line, after a line
+/// break when text comes before the caret on its line and before one when text follows it, so
+/// it is never glued to a neighbouring word.
+pub fn placed(text: &str, range: std::ops::Range<usize>, sql: &str) -> (String, usize) {
+    if !range.is_empty() {
+        return (sql.to_string(), 0);
+    }
+    let at = range.start;
+    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    let before = if text[line_start..at].trim().is_empty() {
+        ""
+    } else {
+        "\n"
+    };
+    let after = if text[at..line_end].trim().is_empty() {
+        ""
+    } else {
+        "\n"
+    };
+    (format!("{before}{sql}{after}"), before.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1149,32 @@ mod tests {
         assert_eq!(sql_block("```\nSELECT 2\n```"), "SELECT 2");
         assert_eq!(sql_block("  SELECT 3  "), "SELECT 3");
         assert_eq!(sql_block("```sql\nunclosed"), "```sql\nunclosed");
+    }
+
+    /// The panel shows an answer without its fences, the prose kept.
+    #[test]
+    fn an_answer_is_shown_without_its_fences() {
+        assert_eq!(
+            unfenced("Here:\n```sql\nSELECT 1;\n```\nDone."),
+            "Here:\nSELECT 1;\nDone."
+        );
+        assert_eq!(unfenced("```\nSELECT 2\n```"), "SELECT 2");
+        assert_eq!(unfenced("plain"), "plain");
+    }
+
+    /// Write SQL's answer never joins a neighbouring word: on its own line at a caret, in
+    /// place of a selection.
+    #[test]
+    fn inserted_sql_goes_on_its_own_line() {
+        let sql = "SELECT 2;";
+        let text = "select 1 as one";
+        let end = text.len();
+        assert_eq!(placed(text, end..end, sql), ("\nSELECT 2;".into(), 1));
+        assert_eq!(placed(text, 0..0, sql), ("SELECT 2;\n".into(), 0));
+        assert_eq!(placed(text, 6..6, sql), ("\nSELECT 2;\n".into(), 1));
+        assert_eq!(placed("", 0..0, sql), ("SELECT 2;".into(), 0));
+        assert_eq!(placed("a\n  \nb", 3..3, sql), ("SELECT 2;".into(), 0));
+        assert_eq!(placed(text, 0..6, sql), ("SELECT 2;".into(), 0));
     }
 
     #[test]

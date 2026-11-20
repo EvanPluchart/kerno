@@ -20,8 +20,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render,
+    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::browse::{
     Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql,
@@ -2334,6 +2334,7 @@ impl DataTab {
             .children(rows)
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_1()
                     .child(
                         Button::new("filter-add")
@@ -2354,7 +2355,7 @@ impl DataTab {
                             .child("WHERE"),
                     )
                     .child(
-                        div().flex_1().min_w_0().child(
+                        div().flex_1().min_w(FILTER_MIN_WIDTH).child(
                             Input::new(&self.raw_filter)
                                 .small()
                                 .id("filter-raw")
@@ -2480,7 +2481,7 @@ impl DataTab {
                     .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
             }))
             .when(self.grid.is_some(), |footer| {
-                footer.child(value_panel::button("data-value-panel", cx))
+                footer.child(value_panel::button("data-value-panel", self.value_panel.as_ref(), cx))
             })
             .children(
                 self.grid
@@ -2827,6 +2828,11 @@ pub fn auto_refresh_button<T: 'static>(
                 ))
         })
 }
+
+/// The narrowest a WHERE field gets: below it, the buttons after it go to
+/// another line (a narrow group of a split) instead of squeezing it to a few
+/// letters.
+pub const FILTER_MIN_WIDTH: Pixels = px(180.);
 
 /// The filters applied before, to apply one again (DBeaver's history of
 /// the filter panel).

@@ -1068,6 +1068,8 @@ impl AdminTab {
     fn render_sections(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let titles = self.section_titles(cx);
         TabBar::new("admin-sections")
+            // The sub-tabs a narrow group cuts off stay one click away.
+            .menu(true)
             .selected_index(self.section)
             .on_click(
                 cx.listener(|this, index: &usize, window, cx| this.select(*index, window, cx)),
@@ -1169,6 +1171,9 @@ impl AdminTab {
         Some(
             h_flex()
                 .flex_none()
+                // The session buttons go to a second line in a narrow group
+                // instead of squeezing the filter to a few letters.
+                .flex_wrap()
                 .px_2()
                 .py_1()
                 .gap_2()
@@ -1941,13 +1946,20 @@ impl TableDelegate for AdminGrid {
             .id(("admin-empty", self.pane as usize))
             .test_support()
             .size_full()
-            .flex()
-            .justify_center()
+            // A block, not a row: the sentence wraps inside the pane, as
+            // narrow as a group of a split makes it, instead of running off
+            // both edges.
+            .text_center()
             .pt_6()
             .px_4()
             .text_sm()
             .text_color(cx.theme().muted_foreground)
-            .child(SharedString::from(self.empty_text()))
+            .child(
+                div()
+                    .id(("admin-empty-text", self.pane as usize))
+                    .test_support()
+                    .child(SharedString::from(self.empty_text())),
+            )
     }
 }
 

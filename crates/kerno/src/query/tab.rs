@@ -74,7 +74,7 @@ use crate::actions::{
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
-use crate::data::tab::{AutoRefresh, auto_refresh_button, history_button};
+use crate::data::tab::{AutoRefresh, FILTER_MIN_WIDTH, auto_refresh_button, history_button};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::multi_run::{ScriptRun, Stage};
@@ -2852,6 +2852,10 @@ impl QueryTab {
                 }
                 let started = Instant::now();
                 let started_at_ms = kerno_core::storage::now_ms();
+                // How long the statement took: until its first page when its rows
+                // come by pages. Later pages come when the user scrolls, and the
+                // time spent reading is not the statement's.
+                let mut took: Option<Duration> = None;
                 // How the statement ended, for the history and the editor.
                 let mut ended: Option<(HistoryStatus, Option<Failure>)> = None;
                 let mut row_count: Option<u64> = None;
@@ -2933,8 +2937,9 @@ impl QueryTab {
                                         // The rows asked for are here: the tab is not
                                         // waiting for the server any more.
                                         this.activity = Activity::Idle;
+                                        let took = *took.get_or_insert_with(|| started.elapsed());
                                         if let Some(pane) = this.pane_mut(id) {
-                                            pane.elapsed = Some(started.elapsed());
+                                            pane.elapsed = Some(took);
                                         }
                                         // In a script the next statement needs the
                                         // session: this one stops at its first page.
@@ -2971,7 +2976,8 @@ impl QueryTab {
                                     }
                                     if let Some(pane) = this.pane_mut(id) {
                                         pane.rows_affected = rows_affected;
-                                        pane.elapsed = Some(started.elapsed());
+                                        pane.elapsed =
+                                            Some(*took.get_or_insert_with(|| started.elapsed()));
                                     }
                                 }
                                 None => {
@@ -3074,7 +3080,7 @@ impl QueryTab {
                 let _ = this.update(cx, |this, cx| {
                     let ended = Ended {
                         started_at_ms,
-                        elapsed: started.elapsed(),
+                        elapsed: took.unwrap_or_else(|| started.elapsed()),
                         status,
                         failure,
                         // The lines of a plan are not rows of data.
@@ -6090,7 +6096,7 @@ impl QueryTab {
                             )
                             .item(
                                 PopupMenuItem::new(
-                                    "Manual commit: statements run in a transaction you end",
+                                    "Manual commit: changes wait for Commit or Rollback",
                                 )
                                 .on_click(move |_, _, cx| {
                                     manual.update(cx, |this, cx| this.request_manual_commit(true, cx))
@@ -6405,6 +6411,9 @@ impl QueryTab {
             .id("result-filter-bar")
             .test_support()
             .flex_none()
+            // In a narrow group, History and Filter go to a second line
+            // rather than squeezing the condition to a few letters.
+            .flex_wrap()
             .px_2()
             .py_1()
             .gap_1()
@@ -6418,7 +6427,7 @@ impl QueryTab {
                     .child("WHERE"),
             )
             .child(
-                div().flex_1().min_w_0().child(
+                div().flex_1().min_w(FILTER_MIN_WIDTH).child(
                     Input::new(&self.result_filter)
                         .small()
                         .id("result-filter")
@@ -6558,12 +6567,19 @@ impl QueryTab {
                 h_flex()
                     .id("result-edit-bar")
                     .test_support()
+                    // Beside the value panel in a narrow group, the row
+                    // commands and Apply go to more lines, never off the edge.
+                    .flex_wrap()
                     .px_2()
                     .py_1()
                     .gap_1()
                     .text_xs()
                     .child(
                         div()
+                            .id("result-edit-table")
+                            .test_support()
+                            .max_w_full()
+                            .truncate()
                             .px_1()
                             .text_color(muted)
                             .child(SharedString::from(format!("Rows of {table}"))),
@@ -7204,9 +7220,14 @@ impl QueryTab {
             .id("result-footer")
             .test_support()
             .flex_none()
-            .h(px(26.))
+            // A narrow result keeps Value, Export and the fetch buttons in
+            // reach: they go to a second line instead of off the edge.
+            .flex_wrap()
+            .min_h(px(26.))
             .px_3()
-            .gap_3()
+            .py_0p5()
+            .gap_x_3()
+            .gap_y_0p5()
             .border_t_1()
             .border_color(border)
             .text_xs()
@@ -7273,7 +7294,11 @@ impl QueryTab {
                     .on_click(move |_, window, cx| Grid::toggle_record(&table, window, cx))
             }))
             .when(grid.is_some(), |this| {
-                this.child(value_panel::button("result-value-panel", cx))
+                this.child(value_panel::button(
+                    "result-value-panel",
+                    self.value_panel.as_ref(),
+                    cx,
+                ))
             })
             .children(
                 grid.as_ref()

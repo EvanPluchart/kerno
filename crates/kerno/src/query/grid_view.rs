@@ -514,6 +514,8 @@ impl Render for SelectionStats {
         div()
             .id("selection-stats")
             .test_support()
+            // A long line wraps inside a narrow footer, never past its edge.
+            .min_w_0()
             .when_some(self.line(), |footer, line| {
                 footer.child(SharedString::from(line))
             })

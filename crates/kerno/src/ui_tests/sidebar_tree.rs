@@ -197,6 +197,32 @@ fn the_filter_matches_connection_names_and_objects(cx: &mut TestAppContext) {
     assert!(app.has(cx, ("connection", 0usize)) && app.has(cx, ("connection", 1usize)));
 }
 
+/// Real-app pass: a filter that matched nothing loaded left the sidebar blank. It says so, and
+/// where the rest is.
+#[gpui_kit::test]
+fn a_filter_that_matches_nothing_loaded_says_so(cx: &mut TestAppContext) {
+    let app = Fixture::saved(cx, &[testing::config(Engine::Postgres)]);
+    assert!(!app.has(cx, "navigator-filter-empty"));
+    app.click(cx, "navigator-filter");
+    app.type_text(cx, "kerno_ui_Nowhere");
+    assert!(!app.has(cx, ("connection", 0usize)));
+    let said = app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .iter()
+            .filter(|text| text.path().contains(&"navigator-filter-empty".into()))
+            .map(|text| text.text().to_string())
+            .collect::<String>()
+    });
+    assert!(
+        said.starts_with("Nothing loaded matches “kerno_ui_Nowhere”.")
+            && said.contains("expand a schema, or use Quick Open"),
+        "{said}"
+    );
+    app.press(cx, &["secondary-a", "backspace"]);
+    assert!(app.has(cx, ("connection", 0usize)));
+    assert!(!app.has(cx, "navigator-filter-empty"));
+}
+
 #[gpui_kit::test]
 fn f2_and_delete_act_on_the_selected_connection(cx: &mut TestAppContext) {
     let config = ConnectionConfig {

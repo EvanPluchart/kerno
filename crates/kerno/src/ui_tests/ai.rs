@@ -458,7 +458,7 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
         "{body}"
     );
     app.click(cx, "ai-copy");
-    assert_eq!(app.clipboard(cx).as_deref(), Some(ANSWER));
+    assert_eq!(app.clipboard(cx), Some(ai::unfenced(ANSWER)));
     app.click(cx, "ai-close");
     assert!(panel(&app, cx).is_none());
 }
@@ -512,6 +512,45 @@ fn a_request_is_stopped(cx: &mut TestAppContext) {
     send_and_wait(&app, cx);
     assert_eq!(answer(&app, cx).as_deref(), Some(ANSWER));
     assert_eq!((fake.answered(), quick.answered()), (0, 1));
+}
+
+/// Real-app pass: Insert put the SQL right after the editor's last word
+/// (`…restart_check_oneSELECT …`), and the panel showed the answer's fences. The SQL goes on
+/// its own line at the caret, replaces a selection, and the panel shows no fence.
+#[gpui_kit::test]
+fn inserted_sql_is_never_glued_to_the_text(cx: &mut TestAppContext) {
+    let fake = FakeAi::start(ANSWER);
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    enable(cx, &fake.base(), true);
+    let line = "select 1 as restart_check_one";
+    app.type_text(cx, line);
+    write_sql(&app, cx, "how many customers");
+    send_and_wait(&app, cx);
+    let shown = app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .iter()
+            .filter(|text| text.path().contains(&"ai-answer".into()))
+            .map(|text| text.text().to_string())
+            .collect::<String>()
+    });
+    assert!(shown.contains("SELECT count(*)"), "{shown}");
+    assert!(!shown.contains("```"), "{shown}");
+    let tab = app.tab(cx);
+    let editor = cx.update(|cx| tab.read(cx).editor().clone());
+    let end = line.len();
+    app.step(cx, |_, cx| {
+        editor.update(cx, |editor, cx| editor.set_selected_range(end..end, cx))
+    });
+    app.click(cx, "ai-insert");
+    let sql = "SELECT count(*) FROM shop.customers;";
+    assert_eq!(app.active_query(cx).1, format!("{line}\n{sql}"));
+    // A selection is replaced, nothing added around it.
+    app.step(cx, |_, cx| {
+        editor.update(cx, |editor, cx| editor.set_selected_range(0..end, cx))
+    });
+    app.click(cx, "ai-insert");
+    assert_eq!(app.active_query(cx).1, format!("{sql}\n{sql}"));
 }
 
 /// The context is built from the tab's catalog on MySQL and MariaDB too: names and types,

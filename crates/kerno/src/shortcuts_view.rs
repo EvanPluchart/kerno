@@ -86,9 +86,9 @@ impl ShortcutsView {
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Filter by name, group or shortcut (⌘K, cmd k)")
         });
-        let subscriptions = vec![cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+        let subscriptions = vec![cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                cx.notify();
+                this.stop_recording(cx);
             }
         })];
         let mut view = Self {
@@ -150,6 +150,8 @@ impl ShortcutsView {
     /// background to the file as it is then (a file Kerno cannot read is
     /// left alone and said).
     fn change(&mut self, changes: Vec<KeymapChange>, window: &mut Window, cx: &mut Context<Self>) {
+        // A question asked before this change is about keys that are no more.
+        self.stop_recording(cx);
         let File::Read { text, .. } = &self.file else {
             return;
         };
@@ -200,10 +202,12 @@ impl ShortcutsView {
         cx.notify();
     }
 
-    /// Ends a recording, if one runs: Settings shows another section, or
-    /// searches.
+    /// Ends a recording, if one runs, and the question it raised: Settings
+    /// shows another section or searches, the filter changes, a shortcut is
+    /// changed another way (Remove, Reset, Reset all).
     pub(crate) fn stop_recording(&mut self, cx: &mut Context<Self>) {
         self.recording = None;
+        self.question = None;
         self.interceptor = None;
         cx.notify();
     }
@@ -665,6 +669,7 @@ impl Render for ShortcutsView {
                         .label("Reset all…")
                         .disabled(changed == 0)
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.stop_recording(cx);
                             this.confirm_reset_all = true;
                             cx.notify();
                         })),
@@ -672,9 +677,12 @@ impl Render for ShortcutsView {
         )
         .when(self.confirm_reset_all, |this| {
             let line = format!(
-                "Every command gets its default shortcuts back: {changed} changed {} lose their \
-                 changes.",
-                if changed == 1 { "command" } else { "commands" }
+                "Every command gets its default shortcuts back: {changed} changed {}.",
+                if changed == 1 {
+                    "command loses its changes"
+                } else {
+                    "commands lose their changes"
+                }
             );
             this.child(
                 h_flex()

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Glyph;
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::base::actions::{SelectLeft, SelectRight};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -238,10 +239,16 @@ enum Halt {
     TimedOut,
 }
 
+/// What a node's row says once its read was cancelled: not a failure, so short and muted
+/// (it fits the sidebar's default width).
+pub const CANCELLED_LOAD: &str = "Cancelled. Expand again to load.";
+
 impl Halt {
-    /// What the row of a read stopped this way says, plain words first.
-    fn message(self, reading: &str) -> String {
+    /// What the row of a read stopped this way says, plain words first; the databases of a
+    /// connection (`root`) have a Try again of their own under it.
+    fn message(self, reading: &str, root: bool) -> String {
         match self {
+            Self::Cancelled if !root => CANCELLED_LOAD.to_string(),
             Self::Cancelled => {
                 format!("Could not read {reading}: cancelled. Refresh to try again.")
             }
@@ -826,7 +833,7 @@ impl Navigator {
             let Some(loading) = browse.loading.remove(&id) else {
                 continue;
             };
-            let message = why.message(&loading.reading);
+            let message = why.message(&loading.reading, id == ROOT_LOAD);
             if id == ROOT_LOAD {
                 browse.root = Root::Failed(message);
             } else {
@@ -3483,6 +3490,14 @@ impl Navigator {
                         _ => None,
                     });
                 match failed {
+                    // A read the user cancelled did not fail: said muted.
+                    Some(message) if message == CANCELLED_LOAD => row.child(
+                        div()
+                            .id(("node-cancelled", at))
+                            .test_support()
+                            .min_w_0()
+                            .child(line_text(label, theme.muted_foreground)),
+                    ),
                     // The row shows the first line; the server's detail and
                     // hint are in its tooltip (C14).
                     Some(message) => row.child(
@@ -3952,6 +3967,17 @@ impl Render for Navigator {
             sidebar_menu(&menu_view, subject, menu, window, cx)
         })
         .size_full();
+        // The filter looks only at what is loaded: when nothing there matches, say so and
+        // where the rest is, rather than an empty sidebar.
+        let nothing = (!self.filter_text.is_empty() && self.tree_state.read(cx).entry(0).is_none())
+            .then(|| {
+                format!(
+                    "Nothing loaded matches “{}”. The filter looks at what the tree has already \
+                     opened: expand a schema, or use Quick Open ({}).",
+                    self.filter.read(cx).value().trim(),
+                    crate::actions::shown("secondary-p")
+                )
+            });
         v_flex()
             .id("navigator")
             .test_support()
@@ -3967,6 +3993,16 @@ impl Render for Navigator {
                         .prefix(Icon::new(IconName::Search).size_3p5().text_color(muted)),
                 ),
             )
+            .children(nothing.map(|line| {
+                div()
+                    .id("navigator-filter-empty")
+                    .test_support()
+                    .px_3()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SharedString::from(line.clone()))
+                    .test_text(line)
+            }))
             // Right and Left also move to the first child and the parent;
             // Enter does what a double click does. They run before the
             // tree's own handling of the keys. The other keys are commands

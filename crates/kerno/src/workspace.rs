@@ -5005,7 +5005,13 @@ impl Workspace {
         items.extend(rows.map(|rows| {
             (
                 StatusItem::Rows,
-                shown.unwrap_or_else(|| format!("{rows} row{}", if rows == 1 { "" } else { "s" })),
+                shown.unwrap_or_else(|| {
+                    format!(
+                        "{} row{}",
+                        crate::query::plan_view::number(rows as f64),
+                        if rows == 1 { "" } else { "s" }
+                    )
+                }),
                 None,
             )
         }));
