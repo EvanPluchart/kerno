@@ -63,6 +63,7 @@ mod portability;
 mod reconnect;
 mod reorder;
 mod script_progress;
+mod settings_look;
 mod shortcuts;
 mod sidebar_tree;
 mod split;

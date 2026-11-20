@@ -11,9 +11,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, TestSupportExt as _, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TestSupportExt as _, Window, div, px, rgb,
 };
 use kerno_core::environment::{self, EnvironmentDef, EnvironmentRules, Tint};
 
@@ -473,7 +473,7 @@ impl EnvironmentsView {
                 "How much of a connection's chrome takes the colour: its tabs, the frame of \
                  the editor and the grid, the status bar.",
             ))
-            .child(div().pt_1().font_weight(FontWeight::MEDIUM).child("Rules"))
+            .child(crate::settings_ui::section_title("Rules").pt_1())
             .child(rule(
                 "env-auto-commit",
                 AUTO_COMMIT,

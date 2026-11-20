@@ -165,6 +165,64 @@ pub fn pick(pair: Pair, cx: &App) -> Hsla {
     rgb(if cx.theme().is_dark() { pair.1 } else { pair.0 }).into()
 }
 
+/// The colours of a theme as Settings ▸ Appearance draws it in miniature
+/// (K25), read from the theme file: the light preview keeps the light
+/// theme's colours while the dark theme is on, and the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preview {
+    pub window: u32,
+    pub bar: u32,
+    pub sidebar: u32,
+    pub border: u32,
+    pub text: u32,
+    pub muted: u32,
+    pub selection: u32,
+    pub accent: u32,
+}
+
+/// The theme file's key of each colour of a [`Preview`].
+const PREVIEW_KEYS: [&str; 8] = [
+    "background",
+    "title_bar.background",
+    "sidebar.background",
+    "border",
+    "foreground",
+    "muted.foreground",
+    "list.active.background",
+    "button.primary.background",
+];
+
+/// The miniature of the light (`dark` false) or the dark theme.
+pub fn preview(dark: bool) -> Preview {
+    static PREVIEWS: std::sync::OnceLock<[Preview; 2]> = std::sync::OnceLock::new();
+    PREVIEWS.get_or_init(|| [read_preview(false), read_preview(true)])[usize::from(dark)]
+}
+
+fn read_preview(dark: bool) -> Preview {
+    let file: serde_json::Value = serde_json::from_str(THEME_JSON).unwrap_or_default();
+    let mode = if dark { "dark" } else { "light" };
+    let colors = file["themes"]
+        .as_array()
+        .and_then(|themes| themes.iter().find(|theme| theme["mode"] == mode))
+        .map(|theme| &theme["colors"]);
+    let [window, bar, sidebar, border, text, muted, selection, accent] = PREVIEW_KEYS.map(|key| {
+        colors
+            .and_then(|colors| colors[key].as_str())
+            .and_then(|hex| u32::from_str_radix(hex.trim_start_matches('#').get(..6)?, 16).ok())
+            .unwrap_or_default()
+    });
+    Preview {
+        window,
+        bar,
+        sidebar,
+        border,
+        text,
+        muted,
+        selection,
+        accent,
+    }
+}
+
 /// The colour of a connection tag, or `None` for an unknown key.
 pub fn tag_color(key: &str, cx: &App) -> Option<Hsla> {
     let dark = cx.theme().is_dark();
@@ -587,6 +645,11 @@ mod tests {
             ("danger.background", "sidebar.background"),
             ("danger.background", "status_bar.background"),
             ("warning.background", "status_bar.background"),
+            // Settings (K25): a card's name and lines, selected (the accent
+            // wash) and hovered.
+            ("foreground", "accent.background"),
+            ("muted.foreground", "accent.background"),
+            ("muted.foreground", "list.hover.background"),
         ];
         let mut failures = Vec::new();
         for theme in themes() {
@@ -666,6 +729,17 @@ mod tests {
                 // the active tab, the side list, the list of every tab).
                 ("warning.background", TAB_SURFACES),
                 ("danger.background", TAB_SURFACES),
+                // Settings (K25): the frame and the check of the selected
+                // card on its wash, the focus ring around it, the icon of the
+                // selected section, and a switch's track where rows are drawn.
+                (
+                    "primary.background",
+                    &["background", "accent.background", "list.active.background"],
+                ),
+                ("ring", &["accent.background"]),
+                ("switch.background", &["background", "muted.background"]),
+                // The thumb (the background) on an off switch's track.
+                ("background", &["switch.background"]),
             ];
             for (indicator, surfaces) in indicators {
                 for surface in surfaces {
@@ -994,6 +1068,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// K25: Settings ▸ Appearance draws each theme in miniature from the
+    /// theme file's own colours, whichever theme is on.
+    #[test]
+    fn the_theme_previews_read_the_theme_file() {
+        for theme in themes() {
+            let preview = super::preview(theme.mode == "dark");
+            let drawn = [
+                preview.window,
+                preview.bar,
+                preview.sidebar,
+                preview.border,
+                preview.text,
+                preview.muted,
+                preview.selection,
+                preview.accent,
+            ];
+            for (key, value) in PREVIEW_KEYS.iter().zip(drawn) {
+                assert_eq!(value, hex(&theme.colors[*key]), "{}: {key}", theme.name);
+            }
+        }
+        assert_ne!(super::preview(false), super::preview(true));
     }
 
     #[test]

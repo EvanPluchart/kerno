@@ -89,7 +89,8 @@ fn a_user_environment_is_added_edited_and_picked_for_a_connection(cx: &mut TestA
     app.click(cx, "env-confirm-execute");
     app.click(cx, "env-auto-commit");
     app.click(cx, "env-read-only");
-    app.click(cx, "env-close-idle");
+    // Under the page's head (K25), the last rule is reached by scrolling the page.
+    app.tap(cx, "env-close-idle");
     let def = environments_now(cx)[3].clone();
     assert_eq!(def.id, "new-environment", "the id never follows the name");
     assert_eq!(def.name, "kerno_ui_env QA");

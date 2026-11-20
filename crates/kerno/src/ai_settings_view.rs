@@ -794,12 +794,7 @@ impl Render for AiSettingsView {
                 .text_color(muted)
                 .child(SharedString::from(text))
         };
-        let heading = |text: String| {
-            div()
-                .pt_2()
-                .font_weight(FontWeight::MEDIUM)
-                .child(SharedString::from(text))
-        };
+        let heading = |text: String| crate::settings_ui::section_title(text).pt_3();
         let label = |text: &'static str| div().w(px(80.)).flex_none().child(text);
         let active = settings.active().cloned();
 
@@ -1102,24 +1097,38 @@ impl Render for AiSettingsView {
                 div()
                     .id("ai-purpose")
                     .test_support()
-                    .text_sm()
+                    .text_xs()
+                    .text_color(muted)
                     .child(PURPOSE)
                     .test_text(PURPOSE),
             )
-            .child(
-                Checkbox::new("settings-ai-enabled")
-                    .label("Enable the AI assistant")
-                    .checked(settings.enabled)
-                    .on_click(|checked, window, cx| {
-                        let checked = *checked;
-                        AppState::update_settings(cx, |settings| settings.ai.enabled = checked);
-                        window.refresh();
-                    }),
-            )
-            .child(note(
-                "Off, no request is ever made. On, Kerno asks only the active endpoint, only when \
-                 you send a request; each request shows what it sends."
-                    .into(),
+            .child(crate::settings_ui::panel(
+                vec![
+                    v_flex()
+                        .gap_1()
+                        .px_3()
+                        .py_2p5()
+                        .child(
+                            Checkbox::new("settings-ai-enabled")
+                                .label("Enable the AI assistant")
+                                .checked(settings.enabled)
+                                .on_click(|checked, window, cx| {
+                                    let checked = *checked;
+                                    AppState::update_settings(cx, |settings| {
+                                        settings.ai.enabled = checked
+                                    });
+                                    window.refresh();
+                                }),
+                        )
+                        .child(note(
+                            "Off, no request is ever made. On, Kerno asks only the active \
+                             endpoint, only when you send a request; each request shows what it \
+                             sends."
+                                .into(),
+                        ))
+                        .into_any_element(),
+                ],
+                cx,
             ))
             // 2. The endpoints, the active one first among equals.
             .child(heading("Endpoints".into()))

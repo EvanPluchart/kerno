@@ -2620,3 +2620,38 @@ we should do as DBeaver does: a window that opens at every launch unless one cli
   is `Updates::offered`, in memory.
 - DBeaver's `VersionUpdateDialog` (Upgrade, More info, Close, a "don't show again for this version" checkbox) is
   the behaviour reference; no code was ported: the dialog is the kit's, three buttons and a link.
+
+## D-098 — Settings: a side list of sections, panels of rows, option cards (K25; 2026-11-20)
+
+The owner asked for a Settings that reads as designed, with "small card buttons" instead of lists of radio
+buttons. Choices:
+
+- **A side list instead of ten tabs.** Ten text tabs filled the 720 px dialog's width already, had no room for
+  an eleventh, and the kit's dialog narrows itself to a small window, where a tab row overflows. A list at the
+  left (184 px, a glyph and the name each) holds any number of sections, reads top to bottom, and is what the
+  operating systems' own settings do. The dialog widened to 860 px so the page keeps about 620 px. The list
+  comes after the page in the keyboard's order (`flex_row_reverse`): Tab from the search reaches the setting
+  shown or found, which K13 promised. No bar marks the chosen item (`CLAUDE.md` §3, item 1): the accent's wash,
+  a medium weight and the glyph in the accent.
+- **Option cards are Kerno's, on Base's radio.** The kit's styled `Radio` draws its own circle beside its label
+  and cannot hold a preview above it; its group has no arrow keys. `OptionCards` builds on `gpui_base::Radio`
+  and `RadioGroup` (role, checked state, Space and Enter, the element ids `<group>/<index>` the earlier tests
+  click) and adds a roving Tab stop and the arrows. Its frame keeps one width (2 px) whatever its state: only
+  colours change, so nothing shifts. Chosen: `primary` frame on the `accent` wash with a check in the mark;
+  hovered or focused: `input` frame on `list_hover`. Every pair is in the theme's contrast tests.
+- **Previews are drawn, not pictures.** A miniature window, a grid, a tree: divs in the theme's colours, so
+  they follow the theme and the brand without a file. The theme previews must show the light theme while the
+  dark one is on: `theme::preview` reads both modes from the theme file itself, tested against it.
+- **Switches for on/off rows.** A row's name at the left and its control at the right needs a control that
+  stands alone; the kit's `Switch` keeps the row's id (the tests click it as they clicked the checkbox). Its
+  default track (the kit's `secondary_active`) was 1.35:1 on white: `switch.background` is now a token,
+  `#7A828E` light (3.96:1 on white, 3.45:1 on the muted surface) and `#646D78` dark.
+- **Motion through the kit's own helpers**: `gpui_base::transition` for a card's colours, GPUI's
+  `with_animation` for the check and the page, both 120 ms (`motion_tokens().duration_fast`) and both read
+  `App::reduce_motion`, which the kit sets from the system at start. Only colour and opacity move; a page
+  fades in from 40 %, so a frame where the clock has not moved (the tests) still shows it.
+- **A height that follows the window**: up to 560 px, never more than the window less 140 px for the dialog's
+  title and margins; every page has the same size, the page scrolls with the kit's scrollbar.
+- Left as they were: the chips of the tab width and the formatter (a segmented choice whose effect the sample
+  shows), the Shortcuts and Local clients views inside their pages, the AI page's logic. Short pages (Updates,
+  Confirmations) end above white space beside a full side list; nothing was invented to fill them.

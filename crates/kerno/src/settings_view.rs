@@ -5,18 +5,16 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::radio::RadioGroup;
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div,
-    px,
+    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, TestSupportExt as _, Window, div, ease_out_quint, px,
 };
 
 use crate::connections::manager::Connections;
@@ -25,6 +23,7 @@ use crate::local_clients_view::LocalClientsView;
 use crate::settings::{
     CODE_FONT_SIZES, PAGE_SIZES, Settings, TabLayout, TableDoubleClick, UI_FONT_SIZES,
 };
+use crate::settings_ui::{self, OptionCards};
 use crate::shortcuts_view::ShortcutsView;
 use crate::state::AppState;
 use crate::theme::{self, Appearance};
@@ -58,6 +57,51 @@ pub(crate) const SECTIONS: [(Section, &str); 10] = [
     (Section::Ai, "AI"),
     (Section::Shortcuts, "Shortcuts"),
 ];
+
+impl Section {
+    /// Its glyph in the side list.
+    fn icon(self) -> IconName {
+        match self {
+            Self::Appearance => IconName::Palette,
+            Self::Fonts => IconName::ALargeSmall,
+            Self::Editor => IconName::SquareTerminal,
+            Self::Grid => IconName::Table,
+            Self::Confirmations => IconName::ShieldCheck,
+            Self::Tools => IconName::Wrench,
+            Self::Environments => IconName::Layers,
+            Self::Updates => IconName::RefreshCw,
+            Self::Ai => IconName::Bot,
+            Self::Shortcuts => IconName::Keyboard,
+        }
+    }
+
+    /// The line under the page's name (not searched: the rows are).
+    fn intro(self) -> &'static str {
+        match self {
+            Self::Appearance => "How Kerno looks, and what the tree and the tabs do.",
+            Self::Fonts => "The text sizes of the interface, the SQL editor and the grids.",
+            Self::Editor => "How the SQL editor indents, completes and formats.",
+            Self::Grid => "How results and table data are fetched and shown.",
+            Self::Confirmations => "When Kerno asks before it runs or closes something.",
+            Self::Updates => "Whether Kerno looks for a newer version, and how.",
+            // A view of its own: the row's line says what it holds.
+            Self::Tools | Self::Environments => ROWS
+                .iter()
+                .find(|row| row.section == self)
+                .map_or("", |row| row.description),
+            // Their views open with what they are for.
+            Self::Ai | Self::Shortcuts => "",
+        }
+    }
+
+    /// Whether its page is a view of its own.
+    fn is_view(self) -> bool {
+        matches!(
+            self,
+            Self::Tools | Self::Environments | Self::Ai | Self::Shortcuts
+        )
+    }
+}
 
 /// What a row of the settings draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,6 +784,8 @@ pub struct SettingsView {
     environments: Entity<EnvironmentsView>,
     ai: Entity<crate::ai_settings_view::AiSettingsView>,
     shortcuts: Entity<ShortcutsView>,
+    /// The items of the side list, one per section.
+    nav_focus: Vec<FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -762,7 +808,7 @@ impl SettingsView {
             let view = view.clone();
             dialog
                 .title("Settings")
-                .w(px(720.))
+                .w(px(settings_ui::DIALOG_WIDTH))
                 // Enter in a field does not close the settings.
                 .on_ok(|_, _, _| false)
                 .content(move |content, _, _| content.child(view.clone()))
@@ -837,25 +883,32 @@ impl SettingsView {
             environments,
             ai,
             shortcuts,
+            nav_focus: SECTIONS.iter().map(|_| cx.focus_handle()).collect(),
             _subscriptions: subscriptions,
         }
     }
 
-    fn heading(text: &'static str) -> impl IntoElement {
-        div().pt_2().font_weight(FontWeight::MEDIUM).child(text)
+    /// A row's name, at its left; its control sits at the right.
+    fn name(text: &'static str) -> gpui_kit::Div {
+        div().flex_1().min_w_0().child(text)
     }
 
-    /// A checkbox bound to one boolean of the settings: its id and label
-    /// are the row's.
+    /// A switch bound to one boolean of the settings, at the right of the
+    /// row's name: its id is the row's.
     fn toggle(row: &'static Row, checked: bool, set: fn(&mut Settings, bool)) -> AnyElement {
-        Checkbox::new(row.key)
-            .label(row.label)
-            .checked(checked)
-            .on_click(move |checked, window, cx| {
-                let checked = *checked;
-                AppState::update_settings(cx, |settings| set(settings, checked));
-                window.refresh();
-            })
+        h_flex()
+            .gap_3()
+            .child(Self::name(row.label))
+            .child(
+                Switch::new(row.key)
+                    .accessibility_label(row.label)
+                    .checked(checked)
+                    .on_click(move |checked, window, cx| {
+                        let checked = *checked;
+                        AppState::update_settings(cx, |settings| set(settings, checked));
+                        window.refresh();
+                    }),
+            )
             .into_any_element()
     }
 
@@ -873,10 +926,12 @@ impl SettingsView {
             choices: &[(T, &'static str)],
             current: T,
             set: fn(&mut FormatOptions, T),
-        ) -> impl IntoElement {
+        ) -> AnyElement {
             h_flex()
                 .gap_2()
-                .child(div().w(px(180.)).child(label))
+                .px_3()
+                .py_2()
+                .child(SettingsView::name(label))
                 .children(choices.iter().enumerate().map(|(index, &(value, text))| {
                     theme::chip(
                         SharedString::from(format!("{id}-{index}")),
@@ -888,13 +943,13 @@ impl SettingsView {
                         AppState::update_settings(cx, |settings| set(&mut settings.format, value))
                     })
                 }))
+                .into_any_element()
         }
         let options = settings.format;
         let theme = cx.theme();
         let sample = format_with(SAMPLE, LexRules::POSTGRES, &options).replace('\t', "    ");
-        v_flex()
-            .gap_2()
-            .child(row(
+        let rows = vec![
+            row(
                 "Keywords",
                 "format-case",
                 &[
@@ -904,8 +959,8 @@ impl SettingsView {
                 ],
                 options.keyword_case,
                 |options, case| options.keyword_case = case,
-            ))
-            .child(row(
+            ),
+            row(
                 "Indentation",
                 "format-indent",
                 &[
@@ -915,8 +970,8 @@ impl SettingsView {
                 ],
                 options.indent,
                 |options, indent| options.indent = indent,
-            ))
-            .child(row(
+            ),
+            row(
                 "Commas in lists",
                 "format-comma",
                 &[
@@ -925,8 +980,8 @@ impl SettingsView {
                 ],
                 options.comma,
                 |options, comma| options.comma = comma,
-            ))
-            .child(row(
+            ),
+            row(
                 "Short lists on one line",
                 "format-width",
                 &[
@@ -936,20 +991,21 @@ impl SettingsView {
                 ],
                 options.line_width,
                 |options, width| options.line_width = width,
-            ))
-            .child(
-                div()
-                    .id("formatter-sample")
-                    .test_support()
-                    .p_2()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.muted)
-                    .font_family(theme.mono_font_family.clone())
-                    .text_sm()
-                    .child(SharedString::from(sample)),
-            )
+            ),
+        ];
+        v_flex().gap_2().child(settings_ui::panel(rows, cx)).child(
+            div()
+                .id("formatter-sample")
+                .test_support()
+                .p_2()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.muted)
+                .font_family(theme.mono_font_family.clone())
+                .text_sm()
+                .child(SharedString::from(sample)),
+        )
     }
 
     fn font_row(size: FontSize, label: &'static str, cx: &App) -> impl IntoElement {
@@ -957,7 +1013,7 @@ impl SettingsView {
         let id = size.id();
         h_flex()
             .gap_2()
-            .child(div().w(px(180.)).child(label))
+            .child(Self::name(label))
             .child(
                 Button::new(SharedString::from(format!("{id}-smaller")))
                     .outline()
@@ -1018,68 +1074,98 @@ impl SettingsView {
         self.clear_search(window, cx);
     }
 
-    /// One row: its control (a heading first over a list of choices), its
-    /// description, and the line saying what overrides it. A section that
-    /// is a view of its own shows the view, or, in the search's results,
-    /// a line with "Open".
+    /// Whether a row is drawn under a heading of its own (a group of cards,
+    /// the formatter) rather than as one line of a panel.
+    fn headed(kind: Kind) -> bool {
+        matches!(
+            kind,
+            Kind::Theme | Kind::DoubleClick | Kind::TabLayout | Kind::Formatter
+        )
+    }
+
+    /// One row: its control (its name at the left, the control at the
+    /// right, or a heading over cards), its description, and the line
+    /// saying what overrides it. A section that is a view of its own shows
+    /// the view, or, in the search's results, a line with "Open".
     fn render_row(&self, row: &'static Row, searching: bool, cx: &Context<Self>) -> AnyElement {
         let settings = AppState::get(cx).settings.clone();
         let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
-        let label = |text: &'static str| div().w(px(180.)).flex_none().child(text);
-        let headed = |control: AnyElement| {
-            v_flex()
-                .gap_2()
-                .child(Self::heading(row.label))
-                .child(control)
-                .into_any_element()
-        };
+        let label = Self::name;
+        let headed = |control: AnyElement| control;
         let control = match row.kind {
             Kind::Theme => {
                 let current = AppState::get(cx).appearance();
+                let cards = OptionCards::new(
+                    "appearance",
+                    Appearance::ALL.iter().position(|a| *a == current),
+                    |index, window, cx| {
+                        if let Some(appearance) = Appearance::ALL.get(index) {
+                            Workspace::set_appearance(*appearance, window, cx);
+                        }
+                    },
+                );
                 headed(
-                    RadioGroup::new("appearance")
-                        .children(Appearance::ALL.map(Appearance::label))
-                        .selected_index(Appearance::ALL.iter().position(|a| *a == current))
-                        .on_change(|index, window, cx| {
-                            if let Some(appearance) = Appearance::ALL.get(*index) {
-                                Workspace::set_appearance(*appearance, window, cx);
-                            }
+                    Appearance::ALL
+                        .into_iter()
+                        .fold(cards, |cards, appearance| {
+                            cards.option(
+                                appearance.label(),
+                                settings_ui::theme_preview(appearance, cx),
+                            )
                         })
                         .into_any_element(),
                 )
             }
             Kind::DoubleClick => headed(
-                RadioGroup::new("table-double-click")
-                    .children(TableDoubleClick::ALL.map(TableDoubleClick::label))
-                    .selected_index(
-                        TableDoubleClick::ALL
-                            .iter()
-                            .position(|choice| *choice == settings.table_double_click),
+                TableDoubleClick::ALL
+                    .into_iter()
+                    .fold(
+                        OptionCards::new(
+                            "table-double-click",
+                            TableDoubleClick::ALL
+                                .iter()
+                                .position(|choice| *choice == settings.table_double_click),
+                            |index, window, cx| {
+                                if let Some(choice) = TableDoubleClick::ALL.get(index) {
+                                    AppState::update_settings(cx, |settings| {
+                                        settings.table_double_click = *choice
+                                    });
+                                    window.refresh();
+                                }
+                            },
+                        ),
+                        |cards, choice| {
+                            cards.option(
+                                choice.label(),
+                                settings_ui::double_click_preview(choice, cx),
+                            )
+                        },
                     )
-                    .on_change(|index, _, cx| {
-                        if let Some(choice) = TableDoubleClick::ALL.get(*index) {
-                            AppState::update_settings(cx, |settings| {
-                                settings.table_double_click = *choice
-                            });
-                        }
-                    })
                     .into_any_element(),
             ),
             // J10 (DBeaver #7114, #23248).
             Kind::TabLayout => headed(
-                RadioGroup::new("settings-tab-layout")
-                    .children(TabLayout::ALL.map(TabLayout::label))
-                    .selected_index(
-                        TabLayout::ALL
-                            .iter()
-                            .position(|layout| *layout == settings.tab_layout),
+                TabLayout::ALL
+                    .into_iter()
+                    .fold(
+                        OptionCards::new(
+                            "settings-tab-layout",
+                            TabLayout::ALL
+                                .iter()
+                                .position(|layout| *layout == settings.tab_layout),
+                            |index, window, cx| {
+                                if let Some(layout) = TabLayout::ALL.get(index) {
+                                    AppState::update_settings(cx, |settings| {
+                                        settings.tab_layout = *layout
+                                    });
+                                    window.refresh();
+                                }
+                            },
+                        ),
+                        |cards, layout| {
+                            cards.option(layout.label(), settings_ui::tabs_preview(layout, cx))
+                        },
                     )
-                    .on_change(|index, window, cx| {
-                        if let Some(layout) = TabLayout::ALL.get(*index) {
-                            AppState::update_settings(cx, |settings| settings.tab_layout = *layout);
-                            window.refresh();
-                        }
-                    })
                     .into_any_element(),
             ),
             Kind::UiFont => Self::font_row(FontSize::Ui, row.label, cx).into_any_element(),
@@ -1238,29 +1324,90 @@ impl SettingsView {
             Kind::Shortcuts => return self.shortcuts.clone().into_any_element(),
         };
         let invalid = row.kind == Kind::PageSize && !self.page_size_valid(cx);
-        v_flex()
-            .id(SharedString::from(format!("row-{}", row.key)))
-            .test_support()
-            .gap_1()
-            .child(control)
-            .when(!row.description.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(if invalid { danger } else { muted })
-                        .child(row.description),
+        let description = (!row.description.is_empty()).then(|| {
+            div()
+                .text_xs()
+                .text_color(if invalid { danger } else { muted })
+                .child(row.description)
+        });
+        // What wins over the setting, under it, marked as a note.
+        let overrides = override_line(row.kind, &settings).map(|line| {
+            h_flex()
+                .gap_1()
+                .items_start()
+                .text_xs()
+                .text_color(muted)
+                .child(
+                    Icon::new(IconName::Info)
+                        .size_3()
+                        .mt(px(1.))
+                        .flex_none()
+                        .text_color(muted),
                 )
-            })
-            .children(override_line(row.kind, &settings).map(|line| {
-                div()
-                    .id(SharedString::from(format!("override-{}", row.key)))
-                    .test_support()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(SharedString::from(line.clone()))
-                    .test_text(line)
-            }))
-            .into_any_element()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("override-{}", row.key)))
+                        .test_support()
+                        .flex_1()
+                        .min_w_0()
+                        .child(SharedString::from(line.clone()))
+                        .test_text(line),
+                )
+        });
+        let shell = v_flex()
+            .id(SharedString::from(format!("row-{}", row.key)))
+            .test_support();
+        if Self::headed(row.kind) {
+            // A heading, what it is about, then the cards.
+            shell
+                .gap_2()
+                .child(settings_ui::section_title(row.label))
+                .children(description)
+                .child(control)
+                .children(overrides)
+                .into_any_element()
+        } else {
+            // One line of a panel: the name and the control, then the lines
+            // under the name.
+            shell
+                .gap_1()
+                .px_3()
+                .py_2p5()
+                .child(control)
+                .children(description)
+                .children(overrides)
+                .into_any_element()
+        }
+    }
+
+    /// The rows of one section as they are drawn: the rows under a heading
+    /// on their own, the others in panels, one panel for each run of them.
+    fn blocks(
+        &self,
+        rows: impl IntoIterator<Item = &'static Row>,
+        searching: bool,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut blocks = Vec::new();
+        let mut lines = Vec::new();
+        for row in rows {
+            let element = self.render_row(row, searching, cx);
+            let own_view = !searching && row.section.is_view();
+            if Self::headed(row.kind) || own_view {
+                if !lines.is_empty() {
+                    blocks.push(
+                        settings_ui::panel(std::mem::take(&mut lines), cx).into_any_element(),
+                    );
+                }
+                blocks.push(element);
+            } else {
+                lines.push(element);
+            }
+        }
+        if !lines.is_empty() {
+            blocks.push(settings_ui::panel(lines, cx).into_any_element());
+        }
+        blocks
     }
 
     /// Whether the page size typed is one the settings take.
@@ -1278,14 +1425,29 @@ impl SettingsView {
     fn render_body(&self, cx: &Context<Self>) -> AnyElement {
         let query = self.search.read(cx).value().to_string();
         match search(&query) {
-            None => v_flex()
-                .gap_3()
-                .children(
-                    ROWS.iter()
-                        .filter(|row| row.section == self.section)
-                        .map(|row| self.render_row(row, false, cx)),
-                )
-                .into_any_element(),
+            None => {
+                let section = self.section;
+                let (index, name) = SECTIONS
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (each, _))| *each == section)
+                    .map(|(index, (_, name))| (index, *name))
+                    .unwrap_or_default();
+                let rows = ROWS.iter().filter(|row| row.section == section);
+                v_flex()
+                    .gap_5()
+                    .child(settings_ui::page_head(name, section.intro(), cx))
+                    .children(self.blocks(rows, false, cx))
+                    // A page comes in with a short fade (120 ms), the next
+                    // click already landing on it.
+                    .with_animation(
+                        ("settings-page", index),
+                        Animation::new(cx.theme().motion_tokens().duration_fast)
+                            .with_easing(ease_out_quint()),
+                        |page, delta| page.opacity(0.4 + 0.6 * delta),
+                    )
+                    .into_any_element()
+            }
             Some(found) if found.is_empty() => {
                 use gpui_kit::component::empty::{
                     Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle,
@@ -1324,7 +1486,7 @@ impl SettingsView {
                     .into_any_element()
             }
             Some(found) => v_flex()
-                .gap_3()
+                .gap_5()
                 .children(found.into_iter().map(|(section, rows)| {
                     let (index, name) = SECTIONS
                         .iter()
@@ -1332,18 +1494,37 @@ impl SettingsView {
                         .find(|(_, (each, _))| *each == section)
                         .map(|(index, (_, name))| (index, *name))
                         .unwrap_or_default();
+                    let muted = cx.theme().muted_foreground;
                     v_flex()
                         .id(("settings-found", index))
                         .test_support()
                         .gap_2()
+                        // Where it is: the section's glyph and name.
                         .child(
-                            div()
+                            h_flex()
+                                .gap_2()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(muted)
+                                .child(Icon::new(section.icon()).size_3p5().text_color(muted))
                                 .child(name),
                         )
-                        .children(rows.into_iter().map(|row| self.render_row(row, true, cx)))
+                        .children(self.blocks(rows, true, cx))
+                        // And the way to its page, after its rows: Tab from
+                        // the search reaches the setting found first.
+                        .when(!section.is_view(), |group| {
+                            group.child(
+                                h_flex().child(
+                                    Button::new(("settings-found-open", index))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(SharedString::from(format!("Show the {name} page")))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.show(section, window, cx)
+                                        })),
+                                ),
+                            )
+                        })
                 }))
                 .into_any_element(),
         }
@@ -1351,11 +1532,60 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = SECTIONS
-            .iter()
-            .position(|(section, _)| *section == self.section);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        // The search's results span sections: none is marked meanwhile.
+        let searching = search(&self.search.read(cx).value()).is_some();
+        let nav = v_flex()
+            .id("settings-nav")
+            .test_support()
+            .w(px(settings_ui::NAV_WIDTH))
+            .flex_none()
+            .gap_0p5()
+            .pr_3()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .children(
+                SECTIONS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (section, label))| {
+                        let section = *section;
+                        settings_ui::nav_item(
+                            (index, section.icon(), label),
+                            section == self.section && !searching,
+                            &self.nav_focus[index],
+                            cx.listener(move |this, _, window, cx| this.show(section, window, cx)),
+                            window,
+                            cx,
+                        )
+                    }),
+            );
+        // One size for every section and for the search's results, the
+        // longer ones scrolling inside: the dialog (its title, the search,
+        // the side list, the footer) stays put from section to section and
+        // while rows are filtered.
+        let body = div()
+            .id("settings-body")
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                v_flex()
+                    .id("settings-scroll")
+                    .size_full()
+                    // Its one part keeps its height: the page scrolls.
+                    .child(
+                        div()
+                            .flex_none()
+                            // Room for a focus ring, and for the scrollbar.
+                            .p_1()
+                            .pr_4()
+                            .child(self.render_body(cx)),
+                    )
+                    .overflow_y_scrollbar(),
+            );
         v_flex()
             .id("settings")
             .test_support()
@@ -1367,6 +1597,7 @@ impl Render for SettingsView {
             )
             // The theme switch works here too, the Theme row showing it.
             .on_action(|_: &actions::ToggleTheme, window, cx| Workspace::toggle_theme(window, cx))
+            .h(settings_ui::height(window))
             .gap_3()
             .text_sm()
             .child(
@@ -1378,33 +1609,17 @@ impl Render for SettingsView {
                 ),
             )
             .child(
-                TabBar::new("settings-sections")
-                    .underline()
-                    .selected_index(selected.unwrap_or_default())
-                    .on_click(cx.listener(|this, index: &usize, window, cx| {
-                        if let Some((section, _)) = SECTIONS.get(*index) {
-                            this.show(*section, window, cx);
-                        }
-                    }))
-                    .children(SECTIONS.iter().enumerate().map(|(index, (_, label))| {
-                        Tab::new().child(
-                            div()
-                                .id(("settings-section", index))
-                                .test_support()
-                                .child(*label),
-                        )
-                    })),
-            )
-            // One size for every section and for the search's results, the
-            // longer ones scrolling inside: the dialog (and its title) stays
-            // put from section to section and while rows are filtered.
-            .child(
-                div()
-                    .id("settings-body")
-                    .test_support()
-                    .h(px(400.))
-                    .overflow_y_scroll()
-                    .child(self.render_body(cx)),
+                // The page comes before the side list to the keyboard (Tab
+                // from the search reaches the settings shown, or found), and
+                // after it on screen.
+                h_flex()
+                    .flex_row_reverse()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .gap_3()
+                    .child(body)
+                    .child(nav),
             )
             .child(
                 h_flex()
@@ -1413,8 +1628,8 @@ impl Render for SettingsView {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(div().flex_1().text_xs().text_color(muted).child(
-                        "Shortcuts are changed in Shortcuts, above, or by hand in the \
-                                 keymap file (read when Kerno starts and when Settings opens).",
+                        "Shortcuts are changed in Shortcuts, in the list at the left, or by hand \
+                         in the keymap file (read when Kerno starts and when Settings opens).",
                     ))
                     .child(
                         Button::new("open-keymap-file")

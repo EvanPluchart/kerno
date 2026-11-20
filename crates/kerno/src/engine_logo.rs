@@ -22,8 +22,8 @@ const POSTGRESQL: &str = "engines/postgresql.svg";
 const MYSQL: &str = "engines/mysql.svg";
 const MARIADB: &str = "engines/mariadb.svg";
 
-// The glyphs of the schema tree, the query toolbar and the main toolbar,
-// from the same Lucide set as the UI kit's.
+// The glyphs of the schema tree, the query toolbar, the main toolbar and the
+// side list of Settings, from the same Lucide set as the UI kit's.
 gpui_kit::assets::icon_assets!(
     TreeGlyphs,
     [
@@ -44,6 +44,8 @@ gpui_kit::assets::icon_assets!(
         Folder,
         House,
         KeyRound,
+        // Settings ▸ Shortcuts in the side list (K25).
+        Keyboard,
         Layers,
         Link2,
         ListOrdered,

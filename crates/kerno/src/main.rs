@@ -32,6 +32,7 @@ mod portability;
 mod query;
 mod quick_open;
 mod settings;
+mod settings_ui;
 mod settings_view;
 mod shortcuts_view;
 mod sidebar;

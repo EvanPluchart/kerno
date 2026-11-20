@@ -937,3 +937,22 @@ Still open (for the owner):
   ▸ Updates shows it with Ask again. No new request.
 - Tests: 6 UI tests added and 1 rewritten in `ui_tests/updates.rs`, each seen failing under a mutation.
 - Still to do: the captures `m12-update-dialog-{light,dark}`.
+
+## 2026-11-20 — K25: the look of Settings (the owner's request)
+
+- The owner sent a capture of Settings ▸ Appearance ("a bullet list is not great, we can have small card
+  buttons with animations"). K25 in a worktree beside K24: a side list of the ten sections with glyphs, each
+  page a head and panels of rows (name left, switch or control right, override lines marked), option cards with
+  previews drawn in the theme's colours for the theme, the double click and the tabs' layout, 120 ms colour and
+  fade motion, one Tab stop per group of cards with the arrows moving the choice, the search's results grouped
+  with a link to their page, a height that follows the window (the footer was cut at 600 px). D-098.
+- Seen while working: every page in both themes at 1200 × 800 and 900 × 600, rendered offscreen by a temporary
+  test (GPUI's headless context, Metal's headless renderer, the real text system; not committed). What the
+  captures showed and was fixed: a click on a section drew a focus ring over its wash (a click no longer takes
+  the keyboard from the search), the side list kept a section marked during a search, the AI purpose in body
+  size above everything.
+- Tests: `ui_tests/settings_look.rs` (five), the theme's previews and new contrast pairs; the kit's switch track
+  was 1.35:1 on white, now a token (`switch.background`). Whole `cargo test -p kerno`: all pass but the two SSH
+  tests whose generated keys a worktree lacks.
+- Still to do: the final captures (`m12-settings-*`), the owner's look at the cards' size and at the short
+  pages (Updates, Confirmations) under their panels.
