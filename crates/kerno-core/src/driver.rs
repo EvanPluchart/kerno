@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use crate::config::{ConnectParams, Engine};
 use crate::dialect::Dialect;
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::exec::ExecSink;
 use crate::schema::{
     Change, DatabaseInfo, Dependent, ExtensionInfo, ObjectRef, SchemaInfo, SchemaObjects,
@@ -122,6 +122,18 @@ pub trait Session: Send + Sync + 'static {
 
     /// Checks the connection is alive with a round trip.
     async fn ping(&self) -> Result<()>;
+
+    /// Whether the server has closed this session while it was idle (an
+    /// idle or transaction timeout, an administrator's terminate or `KILL`),
+    /// with what is known of why. Learned without sending anything on this
+    /// session: a command would restart the server's idle timers, the guard
+    /// a DBA sets against forgotten transactions (C15). `None` while it is
+    /// open, while a statement holds it (that statement finds out), or when
+    /// it cannot be told. Once it returns `Some`, [`Session::tx_state`] is
+    /// `Idle`: the server rolled the transaction back.
+    async fn gone(&self) -> Option<DbError> {
+        None
+    }
 
     /// Closes the connection. The session is unusable afterwards.
     async fn close(&self);

@@ -183,6 +183,10 @@ pub(crate) enum ConnectionEvent {
     Closed(String),
 }
 
+/// Why the connection ended, set once by the task that drives it (or by
+/// Kerno's own close): read without sending anything (C15).
+pub(crate) type Gone = Arc<std::sync::OnceLock<DbError>>;
+
 /// Opens a connection and starts the task that drives it.
 pub(crate) async fn open(
     params: &ConnectParams,
@@ -190,6 +194,7 @@ pub(crate) async fn open(
     Client,
     mpsc::UnboundedReceiver<ConnectionEvent>,
     CancelRoute,
+    Gone,
 )> {
     let tls = MakeRustlsConnect::new(tls_config(&params.tls)?);
     let mut config = tokio_postgres::Config::new();
@@ -237,6 +242,7 @@ pub(crate) async fn open(
     }
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let gone = Gone::default();
     let client = match &params.tunnel {
         None => {
             config
@@ -246,7 +252,7 @@ pub(crate) async fn open(
                 .keepalives(true)
                 .keepalives_idle(Duration::from_secs(60));
             let (client, connection) = config.connect(tls.clone()).await.map_err(connect_error)?;
-            tokio::spawn(drive(connection, events_tx));
+            tokio::spawn(drive(connection, events_tx, gone.clone()));
             client
         }
         Some(tunnel) => {
@@ -264,7 +270,7 @@ pub(crate) async fn open(
                         ))
                     })?
                     .map_err(connect_error)?;
-            tokio::spawn(drive(connection, events_tx));
+            tokio::spawn(drive(connection, events_tx, gone.clone()));
             client
         }
     };
@@ -276,7 +282,7 @@ pub(crate) async fn open(
         host: params.host.clone(),
         port: params.port,
     };
-    Ok((client, events_rx, route))
+    Ok((client, events_rx, route, gone))
 }
 
 /// Startup options are split on spaces; a backslash protects a space or a
@@ -285,32 +291,33 @@ fn escape_startup_option(value: &str) -> String {
     value.replace('\\', "\\\\").replace(' ', "\\ ")
 }
 
-/// Drives the connection until it ends, forwarding notices.
+/// Drives the connection until it ends, forwarding notices. The task reads
+/// the socket all the time, so a server that closes an idle session (its
+/// FATAL: a timeout, a terminate) is seen at once, nothing sent (C15).
 async fn drive<S, T>(
     mut connection: Connection<S, T>,
     events: mpsc::UnboundedSender<ConnectionEvent>,
+    gone: Gone,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    loop {
+    let why = loop {
         match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
             Some(Ok(AsyncMessage::Notice(notice))) => {
                 let _ = events.send(ConnectionEvent::Notice(db_error(&notice).into()));
             }
             Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                let _ = events.send(ConnectionEvent::Closed(error_chain(&error)));
-                return;
-            }
-            None => {
-                let _ = events.send(ConnectionEvent::Closed(
-                    "the server closed the connection".into(),
-                ));
-                return;
-            }
+            // The server's words and SQLSTATE, when it said why.
+            Some(Err(error)) => match error.as_db_error() {
+                Some(db) => break db_error(db),
+                None => break DbError::message(error_chain(&error)),
+            },
+            None => break DbError::message("the server closed the connection"),
         }
-    }
+    };
+    let _ = events.send(ConnectionEvent::Closed(why.to_string()));
+    let _ = gone.set(why);
 }
 
 /// An error's message followed by its causes.

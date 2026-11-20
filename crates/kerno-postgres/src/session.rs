@@ -19,12 +19,12 @@ use kerno_core::schema::{
 };
 use kerno_core::sql::{Catalog, TokenKind, lex};
 use kerno_core::{
-    AdminView, Column, ColumnOrigin, Engine, Error, Result, Session, TxState, TypeKind,
+    AdminView, Column, ColumnOrigin, DbError, Engine, Error, Result, Session, TxState, TypeKind,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 
-use crate::connect::{self, CancelRoute, ConnectionEvent};
+use crate::connect::{self, CancelRoute, ConnectionEvent, Gone};
 use crate::dialect::PgDialect;
 use crate::{admin, introspect, types};
 
@@ -39,6 +39,8 @@ struct Link {
 pub struct PgSession {
     link: Mutex<Link>,
     cancel: CancelRoute,
+    /// Why the connection ended, once it did (C15).
+    gone: Gone,
     tx_state: AtomicU8,
     /// How many times [`Session::cancel`] was called. A cancel that comes
     /// after a statement was asked for and before it is sent (while it waits
@@ -63,7 +65,7 @@ const IN_FAILED_TRANSACTION: &str = "25P02";
 impl PgSession {
     /// Connects and reads the server's identity.
     pub(crate) async fn connect(params: &ConnectParams) -> Result<Self> {
-        let (client, events, cancel) = connect::open(params).await?;
+        let (client, events, cancel, gone) = connect::open(params).await?;
         let rows = simple_rows(
             &client,
             "SELECT current_setting('server_version_num'), version(), current_database(), \
@@ -91,6 +93,7 @@ impl PgSession {
                 events,
             }),
             cancel,
+            gone,
             tx_state: AtomicU8::new(TX_IDLE),
             cancels: AtomicU64::new(0),
             server,
@@ -452,6 +455,10 @@ impl Session for PgSession {
     }
 
     fn tx_state(&self) -> TxState {
+        // The server rolls back the transaction of a session it closes.
+        if self.gone.get().is_some() {
+            return TxState::Idle;
+        }
         match self.tx_state.load(Ordering::Acquire) {
             TX_OPEN => TxState::Open,
             TX_FAILED => TxState::Failed,
@@ -516,7 +523,13 @@ impl Session for PgSession {
         self.query("SELECT 1").await.map(|_| ())
     }
 
+    async fn gone(&self) -> Option<DbError> {
+        self.gone.get().cloned()
+    }
+
     async fn close(&self) {
+        // Closed by Kerno, not by the server.
+        let _ = self.gone.set(DbError::message("the session was closed"));
         // Stop whatever is running so the lock is released promptly.
         let _ = self.cancel.cancel().await;
         // Dropping the client sends Terminate and ends the connection task.

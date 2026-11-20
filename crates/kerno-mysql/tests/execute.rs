@@ -1333,3 +1333,71 @@ async fn the_isolation_level_is_set_for_this_session_only() {
         other.close().await;
     }
 }
+
+/// Asks `gone` every 250 ms, for at most `limit`, until it reports.
+async fn gone_within(session: &Arc<dyn Session>, limit: Duration) -> Option<kerno_core::DbError> {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if let Some(why) = session.gone().await {
+            return Some(why);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+/// C15: any command (a `COM_PING` too) restarts the server's `wait_timeout`,
+/// so a ping on the tab's session would keep a forgotten transaction, and
+/// its locks, forever. `gone` asks from a connection of its own: watched
+/// with it, the session is still closed by the server.
+#[tokio::test]
+async fn watching_a_session_does_not_keep_it_alive() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        exec_ok(&session, "SET SESSION wait_timeout = 2").await;
+        exec_ok(&session, "START TRANSACTION").await;
+        // Pinged more often than the timeout, it stays open long after it.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            session.ping().await.unwrap();
+        }
+        assert!(session.gone().await.is_none(), "{engine:?}");
+        assert_eq!(session.tx_state(), TxState::Open, "{engine:?}");
+
+        let why = gone_within(&session, Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|| panic!("{engine:?}: the server closes the session"));
+        assert!(why.message.contains("wait_timeout"), "{why:?}");
+        // The server rolled the transaction back with it.
+        assert_eq!(session.tx_state(), TxState::Idle, "{engine:?}");
+        let error = run(&session, "SELECT 1").await.unwrap_err();
+        assert!(error.is_disconnect(), "{engine:?}: {error:?}");
+    }
+}
+
+/// C15: a session killed by an administrator while it waits in a
+/// transaction is seen gone without being touched; while a statement holds
+/// it, `gone` says nothing (that statement finds out).
+#[tokio::test]
+async fn a_killed_session_is_seen_gone() {
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let admin = common::session(engine).await;
+        let id = scalar(&session, "SELECT CONNECTION_ID()").await;
+        exec_ok(&session, "START TRANSACTION").await;
+        let mut running = exec::run(session.clone(), "SELECT SLEEP(1)".into(), RowLimit::All);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(session.gone().await.is_none(), "{engine:?}");
+        finish(&mut running).await.unwrap();
+        assert!(session.gone().await.is_none(), "{engine:?}");
+
+        admin.terminate_session(&id).await.unwrap();
+        assert!(
+            gone_within(&session, Duration::from_secs(5))
+                .await
+                .is_some(),
+            "{engine:?}"
+        );
+        assert_eq!(session.tx_state(), TxState::Idle, "{engine:?}");
+    }
+}

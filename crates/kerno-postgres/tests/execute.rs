@@ -868,3 +868,86 @@ async fn the_schema_follows_set_search_path() {
     exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
     session.close().await;
 }
+
+/// Asks `gone` every 100 ms, for at most `limit`, until it reports.
+async fn gone_within(
+    session: &std::sync::Arc<dyn kerno_core::Session>,
+    limit: Duration,
+) -> Option<kerno_core::DbError> {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if let Some(why) = session.gone().await {
+            return Some(why);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// C15: any command restarts the server's idle timers, so a ping on the
+/// tab's session would keep a forgotten transaction, and its locks, past
+/// the DBA's `idle_in_transaction_session_timeout`. `gone` sends nothing:
+/// watched with it, the session is still closed by the server, and says why.
+#[tokio::test]
+async fn watching_a_session_does_not_keep_it_alive() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    exec_ok(&session, "SET idle_in_transaction_session_timeout = '1s'").await;
+    exec_ok(&session, "BEGIN").await;
+    // Pinged more often than the timeout, it stays open long after it.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        session.ping().await.unwrap();
+    }
+    assert!(session.gone().await.is_none());
+    assert_eq!(session.tx_state(), TxState::Open);
+
+    let why = gone_within(&session, Duration::from_secs(10))
+        .await
+        .expect("the server closes the session");
+    assert_eq!(why.code.as_deref(), Some("25P03"), "{why:?}");
+    assert!(why.message.contains("idle-in-transaction"), "{why:?}");
+    // The server rolled the transaction back with it.
+    assert_eq!(session.tx_state(), TxState::Idle);
+    let error = run(&session, "SELECT 1").await.unwrap_err();
+    assert!(error.is_disconnect(), "{error:?}");
+    assert!(error.to_string().contains("[25P03]"), "{error}");
+}
+
+/// C15: the other ways the server closes one session while the others
+/// answer: a transaction too long, a session idle too long, an
+/// administrator's terminate. Each is seen without touching the session.
+#[tokio::test]
+async fn a_session_the_server_closes_says_why() {
+    let Some(admin) = common::session().await else {
+        return;
+    };
+    for (setting, begin, code) in [
+        ("SET transaction_timeout = '1s'", true, "25P04"),
+        ("SET idle_session_timeout = '1s'", false, "57P05"),
+        ("", true, "57P01"),
+    ] {
+        let session = common::session().await.unwrap();
+        if !setting.is_empty() {
+            exec_ok(&session, setting).await;
+        }
+        if begin {
+            exec_ok(&session, "BEGIN").await;
+        }
+        assert!(session.gone().await.is_none(), "{code}");
+        if setting.is_empty() {
+            let pid = scalar(&session, "SELECT pg_backend_pid()").await;
+            admin.terminate_session(&pid).await.unwrap();
+        }
+        let why = gone_within(&session, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|| panic!("{code}: not seen"));
+        assert_eq!(why.code.as_deref(), Some(code), "{why:?}");
+        assert_eq!(session.tx_state(), TxState::Idle, "{code}");
+    }
+    // Kerno's own close is not the server's doing, but the session is gone.
+    let session = common::session().await.unwrap();
+    session.close().await;
+    assert!(session.gone().await.is_some_and(|why| why.code.is_none()));
+}

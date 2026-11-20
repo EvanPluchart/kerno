@@ -2025,3 +2025,65 @@ the dialect and `sql/generate.rs`, tests re-run here with the containers require
   script…" opens the Tools wizard (Execute script) on the active tab's database, else the default connection's,
   with the file chosen, and the wizard asks before it runs as it does from Tools (K6's rule: nothing binds
   silently). Enter answers nothing. The threshold is lowered by the tests through a test-only field.
+
+## D-088 — A tab whose own server session died: found without touching it, said once (K16, C15; 2026-11-20)
+
+- **No ping on the tab's session.** The plan's "ping its own session every 30 s" would defeat the guards a DBA
+  sets against forgotten transactions: any command restarts the server's idle timers (PostgreSQL
+  `idle_in_transaction_session_timeout`, `idle_session_timeout`; MySQL and MariaDB `wait_timeout`, which a
+  `COM_PING` restarts too), so the transaction and its locks would be kept forever. Proved on the three servers
+  with a 1-2 s timeout set on the session itself: pinged more often than the timeout, the session stayed open
+  long after it (`kerno-postgres`, `kerno-mysql` `execute::watching_a_session_does_not_keep_it_alive`).
+- **One driver method, `Session::gone() -> Option<DbError>`**, a one-shot question that sends nothing on the
+  session; default `None`. Once it says `Some`, the session's `tx_state()` is `Idle` (the server rolled the
+  transaction back), so K4's badge, K5's idle rule and K1's quit question agree with it.
+  - PostgreSQL: the task that drives the connection reads the socket all the time, so the server's FATAL (or the
+    end of the stream) is seen the moment it comes; it now keeps it, with its SQLSTATE (25P03, 25P04, 57P05,
+    57P01), in a slot the session holds (`connect::Gone`); `gone()` reads the slot, and `tx_state()` says `Idle`
+    once it is filled. Kerno's own `close` fills it first ("the session was closed"). Cost: none. The `Closed`
+    error a later statement gets now reads "terminating connection due to idle-in-transaction timeout [25P03]"
+    instead of "db error: FATAL: …".
+  - MySQL, MariaDB: `mysql_async` reads nothing while idle and keeps its socket check private
+    (`Endpoint::check` is `pub(crate)`), so the client cannot see the close without sending. `gone()` opens a
+    short connection of its own, as a cancel does (`kill_query`'s route: same tunnel, same TLS), and asks
+    `SELECT @@hostname, (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = <its id>)` (a user
+    always sees its own threads); only an answer of 0 from the same server (`@@hostname`, read at connect)
+    says gone: behind a load balancer or a cluster's endpoint the check's connection may reach another node,
+    where the id means nothing, and taking that for gone would close a live session and lose its transaction;
+    any failure says nothing; while a statement holds the session it
+    says nothing (that statement finds out). Not the connection's meta session: a check queued there would hold
+    its keep-alive (K15). Cost: one TCP + login round trip per check (one SSH channel through a tunnel), only
+    while a tab holds a transaction, every 15 s, plus one before each Commit.
+    A check whose connection cannot be opened is the last one for that session: a login the server refuses (a
+    rotated password, an expired token) is not repeated every 15 s against a production server.
+- **The tab asks every 15 s (`SESSION_CHECK`), only while it holds a transaction and nothing runs**, on the UI's
+  clock (tests advance it, no knob). Armed on the tab's own record of its transaction (`tx_started`, K4), not
+  on the session's state, which turns `Idle` the moment a PostgreSQL client reads the close. A tab without a
+  transaction is not watched: nothing of it can be lost, and its next statement finds out.
+- **What the tab does**: it says once, in its messages and a notification, "The server closed this tab's session
+  while its transaction was open: the server rolled it back, and nothing of it was committed. The next
+  statement opens a new session." then, when the server said why, plain words (for PostgreSQL's 25P03, 25P04,
+  57P05, 57P01) and "The server said: …"; on MySQL "it was idle for longer than its wait_timeout, or it was
+  killed". It drops the session (so the badge, "transaction open", Commit and Roll back go); the transaction's
+  log is kept, headed "The server closed the session: it rolled these statements back", until the next
+  statement; the edits waiting in a result are kept and said so ("Apply runs them in a new transaction"); the
+  next statement opens a new session in the tab's database and schema (the target follows the session, C6),
+  in the same commit mode. Session settings made with `SET` are not put back.
+- **A statement that finds the session gone** (a run, the manual-commit `BEGIN`, a result's Apply) drops that
+  session only and asks the connection's own session (`Connections::verify`, the keep-alive's two-try ping):
+  the connection is taken for lost, and every tab's session closed, only if that does not answer. Before, any
+  such statement called `connection_lost` at once, which closed every session of the connection and rolled back
+  the other tabs' transactions; a dead session found by the manual-commit `BEGIN` or by an Apply was kept and
+  failed every run after it. Whether the tab held a transaction is its own record, not the session's state
+  (which a closed session reports `Idle`): before, a statement that found the session gone never said the
+  transaction was rolled back.
+- **Commit asks `gone()` first** (3 s at most): on a session the server closed, the COMMIT is not sent and Commit
+  says "The commit was not sent. The server closed this tab's session …" instead of "whether the server saved
+  the transaction is not known". **A ROLLBACK that finds the session closed succeeds** (the server rolled
+  back): the idle rule and K1's "Roll back and quit" no longer fail on a dead session.
+- **Behaviour changed on the way**: RefreshConnections now pings each connection with the keep-alive's limit
+  (two tries of 5 s) instead of an unbounded ping, so a connection's own session busy for more than 10 s at
+  that moment is taken for lost; a statement that meets a closed session now waits for that ping (up to 10 s
+  when nothing answers) before the connection is reopened, where it reopened at once.
+- **No second notice**: whichever learns first (the tab's check, a statement, the connection's keep-alive)
+  drops the tab's session and its record of a transaction, so the others find nothing to say.

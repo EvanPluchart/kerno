@@ -4331,3 +4331,474 @@ fn a_database_the_tree_has_read_is_dropped_from_the_tree(cx: &mut TestAppContext
         ) == "0"
     });
 }
+
+// K16: a tab whose own server session died -------------------------------------------------
+
+use crate::query::tab::SESSION_CHECK;
+
+/// What gives the tab's own session id on the server.
+fn k16_own_id(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "select pg_backend_pid()::text",
+        Engine::MySql | Engine::MariaDb => "select connection_id()",
+    }
+}
+
+/// What closes the session `id` on the server, from another session.
+fn k16_end(engine: Engine, id: &str) -> String {
+    match engine {
+        Engine::Postgres => format!("SELECT pg_terminate_backend({id})"),
+        Engine::MySql | Engine::MariaDb => format!("KILL {id}"),
+    }
+}
+
+/// How many times the active tab said the server rolled its transaction back.
+fn k16_said(app: &Fixture, cx: &mut TestAppContext) -> usize {
+    let tab = app.tab(cx);
+    cx.update(|cx| tab.read(cx).messages())
+        .iter()
+        .filter(|message| message.contains("the server rolled it back"))
+        .count()
+}
+
+/// Waits for the tab to say so, moving the clock one check at a time.
+fn k16_wait_said(app: &Fixture, cx: &mut TestAppContext) {
+    app.wait_until(cx, "the tab to say its session was closed", |app, cx| {
+        cx.executor().advance_clock(SESSION_CHECK);
+        k16_said(app, cx) > 0
+    });
+}
+
+/// The tab's open transaction on `engine`: the id of its session on the server, after a row
+/// inserted into `<name>.t`.
+fn k16_transaction(app: &Fixture, cx: &mut TestAppContext, engine: Engine, name: &str) -> String {
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, k16_own_id(engine));
+    let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+    assert_eq!(
+        k3_run(app, cx, &format!("insert into {name}.t values (1)")),
+        ["done, 1 affected"],
+        "{engine:?}"
+    );
+    assert!(app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+    id
+}
+
+/// C15: the server closes a tab's own session while its transaction is open (an
+/// administrator's terminate, a `KILL`) and the connection's own session still answers. The
+/// tab finds out by itself, sending nothing on its session, and says once that the server
+/// rolled the transaction back (why, in plain words, on PostgreSQL); "transaction open" and its
+/// badge go, Commit and Roll back are no longer offered, the transaction log keeps what was
+/// lost; the connection stays, and the next statement runs on a new session, in manual commit.
+#[gpui_kit::test]
+fn a_tab_whose_session_the_server_closed_says_so_before_commit(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k16_said";
+        let _scratch = quit_table(engine, name);
+        let app = connected(cx, engine);
+        let id = k16_transaction(&app, cx, engine, name);
+        on_server(engine, &k16_end(engine, &id));
+
+        k16_wait_said(&app, cx);
+        later(&app, cx, 60);
+        assert_eq!(k16_said(&app, cx), 1, "{engine:?}");
+        let tab = app.tab(cx);
+        let messages = cx.update(|cx| tab.read(cx).messages());
+        assert!(
+            messages.iter().any(|message| message
+                .contains("The server closed this tab's session while its transaction was open")),
+            "{engine:?}: {messages:?}"
+        );
+        let details = cx.update(|cx| tab.read(cx).message_details());
+        let why = match engine {
+            Engine::Postgres => "An administrator ended it (pg_terminate_backend)",
+            Engine::MySql | Engine::MariaDb => "or it was killed",
+        };
+        assert!(
+            details.iter().any(|detail| detail.contains(why)),
+            "{engine:?}: {details:?}"
+        );
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle, "{engine:?}");
+        assert!(!app.has(cx, ("tab-tx", 0usize)), "{engine:?}");
+        assert!(!app.status_says(cx, "transaction"), "{engine:?}");
+        let log: Vec<String> = cx.update(|cx| {
+            tab.read(cx)
+                .transaction_log()
+                .iter()
+                .map(|entry| entry.sql.clone())
+                .collect()
+        });
+        assert!(
+            log.iter().any(|sql| sql.contains("insert into")),
+            "{engine:?}: {log:?}"
+        );
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "0"
+        );
+        assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+
+        // A new session, in manual commit still, and a new transaction with its own log.
+        assert!(manual_commit(&app, cx), "{engine:?}");
+        assert_eq!(k3_run(&app, cx, k16_own_id(engine)), ["1 rows"]);
+        let next = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+        assert_ne!(next, id, "{engine:?}");
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        assert_eq!(cx.update(|cx| tab.read(cx).transaction_log().len()), 1);
+        roll_back(&app, cx);
+    }
+}
+
+/// C15: the server's own guards, set on the session: PostgreSQL's
+/// `idle_in_transaction_session_timeout`, MySQL's `wait_timeout`. Kerno checks the session at
+/// every turn of the clock and the server still closes it: the check sends nothing on it (a
+/// ping would restart the server's timer, and keep the transaction and its locks forever).
+#[gpui_kit::test]
+fn the_server_s_idle_timeout_still_closes_a_watched_session(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k16_timeout";
+        let _scratch = quit_table(engine, name);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        let (timeout, why) = match engine {
+            Engine::Postgres => (
+                "set idle_in_transaction_session_timeout = '2s'",
+                "(idle_in_transaction_session_timeout)",
+            ),
+            Engine::MySql | Engine::MariaDb => ("set session wait_timeout = 2", "wait_timeout"),
+        };
+        assert_eq!(k3_run(&app, cx, timeout), ["done"], "{engine:?}");
+        app.open_transaction(cx, &format!("insert into {name}.t values (1)"));
+
+        k16_wait_said(&app, cx);
+        let tab = app.tab(cx);
+        let details = cx.update(|cx| tab.read(cx).message_details());
+        assert!(
+            details.iter().any(|detail| detail.contains(why)),
+            "{engine:?}: {details:?}"
+        );
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle, "{engine:?}");
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "0"
+        );
+    }
+}
+
+/// C15: a statement run in a tab whose session the server closed (before the tab's check came
+/// round) says the transaction is gone, and only that tab's session is dropped: the connection
+/// is not opened again, and the transaction another tab holds stays open, then commits.
+#[gpui_kit::test]
+fn a_session_closed_alone_leaves_the_connection_and_the_other_tabs(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k16_alone";
+        let _scratch = quit_table(engine, name);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        app.open_transaction(cx, &format!("insert into {name}.t values (1)"));
+        let first = app.tab(cx);
+        let id = {
+            app.press(cx, &["secondary-t"]);
+            app.open_transaction(cx, k16_own_id(engine));
+            app.result(cx, 0, 1).1[0][0].clone().unwrap()
+        };
+        on_server(engine, &k16_end(engine, &id));
+
+        let outcomes = k3_run(&app, cx, "select 1");
+        assert_eq!(outcomes, ["failed []"], "{engine:?}");
+        app.wait_until(cx, "the tab to say so", |app, cx| k16_said(app, cx) == 1);
+        let tab = app.tab(cx);
+        assert!(
+            cx.update(|cx| tab.read(cx).messages())
+                .iter()
+                .any(|message| message.starts_with("Warning: This tab's session closed")),
+            "{engine:?}"
+        );
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle, "{engine:?}");
+        // The connection's own session answered: nothing else was closed.
+        later(&app, cx, 1);
+        let reconnecting = app.connections.read_with(cx, |connections, _| {
+            connections.reconnecting(&connections.saved()[0].id)
+        });
+        assert!(!reconnecting, "{engine:?}");
+        assert!(matches!(app.status(cx, 0), Status::Connected { .. }));
+        assert_eq!(
+            cx.update(|cx| first.read(cx).tx_state()),
+            kerno_core::TxState::Open,
+            "{engine:?}"
+        );
+        // The next statement of the tab runs, on a new session.
+        assert_eq!(k3_run(&app, cx, "select 1"), ["1 rows"], "{engine:?}");
+        roll_back(&app, cx);
+
+        // The first tab's transaction is whole: it commits.
+        app.click(cx, ("tab-title", 0usize));
+        app.dispatch(cx, actions::CommitTransaction);
+        app.wait_until(cx, "the commit", |_, cx| {
+            cx.update(|cx| first.read(cx).tx_state()) == kerno_core::TxState::Idle
+        });
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "1",
+            "{engine:?}"
+        );
+    }
+}
+
+/// C15: Commit before the tab's check came round does not send a COMMIT that cannot be kept: it
+/// says the server had closed the session and rolled the transaction back. Roll back on such a
+/// session ends quietly (the server did roll it back), and the next statement runs.
+#[gpui_kit::test]
+fn commit_on_a_session_the_server_closed_says_it_was_rolled_back(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k16_commit";
+        let _scratch = quit_table(engine, name);
+        let app = connected(cx, engine);
+        let id = k16_transaction(&app, cx, engine, name);
+        on_server(engine, &k16_end(engine, &id));
+        app.dispatch(cx, actions::CommitTransaction);
+        app.wait_until(cx, "the commit to say so", |app, cx| k16_said(app, cx) == 1);
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle, "{engine:?}");
+        assert_eq!(
+            on_server(engine, &format!("SELECT count(*) FROM {name}.t")),
+            "0",
+            "{engine:?}"
+        );
+
+        // Roll back: nothing to report, nothing that fails.
+        k3_run(&app, cx, &format!("insert into {name}.t values (2)"));
+        let id = {
+            assert_eq!(k3_run(&app, cx, k16_own_id(engine)), ["1 rows"]);
+            app.result(cx, 0, 1).1[0][0].clone().unwrap()
+        };
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        on_server(engine, &k16_end(engine, &id));
+        let before = notification_count(&app, cx);
+        roll_back(&app, cx);
+        assert_eq!(notification_count(&app, cx), before, "{engine:?}");
+        assert_eq!(k16_said(&app, cx), 0, "{engine:?}");
+        assert_eq!(k3_run(&app, cx, "select 1"), ["1 rows"], "{engine:?}");
+    }
+}
+
+/// C15: once the server closed a tab's session, the environment's idle rule has nothing to
+/// roll back and Quit nothing to ask about.
+#[gpui_kit::test]
+fn the_idle_rule_and_quit_ignore_a_transaction_the_server_rolled_back(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let name = "kerno_ui_k16_idle";
+        let _scratch = quit_table(engine, name);
+        let config = ConnectionConfig {
+            environment: kerno_core::environment::PRODUCTION.into(),
+            ..testing::config(engine)
+        };
+        let app = connected_as(cx, config);
+        app.press(cx, &["secondary-t"]);
+        assert!(manual_commit(&app, cx), "{engine:?}");
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, k16_own_id(engine));
+        app.press(cx, &["secondary-enter"]);
+        while app.has(cx, "sql-confirm") {
+            app.click(cx, "sql-confirm");
+        }
+        app.wait_until(cx, "the session id", |app, cx| {
+            !app.running(cx) && app.outcomes(cx) == ["1 rows"]
+        });
+        let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+        app.press(cx, &["secondary-a", "backspace"]);
+        app.type_text(cx, &format!("insert into {name}.t values (1)"));
+        app.press(cx, &["secondary-enter"]);
+        // Production asks before a statement, twice before a write.
+        while app.has(cx, "sql-confirm") {
+            app.click(cx, "sql-confirm");
+        }
+        app.wait_until(cx, "the insert", |app, cx| {
+            !app.running(cx) && app.outcomes(cx) == ["done, 1 affected"]
+        });
+        on_server(engine, &k16_end(engine, &id));
+
+        k16_wait_said(&app, cx);
+        later(&app, cx, 601);
+        let tab = app.tab(cx);
+        let messages = cx.update(|cx| tab.read(cx).messages());
+        assert!(
+            !messages.iter().any(|message| message.contains("left idle")),
+            "{engine:?}: {messages:?}"
+        );
+        assert_eq!(k16_said(&app, cx), 1, "{engine:?}");
+        app.dispatch(cx, actions::Quit);
+        assert!(!app.dialog_open(cx), "{engine:?}");
+        assert!(quit_requested(&app, cx), "{engine:?}");
+    }
+}
+
+/// C15: when the whole connection goes (every session of its account terminated), a tab
+/// holding a transaction says once that the server rolled it back: here its own statement
+/// learns first, then the check of the connection it asks for finds the connection lost too,
+/// and says nothing more. (The connection's keep-alive learning first is
+/// `ui_tests::a_lost_connection_says_the_server_rolled_its_transaction_back`.)
+#[gpui_kit::test]
+fn a_lost_connection_found_by_a_statement_is_said_once(cx: &mut TestAppContext) {
+    const ROLE: &str = "kerno_ui_k16_role";
+    const PASSWORD: &str = "kerno_ui_k16_pw";
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let terminate = format!(
+        "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{ROLE}'"
+    );
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[
+            &terminate,
+            &format!("DROP SCHEMA IF EXISTS {ROLE} CASCADE"),
+            &format!("DROP ROLE IF EXISTS {ROLE}"),
+        ],
+        &[
+            &format!("CREATE ROLE {ROLE} LOGIN PASSWORD '{PASSWORD}'"),
+            &format!("CREATE SCHEMA {ROLE} AUTHORIZATION {ROLE}"),
+            &format!("CREATE TABLE {ROLE}.t (id int PRIMARY KEY)"),
+            &format!("ALTER TABLE {ROLE}.t OWNER TO {ROLE}"),
+        ],
+    );
+    let app = connected_as_user(cx, Engine::Postgres, ROLE, PASSWORD);
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, &format!("insert into {ROLE}.t values (1)"));
+    on_server(Engine::Postgres, &terminate);
+    assert_eq!(k3_run(&app, cx, "select 1"), ["failed []"]);
+    assert_eq!(k16_said(&app, cx), 1);
+    app.wait_until(cx, "the reconnection", |app, cx| {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        let reconnecting = app.connections.read_with(cx, |connections, _| {
+            connections.reconnecting(&connections.saved()[0].id)
+        });
+        matches!(app.status(cx, 0), Status::Connected { .. }) && !reconnecting
+    });
+    assert_eq!(k16_said(&app, cx), 1);
+}
+
+/// C15, CLAUDE.md §4 A5: a tab holding no transaction is not watched (nothing of it can be
+/// lost). Its next statement after the server closed its session fails, is not run again,
+/// says nothing of a transaction, and drops only that session; the one after runs on a new
+/// session. In manual commit too, where the statement that found it gone is the `BEGIN`.
+#[gpui_kit::test]
+fn an_idle_tab_whose_session_died_runs_on_a_new_one(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        for manual in [false, true] {
+            app.press(cx, &["secondary-t"]);
+            let tab = app.tab(cx);
+            cx.update(|cx| tab.update(cx, |tab, cx| tab.set_manual_commit(manual, cx)));
+            assert_eq!(k3_run(&app, cx, k16_own_id(engine)), ["1 rows"]);
+            let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+            if manual {
+                roll_back(&app, cx);
+            }
+            on_server(engine, &k16_end(engine, &id));
+            // The client may learn of it only when it sends (MySQL).
+            app.wait_until(cx, "the session to go", |_, _| {
+                on_server(
+                    engine,
+                    &match engine {
+                        Engine::Postgres => {
+                            format!("SELECT count(*) FROM pg_stat_activity WHERE pid = {id}")
+                        }
+                        Engine::MySql | Engine::MariaDb => format!(
+                            "SELECT count(*) FROM information_schema.PROCESSLIST WHERE ID = {id}"
+                        ),
+                    },
+                ) == "0"
+            });
+            assert_eq!(
+                k3_run(&app, cx, "select 1"),
+                ["failed []"],
+                "{engine:?} {manual}"
+            );
+            assert_eq!(k16_said(&app, cx), 0, "{engine:?} {manual}");
+            later(&app, cx, 1);
+            let reconnecting = app.connections.read_with(cx, |connections, _| {
+                connections.reconnecting(&connections.saved()[0].id)
+            });
+            assert!(!reconnecting, "{engine:?} {manual}");
+            assert_eq!(
+                k3_run(&app, cx, k16_own_id(engine)),
+                ["1 rows"],
+                "{engine:?}"
+            );
+            assert_ne!(app.result(cx, 0, 1).1[0][0].clone().unwrap(), id);
+            if manual {
+                roll_back(&app, cx);
+            }
+        }
+    }
+}
+
+/// C15: the edits waiting in a result are not thrown away with a session the server closed.
+/// Apply on it (before the tab's check came round) changes nothing, keeps them and says the
+/// transaction is gone; the next Apply runs them on a new session, in a new transaction.
+#[gpui_kit::test]
+fn the_edits_waiting_in_a_result_outlive_a_closed_session(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let schema = "kerno_ui_k16_edits";
+        let _scratch = g8_table(engine, schema);
+        let app = connected(cx, engine);
+        app.press(cx, &["secondary-t"]);
+        assert_eq!(k3_run(&app, cx, k16_own_id(engine)), ["1 rows"]);
+        let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
+        app.open_transaction(
+            cx,
+            &format!("select id, name, qty from {schema}.t order by id"),
+        );
+        assert_eq!(app.result_verdict(cx), None, "{engine:?}");
+        app.type_in_result(cx, 0, 2, "uno");
+        assert_eq!(app.result_pending(cx), 1, "{engine:?}");
+        on_server(engine, &k16_end(engine, &id));
+
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the apply to fail", |app, cx| {
+            k16_said(app, cx) == 1 && !app.running(cx)
+        });
+        assert_eq!(app.result_pending(cx), 1, "{engine:?}");
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Idle, "{engine:?}");
+
+        // Back from the messages to the result.
+        app.click(cx, ("result-tab", 0usize));
+        app.click(cx, "result-apply");
+        app.click(cx, "sql-confirm");
+        app.wait_until(cx, "the applied change", |app, cx| {
+            app.result_pending(cx) == 0 && !app.running(cx)
+        });
+        assert_eq!(app.tx_state(cx), kerno_core::TxState::Open, "{engine:?}");
+        app.dispatch(cx, actions::CommitTransaction);
+        app.wait_until(cx, "the commit", |app, cx| {
+            app.tx_state(cx) == kerno_core::TxState::Idle
+        });
+        assert_eq!(
+            on_server(engine, &format!("SELECT name FROM {schema}.t WHERE id = 1")),
+            "uno",
+            "{engine:?}"
+        );
+    }
+}

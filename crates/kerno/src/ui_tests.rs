@@ -13271,9 +13271,10 @@ fn a_new_transaction_after_a_lost_connection_starts_an_empty_log(cx: &mut TestAp
     };
     let first = format!("insert into {ROLE}.entries values (1)");
     app.open_transaction(cx, &first);
-    assert_eq!(log(cx), [first]);
+    assert_eq!(log(cx), std::slice::from_ref(&first));
 
-    // The server cuts the session: its transaction is gone, the log with it.
+    // The server cuts the session: its transaction is gone; its log stays, marked rolled back
+    // by the server, until the next statement (K16, C15).
     server(&format!(
         "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{ROLE}'"
     ));
@@ -13286,7 +13287,7 @@ fn a_new_transaction_after_a_lost_connection_starts_an_empty_log(cx: &mut TestAp
     app.wait_until(cx, "the reconnection", |app, cx| {
         matches!(app.status(cx, 0), Status::Connected { .. })
     });
-    assert_eq!(log(cx), Vec::<String>::new());
+    assert_eq!(log(cx), [first]);
 
     // The next statement opens a new transaction whose log holds it alone.
     let second = format!("insert into {ROLE}.entries values (2)");

@@ -709,3 +709,23 @@ Still open (for the owner):
   `docs/COMPETITOR-ISSUES.md`: C3 answered (15 answered, 1 gap). Limits in the "Done:" line of K15
   (`docs/plans/M12.md`): the FDW dialog, "List models", "Revert file", MySQL lock tests (its catalog reads never
   waited).
+
+## 2026-11-20 — K16: a tab whose own server session died says so before Commit (C15)
+
+- The plan's "ping the tab's session every 30 s" was not done: any command restarts the server's idle timers
+  (PostgreSQL `idle_in_transaction_session_timeout`, MySQL `wait_timeout`, a `COM_PING` too), so it would have
+  kept a forgotten transaction and its locks forever. Proved on PostgreSQL, MySQL and MariaDB with a 1-2 s
+  timeout set on the session (D-088).
+- `Session::gone()`: PostgreSQL keeps the server's FATAL as its connection task reads it (free, with its
+  SQLSTATE); MySQL/MariaDB ask from a short connection of their own whether the server still lists the session.
+  A tab holding a transaction asks every 15 s while idle; on loss it says once that the server rolled the
+  transaction back and why, drops the session (badge, "transaction open", Commit and Roll back go), keeps the
+  transaction log and the result's waiting edits, and its next statement opens a new session.
+- Found on the way: a statement that met a closed session took the whole connection down (every tab's session
+  closed, their transactions rolled back) and never said its own transaction was lost; a dead session met by
+  the manual-commit `BEGIN` or by a result's Apply was kept and failed every run after it. Now only the tab's
+  session is dropped and the connection is checked (`Connections::verify`). Commit on a closed session is not
+  sent and says so; a Roll back on it succeeds.
+- Tests: five driver tests (PostgreSQL, MySQL, MariaDB) and eight UI tests, each seen failing under a one-line
+  mutation. `docs/COMPETITOR-ISSUES.md`: C15 answered (16 answered, no gap). Limits in the "Done:" line of K16
+  (`docs/plans/M12.md`).

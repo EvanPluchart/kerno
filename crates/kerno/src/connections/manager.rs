@@ -575,20 +575,34 @@ impl Connections {
             });
         })
         .detach();
-        let open: Vec<(String, Arc<dyn Session>)> = self
+        let open: Vec<String> = self
             .runtime
             .iter()
-            .filter_map(|(id, runtime)| Some((id.clone(), runtime.meta.clone()?)))
+            .filter(|(_, runtime)| runtime.meta.is_some())
+            .map(|(id, _)| id.clone())
             .collect();
-        for (id, meta) in open {
-            let ping = bridge::spawn(cx, async move { meta.ping().await });
-            cx.spawn(async move |this, cx| {
-                if ping.await.is_err() {
-                    let _ = this.update(cx, |this, cx| this.connection_lost(&id, cx));
-                }
-            })
-            .detach();
+        for id in open {
+            self.verify(&id, cx);
         }
+    }
+
+    /// Checks the connection now, as [`Connections::watch`] does, and
+    /// treats it as lost when it does not answer. A session of a tab found
+    /// closed may be the server's doing for that session alone (a timeout,
+    /// a terminate): the connection, and the other tabs' sessions and
+    /// transactions, stay while the connection's own session answers (C15).
+    pub fn verify(&self, id: &str, cx: &mut Context<Self>) {
+        let Some(meta) = self.meta_session(id) else {
+            return;
+        };
+        let id = id.to_string();
+        let ping = bridge::spawn(cx, answers(meta));
+        cx.spawn(async move |this, cx| {
+            if !ping.await {
+                let _ = this.update(cx, |this, cx| this.connection_lost(&id, cx));
+            }
+        })
+        .detach();
     }
 
     // Folders ------------------------------------------------------------------
@@ -1202,19 +1216,7 @@ impl Connections {
                 let Ok(Some(meta)) = this.read_with(cx, |this, _| this.meta_session(&id)) else {
                     return;
                 };
-                let ping = cx.update(|cx| {
-                    bridge::spawn(cx, async move {
-                        // A timeout once may be a long read on this
-                        // session; twice, the server is not answering.
-                        for _ in 0..2 {
-                            match tokio::time::timeout(PING_TIMEOUT, meta.ping()).await {
-                                Ok(outcome) => return outcome.is_ok(),
-                                Err(_) => continue,
-                            }
-                        }
-                        false
-                    })
-                });
+                let ping = cx.update(|cx| bridge::spawn(cx, answers(meta)));
                 if !ping.await {
                     let _ = this.update(cx, |this, cx| this.connection_lost(&id, cx));
                     return;
@@ -1328,6 +1330,18 @@ pub fn origin_text(
         Some(PasswordOrigin::File(file)) => format!("Password from {file}"),
         Some(PasswordOrigin::Command(name)) => format!("Password from the command `{name}`"),
     })
+}
+
+/// Whether the connection's own session answers a ping. A timeout once may
+/// be a long read on this session; twice, the server is not answering.
+async fn answers(meta: Arc<dyn Session>) -> bool {
+    for _ in 0..2 {
+        match tokio::time::timeout(PING_TIMEOUT, meta.ping()).await {
+            Ok(outcome) => return outcome.is_ok(),
+            Err(_) => continue,
+        }
+    }
+    false
 }
 
 /// Closes `meta` and every session in `opened` still open, off the UI thread.

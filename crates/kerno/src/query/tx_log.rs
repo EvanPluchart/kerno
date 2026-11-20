@@ -70,8 +70,20 @@ impl TxLogEntry {
     }
 }
 
-/// Shows `entries`, the log of a transaction (`open`: one is open).
-pub fn open(entries: Vec<TxLogEntry>, open: bool, window: &mut Window, cx: &mut App) {
+/// Which transaction a log is of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The open one.
+    Open,
+    /// The one the server rolled back when it closed the session (C15).
+    Lost,
+    /// None is open.
+    None,
+}
+
+/// Shows `entries`, the log of a transaction.
+pub fn open(entries: Vec<TxLogEntry>, shown: Shown, window: &mut Window, cx: &mut App) {
+    let open = shown == Shown::Open;
     window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
         let (muted, danger, mono) = (
@@ -139,7 +151,23 @@ pub fn open(entries: Vec<TxLogEntry>, open: bool, window: &mut Window, cx: &mut 
                 }))
                 .into_any_element()
         };
-        dialog.title("Transaction log").w(px(640.)).child(body)
+        let lost = (shown == Shown::Lost).then(|| {
+            div()
+                .id("tx-log-lost")
+                .test_support()
+                .pb_2()
+                .text_sm()
+                .text_color(danger)
+                .child(
+                    "The server closed the session: it rolled these statements back, and \
+                     nothing of them was committed.",
+                )
+        });
+        dialog
+            .title("Transaction log")
+            .w(px(640.))
+            .children(lost)
+            .child(body)
     });
 }
 

@@ -20,7 +20,8 @@ use kerno_core::schema::{
 use kerno_core::sql::params::is_number;
 use kerno_core::sql::{Catalog, LexRules, TokenKind, lex};
 use kerno_core::{
-    AdminView, Column, ColumnOrigin, Engine, Error, Notice, Result, Session, TxState, TypeKind,
+    AdminView, Column, ColumnOrigin, DbError, Engine, Error, Notice, Result, Session, TxState,
+    TypeKind,
 };
 use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::Queryable;
@@ -76,6 +77,16 @@ pub struct MysqlSession {
     timeout: Duration,
     /// The server's id of this connection, as `KILL` takes it.
     connection_id: u64,
+    /// The server's `@@hostname`: a connection opened on the same route
+    /// may reach another server (a load balancer, a cluster's endpoint),
+    /// where this connection's id means nothing (C15).
+    host: Option<String>,
+    /// A check connection of [`Session::gone`] could not be opened: no
+    /// other is tried for this session. A login the server refuses (a
+    /// rotated password, an expired token) repeated every few seconds
+    /// would lock the account or raise an alarm on a production server;
+    /// the next statement still finds a closed session.
+    unchecked: AtomicBool,
     engine: Engine,
     server: ServerInfo,
     dialect: MysqlDialect,
@@ -125,7 +136,7 @@ impl MysqlSession {
 
         // The handshake's connection id is 32 bits wide and its version is
         // not the whole string; ask.
-        let identity = "SELECT VERSION(), CONNECTION_ID()";
+        let identity = "SELECT VERSION(), CONNECTION_ID(), @@hostname";
         let rows = text_rows(&mut conn, identity)
             .await
             .map_err(|error| statement_error(error, identity))?;
@@ -138,6 +149,7 @@ impl MysqlSession {
             .get(1)
             .and_then(|id| id.as_deref()?.parse().ok())
             .ok_or_else(|| Error::Protocol("the server did not report a connection id".into()))?;
+        let host = row.get(2).cloned().flatten();
         let engine = engine_of(&version);
 
         let session = Self {
@@ -148,6 +160,8 @@ impl MysqlSession {
             params: params.clone(),
             timeout: settings.timeout,
             connection_id,
+            host,
+            unchecked: AtomicBool::new(false),
             engine,
             server: ServerInfo {
                 version_number: version_number(&version),
@@ -572,6 +586,52 @@ impl Session for MysqlSession {
         outcome
     }
 
+    /// The client reads nothing while idle, so it cannot see the server
+    /// close the connection: a connection of its own, as a cancel takes,
+    /// asks whether the server still lists this one. A user always sees its
+    /// own threads in the process list. Never the connection's other
+    /// sessions: a check queued there would hold their own work (C3, C15).
+    async fn gone(&self) -> Option<DbError> {
+        {
+            let link = self.link.try_lock().ok()?;
+            if link.in_flight || link.conn.is_none() {
+                return None;
+            }
+        }
+        let sql = format!(
+            "SELECT @@hostname, \
+             (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = {})",
+            self.connection_id
+        );
+        if self.unchecked.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut side = match connect::open(&self.params, self.timeout, None).await {
+            Ok(side) => side,
+            Err(error) => {
+                tracing::debug!(%error, "the check connection did not open: no other is tried");
+                self.unchecked.store(true, Ordering::Release);
+                return None;
+            }
+        };
+        let answer = side.query_first::<(Option<String>, u64), _>(&sql).await;
+        if let Err(error) = side.disconnect().await {
+            tracing::debug!(%error, "the check connection did not close cleanly");
+        }
+        // Only an answer of the same server says it is gone; a failure, or
+        // another server behind the same address, says nothing.
+        match answer {
+            Ok(Some((host, 0))) if self.host.is_some() && host == self.host => {}
+            _ => return None,
+        }
+        // The server rolled back its transaction.
+        self.in_transaction.store(false, Ordering::Release);
+        Some(DbError::message(
+            "the server no longer lists this session: it was idle for longer than its \
+             wait_timeout, or it was killed",
+        ))
+    }
+
     async fn close(&self) {
         let conn = match self.link.try_lock() {
             // A statement whose caller dropped it midway still runs on the
@@ -696,6 +756,50 @@ mod tests {
         ] {
             assert!(!touches_session_state(sql, rules), "{sql}");
         }
+    }
+
+    /// C15: `gone` asks from a connection of its own, which may reach another server than the
+    /// session's (a load balancer, a cluster endpoint): an id that server does not list says
+    /// nothing. Here the check is sent to MariaDB for a MySQL session.
+    #[tokio::test]
+    async fn another_server_behind_the_address_is_not_taken_for_this_one() {
+        use kerno_core::testing;
+        if !testing::available(Engine::MySql) || !testing::available(Engine::MariaDb) {
+            return;
+        }
+        let mut session = MysqlSession::connect(&testing::params(Engine::MySql))
+            .await
+            .unwrap();
+        session.connection_id = u64::from(u32::MAX) + 7;
+        assert!(
+            session.gone().await.is_some(),
+            "an id the server does not list"
+        );
+        session.in_transaction.store(true, Ordering::Release);
+        session.params.port = testing::params(Engine::MariaDb).port;
+        assert!(session.gone().await.is_none());
+        assert_eq!(session.tx_state(), TxState::Open);
+    }
+
+    /// C15: a check whose connection cannot be opened is the last one: a
+    /// login the server refuses is not repeated every few seconds against
+    /// it. Fails with `gone` trying again.
+    #[tokio::test]
+    async fn a_check_that_cannot_connect_is_not_tried_again() {
+        use kerno_core::testing;
+        if !testing::available(Engine::MySql) {
+            return;
+        }
+        let good = testing::params(Engine::MySql);
+        let mut session = MysqlSession::connect(&good).await.unwrap();
+        session.connection_id = u64::from(u32::MAX) + 7;
+        session.params.user = "kerno_test_nobody".into();
+        assert!(session.gone().await.is_none(), "the login is refused");
+        session.params = good;
+        assert!(
+            session.gone().await.is_none(),
+            "a second check connection was opened"
+        );
     }
 
     /// C3: a read whose caller dropped it midway (a load stopped from the UI) is killed when

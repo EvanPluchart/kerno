@@ -51,8 +51,8 @@ use kerno_core::sql::{
 };
 use kerno_core::storage::{HistoryEntry, HistoryStatus};
 use kerno_core::{
-    Described, Dialect, Error, ExecEvent, IsolationLevel, Notice, Plan, ResultStore, RowLimit,
-    Session, TxState, describe, exec,
+    DbError, Described, Dialect, Error, ExecEvent, IsolationLevel, Notice, Plan, ResultStore,
+    RowLimit, Session, TxState, describe, exec,
 };
 
 use super::comment;
@@ -192,6 +192,17 @@ impl Failure {
     }
 }
 
+/// How a COMMIT or ROLLBACK ended.
+enum Ending {
+    Done,
+    /// The session closed under a ROLLBACK: its transaction is rolled back.
+    Closed,
+    /// The server had closed the session: the COMMIT was not sent (C15).
+    Gone(DbError),
+    /// What the failure says.
+    Failed(String),
+}
+
 /// What a COMMIT or ROLLBACK that failed says (C14, C15): first what came
 /// of the transaction, from the session's state after the failure (`after`),
 /// then the server's message, detail and hint.
@@ -233,8 +244,62 @@ fn lost_failure(error: Option<&Error>) -> Failure {
         message: LOST_WHILE_RUNNING.into(),
         code: None,
         detail: error.map(|error| error.to_string()),
-        hint: Some("The connection is opened again by itself.".into()),
+        hint: Some(
+            "The next statement opens a new session, and the connection again if it was lost."
+                .into(),
+        ),
         position: None,
+    }
+}
+
+/// How often a tab holding a transaction asks whether the server closed
+/// its session (C15). Never on that session: a command would restart the
+/// server's idle timers, the guard a DBA sets against forgotten
+/// transactions. Free on PostgreSQL (its client reads the server's FATAL as
+/// it comes), one short connection of its own on MySQL.
+pub(crate) const SESSION_CHECK: Duration = Duration::from_secs(15);
+
+/// How long a Commit waits to learn whether the server closed the session
+/// before it is sent anyway.
+const GONE_CHECK: Duration = Duration::from_secs(3);
+
+/// What a tab says when the server closed its session and took the
+/// transaction with it (C15).
+const SESSION_CLOSED: &str = "The server closed this tab's session while its transaction was \
+                              open: the server rolled it back, and nothing of it was committed. \
+                              The next statement opens a new session.";
+
+/// The same, found by a statement of the tab: the session closed under it,
+/// by the server or with the connection.
+const SESSION_LOST: &str = "This tab's session closed while its transaction was open: the server \
+                            rolled it back, and nothing of it was committed.";
+
+/// What the connection's loss says (its own session did not answer).
+const CONNECTION_LOST: &str = "The connection closed while this tab's transaction was open: the \
+                               server rolled it back, and nothing of it was committed.";
+
+/// Why the server closed a session: plain words first, when its code says
+/// it, then the server's own words (C14).
+pub fn closed_why(why: &DbError) -> String {
+    let plain = match why.code.as_deref() {
+        Some("25P03") => Some(
+            "It stayed idle inside a transaction for longer than the server allows \
+             (idle_in_transaction_session_timeout).",
+        ),
+        Some("25P04") => {
+            Some("Its transaction lasted longer than the server allows (transaction_timeout).")
+        }
+        Some("57P05") => {
+            Some("It stayed idle for longer than the server allows (idle_session_timeout).")
+        }
+        Some("57P01") => Some(
+            "An administrator ended it (pg_terminate_backend), or the server is shutting down.",
+        ),
+        _ => None,
+    };
+    match plain {
+        Some(plain) => format!("{plain}\nThe server said: {why}"),
+        None => format!("The server said: {why}"),
     }
 }
 
@@ -542,6 +607,12 @@ pub struct QueryTab {
     /// The rollback of a transaction left idle, armed for the length of
     /// its log and the environment's period (see `watch_idle_transaction`).
     idle_rollback: Option<((usize, u32), Task<()>)>,
+    /// The check of the session the tab's transaction is on (see
+    /// `watch_session`).
+    session_watch: Option<(Arc<dyn Session>, Task<()>)>,
+    /// The transaction's log is of a transaction the server rolled back
+    /// when it closed the session (C15): shown until the next statement.
+    tx_lost: bool,
     /// The run on several connections this tab took part in (J14).
     script: Option<ScriptRun>,
     /// The AI assistant's panel at the side, while open (J17).
@@ -729,6 +800,8 @@ impl QueryTab {
             brackets,
             occurrences,
             idle_rollback: None,
+            session_watch: None,
+            tx_lost: false,
             script: None,
             ai: None,
             vim: None,
@@ -737,7 +810,8 @@ impl QueryTab {
         // Every change of the tab may start, restart or stop the wait for
         // an idle transaction to end.
         let idle = cx.observe_in(&cx.entity(), window, |this: &mut Self, _, window, cx| {
-            this.watch_idle_transaction(window, cx)
+            this.watch_idle_transaction(window, cx);
+            this.watch_session(window, cx);
         });
         tab._subscriptions.push(idle);
         tab.follow_connection(cx);
@@ -1027,6 +1101,15 @@ impl QueryTab {
             .collect()
     }
 
+    /// The details of the messages that have one; for tests.
+    #[cfg(test)]
+    pub fn message_details(&self) -> Vec<String> {
+        self.notices
+            .iter()
+            .filter_map(|notice| notice.detail.clone())
+            .collect()
+    }
+
     /// Column names and the first `limit` rows of a result; for tests.
     #[cfg(test)]
     pub fn rows_of(
@@ -1158,43 +1241,151 @@ impl QueryTab {
     /// closed by something that could not ask (Kerno's own disconnects end
     /// the transaction first). The server rolled it back; the tab says so.
     fn say_if_rolled_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.connected(cx) || self.tx_state() == TxState::Idle {
+        // The tab's own record: the session's state may already say `Idle`
+        // (a PostgreSQL session the server closed, C15).
+        if self.connected(cx) || self.tx_started.is_none() {
             return;
         }
-        self.report_rolled_back(window, cx);
+        self.report_rolled_back(CONNECTION_LOST, None, window, cx);
     }
 
-    /// A statement of this tab found the connection gone: an open
-    /// transaction is reported lost, the session dropped, and the
-    /// connection opened again (CLAUDE.md §4 A5). Nothing runs again.
+    /// A statement of this tab found its session gone: an open transaction
+    /// is reported lost and the session dropped. Nothing runs again. The
+    /// connection is checked, and opened again only if it is lost
+    /// (CLAUDE.md §4 A5): the server may have closed this session alone,
+    /// and the other tabs' transactions stay (C15).
     fn lost_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tx_state() != TxState::Idle {
-            self.report_rolled_back(window, cx);
+        // The session says `Idle` once closed: the tab's record says
+        // whether it held a transaction.
+        if self.tx_started.is_some() {
+            self.report_rolled_back(SESSION_LOST, None, window, cx);
         }
         self.activity = Activity::Idle;
         self.close_session(cx);
         if let Some(id) = self.connection_id().map(str::to_string) {
             self.connections
-                .update(cx, |connections, cx| connections.connection_lost(&id, cx));
+                .update(cx, |connections, cx| connections.verify(&id, cx));
         }
     }
 
-    fn report_rolled_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let message = "The connection closed while this tab's transaction was open: the server \
-                       rolled it back, and nothing of it was committed.";
-        self.notices.push(Notice {
-            severity: "Warning".into(),
-            message: message.into(),
-            code: None,
-            detail: None,
-        });
-        // The messages, after the results.
-        self.active_result = self.results.len();
-        self.show_results();
+    /// Says in the tab, and in a notification, that its transaction was
+    /// rolled back by the server: `first`, then what was kept (C15), then
+    /// why when the server said.
+    fn report_rolled_back(
+        &mut self,
+        first: &str,
+        why: Option<&DbError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = self.note_rolled_back(first, why, cx);
         window.push_notification(
             Notification::warning(SharedString::from(format!("“{}”: {message}", self.title))),
             cx,
         );
+    }
+
+    /// [`Self::report_rolled_back`] in the tab only; returns its text.
+    fn note_rolled_back(
+        &mut self,
+        first: &str,
+        why: Option<&DbError>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let mut message = first.to_string();
+        // Its statements stay in the log, marked rolled back.
+        if !self.tx_log.is_empty() {
+            self.tx_lost = true;
+            message.push_str(" Its statements are in the transaction log.");
+        }
+        if self.pending_count(cx) > 0 {
+            message.push_str(
+                " The pending changes of the results are kept: Apply runs them in a new \
+                 transaction.",
+            );
+        }
+        let why = why.map(closed_why);
+        self.notices.push(Notice {
+            severity: "Warning".into(),
+            message: message.clone(),
+            code: None,
+            detail: why.clone(),
+        });
+        // The messages, after the results.
+        self.active_result = self.results.len();
+        self.show_results();
+        cx.notify();
+        match why {
+            Some(why) => format!("{message}\n{why}"),
+            None => message,
+        }
+    }
+
+    /// While the tab holds a transaction and nothing runs, asks every
+    /// [`SESSION_CHECK`] whether the server closed its session (C15),
+    /// without sending anything on it (see [`Session::gone`]). Armed on
+    /// the tab's record of its transaction, not on the session's state,
+    /// which turns `Idle` the moment a PostgreSQL client reads the close.
+    fn watch_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let due = self
+            .session
+            .clone()
+            .filter(|_| self.tx_started.is_some() && !self.running());
+        let same = match (&due, &self.session_watch) {
+            (Some(due), Some((watched, _))) => Arc::ptr_eq(due, watched),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.session_watch = due.map(|session| {
+            let watched = session.clone();
+            let watch = cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(SESSION_CHECK).await;
+                    let checking = {
+                        let session = session.clone();
+                        cx.update(|_, cx| bridge::spawn(cx, async move { session.gone().await }))
+                    };
+                    let Ok(checking) = checking else {
+                        return;
+                    };
+                    if let Some(why) = checking.await {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.session_gone(&session, why, window, cx)
+                        });
+                        return;
+                    }
+                }
+            });
+            (watched, watch)
+        });
+    }
+
+    /// The server closed `session` (C15): if it is still the tab's, the
+    /// transaction went with it. The tab says so once and drops the
+    /// session; the next statement opens a new one, in the same database
+    /// and schema (the target follows the session, C6) and commit mode.
+    fn session_gone(
+        &mut self,
+        session: &Arc<dyn Session>,
+        why: DbError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Kerno closed it, or the tab moved on: nothing to say.
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|own| Arc::ptr_eq(own, session))
+        {
+            return;
+        }
+        if self.tx_started.is_some() {
+            self.report_rolled_back(SESSION_CLOSED, Some(&why), window, cx);
+        }
+        self.close_session(cx);
         cx.notify();
     }
 
@@ -2598,7 +2789,7 @@ impl QueryTab {
                     return;
                 };
                 if let Err(error) = beginning.await {
-                    let _ = this.update(cx, |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| {
                         this.push_pane(
                             begin.to_string(),
                             Outcome::Failed(Failure::from(&error)),
@@ -2608,6 +2799,11 @@ impl QueryTab {
                         this.activity = Activity::Idle;
                         this.run = None;
                         this.end_script(Stage::Failed, Some(error.to_string()), cx);
+                        // The session is gone (the server closed it, C15):
+                        // dropped, so the next run opens a new one.
+                        if error.is_disconnect() {
+                            this.lost_connection(window, cx);
+                        }
                         cx.notify();
                     });
                     return;
@@ -2963,6 +3159,8 @@ impl QueryTab {
         // rule watches too, C15); one that ended the transaction (COMMIT
         // typed, MySQL's DDL) empties it.
         if !auto {
+            // A lost transaction's log is shown until the next statement.
+            self.tx_lost = false;
             if self.tx_state() == TxState::Idle {
                 self.tx_log.clear();
             } else {
@@ -3044,7 +3242,7 @@ impl QueryTab {
     /// The statements run in the open transaction; none when no
     /// transaction is open.
     pub fn transaction_log(&self) -> &[TxLogEntry] {
-        if self.tx_state() == TxState::Idle {
+        if self.tx_state() == TxState::Idle && !self.tx_lost {
             &[]
         } else {
             &self.tx_log
@@ -3052,10 +3250,16 @@ impl QueryTab {
     }
 
     /// Shows the statements of the open transaction (DBeaver's
-    /// "Transaction log").
+    /// "Transaction log"), or of the one the server rolled back (C15).
     pub fn show_transaction_log(&self, window: &mut Window, cx: &mut App) {
-        let open = self.tx_state() != TxState::Idle;
-        tx_log::open(self.transaction_log().to_vec(), open, window, cx);
+        let state = if self.tx_state() != TxState::Idle {
+            tx_log::Shown::Open
+        } else if self.tx_lost {
+            tx_log::Shown::Lost
+        } else {
+            tx_log::Shown::None
+        };
+        tx_log::open(self.transaction_log().to_vec(), state, window, cx);
     }
 
     /// Underlines the place of an error in the editor. `position` is the
@@ -3471,43 +3675,83 @@ impl QueryTab {
         let Some(session) = self.session.clone() else {
             return Task::ready(Ok(()));
         };
-        if session.tx_state() == TxState::Idle {
+        // Nothing open, and nothing the tab held ended out of its sight (a
+        // session the server closed says `Idle`, C15).
+        if session.tx_state() == TxState::Idle && self.tx_started.is_none() {
             return Task::ready(Ok(()));
         }
         // A result still being paged belongs to the transaction.
         self.stop(cx);
         let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        let checked = session.clone();
         let ending = bridge::spawn(cx, async move {
             let ending = async {
-                // What came of the transaction is the session's state
-                // after the failure (C14).
-                exec::collect(session.clone(), sql)
-                    .await
-                    .map(drop)
-                    .map_err(|error| ending_failed(commit, &error, session.tx_state()))
+                // A COMMIT is not sent on a session the server closed: the
+                // transaction is gone, and saying so beats "whether it was
+                // saved is not known" (C15). A failed check says nothing.
+                if commit
+                    && let Ok(Some(why)) = tokio::time::timeout(GONE_CHECK, session.gone()).await
+                {
+                    return Ending::Gone(why);
+                }
+                match exec::collect(session.clone(), sql).await {
+                    Ok(_) => Ending::Done,
+                    // A closed session's transaction is rolled back: what a
+                    // ROLLBACK asks for.
+                    Err(Error::Closed(_)) if !commit => Ending::Closed,
+                    // What came of the transaction is the session's state
+                    // after the failure (C14).
+                    Err(error) => Ending::Failed(ending_failed(commit, &error, session.tx_state())),
+                }
             };
             match limit {
                 Some(limit) => tokio::time::timeout(limit, ending)
                     .await
                     .unwrap_or_else(|_| {
-                        Err(format!("{sql} got no answer within {} s", limit.as_secs()))
+                        Ending::Failed(format!("{sql} got no answer within {} s", limit.as_secs()))
                     }),
                 None => ending.await,
             }
         });
         cx.spawn(async move |this, cx| {
-            let outcome = ending.await;
-            let _ = this.update(cx, |this, cx| {
+            let ended = ending.await;
+            this.update(cx, |this, cx| {
+                let outcome = match ended {
+                    Ending::Done => Ok(()),
+                    Ending::Failed(text) => Err(text),
+                    Ending::Closed | Ending::Gone(_) => {
+                        let own = this
+                            .session
+                            .as_ref()
+                            .is_some_and(|own| Arc::ptr_eq(own, &checked));
+                        let outcome = match &ended {
+                            Ending::Gone(why) => {
+                                let said = if own {
+                                    this.note_rolled_back(SESSION_CLOSED, Some(why), cx)
+                                } else {
+                                    format!("{SESSION_CLOSED}\n{}", closed_why(why))
+                                };
+                                Err(format!("The commit was not sent. {said}"))
+                            }
+                            _ => Ok(()),
+                        };
+                        if own {
+                            this.close_session(cx);
+                        }
+                        outcome
+                    }
+                };
                 // A failed COMMIT the server rolled back ended it too.
-                if outcome.is_ok() || this.tx_state() == TxState::Idle {
+                if (outcome.is_ok() || this.tx_state() == TxState::Idle) && !this.tx_lost {
                     this.tx_log.clear();
                 }
                 this.note_transaction(cx);
                 // A `SET LOCAL search_path` ended with the transaction.
                 this.follow_session(cx);
-                cx.notify()
-            });
-            outcome
+                cx.notify();
+                outcome
+            })
+            .unwrap_or(Ok(()))
         })
     }
 
@@ -4252,6 +4496,11 @@ impl QueryTab {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.run = None;
                 this.activity = Activity::Idle;
+                // The session is gone (the server closed it, C15): dropped,
+                // the changes kept for an Apply on a new one.
+                if matches!(&applied, Err(failure) if failure.error.is_disconnect()) {
+                    this.lost_connection(window, cx);
+                }
                 // In manual commit the apply may have begun the transaction.
                 this.note_transaction(cx);
                 let Some(pane) = this.pane_mut(id) else {
