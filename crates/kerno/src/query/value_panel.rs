@@ -40,6 +40,11 @@ use crate::actions;
 use crate::settings::VALUE_PANEL_WIDTHS;
 use crate::state::AppState;
 
+mod fk_preview;
+pub use fk_preview::Lookup;
+#[cfg(test)]
+pub use fk_preview::reads_started;
+
 /// The narrowest the grid gets beside the panel; in a narrower window the
 /// panel is not drawn.
 const GRID_MIN: Pixels = px(240.);
@@ -68,14 +73,16 @@ pub fn button(id: &'static str, cx: &App) -> Button {
         .on_click(|_, window, cx| toggle(window, cx))
 }
 
-/// Keeps a tab's panel in step with the setting, the grid on screen and the
-/// tab's reason for read-only rows (`why`): made when the setting shows it,
-/// dropped (its unsaved text kept) when it hides it. Called as the tab
-/// draws; the panel follows its grid right after.
+/// Keeps a tab's panel in step with the setting, the grid on screen, the
+/// tab's reason for read-only rows (`why`) and where it reads the rows
+/// foreign keys point to (`lookup`, K18): made when the setting shows it,
+/// dropped (its unsaved text kept, its session closed) when it hides it.
+/// Called as the tab draws; the panel follows its grid right after.
 pub fn sync(
     slot: &mut Option<Entity<ValuePanel>>,
     grid: Option<&Entity<TableState<Grid>>>,
     why: Option<SharedString>,
+    lookup: Option<Lookup>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Entity<ValuePanel>> {
@@ -90,6 +97,7 @@ pub fn sync(
     let panel = slot
         .get_or_insert_with(|| cx.new(|cx| ValuePanel::new(window, cx)))
         .clone();
+    panel.update(cx, |panel, cx| panel.set_lookup(lookup, cx));
     let (current, known) = {
         let panel = panel.read(cx);
         (panel.grid(), panel.why.clone())
@@ -251,6 +259,8 @@ pub struct ValuePanel {
     /// Not drawn: the window is too narrow.
     collapsed: bool,
     formatting: Option<Task<()>>,
+    /// The row the cell's foreign key points to (K18).
+    preview: fk_preview::Preview,
     _follow: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -296,6 +306,7 @@ impl ValuePanel {
             why: None,
             collapsed: false,
             formatting: None,
+            preview: fk_preview::Preview::default(),
             _follow: None,
             _subscriptions: subscriptions,
         }
@@ -336,6 +347,7 @@ impl ValuePanel {
             });
             self.table = grid.as_ref().map(Entity::downgrade);
             self.seen = None;
+            self.forget_reads();
         }
         self.follow(window, cx);
     }
@@ -382,6 +394,7 @@ impl ValuePanel {
         if let (Target::Cell(row, source), Some(grid)) = (target, self.grid()) {
             self.show(&grid, row, source, window, cx);
         }
+        self.follow_reference(cx);
         cx.notify();
     }
 
@@ -781,8 +794,8 @@ impl ValuePanel {
                         ),
                 )
             })
-            // K18: sections about the cell (the row a foreign key points to)
-            // go here, under the value.
+            // K18: the row the cell's foreign key points to.
+            .children(self.render_preview(cx))
             .into_any_element()
     }
 }

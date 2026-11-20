@@ -937,6 +937,66 @@ impl Storage {
         })
         .map(drop)
     }
+
+    /// The columns the user picked for the preview of a table's rows that
+    /// foreign keys point to (K18), by name; `None` when they leave it to
+    /// Kerno. Kept beside the table's layout (J6), in the same table under a
+    /// key of its own: a data tab of that table, which writes its layout
+    /// from what it holds, never overwrites it, and it goes with the
+    /// connection as the layout does.
+    pub fn preview_columns(
+        &self,
+        connection_id: &str,
+        table_key: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let json: Option<String> = self.with(|c| {
+            c.query_row(
+                "SELECT layout_json FROM table_layouts WHERE connection_id = ?1 AND table_key = ?2",
+                params![connection_id, preview_key(table_key)],
+                |row| row.get(0),
+            )
+            .optional()
+        })?;
+        Ok(json.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
+    /// Keeps the columns picked for a table's preview; `None` goes back to
+    /// Kerno's choice.
+    pub fn save_preview_columns(
+        &self,
+        connection_id: &str,
+        table_key: &str,
+        columns: Option<&[String]>,
+    ) -> Result<()> {
+        let key = preview_key(table_key);
+        let Some(columns) = columns else {
+            return self
+                .with(|c| {
+                    c.execute(
+                        "DELETE FROM table_layouts WHERE connection_id = ?1 AND table_key = ?2",
+                        params![connection_id, key],
+                    )
+                })
+                .map(drop);
+        };
+        let json =
+            serde_json::to_string(columns).map_err(|error| Error::Storage(error.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO table_layouts (connection_id, table_key, layout_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (connection_id, table_key) DO UPDATE
+                 SET layout_json = excluded.layout_json, updated_at = excluded.updated_at",
+                params![connection_id, key, json, now_ms()],
+            )
+        })
+        .map(drop)
+    }
+}
+
+/// Where the preview columns of the table stored under `table_key` are.
+fn preview_key(table_key: &str) -> String {
+    format!("fk-preview:{table_key}")
 }
 
 /// How the columns of a table's data were laid out, by column name: a
@@ -2455,6 +2515,43 @@ mod tests {
             .unwrap();
         storage.delete_connection(&connection).unwrap();
         assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+    }
+
+    /// K18: the columns picked for a table's preview are kept apart from its
+    /// layout, which neither writes nor clears them, and go with the
+    /// connection.
+    #[test]
+    fn preview_columns_round_trip_beside_the_layout() {
+        let storage = Storage::in_memory().unwrap();
+        let connection = storage.save_connection(None, &config("c")).unwrap();
+        let key = r#"["kerno","shop","customers"]"#;
+        assert_eq!(storage.preview_columns(&connection, key).unwrap(), None);
+        let picked = vec!["phone".to_string(), "email".to_string()];
+        storage
+            .save_preview_columns(&connection, key, Some(&picked))
+            .unwrap();
+        // The layout of the same table, written and cleared, leaves them.
+        storage
+            .save_table_layout(&connection, key, &layout())
+            .unwrap();
+        storage
+            .save_table_layout(&connection, key, &TableLayout::default())
+            .unwrap();
+        assert_eq!(
+            storage.preview_columns(&connection, key).unwrap(),
+            Some(picked.clone())
+        );
+        assert_eq!(storage.table_layout(&connection, key).unwrap(), None);
+        // Back to Kerno's choice.
+        storage
+            .save_preview_columns(&connection, key, None)
+            .unwrap();
+        assert_eq!(storage.preview_columns(&connection, key).unwrap(), None);
+        storage
+            .save_preview_columns(&connection, key, Some(&picked))
+            .unwrap();
+        storage.delete_connection(&connection).unwrap();
+        assert_eq!(storage.preview_columns(&connection, key).unwrap(), None);
     }
 
     /// J4: what an unsaved connection left goes; a saved one keeps it.

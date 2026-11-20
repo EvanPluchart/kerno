@@ -189,7 +189,7 @@ fn quitting_from_a_dialog_asks_too(cx: &mut TestAppContext) {
 /// waits behind it. Dropping it releases the lock and closes the session,
 /// whether the test passed or not; a session that does not end in 15 s is
 /// terminated (its own, and no other).
-struct Locker {
+pub(super) struct Locker {
     engine: Engine,
     id: String,
     release: Option<std::sync::mpsc::Sender<()>>,
@@ -197,7 +197,7 @@ struct Locker {
 }
 
 impl Locker {
-    fn start(engine: Engine, table: &str) -> Self {
+    pub(super) fn start(engine: Engine, table: &str) -> Self {
         Self::start_in(engine, None, table)
     }
 

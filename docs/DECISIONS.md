@@ -2234,3 +2234,52 @@ switch between light and dark, a Settings page that lists and changes the shortc
   the panel is not drawn (and the double click and Shift+Enter go back to the inline editor and the dialog) until
   the window is wider again. A text column holding JSON is shown indented when read-only but as stored when it
   can be edited, so that Set never re-indents a user's text.
+
+## D-091 — The row a foreign key points to: read on the panel's own session, after a rest, cached per grid (K18; 2026-11-20)
+
+- **The session**: one of the value panel's own, opened through `Connections::open_session` in the tab's
+  connection and database at the first key to read, kept for the next ones, and closed when the panel goes
+  (hidden, its tab closed: a `oneshot` sender in the panel; its drop wakes the task that closes the session),
+  when its connection or database changes, after a failed read, and when a read is stopped. Not the
+  connection's meta session: K15 found that a read waiting there (behind a lock) also holds the keep-alive
+  ping, and the connection is then declared lost and reopened. Not the tab's session: a data tab's runs its
+  pages and counts, and a query tab's holds the user's transaction and statements; a preview's read there would
+  wait behind them, a stop would close the user's session, and on PostgreSQL a failed read would abort the
+  user's transaction. Cost: one more server connection per tab whose panel has shown a key.
+- **Inside an open transaction**: the panel's session is in auto-commit, so it sees committed rows only. A key
+  the user's own open transaction inserted is "No row with this key", and the panel then adds "Rows of this
+  tab's open transaction are not seen here: only committed rows are." A pending key (edited, not applied) is
+  previewed by its pending value, said under the heading ("The row of the pending value, not applied yet.");
+  a pending default or expression is not known until applied, and the panel says so.
+- **The statement** is the cell menu's jump's (E3): `data::tab::reference` builds the referenced table and the
+  filter on its key from the row's values (pending ones included, every column of a composite key, nothing
+  when one is NULL or binary), and `browse::page_sql` writes `SELECT * FROM <table> WHERE <key> = <literal> …
+  LIMIT 1` through `Filter::where_sql`, its literals typed by the columns that hold the key here (no catalog
+  read of the referenced table). `SELECT *` rather than the columns shown: one read serves Kerno's choice, the
+  user's and "Show all columns", and gives the column list "Choose columns…" offers. Bounded to 10 s on the
+  UI's clock, then stopped (`bridge::Stop`: the task dropped and the session closed, so the server stops the
+  statement): "Not read: the server took longer than 10 s." with Try again; Cancel on the "Reading…" line says
+  "Not read: cancelled.".
+- **Debounce, then stop**: a read starts once the selection has rested 250 ms on a key, so moving through the
+  cells reads nothing; a read in flight is stopped when the selection moves to another key or off the keys
+  (another column of the same key, or a row with the same key, keeps it). Cancel-and-replace alone would open a
+  session per cell walked through, since a stop closes the session. "Reading the row of …" shows only after
+  300 ms: a fast answer does not flicker.
+- **The default columns** (`default_columns`, a pure function): names matched case-insensitively without `_`,
+  `-` or spaces, in this order: name, full name, display name, first name, given name, last name, surname,
+  family name, title, label, email, email address, mail, username, login, nickname, handle, code, slug; then
+  any other column whose name ends in name, title or email; else the text columns, short types before long
+  ones (`text`, `longtext`…); else the first columns. Never the key itself, nor binary or JSON columns; at most
+  eight.
+- **The choice of columns** is stored per connection and referenced table (J6's key: database, schema, table)
+  in J6's `table_layouts` table under a key of its own (`fk-preview:` before the layout's key), not as a field
+  of the table's layout: an open data tab of that table writes its layout from what it holds and would
+  overwrite a choice made elsewhere. No migration (no copy of the store at the next start, no refusal by an
+  older Kerno); it goes with the connection as the layouts do. "Kerno's choice" in the menu removes it.
+- **The cache**: per panel, by referenced table and key values, rows and "no row" only (never a failure or a
+  stop), cleared when the panel follows another grid: a refresh, an Apply, another page, a re-run each make a
+  new grid, and rows may have changed. At most 256 keys, then cleared.
+- **Query results**: an editable result of one table (K17's `ReadOnly` resolved) knows that table's foreign keys
+  already (`Grid::structure`): its panel previews them, its columns mapped to the table's through the result's
+  labels; no catalog read is added for any other result. "Open the row" is a data tab's only (a result's cell
+  menu has no jump).

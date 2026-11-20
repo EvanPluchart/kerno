@@ -1268,12 +1268,45 @@ impl Grid {
         }
     }
 
-    /// The text of a row's cell in the column called `name`; `None` for
-    /// NULL, bytes, and a column the result does not have.
-    pub fn text_of(&self, row: usize, name: &str) -> Option<String> {
-        let columns = self.store.columns();
-        let source = columns.iter().position(|column| column.name == name)?;
-        if columns[source].kind == TypeKind::Binary || row >= self.total_rows() {
+    /// The text of a row's cell in the column of the result that shows the
+    /// table column `name` (an editable result may label it otherwise);
+    /// `None` for NULL, bytes, and a column the result does not show.
+    pub fn table_text(&self, row: usize, name: &str) -> Option<String> {
+        self.text_at(row, self.source_of(name)?)
+    }
+
+    /// The columns of the result under the names of the table columns they
+    /// show (empty: none).
+    fn table_columns(&self) -> &[kerno_core::Column] {
+        match self.edits.as_ref().and_then(|edits| edits.renamed.as_ref()) {
+            Some(renamed) => renamed,
+            None => self.store.columns(),
+        }
+    }
+
+    /// The name of the table column a column of the result shows, when it
+    /// shows one, written to or not (K18).
+    pub(super) fn table_column_name(&self, source: usize) -> Option<&str> {
+        Some(self.table_columns().get(source)?.name.as_str()).filter(|name| !name.is_empty())
+    }
+
+    /// The column of the result that shows the table column `name`.
+    pub(super) fn source_of(&self, name: &str) -> Option<usize> {
+        self.table_columns()
+            .iter()
+            .position(|column| column.name == name)
+    }
+
+    /// Whether the owner's menu jumps along foreign keys
+    /// ([`GridAction::Follow`]): a table's data does.
+    pub(super) fn follows(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.related.is_some())
+    }
+
+    fn text_at(&self, row: usize, source: usize) -> Option<String> {
+        if self.store.columns()[source].kind == TypeKind::Binary || row >= self.total_rows() {
             return None;
         }
         Some(String::from_utf8_lossy(self.cell(row, source)?).into_owned())

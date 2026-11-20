@@ -7580,7 +7580,18 @@ impl Render for QueryTab {
         // The value panel follows the result on screen (the focused one
         // among stacked results).
         let (grid, why) = (self.active_grid(), self.result_edits().err().flatten());
-        value_panel::sync(&mut self.value_panel, grid.as_ref(), why, window, cx);
+        let lookup = self.target.clone().map(|target| value_panel::Lookup {
+            connections: self.connections.clone(),
+            target,
+        });
+        value_panel::sync(
+            &mut self.value_panel,
+            grid.as_ref(),
+            why,
+            lookup,
+            window,
+            cx,
+        );
         // The filter field shows the filter of the result on screen.
         let filterable = self
             .results

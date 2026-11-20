@@ -27,7 +27,7 @@ use kerno_core::browse::{
 };
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
-use kerno_core::schema::{RelationKind, TableRef, TableStructure};
+use kerno_core::schema::{ForeignKeyInfo, RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits_until};
 use kerno_core::storage::TableLayout;
 use kerno_core::{Engine, Error, ResultStore, Session, TxState, describe, exec};
@@ -389,25 +389,9 @@ impl DataTab {
         tab
     }
 
-    /// What the layout of this table's columns is stored under: the
-    /// database, the schema and the table (a MySQL table's schema is its
-    /// database), with the connection apart. The database is the one the
-    /// session is in, known before it opens: a PostgreSQL connection that
-    /// names none opens in the driver's default one, which is also what the
-    /// tree names (J6).
+    /// What the layout of this table's columns is stored under (J6).
     fn layout_key(&self, cx: &App) -> String {
-        let saved = self.connections.read(cx).get(&self.target.connection);
-        let database = match saved.map(|saved| saved.config.engine) {
-            Some(Engine::MySql | Engine::MariaDb) => String::new(),
-            _ => self
-                .target
-                .database
-                .clone()
-                .or_else(|| saved.and_then(|saved| saved.config.database.clone()))
-                .unwrap_or_else(|| kerno_postgres::DEFAULT_DATABASE.to_string()),
-        };
-        serde_json::to_string(&[database.as_str(), &self.table.schema, &self.table.name])
-            .unwrap_or_default()
+        table_key(self.connections.read(cx), &self.target, &self.table)
     }
 
     /// Reads the layout last given to this table, then the first page, in
@@ -2687,36 +2671,12 @@ pub struct Related {
 /// Where the foreign keys of a row lead: to the row it references, and to
 /// the rows that reference it. A key with a NULL column leads nowhere.
 pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Related> {
-    // The values of `columns` in this row, when none is NULL.
-    let values = |columns: &[String]| -> Option<Vec<String>> {
-        columns
-            .iter()
-            .map(|column| grid.text_of(row, column))
-            .collect()
-    };
-    let filter = |on: &[String], values: Vec<String>| Filter {
-        conditions: on
-            .iter()
-            .zip(values)
-            .map(|(column, value)| Condition::equals(column.clone(), value))
-            .collect(),
-        raw: String::new(),
-    };
-    let references = structure.foreign_keys.iter().filter_map(|key| {
-        let values = values(&key.columns)?;
-        Some(Related {
-            label: format!(
-                "Go to {} ({} = {})",
-                key.referenced_table.name,
-                key.columns.join(", "),
-                values.join(", ")
-            ),
-            table: key.referenced_table.clone(),
-            filter: filter(&key.referenced_columns, values),
-        })
-    });
+    let references = structure
+        .foreign_keys
+        .iter()
+        .filter_map(|key| reference(key, grid, row));
     let referenced_by = structure.referenced_by.iter().filter_map(|key| {
-        let values = values(&key.referenced_columns)?;
+        let values = values_of(grid, row, &key.referenced_columns)?;
         Some(Related {
             label: format!(
                 "Rows of {} referencing this one ({})",
@@ -2724,10 +2684,65 @@ pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Relat
                 key.columns.join(", ")
             ),
             table: key.table.clone(),
-            filter: filter(&key.columns, values),
+            filter: equal_to(&key.columns, values),
         })
     });
     references.chain(referenced_by).collect()
+}
+
+/// The row a foreign key of a row points to, when none of its columns is
+/// NULL: the jump of the cell menu, and the value panel's preview (K18).
+pub fn reference(key: &ForeignKeyInfo, grid: &Grid, row: usize) -> Option<Related> {
+    let values = values_of(grid, row, &key.columns)?;
+    Some(Related {
+        label: format!(
+            "Go to {} ({} = {})",
+            key.referenced_table.name,
+            key.columns.join(", "),
+            values.join(", ")
+        ),
+        table: key.referenced_table.clone(),
+        filter: equal_to(&key.referenced_columns, values),
+    })
+}
+
+/// The values of the table columns `columns` in a row, when none is NULL.
+fn values_of(grid: &Grid, row: usize, columns: &[String]) -> Option<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| grid.table_text(row, column))
+        .collect()
+}
+
+/// The rows whose `on` columns hold `values`.
+fn equal_to(on: &[String], values: Vec<String>) -> Filter {
+    Filter {
+        conditions: on
+            .iter()
+            .zip(values)
+            .map(|(column, value)| Condition::equals(column.clone(), value))
+            .collect(),
+        raw: String::new(),
+    }
+}
+
+/// What the layout of a table's columns is stored under (J6), and the
+/// columns its preview shows (K18): the database, the schema and the
+/// table (a MySQL table's schema is its database), with the connection
+/// apart. The database is the one the session is in, known before it
+/// opens: a PostgreSQL connection that names none opens in the driver's
+/// default one, which is also what the tree names.
+pub fn table_key(connections: &Connections, target: &Target, table: &TableRef) -> String {
+    let saved = connections.get(&target.connection);
+    let database = match saved.map(|saved| saved.config.engine) {
+        Some(Engine::MySql | Engine::MariaDb) => String::new(),
+        _ => target
+            .database
+            .clone()
+            .or_else(|| saved.and_then(|saved| saved.config.database.clone()))
+            .unwrap_or_else(|| kerno_postgres::DEFAULT_DATABASE.to_string()),
+    };
+    serde_json::to_string(&[database.as_str(), &table.schema, &table.name]).unwrap_or_default()
 }
 
 /// What a view does with an interval of auto-refresh (`None`: stop).
@@ -2822,7 +2837,18 @@ impl Render for DataTab {
         let read_only = self.grid.as_ref().and_then(|_| self.read_only_reason(cx));
         let grid = self.grid.clone();
         let why = read_only.clone().map(SharedString::from);
-        value_panel::sync(&mut self.value_panel, grid.as_ref(), why, window, cx);
+        let lookup = value_panel::Lookup {
+            connections: self.connections.clone(),
+            target: self.target.clone(),
+        };
+        value_panel::sync(
+            &mut self.value_panel,
+            grid.as_ref(),
+            why,
+            Some(lookup),
+            window,
+            cx,
+        );
         let theme = cx.theme();
         let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
         v_flex()

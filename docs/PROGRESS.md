@@ -768,3 +768,21 @@ Still open (for the owner):
 - Tests: three unit tests (one extended), three UI tests on PostgreSQL and MySQL, each seen failing under a
   one-line mutation. Captures `m12-value-panel-json-{light,dark}` to take. Limits in the "Done:" line of K17
   (`docs/plans/M12.md`).
+
+## 2026-11-20 — K18: the row a foreign key points to, previewed in the value panel (the owner's request)
+
+- `query/value_panel/fk_preview.rs`: under the value of a foreign-key cell, the referenced row as a short
+  record ("customers, by customer_id"): the columns a person reads first (`default_columns`, a pure function),
+  "Show all N columns", "Choose columns…" (kept per connection and table beside J6's layouts, under a key of
+  their own: no migration), "Open the row" (the cell menu's jump). Composite keys, a pending key (its pending
+  value's row, said), NULL (nothing), a dangling key ("No row with this key"), a failure (the server's
+  message), a stop ("Not read: cancelled." / "… took longer than 10 s.", Try again). Editable one-table query
+  results too. D-091.
+- The read is the E3 jump's statement (`data::tab::reference`, extracted from `related`, and `page_sql` with a
+  limit of one), on a session of the panel's own, started once the selection rests 250 ms, stopped
+  (`bridge::Stop`) when it moves to another key and after 10 s, cached per grid.
+- `Grid::text_of` became `Grid::table_text` (the result's column that shows a table column, through an
+  editable result's labels); `data::tab::table_key` is J6's layout key, shared.
+- Tests: two unit tests, one storage test, seven UI tests in `ui_tests/fk_preview.rs` on the three engines,
+  each seen failing under a one-line mutation (`docs/plans/M12.md`, K18). Captures `m12-fk-preview-{light,dark}`
+  to take.

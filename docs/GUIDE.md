@@ -207,6 +207,17 @@ keeps the panel on its cell while you move around the grid. With the panel shown
 on a cell puts the keyboard in the panel; with it hidden, Shift+Enter opens the value in a dialog as before, as
 does "View value" in a cell's menu.
 
+When the selected cell holds a foreign key (an order's `customer_id`, say), the panel shows under the value the
+row it points to, headed "customers, by customer_id": the columns a person reads first (a name, an email, a
+title, a code…), "Show all N columns" for the rest. "Choose columns…" picks the ones shown for that table, for
+every key that points to it, and Kerno remembers them; "Kerno's choice" goes back to the default. "Open the
+row" opens it in a tab of its own, as the cell's menu does. The row is read once the selection rests on the
+cell for a moment, on a session of the panel's own, so it shows committed rows: a key your own open
+transaction added says "No row with this key". A key you edited and not applied shows the row of the new
+value, and says so. Nothing is shown for NULL; a key that points nowhere says "No row with this key"; a read
+the server does not answer in 10 s is stopped, with Try again. Results of a query show this too when they are
+one table's and can be edited.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open

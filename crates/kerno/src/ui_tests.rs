@@ -48,6 +48,7 @@ mod editing_v11;
 mod editor_v11;
 mod environments;
 mod erd;
+mod fk_preview;
 mod folders;
 mod grid_v11;
 mod menus;
