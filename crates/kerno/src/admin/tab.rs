@@ -9,7 +9,7 @@
 //! (`PostgreSessionEditor`, `MySQLSessionEditor`): refresh, auto-refresh,
 //! cancel query, terminate, each confirmed.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -208,9 +208,9 @@ pub struct AdminTab {
     section: usize,
     auto_refresh: Option<Duration>,
     ticker: Option<Task<()>>,
-    /// The workspace's active tab: the sessions refresh on their own only
-    /// while this tab is the one shown.
-    shown: Rc<Cell<Option<EntityId>>>,
+    /// The tab each group of the workspace shows: the sessions refresh on
+    /// their own only while this tab is one of them.
+    shown: Rc<RefCell<Vec<EntityId>>>,
     /// The last job on the session; the next one waits for it, so the
     /// session runs one statement at a time and refreshes never pile up.
     job: Option<Task<()>>,
@@ -229,7 +229,7 @@ impl AdminTab {
     pub fn new(
         target: Target,
         connections: Entity<Connections>,
-        shown: Rc<Cell<Option<EntityId>>>,
+        shown: Rc<RefCell<Vec<EntityId>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -612,7 +612,7 @@ impl AdminTab {
     /// One period of the auto-refresh: the sessions are read again when
     /// they are on screen and not being read already.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.shown.get() == Some(cx.entity_id());
+        let shown = self.shown.borrow().contains(&cx.entity_id());
         let pane = match self.section {
             SESSIONS => Pane::Sessions,
             LOCKS => Pane::Locks,

@@ -78,6 +78,10 @@ fn tab_entry(menu: TabMenu, action: &TabAction) -> Palette {
         A::Duplicate => Command("duplicate_tab"),
         A::CopyPath => Command("copy_tab_file_path"),
         A::Reveal => Command("reveal_tab_file"),
+        A::SplitRight => Command("split_right"),
+        A::SplitDown => Command("split_down"),
+        A::MoveToOtherGroup | A::MoveToNextGroup => Command("move_tab_to_next_group"),
+        A::MoveToPreviousGroup => Command("move_tab_to_previous_group"),
         A::NewQuery => Command("new_query_tab"),
         A::ReopenClosed => Command("reopen_closed_tab"),
         A::ApplySource => Command("apply_source"),
@@ -424,6 +428,15 @@ fn every_entry() -> Vec<Found> {
         );
     }
     walk_tabs("tab bar", TabMenu::Window, tabs::bar_menu(2, 1), &mut found);
+    // A tab's entries about the groups (K19), with two groups and with more.
+    for groups in [2, 3] {
+        walk_tabs(
+            "tab groups",
+            TabMenu::Window,
+            tabs::group_entries(groups, None),
+            &mut found,
+        );
+    }
     let choices = Choices {
         connections: vec![("c1".into(), "one".into(), true)],
         connection: Some("c1".into()),

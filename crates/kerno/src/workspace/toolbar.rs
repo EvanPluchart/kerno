@@ -363,7 +363,7 @@ impl Workspace {
             }
         });
         let fixed = matches!(
-            self.tabs.get(self.active_tab),
+            self.active_open(),
             Some(
                 OpenTab::Data(_)
                     | OpenTab::Structure(_)
@@ -377,7 +377,7 @@ impl Workspace {
     /// Where the active tab works, whatever its kind; a table's tab is on
     /// its table's schema (its database on MySQL).
     fn shown_target(&self, cx: &App) -> Option<Target> {
-        let tab = self.tabs.get(self.active_tab)?;
+        let tab = self.active_open()?;
         let mut target = tab.target(cx)?;
         let table = match tab {
             OpenTab::Data(tab) => Some(tab.read(cx).table().clone()),
@@ -955,8 +955,7 @@ fn tools_menu(workspace: &Entity<Workspace>, mut menu: PopupMenu, cx: &mut App) 
     );
     // The active tab's database when it is on this connection.
     let target = this
-        .tabs
-        .get(this.active_tab)
+        .active_open()
         .and_then(|tab| tab.target(cx))
         .filter(|target| target.connection == id)
         .unwrap_or_else(|| connection_target(&id));

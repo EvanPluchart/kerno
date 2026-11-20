@@ -5964,6 +5964,9 @@ impl QueryTab {
 
         h_flex()
             .flex_none()
+            // A group of a split is often narrower than the toolbar: its
+            // buttons go to a second line instead of off the edge (K19).
+            .flex_wrap()
             .px_2()
             .py_1()
             .gap_1()

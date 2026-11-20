@@ -14,7 +14,7 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, resize_handle};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
@@ -72,7 +72,7 @@ use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::settings::TabLayout;
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
-use crate::state::{ACTIVE_TAB_KEY, AppState};
+use crate::state::{ACTIVE_TAB_KEY, AppState, TAB_LAYOUT_KEY};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{PROPERTIES_SECTION, StructureTab, StructureTabEvent};
 use crate::tabs::{
@@ -129,6 +129,7 @@ enum Asking {
 /// minutes, so a quarter of one is close enough.
 const TX_AGE_REFRESH: Duration = Duration::from_secs(15);
 
+pub(crate) mod panes;
 pub(crate) mod toolbar;
 pub(crate) mod updates;
 
@@ -141,6 +142,55 @@ enum MenuOf {
     Bar,
     /// An item of the status bar.
     Status(StatusItem),
+}
+
+/// The smallest a group of tabs gets when a divider is dragged (K19).
+const MIN_GROUP: gpui_kit::Pixels = px(160.);
+
+/// A tab being dragged to another place of the tab area (K19).
+#[derive(Clone)]
+struct DraggedTab {
+    id: EntityId,
+    label: SharedString,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .text_sm()
+            .child(self.label.clone())
+    }
+}
+
+/// A divider between two groups being dragged: the split (child indices
+/// from the root) and the child it follows.
+#[derive(Clone)]
+struct DraggedDivider {
+    path: Vec<usize>,
+    divider: usize,
+}
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// Where a dragged tab is dropped in a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// On its strip, before the tab at this place (past the end: last).
+    Strip(usize),
+    /// On its content: at an edge it splits there, in the middle it joins.
+    Content(Option<panes::Edge>),
 }
 
 /// A tab of the central area.
@@ -420,8 +470,11 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     connections: Entity<Connections>,
     sidebar: Entity<Sidebar>,
+    /// Every open tab of every group, in the layout's order (group after group, each in its
+    /// strip's order): see `sync_tabs`.
     tabs: Vec<OpenTab>,
-    active_tab: usize,
+    /// The groups of tabs, which tab each shows, and the focused one (K19).
+    panes: panes::Layout<EntityId>,
     /// The last query tabs closed, the latest last; in memory only.
     closed: Vec<TabSnapshot>,
     /// Number given to the next "Query N" tab.
@@ -434,18 +487,28 @@ pub struct Workspace {
     /// Where the active query tab runs, written on each frame for the
     /// schema tree's "Set as default for this tab".
     tab_target: Rc<RefCell<Option<Target>>>,
-    /// The active tab, written on each frame: an administration tab
-    /// refreshes on its own only while it is the one shown.
-    shown_tab: Rc<Cell<Option<EntityId>>>,
-    /// The scroll of the tab strip.
-    tab_scroll: ScrollHandle,
-    /// The active tab, the tab count, the layout, the active tab's label and
-    /// whether it shows a transaction badge, as the strip last scrolled for (a
-    /// label that grows, an unsaved mark or a badge added, can push its close
-    /// button out of the strip).
-    revealed_tab: Option<(usize, usize, TabLayout, Option<SharedString>, bool)>,
-    /// The list of every open tab (J10) is open.
-    all_tabs_open: bool,
+    /// The tab each group shows, written on each frame: an administration tab
+    /// refreshes on its own only while it is shown.
+    shown_tab: Rc<RefCell<Vec<EntityId>>>,
+    /// The scroll of each group's tab strip.
+    tab_scrolls: RefCell<std::collections::HashMap<panes::GroupId, ScrollHandle>>,
+    /// The focused group, its active tab, the tab count, the layout, the active
+    /// tab's label and whether it shows a transaction badge, as the strip last
+    /// scrolled for (a label that grows, an unsaved mark or a badge added, can
+    /// push its close button out of the strip).
+    revealed_tab: Option<(
+        panes::GroupId,
+        usize,
+        usize,
+        TabLayout,
+        Option<SharedString>,
+        bool,
+    )>,
+    /// The group whose list of its open tabs (J10) is open.
+    all_tabs_open: Option<panes::GroupId>,
+    /// Where a tab dragged now would land, over the content of a group:
+    /// its indicator is drawn there (K19).
+    drop_zone: Option<(panes::GroupId, Option<panes::Edge>)>,
     /// The filter of that list, shown when many tabs are open.
     all_tabs_filter: Entity<InputState>,
     /// The scroll of that list: it opens on the active tab.
@@ -473,7 +536,8 @@ pub struct Workspace {
     /// Quitting was decided (`cx.quit()` does nothing on the test platform).
     #[cfg(test)]
     quit_requested: bool,
-    tab_subscriptions: Vec<Subscription>,
+    /// One per tab, by its id: dropped with it.
+    tab_subscriptions: std::collections::HashMap<EntityId, Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -484,6 +548,7 @@ impl Workspace {
         connections: Entity<Connections>,
         tabs: Vec<TabSnapshot>,
         active_tab: usize,
+        layout: Option<panes::SavedPane>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -527,18 +592,19 @@ impl Workspace {
             connections,
             sidebar,
             tabs: Vec::new(),
-            active_tab: 0,
+            panes: panes::Layout::default(),
             closed: Vec::new(),
             next_query_number: 1,
             palette,
             pending_save: None,
             pending_editor: None,
             tab_target,
-            shown_tab: Rc::new(Cell::new(None)),
-            tab_scroll: ScrollHandle::new(),
+            shown_tab: Rc::new(RefCell::new(Vec::new())),
+            tab_scrolls: RefCell::default(),
             revealed_tab: None,
             all_tabs_scroll: ScrollHandle::new(),
-            all_tabs_open: false,
+            all_tabs_open: None,
+            drop_zone: None,
             all_tabs_filter,
             dialog_open: false,
             last_focus: None,
@@ -551,7 +617,7 @@ impl Workspace {
             large_script: LARGE_SCRIPT,
             #[cfg(test)]
             opened_wizard: None,
-            tab_subscriptions: Vec::new(),
+            tab_subscriptions: std::collections::HashMap::new(),
             _subscriptions: vec![
                 follow_system,
                 flush_on_quit,
@@ -563,21 +629,277 @@ impl Workspace {
         };
         // A connection gone since (deleted, or opened from a URL and never
         // saved) leaves its query tabs' text, not its other tabs.
-        let mut active_tab = active_tab;
-        for (index, snapshot) in tabs.into_iter().enumerate() {
+        let mut opened = Vec::with_capacity(tabs.len());
+        for snapshot in tabs {
             let known = |id: &str| workspace.connections.read(cx).get(id).is_some();
             let Some(snapshot) = snapshot.without_gone_connection(known) else {
-                active_tab -= usize::from(index < active_tab);
+                opened.push(None);
                 continue;
             };
             workspace.push_snapshot(snapshot, window, cx);
-            if let Some(tab) = workspace.tabs.last() {
-                tab.defer_until_shown(cx);
+            let tab = workspace.active_open().expect("the tab just opened");
+            tab.defer_until_shown(cx);
+            opened.push(Some(tab.entity_id()));
+        }
+        // The groups as they were (one before K19, or when the stored layout
+        // no longer fits), and the tab that was active is active again.
+        workspace.panes = panes::Layout::restore(layout.as_ref(), &opened, active_tab);
+        workspace.sync_tabs();
+        workspace
+    }
+
+    /// The index in `tabs` of the tab `id`.
+    fn index_of(&self, id: EntityId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.entity_id() == id)
+    }
+
+    /// The index in `tabs` of the tab the focused group shows, `tabs.len()`
+    /// when there is none (so `tabs.get` gives `None`).
+    fn active_index(&self) -> usize {
+        self.panes
+            .active()
+            .and_then(|id| self.index_of(id))
+            .unwrap_or(self.tabs.len())
+    }
+
+    /// The tab the focused group shows.
+    fn active_open(&self) -> Option<&OpenTab> {
+        self.tabs.get(self.active_index())
+    }
+
+    /// Puts `tabs` back in the layout's order after the groups changed, so an
+    /// index into it reads left to right, group after group.
+    fn sync_tabs(&mut self) {
+        let order = self.panes.order();
+        self.tabs.sort_by_key(|tab| {
+            order
+                .iter()
+                .position(|id| *id == tab.entity_id())
+                .unwrap_or(usize::MAX)
+        });
+        // A group gone takes its strip's scroll with it.
+        let groups: Vec<panes::GroupId> = self.panes.groups().iter().map(|g| g.id).collect();
+        self.tab_scrolls
+            .get_mut()
+            .retain(|group, _| groups.contains(group));
+    }
+
+    /// The tab just pushed at the end of `tabs` joins the focused group, at
+    /// the end of its strip, and is shown there.
+    fn adopt_last_tab(&mut self) {
+        if let Some(tab) = self.tabs.last() {
+            self.panes.add(tab.entity_id());
+        }
+        self.sync_tabs();
+    }
+
+    /// The indices in `tabs` of the tabs of `group`, in its strip's order.
+    fn group_indices(&self, group: &panes::Group<EntityId>) -> Vec<usize> {
+        group
+            .tabs
+            .iter()
+            .filter_map(|id| self.index_of(*id))
+            .collect()
+    }
+
+    /// The group of the tab at `index`, the tab's place in that group's strip
+    /// and the number of tabs there.
+    fn place_of(&self, index: usize) -> Option<(panes::GroupId, usize, usize)> {
+        let id = self.tabs.get(index)?.entity_id();
+        let group = self.panes.group(self.panes.group_of(id)?)?;
+        let position = group.tabs.iter().position(|each| *each == id)?;
+        Some((group.id, position, group.tabs.len()))
+    }
+
+    /// The tabs of the group of the tab at `index`, as `tabs` holds them.
+    fn tabs_of_group_at(&self, index: usize) -> Vec<OpenTab> {
+        let Some((group, ..)) = self.place_of(index) else {
+            return Vec::new();
+        };
+        let group = self.panes.group(group).expect("found above");
+        self.group_indices(group)
+            .into_iter()
+            .map(|index| self.tabs[index].clone())
+            .collect()
+    }
+
+    /// The scroll of a group's tab strip.
+    fn strip_scroll(&self, group: panes::GroupId) -> ScrollHandle {
+        self.tab_scrolls
+            .borrow_mut()
+            .entry(group)
+            .or_default()
+            .clone()
+    }
+
+    /// The menu of the tab at `index`: its place in its group's strip, and
+    /// the groups' entries (K19).
+    fn tab_menu(&self, tab: &OpenTab, index: usize, cx: &App) -> Vec<Entry> {
+        let (group, position, count) = self.place_of(index).unwrap_or((self.panes.focused(), 0, 1));
+        let mut entries = tabs::tab_menu(tab.kind(cx), position, count);
+        let split = self.panes.can_split(tab.entity_id(), group).err();
+        entries.extend(tabs::group_entries(
+            self.panes.groups().len(),
+            split.map(panes::Refusal::reason),
+        ));
+        entries
+    }
+
+    /// Where a tab dragged over the content of `group`, in `zone` of it,
+    /// would land: `None` where it changes nothing (the middle of its own
+    /// group, an edge of the group it is alone in). With four groups an
+    /// edge only moves it into the group, as the middle does.
+    fn drop_zone_for(
+        &self,
+        tab: EntityId,
+        group: panes::GroupId,
+        zone: Option<panes::Edge>,
+    ) -> Option<Option<panes::Edge>> {
+        let own = self.panes.group_of(tab) == Some(group);
+        match zone.map(|edge| (edge, self.panes.can_split(tab, group))) {
+            Some((edge, Ok(()))) => Some(Some(edge)),
+            Some((_, Err(panes::Refusal::Alone))) => None,
+            Some((_, Err(panes::Refusal::TooMany))) | None => (!own).then_some(None),
+        }
+    }
+
+    /// Puts the dragged tab where it was dropped in `group`, then shows it
+    /// there (K19).
+    fn drop_tab(
+        &mut self,
+        tab: EntityId,
+        group: panes::GroupId,
+        landing: Landing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_zone = None;
+        if self.index_of(tab).is_none() {
+            return;
+        }
+        match landing {
+            Landing::Strip(at) => {
+                self.panes.move_tab(tab, group, at);
+            }
+            Landing::Content(None) => {
+                self.panes.move_tab(tab, group, usize::MAX);
+            }
+            Landing::Content(Some(edge)) => {
+                if let Err(refusal) = self.panes.split(tab, group, edge) {
+                    let text = format!("The tab stays where it was: {}.", refusal.reason());
+                    window.push_notification(Notification::warning(SharedString::from(text)), cx);
+                    cx.notify();
+                    return;
+                }
             }
         }
-        // The tab that was active is active again.
-        workspace.active_tab = active_tab.min(workspace.tabs.len().saturating_sub(1));
-        workspace
+        self.show_moved(tab, window, cx);
+    }
+
+    /// After the tab `tab` moved to another group or place: `tabs` in the
+    /// new order, the tab shown and given the keyboard, the layout stored.
+    fn show_moved(&mut self, tab: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_tabs();
+        if let Some(index) = self.index_of(tab) {
+            self.activate_tab(index, window, cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Split right or down, or move to another group, for the tab at
+    /// `index` (K19); says why not when it cannot.
+    fn regroup(
+        &mut self,
+        index: usize,
+        action: &TabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.tabs.get(index).map(OpenTab::entity_id) else {
+            return;
+        };
+        let Some(from) = self.panes.group_of(id) else {
+            return;
+        };
+        let edge = match action {
+            TabAction::SplitDown => Some(panes::Edge::Bottom),
+            TabAction::SplitRight => Some(panes::Edge::Right),
+            // With one group, "Move to the other group" makes it.
+            _ if self.panes.groups().len() == 1 => Some(panes::Edge::Right),
+            _ => None,
+        };
+        match edge {
+            Some(edge) => {
+                if let Err(refusal) = self.panes.split(id, from, edge) {
+                    let text = format!("{}: {}.", action.label(), refusal.reason());
+                    window.push_notification(Notification::warning(SharedString::from(text)), cx);
+                    return;
+                }
+            }
+            None => {
+                let forward = *action != TabAction::MoveToPreviousGroup;
+                let to = self.panes.next_group(from, forward);
+                self.panes.move_tab(id, to, usize::MAX);
+            }
+        }
+        self.show_moved(id, window, cx);
+    }
+
+    /// Gives the keyboard to the next group (or the one before), around.
+    fn focus_group(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let next = self.panes.next_group(self.panes.focused(), forward);
+        self.panes.focus(next);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// The indicator of where a dragged tab would land in `group`: half of
+    /// the content at an edge, all of it in the middle, with what a drop
+    /// does in words.
+    fn drop_indicator(&self, group: panes::GroupId, cx: &App) -> Option<AnyElement> {
+        let (_, zone) = self.drop_zone.filter(|(over, _)| *over == group)?;
+        let theme = cx.theme();
+        let half = gpui_kit::relative(0.5);
+        let text = match zone {
+            Some(panes::Edge::Left) => "Split to the left",
+            Some(panes::Edge::Right) => "Split to the right",
+            Some(panes::Edge::Top) => "Split up",
+            Some(panes::Edge::Bottom) => "Split down",
+            None => "Move to this group",
+        };
+        Some(
+            div()
+                .id(("tab-drop", group))
+                .test_support()
+                .absolute()
+                .map(|area| match zone {
+                    Some(panes::Edge::Left) => area.left_0().top_0().h_full().w(half),
+                    Some(panes::Edge::Right) => area.right_0().top_0().h_full().w(half),
+                    Some(panes::Edge::Top) => area.left_0().top_0().w_full().h(half),
+                    Some(panes::Edge::Bottom) => area.left_0().bottom_0().w_full().h(half),
+                    None => area.inset_0(),
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .border_2()
+                .border_color(theme.drag_border)
+                .bg(theme.drop_target)
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .text_sm()
+                        .child(text),
+                )
+                .test_text(text)
+                .into_any_element(),
+        )
     }
 
     /// Opens a tab again from what was stored of it.
@@ -664,6 +986,60 @@ impl Workspace {
             .collect()
     }
 
+    /// The groups of tabs as text, for tests (K19): `[A, B*]` a group, its
+    /// shown tab starred, `>` before the focused one; ` | ` between groups side
+    /// by side, ` / ` between groups one above the other, in parentheses.
+    #[cfg(test)]
+    pub fn layout_text(&self, cx: &App) -> String {
+        fn text(this: &Workspace, pane: &panes::Pane<EntityId>, cx: &App) -> String {
+            match pane {
+                panes::Pane::Tabs(group) => {
+                    let titles: Vec<String> = group
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, id)| {
+                            let title = this.tabs[this.index_of(*id)?].title(cx);
+                            let star = if position == group.active { "*" } else { "" };
+                            Some(format!("{title}{star}"))
+                        })
+                        .collect();
+                    let focus = if group.id == this.panes.focused() {
+                        ">"
+                    } else {
+                        ""
+                    };
+                    format!("{focus}[{}]", titles.join(", "))
+                }
+                panes::Pane::Split { axis, children, .. } => {
+                    let between = match axis {
+                        panes::Axis::Row => " | ",
+                        panes::Axis::Column => " / ",
+                    };
+                    let inner: Vec<String> =
+                        children.iter().map(|child| text(this, child, cx)).collect();
+                    format!("({})", inner.join(between))
+                }
+            }
+        }
+        text(self, self.panes.root(), cx)
+    }
+
+    /// The ids of the groups, in order; for tests.
+    #[cfg(test)]
+    pub fn group_ids(&self) -> Vec<panes::GroupId> {
+        self.panes.groups().iter().map(|group| group.id).collect()
+    }
+
+    /// The shares of the top split, `[1.0]` with one group; for tests.
+    #[cfg(test)]
+    pub fn root_shares(&self) -> Vec<f32> {
+        match self.panes.root() {
+            panes::Pane::Split { shares, .. } => shares.clone(),
+            panes::Pane::Tabs(_) => vec![1.],
+        }
+    }
+
     /// What would be stored of the open tabs now; for tests.
     #[cfg(test)]
     pub fn tab_snapshots(&self, cx: &App) -> Vec<TabSnapshot> {
@@ -704,10 +1080,14 @@ impl Workspace {
     /// the side list), and whether it overflows; for tests.
     #[cfg(test)]
     pub fn active_tab_in_view(&self) -> (bool, bool) {
-        let strip = &self.tab_scroll;
+        let strip = self.strip_scroll(self.panes.focused());
         let (viewport, offset) = (strip.bounds(), strip.offset());
+        let position = self
+            .panes
+            .group(self.panes.focused())
+            .map_or(0, |group| group.active);
         // Item bounds are laid out unscrolled: on screen at x + offset.
-        let inside = strip.bounds_for_item(self.active_tab).is_some_and(|tab| {
+        let inside = strip.bounds_for_item(position).is_some_and(|tab| {
             tab.left() + offset.x >= viewport.left() - px(1.)
                 && tab.right() + offset.x <= viewport.right() + px(1.)
                 && tab.top() + offset.y >= viewport.top() - px(1.)
@@ -726,40 +1106,40 @@ impl Workspace {
     /// Index of the active tab, when there is one.
     #[cfg(test)]
     pub fn active_tab_index(&self) -> Option<usize> {
-        (!self.tabs.is_empty()).then_some(self.active_tab)
+        (!self.tabs.is_empty()).then_some(self.active_index())
     }
 
     /// The active tab, when it is a query tab.
     pub fn active_query_tab(&self) -> Option<&Entity<QueryTab>> {
-        self.tabs.get(self.active_tab)?.query()
+        self.active_open()?.query()
     }
 
     /// The active tab, when it shows a table's data.
     pub fn active_data_tab(&self) -> Option<&Entity<DataTab>> {
-        self.tabs.get(self.active_tab)?.data()
+        self.active_open()?.data()
     }
 
     /// The active tab, when it shows a table's structure.
     #[cfg(test)]
     pub fn active_structure_tab(&self) -> Option<&Entity<StructureTab>> {
-        self.tabs.get(self.active_tab)?.structure()
+        self.active_open()?.structure()
     }
 
     /// The active tab, when it administers a server.
     #[cfg(test)]
     pub fn active_admin_tab(&self) -> Option<&Entity<AdminTab>> {
-        self.tabs.get(self.active_tab)?.admin()
+        self.active_open()?.admin()
     }
 
     /// The active tab, when it is the Tasks view.
     #[cfg(test)]
     pub fn active_tasks_tab(&self) -> Option<&Entity<TasksView>> {
-        self.tabs.get(self.active_tab)?.tasks()
+        self.active_open()?.tasks()
     }
 
     /// The active tab, when it is a table form.
     pub fn active_table_editor(&self) -> Option<&Entity<TableEditor>> {
-        self.tabs.get(self.active_tab)?.table_editor()
+        self.active_open()?.table_editor()
     }
 
     /// Opens the data of a table in a tab of its own.
@@ -775,7 +1155,7 @@ impl Workspace {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| DataTab::new(target, table, kind, filter, connections, window, cx));
         // The other end of a foreign key opens beside it.
-        self.tab_subscriptions.push(cx.subscribe_in(
+        let subscription = cx.subscribe_in(
             &tab,
             window,
             |this, tab, event: &DataTabEvent, window, cx| {
@@ -826,9 +1206,10 @@ impl Workspace {
                     }
                 }
             },
-        ));
+        );
+        self.tab_subscriptions.insert(tab.entity_id(), subscription);
         self.tabs.push(OpenTab::Data(tab.clone()));
-        self.active_tab = self.tabs.len() - 1;
+        self.adopt_last_tab();
         tab
     }
 
@@ -854,7 +1235,7 @@ impl Workspace {
             return self.tabs[index].data().expect("a data tab").clone();
         }
         let tab = self.push_data_tab(target, table, kind, filter, window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.activate_tab(self.active_index(), window, cx);
         self.schedule_save(cx);
         tab
     }
@@ -870,8 +1251,8 @@ impl Workspace {
     ) -> Entity<StructureTab> {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| StructureTab::new(target, table, kind, connections, window, cx));
-        // One subscription per tab: `close_tab_at` removes them by index.
-        self.tab_subscriptions.push(cx.subscribe_in(
+        // One subscription per tab: `close_tab_at` drops it with the tab.
+        let subscription = cx.subscribe_in(
             &tab,
             window,
             |this, tab, event: &StructureTabEvent, window, cx| {
@@ -893,9 +1274,10 @@ impl Workspace {
                     }
                 }
             },
-        ));
+        );
+        self.tab_subscriptions.insert(tab.entity_id(), subscription);
         self.tabs.push(OpenTab::Structure(tab.clone()));
-        self.active_tab = self.tabs.len() - 1;
+        self.adopt_last_tab();
         tab
     }
 
@@ -923,7 +1305,7 @@ impl Workspace {
                 .clone();
         }
         let tab = self.push_structure_tab(target, table, kind, window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.activate_tab(self.active_index(), window, cx);
         self.schedule_save(cx);
         tab
     }
@@ -938,8 +1320,8 @@ impl Workspace {
     ) -> Entity<DiagramTab> {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| DiagramTab::new(target, scope, connections, window, cx));
-        // One subscription per tab: `close_tab_at` removes them by index.
-        self.tab_subscriptions.push(cx.subscribe_in(
+        // One subscription per tab: `close_tab_at` drops it with the tab.
+        let subscription = cx.subscribe_in(
             &tab,
             window,
             |this, tab, event: &DiagramTabEvent, window, cx| {
@@ -954,9 +1336,10 @@ impl Workspace {
                     }
                 }
             },
-        ));
+        );
+        self.tab_subscriptions.insert(tab.entity_id(), subscription);
         self.tabs.push(OpenTab::Diagram(tab.clone()));
-        self.active_tab = self.tabs.len() - 1;
+        self.adopt_last_tab();
         tab
     }
 
@@ -980,7 +1363,7 @@ impl Workspace {
             return self.tabs[index].diagram().expect("a diagram tab").clone();
         }
         let tab = self.push_diagram_tab(target, scope, window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.activate_tab(self.active_index(), window, cx);
         self.schedule_save(cx);
         tab
     }
@@ -993,14 +1376,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let structure = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(OpenTab::structure)
-            .map(|tab| {
-                let tab = tab.read(cx);
-                (tab.target().clone(), tab.table().clone())
-            });
+        let structure = self.active_open().and_then(OpenTab::structure).map(|tab| {
+            let tab = tab.read(cx);
+            (tab.target().clone(), tab.table().clone())
+        });
         match structure {
             Some((target, table)) => {
                 self.open_diagram(target, DiagramScope::Around(table), window, cx);
@@ -1024,12 +1403,12 @@ impl Workspace {
     ) -> Entity<AdminTab> {
         let (connections, shown) = (self.connections.clone(), self.shown_tab.clone());
         let tab = cx.new(|cx| AdminTab::new(target, connections, shown, window, cx));
-        // One subscription per tab: `close_tab_at` removes them by index. The
+        // One subscription per tab: `close_tab_at` drops it with the tab. The
         // tab's title follows the connection's name.
         self.tab_subscriptions
-            .push(cx.observe(&tab, |_, _, cx| cx.notify()));
+            .insert(tab.entity_id(), cx.observe(&tab, |_, _, cx| cx.notify()));
         self.tabs.push(OpenTab::Admin(tab.clone()));
-        self.active_tab = self.tabs.len() - 1;
+        self.adopt_last_tab();
         tab
     }
 
@@ -1050,7 +1429,7 @@ impl Workspace {
             return self.tabs[index].admin().expect("an admin tab").clone();
         }
         let tab = self.push_admin_tab(connection_target(connection), window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.activate_tab(self.active_index(), window, cx);
         self.schedule_save(cx);
         tab
     }
@@ -1082,8 +1461,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Entity<AdminTab>> {
         let connection = self
-            .tabs
-            .get(self.active_tab)
+            .active_open()
             .and_then(|tab| tab.connection(cx))
             .or_else(|| self.sidebar.read(cx).selected(cx));
         match connection {
@@ -1125,11 +1503,14 @@ impl Workspace {
         }
         let connections = self.connections.clone();
         let tab = cx.new(|cx| TableEditor::new(target, schema, table, connections, window, cx));
-        // One subscription per tab: `close_tab_at` removes them by index.
-        self.tab_subscriptions
-            .push(cx.subscribe_in(&tab, window, Self::on_table_editor_event));
+        // One subscription per tab: `close_tab_at` drops it with the tab.
+        self.tab_subscriptions.insert(
+            tab.entity_id(),
+            cx.subscribe_in(&tab, window, Self::on_table_editor_event),
+        );
         self.tabs.push(OpenTab::TableEditor(tab.clone()));
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.adopt_last_tab();
+        self.activate_tab(self.active_index(), window, cx);
         tab
     }
 
@@ -1199,8 +1580,8 @@ impl Workspace {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| QueryTab::new(title, sql, target, connections, window, cx));
         let editor = tab.read(cx).editor().clone();
-        // One subscription per tab: they are dropped with it, by index.
-        self.tab_subscriptions.push(Subscription::join(
+        // One subscription per tab: dropped with it.
+        let subscription = Subscription::join(
             cx.observe(&editor, |this, _, cx| this.schedule_save(cx)),
             cx.subscribe_in(
                 &tab,
@@ -1230,15 +1611,18 @@ impl Workspace {
                     }
                 },
             ),
-        ));
+        );
+        self.tab_subscriptions.insert(tab.entity_id(), subscription);
         self.tabs.push(OpenTab::Query(tab.clone()));
-        self.active_tab = self.tabs.len() - 1;
+        self.adopt_last_tab();
         tab
     }
 
+    /// Shows the tab at `index` in its group, and gives that group and the
+    /// tab the keyboard.
     fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(index) {
-            self.active_tab = index;
+            self.panes.activate(tab.entity_id());
             tab.reveal(window, cx);
             tab.focus_handle(cx).focus(window, cx);
             self.schedule_save(cx);
@@ -1253,7 +1637,7 @@ impl Workspace {
     /// schema tree, and its connection in the list (DBeaver's "Link with
     /// editor", `core.navigator.linkeditor`).
     fn link_active_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
+        let Some(tab) = self.active_open() else {
             return;
         };
         let linked = if let Some(tab) = tab.data() {
@@ -1284,6 +1668,7 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(index);
+        let tab_id = tab.entity_id();
         // Its server session is closed now, not whenever the tab is dropped
         // (its results may be held a while longer).
         match &tab {
@@ -1305,14 +1690,12 @@ impl Workspace {
                 self.closed.remove(0);
             }
         }
-        drop(self.tab_subscriptions.remove(index));
-        if self.active_tab > index || self.active_tab >= self.tabs.len() {
-            self.active_tab = self.active_tab.saturating_sub(1);
-        }
-        match self.tabs.get(self.active_tab) {
-            Some(tab) => tab.focus_handle(cx).focus(window, cx),
-            None => self.focus_handle.focus(window, cx),
-        }
+        drop(self.tab_subscriptions.remove(&tab_id));
+        // The tab after it in its group is shown (else the one before); a
+        // group left empty closes and its space goes to its neighbour.
+        self.panes.remove(tab_id);
+        self.sync_tabs();
+        self.focus_active(window, cx);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1374,7 +1757,7 @@ impl Workspace {
 
     /// Gives the keyboard to the active tab.
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        match self.tabs.get(self.active_tab) {
+        match self.active_open() {
             Some(tab) => tab.focus_handle(cx).focus(window, cx),
             None => self.focus_handle.focus(window, cx),
         }
@@ -1383,7 +1766,7 @@ impl Workspace {
     /// Closes those of `tabs` still open; the active tab stays active when
     /// it is not one of them.
     fn close_now(&mut self, tabs: &[OpenTab], window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.tabs.get(self.active_tab).cloned();
+        let active = self.active_open().cloned();
         for tab in tabs {
             let Some(index) = self.position(tab) else {
                 continue;
@@ -1403,7 +1786,7 @@ impl Workspace {
     fn menu_entries(&self, of: MenuOf, cx: &App) -> Vec<Entry> {
         match of {
             MenuOf::Tab(index) => match self.tabs.get(index) {
-                Some(tab) => tabs::tab_menu(tab.kind(cx), index, self.tabs.len()),
+                Some(tab) => self.tab_menu(tab, index, cx),
                 None => Vec::new(),
             },
             MenuOf::Bar => tabs::bar_menu(self.tabs.len(), self.closed.len()),
@@ -1460,7 +1843,7 @@ impl Workspace {
 
     /// What the status bar menus depend on.
     fn status_facts(&self, cx: &App) -> StatusFacts {
-        let tab = self.tabs.get(self.active_tab);
+        let tab = self.active_open();
         let status = tab.map(|tab| tab.status(cx));
         let query = tab.and_then(OpenTab::query).map(|tab| tab.read(cx));
         let connection = tab.and_then(|tab| tab.connection(cx));
@@ -1494,7 +1877,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let index = index.unwrap_or(self.active_tab);
+        let index = index.unwrap_or(self.active_index());
         let tab = self.tabs.get(index).cloned();
         let query = tab.as_ref().and_then(OpenTab::query).cloned();
         let file = query
@@ -1506,7 +1889,7 @@ impl Workspace {
             (
                 Some(tab),
                 TabAction::Rename | TabAction::Duplicate | TabAction::CopyPath | TabAction::Reveal,
-            ) => Some(tabs::tab_menu(tab.kind(cx), index, self.tabs.len())),
+            ) => Some(self.tab_menu(tab, index, cx)),
             (_, TabAction::Disconnect | TabAction::Reconnect) => Some(tabs::status_menu(
                 StatusItem::Connection,
                 "",
@@ -1536,26 +1919,34 @@ impl Workspace {
         let connection = tab.as_ref().and_then(|tab| tab.connection(cx));
         match action {
             TabAction::Close => self.close_tabs(tab.into_iter().collect(), window, cx),
+            // Within the tab's group (K19): the other groups keep theirs.
             TabAction::CloseOthers => {
                 let others = self
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .filter(|(other, _)| *other != index)
-                    .map(|(_, tab)| tab.clone())
+                    .tabs_of_group_at(index)
+                    .into_iter()
+                    .filter(|other| Some(other.entity_id()) != tab.as_ref().map(OpenTab::entity_id))
                     .collect();
                 self.close_tabs(others, window, cx)
             }
             TabAction::CloseToRight => {
-                let right = self.tabs.iter().skip(index + 1).cloned().collect();
+                let position = self.place_of(index).map_or(0, |(_, position, _)| position);
+                let right = self.tabs_of_group_at(index).into_iter().skip(position + 1).collect();
                 self.close_tabs(right, window, cx)
             }
-            TabAction::CloseAll => self.close_tabs(self.tabs.clone(), window, cx),
+            TabAction::CloseAll => {
+                let all = self.tabs_of_group_at(index);
+                self.close_tabs(all, window, cx)
+            }
             TabAction::Rename => {
                 if let Some(query) = query {
                     self.rename_tab(query, window, cx)
                 }
             }
+            TabAction::SplitRight
+            | TabAction::SplitDown
+            | TabAction::MoveToOtherGroup
+            | TabAction::MoveToNextGroup
+            | TabAction::MoveToPreviousGroup => self.regroup(index, &action, window, cx),
             TabAction::Duplicate => {
                 if let Some(query) = query {
                     let (sql, target) = {
@@ -1580,7 +1971,7 @@ impl Workspace {
             TabAction::ReopenClosed => {
                 if let Some(snapshot) = self.closed.pop() {
                     self.push_snapshot(snapshot, window, cx);
-                    self.activate_tab(self.tabs.len() - 1, window, cx);
+                    self.activate_tab(self.active_index(), window, cx);
                 }
             }
             TabAction::Disconnect => {
@@ -1744,8 +2135,18 @@ impl Workspace {
             .iter()
             .filter_map(|tab| tab.snapshot(cx))
             .collect();
+        // The groups, each tab as its index among the stored ones (K19).
+        let stored: Vec<EntityId> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.snapshot(cx).is_some())
+            .map(OpenTab::entity_id)
+            .collect();
+        let layout = self
+            .panes
+            .save(|id| stored.iter().position(|each| *each == id));
         // Counted among the tabs that are stored.
-        let active_tab = self.tabs[..self.active_tab.min(self.tabs.len())]
+        let active_tab = self.tabs[..self.active_index()]
             .iter()
             .filter(|tab| tab.snapshot(cx).is_some())
             .count()
@@ -1754,7 +2155,8 @@ impl Workspace {
         bridge::spawn_blocking(cx, move || {
             let saved = storage
                 .save_tabs(&snapshots)
-                .and_then(|()| storage.set_setting(ACTIVE_TAB_KEY, &active_tab));
+                .and_then(|()| storage.set_setting(ACTIVE_TAB_KEY, &active_tab))
+                .and_then(|()| storage.set_setting(TAB_LAYOUT_KEY, &layout));
             if let Err(error) = saved {
                 tracing::error!(%error, "could not store the open tabs");
             }
@@ -1783,17 +2185,27 @@ impl Workspace {
         self.perform(None, TabAction::Close, window, cx);
     }
 
+    /// The next tab of the focused group, around.
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate_tab((self.active_tab + 1) % self.tabs.len(), window, cx);
-        }
+        self.step_tab(1, window, cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let count = self.tabs.len();
-            self.activate_tab((self.active_tab + count - 1) % count, window, cx);
+        self.step_tab(-1, window, cx);
+    }
+
+    /// Shows the tab `by` places from the one shown, in the focused group.
+    fn step_tab(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.panes.group(self.panes.focused()) else {
+            return;
+        };
+        let indices = self.group_indices(group);
+        if indices.is_empty() {
+            return;
         }
+        let count = indices.len() as isize;
+        let next = (group.active as isize + by).rem_euclid(count) as usize;
+        self.activate_tab(indices[next], window, cx);
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -1955,7 +2367,7 @@ impl Workspace {
         match event {
             NavigatorEvent::OpenQuery { title, sql, target } => {
                 self.push_query_tab(title.clone(), sql, target.clone(), window, cx);
-                self.activate_tab(self.tabs.len() - 1, window, cx);
+                self.activate_tab(self.active_index(), window, cx);
                 self.schedule_save(cx);
             }
             NavigatorEvent::RunQuery { title, sql, target } => {
@@ -2180,7 +2592,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<QueryTab> {
         let tab = self.push_query_tab(title, sql, target, window, cx);
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.activate_tab(self.active_index(), window, cx);
         self.schedule_save(cx);
         tab
     }
@@ -2375,8 +2787,7 @@ impl Workspace {
     /// default connection's), the file chosen; it asks before running, as it does from Tools.
     fn run_large_script(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let target = self
-            .tabs
-            .get(self.active_tab)
+            .active_open()
             .and_then(|tab| tab.target(cx))
             .or_else(|| self.default_target(cx));
         let Some(target) = target else {
@@ -2674,25 +3085,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<QueryTab> {
-        let active = self.active_tab;
+        let active = self.panes.active();
         let tab = self.push_query_tab(title, sql, Some(target), window, cx);
-        let at = after
-            .and_then(|after| {
-                self.tabs
-                    .iter()
-                    .position(|open| open.query() == Some(after))
-            })
-            .map_or(self.tabs.len() - 1, |index| index + 1);
-        // The tab and its subscription move together: both are by index.
-        if let (Some(open), Some(subscription)) = (self.tabs.pop(), self.tab_subscriptions.pop()) {
-            self.tabs.insert(at, open);
-            self.tab_subscriptions.insert(at, subscription);
+        // Right after `after`, in its group; the tab shown stays shown.
+        let after = after
+            .map(|after| after.entity_id())
+            .filter(|id| self.index_of(*id).is_some());
+        if let Some(after) = after {
+            self.panes.place_after(tab.entity_id(), after);
         }
-        self.active_tab = if active >= at && active < self.tabs.len() - 1 {
-            active + 1
-        } else {
-            active.min(self.tabs.len() - 1)
-        };
+        if let Some(active) = active {
+            self.panes.activate(active);
+        }
+        self.sync_tabs();
         self.schedule_save(cx);
         cx.notify();
         tab
@@ -2891,8 +3296,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let target = self
-            .tabs
-            .get(self.active_tab)
+            .active_open()
             .and_then(|tab| tab.target(cx))
             .or_else(|| self.default_target(cx));
         match target {
@@ -2914,8 +3318,7 @@ impl Workspace {
     /// shows.
     fn tool_command(&mut self, entry: ToolEntry, window: &mut Window, cx: &mut Context<Self>) {
         let target = self
-            .tabs
-            .get(self.active_tab)
+            .active_open()
             .and_then(|tab| tab.target(cx))
             .or_else(|| self.default_target(cx));
         match target {
@@ -3133,9 +3536,10 @@ impl Workspace {
         let connections = self.connections.clone();
         let tab = cx.new(|cx| TasksView::new(connections, open, cx));
         self.tab_subscriptions
-            .push(cx.observe(&tab, |_, _, cx| cx.notify()));
+            .insert(tab.entity_id(), cx.observe(&tab, |_, _, cx| cx.notify()));
         self.tabs.push(OpenTab::Tasks(tab.clone()));
-        self.activate_tab(self.tabs.len() - 1, window, cx);
+        self.adopt_last_tab();
+        self.activate_tab(self.active_index(), window, cx);
         tab
     }
 
@@ -3334,7 +3738,7 @@ impl Workspace {
             tab.update(cx, |tab, cx| tab.cancel(cx));
         }
         // Their reads too, which a lock can hold (C3).
-        match self.tabs.get(self.active_tab) {
+        match self.active_open() {
             Some(OpenTab::Structure(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             Some(OpenTab::Diagram(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             _ => {}
@@ -3737,7 +4141,7 @@ impl Workspace {
 
     // Rendering ---------------------------------------------------------------
 
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         if self.tabs.is_empty() {
             // The tab bar's menu, so a closed tab can come back.
@@ -3771,6 +4175,112 @@ impl Workspace {
                 .into_any_element();
         }
 
+        self.render_pane(self.panes.root(), Vec::new(), cx)
+    }
+
+    /// A node of the tab area: a group, or a split of its children with a
+    /// divider between each two (K19).
+    fn render_pane(
+        &self,
+        pane: &panes::Pane<EntityId>,
+        path: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (axis, children, shares) = match pane {
+            panes::Pane::Tabs(group) => return self.render_group(group, cx),
+            panes::Pane::Split {
+                axis,
+                children,
+                shares,
+            } => (*axis, children, shares),
+        };
+        let row = axis == panes::Axis::Row;
+        // An id per split, from its place in the tree.
+        let key = path.iter().fold(1usize, |key, step| key * 8 + step + 1);
+        let moved = path.clone();
+        let split = if row { h_flex() } else { v_flex() };
+        split
+            .id(("tab-split", key))
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            // A divider follows the pointer, within its split; neither group
+            // gets smaller than `MIN_GROUP`.
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui_kit::DragMoveEvent<DraggedDivider>, _, cx| {
+                    let drag = event.drag(cx).clone();
+                    if drag.path != moved {
+                        return;
+                    }
+                    let (bounds, at) = (event.bounds, event.event.position);
+                    let (offset, length) = if row {
+                        (at.x - bounds.left(), bounds.size.width)
+                    } else {
+                        (at.y - bounds.top(), bounds.size.height)
+                    };
+                    if length <= px(0.) {
+                        return;
+                    }
+                    let min = MIN_GROUP / length;
+                    if this
+                        .panes
+                        .resize(&drag.path, drag.divider, offset / length, min)
+                    {
+                        this.schedule_save(cx);
+                        cx.notify();
+                    }
+                },
+            ))
+            .test_support()
+            .children(
+                children
+                    .iter()
+                    .zip(shares)
+                    .enumerate()
+                    .map(|(index, (child, share))| {
+                        let mut inner = path.clone();
+                        inner.push(index);
+                        let panel = div()
+                            .relative()
+                            .flex_basis(gpui_kit::relative(*share))
+                            .flex_shrink(1.)
+                            .min_w_0()
+                            .min_h_0()
+                            .when(row, |panel| panel.h_full())
+                            .when(!row, |panel| panel.w_full())
+                            .child(self.render_pane(child, inner, cx));
+                        // The kit's divider, on the edge with the child before.
+                        if index == 0 {
+                            return panel;
+                        }
+                        let drag = DraggedDivider {
+                            path: path.clone(),
+                            divider: index - 1,
+                        };
+                        panel.child(
+                            resize_handle::<DraggedDivider, DraggedDivider>(
+                                ("tab-divider", key * 8 + index),
+                                if row {
+                                    gpui_kit::Axis::Horizontal
+                                } else {
+                                    gpui_kit::Axis::Vertical
+                                },
+                            )
+                            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A group of tabs: its strip, in the tabs' layout (J10), and the tab it
+    /// shows.
+    fn render_group(&self, group: &panes::Group<EntityId>, cx: &mut Context<Self>) -> AnyElement {
+        let gid = group.id;
+        let indices = self.group_indices(group);
+        let active = indices.get(group.active).copied();
+        let scroll = self.strip_scroll(gid);
+        let theme = cx.theme();
         let (tab_bar_bg, border, muted) = (theme.tab_bar, theme.border, theme.muted_foreground);
         let side_bg = theme.sidebar;
         let layout = AppState::get(cx).settings.tab_layout;
@@ -3779,7 +4289,7 @@ impl Workspace {
         let tools = h_flex()
             .flex_none()
             .items_center()
-            .child(self.render_all_tabs(cx))
+            .child(self.render_all_tabs(group, cx))
             .child(
                 Button::new("new-tab")
                     .ghost()
@@ -3793,6 +4303,11 @@ impl Workspace {
         // bar's menu, in every layout.
         let empty = div()
             .id("tab-bar-empty")
+            // A tab dropped after the tabs goes to the end of this strip.
+            .drag_over::<DraggedTab>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .on_drop(cx.listener(move |this, drag: &DraggedTab, window, cx| {
+                this.drop_tab(drag.id, gid, Landing::Strip(usize::MAX), window, cx)
+            }))
             .test_support()
             .flex_1()
             .min_w(px(24.))
@@ -3816,12 +4331,17 @@ impl Workspace {
         };
         let bar = match layout {
             TabLayout::SingleRow => TabBar::new("tabs")
-                .track_scroll(&self.tab_scroll)
-                .selected_index(self.active_tab)
-                .on_click(cx.listener(|this, index: &usize, window, cx| {
-                    this.activate_tab(*index, window, cx)
+                .track_scroll(&scroll)
+                .selected_index(group.active)
+                .on_click(cx.listener({
+                    let indices = indices.clone();
+                    move |this, position: &usize, window, cx| {
+                        if let Some(index) = indices.get(*position) {
+                            this.activate_tab(*index, window, cx)
+                        }
+                    }
                 }))
-                .children((0..self.tabs.len()).map(|index| {
+                .children(indices.iter().map(|&index| {
                     let (prefix, title, close) = self.tab_parts(index, true, cx);
                     Tab::new()
                         .when_some(prefix, |tab, prefix| tab.prefix(prefix))
@@ -3854,14 +4374,14 @@ impl Workspace {
                         .pl_2()
                         .max_h(TAB_HEIGHT * TAB_ROWS as f32)
                         .overflow_y_scroll()
-                        .track_scroll(&self.tab_scroll)
-                        .children((0..self.tabs.len()).map(|index| {
+                        .track_scroll(&scroll)
+                        .children(indices.iter().map(|&index| {
                             let (prefix, title, close) = self.tab_parts(index, true, cx);
                             // The kit's tab takes its index as its id: its
                             // own wrapper keeps the ids apart.
                             div().id(("tab-cell", index)).flex_none().child(
                                 Tab::new()
-                                    .selected(index == self.active_tab)
+                                    .selected(Some(index) == active)
                                     .when_some(prefix, |tab, prefix| tab.prefix(prefix))
                                     .on_click(activate(index, cx))
                                     .on_mouse_down(MouseButton::Middle, middle_close(index, cx))
@@ -3871,7 +4391,7 @@ impl Workspace {
                         }))
                         .child(empty.h(TAB_HEIGHT))
                         // Last, so the tabs keep their indices in the scroll.
-                        .vertical_scrollbar(&self.tab_scroll),
+                        .vertical_scrollbar(&scroll),
                 )
                 .child(tools.h(TAB_HEIGHT))
                 .into_any_element(),
@@ -3897,7 +4417,7 @@ impl Workspace {
                             div()
                                 .text_xs()
                                 .text_color(muted)
-                                .child(SharedString::from(format!("{} tabs", self.tabs.len()))),
+                                .child(SharedString::from(format!("{} tabs", indices.len()))),
                         )
                         .child(tools),
                 )
@@ -3908,11 +4428,11 @@ impl Workspace {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
-                        .track_scroll(&self.tab_scroll)
-                        .children((0..self.tabs.len()).map(|index| {
+                        .track_scroll(&scroll)
+                        .children(indices.iter().map(|&index| {
                             let (prefix, title, close) = self.tab_parts(index, false, cx);
                             ListItem::new(("tab-row", index))
-                                .selected(index == self.active_tab)
+                                .selected(Some(index) == active)
                                 .px_2()
                                 .py_0p5()
                                 .on_click(activate(index, cx))
@@ -3932,7 +4452,7 @@ impl Workspace {
                                                 .test_support()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .when(index == self.active_tab, |title| {
+                                                .when(Some(index) == active, |title| {
                                                     title.font_weight(FontWeight::MEDIUM)
                                                 })
                                                 .aria_description(full.clone())
@@ -3948,8 +4468,10 @@ impl Workspace {
                 )
                 .into_any_element(),
         };
-        let content = self.tabs.get(self.active_tab).map(|tab| {
+        let content = active.map(|index| {
+            let tab = &self.tabs[index];
             div()
+                .id(("tab-content", gid))
                 .flex_1()
                 .min_h_0()
                 .size_full()
@@ -3960,8 +4482,39 @@ impl Workspace {
                     matches!(tab, OpenTab::Query(_) | OpenTab::Data(_)),
                     |area| area.child(crate::settings_view::zoom_wheel()),
                 )
+                // A tab dragged over the content: an edge splits there, the
+                // middle moves it into this group (K19).
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui_kit::DragMoveEvent<DraggedTab>, _, cx| {
+                        let (bounds, at) = (event.bounds, event.event.position);
+                        let zone = bounds.contains(&at).then(|| {
+                            let x = (at.x - bounds.left()) / bounds.size.width;
+                            let y = (at.y - bounds.top()) / bounds.size.height;
+                            this.drop_zone_for(event.drag(cx).id, gid, panes::zone_at(x, y))
+                        });
+                        let next = match zone.flatten() {
+                            Some(zone) => Some((gid, zone)),
+                            // Off this group: its indicator goes, another's stays.
+                            None if this.drop_zone.is_some_and(|(group, _)| group == gid) => None,
+                            None => this.drop_zone,
+                        };
+                        if next != this.drop_zone {
+                            this.drop_zone = next;
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(move |this, drag: &DraggedTab, window, cx| {
+                    if let Some((group, zone)) = this.drop_zone
+                        && group == gid
+                    {
+                        this.drop_tab(drag.id, gid, Landing::Content(zone), window, cx)
+                    }
+                }))
+                .test_support()
+                .children(self.drop_indicator(gid, cx))
         });
-        match layout {
+        let area = match layout {
             TabLayout::Vertical => h_resizable("tab-list-split")
                 .child(
                     resizable_panel()
@@ -3976,7 +4529,28 @@ impl Workspace {
                 .child(bar)
                 .children(content)
                 .into_any_element(),
-        }
+        };
+        // A click anywhere in the group (its strip, its editor, its grid, a
+        // scrollbar) focuses it, and gives its tab the keyboard, before the
+        // click does anything else: what is clicked may take the keyboard
+        // itself, but a part that does not (a scrollbar, a greyed button)
+        // must not leave it in another group, whose tab the next key would
+        // act on.
+        div()
+            .id(("tab-group", gid))
+            .test_support()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
+                if this.panes.focused() != gid {
+                    this.panes.focus(gid);
+                    this.focus_active(window, cx);
+                    cx.notify();
+                }
+            }))
+            .child(area)
+            .into_any_element()
     }
 
     /// The transaction tab `index` holds, and how long it has been open: a
@@ -4070,11 +4644,24 @@ impl Workspace {
                 .into_any_element()
         });
         // The active tab's accent marker under its title: olive on light,
-        // Lime on dark (the theme's primary).
-        let marker = if index == self.active_tab {
-            cx.theme().primary
-        } else {
-            cx.theme().transparent
+        // Lime on dark (the theme's primary). With several groups, only the
+        // focused group's is in the accent; another group's shown tab is
+        // marked in the muted text colour (K19).
+        let place = self.place_of(index);
+        let shown = place.is_some_and(|(group, position, _)| {
+            self.panes
+                .group(group)
+                .is_some_and(|group| group.active == position)
+        });
+        let focused = place.is_some_and(|(group, ..)| group == self.panes.focused());
+        let marker = match (shown, focused) {
+            (true, true) => cx.theme().primary,
+            (true, false) => cx.theme().muted_foreground,
+            (false, _) => cx.theme().transparent,
+        };
+        let drag = DraggedTab {
+            id: tab.entity_id(),
+            label: tab.label(cx),
         };
         // In the side list (`underline` false) the title may be cut: it ends
         // in an ellipsis, on the element that holds the text.
@@ -4091,6 +4678,15 @@ impl Workspace {
             .border_b_2()
             .border_color(marker)
             .when(!underline, |title| title.min_w_0())
+            // Dragged to an edge of a group, it splits there; onto a strip,
+            // it goes there, before the tab it is dropped on (K19).
+            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            .drag_over::<DraggedTab>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            .when_some(place, |title, (group, position, _)| {
+                title.on_drop(cx.listener(move |this, drag: &DraggedTab, window, cx| {
+                    this.drop_tab(drag.id, group, Landing::Strip(position), window, cx)
+                }))
+            })
             .test_support()
             .context_menu(self.menu(MenuOf::Tab(index), cx))
             .map(|title| match chrome {
@@ -4135,8 +4731,15 @@ impl Workspace {
     /// The button that lists every open tab (J10, DBeaver #7114): engine
     /// logo, title with its unsaved mark, environment dot, the active one
     /// checked; a filter above them when more than [`FILTER_TABS_OVER`]
-    /// are open. A click shows the tab and scrolls the bar to it.
-    fn render_all_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// are open. A click shows the tab and scrolls the bar to it. Each
+    /// group's strip has it, and it lists the tabs of every group, group after
+    /// group (K19).
+    fn render_all_tabs(
+        &self,
+        group: &panes::Group<EntityId>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let gid = group.id;
         // The transaction a tab holds, for the same badge as on the tab.
         let transactions: Vec<Option<(TxState, Option<Duration>)>> = (0..self.tabs.len())
             .map(|index| self.tx_badge(index, cx))
@@ -4161,7 +4764,7 @@ impl Workspace {
             .collect();
         let filtering = entries.len() > FILTER_TABS_OVER;
         let filter = self.all_tabs_filter.clone();
-        let active = self.active_tab;
+        let active = self.active_index();
         let view = cx.entity().downgrade();
         let opened = view.clone();
         // The filter takes the keyboard when the list opens.
@@ -4174,9 +4777,11 @@ impl Workspace {
             .border_1()
             .border_color(cx.theme().input)
             .when(filtering, |popover| popover.track_focus(&filter_focus))
-            .open(self.all_tabs_open)
+            .open(self.all_tabs_open == Some(gid))
             .on_open_change(move |open, window, cx| {
-                let _ = opened.update(cx, |this, cx| this.show_all_tabs(*open, window, cx));
+                let _ = opened.update(cx, |this, cx| {
+                    this.show_all_tabs(open.then_some(gid), window, cx)
+                });
             })
             .trigger(
                 Button::new("tabs-overflow")
@@ -4220,7 +4825,7 @@ impl Workspace {
                                     .py_0p5()
                                     .on_click(move |_, window, cx| {
                                         let _ = view.update(cx, |this, cx| {
-                                            this.show_all_tabs(false, window, cx);
+                                            this.show_all_tabs(None, window, cx);
                                             this.activate_tab(index, window, cx);
                                         });
                                     })
@@ -4295,17 +4900,22 @@ impl Workspace {
             })
     }
 
-    /// Opens or closes the list of every open tab; it opens with an empty
-    /// filter.
-    fn show_all_tabs(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the list of every open tab from the strip of the group `open`,
+    /// or closes it (`None`); it opens with an empty filter.
+    fn show_all_tabs(
+        &mut self,
+        open: Option<panes::GroupId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if open == self.all_tabs_open {
             return;
         }
         self.all_tabs_open = open;
-        if open {
+        if open.is_some() {
             self.all_tabs_filter
                 .update(cx, |input, cx| input.set_value("", window, cx));
-            self.all_tabs_scroll.scroll_to_item(self.active_tab);
+            self.all_tabs_scroll.scroll_to_item(self.active_index());
         } else {
             self.focus_active(window, cx);
         }
@@ -4323,7 +4933,7 @@ impl Workspace {
     /// how many connections are open.
     fn status_items(&self, cx: &App) -> Vec<(StatusItem, String, Option<Hsla>)> {
         let theme = cx.theme();
-        let status = self.tabs.get(self.active_tab).map(|tab| tab.status(cx));
+        let status = self.active_open().map(|tab| tab.status(cx));
         let Some(TabStatus {
             connection: Some(connection),
             read_only,
@@ -4423,7 +5033,7 @@ impl Workspace {
         // engine's logo, as the tab toolbar's connection selector does.
         let saved = (item == StatusItem::Connection)
             .then(|| {
-                let tab = self.tabs.get(self.active_tab)?;
+                let tab = self.active_open()?;
                 self.connections
                     .read(cx)
                     .get(&tab.connection(cx)?)
@@ -4482,7 +5092,7 @@ impl Workspace {
     /// What the environment of the active tab's connection paints on the
     /// chrome; `None` when it tints nothing.
     pub fn active_chrome(&self, cx: &App) -> Option<theme::EnvironmentChrome> {
-        let connection = self.tabs.get(self.active_tab)?.connection(cx)?;
+        let connection = self.active_open()?.connection(cx)?;
         theme::environment_chrome(&self.connection_config(Some(connection.as_str()), cx)?, cx)
     }
 
@@ -4649,8 +5259,7 @@ impl Workspace {
     /// The connection a connection command acts on: the active tab's, else
     /// the one selected in the sidebar.
     fn command_connection(&self, cx: &App) -> Option<String> {
-        self.tabs
-            .get(self.active_tab)
+        self.active_open()
             .and_then(|tab| tab.connection(cx))
             .or_else(|| self.sidebar.read(cx).selected(cx))
     }
@@ -5280,7 +5889,8 @@ impl Workspace {
         }))
         .on_action(cx.listener(|this, _: &actions::ShowAllTabs, window, cx| {
             if !this.tabs.is_empty() {
-                this.show_all_tabs(true, window, cx)
+                let focused = this.panes.focused();
+                this.show_all_tabs(Some(focused), window, cx)
             }
         }))
         .on_action(
@@ -5729,27 +6339,62 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            tab.reveal(window, cx);
+        // The group the keyboard is in is the focused one (K19): the commands
+        // act where the user types, whatever moved the keyboard there.
+        let typing_in = self
+            .panes
+            .groups()
+            .into_iter()
+            .find(|group| {
+                group
+                    .active_tab()
+                    .and_then(|id| self.index_of(id))
+                    .is_some_and(|index| {
+                        self.tabs[index]
+                            .focus_handle(cx)
+                            .contains_focused(window, cx)
+                    })
+            })
+            .map(|group| group.id);
+        if let Some(group) = typing_in {
+            self.panes.focus(group);
+        }
+        if self.drop_zone.is_some() && !cx.has_active_drag() {
+            self.drop_zone = None;
+        }
+        // Every group's tab is on screen: a deferred one reads what it shows.
+        let shown: Vec<EntityId> = self
+            .panes
+            .groups()
+            .into_iter()
+            .filter_map(|group| group.active_tab())
+            .collect();
+        for id in &shown {
+            if let Some(index) = self.index_of(*id) {
+                self.tabs[index].reveal(window, cx);
+            }
         }
         self.keep_focus(window, cx);
         self.watch_transactions(cx);
-        // The active tab is scrolled into view whenever it or the tabs
-        // change (a tab opened, restored, closed or activated by key); a
-        // scroll of the strip by hand is left alone until then.
-        let shown = (
-            self.active_tab,
+        // The focused group's active tab is scrolled into view whenever it or
+        // the tabs change (a tab opened, restored, closed or activated by
+        // key); a scroll of the strip by hand is left alone until then.
+        let focused = self.panes.focused();
+        let revealed = (
+            focused,
+            self.active_index(),
             self.tabs.len(),
             AppState::get(cx).settings.tab_layout,
-            self.tabs.get(self.active_tab).map(|tab| tab.label(cx)),
-            self.tx_badge(self.active_tab, cx).is_some(),
+            self.active_open().map(|tab| tab.label(cx)),
+            self.tx_badge(self.active_index(), cx).is_some(),
         );
-        if self.revealed_tab.as_ref() != Some(&shown) {
-            self.tab_scroll.scroll_to_item(self.active_tab);
+        if !self.tabs.is_empty() && self.revealed_tab.as_ref() != Some(&revealed) {
+            let scroll = self.strip_scroll(focused);
+            scroll.scroll_to_item(self.panes.group(focused).map_or(0, |group| group.active));
             // Before the strip's first layout there is no width to scroll
             // in: again on the next frame.
-            if self.tab_scroll.bounds().size.width > px(0.) {
-                self.revealed_tab = Some(shown);
+            if scroll.bounds().size.width > px(0.) {
+                self.revealed_tab = Some(revealed);
             } else {
                 window.request_animation_frame();
             }
@@ -5757,16 +6402,15 @@ impl Render for Workspace {
         *self.tab_target.borrow_mut() = self
             .active_query_tab()
             .and_then(|tab| tab.read(cx).target().cloned());
-        let shown = self.tabs.get(self.active_tab).map(OpenTab::entity_id);
         // The tabs no longer shown stop refreshing on their own.
-        if self.shown_tab.get() != shown {
+        if *self.shown_tab.borrow() != shown {
             for tab in &self.tabs {
-                if Some(tab.entity_id()) != shown {
+                if !shown.contains(&tab.entity_id()) {
                     tab.hide(cx);
                 }
             }
         }
-        self.shown_tab.set(shown);
+        *self.shown_tab.borrow_mut() = shown;
         let sidebar_visible = AppState::get(cx).settings.sidebar_visible;
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
@@ -5802,6 +6446,33 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
                 this.perform(None, TabAction::CloseAll, window, cx)
             }))
+            // K19: the groups of tabs.
+            .on_action(cx.listener(|this, _: &actions::SplitRight, window, cx| {
+                this.perform(None, TabAction::SplitRight, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &actions::SplitDown, window, cx| {
+                this.perform(None, TabAction::SplitDown, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &actions::MoveTabToNextGroup, window, cx| {
+                    this.perform(None, TabAction::MoveToNextGroup, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::MoveTabToPreviousGroup, window, cx| {
+                    this.perform(None, TabAction::MoveToPreviousGroup, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::FocusNextGroup, window, cx| {
+                    this.focus_group(true, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &actions::FocusPreviousGroup, window, cx| {
+                    this.focus_group(false, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
                 this.perform(None, TabAction::Rename, window, cx)
             }))
@@ -5906,7 +6577,14 @@ impl Render for Workspace {
                 this.on_query(window, cx, QueryTab::switch_focus)
             }))
             .on_action(cx.listener(|this, _: &CloseTabsToTheLeft, window, cx| {
-                let left = this.tabs[..this.active_tab.min(this.tabs.len())].to_vec();
+                // In the focused group (K19).
+                let active = this.active_index();
+                let position = this.place_of(active).map_or(0, |(_, position, _)| position);
+                let left = this
+                    .tabs_of_group_at(active)
+                    .into_iter()
+                    .take(position)
+                    .collect();
                 this.close_tabs(left, window, cx)
             }))
             .on_action(cx.listener(Self::run_all))

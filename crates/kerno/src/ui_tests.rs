@@ -62,6 +62,7 @@ mod reorder;
 mod script_progress;
 mod shortcuts;
 mod sidebar_tree;
+mod split;
 mod tabs_v11;
 mod tasks;
 mod tool_passwords;
@@ -121,6 +122,7 @@ fn open(cx: &mut TestAppContext, storage: Arc<Storage>) -> Fixture {
             .setting(crate::state::ACTIVE_TAB_KEY)
             .unwrap()
             .unwrap_or(0);
+        let layout = storage.setting(crate::state::TAB_LAYOUT_KEY).unwrap();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::default(),
@@ -130,7 +132,8 @@ fn open(cx: &mut TestAppContext, storage: Arc<Storage>) -> Fixture {
         };
         let manager = connections.clone();
         let (window, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(connections, tabs, active_tab, window, cx));
+            let workspace =
+                cx.new(|cx| Workspace::new(connections, tabs, active_tab, layout, window, cx));
             workspace.focus_handle(cx).focus(window, cx);
             workspace
         })

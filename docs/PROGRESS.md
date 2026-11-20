@@ -786,3 +786,19 @@ Still open (for the owner):
 - Tests: two unit tests, one storage test, seven UI tests in `ui_tests/fk_preview.rs` on the three engines,
   each seen failing under a one-line mutation (`docs/plans/M12.md`, K18). Captures `m12-fk-preview-{light,dark}`
   to take.
+
+## 2026-11-20 — K19: the tab area split in groups (the owner's request of 2026-11-18)
+
+- `workspace/panes.rs`: the groups of tabs as a tree (D-092), with split, move, close, resize, store and restore
+  (an old or broken layout mended into something usable) unit-tested. The workspace keeps its flat list of
+  tabs in the layout's order; every former use of the one active tab goes through the focused group.
+- Split Right (⌘⌥⇧L), Split Down (⌘⌥⇧I), Move Tab to the Next / Previous Group (⌘⌥⇧M), Focus Next / Previous
+  Group (⌘⌥⇧N / ⌘⌥⇧P) in the palette, the Window menu and each tab's menu; a tab dragged to an edge of a
+  group's content splits there, with an indicator of the half it will take; onto a strip it moves there (and
+  reorders within its own). A divider between groups; a group left empty closes. The layout and the sizes come
+  back after a restart.
+- The focused group (last clicked, or where the keyboard is) drives ⌘Enter, Commit, ⌘., ⌘W, the toolbar, the
+  status bar and the chrome's colour; quitting and every check over the tabs still cover every group.
+- Tests: eleven unit tests of the tree, twelve UI tests in `ui_tests/split.rs` (three on PostgreSQL), each seen
+  failing under a mutation. Captures `m12-split-views-{light,dark}` to take. Limits in the "Done:" line of K19
+  (`docs/plans/M12.md`).

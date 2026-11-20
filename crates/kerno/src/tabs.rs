@@ -137,6 +137,13 @@ pub enum TabAction {
     Duplicate,
     CopyPath,
     Reveal,
+    // The groups of the tab area (K19).
+    SplitRight,
+    SplitDown,
+    /// The next group, said "the other group" when there are two or fewer.
+    MoveToOtherGroup,
+    MoveToNextGroup,
+    MoveToPreviousGroup,
     // The empty area of the tab bar.
     NewQuery,
     ReopenClosed,
@@ -234,6 +241,11 @@ impl TabAction {
             Self::Reveal => "Show in folder",
             Self::NewQuery => "New query tab",
             Self::ReopenClosed => "Reopen closed tab",
+            Self::SplitRight => "Split right",
+            Self::SplitDown => "Split down",
+            Self::MoveToOtherGroup => "Move to the other group",
+            Self::MoveToNextGroup => "Move to the next group",
+            Self::MoveToPreviousGroup => "Move to the previous group",
             Self::ApplySource => "Apply source…",
             Self::RunStatement => "Run statement",
             Self::RunInNewTab => "Run statement in new result tab",
@@ -360,6 +372,26 @@ pub fn tab_menu(kind: TabKind, index: usize, count: usize) -> Vec<Entry> {
             enabled(TabAction::CopyPath),
             enabled(TabAction::Reveal),
         ]);
+    }
+    entries
+}
+
+/// The entries of a tab's menu about the groups (K19), with `groups` shown:
+/// split right or down (`split` says why not), and move to the other group
+/// (with one group it splits, so `split` applies), or with more than two to
+/// the next or the previous one.
+pub fn group_entries(groups: usize, split: Option<&'static str>) -> Vec<Entry> {
+    let mut entries = vec![
+        Separator,
+        Item(TabAction::SplitRight, split),
+        Item(TabAction::SplitDown, split),
+    ];
+    if groups <= 2 {
+        let why = if groups <= 1 { split } else { None };
+        entries.push(Item(TabAction::MoveToOtherGroup, why));
+    } else {
+        entries.push(enabled(TabAction::MoveToNextGroup));
+        entries.push(enabled(TabAction::MoveToPreviousGroup));
     }
     entries
 }

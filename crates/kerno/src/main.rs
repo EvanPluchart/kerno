@@ -319,6 +319,7 @@ fn start(
         unreadable_connections,
         tabs,
         active_tab,
+        tab_layout,
         ..
     } = startup;
     let keymap_file = AppState::get(cx).paths.keymap();
@@ -353,8 +354,16 @@ fn start(
             )));
             connections
         });
-        let workspace =
-            cx.new(|cx| Workspace::new(connections.clone(), tabs, active_tab, window, cx));
+        let workspace = cx.new(|cx| {
+            Workspace::new(
+                connections.clone(),
+                tabs,
+                active_tab,
+                tab_layout,
+                window,
+                cx,
+            )
+        });
         workspace::handle_quit(window.window_handle(), workspace.downgrade(), cx);
         bench::begin(&workspace, &connections, window, cx);
         if let Some(listener) = listener {
@@ -765,6 +774,13 @@ fn menus() -> Vec<Menu> {
             vec![
                 command("next_tab"),
                 command("previous_tab"),
+                separator(),
+                command("split_right"),
+                command("split_down"),
+                command("move_tab_to_next_group"),
+                command("move_tab_to_previous_group"),
+                command("focus_next_group"),
+                command("focus_previous_group"),
                 separator(),
                 command("rename_tab"),
                 command("duplicate_tab"),

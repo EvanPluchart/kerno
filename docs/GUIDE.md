@@ -16,6 +16,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Updates](#updates)
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
 - [The value panel](#the-value-panel)
+- [Split views](#split-views)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
@@ -218,6 +219,24 @@ value, and says so. Nothing is shown for NULL; a key that points nowhere says "N
 the server does not answer in 10 s is stopped, with Try again. Results of a query show this too when they are
 one table's and can be edited.
 
+## Split views
+
+To see two tabs side by side, drag a tab by its title onto the left, right, top or bottom edge of the tab area:
+the half it will take is shown while you drag ("Split to the right"), and dropping it there makes a new group of
+tabs. Dropped in the middle of another group, or on its row of tabs, the tab moves into that group (on a row of
+tabs, before the tab under the pointer; dragged within its own row, it changes place). Without the mouse: "Split
+right" and "Split down" in a tab's menu, the palette and the Window menu (⌘⌥⇧L and ⌘⌥⇧I), "Move to the other
+group" (⌘⌥⇧M; with one group it splits). Drag the line between two groups to share the space differently.
+
+Each group has its own row of tabs and shows its own tab. The group you clicked last, or are typing in, is the
+focused one: its tab is underlined in the accent colour, the others' in grey. ⌘T opens a tab there, and ⌘W,
+⌘Enter, ⌘., Commit, Roll back, the main toolbar, the status bar and the window's environment colour act on its
+tab; ⌘⌥⇧N and ⌘⌥⇧P go to the next and the previous group. Close others, to the left, to the right and all close
+tabs of the group only; "All open tabs" (the arrow at the end of each row) lists the tabs of every group. A group
+whose last tab closes goes, and its neighbour takes its space. Kerno shows four groups at most (a 2 × 2 grid):
+past that, Split says so and a dragged tab can only join a group. The groups, their sizes and which tab is where
+come back at the next start.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
@@ -345,8 +364,11 @@ reachable from the command palette.
 | Cmd+B | Toggle sidebar |
 | Cmd+Alt+F | Filter the schema tree |
 | Cmd+T | New query tab |
-| Cmd+W / Cmd+Shift+W | Close tab / close all tabs |
-| Ctrl+Tab / Ctrl+Shift+Tab, also Cmd+Alt+Right / Left (Super on Linux) and Ctrl+PageDown / PageUp | Next / previous tab |
+| Cmd+W / Cmd+Shift+W | Close tab / close all tabs of the group |
+| Ctrl+Tab / Ctrl+Shift+Tab, also Cmd+Alt+Right / Left (Super on Linux) and Ctrl+PageDown / PageUp | Next / previous tab of the group |
+| Cmd+Alt+Shift+L / Cmd+Alt+Shift+I | Split right / split down (the tab goes to a new group) |
+| Cmd+Alt+Shift+M | Move the tab to the next group (with one group: split right) |
+| Cmd+Alt+Shift+N / Cmd+Alt+Shift+P | Focus the next / previous group |
 | Cmd+O | Open SQL file |
 | Cmd+S / Cmd+Shift+S | Save / save as |
 | Cmd+Enter | Run statement |
@@ -397,7 +419,7 @@ reachable from the command palette.
 | Ctrl+F11 | Filter by distinct values of the column |
 | Cmd+= / Cmd+- / Cmd+0 (or Alt+0 / Alt+9) | Grid text larger / smaller / usual |
 | Cmd+Shift+D | Switch between the light and the dark theme (the theme shown; Settings ▸ Appearance ▸ Follow system goes back to the system's) |
-| Cmd+Alt+W | Close the other tabs |
+| Cmd+Alt+W | Close the other tabs of the group |
 | Cmd+Shift+T (macOS; Super+Shift+T on Linux) | Reopen the tab closed last |
 | Ctrl+Alt+Shift+K / Ctrl+Alt+Shift+R | Commit / roll back the transaction (beside Ctrl+4 / Ctrl+8, easier on an AZERTY keyboard) |
 | Ctrl+Shift+O | Show the messages of the last run |

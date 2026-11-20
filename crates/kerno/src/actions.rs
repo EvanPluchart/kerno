@@ -474,6 +474,19 @@ gpui_kit::actions!(
         TabsAtTheSide,
         /// Lists every open tab, to pick one (J10).
         ShowAllTabs,
+        /// Moves the active tab into a new group at the right of its own (K19).
+        SplitRight,
+        /// Moves the active tab into a new group below its own (K19).
+        SplitDown,
+        /// Moves the active tab into the next group (the other one of two);
+        /// with one group, splits it to the right (K19).
+        MoveTabToNextGroup,
+        /// Moves the active tab into the group before its own (K19).
+        MoveTabToPreviousGroup,
+        /// Gives the keyboard to the next group of tabs (K19).
+        FocusNextGroup,
+        /// Gives the keyboard to the group of tabs before (K19).
+        FocusPreviousGroup,
         /// Shows the results of a script one under the other, or in result
         /// tabs again (J11).
         ToggleStackedResults,
@@ -1684,6 +1697,58 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["tabs", "overflow", "switch", "list", "editors"],
         ShowAllTabs
+    ),
+    // K19: the tab area split in groups (VS Code's and DBeaver's split
+    // editors). The keys are letters with ⌘⌥⇧ (Ctrl+Alt+Shift on Linux):
+    // L right, I down (taller than wide), M move, N and P next and
+    // previous group.
+    command!(
+        "split_right",
+        "Split Right",
+        "Tabs",
+        ["secondary-alt-shift-l"],
+        ["side by side", "split view", "group", "pane", "editor"],
+        SplitRight
+    ),
+    command!(
+        "split_down",
+        "Split Down",
+        "Tabs",
+        ["secondary-alt-shift-i"],
+        ["below", "split view", "group", "pane", "editor"],
+        SplitDown
+    ),
+    command!(
+        "move_tab_to_next_group",
+        "Move Tab to the Next Group",
+        "Tabs",
+        ["secondary-alt-shift-m"],
+        ["other group", "split view", "pane"],
+        MoveTabToNextGroup
+    ),
+    command!(
+        "move_tab_to_previous_group",
+        "Move Tab to the Previous Group",
+        "Tabs",
+        [],
+        ["other group", "split view", "pane"],
+        MoveTabToPreviousGroup
+    ),
+    command!(
+        "focus_next_group",
+        "Focus Next Group",
+        "Tabs",
+        ["secondary-alt-shift-n"],
+        ["split view", "pane", "switch group"],
+        FocusNextGroup
+    ),
+    command!(
+        "focus_previous_group",
+        "Focus Previous Group",
+        "Tabs",
+        ["secondary-alt-shift-p"],
+        ["split view", "pane", "switch group"],
+        FocusPreviousGroup
     ),
     // J11: the result sets of a script in one panel (DBeaver #6861).
     command!(
@@ -3237,6 +3302,16 @@ fn bind(bindings: &[(String, &'static str)], cx: &mut App) {
     cx.bind_keys(key_bindings);
 }
 
+/// The defaults K19 added: the split tab area's.
+#[cfg(test)]
+pub(crate) const K19_DEFAULTS: &[(&str, &str)] = &[
+    ("split_right", "secondary-alt-shift-l"),
+    ("split_down", "secondary-alt-shift-i"),
+    ("move_tab_to_next_group", "secondary-alt-shift-m"),
+    ("focus_next_group", "secondary-alt-shift-n"),
+    ("focus_previous_group", "secondary-alt-shift-p"),
+];
+
 /// The defaults K20 added (DBeaver, DataGrip, macOS and browser
 /// conventions; the source is named at each command).
 #[cfg(test)]
@@ -3578,7 +3653,9 @@ mod tests {
     fn the_new_defaults_are_bound_and_take_no_reserved_key() {
         let (bindings, problems) = effective_bindings("");
         assert_eq!(problems, Vec::<String>::new());
-        for (id, key) in K20_DEFAULTS {
+        // K19's split keys follow the same rule.
+        let defaults = || K20_DEFAULTS.iter().chain(K19_DEFAULTS);
+        for (id, key) in defaults() {
             assert!(
                 keys_of(&bindings, id).iter().any(|each| each == key),
                 "{id} {key}"
@@ -3656,7 +3733,7 @@ mod tests {
             "ctrl-r",
         ];
         for os in [OperatingSystem::Mac, OperatingSystem::Linux] {
-            for (id, key) in K20_DEFAULTS {
+            for (id, key) in defaults() {
                 for reserved in RESERVED {
                     assert!(
                         !same_keys(key, reserved, os),

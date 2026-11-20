@@ -16,6 +16,9 @@ use crate::theme::Appearance;
 /// Storage key of the index of the active tab.
 pub const ACTIVE_TAB_KEY: &str = "tabs.active";
 
+/// Storage key of the groups of tabs (K19): see `workspace::panes::SavedPane`.
+pub const TAB_LAYOUT_KEY: &str = "tabs.layout";
+
 /// App-wide state, available as a GPUI global.
 pub struct AppState {
     /// Where Kerno keeps its files.
@@ -46,6 +49,8 @@ pub struct Startup {
     pub tabs: Vec<crate::tabs::TabSnapshot>,
     /// Index of the tab that was active.
     pub active_tab: usize,
+    /// The groups of the tabs, when stored and readable (K19).
+    pub tab_layout: Option<crate::workspace::panes::SavedPane>,
 }
 
 impl Startup {
@@ -56,6 +61,8 @@ impl Startup {
         let (connections, unreadable_connections) = storage.connections_and_unreadable()?;
         let tabs = storage.tabs()?;
         let active_tab = storage.setting(ACTIVE_TAB_KEY)?.unwrap_or(0);
+        // A layout that cannot be read is no reason not to start: one group.
+        let tab_layout = storage.setting(TAB_LAYOUT_KEY).unwrap_or(None);
         Ok(Self {
             paths: paths.clone(),
             storage,
@@ -64,6 +71,7 @@ impl Startup {
             unreadable_connections,
             tabs,
             active_tab,
+            tab_layout,
         })
     }
 }

@@ -2283,3 +2283,60 @@ switch between light and dark, a Settings page that lists and changes the shortc
   already (`Grid::structure`): its panel previews them, its columns mapped to the table's through the result's
   labels; no catalog read is added for any other result. "Open the row" is a data tab's only (a result's cell
   menu has no jump).
+
+## D-092 — The split tab area: Kerno's own pane tree over its strip, four groups at most (K19; 2026-11-20)
+
+- **(a), a pane tree of Kerno's own, not the kit's `DockArea`.** The kit's dock (`gpui_base::dock`: `DockArea`,
+  `TabGroup`, `PaneTree`, a `PanelRegistry` for its own persisted schema) owns its panels, their order, their
+  lifetime and its strip, drawn by a `TabGroupRenderer`. Moving the tabs into it would have meant redoing on its
+  renderer J10's single row, rows and side list and the list of every tab, the environment tint on titles, K4's
+  transaction badge, the unsaved mark, the tab menus, the middle click, and the restore format, and handing over
+  the order of the tabs that K1's quit question, K2/K15's stop on close, K5/K6's transaction and connection
+  checks, `open_query_after` and dozens of tests rely on. Kerno keeps its flat `tabs` list (every tab of every
+  group, kept in the layout's order by `sync_tabs`, so an index into it still reads left to right) and adds
+  `workspace/panes.rs`: `Layout<K>` (a tree of `Pane::Tabs(Group)` and `Pane::Split { axis, children, shares }`,
+  and the focused group), pure and unit-tested; only the drop zones are the dock's rule (the outer 35 % of a
+  side splits, the middle joins, as `gpui_base::dock::split_placement_at`). The tab subscriptions are keyed by
+  tab id instead of running beside the list by index, so a tab can move without its subscription.
+- **Dividers**: the kit's `resize_handle` (its look and cursor), dragged with GPUI's `on_drag_move` on the split,
+  the shares kept as fractions in the tree and laid out as relative flex bases. Not the kit's
+  `h_resizable`/`v_resizable`: their state is in pixels, set at the first frame, so a stored size could not be
+  given back to a window of another size. A divider stops at 160 px for either group; a window too small for the
+  groups shares what there is in their proportions (nothing is hidden).
+- **How deep**: any tree, at most four groups (`MAX_GROUPS`: a 2 × 2 grid already). A split along its parent's
+  axis becomes a sibling (three columns, not nested pairs); a split left with one child folds away. A fifth
+  group is refused in words: the tab's menu greys Split right / Split down with "four groups at most: close the
+  tabs of one first", the commands say it in a notification, and a drag over an edge only offers "Move to this
+  group". A tab alone in its group is not split from it ("the tab is alone in its group"): the group would
+  only move; dragged to an edge of its own group it shows no indicator.
+- **The focused group** is the last one clicked (a capture-phase mouse down on the group, before the click does
+  anything, which also gives the group's tab the keyboard: a scrollbar or a greyed button keeps the click and takes
+  no keyboard, and the keyboard left in another group would have taken the focus back) or the one the keyboard is in (checked on each frame: Focus Next Group, a dialog closing, Tab), so
+  ⌘Enter, Commit, ⌘. and ⌘W never act on a group other than the one the user types in. It is marked without a
+  bar (CLAUDE.md §3 item 1): its shown tab keeps the accent line under its title, another group's shown tab has
+  the line in the muted text colour. The toolbar, the status bar and the chrome's environment colour follow it;
+  a production tab keeps its title tint and its frame in its own group whatever is focused (item 7). New tabs
+  open in it, at the end of its strip.
+- **Per group**: J10's single row, rows or side list (the setting applies to every strip), the "All open tabs"
+  button (it lists the tabs of every group, group after group, so the list still reaches everything), its own
+  scroll. Close others, to the left, to the right and all act on the tab's group; Close All Tabs from the
+  palette closes the focused group's. Next / previous tab go round the focused group. Every group's shown tab is
+  revealed (a restored tab there reads its rows), and only tabs shown in no group stop refreshing on their own;
+  the administration tab's auto-refresh runs while it is shown in any group.
+- **Moves**: Split Right, Split Down, Move Tab to the Next / Previous Group (with one group, Move splits right;
+  with two, the menu says "Move to the other group"), Focus Next / Previous Group. Dropped on a strip, a tab goes
+  before the tab it is dropped on (in its own strip that reorders, which Kerno could not do before); after the
+  tabs, last.
+- **Keys** (letters with ⌘⌥⇧, Ctrl+Alt+Shift on Linux; all pass K20's conflict and reserved-key tests, and none
+  is a digit or a sign, for the AZERTY keyboard): L Split Right, I Split Down, M Move Tab to the Next Group, N and
+  P Focus Next / Previous Group. Not D (⌘⇧D is the theme switch: the search of Settings ▸ Shortcuts for ⌘⇧D would
+  list both), not J (the shortcuts page's own test records it as a free key), not K, R, W, B (Ctrl+Alt+Shift+K
+  commits, +R rolls back, +W wraps, +B opens the administration on Linux), not the arrows (GNOME moves windows
+  between workspaces with Ctrl+Alt+Shift+arrows).
+- **Stored**: the setting `tabs.layout`, written with the tabs: the tree with each tab as its index among the
+  stored tabs (table forms and the Tasks view are not stored, so a group of only those does not come back) and
+  each group's shown tab; the focused group is the one of `tabs.active`. It is read off the UI thread with the
+  tabs (`Startup`); none (before K19) or one that does not parse is one group, and a layout that no longer fits
+  is mended, never refused (`Layout::restore`: unknown and repeated tabs dropped, empty groups closed, the tabs
+  it does not place added to the first group, nonsense shares made even, past four groups one group). No start
+  error is added (K8).
