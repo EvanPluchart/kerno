@@ -361,7 +361,18 @@ impl BackupDialog {
         let picking = cx.prompt_for_new_path(&folder, name.as_deref());
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = picking.await {
-                let _ = this.update_in(cx, |this, window, cx| this.set_file(&path, window, cx));
+                // The macOS panel asks before it returns a file that exists; a Linux
+                // panel may not (it depends on the desktop's portal), so Kerno asks there.
+                let probe = path.clone();
+                let existed = cfg!(target_os = "macos")
+                    && cx
+                        .background_executor()
+                        .spawn(async move { probe.exists() })
+                        .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.agreed_replace = existed.then(|| path.clone());
+                    this.set_file(&path, window, cx)
+                });
             }
         }));
     }

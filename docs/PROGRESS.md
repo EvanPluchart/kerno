@@ -977,5 +977,7 @@ Still open (for the owner):
 - Tests: `ui_tests/backup_simple.rs` (six, each seen failing under its mutation); the wizard's own tests open it
   through `show_advanced`. The tool modules, Settings, the toolbar, the tasks and the whole `cargo test -p kerno`
   pass; clippy and fmt clean.
+- The review's change: a file chosen in the macOS save panel, which already asks before replacing it, is written
+  without Kerno's second "Replace …" question; Linux keeps Kerno's question.
 - Still to do: the final captures (`m12-backup-simple-*`, `m12-restore-simple-*`), the owner's look at the format
   cards' size and the wording of the MySQL line.

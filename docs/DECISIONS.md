@@ -2698,5 +2698,7 @@ The owner found the backup wizard had too many things: a simple mode by default,
   view. Enter (the dialog's Confirm) starts a simple backup that can run, never a restore nor the wizard's
   Start. The page's height follows the window (the window less 230 px, up to 520 px) in both views: at 600 px
   the wizard's footer had been cut.
-- The macOS save panel asks before replacing a file and Kerno's "Replace …" asks again, with the command:
-  kept, one question too many rather than none on Linux panels that do not ask.
+- A file that exists is replaced after one question, not two: on macOS the save panel asks, so a file chosen
+  there is written without Kerno's own "Replace …" (`agreed_replace`; the review's change, the first version
+  asked twice). A path typed or kept from the default name still gets Kerno's question, and so does every file
+  on Linux, where the panel is the desktop's portal and may not ask.

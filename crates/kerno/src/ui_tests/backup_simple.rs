@@ -434,6 +434,19 @@ fn a_simple_backup_is_restored_by_the_simple_restore(cx: &mut TestAppContext) {
         );
         app.tap(cx, "backup-close");
 
+        // The same file chosen again in the macOS save panel, which asks before replacing
+        // it: Kerno does not ask a second time.
+        if cfg!(target_os = "macos") {
+            let dialog = app.simple_dialog(cx, source, false).expect("the backup");
+            app.wait_backup(cx, &dialog, &["ready"]);
+            app.save_as(cx, "simple-choose-file", &file);
+            app.press(cx, &["enter"]);
+            assert!(!app.has(cx, "sql-preview"), "{engine:?}");
+            let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+            assert!(state.starts_with("done: "), "{engine:?}: {state}");
+            app.tap(cx, "backup-close");
+        }
+
         let dialog = app.simple_dialog(cx, target, true).expect("the restore");
         app.wait_backup(cx, &dialog, &["choose a file"]);
         assert_eq!(view(cx, &dialog), "simple");

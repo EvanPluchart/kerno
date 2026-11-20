@@ -258,6 +258,9 @@ pub struct BackupDialog {
     databases: Loaded<Vec<String>>,
     /// Global backup: the databases left out.
     excluded: BTreeSet<String>,
+    /// The file the macOS save panel returned when it already existed: the
+    /// panel asked before replacing it, so the backup does not ask again.
+    agreed_replace: Option<PathBuf>,
     folder: Entity<InputState>,
     pattern: Entity<InputState>,
     extra: Entity<InputState>,
@@ -562,6 +565,7 @@ impl BackupDialog {
             input: None,
             allow_commands: false,
             step: Step::Preparing,
+            agreed_replace: None,
             shown_command: None,
             output: None,
             started: None,
@@ -1679,6 +1683,11 @@ impl BackupDialog {
                 ))),
                 cx,
             );
+            return;
+        }
+        if self.agreed_replace.as_deref() == Some(output.as_path()) {
+            // Chosen in the save panel, which asked: once is enough.
+            self.run(command, Some((output, true)), window, cx);
             return;
         }
         let view = cx.entity();
