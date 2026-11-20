@@ -2564,3 +2564,13 @@ holds: "Next 50 rows");
   models), disabled while a request is on its way; the panel reads the new endpoint's key flag when the active
   endpoint changes. The off notice of the "AI: …" commands says what turning it on gives (the panel never opens
   while off). The keymap footer of Settings is K20's and on every page: left alone.
+
+## D-096 — A release builds on every core (the owner, 2026-11-20)
+
+`scripts/release.sh` sets `CARGO_BUILD_JOBS` and `KERNO_JOBS` to the number of cores when they are not set, so
+the three release compilations (macOS, Linux arm64, Linux x86_64) no longer run on 3 jobs: the 0.2.0 release
+took 40 minutes and the owner asked for it ("lève la limite pour les releases"). Everything else keeps the cap
+of `.cargo/config.toml` (`jobs = 3`) and `nice -n 10`: tests, `scripts/check.sh`, the test bundles
+(`scripts/bundle-macos.sh` and `scripts/bundle-linux.sh` run by themselves), agents. The Mac is slow while a
+release builds; nothing else heavy runs beside it. `CLAUDE.md` §1 still reads "jobs = 3; keep it": the
+exception is the owner's to write there.

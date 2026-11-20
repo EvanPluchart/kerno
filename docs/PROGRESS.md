@@ -911,3 +911,17 @@ Still open (for the owner):
   address without asking; a paged result's time no longer counts a later "fetch all".
 - Tests: 2 unit tests in kerno-core, 13 UI and theme tests added and 3 rewritten, each seen failing under a
   mutation.
+
+## 2026-11-20 — Kerno 0.2.0 published (the owner's ask)
+
+- The owner tested the build of `027e158` and asked for the release. `52efdc8`: workspace version 0.2.0, the
+  four READMEs' status line, `docs/release-notes/v0.2.0.md`. `scripts/release.sh 0.2.0` built the macOS disk
+  image and the six Linux packages (arm64 in 355 s, x86_64 cross-compiled), started every Linux package in
+  clean Ubuntu 20.04 and Debian 13 containers, and wrote `SHA256SUMS`; 40 minutes in all.
+- Published at the owner's word: `main` pushed, tag `v0.2.0`, `gh release create` with the eight files and the
+  notes. Checked after: not a draft, `releases/latest` redirects to `v0.2.0`, the published `SHA256SUMS` equals
+  the local one. Not checked from here: the update as a 0.1.0 install sees and installs it (the owner's
+  installed app is his to run).
+- After it, at the owner's ask: a release builds on every core (D-096).
+- Still to do: the captures of K1 to K23 for `docs/screenshots/final/`, the website, the bench of memory at
+  rest (152.1 MB measured before K15 and K18 added sessions).

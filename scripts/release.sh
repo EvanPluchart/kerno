@@ -34,6 +34,12 @@ if [ "$linux_only" = 0 ] && [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
+# A release alone builds on every core (D-096): the cap of 3 jobs of .cargo/config.toml stays for
+# everything else. CARGO_BUILD_JOBS overrides that file for the macOS build, KERNO_JOBS is read by
+# scripts/bundle-linux.sh (the Docker VM's own CPU limit still applies there).
+cores=$(getconf _NPROCESSORS_ONLN)
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$cores} KERNO_JOBS=${KERNO_JOBS:-$cores}
+
 arch=$(uname -m)
 files=()
 if [ "$linux_only" = 0 ] && [ "$(uname -s)" = Darwin ]; then
