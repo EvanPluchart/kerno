@@ -2,16 +2,19 @@
 //! (CLAUDE.md §3 item 12, docs/DECISIONS.md D-045). The steps that run commands are
 //! `crate::update`; Recto's `viewer/update.rs` (MIT, same owner) is the model: the same
 //! timing, the same item, the same "declining keeps the checked download for the next click".
+//! A timed check that finds a new version also opens a dialog, once per run (D-097).
 
 use std::path::PathBuf;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, BorrowAppContext as _, Context, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, Styled as _, TestSupportExt as _, Window, div,
+    ParentElement as _, SharedString, Styled as _, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::update::{Version, release_page};
 
@@ -21,6 +24,40 @@ use crate::bridge;
 use crate::state::AppState;
 use crate::tabs::{StatusItem, TabAction};
 use crate::update::{self, Install, Phase, Updates};
+
+/// The tooltip of the status bar item when its version was skipped: it stays, without the dialog.
+pub fn update_tooltip(cx: &App) -> Option<&'static str> {
+    let (Phase::Available(version) | Phase::Ready(version, _)) = phase(cx)? else {
+        return None;
+    };
+    let skipped = AppState::get(cx).settings.skipped_update.as_deref();
+    (skipped == Some(version.to_string().as_str())).then_some(
+        "You skipped this version: Kerno no longer asks about it at launch. Click to update anyway.",
+    )
+}
+
+/// What "Update" does for this copy of Kerno, said in the dialog before anyone clicks it.
+pub fn what_update_does(target: &Install, version: Version) -> String {
+    let checked = format!(
+        "Update downloads Kerno {version} from GitHub and checks it against the release's \
+         SHA-256 checksums"
+    );
+    let asks = "If a tab holds an open transaction or pending changes, Kerno asks before it quits.";
+    match target {
+        Install::App(bundle) => format!(
+            "{checked}, replaces {} and starts it again. {asks}",
+            bundle.display()
+        ),
+        Install::Prefix(dir) => format!(
+            "{checked}, replaces Kerno's files in {} and starts it again. {asks}",
+            dir.display()
+        ),
+        Install::Page => "This copy of Kerno cannot replace itself (a package, an AppImage, a \
+             build, or a folder Kerno may not write): Update opens the release page in your \
+             browser, to download it from there."
+            .to_string(),
+    }
+}
 
 /// Changes where the update stands.
 fn set_phase(cx: &mut App, phase: Phase) {
@@ -126,16 +163,16 @@ impl Workspace {
         });
         match found {
             Ok(Some(version)) => {
-                let skipped = AppState::get(cx).settings.skipped_update.clone();
-                let skip = !manual && skipped == Some(version.to_string());
-                // A download or an install under way keeps its state.
-                if !skip
-                    && matches!(
-                        phase(cx),
-                        Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..))
-                    )
-                {
+                // A download or an install under way keeps its state. A skipped version keeps
+                // its item too (D-097): only the dialog is left out.
+                if matches!(
+                    phase(cx),
+                    Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..))
+                ) {
                     set_phase(cx, Phase::Available(version));
+                }
+                if !manual {
+                    self.offer_update(version, window, cx);
                 }
                 if manual {
                     window.push_notification(
@@ -163,10 +200,125 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the update dialog for `version`, unless it was shown in this run already (for any
+    /// version), the version was skipped, or the item is no longer about it. Over another
+    /// dialog it waits: `keep_focus` calls this again once none is open.
+    pub(super) fn offer_update(
+        &mut self,
+        version: Version,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(updates) = cx.try_global::<Updates>() else {
+            return;
+        };
+        let skipped = AppState::get(cx).settings.skipped_update.as_deref();
+        if updates.offered.is_some()
+            || updates.phase != Phase::Available(version)
+            || skipped == Some(version.to_string().as_str())
+        {
+            return;
+        }
+        let have = SharedString::from(format!("You have {}.", updates.current));
+        let does = SharedString::from(what_update_does(&updates.target, version));
+        if window.has_active_dialog(cx) {
+            self.pending_update_offer = Some(version);
+            return;
+        }
+        let title = SharedString::from(format!("Kerno {version} is available"));
+        cx.update_global::<Updates, _>(|updates, _| updates.offered = Some(version));
+        let workspace = cx.entity().downgrade();
+        let text = |id: &'static str, text: SharedString| {
+            div()
+                .id(id)
+                .test_support()
+                .child(text.clone())
+                .test_text(text)
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (workspace, have, does) = (workspace.clone(), have.clone(), does.clone());
+            dialog
+                .title(text("update-dialog-title", title.clone()))
+                .w(px(500.))
+                // Enter answers nothing: a key typed as the dialog arrives installs nothing.
+                // Escape, the close button and the backdrop are "Later".
+                .on_ok(|_, _, _| false)
+                .content(move |content, _, cx| {
+                    let answer =
+                        |id: &'static str, label: &'static str, action: Option<TabAction>| {
+                            let workspace = workspace.clone();
+                            // Only Later is a tab stop: an indented line typed as the dialog arrives
+                            // (Tab, a word, Space) can close it, never skip or install (D-097).
+                            Button::new(id)
+                                .label(label)
+                                .tab_stop(action.is_none())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    if let Some(action) = action.clone() {
+                                        let _ = workspace.update(cx, |this, cx| {
+                                            this.update_action(action, window, cx)
+                                        });
+                                    }
+                                })
+                        };
+                    content.child(
+                        v_flex()
+                            .gap_3()
+                            .text_sm()
+                            .child(text("update-dialog-current", have.clone()))
+                            .child(
+                                text("update-dialog-does", does.clone())
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        // The browser fetches the page; Kerno sends nothing.
+                                        Button::new("update-dialog-notes")
+                                            .ghost()
+                                            .tab_stop(false)
+                                            .label("What's new")
+                                            .on_click(move |_, _, cx| {
+                                                cx.open_url(&release_page(version))
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                answer(
+                                                    "update-dialog-skip",
+                                                    "Skip this version",
+                                                    Some(TabAction::SkipVersion),
+                                                )
+                                                .ghost(),
+                                            )
+                                            .child(
+                                                answer("update-dialog-later", "Later", None)
+                                                    .outline(),
+                                            )
+                                            .child(
+                                                answer(
+                                                    "update-dialog-update",
+                                                    "Update",
+                                                    Some(TabAction::Update),
+                                                )
+                                                .primary(),
+                                            ),
+                                    ),
+                            ),
+                    )
+                })
+        });
+    }
+
     /// The item at the right of the status bar while there is an update to talk about. A click
     /// updates (or opens the release page after a failure); a right-click opens its menu.
     pub(super) fn update_item(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (text, failed) = update_label(cx)?;
+        let tooltip = update_tooltip(cx);
         let theme = cx.theme();
         let color = match self.active_chrome(cx) {
             Some(chrome) => chrome.bar_text,
@@ -183,6 +335,7 @@ impl Workspace {
                         .ghost()
                         .xsmall()
                         .child(div().text_color(color).child(text))
+                        .when_some(tooltip, |button, tooltip| button.tooltip(tooltip))
                         .on_click(cx.listener(|this, _, window, cx| {
                             if let Some(Phase::Failed(version, _)) = phase(cx) {
                                 cx.open_url(&release_page(version));
@@ -222,10 +375,10 @@ impl Workspace {
             },
             TabAction::OpenReleasePage => cx.open_url(&release_page(version)),
             TabAction::SkipVersion => {
+                // The item stays, so the version can still be installed (D-097).
                 AppState::update_settings(cx, |settings| {
                     settings.skipped_update = Some(version.to_string())
                 });
-                set_phase(cx, Phase::Idle);
             }
             TabAction::TurnOffUpdateChecks => {
                 AppState::update_settings(cx, |settings| settings.check_updates = false);

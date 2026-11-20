@@ -523,6 +523,8 @@ pub struct Workspace {
     /// Alive while the quit question is on screen (its dialog holds the
     /// other end): a second Quit does not ask again.
     quit_question: std::rc::Weak<()>,
+    /// A new version found while another dialog was open: its dialog opens once none is (D-097).
+    pending_update_offer: Option<kerno_core::update::Version>,
     /// Redraws the transactions' ages every [`TX_AGE_REFRESH`]; alive only
     /// while some query tab holds a transaction (K4), so an idle window
     /// wakes for nothing. It only redraws: it never touches a session.
@@ -610,6 +612,7 @@ impl Workspace {
             last_focus: None,
             multi_run: None,
             quit_question: std::rc::Weak::new(),
+            pending_update_offer: None,
             tx_ticker: None,
             #[cfg(test)]
             quit_requested: false,
@@ -5713,6 +5716,12 @@ impl Workspace {
         let was_open = std::mem::replace(&mut self.dialog_open, window.has_active_dialog(cx));
         if self.dialog_open {
             return;
+        }
+        if let Some(version) = self.pending_update_offer.take() {
+            let workspace = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |this, cx| this.offer_update(version, window, cx));
+            });
         }
         if self.focus_handle.contains_focused(window, cx) {
             self.last_focus = window.focused(cx).map(|focus| focus.downgrade());

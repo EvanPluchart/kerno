@@ -1167,9 +1167,45 @@ impl SettingsView {
                     settings.confirm_close_tab = on
                 })
             }
-            Kind::Updates => Self::toggle(row, settings.check_updates, |settings, on| {
-                settings.check_updates = on
-            }),
+            Kind::Updates => {
+                let toggle = Self::toggle(row, settings.check_updates, |settings, on| {
+                    settings.check_updates = on
+                });
+                match settings.skipped_update.clone() {
+                    // "Skip this version" of the update dialog (D-097): undone here.
+                    Some(version) => {
+                        let line = format!("Kerno {version} was skipped");
+                        v_flex()
+                            .gap_2()
+                            .child(toggle)
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("settings-skipped-update")
+                                            .test_support()
+                                            .child(SharedString::from(line.clone()))
+                                            .test_text(line),
+                                    )
+                                    .child(
+                                        Button::new("settings-ask-again")
+                                            .ghost()
+                                            .small()
+                                            .label("Ask again")
+                                            .on_click(|_, window, cx| {
+                                                AppState::update_settings(cx, |settings| {
+                                                    settings.skipped_update = None
+                                                });
+                                                window.refresh();
+                                            }),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                    None => toggle,
+                }
+            }
             Kind::LocalClients | Kind::Environments | Kind::Ai | Kind::Shortcuts if searching => {
                 let section = row.section;
                 let index = SECTIONS

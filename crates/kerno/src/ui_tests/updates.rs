@@ -2,11 +2,12 @@
 //! runner answers for `curl`, `hdiutil`, `ditto` and `open`: nothing here reaches the network,
 //! and nothing touches a real `Kerno.app`.
 
+use super::tool_wizards::paints;
 use super::*;
 use crate::tabs::TabAction;
 use crate::update::tests::{Fake, redirect_to, value_of};
 use crate::update::{Install, Phase, Updates};
-use crate::workspace::updates::update_label;
+use crate::workspace::updates::{update_label, update_tooltip, what_update_does};
 use kerno_core::update::{self as releases, Version};
 
 fn v(text: &str) -> Version {
@@ -217,7 +218,10 @@ fn release_runner_then(
         };
         match program.to_str().unwrap() {
             curl if curl.ends_with("/curl") => {
-                let output = value_of(args, "--output").ok_or("no output")?;
+                // The check (`--head`, no file): 0.2.0 is the latest.
+                let Some(output) = value_of(args, "--output") else {
+                    return Ok(redirect_to("v0.2.0"));
+                };
                 let name = args.last().unwrap().rsplit('/').next().unwrap();
                 let (_, body) = files
                     .iter()
@@ -432,6 +436,10 @@ fn the_update_item_answers_a_right_click_and_skip_is_remembered(cx: &mut TestApp
     allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
     check(&app, cx, false);
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    // The dialog of the timed check first (D-097): Escape is "Later".
+    assert!(update_dialog(&app, cx));
+    app.press(cx, &["escape"]);
+    assert!(!app.dialog_open(cx));
 
     app.right_click(cx, "status-update", None);
     for entry in [
@@ -443,23 +451,28 @@ fn the_update_item_answers_a_right_click_and_skip_is_remembered(cx: &mut TestApp
         assert!(app.shows_label(cx, entry), "{entry}");
     }
     app.click_label(cx, "Skip this version");
-    assert_eq!(phase(cx), Phase::Idle);
-    assert!(!app.has(cx, "status-update"));
+    // The item stays (D-097), its tooltip saying the version was skipped.
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert!(app.has(cx, "status-update"));
+    assert!(cx.update(|cx| update_tooltip(cx)).is_some());
     assert_eq!(settings_now(cx).skipped_update.as_deref(), Some("0.2.0"));
     app.wait_until(cx, "the stored skip", |_, _| {
         Settings::load(&storage).skipped_update.as_deref() == Some("0.2.0")
     });
 
-    // The timed checks keep quiet about it; asking offers it anyway.
+    // The timed checks keep the item and open no dialog; asking offers it too.
     check(&app, cx, false);
-    assert_eq!(phase(cx), Phase::Idle);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
     check(&app, cx, true);
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
-    // A newer one than the skipped one is offered again.
+    assert!(!app.dialog_open(cx));
+    // A newer one than the skipped one is offered again, without the skip's tooltip.
     let newer = Fake::new(|_, _| Ok(redirect_to("v0.3.0")));
     allow_updates(&app, cx, newer, "0.1.0", Install::Page, temp.path());
     check(&app, cx, false);
     assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert!(cx.update(|cx| update_tooltip(cx)).is_none());
+    app.press(cx, &["escape"]);
 
     update_does(&app, cx, TabAction::OpenReleasePage);
     assert_eq!(
@@ -469,4 +482,290 @@ fn the_update_item_answers_a_right_click_and_skip_is_remembered(cx: &mut TestApp
     update_does(&app, cx, TabAction::TurnOffUpdateChecks);
     assert!(!settings_now(cx).check_updates);
     assert_eq!(phase(cx), Phase::Idle);
+}
+
+/// Whether the update dialog of D-097 is on screen.
+fn update_dialog(app: &Fixture, cx: &mut TestAppContext) -> bool {
+    app.has(cx, "update-dialog-title")
+}
+
+/// A new run of Kerno on the same store: the settings read back from it, a new updater (no
+/// dialog shown yet) with `runner`.
+fn next_run(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    runner: Arc<Fake>,
+    target: Install,
+    temp: &Path,
+) {
+    let wanted = settings_now(cx).skipped_update;
+    app.wait_until(cx, "the stored settings", |app, _| {
+        Settings::load(&app.storage).skipped_update == wanted
+    });
+    let stored = Settings::load(&app.storage);
+    cx.update(|cx| cx.global_mut::<AppState>().settings = stored);
+    allow_updates(app, cx, runner, "0.1.0", target, temp);
+}
+
+#[gpui_kit::test]
+fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_run(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    assert!(paints(&app, cx, "Kerno 0.2.0 is available"));
+    assert!(paints(&app, cx, "You have 0.1.0."));
+    assert!(paints(
+        &app,
+        cx,
+        "Update opens the release page in your browser"
+    ));
+    // The status bar item is there too.
+    assert!(app.has(cx, "status-update"));
+
+    // "What's new" opens the release page in the browser: Kerno makes no request of its own.
+    app.click(cx, "update-dialog-notes");
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/EvanPluchart/kerno/releases/tag/v0.2.0")
+    );
+    assert!(update_dialog(&app, cx));
+    assert_eq!(curl_args(&fake).len(), 1);
+
+    // Later closes, stores nothing, keeps the item.
+    app.click(cx, "update-dialog-later");
+    assert!(!app.dialog_open(cx));
+    assert_eq!(settings_now(cx).skipped_update, None);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert_eq!(fake.calls().len(), 1);
+
+    // The 6-hour check of the same run: the status bar is enough, for that version or a newer.
+    check(&app, cx, false);
+    assert!(!app.dialog_open(cx));
+    cx.update(|cx| {
+        let newer = Fake::new(|_, _| Ok(redirect_to("v0.3.0")));
+        cx.global_mut::<Updates>().runner = newer;
+    });
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert!(!app.dialog_open(cx));
+
+    // Help ▸ Check for Updates… says it in a notification, not with the dialog.
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    check(&app, cx, true);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert!(!app.dialog_open(cx));
+
+    // The same version or an older one: no dialog.
+    for tag in ["v0.1.0", "v0.0.9"] {
+        let fake = Fake::new(move |_, _| Ok(redirect_to(tag)));
+        allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+        check(&app, cx, false);
+        assert!(!app.dialog_open(cx), "{tag}");
+    }
+
+    // The check turned off: no request, no dialog.
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = false));
+    check(&app, cx, false);
+    assert!(fake.calls().is_empty());
+    assert!(!app.dialog_open(cx));
+}
+
+#[gpui_kit::test]
+fn later_asks_again_at_the_next_run_and_skip_stops_asking_for_that_version_only(
+    cx: &mut TestAppContext,
+) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let latest = |tag: &'static str| Fake::new(move |_, _| Ok(redirect_to(tag)));
+    allow_updates(
+        &app,
+        cx,
+        latest("v0.2.0"),
+        "0.1.0",
+        Install::Page,
+        temp.path(),
+    );
+    check(&app, cx, false);
+    app.click(cx, "update-dialog-later");
+    assert!(!app.dialog_open(cx));
+
+    // The next run asks again.
+    next_run(&app, cx, latest("v0.2.0"), Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.click(cx, "update-dialog-skip");
+    assert!(!app.dialog_open(cx));
+    assert_eq!(settings_now(cx).skipped_update.as_deref(), Some("0.2.0"));
+    // The item stays, so it can still be installed.
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert!(app.has(cx, "status-update"));
+    assert_eq!(
+        label(cx).as_deref(),
+        Some("Kerno 0.2.0 is available · Update")
+    );
+
+    // The run after: no dialog for 0.2.0, the item still there.
+    next_run(&app, cx, latest("v0.2.0"), Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(!app.dialog_open(cx));
+    assert!(app.has(cx, "status-update"));
+    assert!(cx.update(|cx| update_tooltip(cx)).is_some());
+
+    // A newer version asks again.
+    next_run(&app, cx, latest("v0.3.0"), Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    assert!(paints(&app, cx, "Kerno 0.3.0 is available"));
+}
+
+#[gpui_kit::test]
+fn ask_again_in_settings_clears_the_skipped_version(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            settings.skipped_update = Some("0.3.0".into())
+        })
+    });
+    app.dispatch(cx, actions::OpenSettings);
+    let index = crate::settings_view::SECTIONS
+        .iter()
+        .position(|(_, label)| *label == "Updates")
+        .unwrap();
+    app.click(cx, ("settings-section", index));
+    assert!(paints(&app, cx, "Kerno 0.3.0 was skipped"));
+    app.click(cx, "settings-ask-again");
+    assert_eq!(settings_now(cx).skipped_update, None);
+    assert!(!app.has(cx, "settings-skipped-update"));
+    assert!(!app.has(cx, "settings-ask-again"));
+}
+
+#[gpui_kit::test]
+fn update_in_the_dialog_takes_the_path_of_the_status_bar_item(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let (_apps, bundle) = applications();
+    let fake = release_runner(release(&sha256_hex(b"the release")));
+    let target = Install::App(bundle.clone());
+    allow_updates(&app, cx, fake.clone(), "0.1.0", target.clone(), temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    let does = what_update_does(&target, v("0.2.0"));
+    assert!(does.contains(&bundle.display().to_string()), "{does}");
+    assert!(paints(&app, cx, "and starts it again"));
+    app.click(cx, "update-dialog-update");
+    // Checked against SHA256SUMS, installed, started: as from the status bar.
+    app.wait_until(cx, "the relaunch", |_, _| {
+        fake.calls()
+            .iter()
+            .any(|(program, _)| program.ends_with("open"))
+    });
+    assert_eq!(phase(cx), Phase::Installing(v("0.2.0")));
+    assert_eq!(bundle_says(&bundle), "new");
+    // The check, the checksums, the file.
+    assert_eq!(curl_args(&fake).len(), 3);
+
+    // A copy that cannot install itself: Update opens the release page, nothing is downloaded.
+    let page = release_runner(Vec::new());
+    allow_updates(&app, cx, page.clone(), "0.1.0", Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.click(cx, "update-dialog-update");
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/EvanPluchart/kerno/releases/tag/v0.2.0")
+    );
+    assert_eq!(page.calls().len(), 1);
+    assert!(!app.dialog_open(cx));
+}
+
+#[gpui_kit::test]
+fn the_dialog_waits_for_another_dialog_to_close(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::{InteractiveElement as _, ParentElement as _, TestSupportExt as _, div};
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+    app.step(cx, |window, cx| {
+        window.open_dialog(cx, |dialog, _, _| {
+            dialog.title(
+                div()
+                    .id("other-dialog")
+                    .test_support()
+                    .child("Another question"),
+            )
+        })
+    });
+    assert!(app.has(cx, "other-dialog"));
+    check(&app, cx, false);
+    assert!(!update_dialog(&app, cx));
+    assert!(app.has(cx, "other-dialog"));
+    app.step(cx, |window, cx| window.close_dialog(cx));
+    cx.executor().advance_clock(Duration::from_secs(1));
+    app.step(cx, |_, _| ());
+    assert!(!app.has(cx, "other-dialog"));
+    assert!(update_dialog(&app, cx));
+}
+
+#[gpui_kit::test]
+fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let (_apps, bundle) = applications();
+    let fake = release_runner(release(&sha256_hex(b"the release")));
+    allow_updates(
+        &app,
+        cx,
+        fake.clone(),
+        "0.1.0",
+        Install::App(bundle.clone()),
+        temp.path(),
+    );
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 1");
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.press(cx, &["enter", "space", "enter"]);
+    app.type_text(cx, " ");
+    assert!(update_dialog(&app, cx));
+    assert_eq!(fake.calls().len(), 1, "only the check");
+    assert_eq!(cx.opened_url(), None);
+    assert_eq!(settings_now(cx).skipped_update, None);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert_eq!(bundle_says(&bundle), "old");
+
+    // Escape is "Later"; the keyboard goes back to the editor.
+    app.press(cx, &["escape"]);
+    assert!(!app.dialog_open(cx));
+    assert_eq!(settings_now(cx).skipped_update, None);
+    assert_eq!(fake.calls().len(), 1);
+    app.type_text(cx, " as one");
+    let tab = app.tab(cx);
+    assert_eq!(cx.update(|cx| tab.read(cx).sql(cx)), "select 1 as one");
+
+    // An indented line typed into it at the next run (Tab, a word, Space): Tab reaches only
+    // Later, so Space closes it as Later; nothing is skipped, opened or installed.
+    allow_updates(
+        &app,
+        cx,
+        fake.clone(),
+        "0.1.0",
+        Install::App(bundle.clone()),
+        temp.path(),
+    );
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.press(cx, &["tab", "a", "n", "d", "space", "tab", "space"]);
+    assert!(!app.dialog_open(cx));
+    assert_eq!(fake.calls().len(), 2, "only the two checks");
+    assert_eq!(cx.opened_url(), None);
+    assert_eq!(settings_now(cx).skipped_update, None);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert_eq!(bundle_says(&bundle), "old");
 }

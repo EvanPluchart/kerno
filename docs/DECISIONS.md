@@ -2574,3 +2574,49 @@ of `.cargo/config.toml` (`jobs = 3`) and `nice -n 10`: tests, `scripts/check.sh`
 (`scripts/bundle-macos.sh` and `scripts/bundle-linux.sh` run by themselves), agents. The Mac is slow while a
 release builds; nothing else heavy runs beside it. `CLAUDE.md` §1 still reads "jobs = 3; keep it": the
 exception is the owner's to write there.
+
+## D-097 — A new version opens a dialog at launch, once per run, until updated or skipped (K24; the owner, 2026-11-20)
+
+The owner opened his 0.1.0 after 0.2.0 was published and saw the update only as a small text at the end of the
+status bar: "next times, when there is an update we should show a popup, because this is not visible enough;
+we should do as DBeaver does: a window that opens at every launch unless one clicks to skip the version."
+
+- **When it shows.** A timed check (3 s after the window opens, then every 6 hours: D-045, unchanged) that finds
+  a strictly newer version opens the dialog, unless the dialog was already shown in this run (for any version),
+  or that version is the skipped one, or the status bar item is no longer about it (a download or an install
+  under way). A later check of the same run, of the same version or a newer one, only updates the status bar
+  item. Help ▸ Check for Updates… keeps its notification and opens no dialog: it was asked for, and its answer
+  points at the item. Nothing changes when the check is off (Settings ▸ Updates, `KERNO_NO_UPDATE_CHECK`, a
+  bench run, a test build), offline, or when the version is not strictly newer.
+- **What it says.** "Kerno X.Y.Z is available", "You have A.B.C.", and what Update does on this copy
+  (`workspace::updates::what_update_does`): for an installed `Kerno.app` or tarball prefix, that it downloads
+  the release from GitHub, checks it against the release's SHA-256 checksums, replaces that bundle or those
+  files and starts Kerno again, asking first if a tab holds an open transaction or pending changes; for any
+  other copy (`Install::Page`), that it cannot replace itself and Update opens the release page in the browser.
+- **The buttons.** Update (primary): closes the dialog and runs the status bar item's own path
+  (`update_action(TabAction::Update)`), checksum, progress, errors and the quit question unchanged. Later: closes,
+  stores nothing; the next run asks again. Skip this version: stores the version in the settings
+  (`Settings::skipped_update`, the setting "Skip this version" of the item's menu already used: no migration);
+  no later run asks about it, a newer version asks again. What's new: opens the release page in the browser and
+  leaves the dialog open. Escape, the close button and a click beside the dialog are Later.
+- **The item stays.** Reverses D-045's skip: a skipped version keeps its status bar item (before, the item went
+  away and the timed checks kept quiet about it), so it can still be installed; its tooltip says it was skipped.
+  Settings ▸ Updates shows "Kerno X.Y.Z was skipped" with "Ask again", which clears the skip.
+- **Keys.** The check returns a few seconds after the window opens, when the user may be typing. The dialog
+  opens at once (waiting for a pause in the typing would leave it hidden behind a timer for nothing it protects)
+  and no key typed into it skips, installs or opens anything: Enter answers nothing (`on_ok` returns false); the
+  keyboard goes to the dialog itself, not to a button, so Space clicks nothing and letters go nowhere; Escape is
+  Later and gives the keyboard back to the editor. Only Later is a tab stop (`tab_stop(false)` on What's new,
+  Skip and Update), so an indented line typed into it (Tab, a word, Space) closes it as Later at worst: a test
+  found that with every button a tab stop, Tab then Space opened the release page and a third Tab reached Skip.
+  Update, Skip and What's new are therefore clicked with the pointer; the keyboard had no way to install before
+  either (the status bar item is clicked). `ponytail:` a palette command "Install Kerno X" if a keyboard-only
+  user asks. A key typed as the dialog arrives is lost, never acted on.
+- **Other dialogs.** It never opens over another dialog, confirmation, alert or the palette: the version waits
+  in `Workspace::pending_update_offer`, and the first frame with none open (`keep_focus`) offers it again.
+- **No new request.** The release notes are not fetched: "What's new" is a link the browser opens. The check is
+  still the one `HEAD` request of D-045.
+- **Stored**: only the skipped version, in the settings store as before. Whether the dialog was shown this run
+  is `Updates::offered`, in memory.
+- DBeaver's `VersionUpdateDialog` (Upgrade, More info, Close, a "don't show again for this version" checkbox) is
+  the behaviour reference; no code was ported: the dialog is the kit's, three buttons and a link.

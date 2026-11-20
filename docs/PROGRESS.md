@@ -925,3 +925,14 @@ Still open (for the owner):
 - After it, at the owner's ask: a release builds on every core (D-096).
 - Still to do: the captures of K1 to K23 for `docs/screenshots/final/`, the website, the bench of memory at
   rest (152.1 MB measured before K15 and K18 added sessions).
+
+## 2026-11-20 — K24: a new version opens a dialog at launch (the owner's ask, after 0.2.0)
+
+- The owner saw 0.2.0 offered only as a small text at the end of the status bar and asked for a window at
+  every launch, as DBeaver does, until the version is skipped. D-097: a timed check that finds a newer version
+  opens the kit's dialog once per run ("Kerno X is available", the version in use, what Update does on this
+  copy, What's new, Update / Later / Skip this version); Enter and Space act on nothing, Tab reaches only
+  Later, Escape is Later; it waits while another dialog is open; Update is the status bar item's path; a
+  skipped version keeps its item (tooltip) and Settings ▸ Updates shows it with Ask again. No new request.
+- Tests: 6 UI tests added and 1 rewritten in `ui_tests/updates.rs`, each seen failing under a mutation.
+- Still to do: the captures `m12-update-dialog-{light,dark}`.

@@ -243,6 +243,14 @@ Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Chec
 click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
 [architecture notes](ARCHITECTURE.md#the-update-check) give the details.
 
+When a check at launch (or every 6 hours) finds a new version, a window says so once per run: the new version,
+the one you have, and what Update does on your copy (an installed `Kerno.app` or archive replaces itself and
+starts again; any other copy opens the release page). **What's new** opens the release page in your browser.
+**Update** installs as the status bar item does; **Later** closes it, and the next launch asks again; **Skip
+this version** stops the window for that version (a newer one asks again). No key acts in it while you type:
+Enter and Space do nothing, Escape is Later, and Tab reaches only Later (the other buttons are clicked); it waits while another dialog is open. The status bar item stays in
+every case, a skipped version included; Settings ▸ Updates shows the skipped version with **Ask again**.
+
 ## Settings, environments and what wins
 
 Settings (Cmd+,) opens with the keyboard in its search field: type a word ("dark", "font size", "autocommit",

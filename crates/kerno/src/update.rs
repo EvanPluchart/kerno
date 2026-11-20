@@ -510,6 +510,8 @@ pub struct Updates {
     pub phase: Phase,
     /// A check is under way.
     pub checking: bool,
+    /// The version the update dialog was shown for in this run (D-097): it shows once per run.
+    pub offered: Option<Version>,
 }
 
 impl Global for Updates {}
@@ -523,6 +525,7 @@ impl Updates {
             temp,
             phase: Phase::Idle,
             checking: false,
+            offered: None,
         }
     }
 }
