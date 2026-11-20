@@ -139,6 +139,8 @@ pub enum ConnectionsEvent {
     /// An open connection was saved with "connect": its new settings need a
     /// new session, which the window opens once what its tabs hold is ended.
     ReconnectRequested { id: String },
+    /// Something the user should know about a connection that opened.
+    Warned { message: String },
 }
 
 /// The outcome of "Test connection".
@@ -1032,7 +1034,18 @@ impl Connections {
         }
         match outcome {
             Ok((connector, meta)) => {
-                let version = meta.server().version.clone();
+                let version = meta.server().named(meta.engine());
+                // MySQL before 5.6.5 has no read-only sessions (K22).
+                if config.read_only && meta.dialect().read_only_session_sql().is_none() {
+                    cx.emit(ConnectionsEvent::Warned {
+                        message: format!(
+                            "{}: this server ({version}) cannot make a session read-only. Kerno \
+                             still refuses the statements it knows to write, but the server \
+                             would accept them; connect with an account that may only read.",
+                            config.name
+                        ),
+                    });
+                }
                 let keep_alive = self.watch(id, cx);
                 let persistent = AppState::get(cx).secrets.is_persistent();
                 let runtime = self.runtime.entry(id.to_string()).or_default();
@@ -1266,7 +1279,7 @@ impl Connections {
             let started = Instant::now();
             session.ping().await?;
             let latency = started.elapsed();
-            let version = session.server().version.clone();
+            let version = session.server().named(session.engine());
             session.close().await;
             let password = origin_text(
                 connector.password_origin().as_ref(),

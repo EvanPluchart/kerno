@@ -56,6 +56,15 @@ Their FEATURES rows are J18 and J17.
   left, Applications on the right, an arrow between them) and the volume icon. A notarized build (an Apple
   developer account, the owner's) would remove the "Open Anyway" step of the first launch.
 
+- **What old MySQL servers still miss in Kerno** (K22, D-094). On MySQL 5.1 the navigator lists functions and
+  procedures without their arguments (they are in `mysql.proc.param_list`, readable only with SELECT on the
+  `mysql` database); before 5.6.5 there is no plan tree (Kerno would have to read the classic `EXPLAIN` table, as
+  DBeaver's `MySQLPlanNodePlain` does); before MySQL 8.0.3 / MariaDB 10.5.2 a column renamed alone in the
+  structure editor is refused (`CHANGE COLUMN` needs the column's definition, which
+  `TableChange::RenameColumn` would have to carry); `mysqldump` 8.4 finds no columns in a 5.1 table, so a 5.1
+  backup needs a 5.x client chosen in Settings ▸ Local clients, and the wizard does not say so yet. MariaDB
+  before 11 uses the same version facts but is not tested.
+
 ## From the competitors' issues (triage of 2026-11-14): not now
 
 `docs/COMPETITOR-ISSUES.md` sorts what DBeaver's and Beekeeper Studio's users ask for. The "do" list is

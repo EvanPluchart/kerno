@@ -151,6 +151,8 @@ impl MysqlSession {
             .ok_or_else(|| Error::Protocol("the server did not report a connection id".into()))?;
         let host = row.get(2).cloned().flatten();
         let engine = engine_of(&version);
+        let number = version_number(&version);
+        let judged = capability_version(&version);
 
         let session = Self {
             link: Mutex::new(Link {
@@ -164,10 +166,10 @@ impl MysqlSession {
             unchecked: AtomicBool::new(false),
             engine,
             server: ServerInfo {
-                version_number: version_number(&version),
+                version_number: number,
                 version,
             },
-            dialect: MysqlDialect::new(engine),
+            dialect: MysqlDialect::for_server(engine, judged),
             database: std::sync::Mutex::new(None),
             in_transaction: AtomicBool::new(false),
             cancels: AtomicU64::new(0),
@@ -184,9 +186,12 @@ impl MysqlSession {
             };
             setup.push(format!("SET SESSION {name} = {value}"));
         }
-        if params.read_only {
-            // Every transaction of the session, implicit ones included.
-            setup.push("SET SESSION TRANSACTION READ ONLY".into());
+        // Every transaction of the session, implicit ones included. A server
+        // without read-only transactions has only Kerno's own refusal.
+        if params.read_only
+            && let Some(sql) = session.dialect.read_only_session_sql()
+        {
+            setup.push(sql.into());
         }
         for sql in &setup {
             text_rows(&mut conn, sql).await.map_err(|error| {
@@ -202,6 +207,11 @@ impl MysqlSession {
         session.note_status(&conn);
         session.link.lock().await.conn = Some(conn);
         Ok(session)
+    }
+
+    /// What the server can do, by its version.
+    pub(crate) fn caps(&self) -> &crate::capabilities::Capabilities {
+        self.dialect.caps()
     }
 
     /// Runs a metadata query and returns its rows as text.
@@ -504,6 +514,26 @@ fn version_number(version: &str) -> (u32, u32, u32) {
     (next(), next(), next())
 }
 
+/// The version the server's features are judged by (K22): as
+/// [`version_number`], but a patch number the string does not give (Aurora's
+/// `8.0.mysql_aurora.3.05.2`, a bare `10.11`) counts as the newest of its
+/// release, so such a server is not taken for an x.y.0 that lacks what came
+/// later in the series.
+fn capability_version(version: &str) -> (u32, u32, u32) {
+    let (major, minor, patch) = version_number(version);
+    let third = version
+        .strip_prefix("5.5.5-")
+        .unwrap_or(version)
+        .split('.')
+        .nth(2)
+        .unwrap_or_default();
+    if third.starts_with(|c: char| c.is_ascii_digit()) {
+        (major, minor, patch)
+    } else {
+        (major, minor, u32::MAX)
+    }
+}
+
 /// Whether a request may change the current database or `sql_mode`: one of
 /// its statements starts with `USE`, `SET` or `DROP` (dropping the current
 /// database leaves the session in none). Stored routines cannot change
@@ -691,7 +721,7 @@ impl Session for MysqlSession {
     }
 
     fn admin_query(&self, view: AdminView) -> Option<String> {
-        Some(admin::query(view, self.engine, self.server.version_number))
+        admin::query(view, self.dialect.caps())
     }
 
     async fn cancel_session(&self, id: &str) -> Result<()> {
@@ -725,6 +755,18 @@ mod tests {
         assert_eq!(version_number("10.11"), (10, 11, 0));
         assert_eq!(version_number(""), (0, 0, 0));
         assert_eq!(version_number("garbage"), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_version_without_its_patch_is_the_newest_of_its_release() {
+        assert_eq!(capability_version("5.1.73"), (5, 1, 73));
+        assert_eq!(capability_version("5.7.44-log"), (5, 7, 44));
+        assert_eq!(capability_version("5.5.5-10.6.4-MariaDB-log"), (10, 6, 4));
+        assert_eq!(
+            capability_version("8.0.mysql_aurora.3.05.2"),
+            (8, 0, u32::MAX)
+        );
+        assert_eq!(capability_version("10.11"), (10, 11, u32::MAX));
     }
 
     #[test]

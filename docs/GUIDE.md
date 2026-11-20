@@ -7,6 +7,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 
 ## Contents
 
+- [Supported servers](#supported-servers)
 - [SSH](#ssh)
 - [Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf](#passwords-from-a-command-aws-rds-iam-1password-pgpass-and-mycnf)
 - [Open a connection from the shell](#open-a-connection-from-the-shell)
@@ -24,6 +25,37 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Checks and releases](#checks-and-releases)
 - [Test databases](#test-databases)
 - [Keyboard shortcuts](#keyboard-shortcuts)
+
+## Supported servers
+
+PostgreSQL (tested on 17), MySQL from 5.1 (tested on 5.1.73, 5.5.62, 5.6.51, 5.7.44 and 8.4) and MariaDB
+(tested on 11). There is one MySQL engine to pick, whatever the release: Kerno reads the server's version when
+it connects ("Connected to MySQL 5.1.73") and uses what that release has (D-094). Where an old release lacks
+something Kerno offers, Kerno says so in words that name the release it needs, instead of a syntax error:
+
+| What | MySQL 5.1 | 5.5 | 5.6 | 5.7 | What Kerno does without it |
+| --- | --- | --- | --- | --- | --- |
+| `utf8mb4` (5.5.3) | no | yes | yes | yes | The connection speaks `utf8`. A character a column's character set cannot hold (an emoji in a `utf8` column, on any release) is refused by an edit, see the next row |
+| Strict mode on by default (5.7) | no | no | no | yes | Outside strict mode the server stores a value too long for its column, out of range, or with a character it cannot hold, cut or changed, with only a warning. Kerno stops the apply at that statement and changes nothing: "the server would store another value than the one written: Data truncated for column 'c' at row 1" |
+| TLS that Kerno accepts (TLS 1.2 with an ECDHE key exchange) | no (TLS 1.0) | no (TLS 1.0) | yes (OpenSSL builds) | build-dependent (5.7.44's official build offers DHE only: no) | SSL mode "prefer" connects without TLS; "require" and "verify-*" refuse with "This server only offers an old TLS that Kerno does not accept." and the next step (prefer or disable on a trusted network, an SSH tunnel, or a server update) |
+| Passwords with the pre-4.1 hash (`old_passwords`) | can sign in | can sign in | refused by the server (5.6.5) | gone | Refused: "The account … has an old password hash that Kerno does not accept." The administrator sets the password again with `old_passwords = 0` |
+| Read-only sessions (5.6.5) | no | no | yes | yes | A read-only connection still opens and Kerno still refuses the statements it knows to write; a notification says the server would accept them, and suggests an account that may only read |
+| Routine arguments, `information_schema.PARAMETERS` (5.5.3) | no | yes | yes | yes | Functions and procedures are listed without their arguments |
+| Query plans, `EXPLAIN FORMAT=JSON` (5.6.5) | no | no | yes | yes | Explain says "A query plan (EXPLAIN FORMAT=JSON) needs MySQL 5.6.5 or later; this server is MySQL 5.5.62." and runs nothing; `EXPLAIN …` typed in the editor shows the server's own table |
+| `EXPLAIN ANALYZE` (8.0.18) | no | no | no | no | "EXPLAIN ANALYZE needs MySQL 8.0.18 or later; this server is …" |
+| Lock waits (`INNODB_LOCK_WAITS`, 5.5) | no | yes | yes | yes | The list of locks says "not supported by this database: the locks of this server" |
+| Accounts: authentication plugin (5.5.7), password expiry (5.6.6), locked accounts (5.7.6), roles (8.0) | none | plugin | plugin, expiry | plugin, expiry, locked | The columns the release lacks are empty; no roles before 8.0 |
+| Settings with their source (8.0.2) | no | no | no | no | Name, session and global values (from `information_schema` before 5.7.6) |
+| Rename an index (5.7.1) | no | no | no | yes | Refused in words: drop it and create it again under the new name |
+| Rename a column alone, `RENAME COLUMN` (8.0.3) | no | no | no | no | Refused in words; a rename together with another change of the column (type, default…) is one `CHANGE COLUMN` and works |
+| Generated columns (5.7.6), `JSON` (5.7.8), check constraints (8.0.16) | no | no | no | yes, yes, no | Not listed; imported JSON goes into `longtext` |
+| Views over views in what a drop breaks (`VIEW_TABLE_USAGE`, 8.0.13) | no | no | no | no | The views are found by a search of the view definitions for the name, as on MariaDB |
+| Transactions on MyISAM tables (the default engine before 5.5.5) | — | — | — | — | Edits are applied in a transaction as everywhere; a MyISAM table has none, so when one statement fails the ones before it stay: the failure says so |
+| Backups with a `mysqldump` 8.x | no | yes | yes | yes | `mysqldump` 8.4 finds no columns in a 5.1 table: choose a 5.x `mysqldump` as the local client (Settings ▸ Local clients) |
+
+MariaDB releases before 11 share some of these gaps (database comments 10.5, `RENAME COLUMN` 10.5.2, check
+constraints with their table 10.3.10, JSON columns 10.4.3, `information_schema.SYSTEM_VARIABLES` 10.1.1): Kerno
+uses the same facts for them, but only MariaDB 11 is tested. MySQL 5.0 and older are not supported.
 
 ## SSH
 
@@ -369,6 +401,13 @@ scripts/test-env.sh down      # stop and remove the containers
 
 Tests skip with a message when a container is down; `KERNO_REQUIRE_CONTAINERS=1` makes that a failure.
 Details in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+`scripts/test-env.sh up --legacy` adds the old MySQL servers of the compose file's `legacy` profile:
+`kerno-mysql51` (53351), `kerno-mysql55` (53355), `kerno-mysql56` (53356) and `kerno-mysql57` (53357), same
+user and password, seeded with `tests/fixtures/mysql-legacy`. The 5.x images are amd64 only and run under
+emulation on Apple Silicon; 5.1 has no image of its own and is built by `tests/fixtures/mysql51/Dockerfile` from
+Oracle's archived binaries, checked against Oracle's MD5. `scripts/check.sh` starts them; their tests are in
+`crates/kerno-mysql/tests/legacy.rs`.
 
 ## Keyboard shortcuts
 

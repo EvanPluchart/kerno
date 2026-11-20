@@ -56,8 +56,13 @@ fn check(name: &str, port: u16) -> bool {
     if reachable(port) {
         return true;
     }
+    let legacy = if LEGACY_MYSQL.iter().any(|(legacy, _)| *legacy == name) {
+        " --legacy"
+    } else {
+        ""
+    };
     let message = format!(
-        "container {name} is not reachable on 127.0.0.1:{port}; start it with `scripts/test-env.sh up`"
+        "container {name} is not reachable on 127.0.0.1:{port}; start it with `scripts/test-env.sh up{legacy}`"
     );
     if std::env::var_os("KERNO_REQUIRE_CONTAINERS").is_some() {
         panic!("{message}");
@@ -71,6 +76,36 @@ fn check(name: &str, port: u16) -> bool {
 pub fn available(engine: Engine) -> bool {
     exclusive_run();
     check(service_name(engine), port(engine))
+}
+
+/// The legacy MySQL servers of the compose file's `legacy` profile (K22),
+/// oldest first: container name and host port. Same `kerno` user, password
+/// and database as [`config`], seeded with `tests/fixtures/mysql-legacy`.
+pub const LEGACY_MYSQL: [(&str, u16); 4] = [
+    ("kerno-mysql51", 53351),
+    ("kerno-mysql55", 53355),
+    ("kerno-mysql56", 53356),
+    ("kerno-mysql57", 53357),
+];
+
+/// The legacy MySQL servers that are up, with the parameters that reach
+/// them directly without TLS. Prints a `SKIPPED` line for each one that is
+/// down (start them with `scripts/test-env.sh up --legacy`).
+pub fn legacy_mysql() -> Vec<(&'static str, ConnectParams)> {
+    exclusive_run();
+    LEGACY_MYSQL
+        .into_iter()
+        .filter(|(name, port)| check(name, *port))
+        .map(|(name, port)| {
+            (
+                name,
+                ConnectParams {
+                    port,
+                    ..params(Engine::MySql)
+                },
+            )
+        })
+        .collect()
 }
 
 /// Whether the SSH bastion is up. Prints a `SKIPPED` line when it is not.

@@ -245,13 +245,50 @@ pub async fn apply_edits_until(
             .await
             .map(|_| ())
             .map_err(whole),
-        Some(failure) => {
-            if let Err(error) = exec::collect(session.clone(), "ROLLBACK").await {
+        Some(failure) => match exec::collect(session.clone(), "ROLLBACK").await {
+            Ok(rolled) => Err(said_if_kept(failure, &rolled)),
+            Err(error) => {
                 tracing::warn!(%error, "rollback after a failed apply did not succeed");
+                Err(failure)
             }
-            Err(failure)
-        }
+        },
     }
+}
+
+/// MySQL's warnings that a value was stored other than as written, which a
+/// server outside strict mode gives instead of an error: out of range
+/// (1264), data truncated (1265), an incorrect date or number (1292), a
+/// character the column's character set cannot hold (1366).
+const VALUE_CHANGED: [&str; 4] = ["1264", "1265", "1292", "1366"];
+
+/// MySQL's warning when a rollback could not undo changes to a table
+/// without transactions (`ER_WARNING_NOT_COMPLETE_ROLLBACK`).
+const NOT_ROLLED_BACK: &str = "1196";
+
+/// What a failed apply says when the rollback left changes in place.
+pub const KEPT_CHANGES: &str = "The statements before this one stayed applied: the table does \
+     not support transactions (a MyISAM table, for example), so the server could not undo them.";
+
+/// `failure`, saying so when the rollback that followed it warned that the
+/// statements before it could not be undone (a MyISAM table on MySQL or
+/// MariaDB, the default engine of MySQL 5.1, K22).
+fn said_if_kept(mut failure: ApplyFailure, rolled: &exec::Collected) -> ApplyFailure {
+    let kept = rolled
+        .notices
+        .iter()
+        .any(|notice| notice.code.as_deref() == Some(NOT_ROLLED_BACK));
+    if kept {
+        failure.error = match failure.error {
+            Error::Db(mut error) => {
+                error.message = format!("{}. {KEPT_CHANGES}", error.message);
+                Error::Db(error)
+            }
+            other => Error::Db(Box::new(DbError::message(format!(
+                "{other}. {KEPT_CHANGES}"
+            )))),
+        };
+    }
+    failure
 }
 
 /// The savepoint an apply inside an open transaction takes back to.
@@ -302,7 +339,8 @@ pub async fn apply_edits_in_transaction(
             tracing::warn!(%error, "rollback to the savepoint after a failed apply did not succeed");
             Err(failure)
         }
-        (Some(failure), Ok(_)) => {
+        (Some(failure), Ok(rolled)) => {
+            let failure = said_if_kept(failure, &rolled);
             // Back where it was: the savepoint is let go too.
             let release = format!("RELEASE SAVEPOINT {SAVEPOINT}");
             if let Err(error) = exec::collect(session.clone(), release).await {
@@ -335,6 +373,27 @@ async fn run_each(
                     .iter()
                     .filter_map(|result| result.rows_affected)
                     .sum();
+                // A server that stored another value than the one written
+                // only warns (a MySQL `sql_mode` without strict mode, the
+                // default before 5.7): the apply stops there (K22).
+                let altered = collected.notices.iter().find(|notice| {
+                    notice
+                        .code
+                        .as_deref()
+                        .is_some_and(|code| VALUE_CHANGED.contains(&code))
+                });
+                if let Some(notice) = altered {
+                    return Some(ApplyFailure {
+                        statement: Some(index),
+                        error: Error::Db(Box::new(DbError {
+                            code: notice.code.clone(),
+                            ..DbError::message(format!(
+                                "the server would store another value than the one written: {}",
+                                notice.message
+                            ))
+                        })),
+                    });
+                }
                 if changed == 1 {
                     continue;
                 }

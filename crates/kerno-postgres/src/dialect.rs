@@ -91,8 +91,8 @@ impl Dialect for PgDialect {
         }
     }
 
-    fn read_only_session_sql(&self) -> &'static str {
-        "SET default_transaction_read_only = on"
+    fn read_only_session_sql(&self) -> Option<&'static str> {
+        Some("SET default_transaction_read_only = on")
     }
 
     /// READ UNCOMMITTED is accepted but behaves as READ COMMITTED here: it

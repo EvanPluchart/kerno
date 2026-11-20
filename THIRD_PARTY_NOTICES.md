@@ -97,6 +97,16 @@ screenshot, name, colour or wording of either is included.
     connections follow `DBStructUtils.mapTargetDataType`, `JDBCSQLDialect.convertExternalDataType` and
     `PostgreDialect.convertExternalDataType` (the same kind of server keeps the type, a `varchar` without a
     length becomes the target's long text, `json` and `jsonb` become `jsonb` on PostgreSQL).
+  - `crates/kerno-mysql/src/capabilities.rs`: the list of what depends on the MySQL or MariaDB server's
+    version follows the version gates of `MySQLDataSource.java`, `MySQLUtils.java` and
+    `MySQLPlanAnalyser.java` (K22).
 - **Beekeeper Studio** (https://github.com/beekeeper-studio/beekeeper-studio, GPL-3.0) was read to understand
   behaviour and user experience only. None of its code was translated or copied, and its commercially
   licensed directories were never opened.
+
+## Test servers
+
+The legacy MySQL test containers of K22 (`docker-compose.yml`, profile `legacy`) run Oracle's MySQL Community
+Server 5.1.73, 5.5.62, 5.6.51 and 5.7.44 (GPL-2.0): the official Docker images for 5.5 to 5.7, and for 5.1 an
+image built locally by `tests/fixtures/mysql51/Dockerfile` from Oracle's archived binaries. They are used by the
+tests only: no part of them is in Kerno, and the image of 5.1 is never published.

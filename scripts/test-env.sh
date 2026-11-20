@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Manage the kerno-* test containers.
-#   scripts/test-env.sh up      generate test certificates/keys, start, wait until seeded
+#   scripts/test-env.sh up [--legacy]  generate test certificates/keys, start, wait until seeded;
+#                                      --legacy adds the MySQL 5.1-5.7 servers (K22)
 #   scripts/test-env.sh down    stop and remove the containers (data volumes are kept)
 #   scripts/test-env.sh reset   down, and delete the data volumes (forces a re-seed)
 #   scripts/test-env.sh status  show the containers
@@ -41,6 +42,11 @@ CNF
       chmod 644 ./*.crt && chmod 600 ./*.key && chmod 644 server.key
     )
   fi
+  # The legacy MySQL servers (yaSSL) read only the traditional RSA key form.
+  if [ ! -f "$GEN/tls/server-legacy.key" ]; then
+    openssl rsa -in "$GEN/tls/server.key" -traditional -out "$GEN/tls/server-legacy.key" 2>/dev/null
+    chmod 644 "$GEN/tls/server-legacy.key"
+  fi
   if [ ! -f "$GEN/ssh/id_ed25519" ]; then
     echo "Generating test SSH keys in $GEN/ssh"
     ssh-keygen -q -t ed25519 -N "" -C kerno-test -f "$GEN/ssh/id_ed25519"
@@ -53,20 +59,23 @@ CNF
 case "${1:-}" in
   up)
     generate
-    nice -n 10 docker compose up -d --build --wait --wait-timeout 900
-    docker compose ps
+    profile=()
+    [ "${2:-}" = "--legacy" ] && profile=(--profile legacy)
+    nice -n 10 docker compose ${profile[@]+"${profile[@]}"} up -d --build --wait --wait-timeout 900
+    docker compose ${profile[@]+"${profile[@]}"} ps
     ;;
+  # The legacy profile is named so that its containers go too.
   down)
-    docker compose down
+    docker compose --profile legacy down
     ;;
   reset)
-    docker compose down -v
+    docker compose --profile legacy down -v
     ;;
   status)
-    docker compose ps
+    docker compose --profile legacy ps
     ;;
   *)
-    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

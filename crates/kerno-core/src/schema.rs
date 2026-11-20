@@ -560,9 +560,56 @@ pub struct ServerInfo {
     pub version_number: (u32, u32, u32),
 }
 
+impl ServerInfo {
+    /// The server as people name it (K22): PostgreSQL's banner as it is
+    /// (`PostgreSQL 17.2 on …`); `MySQL 5.1.73` or `MariaDB 11.8.9` for a
+    /// version string that names no product first (`5.1.73`,
+    /// `11.8.9-MariaDB-ubu2404`); `MySQL 8.0` for one that gives no patch
+    /// number (`8.0.mysql_aurora.3.05.2`).
+    pub fn named(&self, engine: crate::config::Engine) -> String {
+        if !self.version.starts_with(|c: char| c.is_ascii_digit()) {
+            return self.version.clone();
+        }
+        let lead = self
+            .version
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        if lead.split('.').count() < 3 {
+            return format!("{} {lead}", engine.label());
+        }
+        let (major, minor, patch) = self.version_number;
+        format!("{} {major}.{minor}.{patch}", engine.label())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servers_are_named_with_their_product() {
+        use crate::config::Engine;
+        let server = |version: &str, number| ServerInfo {
+            version: version.into(),
+            version_number: number,
+        };
+        assert_eq!(
+            server("5.1.73", (5, 1, 73)).named(Engine::MySql),
+            "MySQL 5.1.73"
+        );
+        assert_eq!(
+            server("5.5.5-10.6.4-MariaDB-log", (10, 6, 4)).named(Engine::MariaDb),
+            "MariaDB 10.6.4"
+        );
+        assert_eq!(
+            server("8.0.mysql_aurora.3.05.2", (8, 0, 0)).named(Engine::MySql),
+            "MySQL 8.0"
+        );
+        let banner = "PostgreSQL 17.2 on aarch64-unknown-linux-gnu";
+        assert_eq!(server(banner, (17, 2, 0)).named(Engine::Postgres), banner);
+    }
 
     fn column(name: &str, nullable: bool, pk: Option<u32>) -> ColumnInfo {
         ColumnInfo {

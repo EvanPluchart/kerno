@@ -818,3 +818,21 @@ Still open (for the owner):
 - Tests: three unit tests (one extended), seven UI tests in `ui_tests/feedback.rs` (fetch on PostgreSQL and MySQL),
   each seen failing under a mutation. Captures `m12-light-grid-{light,dark}`, `m12-connection-url-{light,dark}`
   to take.
+
+## 2026-11-20 — K22: legacy MySQL servers (the owner's request of 2026-11-20)
+
+- Four real old servers in a `legacy` compose profile: MySQL 5.7.44, 5.6.51 and 5.5.62 (official images, amd64
+  under emulation) and 5.1.73 (built from Oracle's archived binaries, no image exists), seeded with a fixture
+  every release accepts; `scripts/test-env.sh up --legacy`, started by `scripts/check.sh`.
+- Run against them, the 8.4 driver failed on 5.1 at the first navigator listing (`PARAMETERS`), and on every
+  5.x in the isolation level, what a drop breaks, the accounts, settings and lock lists, read-only
+  connections and EXPLAIN before 5.6.5, literals with a backslash before 5.5.3, and TLS (TLS 1.0 on 5.1/5.5,
+  DHE-only on 5.7.44), even in `prefer`.
+- One engine that adapts (D-094): `Capabilities` in `kerno-mysql`, read from the server's version at connect,
+  consulted by the dialect, the introspection and the administration queries. `prefer` goes on without TLS on
+  an old TLS; the strict modes, pre-4.1 password hashes, plans and renames an old server lacks are said in
+  words; a read-only connection to a server without read-only sessions warns; a failed apply on MyISAM says
+  what stayed; a value a non-strict server would store changed stops the apply. "Connected to MySQL 5.1.73".
+- Tests: thirteen integration tests on the four servers, unit tests of every boundary, one UI test; each seen
+  failing under a mutation. MySQL 8.4 and MariaDB 11 unchanged. Limits in the "Done:" line of K22
+  (`docs/plans/M12.md`) and in `docs/ROADMAP.md`.

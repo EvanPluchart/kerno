@@ -1,25 +1,30 @@
 //! Administrative views (plain queries shown in the results grid) and
 //! signalling other sessions.
 //!
-//! The two engines keep this information in different places, so most
-//! views have one query per engine. All of them are written from the
-//! servers' documentation and checked against MySQL 8.4 and MariaDB 11.
+//! The two engines keep this information in different places, and each
+//! release moved some of it (see `Capabilities`), so most views have one
+//! query per engine and era. All of them are written from the servers'
+//! documentation and checked against MySQL 5.1, 5.5, 5.6, 5.7 and 8.4 and
+//! MariaDB 11.
 
-use kerno_core::{AdminView, Engine, Result};
+use kerno_core::{AdminView, Result};
 
+use crate::capabilities::Capabilities;
 use crate::introspect::SYSTEM_DATABASES;
 use crate::session::MysqlSession;
 
-pub(crate) fn query(view: AdminView, engine: Engine, version: (u32, u32, u32)) -> String {
-    let mariadb = engine == Engine::MariaDb;
-    match view {
+/// The query of `view` on a server that can do `caps`; `None` when the
+/// server keeps no such list (lock waits on MySQL 5.1).
+pub(crate) fn query(view: AdminView, caps: &Capabilities) -> Option<String> {
+    let mariadb = caps.mariadb;
+    Some(match view {
         // Column 0 is the id cancel_session/terminate_session accept.
         AdminView::Sessions => {
             // MySQL deprecated the information_schema table in 8.0 in
             // favour of the performance_schema one (8.0.22); MariaDB only
             // has the former. Without the PROCESS privilege a user sees
             // its own sessions only.
-            let source = if !mariadb && version >= (8, 0, 22) {
+            let source = if caps.performance_schema_processlist {
                 "performance_schema.processlist"
             } else {
                 "information_schema.PROCESSLIST"
@@ -42,7 +47,7 @@ ORDER BY (p.COMMAND = 'Sleep'), p.TIME DESC, p.ID"
         // Needs SELECT on the mysql database. Roles are accounts too: MySQL
         // keeps who was granted which in mysql.role_edges, MariaDB flags
         // them (is_role) and keeps memberships in mysql.roles_mapping.
-        AdminView::Roles if mariadb => "\
+        AdminView::Roles if mariadb && caps.roles => "\
 SELECT u.User AS `user`,
        u.Host AS host,
        u.is_role = 'Y' AS is_role,
@@ -59,6 +64,24 @@ SELECT u.User AS `user`,
 FROM mysql.user u
 ORDER BY u.User, u.Host"
             .to_string(),
+        // MySQL before 8.0 has no roles; the columns came one by one.
+        AdminView::Roles if !caps.roles => format!(
+            "\
+SELECT u.User AS `user`,
+       u.Host AS host,
+       {} AS authentication,
+       {} AS locked,
+       {} AS password_expired,
+       u.Super_priv = 'Y' AS super,
+       u.Grant_priv = 'Y' AS can_grant,
+       u.Create_user_priv = 'Y' AS create_user,
+       NULLIF(u.max_user_connections, 0) AS connection_limit
+FROM mysql.user u
+ORDER BY u.User, u.Host",
+            if caps.auth_plugin_column { "u.plugin" } else { "NULL" },
+            if caps.account_locking { "u.account_locked = 'Y'" } else { "NULL" },
+            if caps.password_expiry { "u.password_expired = 'Y'" } else { "NULL" },
+        ),
         AdminView::Roles => "\
 SELECT u.User AS `user`,
        u.Host AS host,
@@ -126,7 +149,7 @@ WHERE t.TABLE_TYPE NOT IN ('VIEW', 'SYSTEM VIEW', 'SEQUENCE')
   AND t.TABLE_SCHEMA NOT IN ({SYSTEM_DATABASES})
 ORDER BY total_bytes DESC, 1, 2"
         ),
-        AdminView::Settings if mariadb => "\
+        AdminView::Settings if caps.system_variables_table => "\
 SELECT LOWER(v.VARIABLE_NAME) AS name,
        COALESCE(v.SESSION_VALUE, v.GLOBAL_VALUE) AS value,
        v.GLOBAL_VALUE AS global_value,
@@ -137,7 +160,7 @@ SELECT LOWER(v.VARIABLE_NAME) AS name,
 FROM information_schema.SYSTEM_VARIABLES v
 ORDER BY 1"
             .to_string(),
-        AdminView::Settings => "\
+        AdminView::Settings if caps.variables_info => "\
 SELECT v.VARIABLE_NAME AS name,
        v.VARIABLE_VALUE AS value,
        g.VARIABLE_VALUE AS global_value,
@@ -147,11 +170,33 @@ LEFT JOIN performance_schema.global_variables g ON g.VARIABLE_NAME = v.VARIABLE_
 LEFT JOIN performance_schema.variables_info i ON i.VARIABLE_NAME = v.VARIABLE_NAME
 ORDER BY 1"
             .to_string(),
+        // MySQL 5.7 has the performance_schema tables without the source;
+        // older servers, and MariaDB before 10.1, the information_schema
+        // ones (whose names are upper case).
+        AdminView::Settings => {
+            let schema = if caps.performance_schema_variables {
+                "performance_schema"
+            } else {
+                "information_schema"
+            };
+            format!(
+                "\
+SELECT LOWER(v.VARIABLE_NAME) AS name,
+       v.VARIABLE_VALUE AS value,
+       g.VARIABLE_VALUE AS global_value
+FROM {schema}.session_variables v
+LEFT JOIN {schema}.global_variables g ON g.VARIABLE_NAME = v.VARIABLE_NAME
+ORDER BY 1"
+            )
+        }
         // InnoDB row and table locks. MariaDB still has the
         // information_schema tables MySQL 8.0 replaced by performance_schema
         // ones, whose thread ids are mapped to the processlist ids KILL takes.
         // Metadata locks (a DDL waiting for a transaction) are not listed.
-        AdminView::Locks if mariadb => "\
+        AdminView::Locks if !caps.performance_schema_locks && !caps.innodb_lock_tables => {
+            return None;
+        }
+        AdminView::Locks if !caps.performance_schema_locks => "\
 SELECT r.trx_mysql_thread_id AS waiting_id,
        rp.USER AS waiting_user,
        rp.DB AS `database`,
@@ -190,7 +235,7 @@ LEFT JOIN performance_schema.data_locks rl
        ON rl.ENGINE = w.ENGINE AND rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID
 ORDER BY waited_seconds DESC, 1, 8"
             .to_string(),
-    }
+    })
 }
 
 /// Sends the dialect's `KILL QUERY` or `KILL CONNECTION` statement.
@@ -213,40 +258,129 @@ mod tests {
         AdminView::Locks,
     ];
 
+    fn mysql(version: (u32, u32, u32)) -> Capabilities {
+        Capabilities::of(version, false)
+    }
+
     #[test]
     fn every_view_has_a_query_on_both_engines() {
-        for engine in [Engine::MySql, Engine::MariaDb] {
+        for caps in [mysql((8, 4, 13)), Capabilities::of((11, 0, 0), true)] {
             for view in VIEWS {
-                let sql = query(view, engine, (11, 0, 0));
-                assert!(sql.starts_with("SELECT "), "{engine:?} {view:?}: {sql}");
+                let sql = query(view, &caps).unwrap();
+                assert!(sql.starts_with("SELECT "), "{caps:?} {view:?}: {sql}");
             }
         }
     }
 
+    /// The table each list is read from, by release (K22): the first line
+    /// that starts with FROM.
     #[test]
-    fn the_session_list_reads_the_table_the_server_has() {
-        let source = |engine, version| {
-            let sql = query(AdminView::Sessions, engine, version);
+    fn each_list_reads_the_table_the_server_has() {
+        let source = |view, caps: Capabilities| {
+            let sql = query(view, &caps)?;
             sql.lines()
                 .find_map(|line| line.strip_prefix("FROM "))
                 .map(str::to_string)
         };
-        assert_eq!(
-            source(Engine::MySql, (8, 4, 13)).as_deref(),
-            Some("performance_schema.processlist p")
+        let mariadb = Capabilities::of((11, 8, 9), true);
+        for (view, caps, expected) in [
+            (
+                AdminView::Sessions,
+                mysql((8, 4, 13)),
+                "performance_schema.processlist p",
+            ),
+            (
+                AdminView::Sessions,
+                mysql((8, 0, 21)),
+                "information_schema.PROCESSLIST p",
+            ),
+            (
+                AdminView::Sessions,
+                mysql((5, 1, 73)),
+                "information_schema.PROCESSLIST p",
+            ),
+            // MariaDB's version numbers are larger and it has no such table.
+            (
+                AdminView::Sessions,
+                mariadb,
+                "information_schema.PROCESSLIST p",
+            ),
+            (
+                AdminView::Settings,
+                mysql((8, 4, 13)),
+                "performance_schema.session_variables v",
+            ),
+            (
+                AdminView::Settings,
+                mysql((5, 7, 44)),
+                "performance_schema.session_variables v",
+            ),
+            (
+                AdminView::Settings,
+                mysql((5, 6, 51)),
+                "information_schema.session_variables v",
+            ),
+            (
+                AdminView::Settings,
+                mariadb,
+                "information_schema.SYSTEM_VARIABLES v",
+            ),
+            (
+                AdminView::Locks,
+                mysql((8, 4, 13)),
+                "performance_schema.data_lock_waits w",
+            ),
+            (
+                AdminView::Locks,
+                mysql((5, 7, 44)),
+                "information_schema.INNODB_LOCK_WAITS w",
+            ),
+            (
+                AdminView::Locks,
+                mysql((5, 5, 62)),
+                "information_schema.INNODB_LOCK_WAITS w",
+            ),
+            (
+                AdminView::Locks,
+                mariadb,
+                "information_schema.INNODB_LOCK_WAITS w",
+            ),
+        ] {
+            assert_eq!(
+                source(view, caps).as_deref(),
+                Some(expected),
+                "{view:?} {caps:?}"
+            );
+        }
+        // Only performance_schema 8.0 says where a setting came from.
+        let settings = |caps| query(AdminView::Settings, &caps).unwrap();
+        assert!(settings(mysql((8, 0, 2))).contains("variables_info"));
+        assert!(!settings(mysql((8, 0, 1))).contains("variables_info"));
+        // MySQL 5.1's built-in InnoDB keeps no lock tables.
+        assert_eq!(query(AdminView::Locks, &mysql((5, 1, 73))), None);
+    }
+
+    /// MySQL before 8.0 has no roles, and mysql.user grew its columns one
+    /// release at a time: each is read only where it exists.
+    #[test]
+    fn accounts_read_the_columns_each_release_has() {
+        let roles = |version| query(AdminView::Roles, &mysql(version)).unwrap();
+        assert!(roles((8, 0, 0)).contains("mysql.role_edges"));
+        let m57 = roles((5, 7, 44));
+        assert!(!m57.contains("role_edges"), "{m57}");
+        assert!(
+            m57.contains("u.account_locked") && m57.contains("u.plugin"),
+            "{m57}"
         );
-        assert_eq!(
-            source(Engine::MySql, (8, 0, 21)).as_deref(),
-            Some("information_schema.PROCESSLIST p")
+        let m56 = roles((5, 6, 51));
+        assert!(!m56.contains("u.account_locked") && m56.contains("u.password_expired"));
+        let m55 = roles((5, 5, 62));
+        assert!(
+            !m55.contains("u.password_expired") && m55.contains("u.plugin"),
+            "{m55}"
         );
-        assert_eq!(
-            source(Engine::MySql, (5, 7, 44)).as_deref(),
-            Some("information_schema.PROCESSLIST p")
-        );
-        // MariaDB's version numbers are larger and it has no such table.
-        assert_eq!(
-            source(Engine::MariaDb, (11, 8, 9)).as_deref(),
-            Some("information_schema.PROCESSLIST p")
-        );
+        assert!(!roles((5, 1, 73)).contains("u.plugin"));
+        let mariadb = query(AdminView::Roles, &Capabilities::of((11, 8, 9), true)).unwrap();
+        assert!(mariadb.contains("roles_mapping"));
     }
 }

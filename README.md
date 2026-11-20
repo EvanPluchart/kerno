@@ -267,7 +267,9 @@ the local checks and the test databases are described in the [guide](docs/GUIDE.
 ## Status
 
 Version 0.1.0, the first release. It covers PostgreSQL, MySQL and MariaDB on macOS (Apple Silicon) and Linux
-(x86_64 and arm64). Other engines, schema compare and more are on the [roadmap](docs/ROADMAP.md).
+(x86_64 and arm64); MySQL from 5.1 on, with what each old release lacks said in the
+[guide](docs/GUIDE.md#supported-servers). Other engines, schema compare and more are on the
+[roadmap](docs/ROADMAP.md).
 
 ## Licence
 

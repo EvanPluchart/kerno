@@ -16,11 +16,16 @@ use kerno_core::table_draft::{
 };
 use kerno_core::{Engine, Error, Plan, Result, TypeKind};
 
+use crate::capabilities::Capabilities;
+
 /// The MySQL / MariaDB dialect. The two engines differ only in how a plan
-/// with actual timings is asked for (see [`Dialect::explain`]).
+/// with actual timings is asked for (see [`Dialect::explain`]); a session
+/// gives it its server's version, and the SQL follows what that release
+/// has (see `Capabilities`).
 #[derive(Debug)]
 pub struct MysqlDialect {
     engine: Engine,
+    caps: Capabilities,
     /// The session's `sql_mode` contains `NO_BACKSLASH_ESCAPES`: a backslash
     /// in a string literal is then an ordinary character. A session keeps
     /// this in step with the server (see `MysqlSession`) so that the lexer
@@ -30,13 +35,25 @@ pub struct MysqlDialect {
 }
 
 impl MysqlDialect {
-    /// The dialect of `engine` under the default `sql_mode`, where the
-    /// backslash is the escape character of string literals.
+    /// The dialect of a current server of `engine` under the default
+    /// `sql_mode`, where the backslash is the escape character of string
+    /// literals.
     pub fn new(engine: Engine) -> Self {
+        Self::for_server(engine, (999, 0, 0))
+    }
+
+    /// The dialect of a server of `engine` at `version`.
+    pub(crate) fn for_server(engine: Engine, version: (u32, u32, u32)) -> Self {
         Self {
             engine,
+            caps: Capabilities::of(version, engine == Engine::MariaDb),
             no_backslash_escapes: AtomicBool::new(false),
         }
+    }
+
+    /// What the server can do.
+    pub(crate) fn caps(&self) -> &Capabilities {
+        &self.caps
     }
 
     /// Records whether the session runs with `NO_BACKSLASH_ESCAPES`.
@@ -128,6 +145,13 @@ impl MysqlDialect {
             }
         }
         if column.invisible {
+            if !self.caps.invisible_columns {
+                return Err(unsupported(&format!(
+                    "an invisible column on this server: {}",
+                    self.caps
+                        .needs("An invisible column", Some("8.0.23"), Some("10.3.3"))
+                )));
+            }
             sql.push_str(" INVISIBLE");
         }
         if let Some(comment) = present(&column.comment) {
@@ -170,14 +194,23 @@ impl Dialect for MysqlDialect {
     }
 
     /// MariaDB names the variable `transaction_isolation` only from 11.1;
-    /// `tx_isolation` is there in every version. MySQL 8 dropped
-    /// `tx_isolation`. Both take the standard `SET SESSION TRANSACTION`.
+    /// `tx_isolation` is there in every version. MySQL has
+    /// `transaction_isolation` from 5.7.20 and dropped `tx_isolation` in 8.0.
+    /// Both take the standard `SET SESSION TRANSACTION`.
     fn isolation_sql(&self) -> &'static str {
-        if self.engine == Engine::MariaDb {
-            "SELECT @@tx_isolation"
-        } else {
+        if self.caps.transaction_isolation_variable {
             "SELECT @@transaction_isolation"
+        } else {
+            "SELECT @@tx_isolation"
         }
+    }
+
+    /// MySQL before 5.6.5 (MariaDB before 10.0) has no read-only
+    /// transactions: Kerno's own refusal of writes is all there is.
+    fn read_only_session_sql(&self) -> Option<&'static str> {
+        self.caps
+            .read_only_transactions
+            .then_some("SET SESSION TRANSACTION READ ONLY")
     }
 
     fn has_schemas(&self) -> bool {
@@ -202,8 +235,11 @@ impl Dialect for MysqlDialect {
         // a backslash or a NUL is therefore written as hexadecimal with a
         // character set, which reads the same in both modes; a quote is
         // doubled, which also reads the same in both.
+        // Servers before utf8mb4 (MySQL 5.5.3) know only the 3-byte utf8,
+        // which holds every character they can store.
         if text.contains(['\\', '\0']) {
-            return format!("_utf8mb4 X'{}'", hex(text.as_bytes()));
+            let charset = if self.caps.utf8mb4 { "utf8mb4" } else { "utf8" };
+            return format!("_{charset} X'{}'", hex(text.as_bytes()));
         }
         format!("'{}'", text.replace('\'', "''"))
     }
@@ -226,6 +262,22 @@ impl Dialect for MysqlDialect {
             (true, Engine::MariaDb) => format!("ANALYZE FORMAT=JSON {sql}"),
             (true, _) => format!("EXPLAIN ANALYZE {sql}"),
         }
+    }
+
+    /// A plan in JSON needs MySQL 5.6.5 or MariaDB 10.1.2; one with what
+    /// really happened, MySQL 8.0.18 or MariaDB 10.1.2.
+    fn explain_unavailable(&self, analyze: bool) -> Option<String> {
+        if !self.caps.explain_json {
+            return Some(self.caps.needs(
+                "A query plan (EXPLAIN FORMAT=JSON)",
+                Some("5.6.5"),
+                Some("10.1.2"),
+            ));
+        }
+        (analyze && !self.caps.explain_analyze).then(|| {
+            self.caps
+                .needs("EXPLAIN ANALYZE", Some("8.0.18"), Some("10.1.2"))
+        })
     }
 
     /// MySQL's `EXPLAIN ANALYZE` is a tree of text; the rest is JSON.
@@ -260,7 +312,8 @@ impl Dialect for MysqlDialect {
             TypeKind::Date => "date",
             TypeKind::DateTime | TypeKind::DateTimeTz => "datetime",
             TypeKind::Uuid => "char(36)",
-            TypeKind::Json => "json",
+            TypeKind::Json if self.caps.json => "json",
+            TypeKind::Json => "longtext",
             TypeKind::Binary => "longblob",
             _ => "text",
         }
@@ -320,6 +373,11 @@ impl Dialect for MysqlDialect {
                 );
                 Ok(format!("ALTER EVENT {from} RENAME TO {to}"))
             }
+            ObjectRef::Index { .. } if !self.caps.rename_index => Err(unsupported(&format!(
+                "renaming an index on this server: {} Drop it and create it again under the new name",
+                self.caps
+                    .needs("RENAME INDEX", Some("5.7.1"), Some("10.5.2"))
+            ))),
             ObjectRef::Index { table, name } => Ok(format!(
                 "ALTER TABLE {} RENAME INDEX {} TO {}",
                 self.table_name(table),
@@ -541,7 +599,7 @@ ORDER BY c.ORDINAL_POSITION",
 
     fn database_properties_sql(&self, database: &str) -> Option<String> {
         let name = self.quote_string(database);
-        let comment = if self.engine == Engine::MariaDb {
+        let comment = if self.caps.database_comments {
             ",\n       NULLIF(s.SCHEMA_COMMENT, '') AS `Comment`"
         } else {
             ""
@@ -690,6 +748,19 @@ WHERE s.SCHEMA_NAME = {name}"
                         q(from),
                         self.column_sql(draft, Some(column))?
                     ),
+                    // ponytail: older servers rename only with CHANGE COLUMN,
+                    // which needs the whole definition this change does not
+                    // carry; give RenameColumn the server's column if renames
+                    // on MySQL 5.x / MariaDB 10.4 matter.
+                    None if !self.caps.rename_column => {
+                        return Err(unsupported(&format!(
+                            "renaming a column alone on this server: {} Change \
+                             something else of the column in the same edit, or write \
+                             ALTER TABLE … CHANGE COLUMN with its whole definition",
+                            self.caps
+                                .needs("RENAME COLUMN", Some("8.0.3"), Some("10.5.2"))
+                        )));
+                    }
                     None => format!("RENAME COLUMN {} TO {}", q(from), q(to)),
                 }),
                 TableChange::AddColumn(column) => {

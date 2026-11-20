@@ -63,7 +63,7 @@ fn is_mariadb(session: &MysqlSession) -> bool {
 
 pub(crate) async fn databases(session: &MysqlSession) -> Result<Vec<DatabaseInfo>> {
     // MySQL has no comment on databases; MariaDB has since 10.5.
-    let comment = if is_mariadb(session) && session.server().version_number >= (10, 5, 0) {
+    let comment = if session.caps().database_comments {
         "s.SCHEMA_COMMENT"
     } else {
         "NULL"
@@ -177,15 +177,23 @@ async fn relations(
 
 async fn routines(session: &MysqlSession, database: &str) -> Result<Vec<RoutineInfo>> {
     let database = lit(session, database);
-    // Position 0 is a function's return value, not an argument.
-    let parameters = session
-        .query(&format!(
-            "SELECT p.ROUTINE_TYPE, p.SPECIFIC_NAME, p.PARAMETER_MODE, p.PARAMETER_NAME, p.DTD_IDENTIFIER \
-             FROM information_schema.PARAMETERS p \
-             WHERE p.SPECIFIC_SCHEMA = {database} AND p.ORDINAL_POSITION > 0 \
-             ORDER BY p.ROUTINE_TYPE, p.SPECIFIC_NAME, p.ORDINAL_POSITION"
-        ))
-        .await?;
+    // Position 0 is a function's return value, not an argument. MySQL 5.1
+    // has no PARAMETERS table: its routines are listed without arguments.
+    // ponytail: mysql.proc.param_list holds them there, readable only with
+    // SELECT on the mysql database; parse it if 5.1 users ask.
+    let parameters = if session.caps().parameters_table {
+        session
+            .query(&format!(
+                "SELECT p.ROUTINE_TYPE, p.SPECIFIC_NAME, p.PARAMETER_MODE, p.PARAMETER_NAME, \
+                        p.DTD_IDENTIFIER \
+                 FROM information_schema.PARAMETERS p \
+                 WHERE p.SPECIFIC_SCHEMA = {database} AND p.ORDINAL_POSITION > 0 \
+                 ORDER BY p.ROUTINE_TYPE, p.SPECIFIC_NAME, p.ORDINAL_POSITION"
+            ))
+            .await?
+    } else {
+        Vec::new()
+    };
     let rows = session
         .query(&format!(
             "SELECT r.ROUTINE_NAME, r.ROUTINE_TYPE, r.DTD_IDENTIFIER, r.ROUTINE_BODY, r.ROUTINE_COMMENT \
@@ -396,15 +404,15 @@ async fn columns(
     table_collation: Option<&str>,
 ) -> Result<Vec<ColumnInfo>> {
     let mariadb = is_mariadb(session);
-    let version = session.server().version_number;
-    let generation = if (mariadb && version >= (10, 2, 5)) || (!mariadb && version >= (5, 7, 0)) {
+    let caps = session.caps();
+    let generation = if caps.generated_columns {
         "c.GENERATION_EXPRESSION"
     } else {
         "NULL"
     };
     // MariaDB's JSON is LONGTEXT with a check the server adds itself
     // (10.4.3), named after the column.
-    let json = if mariadb && version >= (10, 4, 3) {
+    let json = if caps.json_checks {
         "EXISTS (SELECT 1 FROM information_schema.CHECK_CONSTRAINTS k \
                  WHERE k.CONSTRAINT_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME \
                    AND k.CONSTRAINT_NAME = c.COLUMN_NAME \
@@ -669,7 +677,7 @@ async fn indexes(session: &MysqlSession, table: &TableRef) -> Result<Vec<IndexIn
     let dialect = session.dialect();
     // Functional key parts (MySQL 8.0.13) have no column name, only an
     // expression. MariaDB indexes generated columns instead.
-    let expression = if !is_mariadb(session) && session.server().version_number >= (8, 0, 13) {
+    let expression = if session.caps().functional_indexes {
         "s.EXPRESSION"
     } else {
         "NULL"
@@ -809,10 +817,11 @@ async fn check_constraints(
     table: &TableRef,
 ) -> Result<Vec<ConstraintInfo>> {
     let mariadb = is_mariadb(session);
-    let version = session.server().version_number;
     let schema = lit(session, &table.schema);
     let name = lit(session, &table.name);
-    let sql = if mariadb && version >= (10, 3, 10) {
+    let sql = if !session.caps().check_constraints {
+        return Ok(Vec::new());
+    } else if mariadb {
         // MariaDB names checks per table and says which table directly
         // (the TABLE_NAME column came with 10.3.10).
         format!(
@@ -820,7 +829,7 @@ async fn check_constraints(
              FROM information_schema.CHECK_CONSTRAINTS c \
              WHERE c.CONSTRAINT_SCHEMA = {schema} AND c.TABLE_NAME = {name}"
         )
-    } else if !mariadb && version >= (8, 0, 16) {
+    } else {
         // MySQL names checks per database; the table is in TABLE_CONSTRAINTS.
         format!(
             "SELECT c.CONSTRAINT_NAME, c.CHECK_CLAUSE \
@@ -829,8 +838,6 @@ async fn check_constraints(
                ON t.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = c.CONSTRAINT_NAME \
              WHERE t.CONSTRAINT_TYPE = 'CHECK' AND t.TABLE_SCHEMA = {schema} AND t.TABLE_NAME = {name}"
         )
-    } else {
-        return Ok(Vec::new());
     };
     let mut checks: Vec<ConstraintInfo> = session
         .query(&sql)
@@ -997,8 +1004,9 @@ async fn foreign_keys(session: &MysqlSession, filter: &str) -> Result<Vec<Foreig
 /// foreign key of another table points at it (MySQL's error 3730, MariaDB's
 /// 1451; a table's own key to itself does not count), and the views over a
 /// table stay but stop working (error 1356 when read). MySQL lists them in
-/// `VIEW_TABLE_USAGE` (with the views over those views); MariaDB has no such
-/// table, so its view definitions are searched for the name. A rename leaves
+/// `VIEW_TABLE_USAGE` (with the views over those views) from 8.0.13; MariaDB
+/// and older MySQL servers have no such table, so their view definitions are
+/// searched for the name. A rename leaves
 /// every view, routine, trigger and event that names the object broken (none
 /// follow it, checked on both servers): their source is searched.
 pub(crate) async fn dependents(session: &MysqlSession, change: &Change) -> Result<Vec<Dependent>> {
@@ -1025,10 +1033,10 @@ pub(crate) async fn dependents(session: &MysqlSession, change: &Change) -> Resul
                     tie: Tie::Blocks,
                 }));
             }
-            if is_mariadb(session) {
-                found.extend(searched(session, &table.name, &["VIEWS"]).await?);
-            } else {
+            if session.caps().view_table_usage {
                 found.extend(views_over(session, table).await?);
+            } else {
+                found.extend(searched(session, &table.name, &["VIEWS"]).await?);
             }
             sorted(found)
         }

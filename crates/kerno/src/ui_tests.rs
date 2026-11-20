@@ -52,6 +52,7 @@ mod feedback;
 mod fk_preview;
 mod folders;
 mod grid_v11;
+mod legacy;
 mod menus;
 mod multi_run;
 mod open_url;

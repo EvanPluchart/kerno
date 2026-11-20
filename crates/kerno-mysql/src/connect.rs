@@ -201,8 +201,8 @@ async fn dial(
 }
 
 /// Opens a connection to `database` (none when `None`) with the TLS mode
-/// of `params`. `prefer` falls back to a plain connection only when the
-/// server does not offer TLS.
+/// of `params`. `prefer` falls back to a plain connection when the server
+/// does not offer TLS, or offers only a TLS older than Kerno accepts (K22).
 pub(crate) async fn open(
     params: &ConnectParams,
     timeout: Duration,
@@ -211,8 +211,15 @@ pub(crate) async fn open(
     let tls = ssl_opts(params).await?;
     match dial(params, timeout, tls, database).await? {
         Ok(conn) => Ok(conn),
-        Err(mysql_async::Error::Driver(DriverError::NoClientSslFlagFromServer))
-            if params.tls.mode == TlsMode::Prefer =>
+        // `prefer` checks no certificate and goes on without TLS when the
+        // server has none: a server whose TLS cannot be used is the same
+        // case, and the plain connection is no weaker than that one.
+        Err(error)
+            if params.tls.mode == TlsMode::Prefer
+                && (matches!(
+                    error,
+                    mysql_async::Error::Driver(DriverError::NoClientSslFlagFromServer)
+                ) || old_server_tls(&error)) =>
         {
             dial(params, timeout, None, database)
                 .await?
@@ -242,16 +249,42 @@ async fn tls_under_name(params: &ConnectParams, name: String) -> Result<Option<S
         .map(|opts| opts.with_danger_tls_hostname_override(Some(name))))
 }
 
+/// The TLS library's own error inside a failed connection, if that is
+/// what failed.
+fn rustls_error(error: &mysql_async::Error) -> Option<&rustls::Error> {
+    match error {
+        mysql_async::Error::Io(IoError::Tls(mysql_async::TlsError::Tls(error))) => Some(error),
+        // The handshake's own failure arrives wrapped in an I/O error.
+        mysql_async::Error::Io(IoError::Io(io)) => io.get_ref()?.downcast_ref::<rustls::Error>(),
+        _ => None,
+    }
+}
+
+/// Whether the TLS handshake failed because the server's TLS is older than
+/// what Kerno's TLS library accepts (K22): TLS 1.0 or 1.1 only (MySQL 5.1
+/// to 5.6 built with yaSSL answer with an unknown protocol version or a
+/// pre-1.2 hello), or TLS 1.2 without an ECDHE key exchange (MySQL 5.7's
+/// builds offer DHE only and end the handshake).
+fn old_server_tls(error: &mysql_async::Error) -> bool {
+    use rustls::{AlertDescription, InvalidMessage};
+    matches!(
+        rustls_error(error),
+        Some(
+            rustls::Error::PeerIncompatible(_)
+                | rustls::Error::InvalidMessage(InvalidMessage::UnknownProtocolVersion)
+                | rustls::Error::AlertReceived(
+                    AlertDescription::HandshakeFailure
+                        | AlertDescription::ProtocolVersion
+                        | AlertDescription::InsufficientSecurity
+                )
+        )
+    )
+}
+
 /// The names the server's certificate carries, when the only thing wrong
 /// with it is that the host name is not one of them.
 fn presented_names(error: &mysql_async::Error) -> Option<Vec<String>> {
-    let tls = match error {
-        mysql_async::Error::Io(IoError::Tls(mysql_async::TlsError::Tls(error))) => error,
-        // The handshake's own failure arrives wrapped in an I/O error.
-        mysql_async::Error::Io(IoError::Io(io)) => io.get_ref()?.downcast_ref::<rustls::Error>()?,
-        _ => return None,
-    };
-    match tls {
+    match rustls_error(error)? {
         rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext {
             presented,
             ..
@@ -308,6 +341,23 @@ fn connect_error(error: mysql_async::Error, params: &ConnectParams) -> Error {
         mysql_async::Error::Driver(DriverError::NoClientSslFlagFromServer) => {
             Error::Tls("the server does not offer TLS".into())
         }
+        // MySQL's pre-4.1 hash: one captured login is enough to find the
+        // password. The server refuses such accounts itself from 5.6.5;
+        // Kerno does too.
+        mysql_async::Error::Driver(DriverError::MysqlOldPasswordDisabled) => {
+            Error::Connect(format!(
+                "the account {} {}, which Kerno refuses",
+                params.user,
+                kerno_core::error::OLD_PASSWORD_HASH
+            ))
+        }
+        ref tls if old_server_tls(tls) => Error::Tls(format!(
+            "{} (TLS 1.0 or 1.1, or no ECDHE key exchange): {}",
+            kerno_core::error::OLD_SERVER_TLS,
+            rustls_error(tls)
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        )),
         mysql_async::Error::Io(io) => {
             // A failed handshake arrives as a TLS error or wrapped in an
             // I/O error, depending on where it was noticed.

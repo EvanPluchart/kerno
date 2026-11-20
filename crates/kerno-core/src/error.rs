@@ -273,6 +273,14 @@ const TIMED_OUT: [&str; 8] = [
     "Network is unreachable",
 ];
 
+/// Part of the driver's message when a server's TLS is older than what
+/// Kerno accepts (MySQL 5.x, K22); read by [`explain`].
+pub const OLD_SERVER_TLS: &str = "the server's TLS is older than Kerno accepts";
+
+/// Part of the driver's message when an account's password has MySQL's
+/// pre-4.1 hash (K22); read by [`explain`].
+pub const OLD_PASSWORD_HASH: &str = "has a pre-4.1 password hash";
+
 const AUTHENTICATION: [&str; 5] = [
     "[28P01]",
     "[28000]",
@@ -401,6 +409,22 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
         }
     } else if let Some(store) = raw.strip_prefix("secrets: ") {
         secret_store_words(store)
+    } else if raw.contains(OLD_SERVER_TLS) {
+        (
+            FailureKind::Tls,
+            "This server only offers an old TLS that Kerno does not accept.".to_string(),
+            "Choose SSL mode “prefer” (Kerno then connects without TLS) or “disable” on the SSL \
+             tab, on a network you trust or through an SSH tunnel; or update the server's TLS."
+                .to_string(),
+        )
+    } else if raw.contains(OLD_PASSWORD_HASH) {
+        (
+            FailureKind::Authentication,
+            format!("The account “{user}” has an old password hash that Kerno does not accept."),
+            "Ask the server's administrator to set its password again with a current hash \
+             (SET old_passwords = 0, then SET PASSWORD)."
+                .to_string(),
+        )
     } else if raw.starts_with("TLS: ") {
         (
             FailureKind::Tls,
@@ -898,6 +922,19 @@ mod tests {
                 "TLS: the server does not offer TLS",
                 Tls,
                 "The secure (TLS) connection could not be set up.",
+            ),
+            // K22: MySQL 5.x servers.
+            (
+                "TLS: the server's TLS is older than Kerno accepts (TLS 1.0 or 1.1, or no ECDHE \
+                 key exchange): peer is incompatible: ServerDoesNotSupportTls12Or13",
+                Tls,
+                "This server only offers an old TLS that Kerno does not accept.",
+            ),
+            (
+                "could not connect: the account evan has a pre-4.1 password hash, which Kerno \
+                 refuses",
+                Authentication,
+                "The account “evan” has an old password hash that Kerno does not accept.",
             ),
             // SSH: a refused port inside the reason is still the SSH server's.
             (

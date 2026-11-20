@@ -2403,3 +2403,67 @@ holds: "Next 50 rows");
   plain white. The condition is gone, so results and table data look alike; one comparison less per row. The
   structure and administration tables (their own delegates) take the new lines, header and hover from the same
   tokens and stay unstriped, as before.
+
+## D-094 — Legacy MySQL servers: one engine that adapts to the server's version (K22; 2026-11-20)
+
+- **One engine, no "MySQL 5 (Legacy)" entry.** DBeaver has a separate legacy driver because its modern JDBC
+  driver (Connector/J 8) dropped old servers; its model (`MySQLDataSource`, `MySQLUtils`, `MySQLPlanAnalyser`)
+  is one, gated by `isServerVersionAtLeast`. Kerno's client library (`mysql_async` 0.37) already speaks to
+  5.1: it picks `utf8_general_ci` below 5.5.3 in the handshake and supports the pre-4.1 authentication switch.
+  Nothing has to be chosen before the connection exists, so the user picks "MySQL" whatever the release and
+  `MysqlSession::connect` reads `VERSION()` (it always did). `Capabilities::of(version, is_mariadb)`
+  (`crates/kerno-mysql/src/capabilities.rs`) names every fact that came with a release (26 of them: utf8mb4,
+  `@@transaction_isolation`, read-only transactions, JSON plans, EXPLAIN ANALYZE, `PARAMETERS`, generated
+  columns, JSON, check constraints, functional indexes, `VIEW_TABLE_USAGE`, RENAME COLUMN / INDEX, invisible
+  columns, roles and the `mysql.user` columns, the performance_schema tables, the InnoDB lock tables…), unit
+  tested at each boundary; the dialect holds it (`MysqlDialect::for_server`; `MysqlDialect::new` stays "a
+  current server", for the app's offline uses), and the introspection, the DDL writer and the administration
+  queries read it. The version checks scattered before (generated columns, checks, functional indexes,
+  database comments, the session list) moved into it; the generated-columns gate moved from 5.7.0 to 5.7.6,
+  the release that brought them. MariaDB uses the same struct with its own releases (untested below 11). A
+  version string without a patch number (Aurora's `8.0.mysql_aurora.3.05.2`) is judged as the newest of its
+  release (`session::capability_version`), so such a server keeps what Kerno did before K22.
+- **Oldest version claimed: MySQL 5.1 (5.1.73 tested).** 5.0 lacks `information_schema.PROCESSLIST` (5.1.7),
+  `EVENTS` (5.1.6) and `SHOW CREATE TRIGGER` (5.1.21), which the navigator and the session check rely on.
+  Tested servers: `mysql:5.7` (5.7.44, `sha256:4bc6bc96…`), `mysql:5.6` (5.6.51, `sha256:20575ece…`),
+  `mysql:5.5` (5.5.62, `sha256:12da85ab…`), all Docker's official images, amd64 only, run under emulation on
+  Apple Silicon; 5.1 has no official image and no publisher we could vouch for, so `tests/fixtures/mysql51`
+  builds one on `debian:bookworm-slim` (pinned by digest) from Oracle's archived generic build
+  (`cdn.mysql.com/archives/mysql-5.1/mysql-5.1.73-linux-x86_64-glibc23.tar.gz`), checked against the MD5 on
+  Oracle's archive page and a SHA-256 recorded on first download. The legacy services are in the compose
+  profile `legacy`: `scripts/test-env.sh up` stays as it was, `up --legacy` adds them, `scripts/check.sh`
+  starts them (they are up and seeded in about 10 s under Rosetta; their thirteen tests take about 2 s).
+- **TLS on servers older than rustls accepts.** MySQL 5.1 and 5.5 (yaSSL) speak TLS 1.0; 5.7.44's official
+  build speaks TLS 1.2 with DHE key exchanges only, which rustls does not implement; 5.6.51's OpenSSL build
+  works as 8.x does. `prefer` already went on without TLS when the server offers none; it now also does when
+  the handshake fails for these reasons (`connect::old_server_tls`: an incompatible peer, an unknown protocol
+  version, a handshake-failure or protocol-version alert, matched on the TLS library's typed error). `prefer`
+  never checks the certificate, so the plain connection is no weaker than the one it already accepted; the TLS
+  of modern servers is unchanged (no lower version, no other cipher is enabled). `require` and `verify-*`
+  refuse with "This server only offers an old TLS that Kerno does not accept." and the next step (prefer or
+  disable on a trusted network, an SSH tunnel, a server update).
+- **Pre-4.1 password hashes refused.** One captured login is enough to find such a password, and the server
+  itself refuses them from 5.6.5; the client library refuses them unless told otherwise, and Kerno does not
+  tell it otherwise. The error says it in words ("The account … has an old password hash that Kerno does not
+  accept.") with the administrator's fix (`old_passwords = 0`, then `SET PASSWORD`).
+- **Read-only before 5.6.5.** `Dialect::read_only_session_sql` returns an `Option`: `None` on a server without
+  read-only transactions. The connection still opens (refusing it would forbid the safest way to look at an
+  old production server); Kerno's own refusal of writes stays, and the app shows a warning on connect that the
+  server would accept what Kerno does not recognise as a write, suggesting an account that may only read.
+- **What an old server lacks is said, not failed.** `Dialect::explain_unavailable` gives the sentence ("A query
+  plan (EXPLAIN FORMAT=JSON) needs MySQL 5.6.5 or later; this server is MySQL 5.5.62."), checked by the query
+  tab before anything runs; renames the server cannot do are refused with the release they need; lock waits on
+  5.1 are "not supported"; lists read only the columns the release has. A failed apply whose rollback the
+  server could not complete (a MyISAM table: warning 1196) says that the statements before it stayed applied.
+  The test-connection line and the status say "MySQL 5.1.73" (`ServerInfo::named`).
+- **A value the server would change is not applied.** MySQL before 5.7 (and any server whose `sql_mode` is not
+  strict) stores a value too long, out of range, or with a character its column cannot hold, changed, with a
+  warning only (1264, 1265, 1292, 1366): the statement "changed one row" and an apply would have reported
+  success while the row held something else. `run_each` treats these warnings as the statement's failure, so
+  the apply rolls back and says what the server would have stored; a strict server answers with an error as
+  before, and PostgreSQL's notices (five-character SQLSTATEs) never match.
+- **Not done** (D-094's limits, in `docs/ROADMAP.md`): routine arguments on 5.1 (`mysql.proc.param_list`,
+  readable only with SELECT on `mysql`), a plan tree from the classic `EXPLAIN` table before 5.6.5, a column
+  renamed alone before 8.0.3 (needs the column's definition in `TableChange::RenameColumn`), and the tools:
+  `mysqldump` 8.4 dumps 5.5 to 5.7 as it is but finds no columns in a 5.1 table, so 5.1 needs a 5.x client
+  chosen as the local client.

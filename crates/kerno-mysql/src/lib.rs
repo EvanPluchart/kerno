@@ -1,6 +1,7 @@
 //! Kerno's MySQL and MariaDB driver.
 
 mod admin;
+mod capabilities;
 mod connect;
 mod ddl;
 mod dialect;

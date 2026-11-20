@@ -95,11 +95,20 @@ pub trait Dialect: Send + Sync {
         Err(Error::Unsupported("reading query plans".into()))
     }
 
+    /// Why the server cannot give the plan [`Dialect::explain`] asks for
+    /// (too old a release), in words for the user; `None` when it can.
+    fn explain_unavailable(&self, analyze: bool) -> Option<String> {
+        let _ = analyze;
+        None
+    }
+
     /// The statement that makes every later transaction of a session
     /// read-only. A read-only connection runs it again after its bootstrap
     /// statements, so nothing run at connect can leave the session writable.
-    fn read_only_session_sql(&self) -> &'static str {
-        "SET SESSION TRANSACTION READ ONLY"
+    /// `None` when the server has no read-only sessions (MySQL before
+    /// 5.6.5): Kerno's own refusal of writes is then all there is.
+    fn read_only_session_sql(&self) -> Option<&'static str> {
+        Some("SET SESSION TRANSACTION READ ONLY")
     }
 
     /// `expr` as text, for matching a pattern against a column of any

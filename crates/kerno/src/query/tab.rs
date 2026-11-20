@@ -2284,6 +2284,20 @@ impl QueryTab {
         ) {
             return;
         }
+        // An old server has no such plan (K22): said before anything runs,
+        // here so that a plan asked while the connection was opening is
+        // checked once it is open too.
+        let unavailable = explain.and_then(|analyze| {
+            self.target
+                .as_ref()
+                .and_then(|target| self.connections.read(cx).meta_session(&target.connection))
+                .and_then(|meta| meta.dialect().explain_unavailable(analyze))
+        });
+        if let Some(reason) = unavailable {
+            self.end_script(Stage::Failed, Some(reason.clone()), cx);
+            window.push_notification(Notification::warning(SharedString::from(reason)), cx);
+            return;
+        }
         let mut statements = self.statements(scope, cx);
         if explain.is_some() {
             // One plan at a time: the first statement of a selection.

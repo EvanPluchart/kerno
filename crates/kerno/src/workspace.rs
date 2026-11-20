@@ -3901,6 +3901,12 @@ impl Workspace {
                 self.delete_connection(id.clone(), window, cx)
             }
             ConnectionsEvent::ReconnectRequested { id } => self.reconnect(id.clone(), window, cx),
+            ConnectionsEvent::Warned { message } => {
+                window.push_notification(
+                    Notification::warning(SharedString::from(message.clone())),
+                    cx,
+                );
+            }
         }
         cx.notify();
     }

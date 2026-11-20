@@ -286,12 +286,12 @@ impl Connector {
         }
         // Whatever ran above, a read-only connection ends its setup read-only
         // (bootstrap statements are also refused when they name that state).
-        if self.config.read_only {
-            exec::collect(session.clone(), session.dialect().read_only_session_sql())
-                .await
-                .map_err(|error| {
-                    Error::Connect(format!("the session could not be made read-only: {error}"))
-                })?;
+        if self.config.read_only
+            && let Some(sql) = session.dialect().read_only_session_sql()
+        {
+            exec::collect(session.clone(), sql).await.map_err(|error| {
+                Error::Connect(format!("the session could not be made read-only: {error}"))
+            })?;
         }
         Ok(())
     }

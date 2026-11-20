@@ -129,6 +129,86 @@ services:
       timeout: 3s
       retries: 30
 
+  # Legacy MySQL servers (K22), in the `legacy` profile: started by
+  # `scripts/test-env.sh up --legacy` and by scripts/check.sh. The official
+  # 5.x images are amd64 only and run under emulation on Apple Silicon; there
+  # is no image of 5.1, so tests/fixtures/mysql51 builds one from Oracle's
+  # archived binaries. Same `kerno` user and password as kerno-mysql, seeded
+  # with tests/fixtures/mysql-legacy, TLS with the test certificates.
+  mysql57:
+    profiles: [legacy]
+    image: mysql:5.7@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb
+    platform: linux/amd64
+    container_name: kerno-mysql57
+    environment: &legacy-env
+      MYSQL_ROOT_PASSWORD: kerno_test_pw
+      MYSQL_DATABASE: kerno
+      MYSQL_USER: kerno
+      MYSQL_PASSWORD: kerno_test_pw
+    command: &legacy-command
+      - --character-set-server=utf8
+      - --ssl-ca=/kerno-tls/ca.crt
+      - --ssl-cert=/kerno-tls/server.crt
+      - --ssl-key=/kerno-tls/server-legacy.key
+    ports:
+      - "127.0.0.1:53357:3306"
+    volumes:
+      - ./tests/fixtures/mysql-legacy:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
+    healthcheck: &legacy-health
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -ukerno -pkerno_test_pw -N -e 'select 1 from kerno.kerno_seed_done' | grep -q 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 200
+      start_period: 5s
+
+  mysql56:
+    profiles: [legacy]
+    image: mysql:5.6@sha256:20575ecebe6216036d25dab5903808211f1e9ba63dc7825ac20cb975e34cfcae
+    platform: linux/amd64
+    container_name: kerno-mysql56
+    environment: *legacy-env
+    command: *legacy-command
+    ports:
+      - "127.0.0.1:53356:3306"
+    volumes:
+      - ./tests/fixtures/mysql-legacy:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
+    healthcheck: *legacy-health
+
+  mysql55:
+    profiles: [legacy]
+    image: mysql:5.5@sha256:12da85ab88aedfdf39455872fb044f607c32fdc233cd59f1d26769fbf439b045
+    platform: linux/amd64
+    container_name: kerno-mysql55
+    environment: *legacy-env
+    command: *legacy-command
+    ports:
+      - "127.0.0.1:53355:3306"
+    volumes:
+      - ./tests/fixtures/mysql-legacy:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
+    healthcheck: *legacy-health
+
+  mysql51:
+    profiles: [legacy]
+    build: ./tests/fixtures/mysql51
+    image: kerno-mysql51:local
+    platform: linux/amd64
+    container_name: kerno-mysql51
+    # The server's own default character set (latin1), as most 5.1 servers
+    # ran; the fixture's databases are utf8.
+    command:
+      - --ssl-ca=/kerno-tls/ca.crt
+      - --ssl-cert=/kerno-tls/server.crt
+      - --ssl-key=/kerno-tls/server-legacy.key
+    ports:
+      - "127.0.0.1:53351:3306"
+    volumes:
+      - ./tests/fixtures/mysql-legacy:/docker-entrypoint-initdb.d:ro
+      - ./tests/fixtures/generated/tls:/kerno-tls:ro
+    healthcheck: *legacy-health
+
 volumes:
   kerno_postgres_data:
   kerno_mysql_data:
