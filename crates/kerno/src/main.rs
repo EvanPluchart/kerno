@@ -2,6 +2,7 @@
 
 mod actions;
 mod admin;
+mod ai_settings_view;
 mod ai_view;
 mod app_icon;
 mod backup_dialog;
@@ -291,6 +292,8 @@ fn start(
         }
     })
     .detach();
+    // Where Settings → AI's Import and Detect look, on click only (K23).
+    cx.set_global(ai_settings_view::AiSources::of_this_computer());
     // The menu bar was set by `bind_keys`, which builds it again whenever
     // the shortcuts change (K20).
 

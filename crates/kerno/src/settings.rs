@@ -294,6 +294,8 @@ impl Settings {
         }
         // The built-ins are never lost, whatever was stored.
         self.environments = environment::with_builtins(std::mem::take(&mut self.environments));
+        // The AI address of before K23 (or of an older Kerno since): a saved endpoint.
+        self.ai.adopt_legacy();
         self
     }
 
@@ -396,6 +398,15 @@ mod tests {
                 endpoint: "http://localhost:11434/v1".into(),
                 model: "llama3.2".into(),
                 confirmed: ["https://api.example.com/v1".to_string()].into(),
+                endpoints: vec![kerno_core::ai::SavedEndpoint {
+                    name: "Ollama on this computer".into(),
+                    base: "http://localhost:11434/v1".into(),
+                    model: "llama3.2".into(),
+                    models: vec![kerno_core::ai::Model {
+                        id: "llama3.2".into(),
+                        label: Some("Llama 3.2".into()),
+                    }],
+                }],
             },
             value_panel: true,
             value_panel_width: 512.0,

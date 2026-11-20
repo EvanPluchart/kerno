@@ -28,8 +28,17 @@ use crate::dialect::Dialect;
 use crate::schema::{RelationKind, TableRef};
 use crate::sql::Catalog;
 
-/// How long a request may take, from connect to the last byte of the answer.
-pub const TIMEOUT: Duration = Duration::from_secs(60);
+pub mod endpoints;
+mod tls;
+
+pub use endpoints::{Model, Reach, SavedEndpoint};
+
+/// How long a chat request may take, from connect to the last byte of the answer: a reasoning
+/// model on a server of the user's network can think for minutes before it answers (the answer
+/// is not streamed). Stop closes the connection at once whatever this says.
+pub const CHAT_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long listing the models (List models, Test) may take.
+pub const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Tables described with their columns; beyond, names only.
 pub const MAX_TABLES: usize = 200;
 /// Table names listed beyond [`MAX_TABLES`].
@@ -42,24 +51,26 @@ const MAX_CELL: usize = 200;
 /// Largest answer read.
 const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 
-/// The endpoints offered in Settings → AI: name and base address.
-pub const SUGGESTIONS: [(&str, &str); 2] = [
-    ("Ollama", "http://localhost:11434/v1"),
-    ("LM Studio", "http://localhost:1234/v1"),
-];
-
-/// Settings → AI. The API key is not here: it lives in the secret store ([`key_name`]).
+/// Settings → AI. The API keys are not here: they live in the secret store ([`key_name`]).
+///
+/// `endpoint` and `model` are the active endpoint's, kept equal to its entry of `endpoints`
+/// (K23): they are what every request reads, and what a Kerno older than K23 reads (it ignores
+/// `endpoints`, and drops the list if it saves the settings; the active endpoint survives in
+/// these two fields and comes back as a saved endpoint, [`AiSettings::adopt_legacy`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
     /// "Enable the AI assistant". Off: no request is ever made.
     pub enabled: bool,
-    /// The OpenAI-compatible base address, e.g. `http://localhost:11434/v1`.
+    /// The active endpoint's OpenAI-compatible base address, e.g. `http://localhost:11434/v1`.
     pub endpoint: String,
-    /// The model named in each request.
+    /// The model named in each request: the active endpoint's.
     pub model: String,
     /// Base addresses of hosts other than this computer that the user allowed requests to.
     pub confirmed: BTreeSet<String>,
+    /// The saved endpoints, the active one among them (K23).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<SavedEndpoint>,
 }
 
 /// The secret store entry of an endpoint's API key.
@@ -406,6 +417,8 @@ pub struct Endpoint {
     pub host: String,
     /// The host is this computer (127.0.0.0/8, ::1, `localhost`).
     pub loopback: bool,
+    /// Its port, given or the scheme's.
+    pub port: u16,
 }
 
 /// Reads an endpoint address: `https://`, or `http://` to this computer only; no user name or
@@ -448,6 +461,7 @@ pub fn endpoint(text: &str) -> Result<Endpoint, String> {
         base: url.as_str().trim_end_matches('/').to_string(),
         host,
         loopback,
+        port: url.port_or_known_default().unwrap_or(443),
     })
 }
 
@@ -493,9 +507,22 @@ impl fmt::Display for AiError {
             ),
             Self::Network(why) => f.write_str(why),
             Self::Status(status, text) => {
-                write!(f, "The endpoint answered with an error ({status})")?;
+                match status {
+                    401 | 403 => write!(
+                        f,
+                        "The endpoint refused the request ({status}): check the API key saved \
+                         for it in Settings → AI."
+                    )?,
+                    404 => write!(
+                        f,
+                        "The endpoint has nothing at that address (404): check the address (most \
+                         servers end in /v1). If only the model list is missing, type the \
+                         model's name."
+                    )?,
+                    _ => write!(f, "The endpoint answered with an error ({status}).")?,
+                }
                 if !text.is_empty() {
-                    write!(f, ": {text}")?;
+                    write!(f, "\n{text}")?;
                 }
                 Ok(())
             }
@@ -522,7 +549,7 @@ pub fn gate(settings: &AiSettings) -> Result<Endpoint, AiError> {
 
 /// What stops a request in flight (the panel's Stop): the request's connection is closed at
 /// once, so its call returns and the endpoint sees the client go, instead of an answer read
-/// up to [`TIMEOUT`] later (C3). A request sent after the stop is not sent at all.
+/// up to [`CHAT_TIMEOUT`] later (C3). A request sent after the stop is not sent at all.
 #[derive(Clone, Default)]
 pub struct Stopper(Arc<Mutex<Stopping>>);
 
@@ -580,18 +607,40 @@ pub fn request_until(
     call: &Call,
     stop: &Stopper,
 ) -> Result<String, AiError> {
+    let timeout = match call {
+        Call::Chat(_) => CHAT_TIMEOUT,
+        Call::Models => LIST_TIMEOUT,
+    };
+    send(settings, key, call, stop, timeout)
+}
+
+/// The one function that opens a socket for the assistant's requests (Detect goes through it
+/// too, with its own timeout), only after [`gate`]. The one other connection is the issuer
+/// check of a refused certificate (`tls::issuer`), to the same host, after the same gate.
+fn send(
+    settings: &AiSettings,
+    key: Option<&Secret>,
+    call: &Call,
+    stop: &Stopper,
+    timeout: Duration,
+) -> Result<String, AiError> {
     let endpoint = gate(settings)?;
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            // Only the configured host: no proxy from the environment, no redirect.
-            .proxy(None)
-            .max_redirects(0)
-            .https_only(!endpoint.loopback)
-            .timeout_global(Some(TIMEOUT))
-            .http_status_as_error(false)
-            .user_agent(format!("Kerno/{}", env!("CARGO_PKG_VERSION")))
-            .build(),
-    );
+    let mut config = ureq::Agent::config_builder()
+        // Only the configured host: no proxy from the environment, no redirect.
+        .proxy(None)
+        .max_redirects(0)
+        .https_only(!endpoint.loopback)
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .user_agent(format!("Kerno/{}", env!("CARGO_PKG_VERSION")));
+    if endpoint.base.starts_with("https://") {
+        config = config.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(tls::roots())
+                .build(),
+        );
+    }
+    let agent = ureq::Agent::new_with_config(config.build());
     if !stop.hold(&agent) {
         return Err(AiError::Stopped);
     }
@@ -599,7 +648,7 @@ pub fn request_until(
         if stop.0.lock().map(|state| state.stopped).unwrap_or(true) {
             AiError::Stopped
         } else {
-            network(&endpoint.host, error)
+            network(&endpoint, error, timeout)
         }
     };
     let bearer = key
@@ -639,21 +688,50 @@ pub fn request_until(
     Ok(text)
 }
 
-/// A failed connection or read, in plain words first.
-fn network(host: &str, error: ureq::Error) -> AiError {
-    let what = match &error {
-        ureq::Error::Timeout(_) => format!("{host} gave no answer within 60 seconds."),
-        ureq::Error::HostNotFound => format!("The host “{host}” was not found."),
-        ureq::Error::ConnectionFailed => {
-            format!("Kerno could not connect to {host}: is the server running?")
-        }
-        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
-            format!("{host} refused the connection: is the server running on that port?")
-        }
-        ureq::Error::BodyExceedsLimit(_) => format!("The answer of {host} is too large."),
-        other => format!("The request to {host} failed: {other}"),
+/// A failed connection or read, in plain words first, then the client's own message.
+fn network(endpoint: &Endpoint, error: ureq::Error, timeout: Duration) -> AiError {
+    let host = &endpoint.host;
+    let refused = || {
+        format!(
+            "{host} refused the connection on port {}: is the server running on that port?",
+            endpoint.port
+        )
     };
-    AiError::Network(what)
+    let plain = match &error {
+        ureq::Error::Timeout(_) => format!("{host} gave no answer within {}.", waited(timeout)),
+        ureq::Error::HostNotFound => format!(
+            "The host “{host}” was not found. Is this computer on the network that serves it, \
+             or on its VPN?"
+        ),
+        ureq::Error::ConnectionFailed => refused(),
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => refused(),
+        ureq::Error::BodyExceedsLimit(_) => format!("The answer of {host} is too large."),
+        error if tls::unknown_issuer(error) => {
+            let issuer = tls::issuer(host, endpoint.port, Duration::from_secs(5))
+                .map(|name| format!("“{name}”"))
+                .unwrap_or_else(|| "an authority".into());
+            format!(
+                "The certificate of {host} was issued by {issuer}, which this computer does not \
+                 trust. Kerno trusts the certificates the system trusts: add that authority to \
+                 the system's trust store (Keychain Access on macOS), then test again."
+            )
+        }
+        error if tls::tls_error(error).is_some() => format!(
+            "The secure connection to {host} failed. Kerno trusts the certificates the system \
+             trusts."
+        ),
+        _ => format!("The request to {host} failed."),
+    };
+    AiError::Network(format!("{plain}\n{error}"))
+}
+
+/// A timeout in words: `1500 ms`, `15 seconds`, `5 minutes`.
+fn waited(timeout: Duration) -> String {
+    match timeout.as_secs() {
+        0 => format!("{} ms", timeout.as_millis()),
+        seconds if seconds < 120 => format!("{seconds} seconds"),
+        seconds => format!("{} minutes", seconds / 60),
+    }
 }
 
 /// Asks the endpoint for a completion of `payload` and returns the model's answer.
@@ -673,20 +751,66 @@ pub fn chat_until(
     stop: &Stopper,
 ) -> Result<String, AiError> {
     let text = request_until(settings, key, &Call::Chat(payload.clone()), stop)?;
+    answer_text(&text)
+}
+
+/// The answer of a chat completion's body, without the model's reasoning: a reasoning field
+/// (`reasoning_content`, `reasoning`) is not read, and `<think>…</think>` is taken out of the
+/// text ([`strip_reasoning`]), so neither is shown, copied or inserted.
+pub fn answer_text(body: &str) -> Result<String, AiError> {
     let answer: Value =
-        serde_json::from_str(&text).map_err(|error| AiError::Answer(error.to_string()))?;
-    answer
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| AiError::Answer("it holds no choices[0].message.content".into()))
+        serde_json::from_str(body).map_err(|error| AiError::Answer(error.to_string()))?;
+    let message = answer
+        .pointer("/choices/0/message")
+        .ok_or_else(|| AiError::Answer("it holds no choices[0].message".into()))?;
+    let text = strip_reasoning(message.get("content").and_then(Value::as_str).unwrap_or(""));
+    if text.is_empty() {
+        let reasoned = ["reasoning_content", "reasoning"].iter().any(|field| {
+            (message.get(*field).and_then(Value::as_str)).is_some_and(|text| !text.is_empty())
+        });
+        return Err(AiError::Answer(if reasoned {
+            "the model gave its reasoning but no answer (it may have run out of tokens): ask \
+             again, or choose a model that thinks less."
+                .into()
+        } else {
+            "the model's answer is empty.".into()
+        }));
+    }
+    Ok(text)
+}
+
+/// `text` without the reasoning some models write in it: each `<think>…</think>`, the text up
+/// to a `</think>` whose `<think>` the server's template wrote (Qwen3, DeepSeek-R1), and what
+/// follows a `<think>` never closed (an answer cut short).
+pub fn strip_reasoning(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut text = text.to_string();
+    loop {
+        match (text.find(OPEN), text.find(CLOSE)) {
+            (Some(open), Some(close)) if open < close => {
+                text.replace_range(open..close + CLOSE.len(), "")
+            }
+            (_, Some(close)) => text.replace_range(..close + CLOSE.len(), ""),
+            (Some(open), None) => {
+                text.truncate(open);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    text.trim().to_string()
 }
 
 /// The model names the endpoint offers (`GET /models`), sorted.
 pub fn list_models(settings: &AiSettings, key: Option<&Secret>) -> Result<Vec<String>, AiError> {
-    let text = request(settings, key, &Call::Models)?;
+    parse_models(&request(settings, key, &Call::Models)?)
+}
+
+/// The model ids of a `GET /models` body, sorted.
+fn parse_models(text: &str) -> Result<Vec<String>, AiError> {
     let answer: Value =
-        serde_json::from_str(&text).map_err(|error| AiError::Answer(error.to_string()))?;
+        serde_json::from_str(text).map_err(|error| AiError::Answer(error.to_string()))?;
     let mut models: Vec<String> = answer
         .get("data")
         .and_then(Value::as_array)
@@ -780,6 +904,7 @@ mod tests {
             endpoint: "http://127.0.0.1:9/v1".into(),
             model: "m".into(),
             confirmed: BTreeSet::new(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -991,5 +1116,108 @@ mod tests {
             key_name("http://localhost:11434/v1"),
             "ai/http://localhost:11434/v1"
         );
+    }
+
+    /// K23: the reasoning of Qwen, DeepSeek and GLM variants never reaches the panel, Copy or
+    /// Insert: a separate field is not read, `<think>` is taken out in every shape.
+    #[test]
+    fn the_reasoning_is_left_out_of_the_answer() {
+        assert_eq!(
+            strip_reasoning("<think>```sql\nDROP TABLE t;\n```</think>\n```sql\nSELECT 1;\n```"),
+            "```sql\nSELECT 1;\n```"
+        );
+        // The template wrote `<think>`: the text starts inside it.
+        assert_eq!(
+            strip_reasoning("weighing it…</think>The answer."),
+            "The answer."
+        );
+        // Cut short while thinking: nothing of it.
+        assert_eq!(strip_reasoning("Here.<think>and then"), "Here.");
+        assert_eq!(strip_reasoning("<think>a</think>x<think>b</think>y"), "xy");
+        assert_eq!(strip_reasoning("plain"), "plain");
+        let body = |message: Value| json!({"choices": [{"message": message}]}).to_string();
+        let separate = body(json!({"content": "```sql\nSELECT 2;\n```",
+            "reasoning_content": "```sql\nDELETE FROM t;\n```"}));
+        assert_eq!(answer_text(&separate).unwrap(), "```sql\nSELECT 2;\n```");
+        assert_eq!(sql_block(&answer_text(&separate).unwrap()), "SELECT 2;");
+        let inline = body(
+            json!({"content": "<think>```sql\nDELETE FROM t;\n```</think>```sql\nSELECT 3;\n```"}),
+        );
+        assert_eq!(sql_block(&answer_text(&inline).unwrap()), "SELECT 3;");
+        // Only reasoning, the budget spent: said in plain words.
+        let only = body(json!({"content": null, "reasoning_content": "long thoughts"}));
+        let why = answer_text(&only).unwrap_err().to_string();
+        assert!(why.contains("reasoning but no answer"), "{why}");
+    }
+
+    /// K23: the client trusts what the system trusts and no less; a certificate whose
+    /// authority the system does not trust is refused, said with the authority's name. A
+    /// local TLS server with the certificate `scripts/test-env.sh` generates for the test
+    /// servers (no private key is kept in the repository); nothing leaves the machine.
+    #[test]
+    fn a_certificate_the_system_does_not_trust_is_said_with_its_issuer() {
+        use std::net::TcpListener;
+        let (pem, key) = (
+            crate::testing::generated("tls/server.crt"),
+            crate::testing::generated("tls/server.key"),
+        );
+        let (Ok(pem), Ok(key)) = (std::fs::read(&pem), std::fs::read(&key)) else {
+            let message = format!(
+                "{} is missing; generate the test certificates with `scripts/test-env.sh up`",
+                pem.display()
+            );
+            if std::env::var_os("KERNO_REQUIRE_CONTAINERS").is_some() {
+                panic!("{message}");
+            }
+            eprintln!("SKIPPED: {message}");
+            return;
+        };
+        let cert = ureq::tls::Certificate::from_pem(&pem).unwrap();
+        assert_eq!(
+            tls::issuer_name(cert.der()).as_deref(),
+            Some("Kerno Test CA")
+        );
+        let key = ureq::tls::PrivateKey::from_pem(&key).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().to_vec().into()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.der().to_vec().into()),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut server = rustls::ServerConnection::new(config.clone()).unwrap();
+                while server.is_handshaking() {
+                    if server.complete_io(&mut stream).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let settings = AiSettings {
+            enabled: true,
+            endpoint: format!("https://127.0.0.1:{port}/v1"),
+            ..AiSettings::default()
+        };
+        let error = list_models(&settings, Some(&Secret::new("sk-tls-0005"))).unwrap_err();
+        let text = error.to_string();
+        assert!(matches!(error, AiError::Network(_)), "{error:?}");
+        assert!(
+            text.starts_with(
+                "The certificate of 127.0.0.1 was issued by “Kerno Test CA”, which this \
+                 computer does not trust. Kerno trusts the certificates the system trusts"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("sk-tls"), "{text}");
     }
 }

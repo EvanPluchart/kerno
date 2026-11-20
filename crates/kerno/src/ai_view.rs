@@ -1,15 +1,16 @@
 //! The AI assistant's screens (CLAUDE.md §4 J17, DBeaver #36951, #20072; D-068): the answer
-//! panel at the side of a query tab, the AI entries of the editor's menu, Settings → AI, and
-//! the session's "What was sent" log. What is sent and the one function that sends are
-//! `kerno_core::ai`: this file only gathers what the user chose and shows the answer, as text.
-//! An answer runs nothing: its SQL is inserted in the editor when the user clicks Insert.
+//! panel at the side of a query tab, the AI entries of the editor's menu, and the session's
+//! "What was sent" log (Settings → AI is `ai_settings_view`). What is sent and the one function
+//! that sends are `kerno_core::ai`: this file only gathers what the user chose and shows the
+//! answer, as text. An answer runs nothing: its SQL is inserted in the editor when the user
+//! clicks Insert.
 
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -28,13 +29,15 @@ use crate::actions;
 use crate::bridge;
 use crate::query::tab::QueryTab;
 use crate::state::AppState;
-use crate::theme;
 
 /// What an entry says while the assistant is off.
 pub const OFF: &str = "turn on in Settings → AI";
 
-/// What an "AI: …" command says while the assistant is off, wherever it runs.
-pub const OFF_NOTICE: &str = "The AI assistant is off: turn it on in Settings → AI.";
+/// What an "AI: …" command says while the assistant is off, wherever it runs: what turning it
+/// on gives, in the words of the top of Settings → AI (K23).
+pub const OFF_NOTICE: &str = "The AI assistant is off. Turned on in Settings → AI, it writes SQL \
+     from a sentence (never run by itself) and explains a query, a plan or an error, sending \
+     only names and types to the endpoint you choose.";
 
 /// An "AI: …" command that reached the window, not a query tab (the keyboard was in the
 /// sidebar or a data tab): the active query tab takes it; with none, it says what is needed.
@@ -169,8 +172,11 @@ pub struct AiPanel {
     samples: Option<Result<Vec<Sample>, String>>,
     samples_for: Vec<TableRef>,
     show_preview: bool,
-    /// An API key is stored for the endpoint (read once, off the UI thread).
+    /// An API key is stored for the endpoint (read off the UI thread, again when the active
+    /// endpoint changes).
     has_key: bool,
+    /// The endpoint `has_key` was read for.
+    key_for: String,
     stage: Stage,
     /// Bumped by Stop and each request: a late answer is dropped.
     generation: u64,
@@ -210,6 +216,14 @@ impl AiPanel {
             input.update(cx, |input, cx| input.focus(window, cx));
             input
         });
+        // Switched in Settings or in the picker: the key of the new endpoint, for the
+        // preview's and the log's `Authorization` line.
+        subscriptions.push(cx.observe_global::<AppState>(|this: &mut Self, cx| {
+            if AppState::get(cx).settings.ai.endpoint != this.key_for {
+                this.read_key(cx);
+                cx.notify();
+            }
+        }));
         let mut panel = Self {
             tab,
             editor,
@@ -221,6 +235,7 @@ impl AiPanel {
             samples_for: Vec::new(),
             show_preview: false,
             has_key: false,
+            key_for: String::new(),
             stage: Stage::Ready,
             generation: 0,
             tasks: Vec::new(),
@@ -232,7 +247,9 @@ impl AiPanel {
 
     /// Whether a key is stored for the endpoint, for the preview's `Authorization` line.
     fn read_key(&mut self, cx: &mut Context<Self>) {
-        let Ok(endpoint) = ai::endpoint(&AppState::get(cx).settings.ai.endpoint) else {
+        self.key_for = AppState::get(cx).settings.ai.endpoint.clone();
+        self.has_key = false;
+        let Ok(endpoint) = ai::endpoint(&self.key_for) else {
             return;
         };
         let secrets = AppState::get(cx).secrets.clone();
@@ -243,13 +260,79 @@ impl AiPanel {
                 .flatten()
                 .is_some_and(|key| !key.is_empty())
         });
+        let base = self.key_for.clone();
         self.tasks.push(cx.spawn(async move |this, cx| {
             let has_key = reading.await;
             let _ = this.update(cx, |this, cx| {
-                this.has_key = has_key;
-                cx.notify();
+                if this.key_for == base {
+                    this.has_key = has_key;
+                    cx.notify();
+                }
             });
         }));
+    }
+
+    /// The picker at the top of the panel: "endpoint · model", a menu of the saved endpoints
+    /// and of the active one's models (K23). Not while a request is on its way.
+    fn picker(&self, cx: &Context<Self>) -> impl IntoElement {
+        let mut settings = AppState::get(cx).settings.ai.clone();
+        settings.adopt_legacy();
+        let shown = match settings.active() {
+            Some(saved) if !settings.model.is_empty() => {
+                format!("{} · {}", saved.name, settings.model)
+            }
+            Some(saved) => format!("{} · no model chosen", saved.name),
+            None => "No endpoint: add one in Settings → AI".into(),
+        };
+        let menu = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            for saved in &settings.endpoints {
+                let base = saved.base.clone();
+                let model = match saved.model.as_str() {
+                    "" => "no model chosen",
+                    model => model,
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(SharedString::from(format!("{} · {model}", saved.name)))
+                        .checked(saved.base == settings.endpoint)
+                        .on_click(move |_, _, cx| {
+                            let base = base.clone();
+                            AppState::update_settings(cx, |settings| {
+                                settings.ai.adopt_legacy();
+                                settings.ai.activate(&base)
+                            });
+                        }),
+                );
+            }
+            if let Some(active) = settings.active()
+                && !active.models.is_empty()
+            {
+                menu = menu.separator();
+                for model in &active.models {
+                    let id = model.id.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(SharedString::from(model.shown()))
+                            .checked(model.id == settings.model)
+                            .on_click(move |_, _, cx| {
+                                let id = id.clone();
+                                AppState::update_settings(cx, |settings| {
+                                    settings.ai.adopt_legacy();
+                                    settings.ai.set_model(&id)
+                                });
+                            }),
+                    );
+                }
+            }
+            crate::tabs::fit_window(menu, window)
+        };
+        div().id("ai-picker").test_support().child(
+            Button::new("ai-endpoint-picker")
+                .outline()
+                .xsmall()
+                .label(SharedString::from(shown))
+                .dropdown_caret(true)
+                .disabled(self.sending())
+                .dropdown_menu(menu),
+        )
     }
 
     /// The request as it stands: the sentence typed so far for "Write SQL".
@@ -658,12 +741,13 @@ impl Render for AiPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
                     ),
             )
+            .child(self.picker(cx))
             .when(!on, |panel| {
                 panel.child(
                     div()
                         .text_xs()
                         .text_color(danger)
-                        .child("The AI assistant is off: turn it on in Settings → AI. Nothing is sent while it is off."),
+                        .child(SharedString::from(format!("{OFF_NOTICE} Nothing is sent while it is off."))),
                 )
             })
             .children(subject)
@@ -724,442 +808,6 @@ impl Render for AiPanel {
                         .child(SharedString::from(self.preview_text(cx))),
                 )
             })
-    }
-}
-
-/// What Settings → AI says of an endpoint on another host, until it is allowed.
-pub fn remote_warning(host: &str) -> String {
-    format!(
-        "Requests will leave this computer and go to {host}: the schema of the database you ask \
-         about (and its first rows when you tick them) is sent there. Nothing is sent until you \
-         allow it."
-    )
-}
-
-/// Settings → AI: on or off, the endpoint and its key, the model, and the session's log.
-pub struct AiSettingsView {
-    endpoint: Entity<InputState>,
-    model: Entity<InputState>,
-    key: Entity<InputState>,
-    /// The models "List models" found, or why not.
-    models: Option<Result<Vec<String>, String>>,
-    /// What happened to the key last.
-    key_note: Option<String>,
-    tasks: Vec<Task<()>>,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl AiSettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let settings = AppState::get(cx).settings.ai.clone();
-        let endpoint = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(ai::SUGGESTIONS[0].1)
-                .default_value(settings.endpoint)
-        });
-        let model = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("llama3.2")
-                .default_value(settings.model)
-        });
-        let key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder("Only for endpoints that ask for one")
-        });
-        let subscriptions = vec![
-            cx.subscribe(&endpoint, |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().trim().to_string();
-                    AppState::update_settings(cx, |settings| settings.ai.endpoint = text);
-                    this.models = None;
-                    this.key_note = None;
-                    cx.notify();
-                }
-            }),
-            cx.subscribe(&model, |_, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let text = input.read(cx).value().trim().to_string();
-                    AppState::update_settings(cx, |settings| settings.ai.model = text);
-                    cx.notify();
-                }
-            }),
-            cx.subscribe_in(&key, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.save_key(window, cx);
-                }
-            }),
-        ];
-        Self {
-            endpoint,
-            model,
-            key,
-            models: None,
-            key_note: None,
-            tasks: Vec::new(),
-            _subscriptions: subscriptions,
-        }
-    }
-
-    /// Puts `text` in the endpoint field (a suggestion).
-    pub fn set_endpoint(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.endpoint
-            .update(cx, |input, cx| input.set_value(text, window, cx));
-        AppState::update_settings(cx, |settings| settings.ai.endpoint = text.to_string());
-        cx.notify();
-    }
-
-    /// Puts `text` in the model field.
-    pub fn set_model(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.model
-            .update(cx, |input, cx| input.set_value(text, window, cx));
-        AppState::update_settings(cx, |settings| settings.ai.model = text.to_string());
-        cx.notify();
-    }
-
-    /// Stores the typed key in the secret store, for this endpoint only, and empties the field.
-    pub fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self.key.read(cx).value().to_string();
-        if typed.trim().is_empty() {
-            return;
-        }
-        let endpoint = match ai::endpoint(&AppState::get(cx).settings.ai.endpoint) {
-            Ok(endpoint) => endpoint,
-            Err(why) => {
-                self.key_note = Some(format!("Not saved: {why}"));
-                cx.notify();
-                return;
-            }
-        };
-        self.key
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        let secrets = AppState::get(cx).secrets.clone();
-        let host = endpoint.host.clone();
-        let saving = bridge::spawn_blocking(cx, move || {
-            secrets.set(&ai::key_name(&endpoint.base), &Secret::new(typed.trim()))
-        });
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let saved = saving.await;
-            let _ = this.update(cx, |this, cx| {
-                this.key_note = Some(match saved {
-                    Ok(()) => format!("Key saved in the system's secret store, for {host} only."),
-                    Err(error) => format!("The key could not be saved: {error}"),
-                });
-                cx.notify();
-            });
-        }));
-    }
-
-    /// Forgets the key of the endpoint.
-    fn remove_key(&mut self, cx: &mut Context<Self>) {
-        let Ok(endpoint) = ai::endpoint(&AppState::get(cx).settings.ai.endpoint) else {
-            return;
-        };
-        let secrets = AppState::get(cx).secrets.clone();
-        let removing =
-            bridge::spawn_blocking(cx, move || secrets.delete(&ai::key_name(&endpoint.base)));
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let removed = removing.await;
-            let _ = this.update(cx, |this, cx| {
-                this.key_note = Some(match removed {
-                    Ok(()) => "Key removed.".into(),
-                    Err(error) => format!("The key could not be removed: {error}"),
-                });
-                cx.notify();
-            });
-        }));
-    }
-
-    /// "List models": `GET /models` through the one sender, so it obeys the same switch and
-    /// checks; asked only when the user clicks.
-    pub fn list_models(&mut self, cx: &mut Context<Self>) {
-        let settings = AppState::get(cx).settings.ai.clone();
-        let endpoint = match ai::gate(&settings) {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                self.models = Some(Err(error.to_string()));
-                cx.notify();
-                return;
-            }
-        };
-        let secrets = AppState::get(cx).secrets.clone();
-        let asking = bridge::spawn_blocking(cx, move || {
-            let key = secrets.get(&ai::key_name(&endpoint.base)).ok().flatten();
-            ai::list_models(&settings, key.as_ref()).map_err(|error| error.to_string())
-        });
-        self.models = None;
-        self.tasks.push(cx.spawn(async move |this, cx| {
-            let models = asking.await;
-            let _ = this.update(cx, |this, cx| {
-                this.models = Some(models);
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-}
-
-impl Render for AiSettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = AppState::get(cx).settings.ai.clone();
-        let theme = cx.theme();
-        let (muted, danger, warning, mono) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.warning,
-            theme.mono_font_family.clone(),
-        );
-        let note = |text: String| {
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(SharedString::from(text))
-        };
-        let label = |text: &'static str| div().w(px(120.)).child(text);
-        let checked = ai::endpoint(&settings.endpoint);
-        let where_to: AnyElement =
-            match &checked {
-                Err(why) if !settings.endpoint.is_empty() => div()
-                    .id("ai-endpoint-error")
-                    .test_support()
-                    .text_xs()
-                    .text_color(danger)
-                    .child(SharedString::from(why.clone()))
-                    .into_any_element(),
-                Err(_) => {
-                    note("Kerno asks only this address, and only when you send a request.".into())
-                        .into_any_element()
-                }
-                Ok(endpoint) if endpoint.loopback => note(format!(
-                    "{} is this computer: nothing leaves it.",
-                    endpoint.host
-                ))
-                .into_any_element(),
-                Ok(endpoint) if settings.confirmed.contains(&endpoint.base) => {
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().text_xs().text_color(warning).child(
-                            SharedString::from(format!(
-                                "Requests leave this computer and go to {}: allowed.",
-                                endpoint.host
-                            )),
-                        ))
-                        .child({
-                            let base = endpoint.base.clone();
-                            Button::new("ai-forget-host")
-                                .ghost()
-                                .xsmall()
-                                .label("Stop allowing")
-                                .on_click(move |_, _, cx| {
-                                    let base = base.clone();
-                                    AppState::update_settings(cx, |settings| {
-                                        settings.ai.confirmed.remove(&base);
-                                    });
-                                })
-                        })
-                        .into_any_element()
-                }
-                Ok(endpoint) => v_flex()
-                    .id("ai-remote-warning")
-                    .test_support()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(warning)
-                            .child(SharedString::from(remote_warning(&endpoint.host))),
-                    )
-                    .child({
-                        let base = endpoint.base.clone();
-                        Button::new("ai-allow-host")
-                            .outline()
-                            .small()
-                            .label(SharedString::from(format!(
-                                "Allow requests to {}",
-                                endpoint.host
-                            )))
-                            .on_click(move |_, _, cx| {
-                                let base = base.clone();
-                                AppState::update_settings(cx, |settings| {
-                                    settings.ai.confirmed.insert(base);
-                                });
-                            })
-                    })
-                    .into_any_element(),
-            };
-        let models: Option<AnyElement> =
-            self.models.as_ref().map(|models| match models {
-                Ok(models) if models.is_empty() => {
-                    note("The endpoint lists no model.".into()).into_any_element()
-                }
-                Ok(models) => h_flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(models.iter().enumerate().map(|(index, name)| {
-                        let name = name.clone();
-                        theme::chip(("ai-model", index), settings.model == name)
-                            .xsmall()
-                            .label(SharedString::from(name.clone()))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.set_model(&name, window, cx)
-                            }))
-                    }))
-                    .into_any_element(),
-                Err(why) => div()
-                    .id("ai-models-error")
-                    .test_support()
-                    .text_xs()
-                    .text_color(danger)
-                    .child(SharedString::from(why.clone()))
-                    .into_any_element(),
-            });
-        let now = now_ms();
-        let log = sent_log(cx);
-        v_flex()
-            .id("settings-ai")
-            .test_support()
-            .gap_2()
-            .child(
-                Checkbox::new("settings-ai-enabled")
-                    .label("Enable the AI assistant")
-                    .checked(settings.enabled)
-                    .on_click(|checked, window, cx| {
-                        let checked = *checked;
-                        AppState::update_settings(cx, |settings| settings.ai.enabled = checked);
-                        window.refresh();
-                    }),
-            )
-            .child(note(
-                "Off, no request is ever made. On, Kerno talks to the OpenAI-compatible endpoint \
-                 below only when you ask (Write SQL, Explain query, plan or error): it sends the \
-                 names of the schemas, tables and columns with their types, never rows unless you \
-                 tick “Include sample rows” for that request. Each request shows what it sends."
-                    .into(),
-            ))
-            .child(
-                h_flex().gap_2().child(label("Endpoint")).child(
-                    div()
-                        .id("ai-endpoint")
-                        .test_support()
-                        .flex_1()
-                        .child(Input::new(&self.endpoint).small()),
-                ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .pl(px(128.))
-                    .children(ai::SUGGESTIONS.iter().enumerate().map(
-                        |(index, (name, address))| {
-                            let address = *address;
-                            Button::new(("ai-suggestion", index))
-                                .ghost()
-                                .xsmall()
-                                .label(SharedString::from(format!("{name}: {address}")))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.set_endpoint(address, window, cx)
-                                }))
-                        },
-                    )),
-            )
-            .child(where_to)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(label("Model"))
-                    .child(
-                        div()
-                            .id("ai-model")
-                            .test_support()
-                            .flex_1()
-                            .child(Input::new(&self.model).small()),
-                    )
-                    .child(
-                        Button::new("ai-list-models")
-                            .outline()
-                            .small()
-                            .label("List models")
-                            .disabled(!settings.enabled || checked.is_err())
-                            .on_click(cx.listener(|this, _, _, cx| this.list_models(cx))),
-                    ),
-            )
-            .children(models)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(label("API key"))
-                    .child(
-                        div()
-                            .id("ai-key")
-                            .test_support()
-                            .flex_1()
-                            .child(Input::new(&self.key).small()),
-                    )
-                    .child(
-                        Button::new("ai-save-key")
-                            .outline()
-                            .small()
-                            .label("Save key")
-                            .disabled(checked.is_err())
-                            .on_click(cx.listener(|this, _, window, cx| this.save_key(window, cx))),
-                    )
-                    .child(
-                        Button::new("ai-remove-key")
-                            .ghost()
-                            .small()
-                            .label("Remove")
-                            .disabled(checked.is_err())
-                            .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx))),
-                    ),
-            )
-            .child(note(match &self.key_note {
-                Some(note) => note.clone(),
-                None => "The key is kept in the system's secret store, one per endpoint, never \
-                         in Kerno's files or logs."
-                    .into(),
-            }))
-            .child(
-                div()
-                    .pt_2()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("What was sent"),
-            )
-            .child(
-                v_flex()
-                    .id("ai-sent-log")
-                    .test_support()
-                    .gap_2()
-                    .when(log.is_empty(), |list| {
-                        list.child(note(
-                            "Nothing was sent during this run. The list is kept in memory only."
-                                .into(),
-                        ))
-                    })
-                    .children(log.into_iter().rev().enumerate().map(|(index, sent)| {
-                        v_flex()
-                            .id(("ai-sent", index))
-                            .test_support()
-                            .gap_1()
-                            .child(note(format!(
-                                "{} · POST {}{}",
-                                crate::library::ago(now, sent.at_ms),
-                                sent.endpoint,
-                                if sent.key {
-                                    " · Authorization: Bearer ***"
-                                } else {
-                                    ""
-                                }
-                            )))
-                            .child(
-                                div()
-                                    .max_h(px(160.))
-                                    .overflow_hidden()
-                                    .font_family(mono.clone())
-                                    .text_xs()
-                                    .child(SharedString::from(sent.body)),
-                            )
-                    })),
-            )
     }
 }
 

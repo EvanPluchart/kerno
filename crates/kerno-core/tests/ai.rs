@@ -14,6 +14,7 @@ fn settings(fake: &FakeAi, enabled: bool) -> AiSettings {
         endpoint: fake.base(),
         model: "fake-model".into(),
         confirmed: BTreeSet::new(),
+        endpoints: Vec::new(),
     }
 }
 

@@ -32,6 +32,13 @@ rust_xlsxwriter.workspace = true
 # The AI assistant's HTTP client (J17, D-0xx): rustls with ring and webpki-roots,
 # both already in the tree; no gzip, no native-tls, no second crypto backend.
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# K23 (D-095), all already in the tree: the system's trust store for the AI client (the
+# drivers' rustls-native-certs), the issuer of a certificate it refuses (x509-cert, through
+# tokio-postgres-rustls), and omp's models.yml (serde-saphyr, through gpui-component's i18n).
+rustls.workspace = true
+rustls-native-certs.workspace = true
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+serde-saphyr = "1.3"
 # Already in the tree through rust_xlsxwriter.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 

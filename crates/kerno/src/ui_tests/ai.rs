@@ -16,7 +16,7 @@ const ANSWER: &str =
 /// The end of every fixture customer's email: a cell value, never a name.
 const ROW_VALUE: &str = "@example.com";
 
-fn enable(cx: &mut TestAppContext, endpoint: &str, enabled: bool) {
+pub(super) fn enable(cx: &mut TestAppContext, endpoint: &str, enabled: bool) {
     let endpoint = endpoint.to_string();
     cx.update(|cx| {
         AppState::update_settings(cx, |settings| {
@@ -24,13 +24,13 @@ fn enable(cx: &mut TestAppContext, endpoint: &str, enabled: bool) {
                 enabled,
                 endpoint,
                 model: "fake-model".into(),
-                confirmed: Default::default(),
+                ..AiSettings::default()
             }
         })
     });
 }
 
-fn panel(app: &Fixture, cx: &mut TestAppContext) -> Option<Entity<AiPanel>> {
+pub(super) fn panel(app: &Fixture, cx: &mut TestAppContext) -> Option<Entity<AiPanel>> {
     let tab = app.tab(cx);
     cx.update(|cx| tab.read(cx).ai_panel().cloned())
 }
@@ -46,25 +46,25 @@ fn previewed(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
     })
 }
 
-fn answer(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
+pub(super) fn answer(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
     let panel = panel(app, cx)?;
     cx.update(|cx| panel.read(cx).answer().map(str::to_string))
 }
 
-fn failure(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
+pub(super) fn failure(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
     let panel = panel(app, cx)?;
     cx.update(|cx| panel.read(cx).failure().map(str::to_string))
 }
 
 /// Opens "Write SQL" and types `sentence`.
-fn write_sql(app: &Fixture, cx: &mut TestAppContext, sentence: &str) {
+pub(super) fn write_sql(app: &Fixture, cx: &mut TestAppContext, sentence: &str) {
     app.dispatch(cx, actions::AiWriteSql);
     assert!(app.has(cx, "ai-panel"));
     app.click(cx, "ai-sentence");
     app.type_text(cx, sentence);
 }
 
-fn send_and_wait(app: &Fixture, cx: &mut TestAppContext) {
+pub(super) fn send_and_wait(app: &Fixture, cx: &mut TestAppContext) {
     app.click(cx, "ai-send");
     app.wait_until(cx, "the answer", |app, cx| {
         if let Some(failure) = failure(app, cx) {
@@ -125,7 +125,7 @@ fn nothing_is_sent_while_the_assistant_is_off(cx: &mut TestAppContext) {
         .unwrap();
     app.click(cx, ("settings-section", index));
     assert!(app.has(cx, "settings-ai"));
-    app.click(cx, "ai-list-models");
+    app.tap(cx, "ai-list-models");
     assert!(!app.has(cx, ("ai-model", 0usize)));
     cx.run_until_parked();
     assert_eq!(fake.connections(), 0);
@@ -262,19 +262,19 @@ fn the_key_goes_in_authorization_and_nowhere_else(cx: &mut TestAppContext) {
         .position(|(_, label)| *label == "AI")
         .unwrap();
     app.click(cx, ("settings-section", index));
-    app.fill_in(cx, "ai-key", KEY);
-    app.click(cx, "ai-save-key");
+    type_in(&app, cx, "ai-key", KEY);
+    app.tap(cx, "ai-save-key");
     let name = ai::key_name(&fake.base());
     app.wait_until(cx, "the saved key", |_, cx| {
         cx.update(|cx| AppState::get(cx).secrets.get(&name).unwrap())
             .is_some_and(|key| key.expose() == KEY)
     });
     // List models sends it too.
-    app.click(cx, "ai-list-models");
+    app.tap(cx, "ai-list-models");
     app.wait_until(cx, "the models", |app, cx| {
         app.has(cx, ("ai-model", 0usize))
     });
-    app.click(cx, ("ai-model", 0usize));
+    app.tap(cx, ("ai-model", 0usize));
     assert_eq!(settings_now(cx).ai.model, "fake-model");
     app.press(cx, &["escape"]);
     write_sql(&app, cx, "count the orders");
@@ -332,22 +332,33 @@ fn a_remote_endpoint_asks_first_and_plain_http_to_it_is_refused(cx: &mut TestApp
         .position(|(_, label)| *label == "AI")
         .unwrap();
     app.click(cx, ("settings-section", index));
-    // The suggestions fill the field.
-    app.click(cx, ("ai-suggestion", 1usize));
-    assert_eq!(settings_now(cx).ai.endpoint, "http://localhost:1234/v1");
-    app.fill_in(cx, "ai-endpoint", "http://kerno-ai.invalid/v1");
-    assert_eq!(settings_now(cx).ai.endpoint, "http://kerno-ai.invalid/v1");
-    assert!(app.has(cx, "ai-endpoint-error"));
-    app.fill_in(cx, "ai-endpoint", "https://kerno-ai.invalid/v1");
-    assert!(app.has(cx, "ai-remote-warning"));
+    // Added by hand: plain http:// to another host is refused and not saved.
+    app.tap(cx, "ai-add");
+    type_in(&app, cx, "ai-add-address", "http://kerno-ai.invalid/v1");
+    assert!(app.has(cx, "ai-add-error"));
+    app.tap(cx, "ai-add-save");
+    assert!(settings_now(cx).ai.endpoints.is_empty());
+    // Without a scheme or /v1: https and /v1, saved, active, and asking first.
+    type_in(&app, cx, "ai-add-address", "kerno-ai.invalid");
+    app.tap(cx, "ai-add-save");
+    assert_eq!(settings_now(cx).ai.endpoint, "https://kerno-ai.invalid/v1");
+    assert!(app.has(cx, ("ai-remote-warning", 0usize)));
     assert!(
-        crate::ai_view::remote_warning("kerno-ai.invalid")
-            .starts_with("Requests will leave this computer and go to kerno-ai.invalid")
+        crate::ai_settings_view::remote_warning("kerno-ai.invalid", ai::Reach::Internet)
+            .starts_with(
+                "Requests will leave this computer and go to kerno-ai.invalid, on the internet"
+            )
+    );
+    assert!(
+        crate::ai_settings_view::remote_warning("llm.example.lan", ai::Reach::Network)
+            .contains("llm.example.lan, on your network")
     );
     // Not allowed yet: List models and Send refuse before connecting.
-    app.click(cx, "ai-list-models");
+    app.tap(cx, "ai-list-models");
     app.wait_until(cx, "the refusal", |app, cx| app.has(cx, "ai-models-error"));
-    app.press(cx, &["escape"]);
+    app.step(cx, |window, cx| {
+        gpui_kit::component::WindowExt::close_dialog(window, cx)
+    });
     write_sql(&app, cx, "anything");
     app.click(cx, "ai-send");
     let refused = failure(&app, cx).unwrap();
@@ -356,16 +367,28 @@ fn a_remote_endpoint_asks_first_and_plain_http_to_it_is_refused(cx: &mut TestApp
     // Allowed once per endpoint, and forgotten on demand.
     app.press(cx, &["secondary-,"]);
     app.click(cx, ("settings-section", index));
-    app.click(cx, "ai-allow-host");
+    app.tap(cx, ("ai-allow-host", 0usize));
     assert!(
         settings_now(cx)
             .ai
             .confirmed
             .contains("https://kerno-ai.invalid/v1")
     );
-    assert!(!app.has(cx, "ai-remote-warning"));
-    app.click(cx, "ai-forget-host");
+    assert!(!app.has(cx, ("ai-remote-warning", 0usize)));
+    app.tap(cx, ("ai-forget-host", 0usize));
     assert!(settings_now(cx).ai.confirmed.is_empty());
+}
+
+/// Replaces what the input `id` holds with `text`, as typed, scrolled into view first.
+pub(super) fn type_in(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    id: impl Into<gpui_kit::ElementId>,
+    text: &str,
+) {
+    app.tap(cx, id);
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, text);
 }
 
 /// "Explain error" sends the statement and the server's message and offers the fix as a new

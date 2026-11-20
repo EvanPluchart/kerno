@@ -120,21 +120,62 @@ unlinked cannot read any of the old secrets. Files written by earlier versions s
 
 ## AI assistant and what it sends
 
+**What it is for.** Turned on, the assistant does three things, only when you ask: it writes SQL from a
+sentence (inserted in the editor, never run by itself), explains a query or its plan, and explains an error
+with a proposed fix. You find it in the editor's right-click menu (**AI: Write SQL…**, **Explain query**,
+**Explain plan**, **Explain error**), the command palette and Query ▸ AI Assistant, and the **Explain with
+AI…** and **Explain error with AI…** buttons under a plan or an error. It sends the endpoint you choose the
+names of your schemas, tables and columns with their types; rows only when you tick **Include sample rows**
+for that request.
+
 The assistant is off until **Settings → AI ▸ Enable the AI assistant** is ticked. While it is off, no
-request is ever made: its entries (editor menu ▸ **AI: Write SQL…**, **Explain query**, **Explain plan**,
-**Explain error**, the palette, Query ▸ AI Assistant) say "turn on in Settings → AI" and do nothing.
+request is ever made, not even Detect or Test: its entries say "turn on in Settings → AI" and do nothing.
+Import and Add by hand work while it is off: they read only files and what you type.
 
-On, it talks to one OpenAI-compatible endpoint you set (`POST <endpoint>/chat/completions`), and only when
-you click **Send**. Local servers come first: Ollama (`http://localhost:11434/v1`) and LM Studio
-(`http://localhost:1234/v1`). Plain `http://` is accepted only for this computer (`localhost`, `127.0.0.1`,
-`::1`); any other host needs `https://`, and Kerno names it ("Requests will leave this computer and go to
-…") and sends nothing there until you click **Allow requests to …** once for that endpoint. Requests never go
-through a proxy and never follow a redirect. **List models** asks `GET <endpoint>/models`, only when you click
-it. An API key, for the endpoints that want one, is kept in the system's secret store for that endpoint
-only; it is sent as `Authorization: Bearer …` and appears nowhere else (previews and the log show
-`Bearer ***`).
+### Endpoints
 
-What a request holds, and nothing more:
+Settings → AI keeps several named endpoints, any OpenAI-compatible server: one is active, and requests go to
+it alone. **Use** on a row (or the "endpoint · model" picker at the top of the AI panel) switches, in one
+click; each endpoint keeps its own model and its own key. Three ways to add one:
+
+- **Detect on this computer** asks `127.0.0.1` on the usual ports, only when you click: Ollama (11434), LM
+  Studio (1234), llama.cpp (8080), vLLM (8000), LiteLLM (4000) and Jan (1337). It lists what answered with its
+  models ("Ollama · 4 models"); **Add** saves it. Nothing leaves the computer.
+- **Import from omp, pi or the environment** reads `~/.omp/agent/models.yml` (or `models.yaml`),
+  `~/.pi/agent/models.json` and the variables `OPENAI_BASE_URL` / `OPENAI_API_KEY`, and lists the
+  OpenAI-compatible providers it found (`api: openai-completions`) with their address, models and whether they
+  have a key; the others are listed as skipped with the reason. **Import ticked** saves the ones you tick: the
+  address, the models with the names the file gives them ("Qwen · gpu1 · low"), and the key in the system's
+  secret store (never in Kerno's files or logs). A key written as an environment variable's name is read from
+  that variable when you import; if it is not set, or the key comes from a command (`!…`, which Kerno never
+  runs), the endpoint is imported without a key and the page says so: type it in **API key of …**. Kerno
+  started from the Dock or the Finder sees the variables macOS gives it, not those of your shell.
+- **Add by hand**: a name, an address and a key. The address may be written with or without `/v1` and with a
+  trailing slash (`llm.example.lan`, `https://llm.example.lan/v1/`); the form says what Kerno will call
+  (`https://llm.example.lan/v1/models` and `…/chat/completions`).
+
+Plain `http://` is accepted only for this computer (`localhost`, `127.0.0.1`, `::1`); any other host needs
+`https://`, and Kerno names where it is ("Requests will leave this computer and go to llm.example.lan, on your
+network…", "…on the internet" for a public host) and sends nothing there until you click **Allow requests
+to …** once for that endpoint. Requests never go through a proxy and never follow a redirect. Kerno trusts the
+certificates the system trusts (the macOS keychains, the Linux CA bundle), so a company's internal authority
+that the computer trusts is trusted here too, and never less verification than that.
+
+**Test** on a row asks `GET <address>/models` once and says how long it took and how many models it lists,
+or why not, in plain words first and the server's own message under it:
+
+- the host was not found ("Is this computer on the network that serves it, or on its VPN?");
+- the connection was refused on that port, or no answer came in time;
+- the certificate was issued by an authority the computer does not trust (named, with how to trust it);
+- the key was refused (401, 403): check the key saved for it;
+- nothing at that address (404): check the address; if only the list of models is missing, type the model.
+
+### The model
+
+Under the endpoints, the active endpoint's model: type its id, or pick it from the list (filtered by what you
+type, by name or id). **List models** fills the list from the endpoint; an import fills it from the file.
+
+### What a request holds
 
 - the instruction for the action, and your sentence, the statement (the selection or the one at the
   cursor), the plan on screen, or the statement and the server's error message (which may quote a value:
@@ -146,11 +187,14 @@ What a request holds, and nothing more:
   10 tables); the tick is off again at every new request.
 
 **What is sent…** in the panel shows the exact bytes before you send them; Settings → AI ▸ **What was sent**
-lists every request of the session (time, endpoint, body), in memory only. The answer is shown as text:
-nothing in it runs or opens anything. **Insert** puts its SQL in the editor (at the cursor, selected, one undo
-step; a proposed fix goes after your text as a new statement) and you run it yourself, through the usual
-confirmations, read-only and production rules. **Stop** drops an answer you no longer want (the request ends
-on its own within its 60 s timeout).
+lists every request of the session (time, endpoint, body), in memory only. The key goes as `Authorization:
+Bearer …` and nowhere else (previews and the log show `Bearer ***`). The answer is shown as text: nothing in it
+runs or opens anything. Models that think aloud (Qwen, DeepSeek, GLM variants) have their reasoning left out,
+whether it comes in its own field or between `<think>` and `</think>`: the panel, Copy and Insert get the
+answer only. **Insert** puts its SQL in the editor (at the cursor, selected, one undo step; a proposed fix goes
+after your text as a new statement) and you run it yourself, through the usual confirmations, read-only and
+production rules. An answer may take up to 5 minutes (a reasoning model on a server of your network thinks
+before it answers); **Stop** closes the request at once.
 
 ## Vim mode
 

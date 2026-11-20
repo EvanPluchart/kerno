@@ -417,18 +417,29 @@ pub(crate) static ROWS: &[Row] = &[
         section: Section::Ai,
         key: "settings-ai",
         label: "AI assistant",
-        description: "Off until you turn it on: an OpenAI-compatible endpoint you choose (Ollama, \
-             LM Studio) writes or explains SQL, and you see what is sent.",
+        description: "Off until you turn it on: a model you choose writes SQL from a sentence and \
+             explains a query, a plan or an error. Endpoints found on this computer, imported \
+             from omp or pi, or typed; you see what is sent.",
         keywords: &[
             "ai",
             "assistant",
             "llm",
             "ollama",
             "lm studio",
+            "llama.cpp",
+            "vllm",
+            "litellm",
+            "jan",
+            "omp",
             "openai",
             "model",
+            "models",
             "endpoint",
+            "endpoints",
+            "detect",
+            "import",
             "api key",
+            "reasoning",
         ],
     },
     // K20: the owner's request of 2026-11-20.
@@ -727,7 +738,7 @@ pub struct SettingsView {
     null_text: Entity<InputState>,
     local_clients: Entity<LocalClientsView>,
     environments: Entity<EnvironmentsView>,
-    ai: Entity<crate::ai_view::AiSettingsView>,
+    ai: Entity<crate::ai_settings_view::AiSettingsView>,
     shortcuts: Entity<ShortcutsView>,
     _subscriptions: Vec<Subscription>,
 }
@@ -815,7 +826,7 @@ impl SettingsView {
         ];
         let local_clients = cx.new(LocalClientsView::new);
         let environments = cx.new(|cx| EnvironmentsView::new(connections, window, cx));
-        let ai = cx.new(|cx| crate::ai_view::AiSettingsView::new(window, cx));
+        let ai = cx.new(|cx| crate::ai_settings_view::AiSettingsView::new(window, cx));
         let shortcuts = cx.new(|cx| ShortcutsView::new(window, cx));
         Self {
             section: Section::Appearance,

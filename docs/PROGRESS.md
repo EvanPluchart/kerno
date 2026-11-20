@@ -836,3 +836,20 @@ Still open (for the owner):
 - Tests: thirteen integration tests on the four servers, unit tests of every boundary, one UI test; each seen
   failing under a mutation. MySQL 8.4 and MariaDB 11 unchanged. Limits in the "Done:" line of K22
   (`docs/plans/M12.md`) and in `docs/ROADMAP.md`.
+
+## 2026-11-20 — K23: the AI assistant's endpoints
+
+- The owner: "tell me what it is for", then make reaching local and work models simple (models on two DGX
+  Spark machines behind an OpenAI-compatible LiteLLM proxy on the company LAN, declared for omp by a company kit).
+- Settings → AI now opens on what the assistant does, where it is found and what it sends, then the switch;
+  several saved endpoints (one active, Use, or the panel's "endpoint · model" picker), added three ways: Detect
+  on this computer (six local ports, on click), Import from omp, pi or the environment (keys to the secret store,
+  a command key never run), or by hand (with or without `/v1`); Test says the latency and the models, or the
+  failure in plain words; the model is picked from the endpoint's list, filtered as you type, kept per endpoint.
+- The client trusts the system's certificates (an internal authority the computer trusts works), names the
+  issuer of one it refuses, waits 5 minutes for an answer (Stop still at once) and leaves a model's reasoning
+  out of what is shown and inserted. The settings of before become one saved endpoint, with their key; an older
+  Kerno keeps working with the active one (D-095).
+- Tests: ten unit tests in kerno-core (a local TLS server with a test authority for the certificate), eight UI
+  tests in `ui_tests/ai_endpoints.rs`, one rewritten in `ui_tests/ai.rs`, each seen failing under a mutation.
+  Nothing was run against a real LAN endpoint. Captures `m12-ai-endpoints-{light,dark}` to take.

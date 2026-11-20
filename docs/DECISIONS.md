@@ -2467,3 +2467,88 @@ holds: "Next 50 rows");
   renamed alone before 8.0.3 (needs the column's definition in `TableChange::RenameColumn`), and the tools:
   `mysqldump` 8.4 dumps 5.5 to 5.7 as it is but finds no columns in a 5.1 table, so 5.1 needs a 5.x client
   chosen as the local client.
+
+## D-095 — The AI assistant's endpoints: saved, detected, imported; the system's trust; reasoning left out (K23; 2026-11-20)
+
+- **Settings: no schema bump.** The settings stay one JSON value read with `serde(default)` (unknown keys
+  ignored). `AiSettings` keeps `enabled`, `endpoint`, `model`, `confirmed` as they were and gains `endpoints`
+  (name, base, model, the models with the labels a tool gave them), written only when not empty. `endpoint` and
+  `model` are the active endpoint's, kept equal to its entry by the only functions that change them
+  (`activate`, `set_model`, `save_endpoint`, `remove_endpoint`), so every request, `ai::gate` and the panel read
+  what they read before. An endpoint is its base address: one per base, its key the same secret-store entry as
+  before (`ai/<base>`), its confirmation the same `confirmed` entry. `Settings::sanitized` calls
+  `AiSettings::adopt_legacy`: an address not in the list (the settings of before K23, or of an older Kerno since)
+  becomes a saved endpoint under the base `ai::endpoint` gives it (byte for byte what the client used, never the
+  new normaliser's `/v1`, so its key and confirmation are found again), named after its local server
+  ("Ollama on this computer") or its host; an older Kerno's model wins for its endpoint. Removing the active
+  endpoint moves the two fields to the next one or clears them, so nothing brings it back. **An older Kerno** reads `endpoint`, `model` and
+  `confirmed` and works with the active endpoint; it ignores `endpoints`, and drops the list the next time it
+  saves its settings; the active endpoint survives in the two fields and comes back as a saved endpoint.
+- **Trust: the system's roots instead of `webpki-roots`.** ureq 3.5's `RootCerts::Specific` takes full
+  certificates and `webpki-roots` holds trust anchors, so the two cannot be merged. `https://` requests use the
+  certificates `rustls-native-certs` loads (macOS keychains and trust settings, the Linux CA bundle), read once
+  per run at the first `https://` request; `RootCerts::WebPki` only when the system gives none. The macOS
+  system roots are a superset of the public authorities, and an internal authority the computer was told to
+  trust is trusted: never less verification than the system's, no "accept invalid certificates". No new crate
+  (`rustls-native-certs` is the drivers'), no `platform-verifier` (it would add `rustls-platform-verifier`).
+  `cargo deny check` clean.
+- **A refused certificate names its issuer.** On `UnknownIssuer` (ureq gives the rustls error inside an I/O
+  error), `ai/tls.rs` makes one more TLS handshake to the same host and port, after the same gate, with a
+  verifier that notes the server certificate's issuer (`x509-cert`, already in the tree through
+  `tokio-postgres-rustls`) and refuses it: the handshake fails, nothing but the TLS greeting is sent, no key,
+  5 s at most. It is the one connection besides `ai::send`. The message: "The certificate of {host} was issued
+  by “{issuer}”, which this computer does not trust. Kerno trusts the certificates the system trusts: add that
+  authority to the system's trust store (Keychain Access on macOS), then test again."
+- **omp's YAML: `serde-saphyr` 1.3** (MIT OR Apache-2.0, maintained, `#![forbid(unsafe_code)]`), already in
+  `Cargo.lock` with the same default features through gpui-component's i18n macro; now also linked into the app.
+  No `unsafe-libyaml`, and not `serde_yaml` (deprecated) or a hand parser (the file is the company kit's: flow
+  sequences, quotes, comments). It parses into `serde_json::Value`, so omp's YAML and pi's JSON share one reader.
+  The format, from both tools' docs: `providers.<id>.{name, baseUrl, apiKey, api, models[].{id, name, api}}`;
+  only `api: openai-completions` is taken (a model with another `api` too is left out), anything else is a note
+  with its reason; unknown keys are ignored; a file that cannot be parsed is a note, not a stop. omp reads
+  `models.yml`, then `models.yaml`. Keys: `!command` is never run (imported without a key, said); `$NAME` and
+  `${NAME}` (pi, `$$` a literal `$`) and an exact variable name (omp, and older pi) are read from the
+  environment at import; a value shaped like a variable name whose variable is unset is said, not taken as the
+  key (omp would send the name itself). `OPENAI_BASE_URL` / `OPENAI_API_KEY` are one more candidate (an
+  `OPENAI_API_KEY` alone means `https://api.openai.com/v1`). A GUI app started from the Finder does not see the
+  shell's variables: said in GUIDE by naming the variables, not worked around.
+- **Where Import and Detect look** is a global, `ai_settings_view::AiSources`, that `main` sets to `HOME`, the process's
+  environment and the default ports; without it (every UI test) it is no home, an empty environment and no
+  port, so a test that forgets it reads no file of the developer and asks no local server. The core functions
+  take the home, the environment and the ports as parameters.
+- **Detect** asks `GET http://127.0.0.1:<port>/v1/models` on Ollama 11434, LM Studio 1234, llama.cpp 8080, vLLM
+  8000, LiteLLM 4000, Jan 1337 (each tool's default), in parallel (scoped threads), 1.5 s each, through
+  `ai::send` with built loopback addresses only: loopback by construction, never at start, never without the
+  click. A port that answers with a model list, or 401/403 (a LiteLLM proxy that wants its key: "needs a key"),
+  is listed; a refused port, a 404 or a body that is not a model list (another program on 8080) is not.
+- **The switch covers everything that connects.** Detect and Test are refused while the assistant is off (the
+  page's "Off, no request is ever made" stays true); Import and Add by hand work while off: they read files and
+  what is typed.
+- **Test is `GET /models` only**, timed: no tiny chat completion, since a reasoning model takes long to answer
+  even "hi", and a chat body would have to appear in "What was sent". Its result fills the endpoint's model list.
+  Its failures and every request's say the plain words first, then ureq's message: host not found ("Is this
+  computer on the network that serves it, or on its VPN?"), refused on port N, no answer within the timeout
+  (named), the certificate, 401/403 ("check the API key saved for it"), 404 ("check the address (most servers end
+  in /v1). If only the model list is missing, type the model's name.").
+- **Where an endpoint is** (`endpoints::reach`) decides only the warning's words, both cases asking first: "on
+  your network" for 10/8, 172.16/12, 192.168/16, 100.64/10 (VPNs such as Tailscale), 169.254/16, fc00::/7,
+  fe80::/10, a single-label name, a name under `home.arpa`, or a name with a label `lan`, `local`, `internal`,
+  `intranet` or `localdomain` anywhere (a company proxy is often `host.lan.company.tld`); "on the internet"
+  otherwise. No DNS lookup to decide.
+- **Reasoning is dropped, not folded.** A separate `reasoning_content` / `reasoning` field was never read and
+  still is not; `ai::answer_text` takes `<think>…</think>` out of the content, the text up to a lone `</think>`
+  (a template that wrote the opening tag: Qwen3, DeepSeek-R1), and what follows a `<think>` never closed (cut
+  short); the panel, Copy and Insert get the answer only, and SQL inside the reasoning can never be inserted. An
+  answer that is only reasoning says "the model gave its reasoning but no answer (it may have run out of tokens)".
+  `ponytail:` no "show the reasoning" fold; add one if a user asks to read it.
+- **Timeouts**: a chat request 5 minutes (`CHAT_TIMEOUT`, was 60 s: the answer is not streamed, and a reasoning
+  model on a LAN server thinks for minutes before its first token); List models and Test 15 s; Detect 1.5 s a
+  port. Stop still closes the connection at once (K15's `Stopper`), whatever the timeout.
+- **UI.** Settings → AI in four parts: what it is for (`ai_settings_view::PURPOSE`) and the switch; the endpoints (Use or
+  Active, name · model, address · where, Test, Remove, the question before another host per row), the key of
+  the active one, Detect / Import / Add by hand and which files and ports they read; the model (typed, or picked
+  from the endpoint's list filtered by what is typed, by label or id, remembered per endpoint); What was sent.
+  The panel opens with an "endpoint · model" picker (the kit's dropdown menu: endpoints, then the active one's
+  models), disabled while a request is on its way; the panel reads the new endpoint's key flag when the active
+  endpoint changes. The off notice of the "AI: …" commands says what turning it on gives (the panel never opens
+  while off). The keymap footer of Settings is K20's and on every page: left alone.
