@@ -3320,9 +3320,15 @@ impl Workspace {
     /// the active tab, else on the default one of the connection the tree
     /// shows.
     fn tool_command(&mut self, entry: ToolEntry, window: &mut Window, cx: &mut Context<Self>) {
+        // The tab's database, not its schema: a backup from here is of the
+        // whole database (only a schema of the tree backs that schema up).
         let target = self
             .active_open()
             .and_then(|tab| tab.target(cx))
+            .map(|target| Target {
+                schema: None,
+                ..target
+            })
             .or_else(|| self.default_target(cx));
         match target {
             Some(target) => self.run_tool(target, entry, Vec::new(), window, cx),

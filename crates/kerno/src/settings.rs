@@ -79,6 +79,9 @@ pub struct Settings {
     /// The client each engine family uses unless a connection names its
     /// own; the newest found when absent.
     pub default_clients: BTreeMap<ClientFamily, PathBuf>,
+    /// The folder the last backup of a database was written to: the next
+    /// one is proposed there (K26).
+    pub backup_folder: Option<PathBuf>,
     /// Text size of the interface, in points.
     pub ui_font_size: f32,
     /// Text size of the SQL editors.
@@ -202,6 +205,7 @@ impl Default for Settings {
             tool_paths: BTreeMap::new(),
             client_folders: Vec::new(),
             default_clients: BTreeMap::new(),
+            backup_folder: None,
             ui_font_size: 13.0,
             editor_font_size: 12.5,
             grid_font_size: 11.5,
@@ -350,6 +354,7 @@ mod tests {
             tool_paths: BTreeMap::new(),
             client_folders: vec![PathBuf::from("/opt/pg/bin")],
             default_clients: [(ClientFamily::Postgres, PathBuf::from("/opt/pg/bin"))].into(),
+            backup_folder: Some(PathBuf::from("/Users/me/backups")),
             ui_font_size: 15.0,
             editor_font_size: 14.0,
             grid_font_size: 13.0,

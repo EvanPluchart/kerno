@@ -956,3 +956,26 @@ Still open (for the owner):
   tests whose generated keys a worktree lacks.
 - Still to do: the final captures (`m12-settings-*`), the owner's look at the cards' size and at the short
   pages (Updates, Confirmations) under their panels.
+
+## 2026-11-20 — K26: a simple backup and restore by default (the owner's request)
+
+- The owner found the backup wizard had too many things ("a simplified mode by default, and an 'advanced
+  settings' mode for the version we have now"). A database's Back up… and Restore… now open one screen over the
+  wizard's own state (`backup_dialog/simple.rs`): what is backed up in one sentence with its schemas, tables and
+  views counted, the file (the last backup's folder, else home; the wizard's name pattern; the save panel),
+  PostgreSQL's two formats as option cards (compressed archive by default, plain SQL script), MySQL's defaults
+  said in one line, the client small with "Local client…", "Show command"; a restore's file, its database and
+  what a restore does to it. "Advanced settings…" is the wizard on the same file and format; "Simple view" goes
+  back, asking first when a hidden option would be reset. Tools ▸ on a schema or a table, tasks, the global backup
+  and Execute script stay in the wizard; the toolbar's Tools ▸ backs up the tab's database, not its schema. Enter
+  backs up, never restores. The page's height follows the window in both views (the wizard's footer was cut at
+  600 px). D-099.
+- Seen while working: both views and the way back's question in both themes at 1200 × 800 and 900 × 600,
+  rendered offscreen by a temporary headless test (not committed) on the test server with a stand-in client.
+  Fixed from the captures: the client's long folder on the same line as its name (now a small line under it), a
+  bare "Show command" that did not read as a disclosure (a chevron).
+- Tests: `ui_tests/backup_simple.rs` (six, each seen failing under its mutation); the wizard's own tests open it
+  through `show_advanced`. The tool modules, Settings, the toolbar, the tasks and the whole `cargo test -p kerno`
+  pass; clippy and fmt clean.
+- Still to do: the final captures (`m12-backup-simple-*`, `m12-restore-simple-*`), the owner's look at the format
+  cards' size and the wording of the MySQL line.

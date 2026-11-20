@@ -21,6 +21,10 @@
 //! confirmed first, twice on production, and refused on a read-only
 //! connection. The settings of each wizard are `kerno_core::tools`' own
 //! serialisable structs, which saved tasks keep.
+//!
+//! A backup or a restore of a database opens first in its simple view
+//! (`backup_dialog/simple.rs`, K26): one screen on the same state, whose
+//! "Advanced settings…" is the wizard.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::Range;
@@ -68,6 +72,8 @@ use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
 use crate::theme;
+
+mod simple;
 
 /// Which wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +139,15 @@ impl Page {
             (Self::Progress, _) => "Progress",
         }
     }
+}
+
+/// Which face of the dialog shows (K26, D-099): a backup or a restore of a
+/// run opens on one simple screen; the wizard is its "Advanced settings…".
+/// Both are drawn from the same state and build the same command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Simple,
+    Advanced,
 }
 
 /// The client in use.
@@ -211,6 +226,9 @@ fn is_view(kind: &RelationKind) -> bool {
 
 pub struct BackupDialog {
     mode: Mode,
+    view: View,
+    /// The simple view's "Show command" is open.
+    show_command: bool,
     connections: Entity<Connections>,
     connection: String,
     /// The connection's name, as the confirmation shows it.
@@ -370,10 +388,16 @@ pub fn open(
     window.open_dialog(cx, move |dialog, _, _| {
         let view = shown.clone();
         let asked = shown.clone();
+        let entered = shown.clone();
         dialog
             .title(SharedString::from(title.clone()))
             .w(px(860.))
-            .on_ok(|_, _, _| false)
+            // Enter starts a simple backup only: never a restore, never the
+            // wizard's Start.
+            .on_ok(move |_, window, cx| {
+                entered.update(cx, |this, cx| this.enter(window, cx));
+                false
+            })
             // Closing while a tool runs asks first.
             .on_cancel(move |_, window, cx| asked.update(cx, |this, cx| this.may_close(window, cx)))
             .content(move |content, _, _| content.child(view.clone()))
@@ -426,6 +450,12 @@ impl BackupDialog {
             Mode::GlobalBackup => global.file_pattern.clone(),
             _ => tools::DEFAULT_FILE_PATTERN.to_string(),
         };
+        // A backup goes where the last one went (K26), else home.
+        let last = AppState::get(cx)
+            .settings
+            .backup_folder
+            .clone()
+            .filter(|folder| mode == Mode::Backup && folder.is_absolute());
         let mut input = |value: String, placeholder: &'static str| {
             cx.new(|cx| {
                 InputState::new(window, cx)
@@ -433,7 +463,7 @@ impl BackupDialog {
                     .default_value(value)
             })
         };
-        let folder = input(home.display().to_string(), "Folder");
+        let folder = input(last.unwrap_or(home).display().to_string(), "Folder");
         let pattern = input(pattern_default, "${database}-${timestamp}");
         let extra = input(String::new(), "--name=value …");
         let compression = input(String::new(), "default");
@@ -483,6 +513,11 @@ impl BackupDialog {
         );
         let mut dialog = Self {
             mode,
+            view: match mode {
+                Mode::Backup | Mode::Restore => View::Simple,
+                Mode::GlobalBackup | Mode::ExecuteScript => View::Advanced,
+            },
+            show_command: false,
             connections: connections.clone(),
             connection,
             name: config.name.clone(),
@@ -861,6 +896,9 @@ impl BackupDialog {
     /// Backup: only `tables`, as DBeaver's Tools ▸ Backup on selected
     /// tables; an empty list is the whole database again.
     pub fn only_tables(&mut self, tables: Vec<TableRef>, cx: &mut Context<Self>) {
+        if !tables.is_empty() {
+            self.view = View::Advanced;
+        }
         self.selection.complete = tables.is_empty();
         self.selection.schemas = tables.iter().map(|table| table.schema.clone()).collect();
         if let Some(first) = tables.first() {
@@ -874,6 +912,9 @@ impl BackupDialog {
     /// Backup: these schemas ticked whole (DBeaver's backup of a schema);
     /// an empty list is the whole database again.
     pub fn only_schemas(&mut self, schemas: Vec<String>, cx: &mut Context<Self>) {
+        if !schemas.is_empty() {
+            self.view = View::Advanced;
+        }
         self.selection.complete = schemas.is_empty();
         self.selection.schemas = schemas.iter().cloned().collect();
         self.selection.tables.clear();
@@ -907,6 +948,10 @@ impl BackupDialog {
         changed: impl Fn(&mut App) + 'static,
         cx: &mut Context<Self>,
     ) {
+        // A task carries its settings: the wizard shows them all.
+        if purpose != Purpose::Run {
+            self.view = View::Advanced;
+        }
         self.purpose = purpose;
         self.on_tasks_changed = Some(Rc::new(changed));
         cx.notify();
@@ -919,6 +964,7 @@ impl BackupDialog {
         fn set(input: &Entity<InputState>, value: String, window: &mut Window, cx: &mut App) {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
+        self.view = View::Advanced;
         let folder = |path: &Path| path.display().to_string();
         let (extra, auth_user) = match &settings {
             TaskSettings::Backup(o) => (o.extra_args.clone(), o.auth_user.clone()),
@@ -1942,6 +1988,12 @@ impl BackupDialog {
         };
         self.step = match ended.outcome {
             Ok(status) if status.success() => {
+                if self.mode == Mode::Backup
+                    && let Some(folder) = self.output.as_deref().and_then(Path::parent)
+                {
+                    let folder = folder.to_path_buf();
+                    AppState::update_settings(cx, |settings| settings.backup_folder = Some(folder));
+                }
                 let text = if writes_file {
                     format!(
                         "{program} finished ({}). Backed up {} to {}{}.",
@@ -2753,9 +2805,11 @@ impl BackupDialog {
         Some(format!("{format}{from}"))
     }
 
-    /// The client in use, its version, and why it may not suit.
-    fn render_tool(&self, cx: &Context<Self>) -> AnyElement {
+    /// The client in use, its version, and why it may not suit; `compact`
+    /// (the simple view): its folder on a small line of its own.
+    fn render_tool(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let mut folder = None;
         let text = match &self.tool_state {
             ToolState::Probing => "Looking for the local clients…".to_string(),
             ToolState::Missing(text) => text.clone(),
@@ -2767,6 +2821,10 @@ impl BackupDialog {
                     "{}. Choose the file first: its format says which tool restores it.",
                     install.label()
                 )
+            }
+            ToolState::Ready { path, install, .. } if compact => {
+                folder = Some(path.display().to_string());
+                install.label()
             }
             ToolState::Ready { path, install, .. } => {
                 format!("{} · {}", install.label(), path.display())
@@ -2786,6 +2844,7 @@ impl BackupDialog {
                     .aria_label(SharedString::from(text.clone()))
                     .child(SharedString::from(text)),
             )
+            .when_some(folder, |this, folder| this.child(Self::muted(folder, cx)))
             .when_some(warning, |this, warning| {
                 this.child(
                     div()
@@ -2793,7 +2852,8 @@ impl BackupDialog {
                         .test_support()
                         .text_xs()
                         .text_color(if blocks { theme.danger } else { theme.warning })
-                        .child(SharedString::from(warning)),
+                        .child(SharedString::from(warning.clone()))
+                        .test_text(warning),
                 )
             })
             .into_any_element()
@@ -3932,7 +3992,8 @@ impl BackupDialog {
                     div()
                         .id("backup-command-text")
                         .test_support()
-                        .child(SharedString::from(command)),
+                        .child(SharedString::from(command.clone()))
+                        .test_text(command),
                 ),
                 Err(reason) => this
                     .text_color(theme.muted_foreground)
@@ -4025,7 +4086,7 @@ impl BackupDialog {
                 _ => self.render_objects(cx),
             }),
             Page::Settings => {
-                body.push(Self::field("Client", self.render_tool(cx), cx));
+                body.push(Self::field("Client", self.render_tool(false, cx), cx));
                 body.extend(match self.mode {
                     Mode::Backup => self.render_backup_settings(cx),
                     Mode::GlobalBackup => self.render_global_settings(cx),
@@ -4172,6 +4233,16 @@ impl BackupDialog {
                         cx.notify();
                     })),
             )
+            .when(self.simple_offered(), |this| {
+                this.child(
+                    Button::new("wizard-simple")
+                        .ghost()
+                        .label("Simple view")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.back_to_simple(window, cx)),
+                        ),
+                )
+            })
             .child(div().flex_1())
             .child(close("Cancel"))
             .child(
@@ -4230,8 +4301,17 @@ impl BackupDialog {
     }
 }
 
+/// What the dialog draws around its page (its title, the intro, the
+/// footer, paddings and the kit's margins), with room to spare: a short
+/// window shortens the page, which scrolls, and never cuts the buttons.
+const DIALOG_CHROME: f32 = 230.;
+
 impl Render for BackupDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page_height = (window.viewport_size().height - px(DIALOG_CHROME))
+            .min(px(520.))
+            .max(px(160.));
+        let simple = self.view == View::Simple;
         let intro = match self.mode {
             Mode::Backup => format!(
                 "Back up the database “{}” of “{}” with the engine's dump tool, run on this \
@@ -4269,7 +4349,7 @@ impl Render for BackupDialog {
                 h_flex()
                     .gap_3()
                     .items_start()
-                    .child(self.render_steps(cx))
+                    .when(!simple, |this| this.child(self.render_steps(cx)))
                     .child(
                         div()
                             .id("wizard-page")
@@ -4284,17 +4364,25 @@ impl Render for BackupDialog {
                                 v_flex()
                                     .id("wizard-page-scroll")
                                     .gap_3()
-                                    .max_h(px(520.))
+                                    .max_h(page_height)
                                     .children(
-                                        self.render_page(cx)
-                                            .into_iter()
-                                            .map(|part| div().flex_none().child(part)),
+                                        if simple && self.simple_page_shown() {
+                                            self.render_simple(cx)
+                                        } else {
+                                            self.render_page(cx)
+                                        }
+                                        .into_iter()
+                                        .map(|part| div().flex_none().child(part)),
                                     )
                                     .overflow_y_scrollbar(),
                             ),
                     ),
             )
-            .child(self.render_footer(cx))
+            .child(if simple && matches!(self.step, Step::Options) {
+                self.render_simple_footer(cx)
+            } else {
+                self.render_footer(cx)
+            })
     }
 }
 

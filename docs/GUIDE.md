@@ -19,6 +19,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Rows by pages](#rows-by-pages)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
+- [Backup and restore](#backup-and-restore)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
@@ -342,6 +343,35 @@ tabs of the group only; "All open tabs" (the arrow at the end of each row) lists
 whose last tab closes goes, and its neighbour takes its space. Kerno shows four groups at most (a 2 × 2 grid):
 past that, Split says so and a dragged tab can only join a group. The groups, their sizes and which tab is where
 come back at the next start.
+
+## Backup and restore
+
+Kerno backs up and restores with the engine's own tools, run on this computer: `pg_dump`, `pg_restore` and
+`psql` for PostgreSQL, `mysqldump` and `mysql` for MySQL and MariaDB. The client used is the newest one found
+that is not older than the server (Settings ▸ Local clients lists them; a connection can name its own).
+
+**Back up…** on a database (the tree, Tools ▸, the main toolbar, the palette) opens one screen: what is backed
+up (the whole database, with its schemas and tables counted), the file it writes, the format and the client.
+The file is proposed in the folder of the last backup (else your home folder) as `<database>-<date and
+time>`; **Choose…** opens the save panel. PostgreSQL offers two formats: the **compressed archive** (pg_dump's
+custom format, the default, which pg_restore restores whole or only some of its tables) or a **plain SQL
+script**. MySQL and MariaDB write a SQL script, read in one consistent snapshot, with the procedures, functions
+and triggers. **Show command** shows the exact command (the password never: it goes to the tool through its
+environment). **Back up** (or Enter) runs it; the progress shows the tool's output, the time, Cancel, and Show
+in Finder at the end.
+
+**Restore…** opens the same kind of screen: the file (Choose… or a typed path; its format is read from the file
+and says which tool restores it), the database it goes into, what a restore does to it, the client.
+**Restore…** shows the command and asks first, twice on a production connection; a read-only connection has
+no restore. Enter never starts a restore. A SQL file that holds client commands (`\!`, `\connect`, `system`…)
+is refused; it can be allowed in the advanced settings, for a file you trust.
+
+**Advanced settings…** opens the full wizard on what the screen holds (the file, the format, the client): the
+objects to back up (schemas and tables), every option of the tool, the file name pattern with its variables,
+extra arguments, another user, **Save as task…**. **Simple view** goes back; when an option the simple screen
+does not show was changed, it says which and asks before putting them back to their defaults. Tools ▸ Back up…
+on a schema or a table, a new task and a saved task open in the wizard; the global backup (`pg_dumpall`) and
+Execute script are wizards only.
 
 ## Where Kerno keeps its data
 

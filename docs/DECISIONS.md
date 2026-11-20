@@ -2655,3 +2655,48 @@ buttons. Choices:
 - Left as they were: the chips of the tab width and the formatter (a segmented choice whose effect the sample
   shows), the Shortcuts and Local clients views inside their pages, the AI page's logic. Short pages (Updates,
   Confirmations) end above white space beside a full side list; nothing was invented to fill them.
+
+## D-099 — A backup or a restore opens simple; the wizard is "Advanced settings…" (K26; the owner, 2026-11-20)
+
+The owner found the backup wizard had too many things: a simple mode by default, the present wizard as
+"Advanced settings". Choices:
+
+- **One dialog, two views over one state.** `BackupDialog::view` (`Simple` / `Advanced`); the simple view
+  (`backup_dialog/simple.rs`) only sets fields the wizard has (the folder, the file name pattern, the format)
+  and runs through the same `command`, `output_path`, `start`, `confirm_restore` and progress page. What it
+  shows and runs is what the wizard would with the same choices: no second copy of the logic.
+- **The defaults are the wizard's, unchanged** (`BackupOptions::new`, `RestoreOptions::new`). PostgreSQL: the
+  custom archive (DBeaver's default; compressed; pg_restore restores all of it or only some tables), with the
+  plain SQL script as the one alternative; Directory and Tar stay in the wizard. MySQL and MariaDB: a SQL
+  script only, so no format choice, with the options already on (single transaction, procedures and functions,
+  triggers; binary columns in hexadecimal, extended inserts); events stay off, as they always were. The view
+  describes the options from the options themselves, so it never says something is done that is not. A
+  restore: PostgreSQL in one transaction, nothing dropped first; MySQL and MariaDB statement by statement.
+- **The file**: one path, the folder joined to the pattern (`${database}-${timestamp}`) and the format's
+  extension, the same name in both views. "Choose…" is the native save panel: its folder becomes the folder
+  and its name the pattern; a name ending in `.sql` or `.dump` chooses that format, the extension left to the
+  format (another format later does not write `name.dump.sql`). The folder of the last backup that succeeded
+  is kept (`Settings::backup_folder`) and proposed by both views next time, else the home folder as before.
+- **What opens where.** A database's Back up… and Restore… (the tree, Tools ▸ on a database or on the
+  connection, the main toolbar, the palette, the menu bar) open simple. Whatever carries explicit settings opens
+  the wizard: Tools ▸ Back up… on a table or a schema, Create new task…, a saved task's Run and Edit; the
+  global backup and Execute script have no simple view. The switch happens inside the dialog's state, one way
+  (`only_tables` / `only_schemas` with objects, `set_purpose` other than a run, `apply`), so no caller changed
+  and a later caller with settings cannot land in the simple view. The main toolbar's and the menu bar's Tools ▸
+  now take the active tab's database without its schema: a tab's search-path schema is not a choice of what to
+  back up (before, a tab on `public` backed up `public` alone).
+- **The way back from the wizard** ("Simple view", offered for the backup or restore of a run only): at once
+  when nothing the simple view hides differs from its defaults; otherwise a dialog names what differs (the
+  objects ticked, a format it does not offer, the content, the dump tool's options, compression, encoding or
+  jobs, the restore options, the client commands allowed, the extra arguments, another user) and offers "Reset
+  and go back" or "Keep the advanced settings". One function lists the differences; the reset puts each back.
+  The folder, the file name, an offered format, the file to restore and the client stay.
+- **Nothing weaker.** The same `open` refuses a read-only connection and a route the tools cannot take; a
+  restore goes through `confirm_restore` (its command shown, twice on production); the simple restore says what
+  it does to the database before anything runs; a file's client commands are refused in the simple view, the
+  opt-in left to the wizard's Client commands step; the client's warning and "Local client…" are in the simple
+  view. Enter (the dialog's Confirm) starts a simple backup that can run, never a restore nor the wizard's
+  Start. The page's height follows the window (the window less 230 px, up to 520 px) in both views: at 600 px
+  the wizard's footer had been cut.
+- The macOS save panel asks before replacing a file and Kerno's "Replace …" asks again, with the command:
+  kept, one question too many rather than none on Linux panels that do not ask.

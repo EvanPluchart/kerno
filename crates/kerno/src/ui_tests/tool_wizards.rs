@@ -47,8 +47,23 @@ pub(super) fn fake_client(
 }
 
 impl Fixture {
-    /// Opens the backup of `database`, or the restore of a file into it.
+    /// Opens the backup of `database`, or the restore of a file into it, in
+    /// its wizard: "Advanced settings…" of the simple view (K26).
     pub(super) fn backup_dialog(
+        &self,
+        cx: &mut TestAppContext,
+        database: &str,
+        restore: bool,
+    ) -> Option<Entity<BackupDialog>> {
+        let dialog = self.simple_dialog(cx, database, restore)?;
+        cx.update(|cx| dialog.update(cx, |dialog, cx| dialog.show_advanced(cx)));
+        cx.run_until_parked();
+        Some(dialog)
+    }
+
+    /// Opens the backup of `database`, or the restore of a file into it,
+    /// as the tree and the palette do: in its simple view.
+    pub(super) fn simple_dialog(
         &self,
         cx: &mut TestAppContext,
         database: &str,
@@ -228,7 +243,11 @@ fn a_backup_tool_is_found_or_chosen_and_its_output_streams(cx: &mut TestAppConte
         app.tree(cx).contains(&row(0, "kerno_other"))
     });
     app.act(cx, Action::Backup, &["kerno_other"]);
-    assert!(app.has(cx, "backup-dialog") && app.has(cx, ("wizard-step", 0usize)));
+    // A database's backup opens in its simple view (K26).
+    assert!(app.has(cx, "backup-dialog") && !app.has(cx, ("wizard-step", 0usize)));
+    app.wait_until(cx, "the simple view", |app, cx| {
+        app.has(cx, "backup-simple")
+    });
     app.tap(cx, "backup-close");
     assert!(!app.has(cx, "backup-dialog"));
 

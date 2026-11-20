@@ -953,11 +953,16 @@ fn tools_menu(workspace: &Entity<Workspace>, mut menu: PopupMenu, cx: &mut App) 
         connected,
         saved.config.read_only,
     );
-    // The active tab's database when it is on this connection.
+    // The active tab's database when it is on this connection; not its
+    // schema: a backup from here is of the whole database (K26).
     let target = this
         .active_open()
         .and_then(|tab| tab.target(cx))
         .filter(|target| target.connection == id)
+        .map(|target| Target {
+            schema: None,
+            ..target
+        })
         .unwrap_or_else(|| connection_target(&id));
     for (index, group) in groups.into_iter().enumerate() {
         if index > 0 {

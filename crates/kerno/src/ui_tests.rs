@@ -41,6 +41,7 @@ use crate::{actions, bridge};
 mod ai;
 mod ai_endpoints;
 mod alter_form;
+mod backup_simple;
 mod brackets;
 mod connection_feedback;
 mod coverage;
