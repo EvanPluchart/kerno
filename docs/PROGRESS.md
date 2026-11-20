@@ -853,3 +853,24 @@ Still open (for the owner):
 - Tests: ten unit tests in kerno-core (a local TLS server with a test authority for the certificate), eight UI
   tests in `ui_tests/ai_endpoints.rs`, one rewritten in `ui_tests/ai.rs`, each seen failing under a mutation.
   Nothing was run against a real LAN endpoint. Captures `m12-ai-endpoints-{light,dark}` to take.
+
+## 2026-11-20 — The owner's test of the build and a first real-app pass
+
+- The owner's test: "Fill" on an empty URL field takes the clipboard's URL (`278e0a3`); a table's toolbar drew
+  over the group beside it in a narrow split: the toolbars of the table, structure, administration and diagram
+  tabs wrap, and a group cuts what is drawn wider than itself (`66974a6`).
+- A real-app pass through the release checklist (an agent driving its own instance on a scratch data directory,
+  in the background): 26 of 86 points passed before macOS's Stage Manager and then the screen lock stopped it;
+  the rest is still to run. What it found, fixed here: the value panel kept its remembered width in a narrow
+  group and was drawn past the group's edge (`ValuePanel::fit`: it takes what the grid leaves and its own width
+  again when there is room, without forgetting the user's width;
+  `ui_tests::split::the_value_panel_stays_inside_a_narrow_group`); a list an old server does not have (the locks
+  on MySQL 5.1) was shown as a failure that blamed the account's privileges, two sentences run together: it is
+  said as missing, with the server's name (`PaneState::Missing`;
+  `ui_tests::legacy::a_list_an_old_server_does_not_have_is_said_as_missing`); four sentences carried a run of
+  spaces from a broken line continuation since M6 (the result's Apply dialog: "or none            does.", the
+  read-only and no-secret-store notices); Run and its menu stay together when a query tab's toolbar wraps.
+- Found and left: a notification covers the tab's toolbar while it shows; Cmd+T on a saved connection that is
+  not connected opens a tab without a connection; the window's size is not restored after a restart; with a
+  very long data directory the instance socket's path is too long and `kerno <url>` does not reach the running
+  instance (a warning in the log).

@@ -592,6 +592,41 @@ fn k19_table(name: &str) -> Scratch {
     )
 }
 
+/// The real-app pass of 2026-11-20: beside a table in a narrow group, the value panel kept its
+/// remembered width and was drawn past the group's edge ("Set" half visible, "Open the row" out
+/// of reach). It takes the width the grid leaves, and its own width again once there is room,
+/// without forgetting the width the user gave it. Fails without `ValuePanel::fit`.
+#[gpui_kit::test]
+fn the_value_panel_stays_inside_a_narrow_group(cx: &mut TestAppContext) {
+    use gpui_kit::size;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    cx.simulate_window_resize(app.window.into(), size(px(1400.), px(800.)));
+    app.open_table(cx, "shop", "orders", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1")
+    });
+    app.press(cx, &["f7"]);
+    app.wait_until(cx, "the value panel", |app, cx| app.has(cx, "value-panel"));
+    let wide = bounds(&app, cx, "value-panel").size.width;
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let left = groups(&app, cx)[0];
+    app.wait_until(cx, "the panel inside its group", |app, cx| {
+        let (group, panel) = (
+            bounds(app, cx, ("tab-group", left)),
+            bounds(app, cx, "value-panel"),
+        );
+        panel.right() <= group.right() + px(1.) && panel.size.width >= px(240.)
+    });
+    assert!(bounds(&app, cx, "value-panel").size.width < wide);
+    // The width the user chose is not replaced by the narrow one.
+    let remembered = cx.update(|cx| AppState::get(cx).settings.value_panel_width);
+    assert_eq!(px(remembered), wide);
+}
+
 /// The owner's test of the build (2026-11-20): a table's toolbar in a narrow group drew over the
 /// group beside it ("Set NULL", "Structure", "Export" on top of the other tab's connection
 /// picker). It wraps inside its own group, as a query tab's does. Fails without `flex_wrap` on

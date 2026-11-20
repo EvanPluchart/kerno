@@ -258,6 +258,12 @@ pub struct ValuePanel {
     why: Option<SharedString>,
     /// Not drawn: the window is too narrow.
     collapsed: bool,
+    /// The panel was made narrower than its remembered width to stay inside
+    /// its area ([`Self::fit`]); it grows back when there is room.
+    fitted: bool,
+    /// The width `fit` asked for, until the split says it is done: that
+    /// resize is not the user's and is not remembered.
+    fit_to: Option<f32>,
     formatting: Option<Task<()>>,
     /// The row the cell's foreign key points to (K18).
     preview: fk_preview::Preview,
@@ -284,11 +290,20 @@ impl ValuePanel {
                     }
                 },
             ),
-            // The width is kept once a drag ends.
-            cx.subscribe(&split, |_, split, _: &ResizablePanelEvent, cx| {
+            // The width is kept once a drag ends; not the width `fit` gave
+            // the panel to keep it inside a narrow area.
+            cx.subscribe(&split, |this, split, _: &ResizablePanelEvent, cx| {
                 if let Some(width) = split.read(cx).sizes().get(1) {
-                    let width = f32::from(*width)
-                        .clamp(*VALUE_PANEL_WIDTHS.start(), *VALUE_PANEL_WIDTHS.end());
+                    let width = f32::from(*width);
+                    if this
+                        .fit_to
+                        .take()
+                        .is_some_and(|fit| (fit - width).abs() < 1.)
+                    {
+                        return;
+                    }
+                    this.fitted = false;
+                    let width = width.clamp(*VALUE_PANEL_WIDTHS.start(), *VALUE_PANEL_WIDTHS.end());
                     AppState::update_settings(cx, |settings| settings.value_panel_width = width);
                 }
             }),
@@ -305,6 +320,8 @@ impl ValuePanel {
             problem: None,
             why: None,
             collapsed: false,
+            fitted: false,
+            fit_to: None,
             formatting: None,
             preview: fk_preview::Preview::default(),
             _follow: None,
@@ -483,6 +500,47 @@ impl ValuePanel {
             editor.set_value(text, window, cx);
         });
         cx.notify();
+    }
+
+    /// Keeps the panel inside its area: where the grid's minimum leaves
+    /// less than the remembered width (a group of a split, a small window),
+    /// the panel takes what is left, and its remembered width again once
+    /// there is room. The kit keeps a fixed panel's width whatever the
+    /// container, so without this the panel is drawn past the area's edge.
+    fn fit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (container, current) = {
+            let split = self.split.read(cx);
+            (
+                f32::from(split.container_size()),
+                split.sizes().get(1).copied().map(f32::from),
+            )
+        };
+        let Some(current) = current else {
+            return;
+        };
+        let room = container - f32::from(GRID_MIN);
+        if container <= 0. || room < *VALUE_PANEL_WIDTHS.start() {
+            return;
+        }
+        let wanted = AppState::get(cx).settings.value_panel_width;
+        let target = if current > room {
+            room
+        } else if self.fitted {
+            wanted.min(room)
+        } else {
+            return;
+        };
+        self.fitted = target < wanted;
+        if (target - current).abs() < 1. || self.fit_to.is_some() {
+            return;
+        }
+        self.fit_to = Some(target);
+        let split = self.split.clone();
+        window.defer(cx, move |window, cx| {
+            split.update(cx, |state, cx| {
+                state.resize_panel(1, px(target), window, cx)
+            });
+        });
     }
 
     /// The text was typed in: it is a draft while it differs from the value.
@@ -801,7 +859,8 @@ impl ValuePanel {
 }
 
 impl Render for ValuePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fit(window, cx);
         let theme = cx.theme();
         let (muted, warning, border) = (theme.muted_foreground, theme.warning, theme.border);
         let header = self.shown.as_ref().map(|shown| {

@@ -4400,9 +4400,9 @@ impl QueryTab {
                     if count == 1 { "change" } else { "changes" }
                 ),
                 explanation: if in_transaction {
-                    "These statements join the transaction open in this tab, all of them or none:                      nothing is committed until you commit it."
+                    "These statements join the transaction open in this tab, all of them or none: nothing is committed until you commit it."
                 } else {
-                    "These statements run in one transaction: all of them take effect, or none                      does."
+                    "These statements run in one transaction: all of them take effect, or none does."
                 }
                 .into(),
                 statement: ConfirmStatement::Fixed(
@@ -6200,6 +6200,11 @@ impl QueryTab {
                         .on_click(cx.listener(|this, _, window, cx| this.apply_source(window, cx))),
                 )
             })
+            // Run and its menu stay together when the toolbar wraps.
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
             .child(
                 Button::new("tab-run")
                     .map(|button| {
@@ -6244,6 +6249,7 @@ impl QueryTab {
                             )
                         }
                     }),
+            )
             )
     }
 

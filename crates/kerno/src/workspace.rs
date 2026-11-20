@@ -2032,12 +2032,12 @@ impl Workspace {
             TabAction::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             TabAction::AboutReadOnly => window.open_alert_dialog(cx, |alert, _, _| {
                 alert.title("A read-only connection").description(
-                    "Kerno refuses statements that write before they are sent, and the server                      session is opened read-only. Edit the connection and clear “Read-only” to                      change data from Kerno.",
+                    "Kerno refuses statements that write before they are sent, and the server session is opened read-only. Edit the connection and clear “Read-only” to change data from Kerno.",
                 )
             }),
             TabAction::AboutMemoryOnly => window.open_alert_dialog(cx, |alert, _, _| {
                 alert.title("Passwords kept in memory only").description(
-                    "No system secret store (macOS Keychain or a Secret Service on Linux) can be                      used, so Kerno writes no password to disk: each password is asked for when                      you connect and forgotten when Kerno quits. Start a Secret Service (GNOME                      Keyring, KWallet) and restart Kerno to save them.",
+                    "No system secret store (macOS Keychain or a Secret Service on Linux) can be used, so Kerno writes no password to disk: each password is asked for when you connect and forgotten when Kerno quits. Start a Secret Service (GNOME Keyring, KWallet) and restart Kerno to save them.",
                 )
             }),
             TabAction::ShowMessages => {

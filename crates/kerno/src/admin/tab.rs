@@ -182,6 +182,9 @@ enum PaneState {
     Loading,
     Ready,
     Failed(String),
+    /// The server has no such list (an old release): nothing to retry and
+    /// nothing wrong with the account.
+    Missing,
 }
 
 struct PaneView {
@@ -353,6 +356,18 @@ impl AdminTab {
             .map_or_else(
                 || "this connection".into(),
                 |saved| saved.config.name.clone(),
+            )
+    }
+
+    /// The server as its status names it ("MySQL 5.1.73"), else "This
+    /// server".
+    fn server_name(&self, cx: &App) -> String {
+        self.connections
+            .read(cx)
+            .meta_session(&self.target.connection)
+            .map_or_else(
+                || "This server".into(),
+                |meta| meta.server().named(meta.engine()),
             )
     }
 
@@ -530,7 +545,10 @@ impl AdminTab {
         if error.is_disconnect() {
             self.close_session(cx);
         }
-        self.panes[pane as usize].state = PaneState::Failed(describe(error).to_string());
+        self.panes[pane as usize].state = match error {
+            Error::Unsupported(_) => PaneState::Missing,
+            error => PaneState::Failed(describe(error).to_string()),
+        };
         cx.notify();
     }
 
@@ -911,6 +929,7 @@ impl AdminTab {
             PaneState::Loading => "loading".into(),
             PaneState::Ready => "ready".into(),
             PaneState::Failed(error) => format!("failed: {error}"),
+            PaneState::Missing => "missing".into(),
         }
     }
 
@@ -1264,6 +1283,19 @@ impl AdminTab {
                             cx,
                         )
                     }
+                    // Not a failure: the release has no such list. Said as
+                    // that, without blaming the account's privileges.
+                    PaneState::Missing => self.render_notice(
+                        ("admin-missing", pane as usize),
+                        format!("This server does not list its {}", pane.noun()),
+                        format!(
+                            "{} has no such list: it came with a later release. Nothing is \
+                             wrong with the connection or the account.",
+                            self.server_name(cx)
+                        ),
+                        None,
+                        cx,
+                    ),
                     _ if !view.loaded => self.render_notice(
                         ("admin-loading", pane as usize),
                         format!("Reading the {}…", pane.noun()),
