@@ -2077,6 +2077,9 @@ impl DataTab {
         let chrome = self.chrome(cx);
         h_flex()
             .flex_none()
+            // A group of a split is often narrower than the toolbar: its
+            // buttons go to a second line instead of over the next group.
+            .flex_wrap()
             .px_2()
             .py_1()
             .gap_1()

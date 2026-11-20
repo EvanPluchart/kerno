@@ -4482,6 +4482,9 @@ impl Workspace {
                 .min_h_0()
                 .size_full()
                 .relative()
+                // Whatever a tab draws wider than its group is cut at the
+                // group's edge, never drawn over the group beside it.
+                .overflow_hidden()
                 .child(tab.view())
                 // ⌘-wheel over an editor or a grid zooms them (J7).
                 .when(

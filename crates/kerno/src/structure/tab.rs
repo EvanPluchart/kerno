@@ -684,6 +684,8 @@ impl StructureTab {
             .map(|saved| saved.config.engine);
         h_flex()
             .flex_none()
+            // Wraps in a narrow group of a split instead of being cut.
+            .flex_wrap()
             .px_2()
             .py_1()
             .gap_1()

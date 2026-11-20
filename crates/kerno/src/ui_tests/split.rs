@@ -592,6 +592,36 @@ fn k19_table(name: &str) -> Scratch {
     )
 }
 
+/// The owner's test of the build (2026-11-20): a table's toolbar in a narrow group drew over the
+/// group beside it ("Set NULL", "Structure", "Export" on top of the other tab's connection
+/// picker). It wraps inside its own group, as a query tab's does. Fails without `flex_wrap` on
+/// the data tab's toolbar.
+#[gpui_kit::test]
+fn the_toolbar_of_a_table_stays_inside_its_narrow_group(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the first page", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1")
+    });
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SplitRight);
+    let ids = groups(&app, cx);
+    assert_eq!(ids.len(), 2);
+    let left = bounds(&app, cx, ("tab-group", ids[0]));
+    for id in ["data-add-row", "data-export"] {
+        let button = bounds(&app, cx, id);
+        assert!(
+            button.left() >= left.left()
+                && button.right() <= left.right()
+                && button.bottom() <= left.bottom(),
+            "{id} is drawn outside its group: {button:?} in {left:?}"
+        );
+    }
+}
+
 /// K19, review fix: two groups side by side in the default window are each narrower than a
 /// query tab's toolbar; its buttons wrap to a second line instead of being cut off at the
 /// group's edge, so Run stays in reach in both. Fails without `flex_wrap` on the toolbar.
