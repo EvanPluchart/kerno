@@ -248,7 +248,7 @@ the one you have, and what Update does on your copy (an installed `Kerno.app` or
 starts again; any other copy opens the release page). **What's new** opens the release page in your browser.
 **Update** installs as the status bar item does; **Later** closes it, and the next launch asks again; **Skip
 this version** stops the window for that version (a newer one asks again). No key acts in it while you type:
-Enter and Space do nothing, Escape is Later, and Tab reaches only Later (the other buttons are clicked); it waits while another dialog is open. The status bar item stays in
+Enter and Space do nothing, Escape is Later, and Tab goes to Later first and to Update last; it waits while another dialog is open. The status bar item stays in
 every case, a skipped version included; Settings ▸ Updates shows the skipped version with **Ask again**.
 
 ## Settings, environments and what wins

@@ -713,6 +713,43 @@ fn the_dialog_waits_for_another_dialog_to_close(cx: &mut TestAppContext) {
     assert!(update_dialog(&app, cx));
 }
 
+/// Every answer can be given from the keyboard, the harmless ones first: Tab goes to the
+/// dialog's close button, then Later, What's new, Skip this version, and Update last.
+#[gpui_kit::test]
+fn the_keyboard_reaches_every_answer_of_the_dialog_later_first(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let answer = |app: &Fixture, cx: &mut TestAppContext, tabs: usize| {
+        let latest = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+        next_run(app, cx, latest, Install::Page, temp.path());
+        check(app, cx, false);
+        assert!(update_dialog(app, cx));
+        let mut keys = vec!["tab"; tabs];
+        keys.push("space");
+        app.press(cx, &keys);
+    };
+    // One Tab (the close button) and two (Later): closed, nothing stored or opened.
+    for tabs in [1, 2] {
+        answer(&app, cx, tabs);
+        assert!(!app.dialog_open(cx), "{tabs}");
+        assert_eq!(settings_now(cx).skipped_update, None);
+        assert_eq!(cx.opened_url(), None);
+    }
+    // Three: What's new opens the release page and leaves the question on screen.
+    answer(&app, cx, 3);
+    assert!(update_dialog(&app, cx));
+    assert!(cx.opened_url().is_some());
+    app.press(cx, &["escape"]);
+    // Five: Update, which for this copy opens the release page and closes.
+    answer(&app, cx, 5);
+    assert!(!app.dialog_open(cx));
+    assert_eq!(settings_now(cx).skipped_update, None);
+    // Four: Skip this version.
+    answer(&app, cx, 4);
+    assert!(!app.dialog_open(cx));
+    assert_eq!(settings_now(cx).skipped_update.as_deref(), Some("0.2.0"));
+}
+
 #[gpui_kit::test]
 fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
@@ -749,8 +786,8 @@ fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppCon
     let tab = app.tab(cx);
     assert_eq!(cx.update(|cx| tab.read(cx).sql(cx)), "select 1 as one");
 
-    // An indented line typed into it at the next run (Tab, a word, Space): Tab reaches only
-    // Later, so Space closes it as Later; nothing is skipped, opened or installed.
+    // An indented line typed into it at the next run (Tab, a word, Space): Tab reaches Later
+    // first, so Space closes it as Later; nothing is skipped, opened or installed.
     allow_updates(
         &app,
         cx,

@@ -2606,12 +2606,12 @@ we should do as DBeaver does: a window that opens at every launch unless one cli
   opens at once (waiting for a pause in the typing would leave it hidden behind a timer for nothing it protects)
   and no key typed into it skips, installs or opens anything: Enter answers nothing (`on_ok` returns false); the
   keyboard goes to the dialog itself, not to a button, so Space clicks nothing and letters go nowhere; Escape is
-  Later and gives the keyboard back to the editor. Only Later is a tab stop (`tab_stop(false)` on What's new,
-  Skip and Update), so an indented line typed into it (Tab, a word, Space) closes it as Later at worst: a test
-  found that with every button a tab stop, Tab then Space opened the release page and a third Tab reached Skip.
-  Update, Skip and What's new are therefore clicked with the pointer; the keyboard had no way to install before
-  either (the status bar item is clicked). `ponytail:` a palette command "Install Kerno X" if a keyboard-only
-  user asks. A key typed as the dialog arrives is lost, never acted on.
+  Later and gives the keyboard back to the editor. Tab reaches the harmless answers first (`tab_index`):
+  the dialog's close button, Later, What's new, Skip, and Update last, so an indented line typed into it (Tab, a
+  word, Space) closes it as Later, and installing from the keyboard takes five Tabs and Space. In the kit's own
+  order (the order drawn) Tab then Space opened the release page and a third Tab reached Skip. The first version
+  of this made Later the only tab stop; the review changed it: every answer must be reachable without a pointer
+  (`CLAUDE.md` §3, keyboard first). A key typed as the dialog arrives is lost, never acted on.
 - **Other dialogs.** It never opens over another dialog, confirmation, alert or the palette: the version waits
   in `Workspace::pending_update_offer`, and the first frame with none open (`keep_focus`) offers it again.
 - **No new request.** The release notes are not fetched: "What's new" is a link the browser opens. The check is

@@ -247,11 +247,16 @@ impl Workspace {
                     let answer =
                         |id: &'static str, label: &'static str, action: Option<TabAction>| {
                             let workspace = workspace.clone();
-                            // Only Later is a tab stop: an indented line typed as the dialog arrives
-                            // (Tab, a word, Space) can close it, never skip or install (D-097).
+                            // Tab reaches Later first, Update last: an indented line typed as the
+                            // dialog arrives (Tab, a word, Space) can close it, never skip or
+                            // install, and the keyboard still reaches every answer (D-097).
                             Button::new(id)
                                 .label(label)
-                                .tab_stop(action.is_none())
+                                .tab_index(match action {
+                                    None => 1,
+                                    Some(TabAction::Update) => 4,
+                                    Some(_) => 3,
+                                })
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     if let Some(action) = action.clone() {
@@ -278,7 +283,7 @@ impl Workspace {
                                         // The browser fetches the page; Kerno sends nothing.
                                         Button::new("update-dialog-notes")
                                             .ghost()
-                                            .tab_stop(false)
+                                            .tab_index(2)
                                             .label("What's new")
                                             .on_click(move |_, _, cx| {
                                                 cx.open_url(&release_page(version))
