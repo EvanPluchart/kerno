@@ -1114,3 +1114,23 @@ Still open (for the owner):
   strings) or check the font reader against `ttf-parser`'s values, two of the font reader's character maps, the
   driver tests of K31 extended to the PDF on PostgreSQL, MySQL, MariaDB and SQLite, one UI test; each seen failing
   under a mutation.
+
+## 2026-11-21 — K34: a selected row is seen at a glance in both themes
+
+- The light theme's selection was the Lime wash, painted by the kit at 20 % and so at 1.01:1 on the sidebar: the
+  owner could not see which schema was selected. Every selection is now the brand's accent at the kit's cap,
+  Olive in light (1.31 to 1.34:1 on what it is painted on) and Lime in dark (1.49 to 1.56, as K28 left it), and
+  the menus, the command palette, the dropdowns and the dialogs' picked rows use the same tint, opaque (1.25 to
+  1.34 in light, 1.55 to 1.73 in dark; they were 1.02 to 1.19). The text selection of the editor and the inputs
+  goes from 1.07 to 1.24 (light) and 1.20 to 1.42 (dark). The record view's current field takes the grid's tint.
+  D-107.
+- The light theme's muted text is one step darker (`#505965`, 7.1:1 on white) so that it keeps 4.5:1 on a
+  selection, as the dark one went one step lighter in K28.
+- Not reached: the `=` mark of a pending SQL expression on a light selection over a striped or hovered row (4.3 and
+  4.0:1); hover and selected are one look in the kit's menus and in Settings ▸ Environments; the tree's selection
+  is the same with or without focus. Side effects: ghost buttons hover with the Olive tint in light, and a find
+  match is the colour of a selected cell in light (the selected one keeps its frame).
+- Seen while working: the tree with `shop` selected, focused and not, the grid's row, cell and range, the record
+  view, a dropdown, the command palette, the schema export and compare dialogs, light and dark, before and after.
+- Tests: the dark-only selection test of K28 becomes one for both themes, plus one for selected text; each seen
+  failing with each old value put back.

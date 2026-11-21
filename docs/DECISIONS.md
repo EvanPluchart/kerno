@@ -3083,3 +3083,51 @@ now direct dependencies of `kerno-core` at the version locked. No logic of krill
   "Paper" A4 / US Letter beside them for the PDF only; written through the `.part` then rename path as bytes.
 - **Not in this version:** kerning and complex scripts, a fallback font, a diagram over several pages, a
   landscape page, tagged PDF for screen readers, PDF/A.
+
+## D-107 — A selected row is seen at a glance in both themes (K34; 2026-11-21)
+
+The owner, on the light theme's sidebar: "le selected se voit pas assez". The kit paints `list.active.background`
+and `table.active.background` at most 20 % opaque and `selection.background` at most 30 % (`clamp_alpha` in
+gpui-component's `theme/schema.rs`); the light file's Lime wash `#F1F8D6`, opaque, came out at 1.01:1 on the
+sidebar, 1.02:1 on white. K28 (D-101) fixed dark only. One idea of "selected" now holds everywhere: the brand's
+accent written with its opacity, so that the kit's cap paints it as meant, Olive in light and Lime in dark, and
+the same tint, opaque, for the places the kit paints with `accent` (menus, the command palette, dropdowns, the
+picked or current rows of Kerno's dialogs).
+
+- **Light**, painted on the surface under it (ratio to that surface; text, muted text, link on it):
+  `list.active.background` `#F1F8D6` → `#4D6B0033` (Olive at 20 %): `#D4DBC6` on the sidebar 1.33:1 (was 1.01),
+  `#DBE1CC` on white 1.34:1; `table.active.background` `#B9DC3233` → `#4D6B0033`: 1.34 on a row (was 1.10), 1.33
+  on a stripe, 1.31 on a hovered row; `accent.background` `#F1F8D6` → `#DBE1CC` (the list's tint on a popup):
+  1.34:1 on white and popups (was 1.10), 1.25 on the sidebar; `selection.background` (text) `#D8F477` →
+  `#4D6B0026` (15 %): 1.24:1 on the editor (was 1.07), the comment colour 3.95:1 on it (was 4.59).
+- **The light muted text goes one step darker**, `#5B6470` → `#505965` (7.10:1 on white, was 6.00): on an Olive
+  tint the old one fell to 4.21:1 on the sidebar and 3.92:1 on a selected cell of a hovered row. Now 4.99 and
+  4.64. Every muted text of the light theme is a little darker; the dark theme's went one step lighter in K28
+  for the same reason.
+- **Dark**: the tints stay (`#C8F03C2A`, 1.49 to 1.56:1). `accent.background` `#22281D` → `#374126` (the list's
+  tint on a popup): 1.55:1 on a popup (was 1.11), 1.67 on the background (was 1.19); `selection.background`
+  `#465424` → `#C8F03C24` (14 %): 1.42:1 on the editor (was 1.20), the comment colour 3.52:1 on it (was 4.15).
+- **The record view's current field** takes the grid's selection tint (`table_active`) instead of the text
+  selection's, as K28 did for a range.
+- **The floor**, 1.22:1 between a selection as painted and what it is painted on, is above every step of the
+  theme meant to stay quiet (a stripe 1.08, the grid's header 1.14, a hovered row 1.16): a selected row is the
+  strongest band of its list. Every old light value and the old dark accent and text selection are under it.
+  Hover stays under the selection on the same surface (light list 1.02, grid 1.16; dark 1.15 and 1.11).
+- **Text on it**: text and muted text 4.5:1 on every selection. Syntax colours on selected text 3:1 (WCAG's
+  floor for large text: a selection is short-lived, and holding 4.5 kept it invisible).
+- **Not reached**: the link colour on a light selection over a striped (4.27:1) or hovered (4.02:1) row: the one
+  link-coloured mark in a grid is the `=` of a pending SQL expression, Olive on an Olive tint. In the kit's menus
+  hover and selected are the same `accent` (one highlight, by the pointer or the keys: a fork to change). The
+  sidebar's tree draws its selection the same with or without focus: the kit paints the tint after Kerno's row,
+  so an unfocused row cannot be made weaker, and a frame shown only while the tree has focus was not done, the
+  kit's tree exposing no focus handle to test. Settings ▸ Environments paints hover and selected with the same
+  `accent` (Settings is another item's ground; not edited); the new connection dialog's engines too, the
+  selected one keeping its Olive or Lime border.
+- **Side effects, owner-disagreeable**: the kit's ghost buttons hover with `accent` (opaque in light, half in
+  dark), so every toolbar button's hover is now the Olive tint in light (1.18:1 on the toolbar, was 1.03). A
+  cell matching a grid's find (`GRID_MATCH_FILL`, light `#DFE4D1`) is now the colour of a selected cell in light
+  (ΔE 1.6, was 10.0; 7.9 in dark): a match is a tint, the selected cell a tint with a frame, and stepping
+  through the matches selects the current one, so the frame still tells it. Library and multi-run rows, which
+  hovered with `accent`, hover with `list.hover.background`.
+- `CLAUDE.md` §3 says selected rows use Lime wash in light: that line is out of date, the owner's word of
+  2026-11-21 wins. `assets/brand/BRAND.md` updated (Olive's role, Lime wash retired).

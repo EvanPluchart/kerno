@@ -140,7 +140,7 @@ pub fn apply_fonts(cx: &mut App) {
 
 /// Night, the brand's dark surface (`assets/brand/BRAND.md`): the reversed
 /// lockup is drawn on it, as its file is. The other brand colours (Lime,
-/// Ink, Olive, Lime wash) live in the theme file.
+/// Ink, Olive) live in the theme file.
 pub const NIGHT: u32 = 0x0E1116;
 
 /// An option chip (a format, an encoding, a column of a key): selected, it
@@ -180,7 +180,7 @@ pub const OCCURRENCE_FILL: Pair = (0xF6F8F2, 0x1B201B);
 /// Olive on light, Lime on dark (the brand's accent for marks).
 pub const MARK_EDGE: Pair = (0x4D6B00, 0xC8F03C);
 /// A cell that matches a grid's find (J6): Olive over white, Lime over the
-/// dark grid; not the Lime wash of the selected row.
+/// dark grid.
 pub const GRID_MATCH_FILL: Pair = (0xDFE4D1, 0x3C4721);
 
 /// The colour of `pair` in the current theme.
@@ -810,58 +810,157 @@ mod tests {
         assert!(failures.is_empty(), "below 3:1:\n{}", failures.join("\n"));
     }
 
-    /// A selected row, cell or range, and a selected item of a list or of
-    /// the sidebar's tree, stand out in the dark theme, measured as the kit
-    /// paints them (K28: the selection was written opaque, painted at 20 %
-    /// and came out at 1.02:1, while this test read it as written). A row's
-    /// tint is painted over the grid (the kit drops a selected row's stripe
-    /// and hover); a cell's, each cell of a range too (the grid tints a
-    /// range with it), over its row, plain, striped or hovered; a list
-    /// item's over the list, the sidebar or a popup. Each is a Lime tint (`assets/brand/BRAND.md`) at least 1.45:1
-    /// from what it is painted on and from the plain and striped rows, and
-    /// the text, the muted text of NULL and links read on it (4.5:1).
+    /// How far a selection, as painted, stands from the surface under it, at
+    /// least (K34, D-107): above every step of the theme meant to stay
+    /// quiet (a stripe 1.08:1, the grid's header 1.14, a hovered row 1.16),
+    /// so a selected row is the strongest band of its list. The light theme's
+    /// Lime wash came out at 1.01 to 1.02 and the owner could not see it;
+    /// the dark theme's text selection at 1.20.
+    const SEEN: f64 = 1.22;
+
+    /// A selection's colour as painted over `under`: the kit's capped tints
+    /// (see [`painted`]); `accent.background`, which the kit paints as
+    /// written, as it is.
+    fn shown(theme: &ThemeEntry, key: &str, under: &str) -> u32 {
+        match key {
+            "accent.background" => hex(&theme.colors[key]),
+            _ => painted(theme, key, under),
+        }
+    }
+
+    /// A selected row, cell, range or list item is seen at a glance in both
+    /// themes, measured as the kit paints it (K28 met the 20 % cap in dark,
+    /// K34 in light, where the Lime wash came out at 1.02:1 on the sidebar).
+    /// A row's tint is painted over the grid (the kit drops a selected row's
+    /// stripe and hover); a cell's, a range's and the record view's current
+    /// field over a row, plain, striped or hovered; a list item's (the
+    /// sidebar's tree, pickers, the completion list) over the list, the
+    /// sidebar or a popup; the accent (menus, the command palette, the
+    /// picked rows of Kerno's dialogs) over a popup, a dialog or the sidebar.
+    /// Each is a tint of the brand's accent (Olive in light, Lime in dark),
+    /// [`SEEN`] from what it is painted on and from the plain and striped
+    /// rows, clearly above the hover of the same surface, and the text and
+    /// the muted text (sizes, counts, NULL, the "default" badge) read on it
+    /// (4.5:1). Links too on a plain row: the one link-coloured mark of a
+    /// cell (the `=` of a pending SQL expression) falls to 4.3:1 on a
+    /// striped and 4.0:1 on a hovered row in light, a known limit of an
+    /// Olive tint under Olive text; no list draws a link.
     #[test]
-    fn a_selected_row_stands_out_in_the_dark_theme() {
-        const LIME: &str = "#C8F03C";
-        let themes = themes();
-        let dark = &themes[1];
-        assert_eq!(dark.mode, "dark");
+    fn a_selection_is_seen_at_a_glance_in_both_themes() {
         let stripes = ["table.background", "table.even.background"];
-        let mut cases: Vec<(&str, &str, &[&str])> = Vec::new();
-        for under in [
-            "table.background",
-            "table.even.background",
-            "table.hover.background",
+        let mut cases: Vec<(&str, &str, &[&str], Option<&str>)> = Vec::new();
+        for (under, hover) in [
+            ("table.background", Some("table.hover.background")),
+            ("table.even.background", None),
+            ("table.hover.background", None),
         ] {
-            cases.push(("table.active.background", under, &stripes));
+            cases.push(("table.active.background", under, &stripes, hover));
         }
         for under in [
             "list.background",
             "sidebar.background",
             "popover.background",
         ] {
-            cases.push(("list.active.background", under, &[]));
+            cases.push((
+                "list.active.background",
+                under,
+                &[],
+                Some("list.hover.background"),
+            ));
+        }
+        for under in ["popover.background", "background", "sidebar.background"] {
+            cases.push(("accent.background", under, &[], None));
         }
         let mut failures = Vec::new();
-        for (tint, under, around) in cases {
-            let shown = painted(dark, tint, under);
-            let others = around.iter().filter(|other| **other != under);
-            for other in std::iter::once(&under).chain(others) {
-                let ratio = super::contrast(shown, hex(&dark.colors[*other]));
-                if ratio < 1.45 {
-                    failures.push(format!("{tint} on {under} is {ratio:.2}:1 from {other}"));
+        for theme in themes() {
+            let accent = match theme.mode.as_str() {
+                "dark" => "#C8F03C",
+                _ => "#4D6B00",
+            };
+            for (tint, under, around, hover) in &cases {
+                let shown = shown(&theme, tint, under);
+                let others = around.iter().filter(|other| *other != under);
+                let mut fail = |what: String| failures.push(format!("{}: {what}", theme.name));
+                for other in std::iter::once(under).chain(others) {
+                    let ratio = super::contrast(shown, hex(&theme.colors[*other]));
+                    if ratio < SEEN {
+                        fail(format!("{tint} on {under} is {ratio:.2}:1 from {other}"));
+                    }
+                }
+                if let Some(hover) = hover {
+                    let surface = hex(&theme.colors[*under]);
+                    let hovered = super::contrast(hex(&theme.colors[*hover]), surface);
+                    let selected = super::contrast(shown, surface);
+                    if selected < hovered + 0.1 {
+                        fail(format!(
+                            "{tint} on {under} ({selected:.2}:1) is not above {hover} ({hovered:.2}:1)"
+                        ));
+                    }
+                }
+                let written = &theme.colors[*tint][..7];
+                let off = (hue(written) - hue(accent)).abs();
+                if off > 12.0 {
+                    fail(format!("{tint} is {written}, not the accent's hue"));
+                }
+                for text in ["foreground", "muted.foreground", "link"] {
+                    if text == "link" && *under != "table.background" {
+                        continue;
+                    }
+                    let ratio = super::contrast(hex(&theme.colors[text]), shown);
+                    if ratio < 4.5 {
+                        fail(format!("{text} on {tint} on {under} is {ratio:.2}:1"));
+                    }
                 }
             }
-            let off = (hue(&format!("#{shown:06X}")) - hue(LIME)).abs();
-            if off > 10.0 {
-                failures.push(format!(
-                    "{tint} on {under} is #{shown:06X}, not a Lime tint"
-                ));
-            }
-            for text in ["foreground", "muted.foreground", "link"] {
-                let ratio = super::contrast(hex(&dark.colors[text]), shown);
-                if ratio < 4.5 {
-                    failures.push(format!("{text} on {tint} on {under} is {ratio:.2}:1"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Selected text in the editor and the inputs is seen at a glance too
+    /// ([`SEEN`] from the editor and from its active line; it was 1.07:1 in
+    /// light, 1.20:1 in dark), the text reads on it (4.5:1) and every syntax
+    /// colour stays legible (3:1, WCAG's floor for large text: a selection
+    /// is short-lived and the comment colour is the faintest).
+    #[test]
+    fn selected_text_is_seen_at_a_glance() {
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let mut texts = theme.syntax();
+            texts.insert(
+                "editor.foreground".into(),
+                theme.editor("editor.foreground"),
+            );
+            for surface in ["editor.background", "editor.active_line.background"] {
+                let under = theme.editor(surface);
+                let digits = theme.colors["selection.background"].trim_start_matches('#');
+                let alpha = digits.get(6..8).map_or(1.0, |a| {
+                    f64::from(u8::from_str_radix(a, 16).unwrap()) / 255.0
+                });
+                let shown = super::mix(
+                    hex(&under),
+                    hex(&theme.colors["selection.background"]),
+                    alpha.min(SELECTION_ALPHA),
+                );
+                let ratio = super::contrast(shown, hex(&under));
+                if ratio < SEEN {
+                    failures.push(format!(
+                        "{}: the selection on {surface} is {ratio:.2}:1",
+                        theme.name
+                    ));
+                }
+                for (kind, color) in &texts {
+                    let floor = if kind == "editor.foreground" {
+                        4.5
+                    } else {
+                        3.0
+                    };
+                    let ratio = super::contrast(hex(color), shown);
+                    if ratio < floor {
+                        failures.push(format!(
+                            "{}: {kind} on the selection on {surface} is {ratio:.2}:1",
+                            theme.name
+                        ));
+                    }
                 }
             }
         }
@@ -873,9 +972,8 @@ mod tests {
     /// white. The light theme now sits above the dark one, whose ratios no
     /// one complained about (stripe 1.03, line 1.21, header 1.04): the
     /// floors below are the light values chosen, rounded down, and the
-    /// dark ones as they are. A selected cell on a striped row is told by
-    /// its Olive (light) or Lime (dark) frame, not by its Lime wash, which
-    /// is a brand rule (1.01:1 on the light stripe): the frame is pinned.
+    /// dark ones as they are. A selected cell is also told by its Olive
+    /// (light) or Lime (dark) frame, pinned here on a striped or hovered row.
     #[test]
     fn the_grid_rows_and_columns_are_visible() {
         let floors: [(&str, &str, f64, f64); 7] = [
@@ -923,9 +1021,10 @@ mod tests {
     /// the grey of a stripe (1.05:1), and a selected cell or row looked like
     /// a stripe, told only by its Olive frame: the kit paints the selection's
     /// tint at 20 %, so the Lime wash written in the file came out grey. The
-    /// header has its own tone, and the selection as painted is the Lime wash
-    /// (`assets/brand/BRAND.md`) on a plain row, still lime on a stripe or a
-    /// hovered row, apart from all three, its text readable.
+    /// header has its own tone, and the selection as painted (an Olive tint
+    /// since K34, D-107: the Lime wash was too faint) is apart from a plain,
+    /// a striped and a hovered row, its text readable (links: see
+    /// [`a_selection_is_seen_at_a_glance_in_both_themes`]).
     #[test]
     fn the_light_grid_header_and_selection_stand_apart() {
         let themes = themes();
@@ -943,12 +1042,6 @@ mod tests {
                 failures.push(format!("the header on {row} is {ratio:.3}:1"));
             }
         }
-        let wash = selected_on(light, "table.background");
-        if delta_e(wash, 0xF1F8D6) > 2.0 {
-            failures.push(format!(
-                "a selection on a plain row is #{wash:06X}, not the Lime wash"
-            ));
-        }
         for row in rows {
             let shown = selected_on(light, row);
             for other in rows {
@@ -960,6 +1053,9 @@ mod tests {
                 }
             }
             for text in ["foreground", "muted.foreground", "link"] {
+                if text == "link" && row != "table.background" {
+                    continue;
+                }
                 let ratio = super::contrast(hex(&light.colors[text]), shown);
                 if ratio < 4.5 {
                     failures.push(format!("{text} on a selection on {row} is {ratio:.2}:1"));
@@ -1078,14 +1174,13 @@ mod tests {
 
     /// The brand (`assets/brand/BRAND.md`) is where its rules put it: Lime
     /// buttons with Ink labels in both themes; on light surfaces Olive for
-    /// text, links and rings (Lime is 1.3:1 on white) and Lime wash for the
-    /// selected row; on dark surfaces Lime for all of it.
+    /// text, links, rings and the selected row's tint (Lime is 1.3:1 on
+    /// white); on dark surfaces Lime for all of it.
     #[test]
     fn the_brand_colours_sit_where_brand_md_puts_them() {
         const LIME: &str = "#C8F03C";
         const INK: &str = "#111111";
         const OLIVE: &str = "#4D6B00";
-        const LIME_WASH: &str = "#F1F8D6";
         // The ratios BRAND.md lists.
         assert!(contrast(INK, LIME) >= 14.3, "ink on lime");
         assert!(contrast(OLIVE, "#FFFFFF") >= 6.1, "olive on white");
@@ -1115,10 +1210,13 @@ mod tests {
             assert_eq!(dark[key], LIME, "dark {key}");
         }
         assert_eq!(dark["primary.foreground"], INK);
-        assert_eq!(light["list.active.background"], LIME_WASH);
-        // Painted at 20 % by the kit, the grid's selection comes out as the
-        // wash on a plain row.
-        assert_eq!(color(&themes[0], "table.active.background"), LIME_WASH);
+        // The selection is the accent written with its opacity (the kit
+        // paints it at most 20 %): Olive in light (the Lime wash came out at
+        // 1.02:1 and could not be seen, K34), Lime in dark.
+        for key in ["list.active.background", "table.active.background"] {
+            assert!(light[key].starts_with(OLIVE), "light {key}");
+            assert!(dark[key].starts_with(LIME), "dark {key}");
+        }
         // Lime never carries text or a ring on a light surface.
         for (key, hex) in light {
             if key.starts_with("button.primary") {

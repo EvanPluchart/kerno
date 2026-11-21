@@ -27,8 +27,8 @@ The wordmark is Inter SemiBold (OFL) converted to outlines, tracking -2 %.
 | Lime | `#C8F03C` | Brand colour, app icon tile, primary buttons and selection accent in the dark theme |
 | Ink | `#111111` | Mark and text on lime |
 | Night | `#0E1116` | Dark surfaces |
-| Olive | `#4D6B00` | Accent for text, links and focus rings on light surfaces (6.1:1 on white) |
-| Lime wash | `#F1F8D6` | Selected row and soft accent background in the light theme |
+| Olive | `#4D6B00` | Text, links, focus rings and (at 20 %) selection on light surfaces (6.1:1 on white) |
+| Lime wash | `#F1F8D6` | Was the light theme's selected row and soft accent; retired in K34 (1.02:1 on the sidebar, not seen) |
 
 Contrast: ink on lime 14.4:1. Lime on white is 1.3:1, so lime never carries text or a focus ring on a light
 surface; use olive there. Lime buttons always carry ink text, in both themes.

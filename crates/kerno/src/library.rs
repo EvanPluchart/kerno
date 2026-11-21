@@ -220,7 +220,7 @@ impl Render for Library {
                 .gap_3()
                 .rounded(theme.radius)
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.accent))
+                .hover(|style| style.bg(theme.list_hover))
         };
         let list: Vec<gpui_kit::AnyElement> = match self.shelf {
             Shelf::History => self

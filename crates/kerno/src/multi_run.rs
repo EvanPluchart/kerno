@@ -794,7 +794,7 @@ impl MultiRun {
                     .gap_0p5()
                     .rounded(theme.radius)
                     .cursor_pointer()
-                    .hover(|this| this.bg(theme.accent))
+                    .hover(|this| this.bg(theme.list_hover))
                     .on_click(cx.listener(move |this, _, window, cx| this.go_to(index, window, cx)))
                     .child(
                         h_flex()

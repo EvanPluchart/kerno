@@ -143,7 +143,7 @@ fn record_view(table: &Entity<TableState<Grid>>, cx: &App) -> AnyElement {
                 .gap_3()
                 .border_b_1()
                 .border_color(theme.border)
-                .when(column == selected, |line| line.bg(theme.selection))
+                .when(column == selected, |line| line.bg(theme.table_active))
                 .on_click(move |event, window, cx| {
                     pick.update(cx, |table, cx| {
                         Grid::select(table, row, column, cx);
