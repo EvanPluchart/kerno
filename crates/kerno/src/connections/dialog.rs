@@ -82,6 +82,8 @@ fn database_placeholder(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "the server's default (often postgres)",
         Engine::MySql | Engine::MariaDb => "Default database (optional)",
+        // A database file has no Database field: it is the file.
+        Engine::Sqlite => "",
     }
 }
 
@@ -92,6 +94,8 @@ fn url_placeholder(engine: Engine) -> &'static str {
         Engine::Postgres => "postgres://user:password@host:5432/database",
         Engine::MySql => "mysql://user:password@host:3306/database",
         Engine::MariaDb => "mariadb://user:password@host:3306/database",
+        // No URL fills a database file's form (sqlite:// is still to come).
+        Engine::Sqlite => "",
     }
 }
 
@@ -130,6 +134,8 @@ struct Inputs {
     user: Entity<InputState>,
     password: Entity<InputState>,
     database: Entity<InputState>,
+    /// SQLite: the database file.
+    file: Entity<InputState>,
     options: Entity<TextareaState>,
     default_schema: Entity<InputState>,
     init_sql: Entity<TextareaState>,
@@ -303,6 +309,7 @@ impl ConnectionDialog {
         let port = text(&form.port, "");
         let user = text(&form.user, "");
         let database = text(&form.database, database_placeholder(form.engine));
+        let file = text(&form.file, "~/data/shop.db");
         let ca_file = text(&form.ca_file, "System trust store when empty");
         let cert_file = text(&form.cert_file, "Client certificate (optional)");
         let key_file = text(&form.key_file, "Client key (optional)");
@@ -408,6 +415,7 @@ impl ConnectionDialog {
                 user,
                 password,
                 database,
+                file,
                 options,
                 default_schema,
                 init_sql,
@@ -540,6 +548,7 @@ impl ConnectionDialog {
             user: value(&i.user),
             password: value(&i.password),
             database: value(&i.database),
+            file: value(&i.file),
             options: i.options.read(cx).value().to_string(),
             default_schema: value(&i.default_schema),
             init_sql: i.init_sql.read(cx).value().to_string(),
@@ -579,6 +588,11 @@ impl ConnectionDialog {
         set(&i.user, &form.user);
         set(&i.password, &form.password);
         set(&i.database, &form.database);
+        set(&i.file, &form.file);
+        // A file engine has only the General and Advanced tabs.
+        if form.engine.is_file() && matches!(self.section, Section::Tls | Section::Ssh) {
+            self.section = Section::General;
+        }
         let placeholder = database_placeholder(form.engine);
         i.database.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx)
@@ -738,6 +752,93 @@ impl ConnectionDialog {
             }
         })
         .detach();
+    }
+
+    /// "New file…": a save panel, then an empty database at the chosen path.
+    /// A file that is there already is kept as it is and opened, never
+    /// emptied: the panel's "Replace?" cannot wipe a database.
+    fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let picking = cx.prompt_for_new_path(&home, Some("database.db"));
+        let input = self.inputs.file.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = picking.await else {
+                return;
+            };
+            let making = this.update(cx, |_, cx| {
+                let path = path.clone();
+                crate::bridge::spawn_blocking(cx, move || kerno_sqlite::new_database_file(&path))
+            });
+            let Ok(making) = making else {
+                return;
+            };
+            let outcome = making.await;
+            let _ = input.update_in(cx, |input, window, cx| {
+                use gpui_kit::component::notification::Notification;
+                match outcome {
+                    Ok(made) => {
+                        input.set_value(path.display().to_string(), window, cx);
+                        if !made {
+                            window.push_notification(
+                                Notification::info(SharedString::from(format!(
+                                    "{} is there already: Kerno opens it as it is, nothing \
+                                     was replaced.",
+                                    path.display()
+                                ))),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => window.push_notification(
+                        Notification::warning(SharedString::from(format!(
+                            "Could not make {}: {error}.",
+                            path.display()
+                        ))),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The tabs of the engine: a database file has no TLS or SSH tunnel.
+    fn sections(&self) -> Vec<(Section, &'static str)> {
+        SECTIONS
+            .into_iter()
+            .filter(|(section, _)| {
+                !self.form.engine.is_file()
+                    || matches!(section, Section::General | Section::Advanced)
+            })
+            .collect()
+    }
+
+    /// The General tab's fields of a database file: the file, chosen or
+    /// made, in place of the server's fields.
+    fn render_file(&self, cx: &mut Context<Self>) -> AnyElement {
+        let target = self.inputs.file.clone();
+        let control = h_flex()
+            .gap_2()
+            .child(Input::new(&self.inputs.file).id("conn-file").flex_1())
+            .child(
+                Button::new("conn-file-browse")
+                    .outline()
+                    .label("Choose…")
+                    .tooltip("Open an existing database file")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.browse(target.clone(), "Open", window, cx);
+                    })),
+            )
+            .child(
+                Button::new("conn-file-new")
+                    .outline()
+                    .label("New file…")
+                    .tooltip("Make an empty database file")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_file(window, cx))),
+            );
+        self.field("Database file", Some(Field::File), control, cx)
     }
 
     // Rendering ---------------------------------------------------------------
@@ -1034,7 +1135,8 @@ impl ConnectionDialog {
                         h_flex()
                             .id(SharedString::from(format!("engine-{}", engine_key(engine))))
                             .test_support()
-                            .w(px(168.))
+                            // Four engines on one row of the 720 px dialog.
+                            .w(px(152.))
                             .p_2()
                             .gap_2()
                             .rounded(theme.radius)
@@ -1078,11 +1180,16 @@ impl ConnectionDialog {
             swatches.push(swatch(Some(key), cx));
         }
         let environments = self.environment_picker(cx).into_any_element();
-        let password = self.render_password(!memory_only, cx);
+        // A database file: the file in place of the server's fields, which
+        // are hidden, not disabled (D-102).
+        let file_engine = self.form.engine.is_file();
+        let password = (!file_engine).then(|| self.render_password(!memory_only, cx));
+        let file_field = file_engine.then(|| self.render_file(cx));
 
         v_flex()
             .gap_3()
-            .child(
+            .when(!file_engine, |this| {
+                this.child(
                 // The hint sits on the label's line: the dialog grows no
                 // taller (its buttons stay in a short window).
                 v_flex()
@@ -1142,6 +1249,7 @@ impl ConnectionDialog {
                             .child(message)
                     })),
             )
+            })
             .child(
                 h_flex()
                     .gap_3()
@@ -1168,72 +1276,77 @@ impl ConnectionDialog {
                     .child(self.field("Colour", None, h_flex().gap_1().children(swatches), cx)),
             )
             .child(environments)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_start()
-                    .child(div().flex_1().child(self.field(
-                        "Host",
-                        Some(Field::Host),
-                        Input::new(&self.inputs.host).id("conn-host"),
-                        cx,
-                    )))
-                    .child(div().w(px(120.)).child(self.field(
-                        "Port",
-                        Some(Field::Port),
-                        Input::new(&self.inputs.port).id("conn-port"),
-                        cx,
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_start()
-                    .child(div().flex_1().child(self.field(
-                        "User",
-                        Some(Field::User),
-                        Input::new(&self.inputs.user).id("conn-user"),
-                        cx,
-                    )))
-                    .when(!self.form.password_choice.runs_a_command(), |this| {
-                        this.child(
-                            div().flex_1().child(
-                                self.field(
-                                    "Password",
-                                    None,
-                                    Input::new(&self.inputs.password)
-                                        .id("conn-password")
-                                        .mask_toggle(),
-                                    cx,
-                                ),
-                            ),
-                        )
-                    }),
-            )
-            .child(password)
-            .child(
-                self.field(
-                    "Database",
-                    None,
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div().flex_1().child(
-                                        Input::new(&self.inputs.database).id("conn-database"),
+            .children(file_field)
+            .when(!file_engine, |this| {
+                this.child(
+                    h_flex()
+                        .gap_3()
+                        .items_start()
+                        .child(div().flex_1().child(self.field(
+                            "Host",
+                            Some(Field::Host),
+                            Input::new(&self.inputs.host).id("conn-host"),
+                            cx,
+                        )))
+                        .child(div().w(px(120.)).child(self.field(
+                            "Port",
+                            Some(Field::Port),
+                            Input::new(&self.inputs.port).id("conn-port"),
+                            cx,
+                        ))),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_start()
+                        .child(div().flex_1().child(self.field(
+                            "User",
+                            Some(Field::User),
+                            Input::new(&self.inputs.user).id("conn-user"),
+                            cx,
+                        )))
+                        .when(!self.form.password_choice.runs_a_command(), |this| {
+                            this.child(
+                                div().flex_1().child(
+                                    self.field(
+                                        "Password",
+                                        None,
+                                        Input::new(&self.inputs.password)
+                                            .id("conn-password")
+                                            .mask_toggle(),
+                                        cx,
                                     ),
-                                )
-                                .child(self.database_picker(cx)),
-                        )
-                        .child(self.render_databases(cx)),
-                    cx,
-                ),
-            )
+                                ),
+                            )
+                        }),
+                )
+                .children(password)
+                .child(
+                    self.field(
+                        "Database",
+                        None,
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().flex_1().child(
+                                        Input::new(&self.inputs.database).id("conn-database"),
+                                    ))
+                                    .child(self.database_picker(cx)),
+                            )
+                            .child(self.render_databases(cx)),
+                        cx,
+                    ),
+                )
+            })
             .child(
                 Switch::new("conn-read-only")
-                    .label("Read-only: block writes here and open sessions read-only on the server")
+                    .label(if file_engine {
+                        "Read-only: block writes here and open the file for reading only"
+                    } else {
+                        "Read-only: block writes here and open sessions read-only on the server"
+                    })
                     .checked(self.form.read_only)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.form.read_only = *checked;
@@ -1286,6 +1399,8 @@ impl ConnectionDialog {
         let file = match self.form.engine {
             Engine::Postgres => "~/.pgpass",
             Engine::MySql | Engine::MariaDb => "~/.my.cnf",
+            // Not drawn for a database file, which has no password.
+            Engine::Sqlite => "",
         };
         let fields = match choice {
             PasswordChoice::Keychain => note(
@@ -1787,7 +1902,9 @@ impl ConnectionDialog {
                     cx,
                 ))
             })
-            .child(self.field(
+            // A database file: the commit mode only. No bootstrap, client
+            // tools or driver options (D-102).
+            .when(!self.form.engine.is_file(), |this| this.child(self.field(
                 "Bootstrap statements, run in every new session (separate them with ;)",
                 Some(Field::InitSql),
                 Textarea::new(&self.inputs.init_sql),
@@ -1821,8 +1938,10 @@ impl ConnectionDialog {
                     .child(match self.form.engine {
                         Engine::Postgres => "application_name and connect_timeout are understood by the driver; any other option is a server setting applied at session start (search_path, statement_timeout, …).",
                         Engine::MySql | Engine::MariaDb => "connect_timeout is understood by the driver; any other option is a session variable set at session start (sql_mode, time_zone, …).",
+                        // Not drawn for a database file, which takes no option.
+                        Engine::Sqlite => "",
                     }),
-            )
+            ))
     }
 
     /// The connection's client folder, or the default; a folder chosen
@@ -1873,7 +1992,9 @@ impl ConnectionDialog {
             multiple: false,
             prompt: Some("Use this client".into()),
         });
-        let family = kerno_core::tools::ClientFamily::of(self.form.engine);
+        let Some(family) = kerno_core::tools::ClientFamily::of(self.form.engine) else {
+            return;
+        };
         self.choosing_client = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picking.await else {
                 return;
@@ -1925,30 +2046,34 @@ impl ConnectionDialog {
                 .text_color(theme.muted_foreground)
                 .child("Connecting…")
                 .into_any_element(),
-            TestState::Passed(report) => v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .id("conn-test-passed")
-                        .test_support()
-                        .text_sm()
-                        .text_color(theme.success)
-                        .child(SharedString::from(format!(
-                            "Connected to {} · {} ms round trip",
-                            short_version(&report.version),
-                            report.latency.as_millis().max(1)
-                        ))),
-                )
-                .children(report.password.clone().map(|origin| {
-                    div()
-                        .id("conn-test-password")
-                        .test_support()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(origin.clone()))
-                        .test_text(origin)
-                }))
-                .into_any_element(),
+            TestState::Passed(report) => {
+                let passed = SharedString::from(format!(
+                    "Connected to {} · {} ms round trip",
+                    short_version(&report.version),
+                    report.latency.as_millis().max(1)
+                ));
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("conn-test-passed")
+                            .test_support()
+                            .text_sm()
+                            .text_color(theme.success)
+                            .child(passed.clone())
+                            .test_text(passed),
+                    )
+                    .children(report.password.clone().map(|origin| {
+                        div()
+                            .id("conn-test-password")
+                            .test_support()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(origin.clone()))
+                            .test_text(origin)
+                    }))
+                    .into_any_element()
+            }
             TestState::Failed(explained) => {
                 render_failure("conn-test-failed", explained, cx).into_any_element()
             }
@@ -1998,6 +2123,7 @@ impl ConnectionDialog {
 fn section_of(field: Field) -> Section {
     match field {
         Field::Url
+        | Field::File
         | Field::Host
         | Field::Port
         | Field::User
@@ -2038,6 +2164,7 @@ fn engine_key(engine: Engine) -> &'static str {
         Engine::Postgres => "postgres",
         Engine::MySql => "mysql",
         Engine::MariaDb => "mariadb",
+        Engine::Sqlite => "sqlite",
     }
 }
 
@@ -2050,7 +2177,8 @@ fn short_version(banner: &str) -> &str {
 
 impl Render for ConnectionDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = SECTIONS
+        let sections = self.sections();
+        let selected = sections
             .iter()
             .position(|(section, _)| *section == self.section)
             .unwrap_or(0);
@@ -2077,12 +2205,12 @@ impl Render for ConnectionDialog {
                     .underline()
                     .selected_index(selected)
                     .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        if let Some((section, _)) = SECTIONS.get(*index) {
+                        if let Some((section, _)) = this.sections().get(*index) {
                             this.section = *section;
                             cx.notify();
                         }
                     }))
-                    .children(SECTIONS.iter().map(|(section, label)| {
+                    .children(sections.iter().map(|(section, label)| {
                         Tab::new().label(*label).when(has_error(*section), |tab| {
                             tab.suffix(div().size(px(6.)).rounded_full().bg(danger))
                         })
@@ -2191,7 +2319,9 @@ mod tests {
     /// K21: the URL example follows the engine, scheme and standard port.
     #[test]
     fn the_url_placeholder_follows_the_engine() {
-        for engine in Engine::ALL {
+        // A database file has no URL field (K29).
+        assert_eq!(url_placeholder(Engine::Sqlite), "");
+        for engine in Engine::ALL.into_iter().filter(|engine| !engine.is_file()) {
             let placeholder = url_placeholder(engine);
             let parsed = kerno_core::config::parse_connection_url(placeholder).unwrap();
             assert_eq!(parsed.engine, engine, "{placeholder}");

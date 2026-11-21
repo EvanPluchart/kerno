@@ -361,6 +361,24 @@ pub trait Dialect: Send + Sync {
     fn isolation_sql(&self) -> &'static str {
         "SELECT @@transaction_isolation"
     }
+
+    /// The statement that opens a transaction. The default is the
+    /// standard's `START TRANSACTION`.
+    fn begin_sql(&self) -> &'static str {
+        "START TRANSACTION"
+    }
+
+    /// Whether the database stores routines (functions, procedures) and,
+    /// where the engine has them, scheduled events. SQLite has neither.
+    fn has_routines(&self) -> bool {
+        true
+    }
+
+    /// Whether `CREATE` and `ALTER` statements take part in a transaction
+    /// (PostgreSQL, SQLite) rather than committing it (MySQL).
+    fn transactional_ddl(&self) -> bool {
+        false
+    }
 }
 
 /// A transaction isolation level of the SQL standard, as DBeaver lists them

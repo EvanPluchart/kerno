@@ -190,7 +190,7 @@ impl Blocks {
     /// Takes the meaningful token at `index` into account.
     fn see(&mut self, source: &str, tokens: &[Token], index: usize, rules: LexRules) {
         let token = &tokens[index];
-        let mysql = rules.hash_comments;
+        let mysql = rules.begin_blocks;
         match self.state {
             Body::Start => {
                 self.state =
@@ -924,5 +924,21 @@ mod tests {
         // Past the end: the last one.
         assert_eq!(at(source.len()), Some("select 3"));
         assert_eq!(statement_at(&[], 0), None);
+    }
+
+    /// K29: a SQLite trigger's body stays in its statement; a bare BEGIN
+    /// is a transaction. Fails with `begin_blocks` off for SQLite.
+    #[test]
+    fn sqlite_trigger_bodies_stay_whole() {
+        let script = "BEGIN;\nCREATE TRIGGER t AFTER INSERT ON a BEGIN\n  UPDATE a SET x = 1;\n  \
+                      DELETE FROM b;\nEND;\nCOMMIT;";
+        assert_eq!(
+            texts(script, LexRules::SQLITE),
+            [
+                "BEGIN",
+                "CREATE TRIGGER t AFTER INSERT ON a BEGIN\n  UPDATE a SET x = 1;\n  DELETE FROM b;\nEND",
+                "COMMIT",
+            ]
+        );
     }
 }

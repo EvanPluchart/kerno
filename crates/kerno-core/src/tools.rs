@@ -156,12 +156,20 @@ impl ClientFamily {
     /// Both families, in the order the settings list them.
     pub const ALL: [ClientFamily; 2] = [Self::Postgres, Self::MySql];
 
-    /// The family whose tools reach `engine`.
-    pub fn of(engine: Engine) -> Self {
+    /// The family whose tools reach `engine`; `None` for SQLite, whose
+    /// files Kerno opens itself.
+    pub fn of(engine: Engine) -> Option<Self> {
         match engine {
-            Engine::Postgres => Self::Postgres,
-            Engine::MySql | Engine::MariaDb => Self::MySql,
+            Engine::Postgres => Some(Self::Postgres),
+            Engine::MySql | Engine::MariaDb => Some(Self::MySql),
+            Engine::Sqlite => None,
         }
+    }
+
+    /// [`ClientFamily::of`], with the refusal in words for an engine
+    /// without client tools.
+    pub fn required(engine: Engine) -> Result<Self> {
+        Self::of(engine).ok_or_else(|| Error::Unsupported(NO_CLIENT_TOOLS.into()))
     }
 
     /// Its tools; the first one present in a folder identifies the install
@@ -439,16 +447,23 @@ pub fn probe_client(dir: &Path, family: ClientFamily) -> Option<ClientInstall> {
         .find(|install| install.family == family)
 }
 
+/// Why an engine has no client tools in Kerno.
+pub const NO_CLIENT_TOOLS: &str = "SQLite has no client tools in Kerno: Kerno opens the file \
+     itself, and backing up or restoring a database file is still to come";
+
 /// Why no client can be used for a connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMissing {
-    pub family: ClientFamily,
+    /// `None`: the engine has no client tools at all (SQLite).
+    pub family: Option<ClientFamily>,
 }
 
 impl ClientMissing {
     /// What happened and what to do, in words.
     pub fn text(&self) -> String {
-        let family = self.family;
+        let Some(family) = self.family else {
+            return format!("{NO_CLIENT_TOOLS}.");
+        };
         format!(
             "No {} client was found: Kerno looked in Homebrew, Postgres.app, the EDB and Linux \
              package folders, $PATH, {} and the folders added in Settings ▸ Local clients. It is \
@@ -494,7 +509,9 @@ pub fn client_for<'a>(
     detected: &'a [ClientInstall],
     wanted: &ClientWanted,
 ) -> std::result::Result<ClientPick<'a>, ClientMissing> {
-    let family = ClientFamily::of(wanted.engine);
+    let Some(family) = ClientFamily::of(wanted.engine) else {
+        return Err(ClientMissing { family: None });
+    };
     let in_family = || {
         detected
             .iter()
@@ -529,7 +546,9 @@ pub fn client_for<'a>(
             rank(a).cmp(&rank(b)).then(std::cmp::Ordering::Greater)
         })
         .map(|install| ClientPick { install, ignored })
-        .ok_or(ClientMissing { family })
+        .ok_or(ClientMissing {
+            family: Some(family),
+        })
 }
 
 /// Whether a client suits a server.
@@ -615,6 +634,8 @@ pub fn compatibility(
                 }
             }
         }
+        // No client tools: no version to compare.
+        Engine::Sqlite => Compatibility::Unknown,
     }
 }
 
@@ -855,25 +876,28 @@ fn quote(text: &str) -> String {
     }
 }
 
-/// The tool that writes a backup of `engine`.
-pub fn backup_tool(engine: Engine) -> Tool {
+/// The tool that writes a backup of `engine`; `None` without client tools.
+pub fn backup_tool(engine: Engine) -> Option<Tool> {
     match engine {
-        Engine::Postgres => Tool::PgDump,
-        Engine::MySql | Engine::MariaDb => Tool::MysqlDump,
+        Engine::Postgres => Some(Tool::PgDump),
+        Engine::MySql | Engine::MariaDb => Some(Tool::MysqlDump),
+        Engine::Sqlite => None,
     }
 }
 
-/// The tool that restores a backup of `engine` written in `format`.
-pub fn restore_tool(engine: Engine, format: BackupFormat) -> Tool {
+/// The tool that restores a backup of `engine` written in `format`; `None`
+/// without client tools.
+pub fn restore_tool(engine: Engine, format: BackupFormat) -> Option<Tool> {
     match (engine, format) {
-        (Engine::Postgres, BackupFormat::Sql) => Tool::Psql,
-        (Engine::Postgres, _) => Tool::PgRestore,
-        (Engine::MySql | Engine::MariaDb, _) => Tool::Mysql,
+        (Engine::Postgres, BackupFormat::Sql) => Some(Tool::Psql),
+        (Engine::Postgres, _) => Some(Tool::PgRestore),
+        (Engine::MySql | Engine::MariaDb, _) => Some(Tool::Mysql),
+        (Engine::Sqlite, _) => None,
     }
 }
 
-/// The tool that runs a SQL script on `engine`.
-pub fn script_tool(engine: Engine) -> Tool {
+/// The tool that runs a SQL script on `engine`; `None` without client tools.
+pub fn script_tool(engine: Engine) -> Option<Tool> {
     restore_tool(engine, BackupFormat::Sql)
 }
 
@@ -1106,6 +1130,13 @@ impl BackupOptions {
                 EngineBackup::Postgres(PgBackup::default()),
             ),
             Engine::MySql | Engine::MariaDb => (
+                BackupFormat::Sql,
+                EngineBackup::MySql(MySqlBackup::default()),
+            ),
+            // No dump tool: `backup_command` refuses SQLite whatever the
+            // options say, and no wizard opens for it. A plain SQL file is
+            // what a SQLite backup will be once it comes (`.dump`).
+            Engine::Sqlite => (
                 BackupFormat::Sql,
                 EngineBackup::MySql(MySqlBackup::default()),
             ),
@@ -1680,8 +1711,8 @@ pub fn backup_command(
     options: &BackupOptions,
     output: &Path,
 ) -> Result<ToolCommand> {
-    let extra = extra_args(&options.extra_args, ClientFamily::of(params.engine))?;
-    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user));
+    let extra = extra_args(&options.extra_args, ClientFamily::required(params.engine)?)?;
+    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user))?;
     let args = &mut command.args;
     match (params.engine, &options.engine) {
         (Engine::Postgres, EngineBackup::Postgres(pg)) => {
@@ -1844,7 +1875,7 @@ pub fn global_backup_command(
         "excluded databases go with a backup of the databases, not of the globals only",
     )?;
     let extra = extra_args(&options.extra_args, ClientFamily::Postgres)?;
-    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user));
+    let mut command = connection_command(tool_path, &with_user(params, &options.auth_user))?;
     let args = &mut command.args;
     args.push("--verbose".into());
     if let Some(encoding) = options.encoding.as_deref().filter(|e| !e.is_empty()) {
@@ -1888,7 +1919,7 @@ pub fn restore_command(
             "restoring a backup writes to the database".into(),
         ));
     }
-    let family = ClientFamily::of(params.engine);
+    let family = ClientFamily::required(params.engine)?;
     let extra = extra_args(&options.extra_args, family)?;
     let archive_only = options.clean
         || options.if_exists
@@ -1917,7 +1948,7 @@ pub fn restore_command(
                     allow_client_commands: options.allow_client_commands,
                     tool_version: options.tool_version.as_ref(),
                 },
-            );
+            )?;
             if options.single_transaction {
                 let at = command
                     .args
@@ -1950,7 +1981,7 @@ pub fn restore_command(
                 options.disable_foreign_keys,
                 "foreign-key checks off is MySQL's",
             )?;
-            let mut command = connection_command(tool_path, &params);
+            let mut command = connection_command(tool_path, &params)?;
             let args = &mut command.args;
             args.push("--verbose".into());
             args.push(format!("--dbname={}", pg_dbname(&options.database)));
@@ -1988,7 +2019,7 @@ pub fn restore_command(
                     allow_client_commands: options.allow_client_commands,
                     tool_version: options.tool_version.as_ref(),
                 },
-            );
+            )?;
             if options.disable_foreign_keys {
                 command.args.push(FOREIGN_KEYS_OFF.into());
             }
@@ -1998,6 +2029,7 @@ pub fn restore_command(
         (Engine::MySql | Engine::MariaDb, _) => Err(Error::Unsupported(
             "MySQL backups are SQL scripts; the archive formats are PostgreSQL's".into(),
         )),
+        (Engine::Sqlite, _) => Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
 }
 
@@ -2018,7 +2050,7 @@ pub fn script_command(
     if params.read_only {
         return Err(Error::ReadOnly("a script can write to the database".into()));
     }
-    let family = ClientFamily::of(params.engine);
+    let family = ClientFamily::required(params.engine)?;
     let extra = extra_args(&options.extra_args, family)?;
     let mysql_only = options.log_level != ScriptLogLevel::Normal
         || options.no_beep
@@ -2037,7 +2069,7 @@ pub fn script_command(
             allow_client_commands: options.allow_client_commands,
             tool_version: options.tool_version.as_ref(),
         },
-    );
+    )?;
     let args = &mut command.args;
     match params.engine {
         Engine::Postgres => {
@@ -2060,6 +2092,7 @@ pub fn script_command(
                 }
             }
         }
+        Engine::Sqlite => return Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
     args.extend(extra);
     Ok(command)
@@ -2075,8 +2108,12 @@ struct SqlScript<'a> {
 
 /// `psql` or `mysql` reading a SQL file, its client commands kept off by
 /// the client's sandbox or by the check [`run`] makes first.
-fn sql_script_command(tool_path: &Path, params: &ConnectParams, script: &SqlScript) -> ToolCommand {
-    let mut command = connection_command(tool_path, params);
+fn sql_script_command(
+    tool_path: &Path,
+    params: &ConnectParams,
+    script: &SqlScript,
+) -> Result<ToolCommand> {
+    let mut command = connection_command(tool_path, params)?;
     let check = |tool| {
         (!script.allow_client_commands).then(|| ScriptCheck {
             tool,
@@ -2110,8 +2147,9 @@ fn sql_script_command(tool_path: &Path, params: &ConnectParams, script: &SqlScri
             }
             command.stdin = Some(script.input.to_path_buf());
         }
+        Engine::Sqlite => return Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
-    command
+    Ok(command)
 }
 
 /// The format of a backup to restore: a folder holding `toc.dat` is a
@@ -2152,7 +2190,7 @@ pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFo
 
 /// The program with the arguments and environment that say which server to
 /// reach, as whom, and over which TLS.
-fn connection_command(tool_path: &Path, params: &ConnectParams) -> ToolCommand {
+fn connection_command(tool_path: &Path, params: &ConnectParams) -> Result<ToolCommand> {
     let mut args = Vec::new();
     let mut env = Vec::new();
     let tunnelled = params.tunnel.is_some();
@@ -2188,12 +2226,13 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> ToolCommand {
             args.push(format!("--user={}", params.user));
             mysql_tls_args(is_mariadb_client(tool_path), &params.tls, &mut args);
         }
+        Engine::Sqlite => return Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
     let port_arg = args
         .iter()
         .position(|arg| arg.starts_with("--port="))
         .unwrap_or_default();
-    ToolCommand {
+    Ok(ToolCommand {
         program: tool_path.to_path_buf(),
         args,
         env,
@@ -2211,7 +2250,7 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> ToolCommand {
             port_arg,
         }),
         script_check: None,
-    }
+    })
 }
 
 fn pg_tls_env(tls: &TlsConfig, env: &mut Vec<(String, String)>) {
@@ -2952,7 +2991,7 @@ impl TaskSettings {
             Self::Restore(options) => &options.extra_args,
             Self::ExecuteScript(options) => &options.extra_args,
         };
-        extra_args(extra, ClientFamily::of(engine)).map(drop)
+        extra_args(extra, ClientFamily::required(engine)?).map(drop)
     }
 }
 
@@ -2974,6 +3013,7 @@ mod tests {
             user: "ada".into(),
             password: Some(Secret::new(PASSWORD)),
             database: Some("ignored".into()),
+            file: None,
             tls: TlsConfig::default(),
             read_only: false,
             options: BTreeMap::new(),
@@ -4663,18 +4703,21 @@ mod tests {
         // Each format goes to its tool.
         assert_eq!(
             restore_tool(Engine::Postgres, BackupFormat::Sql),
-            Tool::Psql
+            Some(Tool::Psql)
         );
         for format in [
             BackupFormat::Custom,
             BackupFormat::Directory,
             BackupFormat::Tar,
         ] {
-            assert_eq!(restore_tool(Engine::Postgres, format), Tool::PgRestore);
+            assert_eq!(
+                restore_tool(Engine::Postgres, format),
+                Some(Tool::PgRestore)
+            );
         }
         assert_eq!(
             restore_tool(Engine::MariaDb, BackupFormat::Sql),
-            Tool::Mysql
+            Some(Tool::Mysql)
         );
     }
 
@@ -4894,12 +4937,16 @@ mod tests {
                     default_dir: None
                 }
             ),
-            Err(ClientMissing { family: MySql })
+            Err(ClientMissing {
+                family: Some(MySql)
+            })
         );
         assert!(
-            ClientMissing { family: MySql }
-                .text()
-                .contains("brew install mysql-client")
+            ClientMissing {
+                family: Some(MySql)
+            }
+            .text()
+            .contains("brew install mysql-client")
         );
     }
 

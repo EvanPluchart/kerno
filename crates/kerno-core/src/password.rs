@@ -493,6 +493,10 @@ pub async fn resolve(
     database: Option<&str>,
     env: Option<&PasswordEnv>,
 ) -> Result<Resolved> {
+    // A database file has no password: nothing is read, run or asked.
+    if config.engine.is_file() {
+        return Ok(Resolved::default());
+    }
     if let Some(line) = command_line(config, database) {
         if config.password_command_unconfirmed {
             return Err(Error::Config(format!(
@@ -524,6 +528,7 @@ pub async fn resolve(
             .clone()
             .unwrap_or_else(|| home.join(".pgpass")),
         Engine::MySql | Engine::MariaDb => home.join(".my.cnf"),
+        Engine::Sqlite => return Ok(Resolved::default()),
     };
     let text = match read_file(&file, env, config.engine).await {
         Ok(Some(text)) => text,
@@ -547,6 +552,7 @@ pub async fn resolve(
             pgpass_password(&text, &config.host, config.port, database, &config.user)
         }
         Engine::MySql | Engine::MariaDb => my_cnf_password(&text),
+        Engine::Sqlite => None,
     };
     Ok(Resolved {
         origin: password

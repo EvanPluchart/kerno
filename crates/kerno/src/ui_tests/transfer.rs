@@ -32,6 +32,9 @@ async fn session(engine: Engine) -> Arc<dyn Session> {
     match engine {
         Engine::Postgres => kerno_postgres::PostgresDriver.connect(&params).await,
         Engine::MySql | Engine::MariaDb => kerno_mysql::MysqlDriver.connect(&params).await,
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
     .expect("the test server")
 }

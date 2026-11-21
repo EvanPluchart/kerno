@@ -8,6 +8,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 ## Contents
 
 - [Supported servers](#supported-servers)
+- [SQLite](#sqlite)
 - [SSH](#ssh)
 - [Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf](#passwords-from-a-command-aws-rds-iam-1password-pgpass-and-mycnf)
 - [Open a connection from the shell](#open-a-connection-from-the-shell)
@@ -58,6 +59,32 @@ something Kerno offers, Kerno says so in words that name the release it needs, i
 MariaDB releases before 11 share some of these gaps (database comments 10.5, `RENAME COLUMN` 10.5.2, check
 constraints with their table 10.3.10, JSON columns 10.4.3, `information_schema.SYSTEM_VARIABLES` 10.1.1): Kerno
 uses the same facts for them, but only MariaDB 11 is tested. MySQL 5.0 and older are not supported.
+
+## SQLite
+
+A SQLite database is a file, and Kerno opens it itself: there is no server, host, port, user or password. In
+the new-connection dialog, pick SQLite, then either **Choose…** an existing file or **New file…** to make an
+empty database (a path that is there already is opened as it is, never emptied). Test connection opens the file
+and names SQLite's version. A file that is missing, is not a SQLite database, is locked by another program, or
+that you may only read is said in plain words first, SQLite's own message below; tick Read-only to open a file
+you may not write, or to make sure nothing writes to it.
+
+Under the connection the tree shows `main` (the file), then its tables, views and triggers, each table's columns
+and indexes. Queries, the grid, table data editing, the structure tabs, the table form, exports and CSV import
+work as on the other engines, with these differences:
+
+- SQLite types each value, not each column: the grid shows each cell as it is stored (a number as a number, a
+  blob in hex), the header the column's declared type. A DATE, BOOLEAN or JSON column gets its rendering only
+  when its values are stored that way; a date kept as a Unix time shows as a number.
+- The table form renames the table, renames, adds and drops columns, and creates and drops indexes. Changing a
+  column's type, NULL or default, the keys or a column's place needs the table rebuilt, which Kerno does not do
+  yet: it says so instead of trying.
+- Explain shows SQLite's query plan; there is no EXPLAIN ANALYZE.
+- While a result is still being read in one tab, the file is held for reading: a write from another tab waits
+  five seconds, then fails with "database is locked". Read the result to its end or close it first.
+- Not there yet: backup and restore, the Tools ▸ menu (ANALYZE, VACUUM, integrity check), the administration
+  tab, copying tables to or from another connection, opening a file from the shell (`kerno shop.db`),
+  attached databases, and editing the rows of a query result (a table's data tab edits them).
 
 ## SSH
 

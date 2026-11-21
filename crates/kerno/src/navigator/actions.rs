@@ -436,13 +436,18 @@ impl ToolEntry {
 /// node ([`tools`]). Only databases, schemas, tables, views and triggers
 /// have the menu; a connection has no maintenance group (its tools act on
 /// objects of the tree). The reasons are left to [`tools_now`]: what the
-/// connection's state forbids.
+/// connection's state forbids. An engine without client tools (SQLite) has
+/// no Tools ▸ at all yet: its engine tools are still to come (D-102).
 pub fn tool_entries(
     node: Option<&Node>,
-    has_schemas: bool,
+    engine: kerno_core::Engine,
     maintenance: &[Maintenance],
 ) -> ToolGroups {
     use ToolEntry::*;
+    let Some(family) = kerno_core::tools::ClientFamily::of(engine) else {
+        return Vec::new();
+    };
+    let has_schemas = family == kerno_core::tools::ClientFamily::Postgres;
     let object = match node.map(|node| &node.kind) {
         None => None,
         Some(NodeKind::Object(
@@ -1283,7 +1288,7 @@ mod tests {
     /// with its reason.
     fn tool_labels(node: Option<&Node>, dialect: &dyn Dialect) -> Vec<String> {
         let offered = node.map(|node| tools(node, dialect)).unwrap_or_default();
-        tool_entries(node, dialect.has_schemas(), &offered)
+        tool_entries(node, dialect.engine(), &offered)
             .into_iter()
             .map(|group| {
                 group

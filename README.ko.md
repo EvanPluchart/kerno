@@ -7,7 +7,7 @@
 
 <p align="center">
   macOS와 Linux용 빠른 네이티브 데이터베이스 클라이언트입니다.<br>
-  PostgreSQL, MySQL, MariaDB를 지원합니다. Rust로 작성되었으며 오픈 소스입니다.
+  PostgreSQL, MySQL, MariaDB, SQLite를 지원합니다. Rust로 작성되었으며 오픈 소스입니다.
 </p>
 
 <p align="center">

@@ -229,6 +229,14 @@ pub enum FailureKind {
     SshForward,
     /// The saved password could not be read from the system secret store.
     SecretStore,
+    /// A database file (SQLite) is not where the connection says.
+    FileMissing,
+    /// The file is not a database Kerno can open.
+    NotADatabase,
+    /// Another connection or program holds the file locked.
+    FileLocked,
+    /// The file may only be read, and the connection would write.
+    FileReadOnly,
     /// Anything else: only the raw message says what happened.
     Other,
 }
@@ -311,7 +319,9 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
     };
     let ssh_user = ssh.map(|ssh| ssh.user.as_str()).unwrap_or_default();
 
-    let (kind, headline, next_step) = if let Some(words) = password_words(raw) {
+    let (kind, headline, next_step) = if config.engine.is_file() {
+        file_words(raw, config)
+    } else if let Some(words) = password_words(raw) {
         words
     } else if let Some(ssh_text) = raw.split_once("SSH tunnel: ") {
         let ssh_text = ssh_text.1;
@@ -781,6 +791,48 @@ fn secret_store_words(text: &str) -> (FailureKind, String, String) {
         )
     };
     (FailureKind::SecretStore, headline, next)
+}
+
+/// A database file's failure (SQLite), from the words its driver opens
+/// with; the raw message follows them.
+fn file_words(
+    raw: &str,
+    config: &crate::config::ConnectionConfig,
+) -> (FailureKind, String, String) {
+    let file = config
+        .file
+        .as_ref()
+        .map(|file| file.display().to_string())
+        .unwrap_or_default();
+    let (kind, headline, next) = if raw.contains("the database file does not exist") {
+        (
+            FailureKind::FileMissing,
+            format!("The file “{file}” does not exist."),
+            "Check the path, or make a new database with New file…",
+        )
+    } else if raw.contains("the file is not a SQLite database") {
+        (
+            FailureKind::NotADatabase,
+            format!("“{file}” is not a SQLite database."),
+            "Choose the database file itself; an encrypted or damaged file cannot be opened.",
+        )
+    } else if raw.contains("the database file is locked") || raw.contains("database is locked") {
+        (
+            FailureKind::FileLocked,
+            format!("The file “{file}” is locked by another connection or program."),
+            "Finish or close what holds it (an open transaction, another app), then connect again.",
+        )
+    } else if raw.contains("the database file can only be read") {
+        (
+            FailureKind::FileReadOnly,
+            format!("Kerno may only read “{file}”."),
+            "Turn Read-only on to open it as it is, or give yourself write permission on the file \
+             and its folder.",
+        )
+    } else {
+        return other();
+    };
+    (kind, headline, next.to_string())
 }
 
 fn other() -> (FailureKind, String, String) {
@@ -1356,5 +1408,49 @@ mod tests {
             explain(refused, &config).next_step,
             "Check the user name and the password."
         );
+    }
+
+    /// K29: a database file's failures in plain words first, SQLite's
+    /// message kept as the raw text.
+    #[test]
+    fn a_file_s_failures_are_told_plainly() {
+        use crate::config::Engine;
+        let config = ConnectionConfig {
+            file: Some("/data/shop.db".into()),
+            ..ConnectionConfig::new(Engine::Sqlite)
+        };
+        let cases = [
+            (
+                "could not connect: the database file does not exist: /data/shop.db",
+                FailureKind::FileMissing,
+                "The file “/data/shop.db” does not exist.",
+            ),
+            (
+                "could not connect: the file is not a SQLite database: /data/shop.db (file is not a \
+                 database)",
+                FailureKind::NotADatabase,
+                "“/data/shop.db” is not a SQLite database.",
+            ),
+            (
+                "could not connect: the database file is locked: /data/shop.db (database is locked)",
+                FailureKind::FileLocked,
+                "The file “/data/shop.db” is locked by another connection or program.",
+            ),
+            (
+                "could not connect: the database file can only be read: /data/shop.db is read-only",
+                FailureKind::FileReadOnly,
+                "Kerno may only read “/data/shop.db”.",
+            ),
+        ];
+        for (raw, kind, headline) in cases {
+            let explained = explain(raw, &config);
+            assert_eq!(
+                (explained.kind, explained.headline.as_str()),
+                (kind, headline)
+            );
+            assert!(!explained.next_step.is_empty());
+            assert_eq!(explained.raw, raw);
+        }
+        assert_eq!(explain("something else", &config).kind, FailureKind::Other);
     }
 }

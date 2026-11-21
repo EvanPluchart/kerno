@@ -515,7 +515,8 @@ impl Navigator {
             connection.to_string(),
             Browse {
                 root: Root::Loading,
-                tree: Tree::new(meta.dialect().has_schemas()),
+                tree: Tree::new(meta.dialect().has_schemas())
+                    .with_routines(meta.dialect().has_routines()),
                 sessions: HashMap::new(),
                 stops: HashMap::new(),
                 loading: HashMap::new(),
@@ -1591,6 +1592,13 @@ impl Navigator {
             {
                 Some("not supported by this database")
             }
+            // SQLite: a database is a file, and has no schemas.
+            (Action::CreateDatabase, _) if dialect.create_database_sql("name").is_err() => {
+                Some("a SQLite database is a file: use New file… in a new connection")
+            }
+            (Action::CreateSchema, _) if dialect.create_schema_sql("name").is_err() => {
+                Some("this database has no schemas")
+            }
             // PostgreSQL cannot drop the database a session is in.
             (Action::Drop, Some(ObjectRef::Database(name)))
                 if dialect.has_schemas() && meta.database().as_deref() == Some(name.as_str()) =>
@@ -1662,11 +1670,11 @@ impl Navigator {
 
     /// Tools ▸ of `node` for its kind (see [`tool_entries`]).
     fn tool_entries_of(&self, connection: &str, node: &Node, cx: &App) -> ToolGroups {
-        let offered = self
-            .meta(connection, cx)
-            .map(|meta| tools(node, meta.dialect()))
-            .unwrap_or_default();
-        tool_entries(Some(node), self.has_schemas(connection, cx), &offered)
+        let Some(meta) = self.meta(connection, cx) else {
+            return Vec::new();
+        };
+        let offered = tools(node, meta.dialect());
+        tool_entries(Some(node), meta.engine(), &offered)
     }
 
     /// Tools ▸ of `node` as its menu shows it: each entry with why it

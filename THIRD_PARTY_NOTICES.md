@@ -41,10 +41,11 @@ not alter them.
 | `postgresql.svg` | PostgreSQL elephant ("Slonik"), official three-colour artwork | https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg (listed on https://wiki.postgresql.org/wiki/Logo) | `51f93e19516081fc7d6fe6ab9bbab07abe5f7819e28016eefacea6dea691bc54` |
 | `mysql.svg` | MySQL logo (dolphin and wordmark), official colours | https://www.mysql.com/common/logos/mysql-logo.svg (the artwork of https://www.mysql.com/about/legal/logos.html) | `974bf440a8a42e7783d3896cf9b326f3d73bc7305a27febf45cef0e91b53e595` |
 | `mariadb.svg` | MariaDB sea lion, single colour | Simple Icons 15.22.0, `icons/mariadb.svg` (https://simpleicons.org, artwork files released under CC0-1.0) | `477435746bb2024048c7b71529f615fb70d7e679618f37bac49f78fd07e67dfe` |
+| `sqlite.svg` | SQLite feather, single colour | Simple Icons 15.22.0, `icons/sqlite.svg` (https://raw.githubusercontent.com/simple-icons/simple-icons/15.22.0/icons/sqlite.svg, artwork files released under CC0-1.0) | `71d4153bc9661dfe6b92dad70f737ec2b6c7c839311e502b4ca66fe664fe12b6` |
 
-The PostgreSQL and MySQL logos keep their official colours. The MariaDB mark is single-colour and is drawn in
-one flat colour, dark on light surfaces and light on dark ones, as the vendor's own black and reversed
-variants are.
+The PostgreSQL and MySQL logos keep their official colours. The MariaDB and SQLite marks are single-colour and
+are drawn in one flat colour, dark on light surfaces and light on dark ones, as the vendors' own black and
+reversed variants are.
 
 Trademark notices:
 
@@ -54,6 +55,8 @@ Trademark notices:
 - MySQL is a registered trademark of Oracle and/or its affiliates. Logo policy:
   https://www.mysql.com/about/legal/logos.html
 - MariaDB is a registered trademark of MariaDB plc or its affiliates. Logo page: https://mariadb.com/about-us/logos/
+- SQLite is a registered trademark of Hipp, Wyrick & Company, Inc. The SQLite source code itself is in the
+  public domain (https://www.sqlite.org/copyright.html); Kerno embeds it through `libsqlite3-sys`.
 
 ## UI framework
 

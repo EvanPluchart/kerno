@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::config::Engine;
 use crate::driver::{Session, TxState};
 use crate::error::{Error, Result};
 use crate::exec;
@@ -391,9 +390,8 @@ pub async fn import_csv(
         Target::Existing(_) => Vec::new(),
         Target::New { table, columns } => create_table_sql(dialect, table, columns)?,
     };
-    // ponytail: PostgreSQL is the one engine here with transactional DDL;
-    // make it a Dialect property when a third engine arrives.
-    let create_first = !create.is_empty() && session.engine() != Engine::Postgres;
+    // A `CREATE` that commits (MySQL) runs before the transaction of rows.
+    let create_first = !create.is_empty() && !dialect.transactional_ddl();
     if create_first {
         for sql in &create {
             run(&session, sql).await?;
@@ -402,7 +400,7 @@ pub async fn import_csv(
 
     let mut inserted = 0;
     let outcome: Result<Option<ImportFailure>> = async {
-        run(&session, "START TRANSACTION").await?;
+        run(&session, session.dialect().begin_sql()).await?;
         if !create_first {
             for sql in &create {
                 run(&session, sql).await?;

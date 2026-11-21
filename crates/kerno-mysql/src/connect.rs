@@ -483,6 +483,7 @@ mod tests {
             user: "kerno".into(),
             password: Some(Secret::new("pw")),
             database: None,
+            file: None,
             tls,
             read_only: false,
             options: BTreeMap::new(),

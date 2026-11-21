@@ -13,6 +13,9 @@ fn now(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "now()",
         Engine::MySql | Engine::MariaDb => "NOW()",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -21,6 +24,9 @@ fn new_uuid(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "gen_random_uuid()",
         Engine::MySql | Engine::MariaDb => "UUID()",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -29,6 +35,9 @@ fn uuid_type(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "uuid",
         Engine::MySql | Engine::MariaDb => "CHAR(36)",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -158,6 +167,9 @@ fn a_cell_takes_a_sql_expression_and_shows_what_the_server_made_of_it(cx: &mut T
         let stamp = match engine {
             Engine::Postgres => "timestamp(6)",
             Engine::MySql | Engine::MariaDb => "DATETIME(6)",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         let _scratch = Scratch::new(
             engine,
@@ -210,6 +222,9 @@ fn a_cell_takes_a_sql_expression_and_shows_what_the_server_made_of_it(cx: &mut T
         let recent = match engine {
             Engine::Postgres => "stamp > now() - interval '1 minute'",
             Engine::MySql | Engine::MariaDb => "stamp > NOW() - INTERVAL 1 MINUTE",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         assert_eq!(
             server(&format!(
@@ -267,6 +282,9 @@ fn a_new_row_takes_default_and_a_new_uuid(cx: &mut TestAppContext) {
         let id_default = match engine {
             Engine::Postgres => "DEFAULT gen_random_uuid()",
             Engine::MySql | Engine::MariaDb => "DEFAULT (UUID())",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         let _scratch = Scratch::new(
             engine,

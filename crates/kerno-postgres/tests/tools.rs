@@ -175,7 +175,7 @@ async fn round_trips(session: Arc<dyn Session>, dir: PathBuf) {
         assert!(log.iter().any(|line| line.contains("notes")), "{log:#?}");
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
 
-        let tool = tools::restore_tool(Engine::Postgres, format);
+        let tool = tools::restore_tool(Engine::Postgres, format).expect("a client tool");
         let restore = tools::restore_command(
             &dir.join(tool.names()[0]),
             &params,

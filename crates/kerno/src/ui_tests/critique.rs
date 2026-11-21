@@ -217,10 +217,16 @@ impl Locker {
                 "SELECT CONNECTION_ID()",
                 vec![format!("LOCK TABLES {table} WRITE")],
             ),
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         let unlock = match engine {
             Engine::Postgres => "ROLLBACK",
             Engine::MySql | Engine::MariaDb => "UNLOCK TABLES",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         let (locked, held) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -239,6 +245,9 @@ impl Locker {
                     Engine::MySql | Engine::MariaDb => {
                         kerno_mysql::MysqlDriver.connect(&params).await
                     }
+                    kerno_core::Engine::Sqlite => unreachable!(
+                        "SQLite has no test server: these tests run on the server engines"
+                    ),
                 }
                 .expect("the test server");
                 let id = kerno_core::exec::collect(session.clone(), own_id)
@@ -293,6 +302,9 @@ impl Locker {
                 "SELECT count(*) FROM sys.schema_table_lock_waits WHERE blocking_pid = {}",
                 self.id
             ),
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         on_server(self.engine, &sql) != "0"
     }
@@ -312,6 +324,9 @@ impl Drop for Locker {
             let sql = match self.engine {
                 Engine::Postgres => format!("SELECT pg_terminate_backend({})", self.id),
                 Engine::MySql | Engine::MariaDb => format!("KILL CONNECTION {}", self.id),
+                kerno_core::Engine::Sqlite => {
+                    unreachable!("SQLite has no test server: these tests run on the server engines")
+                }
             };
             let engine = self.engine;
             // A failure here must not abort a test that is already failing.
@@ -340,6 +355,9 @@ fn k2_path(engine: Engine, name: &str) -> Vec<&str> {
     match engine {
         Engine::Postgres => vec!["kerno", name, "Tables", "t"],
         Engine::MySql | Engine::MariaDb => vec![name, "Tables", "t"],
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -658,6 +676,9 @@ fn k3_sql(engine: Engine, place: &str) -> (String, &'static str) {
         Engine::MySql | Engine::MariaDb => {
             (format!("use {place}"), "select database(), connection_id()")
         }
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -717,6 +738,9 @@ fn k3_moves_and_survives_a_reconnect(cx: &mut TestAppContext, engine: Engine, pl
     let unmoved = match engine {
         Engine::Postgres => "set statement_timeout to 0",
         Engine::MySql | Engine::MariaDb => "set @kerno_ui_k3 = 1",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     assert_eq!(k3_run(&app, cx, unmoved), ["done"], "{engine:?}");
     let messages = cx.update(|cx| tab.read(cx).messages());
@@ -731,6 +755,9 @@ fn k3_moves_and_survives_a_reconnect(cx: &mut TestAppContext, engine: Engine, pl
     let (what, how) = match engine {
         Engine::Postgres => ("schema", "search_path"),
         Engine::MySql | Engine::MariaDb => ("database", "USE"),
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     let messages = cx.update(|cx| tab.read(cx).messages());
     assert!(
@@ -767,6 +794,9 @@ fn k3_moves_and_survives_a_reconnect(cx: &mut TestAppContext, engine: Engine, pl
                 target.and_then(|target| match engine {
                     Engine::Postgres => target.schema,
                     Engine::MySql | Engine::MariaDb => target.database,
+                    kerno_core::Engine::Sqlite => unreachable!(
+                        "SQLite has no test server: these tests run on the server engines"
+                    ),
                 })
             }
             _ => None,
@@ -803,6 +833,9 @@ fn k3_moves_and_survives_a_reconnect(cx: &mut TestAppContext, engine: Engine, pl
     let kill = match engine {
         Engine::Postgres => format!("SELECT pg_terminate_backend({first_id})"),
         Engine::MySql | Engine::MariaDb => format!("KILL {first_id}"),
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     on_server(engine, &kill);
     let (now, second_id) = k3_where(&app, cx, engine);
@@ -1010,6 +1043,9 @@ fn the_transaction_badge_goes_when_it_ends(cx: &mut TestAppContext) {
         let begin = match engine {
             Engine::Postgres => "begin",
             Engine::MySql | Engine::MariaDb => "start transaction",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         assert_eq!(k3_run(&app, cx, begin), ["done"], "{engine:?}");
         assert_eq!(app.tx_state(cx), Open, "{engine:?}");
@@ -1106,6 +1142,9 @@ fn a_transaction_ended_behind_another_tab_leaves_the_strip(cx: &mut TestAppConte
         let sleep = match engine {
             Engine::Postgres => "select pg_sleep(1) as kerno_ui_k4_behind;\ncommit",
             Engine::MySql | Engine::MariaDb => "select sleep(1) as kerno_ui_k4_behind;\ncommit",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         app.press(cx, &["secondary-a", "backspace"]);
         app.type_text(cx, sleep);
@@ -1136,6 +1175,9 @@ fn a_transaction_begun_in_a_script_is_dated_from_its_begin(cx: &mut TestAppConte
             Engine::Postgres => ("begin", "select pg_sleep(2) as kerno_ui_k4_script"),
             Engine::MySql | Engine::MariaDb => {
                 ("start transaction", "select sleep(2) as kerno_ui_k4_script")
+            }
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
             }
         };
         for manual in [false, true] {
@@ -1219,6 +1261,9 @@ fn a_lost_connection_takes_the_badge_away(cx: &mut TestAppContext) {
         let own = match engine {
             Engine::Postgres => "select pg_backend_pid()::text",
             Engine::MySql | Engine::MariaDb => "select connection_id()",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         app.open_transaction(cx, own);
         let id = app.result(cx, 0, 1).1[0][0].clone().unwrap();
@@ -1228,6 +1273,9 @@ fn a_lost_connection_takes_the_badge_away(cx: &mut TestAppContext) {
             &match engine {
                 Engine::Postgres => format!("SELECT pg_terminate_backend({id})"),
                 Engine::MySql | Engine::MariaDb => format!("KILL {id}"),
+                kerno_core::Engine::Sqlite => {
+                    unreachable!("SQLite has no test server: these tests run on the server engines")
+                }
             },
         );
         k3_run(&app, cx, "select 1");
@@ -1425,6 +1473,9 @@ fn k5_begin(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "begin",
         Engine::MySql | Engine::MariaDb => "start transaction",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -1612,6 +1663,9 @@ fn set_as_default_asks_before_rolling_back(cx: &mut TestAppContext) {
         let (path, other, kind): (Vec<&str>, Vec<&str>, &str) = match engine {
             Engine::Postgres => (vec!["kerno", first], vec!["kerno", second], "schema"),
             Engine::MySql | Engine::MariaDb => (vec![first], vec![second], "database"),
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         let place = |app: &Fixture, cx: &mut TestAppContext| {
             let tab = app.tab(cx);
@@ -1619,6 +1673,9 @@ fn set_as_default_asks_before_rolling_back(cx: &mut TestAppContext) {
                 tab.read(cx).target().and_then(|target| match engine {
                     Engine::Postgres => target.schema.clone(),
                     Engine::MySql | Engine::MariaDb => target.database.clone(),
+                    kerno_core::Engine::Sqlite => unreachable!(
+                        "SQLite has no test server: these tests run on the server engines"
+                    ),
                 })
             })
         };
@@ -2107,6 +2164,9 @@ fn deleting_a_connection_unbinds_its_query_tabs_and_closes_the_others(cx: &mut T
         let sleep = match engine {
             Engine::Postgres => format!("select '{marker}', pg_sleep(60)"),
             Engine::MySql | Engine::MariaDb => format!("select '{marker}', sleep(60)"),
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         app.type_text(cx, &sleep);
         app.press(cx, &["secondary-enter"]);
@@ -2861,6 +2921,9 @@ fn k10_slow_rows(engine: Engine, marker: &str) -> String {
             "select id as {marker}, username from kerno_analytics.big_table \
              where id <= 4000 and if(id <= 1000, 0, sleep(0.02)) = 0"
         ),
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -3295,6 +3358,9 @@ fn k12_a_routine_typed_without_delimiter(cx: &mut TestAppContext, engine: Engine
             ),
             format!("DROP PROCEDURE {name}.p"),
         ),
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     let script = format!("{routine}\n  DELETE FROM {name}.t;\n  SELECT 2;\nEND;\nSELECT 3;");
     let stored = |what: &str| {
@@ -3566,6 +3632,9 @@ fn k14_path<'a>(engine: Engine, name: &'a str, table: &'a str) -> Vec<&'a str> {
     match engine {
         Engine::Postgres => vec!["kerno", name, "Tables", table],
         Engine::MySql | Engine::MariaDb => vec![name, "Tables", table],
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -4346,6 +4415,9 @@ fn k16_own_id(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "select pg_backend_pid()::text",
         Engine::MySql | Engine::MariaDb => "select connection_id()",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -4354,6 +4426,9 @@ fn k16_end(engine: Engine, id: &str) -> String {
     match engine {
         Engine::Postgres => format!("SELECT pg_terminate_backend({id})"),
         Engine::MySql | Engine::MariaDb => format!("KILL {id}"),
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 
@@ -4421,6 +4496,9 @@ fn a_tab_whose_session_the_server_closed_says_so_before_commit(cx: &mut TestAppC
         let why = match engine {
             Engine::Postgres => "An administrator ended it (pg_terminate_backend)",
             Engine::MySql | Engine::MariaDb => "or it was killed",
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         assert!(
             details.iter().any(|detail| detail.contains(why)),
@@ -4477,6 +4555,9 @@ fn the_server_s_idle_timeout_still_closes_a_watched_session(cx: &mut TestAppCont
                 "(idle_in_transaction_session_timeout)",
             ),
             Engine::MySql | Engine::MariaDb => ("set session wait_timeout = 2", "wait_timeout"),
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
         };
         assert_eq!(k3_run(&app, cx, timeout), ["done"], "{engine:?}");
         app.open_transaction(cx, &format!("insert into {name}.t values (1)"));
@@ -4728,6 +4809,9 @@ fn an_idle_tab_whose_session_died_runs_on_a_new_one(cx: &mut TestAppContext) {
                         }
                         Engine::MySql | Engine::MariaDb => format!(
                             "SELECT count(*) FROM information_schema.PROCESSLIST WHERE ID = {id}"
+                        ),
+                        kerno_core::Engine::Sqlite => unreachable!(
+                            "SQLite has no test server: these tests run on the server engines"
                         ),
                     },
                 ) == "0"

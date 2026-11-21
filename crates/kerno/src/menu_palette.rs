@@ -532,7 +532,10 @@ fn every_entry() -> Vec<Found> {
             },
         ] {
             let entries = sidebar::menu(&subject, &status, &["Work".into()], None, 1, true, true);
-            let entries = sidebar::with_tools(entries, tool_entries(None, true, &[]));
+            let entries = sidebar::with_tools(
+                entries,
+                tool_entries(None, kerno_core::Engine::Postgres, &[]),
+            );
             walk_sidebar(&subject, entries, &mut found);
         }
     }
@@ -542,8 +545,8 @@ fn every_entry() -> Vec<Found> {
         &mut found,
     );
     // Tools ▸ of a connection (the toolbar's Tools) on both dialects.
-    for postgres in [true, false] {
-        for (entry, _) in tool_entries(None, postgres, &[]).concat() {
+    for engine in [kerno_core::Engine::Postgres, kerno_core::Engine::MySql] {
+        for (entry, _) in tool_entries(None, engine, &[]).concat() {
             found.push(("toolbar Tools", entry.label(), tool_entry(false, &entry)));
         }
     }

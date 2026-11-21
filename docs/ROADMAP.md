@@ -15,11 +15,14 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
    pending-edit SQL and its transactional apply. No trait change.
 3. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
    `LIMIT/OFFSET`; its output is SQL text in a query tab. No trait change.
-4. **SQLite** as the first engine beyond v1 (it needs no server). A new `Engine` variant and a
-   `kerno-sqlite` crate following the walkthrough in ARCHITECTURE.md. It stresses the trait where PostgreSQL
-   and MySQL do not: there is no host, port, user or tunnel (`ConnectParams` and the connection form gain a
-   file-path variant), `has_schemas` is false, cancel is an interrupt of the running statement, and
-   `admin_query` returns `None` for the views it has no equivalent of.
+4. **SQLite**: built (K29, D-102; see below), still to come for it: backup and restore (`VACUUM INTO`,
+   `.dump`); the engine's tools under Tools ▸ (ANALYZE, VACUUM, integrity check); copying tables to or from a
+   SQLite connection (J13 needs a type mapping of its own); opening a file from the shell (`kerno shop.db`,
+   `sqlite://` URLs); attached databases and `temp`; the 12-step table rebuild behind the alters SQLite cannot
+   do in place (a column's type, NULL, default, keys, a column's place); keying a keyless table on `rowid`;
+   editing the rows of a query result (column origins, `column_metadata`); loadable extensions; check
+   constraints in the structure tabs; a column whose rows mix storage classes shown cell by cell (the result
+   model has one kind per column).
 5. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
    brings its own `Dialect` (quoting, `LIMIT` or `TOP`/`FETCH`, `explain`, `parse_plan`), its introspection
    queries, a `TypeKind` mapping and a cancel mechanism. Where a feature has no equivalent, the provided
@@ -37,6 +40,11 @@ Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47
 from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
 **AI assistant** (TOOL-24; J17, D-068), opt-in and local first; left for later: streaming answers, per-connection opt-out, tool calls.
 Their FEATURES rows are J18 and J17.
+**SQLite** (item 4; K29, D-102), the first engine beyond v1: a `kerno-sqlite` crate on the bundled `rusqlite`,
+a connection that is a file (`ConnectionConfig::file`), `has_schemas` false with one database `main`, cancel as
+SQLite's interrupt, `admin_query` `None` for every view, and the capabilities it needed added to the trait with
+defaults (`Dialect::begin_sql`, `transactional_ddl`, `has_routines`, `ExecSink::stop_signal`). Its FEATURES row
+is K29.
 
 ## Limits found on the way
 
@@ -82,8 +90,8 @@ v1.1 (CLAUDE.md §4 J, `docs/plans/M11.md`). What was left out, and why:
   for (`admin_query`, `table_structure`).
 - **Schema compare and data compare** (items 1 and 2 above), **notebooks, PRQL, an HTTP proxy for
   connections, Emacs keys, real bind parameters.** Low demand in the sample.
-- **Other engines** (MongoDB, Oracle, SQL Server, ClickHouse, SQLite…). The biggest block of demand and out
-  of v1's scope: items 4 and 5 above, through the driver layer.
+- **Other engines** (MongoDB, Oracle, SQL Server, ClickHouse…). The biggest block of demand and out
+  of v1's scope: item 5 above, through the driver layer (SQLite, item 4, is built: K29).
 
 ## From the general critique of DBeaver (triage of 2026-11-17): not now
 

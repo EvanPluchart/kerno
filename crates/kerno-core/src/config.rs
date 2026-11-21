@@ -22,11 +22,18 @@ pub enum Engine {
     /// MariaDB.
     #[serde(rename = "mariadb")]
     MariaDb,
+    /// SQLite: a database in one file, opened by Kerno itself (no server).
+    Sqlite,
 }
 
 impl Engine {
     /// Every engine, in the order the engine picker shows them.
-    pub const ALL: [Engine; 3] = [Engine::Postgres, Engine::MySql, Engine::MariaDb];
+    pub const ALL: [Engine; 4] = [
+        Engine::Postgres,
+        Engine::MySql,
+        Engine::MariaDb,
+        Engine::Sqlite,
+    ];
 
     /// Name shown to the user.
     pub fn label(self) -> &'static str {
@@ -34,22 +41,43 @@ impl Engine {
             Self::Postgres => "PostgreSQL",
             Self::MySql => "MySQL",
             Self::MariaDb => "MariaDB",
+            Self::Sqlite => "SQLite",
         }
     }
 
-    /// The engine's standard port.
+    /// Whether a connection is a database file on this computer rather
+    /// than a server: no host, port, user, password, TLS or SSH tunnel.
+    pub fn is_file(self) -> bool {
+        match self {
+            Self::Postgres | Self::MySql | Self::MariaDb => false,
+            Self::Sqlite => true,
+        }
+    }
+
+    /// Whether tables and columns can carry a comment. SQLite has none.
+    pub fn has_comments(self) -> bool {
+        match self {
+            Self::Postgres | Self::MySql | Self::MariaDb => true,
+            Self::Sqlite => false,
+        }
+    }
+
+    /// The engine's standard port; 0 for an engine without a server.
     pub fn default_port(self) -> u16 {
         match self {
             Self::Postgres => 5432,
             Self::MySql | Self::MariaDb => 3306,
+            Self::Sqlite => 0,
         }
     }
 
-    /// The user name the engine's own tools default to.
+    /// The user name the engine's own tools default to; empty for an
+    /// engine without users.
     pub fn default_user(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
             Self::MySql | Self::MariaDb => "root",
+            Self::Sqlite => "",
         }
     }
 
@@ -229,6 +257,9 @@ pub struct ConnectionConfig {
     /// Database opened at connect; the engine's default when empty.
     #[serde(default)]
     pub database: Option<String>,
+    /// SQLite: the database file. Exported with the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
     /// TLS settings.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -453,10 +484,15 @@ impl ConnectionConfig {
         Self {
             name: String::new(),
             engine,
-            host: "localhost".into(),
+            host: if engine.is_file() {
+                String::new()
+            } else {
+                "localhost".into()
+            },
             port: engine.default_port(),
             user: engine.default_user().into(),
             database: None,
+            file: None,
             tls: TlsConfig::default(),
             ssh: None,
             read_only: false,
@@ -497,6 +533,9 @@ impl ConnectionConfig {
     /// Checks the settings are complete enough to try a connection.
     pub fn validate(&self) -> Result<()> {
         let missing = |what: &str| Err(Error::Config(format!("{what} is required")));
+        if self.engine.is_file() {
+            return self.validate_file();
+        }
         if self.host.trim().is_empty() {
             return missing("the host");
         }
@@ -584,6 +623,39 @@ impl ConnectionConfig {
             }
         }
         self.validate_password_source()
+    }
+
+    /// The rules of a database file (SQLite): a file, and nothing only a
+    /// server takes. A connection file from elsewhere could carry a tunnel,
+    /// a password command or bootstrap statements: refused rather than
+    /// silently ignored.
+    fn validate_file(&self) -> Result<()> {
+        let refuse = |what: &str| {
+            Err(Error::Config(format!(
+                "{what} has no meaning for a {} database file",
+                self.engine.label()
+            )))
+        };
+        if self
+            .file
+            .as_ref()
+            .is_none_or(|file| file.as_os_str().is_empty())
+        {
+            return Err(Error::Config("the database file is required".into()));
+        }
+        if self.ssh.is_some() {
+            return refuse("an SSH tunnel");
+        }
+        if !self.password_source.is_stored() {
+            return refuse("a password command");
+        }
+        if !self.init_sql.is_empty() {
+            return refuse("a bootstrap statement");
+        }
+        if !self.options.is_empty() {
+            return refuse("a driver option");
+        }
+        Ok(())
     }
 
     /// The password source's own rules (J3).
@@ -706,6 +778,8 @@ pub struct ConnectParams {
     pub password: Option<Secret>,
     /// Database to open; the engine's default when `None`.
     pub database: Option<String>,
+    /// SQLite: the database file to open (host, port and user are unused).
+    pub file: Option<PathBuf>,
     /// TLS settings.
     pub tls: TlsConfig,
     /// Open the session read-only on the server.
@@ -794,11 +868,7 @@ pub fn bootstrap_refusal(sql: &str, engine: Engine) -> Option<&'static str> {
         );
     }
     let postgres = engine == Engine::Postgres;
-    let rules = if postgres {
-        LexRules::POSTGRES
-    } else {
-        LexRules::MYSQL
-    };
+    let rules = LexRules::of(engine);
     let all = lex(sql, rules);
     if all
         .iter()
@@ -1255,12 +1325,14 @@ pub fn reaches_another_server(existing: &ConnectionConfig, imported: &Connection
         existing.port,
         &existing.user,
         &existing.ssh,
+        &existing.file,
     ) != (
         imported.engine,
         &imported.host,
         imported.port,
         &imported.user,
         &imported.ssh,
+        &imported.file,
     )
 }
 
@@ -1386,6 +1458,14 @@ pub fn connection_url(config: &ConnectionConfig) -> String {
         Engine::Postgres => "postgresql",
         Engine::MySql => "mysql",
         Engine::MariaDb => "mariadb",
+        // A database file has no server URL: its path names it.
+        Engine::Sqlite => {
+            return config
+                .file
+                .as_ref()
+                .map(|file| file.display().to_string())
+                .unwrap_or_default();
+        }
     };
     let host = if config.host.contains(':') {
         format!("[{}]", config.host)
@@ -2678,5 +2758,90 @@ mod tests {
         // A filter written without `enabled` is on.
         let filter: ObjectFilter = serde_json::from_str(r#"{"include":["a"]}"#).unwrap();
         assert!(filter.enabled && !filter.shows("b"));
+    }
+
+    fn sqlite(file: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            name: "Shop file".into(),
+            file: Some(PathBuf::from(file)),
+            ..ConnectionConfig::new(Engine::Sqlite)
+        }
+    }
+
+    /// K29: the engine is stored as "sqlite", a database file needs only its
+    /// path, and what only a server takes is refused rather than ignored.
+    #[test]
+    fn a_database_file_is_a_connection_of_its_own() {
+        assert_eq!(
+            serde_json::to_string(&Engine::Sqlite).unwrap(),
+            "\"sqlite\""
+        );
+        assert_eq!(Engine::Sqlite.label(), "SQLite");
+        assert!(Engine::ALL.contains(&Engine::Sqlite));
+        assert!(Engine::Sqlite.is_file() && !Engine::MySql.is_file());
+        let config = sqlite("/data/shop.db");
+        config.validate().unwrap();
+        assert_eq!(connection_url(&config), "/data/shop.db");
+        let missing = ConnectionConfig::new(Engine::Sqlite)
+            .validate()
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("database file is required"),
+            "{missing}"
+        );
+        let tunnelled = ConnectionConfig {
+            ssh: Some(SshConfig {
+                host: "h".into(),
+                port: 22,
+                user: "u".into(),
+                auth: SshAuth::default(),
+                keepalive_secs: 30,
+                client: SshClient::Builtin,
+                jump: None,
+            }),
+            ..sqlite("/data/shop.db")
+        };
+        assert!(
+            tunnelled
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("SSH tunnel")
+        );
+        let bootstrap = ConnectionConfig {
+            init_sql: vec!["SET a = 1".into()],
+            ..sqlite("/data/shop.db")
+        };
+        assert!(bootstrap.validate().is_err());
+        let command = ConnectionConfig {
+            password_source: PasswordSource::OnePassword {
+                reference: "op://a/b/c".into(),
+            },
+            ..sqlite("/data/shop.db")
+        };
+        assert!(command.validate().is_err());
+    }
+
+    /// K29: connections saved before SQLite load as they were and write no
+    /// `file` key; a database file's path travels in an export.
+    #[test]
+    fn old_connections_load_and_a_file_s_path_is_exported() {
+        let old = r#"{"name":"Shop","engine":"postgres","host":"db","port":5432,"user":"ada"}"#;
+        let loaded: ConnectionConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.file, None);
+        assert!(!serde_json::to_string(&loaded).unwrap().contains("\"file\""));
+
+        let json = export_connections(&[sqlite("/data/shop.db")]).unwrap();
+        assert!(json.contains("\"engine\": \"sqlite\""), "{json}");
+        assert!(json.contains("/data/shop.db"), "{json}");
+        assert_eq!(
+            import_connections(&json).unwrap(),
+            [sqlite("/data/shop.db")]
+        );
+        // Another file is another database: not linked silently.
+        assert!(reaches_another_server(
+            &sqlite("/data/shop.db"),
+            &sqlite("/data/other.db")
+        ));
     }
 }

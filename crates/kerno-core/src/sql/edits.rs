@@ -233,7 +233,7 @@ pub async fn apply_edits_until(
     if statements.is_empty() {
         return Ok(());
     }
-    exec::collect(session.clone(), "START TRANSACTION")
+    exec::collect(session.clone(), session.dialect().begin_sql())
         .await
         .map_err(whole)?;
     let failure = run_each(session, statements, stop).await.or_else(|| {

@@ -16,6 +16,9 @@ fn url(engine: Engine, password: bool) -> String {
         Engine::Postgres => "postgres",
         Engine::MySql => "mysql",
         Engine::MariaDb => "mariadb",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     let password = match password {
         true => format!(":{}", testing::DB_PASSWORD),

@@ -1615,7 +1615,24 @@ impl Workspace {
             .active_open()
             .and_then(|tab| tab.connection(cx))
             .or_else(|| self.sidebar.read(cx).selected(cx));
+        let file = connection.as_ref().is_some_and(|id| {
+            self.connections
+                .read(cx)
+                .get(id)
+                .is_some_and(|saved| saved.config.engine.is_file())
+        });
         match connection {
+            // SQLite: no sessions, users, grants or settings (D-102).
+            Some(_) if file => {
+                window.push_notification(
+                    Notification::warning(
+                        "Server Administration: a database file has no server, so no sessions, \
+                         users or settings to show.",
+                    ),
+                    cx,
+                );
+                None
+            }
             Some(connection) => Some(self.open_admin(&connection, window, cx)),
             None => {
                 window.push_notification(

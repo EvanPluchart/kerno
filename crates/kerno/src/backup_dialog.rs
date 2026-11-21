@@ -236,6 +236,8 @@ pub struct BackupDialog {
     environment: String,
     host: String,
     engine: Engine,
+    /// The engine's client tools (never SQLite's: it has none).
+    family: ClientFamily,
     database: String,
     server_version: (u32, u32, u32),
     /// The connection's own client folder.
@@ -334,6 +336,7 @@ pub fn open(
                     .clone()
                     .or_else(|| meta.database())
                     .filter(|name| !name.is_empty());
+                let family = ClientFamily::of(config.engine);
                 if mode.writes() && config.read_only {
                     Err(format!(
                         "“{}” is a read-only connection: {} writes to the database.",
@@ -344,12 +347,20 @@ pub fn open(
                             "a script"
                         }
                     ))
+                } else if family.is_none() {
+                    Err(format!("{}.", tools::NO_CLIENT_TOOLS))
                 } else if mode == Mode::GlobalBackup && config.engine != Engine::Postgres {
                     Err("The global backup is PostgreSQL's pg_dumpall.".into())
                 } else if let Some(problem) = route_problem(config) {
                     Err(problem.to_string())
-                } else if let Some(database) = database {
-                    Ok((config.clone(), database, meta.server().version_number, meta))
+                } else if let (Some(database), Some(family)) = (database, family) {
+                    Ok((
+                        config.clone(),
+                        database,
+                        meta.server().version_number,
+                        meta,
+                        family,
+                    ))
                 } else {
                     Err(
                         "Choose a database first: right-click it in the tree and choose \
@@ -364,7 +375,7 @@ pub fn open(
             ),
         }
     };
-    let (config, database, server_version, meta) = match checked {
+    let (config, database, server_version, meta, family) = match checked {
         Ok(checked) => checked,
         Err(refusal) => {
             window.push_notification(Notification::warning(SharedString::from(refusal)), cx);
@@ -384,6 +395,7 @@ pub fn open(
         server_version,
         mode,
         meta,
+        family,
     };
     let on_restored: Rc<Restored> = Rc::new(on_restored);
     let view = cx.new(|cx| BackupDialog::new(connections, opening, on_restored, window, cx));
@@ -427,6 +439,9 @@ struct Opening {
     server_version: (u32, u32, u32),
     mode: Mode,
     meta: Arc<dyn Session>,
+    /// The client tools of the engine: the dialog opens only for an engine
+    /// that has them.
+    family: ClientFamily,
 }
 
 impl BackupDialog {
@@ -444,6 +459,7 @@ impl BackupDialog {
             server_version,
             mode,
             meta,
+            family,
         } = opening;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -527,6 +543,7 @@ impl BackupDialog {
             environment: config.environment.clone(),
             host: config.host.clone(),
             engine: config.engine,
+            family,
             database: database.clone(),
             server_version,
             client_dir: config.client_dir.clone(),
@@ -651,7 +668,7 @@ impl BackupDialog {
     /// own session when it is in the database, else on a session of its
     /// own, closed once read.
     fn load_objects(&mut self, meta: Arc<dyn Session>, cx: &mut Context<Self>) {
-        let (engine, database) = (self.engine, self.database.clone());
+        let database = self.database.clone();
         let session = if meta.database().as_deref() == Some(database.as_str()) {
             None
         } else {
@@ -671,7 +688,7 @@ impl BackupDialog {
                 Ok(session) => {
                     let reading = cx.update(|cx| {
                         bridge::spawn(cx, async move {
-                            let objects = fetch_objects(&*session, engine, &database).await;
+                            let objects = fetch_objects(&*session, &database).await;
                             if own {
                                 session.close().await;
                             }
@@ -721,9 +738,9 @@ impl BackupDialog {
     /// The tool the wizard runs; a restore's follows its file's format.
     fn tool(&self) -> Option<Tool> {
         match self.mode {
-            Mode::Backup => Some(tools::backup_tool(self.engine)),
+            Mode::Backup => tools::backup_tool(self.engine),
             Mode::GlobalBackup => Some(Tool::PgDumpall),
-            Mode::ExecuteScript => Some(tools::script_tool(self.engine)),
+            Mode::ExecuteScript => tools::script_tool(self.engine),
             Mode::Restore => None,
         }
     }
@@ -742,7 +759,7 @@ impl BackupDialog {
         self.input = None;
         self.allow_commands = false;
         let settings = &AppState::get(cx).settings;
-        let family = ClientFamily::of(self.engine);
+        let family = self.family;
         let job = Job {
             mode: self.mode,
             engine: self.engine,
@@ -792,7 +809,7 @@ impl BackupDialog {
             multiple: false,
             prompt: Some("Use this client".into()),
         });
-        let family = ClientFamily::of(self.engine);
+        let family = self.family;
         self.tasks.push(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = picking.await else {
                 return;
@@ -1167,10 +1184,7 @@ impl BackupDialog {
             .chain(self.log.iter().map(|line| line.to_string()))
             .chain([ended.to_string()])
             .collect();
-        let rules = match self.engine {
-            Engine::Postgres => LexRules::POSTGRES,
-            Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
-        };
+        let rules = LexRules::of(self.engine);
         let (storage, id) = (AppState::get(cx).storage.clone(), task.id);
         let recording = bridge::spawn_blocking(cx, move || {
             storage.record_task_run(id, status, &lines, rules)
@@ -1257,10 +1271,12 @@ impl BackupDialog {
                 })
             });
         let tables = || selection.tables.iter().cloned().collect();
-        Ok(match (self.engine, partial) {
+        Ok(match (self.family, partial) {
             (_, true) => (Vec::new(), tables()),
-            (Engine::Postgres, false) => (selection.schemas.iter().cloned().collect(), Vec::new()),
-            (Engine::MySql | Engine::MariaDb, false) => (Vec::new(), Vec::new()),
+            (ClientFamily::Postgres, false) => {
+                (selection.schemas.iter().cloned().collect(), Vec::new())
+            }
+            (ClientFamily::MySql, false) => (Vec::new(), Vec::new()),
         })
     }
 
@@ -1751,7 +1767,7 @@ impl BackupDialog {
                     format!("Restore {file} into {}", self.database)
                 },
                 explanation: restore_explanation(&Explained {
-                    engine: self.engine,
+                    family: self.family,
                     database: &self.database,
                     connection: &self.name,
                     input: &input,
@@ -2292,28 +2308,29 @@ async fn params_for(
         user: config.user,
         password,
         database: Some(database),
+        file: config.file,
         tls: config.tls,
         read_only: config.read_only,
         options: config.options,
     })
 }
 
-/// The schemas and their tables and views (the database alone on MySQL),
-/// partitions left out as in the tree.
+/// The schemas and their tables and views (the database alone where it
+/// has no schemas: MySQL, SQLite), partitions left out as in the tree.
 pub(crate) async fn fetch_objects(
     session: &dyn Session,
-    engine: Engine,
     database: &str,
 ) -> kerno_core::Result<Vec<SchemaEntry>> {
-    let schemas: Vec<String> = match engine {
-        Engine::Postgres => session
+    let schemas: Vec<String> = if session.dialect().has_schemas() {
+        session
             .schemas()
             .await?
             .into_iter()
             .filter(|schema| !schema.is_system)
             .map(|schema| schema.name)
-            .collect(),
-        Engine::MySql | Engine::MariaDb => vec![database.to_string()],
+            .collect()
+    } else {
+        vec![database.to_string()]
     };
     let mut entries = Vec::new();
     // ponytail: every schema read up front; read a schema's tables when it
@@ -2374,9 +2391,16 @@ fn examine(job: Job) -> Examined {
         Some(_) => Some(BackupFormat::Sql),
         None => None,
     };
-    let tool = job
+    let Some(tool) = job
         .tool
-        .unwrap_or_else(|| tools::restore_tool(job.engine, format.unwrap_or_default()));
+        .or_else(|| tools::restore_tool(job.engine, format.unwrap_or_default()))
+    else {
+        return Examined {
+            tool: ToolState::Missing(format!("{}.", tools::NO_CLIENT_TOOLS)),
+            detected,
+            input: None,
+        };
+    };
     let picked = tools::client_for(
         &detected,
         &ClientWanted {
@@ -2474,7 +2498,7 @@ fn archive_database(pg_restore: &Path, archive: &Path) -> Option<String> {
 
 /// What the confirmation of a restore or a script is about.
 struct Explained<'a> {
-    engine: Engine,
+    family: ClientFamily,
     database: &'a str,
     connection: &'a str,
     input: &'a Input,
@@ -2536,12 +2560,12 @@ fn restore_explanation(about: &Explained) -> String {
             }
         ));
     }
-    text.push_str(match about.engine {
-        Engine::Postgres if about.restore.single_transaction && !about.script => {
+    text.push_str(match about.family {
+        ClientFamily::Postgres if about.restore.single_transaction && !about.script => {
             " It runs in one transaction: if a statement fails, nothing is kept."
         }
-        Engine::Postgres => " A failure keeps what ran before it.",
-        Engine::MySql | Engine::MariaDb => {
+        ClientFamily::Postgres => " A failure keeps what ran before it.",
+        ClientFamily::MySql => {
             " MySQL and MariaDB apply it statement by statement: a failed or cancelled run \
              keeps what was already applied."
         }
@@ -2550,10 +2574,10 @@ fn restore_explanation(about: &Explained) -> String {
 }
 
 /// Why a file with a client command is not run as it is.
-fn refusal_text(found: &Finding, engine: Engine, database: &str) -> String {
-    let client = match engine {
-        Engine::Postgres => "psql",
-        Engine::MySql | Engine::MariaDb => "mysql",
+fn refusal_text(found: &Finding, family: ClientFamily, database: &str) -> String {
+    let client = match family {
+        ClientFamily::Postgres => "psql",
+        ClientFamily::MySql => "mysql",
     };
     let mut text = format!(
         "Line {} of this file holds {}, a {client} client command: the client tool would run \
@@ -2561,7 +2585,7 @@ fn refusal_text(found: &Finding, engine: Engine, database: &str) -> String {
          files, or connect elsewhere. Nothing was run.",
         found.line, found.command
     );
-    if engine == Engine::Postgres && matches!(found.command.as_str(), "\\c" | "\\connect") {
+    if family == ClientFamily::Postgres && matches!(found.command.as_str(), "\\c" | "\\connect") {
         text.push_str(&format!(
             " pg_dump writes \\connect in a backup made with its “create database” option, to \
              switch to the database it creates. The restore goes into “{database}”, with the \
@@ -3235,8 +3259,7 @@ impl BackupDialog {
     /// Extra arguments and another user, shared by every wizard.
     fn render_advanced(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let extra_error =
-            tools::extra_args(&self.extra_value(cx), ClientFamily::of(self.engine)).err();
+        let extra_error = tools::extra_args(&self.extra_value(cx), self.family).err();
         let mut rows = vec![
             Self::field(
                 "Extra arguments",
@@ -3622,8 +3645,8 @@ impl BackupDialog {
         }
         let r = &self.restore;
         let archive = matches!(&self.input, Some(Ok(input)) if input.format != BackupFormat::Sql);
-        let options = match self.engine {
-            Engine::Postgres if archive => vec![
+        let options = match self.family {
+            ClientFamily::Postgres if archive => vec![
                 Self::check(
                     "restore-clean",
                     "Clean: drop each object before creating it",
@@ -3686,14 +3709,14 @@ impl BackupDialog {
                     cx,
                 ),
             ],
-            Engine::Postgres => vec![Self::check(
+            ClientFamily::Postgres => vec![Self::check(
                 "restore-single-transaction",
                 "In one transaction (all or nothing)",
                 r.single_transaction,
                 |t, on| t.restore.single_transaction = on,
                 cx,
             )],
-            Engine::MySql | Engine::MariaDb => vec![Self::check(
+            ClientFamily::MySql => vec![Self::check(
                 "restore-foreign-keys",
                 "Turn foreign-key checks off while it runs",
                 r.disable_foreign_keys,
@@ -3762,7 +3785,7 @@ impl BackupDialog {
         else {
             return div().into_any_element();
         };
-        let text = refusal_text(found, self.engine, &self.database);
+        let text = refusal_text(found, self.family, &self.database);
         v_flex()
             .gap_2()
             .p_2()
@@ -3815,7 +3838,7 @@ impl BackupDialog {
         &self,
         cx: &App,
     ) -> Vec<(&ClientInstall, String, Option<&'static str>, bool)> {
-        let family = ClientFamily::of(self.engine);
+        let family = self.family;
         let in_use = match &self.tool_state {
             ToolState::Ready { install, .. } => Some(install.dir.clone()),
             _ => None,
@@ -3875,7 +3898,7 @@ impl BackupDialog {
     /// the engine (the one in use, the default), Browse….
     fn render_clients(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let family = ClientFamily::of(self.engine);
+        let family = self.family;
         let rows = self.client_choices(cx).into_iter().enumerate().map(
             |(index, (install, label, note, usable))| {
                 let dir = install.dir.clone();
@@ -4430,7 +4453,7 @@ mod tests {
 
     fn explain(case: Case) -> String {
         restore_explanation(&Explained {
-            engine: case.engine,
+            family: ClientFamily::of(case.engine).expect("a server engine"),
             database: "shop_copy",
             connection: "Shop (prod)",
             input: case.input,
@@ -4515,13 +4538,15 @@ mod tests {
             line: 12,
             command: command.into(),
         };
-        let connect = refusal_text(&found("\\connect"), Engine::Postgres, "shop_copy");
+        let connect = refusal_text(&found("\\connect"), ClientFamily::Postgres, "shop_copy");
         assert!(connect.starts_with("Line 12 of this file holds \\connect, a psql"));
         assert!(connect.contains("“create database” option") && connect.contains("“shop_copy”"));
-        assert!(refusal_text(&found("\\c"), Engine::Postgres, "x").contains("create database"));
-        let shell = refusal_text(&found("\\!"), Engine::Postgres, "x");
+        assert!(
+            refusal_text(&found("\\c"), ClientFamily::Postgres, "x").contains("create database")
+        );
+        let shell = refusal_text(&found("\\!"), ClientFamily::Postgres, "x");
         assert!(shell.contains("start programs") && !shell.contains("create database"));
-        let system = refusal_text(&found("system"), Engine::MySql, "x");
+        let system = refusal_text(&found("system"), ClientFamily::MySql, "x");
         assert!(system.contains("a mysql client command"));
     }
 

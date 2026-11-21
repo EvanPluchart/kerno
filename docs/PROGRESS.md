@@ -1022,3 +1022,28 @@ Still open (for the owner):
   passes (with `tests/fixtures/generated` linked from the main checkout); fmt, clippy and deny clean.
 - Not proved in a real window: the restore of a real window's place, maximised or full screen (test context
   only). Still to do: the final captures (`m12-grid-selection-*`, `m12-notification-*`).
+
+## 2026-11-21 — K29: SQLite, the third engine family (ROADMAP item 4)
+
+- A new crate `kerno-sqlite` on the bundled `rusqlite` already in the workspace (no new dependency; the
+  `column_decltype` feature): a connection is a database file, chosen or made empty with New file…, never
+  created by a mistyped path; one thread per session owns its connection; rows stream to the sink without
+  reading ahead; cancel is SQLite's interrupt; types per cell by storage class, the declared type's rendering
+  kept only when the value fits it. `Engine::Sqlite` and every match on the engine decided; three
+  capabilities added to the dialect with defaults (`begin_sql`, `transactional_ddl`, `has_routines`), client
+  tools now optional per engine, so the backup dialog, Tools ▸, the dashboard and the administration tab refuse
+  or hide themselves for a file with their reason. D-102.
+- In the app: the dialog shows the file and the choices every connection has, General and Advanced tabs only;
+  the tree shows `main`, tables, views, triggers, columns and indexes; queries, plans, data editing, the
+  structure tabs, the table form (SQLite's four alters and indexes, the rest refused in words), exports, CSV
+  import and the ER diagram go through the generic paths, each tested on a file.
+- Seen while working: the dialog, the tree and a data tab, a query with every storage class, a plan, the
+  structure tab and the table form's refusal, offscreen in both themes (temporary test, not committed). Fixed
+  from them: the empty Routines and Events folders under `main`; the four engine cards now fit one row.
+- Tests: 15 integration and 12 unit tests in `kerno-sqlite` (files made in temporary directories, never a file
+  of the user's), core tests of the config, the URL and export, the failures' words and the trigger split, one
+  form test and three UI tests; mutations named in M12's K29.
+- Review: the table form no longer shows its comment fields on an engine without comments
+  (`Engine::has_comments`; SQLite refused them only once typed); the UI test of the refused alter checks it and
+  was seen failing with the capability switched.
+- Still to do: the final captures (`m12-sqlite-*`); what ROADMAP item 4 lists as still to come.

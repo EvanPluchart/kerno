@@ -184,10 +184,7 @@ pub fn toggle(ticked: &mut BTreeSet<String>, ids: &[String]) {
 /// no statement, or parameters, which a run on several connections cannot
 /// ask for.
 pub fn script_problem(script: &str, engines: &[Engine]) -> Option<&'static str> {
-    let rules = |engine: &Engine| match engine {
-        Engine::Postgres => LexRules::POSTGRES,
-        Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
-    };
+    let rules = |engine: &Engine| LexRules::of(*engine);
     let all = [Engine::Postgres];
     let engines = if engines.is_empty() {
         &all[..]

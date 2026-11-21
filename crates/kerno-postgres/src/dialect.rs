@@ -52,6 +52,14 @@ impl Dialect for PgDialect {
         true
     }
 
+    fn begin_sql(&self) -> &'static str {
+        "BEGIN"
+    }
+
+    fn transactional_ddl(&self) -> bool {
+        true
+    }
+
     fn lex_rules(&self) -> LexRules {
         LexRules::POSTGRES
     }

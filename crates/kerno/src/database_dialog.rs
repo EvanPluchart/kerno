@@ -53,6 +53,8 @@ impl Field {
                 Field::Tablespace,
             ],
             Engine::MySql | Engine::MariaDb => &[Field::Encoding, Field::Collation],
+            // A SQLite database is a file: the dialog never opens for it.
+            Engine::Sqlite => &[],
         }
     }
 

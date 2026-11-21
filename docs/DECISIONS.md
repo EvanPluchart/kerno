@@ -2789,3 +2789,93 @@ filters Installed / Available / To update, and Install, Update, Drop with the SQ
 - Not done: the light theme's `list.active.background` (`#F1F8D6`, opaque) is painted at 20 % too and a selected
   tree or list item hardly shows in light (pinned by the brand test as written); the record view's current column
   and the dark text selection keep `selection.background` at 30 % (faint, unchanged).
+
+## D-102 — SQLite, the third engine family: a connection is a file (K29; 2026-11-21)
+
+ROADMAP item 4, so that someone can open a SQLite file and work in it every day. Choices taken with the
+coordinator before the work, then the ones made on the way:
+
+- **No new dependency.** `rusqlite` 0.42 with the bundled SQLite, already kerno-core's for the app's store, in a
+  new crate `crates/kerno-sqlite` shaped like `kerno-mysql` (`connect`, `dialect`, `introspect`, `plan`,
+  `session`, `types`). One feature is added to it, `column_decltype` (no crate: the declared type of each result
+  column). The SQLite source is public domain; the logo is Simple Icons' (CC0), in `THIRD_PARTY_NOTICES.md`.
+- **One owner thread per session.** rusqlite is blocking and its connection is not `Sync`: each session owns its
+  connection on a thread of its own (`kerno-sqlite`), and every call is a job sent to it, never run on a Tokio
+  worker or the UI thread. A statement's sink moves to that thread while it runs and comes back after; rows are
+  written there and the thread waits in `ExecSink::end_row` (through the runtime's handle) when the consumer has
+  asked for no more, so nothing is read ahead of demand, as the sink's contract asks. A paused result keeps its
+  thread, not a pool's. `ExecSink::stop_signal` (new, kerno-core) lets `execute` notice a consumer that left
+  while the thread holds the sink: the statement is then interrupted.
+- **Cancel is SQLite's interrupt** (`InterruptHandle::interrupt`), from any thread; a counter as MySQL's makes a
+  cancel that arrives while a statement waits for the thread apply to it. A consumer that leaves interrupts too.
+- **A connection is a file.** `Engine::Sqlite` (`"sqlite"`, label "SQLite", `Engine::is_file`),
+  `ConnectionConfig::file` and `ConnectParams::file` (`serde(default, skip_serializing_if = "Option::is_none")`:
+  connections saved before load and write exactly as before; an export carries the path). `validate` asks for
+  the file and refuses an SSH tunnel, a password command, bootstrap statements and driver options rather than
+  ignoring them (an imported file could carry them). Nothing reads or stores a secret for a file: the password
+  resolution, the connect, the dialog's secrets, duplicate and the save skip the store. Deleting a connection,
+  or importing one over a server connection of the same id, still removes what the store holds under that id
+  (a connection switched from a server to a file may have left a password there).
+- **Unfilled parameters are refused.** SQLite binds a parameter nobody filled in as NULL without a word; the
+  query tab fills `:name` and `?` before sending, so a parameter left in a statement (`$id`, `@id`) is refused
+  in words that say how to write it.
+- **Row counts are exact and cost a `count(*)`** per table when `main` is opened and per data-tab refresh:
+  quick on files of ordinary size, slow on tables of tens of millions of rows (Stop interrupts it). A cap or
+  `sqlite_stat1` when it exists is the way up if it shows.
+- **The file is opened as it is**: never created (`READ_WRITE` or `READ_ONLY`, without `CREATE` or `URI`), so a
+  mistyped path leaves no empty database behind; a first read checks it is a database; a file the user may not
+  write is refused for writing (SQLite would open it read-only silently) unless the connection is read-only.
+  Missing, not a database, locked, read-only: each has words of its own (`error::explain`'s file branch,
+  `FailureKind::{FileMissing, NotADatabase, FileLocked, FileReadOnly}`), SQLite's message below. "New file…"
+  makes an empty file (an empty file is an empty database to SQLite) with `create_new`: a path that exists is
+  opened as it is and never emptied, whatever the save panel's "Replace?" said. `journal_mode` is never set.
+- **Read-only** opens the file read-only at the SQLite level, and Kerno's own refusal of writes stays.
+- **No schemas, one database.** `has_schemas` is false and `databases()` lists `main`, as a MySQL database: SQL
+  writes `"main"."t"`, which SQLite reads as the file's own tables. Attached databases and `temp` are not shown.
+  The tree under the connection: `main`, then Tables, Views and Triggers; no Routines or Events folder
+  (`Dialect::has_routines`, false for SQLite; the tree drops those folders). Indexes are under each table, not
+  in a folder of their own (SchemaObjects has none). Row counts in the tree are exact (`count(*)`: SQLite keeps
+  no estimate unless ANALYZE ran); a view has none.
+- **Types per cell.** A result column's kind comes from its declared type by SQLite's affinity rules, with
+  BOOLEAN, DATE, DATETIME/TIMESTAMP, TIME and JSON picked out; that rendering is kept only when the first value
+  is stored the way it expects (a date as text, a boolean as an integer, JSON as text), else the column is what
+  that value holds (a date kept as a Unix time is an integer, and J6's timestamp hint shows). A column without a
+  type follows its first value. Each cell is pushed in its storage class's text: integers and text as they are,
+  a REAL in Rust's shortest round-trip form with `.0` when whole (SQLite's `%.15g` would not round-trip and an
+  edit would miss its row), a blob as bytes in a binary column and as its `X'…'` literal elsewhere. The model
+  has one kind per column: a column whose rows mix storage classes shows them by the first row's kind (a
+  `BLOB` column holding text shows that text's hex). Recorded as a limit.
+- **SQL that differs**: `BEGIN` (`Dialect::begin_sql`, new; `START TRANSACTION` by default, PostgreSQL `BEGIN`)
+  wherever Kerno opened a transaction with `START TRANSACTION` (pending edits, CSV import, transfer, the table
+  form, manual-commit tabs); `Dialect::transactional_ddl` (new; PostgreSQL and SQLite true) replaces the import's
+  and the table form's checks of the engine's name. `DEFAULT` is no value in SQLite's `VALUES` or `SET`: a cell
+  set to its default writes the column's declared default (`NULL` without one, which an `INTEGER PRIMARY KEY`
+  numbers). Truncate is `DELETE FROM`. `EXPLAIN QUERY PLAN` is read into the plan tree (id, parent, detail; the
+  query tab now joins the cells of a plan row with tabs, which one-column plans do not notice); EXPLAIN ANALYZE
+  is refused before it runs, with its reason. One isolation level, serializable.
+- **Structure**: read from `pragma_table_xinfo`, `pragma_index_list`/`index_info`, `pragma_foreign_key_list`
+  (a key without referenced columns refers to the other table's primary key), `pragma_table_list` (WITHOUT
+  ROWID) and `sqlite_schema` (DDL, triggers). An `INTEGER PRIMARY KEY` of a rowid table is the row id: never
+  NULL, "auto increment". Foreign keys are named `<table>_fk<n>` (SQLite's are often unnamed). Check
+  constraints are not listed. The form creates tables (`INTEGER PRIMARY KEY AUTOINCREMENT` for the numbered
+  column, which must be the only key column; foreign keys to the same database; `CREATE INDEX main.i ON t`) and
+  alters what SQLite's ALTER TABLE does: rename the table, rename, add and drop a column, plus create and drop an
+  index. Every other change (a column's type, NULL or default, keys, comments, moving a column) is refused in
+  words that say SQLite cannot do it in place and that rebuilding the table is still to come.
+- **Trigger bodies stay one statement**: `LexRules::SQLITE`, and a `begin_blocks` rule (MySQL's and SQLite's
+  `BEGIN … END` bodies) instead of the splitter reading MySQL from its `#` comments.
+- **Locks**: in rollback-journal mode a result still being read holds a shared lock on the file, so a write from
+  another tab waits five seconds (the busy timeout) and fails with "database is locked"; the error's hint says
+  what holds the file in plain words.
+- **Hidden for SQLite, each said where it is asked for**: the server fields of the dialog (host, port, user,
+  password and its sources, URL fill, database, TLS and SSH tabs, bootstrap, driver options, local client);
+  Tools ▸ (no client tools: backup, restore, scripts, maintenance, sessions, locks, tasks, copy to another
+  connection; `ClientFamily::of` is now an `Option`, the backup dialog refuses to open and keeps the family it
+  opened with); the administration tab and the toolbar's dashboard ("a database file has no server"); create
+  database and create schema in the tree. Copying tables to or from SQLite is refused by the type mapping
+  (`transfer::map_type`) until it has one of its own. Query results are not editable (no column origins);
+  table data is.
+- Not done (ROADMAP item 4, "still to come"): backup and restore (`VACUUM INTO`, `.dump`), the engine's tools
+  (ANALYZE, VACUUM, integrity check), copying tables to or from SQLite, `kerno file.db` and `sqlite://` URLs,
+  attached databases and `temp`, the 12-step table rebuild, keying a keyless table on `rowid`, editing query
+  results, loadable extensions, check constraints in the structure.

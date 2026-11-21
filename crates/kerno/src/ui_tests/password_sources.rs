@@ -36,6 +36,9 @@ fn url(engine: Engine) -> String {
         Engine::Postgres => "postgres",
         Engine::MySql => "mysql",
         Engine::MariaDb => "mariadb",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     format!("{scheme}://kerno@127.0.0.1:{}/kerno", testing::port(engine))
 }

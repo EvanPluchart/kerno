@@ -160,6 +160,14 @@ impl ExecSink {
         self.events.closed().await;
     }
 
+    /// [`Self::stopped`] without a borrow of the sink: for a driver whose
+    /// blocking thread holds the sink while the statement runs (SQLite),
+    /// and which must still stop that statement when the consumer leaves.
+    pub fn stop_signal(&self) -> impl Future<Output = ()> + Send + 'static {
+        let events = self.events.clone();
+        async move { events.closed().await }
+    }
+
     async fn send(&mut self, event: ExecEvent) -> Result<(), Stopped> {
         self.events.send(event).await.map_err(|_| Stopped)
     }

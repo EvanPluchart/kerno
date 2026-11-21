@@ -288,7 +288,7 @@ impl TransferDialog {
 
     /// Lists the source's schemas and their tables on a session of its own.
     fn load_objects(&mut self, cx: &mut Context<Self>) {
-        let (engine, database) = (self.engine, self.database.clone());
+        let database = self.database.clone();
         let opening = self.connections.read(cx).open_session(
             &self.source.connection,
             Some(database.clone()),
@@ -300,7 +300,7 @@ impl TransferDialog {
                 Ok(session) => {
                     let reading = cx.update(|cx| {
                         bridge::spawn(cx, async move {
-                            let objects = fetch_objects(&*session, engine, &database).await;
+                            let objects = fetch_objects(&*session, &database).await;
                             session.close().await;
                             objects
                         })
@@ -376,7 +376,8 @@ impl TransferDialog {
         let database = database.or(meta_database).unwrap_or_default();
         let (database, schema) = match engine {
             Engine::Postgres => (database, "public".to_string()),
-            Engine::MySql | Engine::MariaDb => (String::new(), database),
+            // No schemas: the database is where the tables go.
+            Engine::MySql | Engine::MariaDb | Engine::Sqlite => (String::new(), database),
         };
         self.target_database
             .update(cx, |input, cx| input.set_value(database, window, cx));

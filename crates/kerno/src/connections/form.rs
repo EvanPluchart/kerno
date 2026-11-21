@@ -16,6 +16,7 @@ use kerno_core::sql::{LexRules, split_statements};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Url,
+    File,
     Host,
     Port,
     User,
@@ -160,6 +161,8 @@ pub struct ConnectionForm {
     /// The command came from an imported file and is not confirmed yet.
     pub command_unconfirmed: bool,
     pub database: String,
+    /// SQLite: the database file.
+    pub file: String,
     /// Extra driver options, one `key=value` per line.
     pub options: String,
     pub read_only: bool,
@@ -279,6 +282,7 @@ impl ConnectionForm {
             op_reference,
             command_unconfirmed: config.password_command_unconfirmed,
             database: config.database.clone().unwrap_or_default(),
+            file: text(&config.file),
             options: config
                 .options
                 .iter()
@@ -329,6 +333,10 @@ impl ConnectionForm {
         }
         if self.user.trim() == previous.default_user() {
             self.user = engine.default_user().to_string();
+        }
+        // From a database file to a server: the server's default host.
+        if previous.is_file() && !engine.is_file() && self.host.trim().is_empty() {
+            self.host = ConnectionConfig::new(engine).host;
         }
         self.engine = engine;
     }
@@ -445,6 +453,13 @@ impl ConnectionForm {
 
     /// The name shown when the user gave none.
     pub fn default_name(&self) -> String {
+        if self.engine.is_file() {
+            // The file's name without its folder: `shop.db`.
+            return std::path::Path::new(self.file.trim())
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.engine.label().to_string());
+        }
         match (self.user.trim(), self.host.trim()) {
             ("", "") => self.engine.label().to_string(),
             ("", host) => host.to_string(),
@@ -455,6 +470,9 @@ impl ConnectionForm {
     /// Validates the fields and turns them into settings and secrets.
     /// Every problem is reported, each on its field.
     pub fn build(&self) -> Result<(ConnectionConfig, Secrets), Vec<FieldError>> {
+        if self.engine.is_file() {
+            return self.build_file();
+        }
         let mut errors = Vec::new();
         let required = |value: &str, field: Field, what: &str, errors: &mut Vec<FieldError>| {
             if value.trim().is_empty() {
@@ -517,10 +535,7 @@ impl ConnectionForm {
             }
         }
 
-        let rules = match self.engine {
-            Engine::Postgres => LexRules::POSTGRES,
-            Engine::MySql | Engine::MariaDb => LexRules::MYSQL,
-        };
+        let rules = LexRules::of(self.engine);
         let mut init_sql = Vec::new();
         for statement in split_statements(&self.init_sql, rules) {
             let sql = statement.text(&self.init_sql).to_string();
@@ -713,6 +728,7 @@ impl ConnectionForm {
             port: db_port,
             user: self.user.trim().to_string(),
             database: non_empty(&self.database),
+            file: None,
             tls,
             ssh,
             read_only: self.read_only,
@@ -750,6 +766,35 @@ impl ConnectionForm {
                 .flatten(),
         };
         Ok((config, secrets))
+    }
+
+    /// [`ConnectionForm::build`] for a database file (SQLite): the file and
+    /// the choices every connection has. What only a server takes (host,
+    /// port, user, password, TLS, SSH, options, bootstrap statements) is
+    /// not kept, and no secret is.
+    fn build_file(&self) -> Result<(ConnectionConfig, Secrets), Vec<FieldError>> {
+        let file = self.file.trim();
+        if file.is_empty() {
+            return Err(vec![error(
+                Field::File,
+                "Choose the database file, or make a new one with New file…",
+            )]);
+        }
+        let name = Some(self.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.default_name());
+        let config = ConnectionConfig {
+            name,
+            file: Some(expand_home(file)),
+            read_only: self.read_only,
+            environment: self.environment.clone(),
+            color: self.color.clone(),
+            group: kerno_core::config::folder_path(&self.group),
+            auto_commit: self.auto_commit,
+            navigator_filters: self.navigator_filters.clone(),
+            ..ConnectionConfig::new(self.engine)
+        };
+        Ok((config, Secrets::default()))
     }
 }
 
@@ -1225,5 +1270,41 @@ mod tests {
         assert!(imported.build().unwrap().0.password_command_unconfirmed);
         imported.command_unconfirmed = false;
         assert!(!imported.build().unwrap().0.password_command_unconfirmed);
+    }
+
+    /// K29: a SQLite form keeps its file and nothing a server takes, holds
+    /// no secret, is named after the file, and round-trips.
+    #[test]
+    fn a_database_file_form_builds_from_its_file() {
+        let mut form = ConnectionForm::new(Engine::Postgres);
+        form.password = "typed".into();
+        form.ssh_enabled = true;
+        form.options = "a=1".into();
+        form.set_engine(Engine::Sqlite);
+        assert_eq!(fields(&form.build().unwrap_err()), [Field::File]);
+        form.file = " /data/shop.db ".into();
+        form.read_only = true;
+        let (config, secrets) = form.build().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.name, "shop.db");
+        assert_eq!(
+            config.file.as_deref(),
+            Some(std::path::Path::new("/data/shop.db"))
+        );
+        assert!(config.read_only);
+        assert_eq!((config.ssh.clone(), config.options.len()), (None, 0));
+        assert_eq!(secrets, Secrets::default(), "no password is kept");
+        assert_eq!(
+            ConnectionForm::from_saved(&config, &secrets)
+                .build()
+                .unwrap(),
+            (config, secrets)
+        );
+        // Back to a server: its default host and port again.
+        form.set_engine(Engine::MySql);
+        assert_eq!(
+            (form.host.as_str(), form.port.as_str()),
+            ("localhost", "3306")
+        );
     }
 }

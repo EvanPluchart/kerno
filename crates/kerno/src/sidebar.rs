@@ -241,11 +241,13 @@ pub fn with_tools(entries: Vec<Entry>, tools: ToolGroups) -> Vec<Entry> {
             )
         })
         .collect();
+    // An engine without tools (SQLite) has no Tools ▸ at all.
     entries
         .into_iter()
-        .map(|entry| match entry {
-            Entry::Submenu(TOOLS, _) => Entry::Submenu(TOOLS, items.clone()),
-            entry => entry,
+        .filter_map(|entry| match entry {
+            Entry::Submenu(TOOLS, _) if items.is_empty() => None,
+            Entry::Submenu(TOOLS, _) => Some(Entry::Submenu(TOOLS, items.clone())),
+            entry => Some(entry),
         })
         .collect()
 }
@@ -391,11 +393,11 @@ impl Sidebar {
             .collect(),
             false => entries,
         };
-        let postgres = connections
-            .get(id)
-            .is_some_and(|saved| saved.config.engine == kerno_core::Engine::Postgres);
+        let Some(engine) = connections.get(id).map(|saved| saved.config.engine) else {
+            return entries;
+        };
         let connected = matches!(status, Status::Connected { .. });
-        let tools = crate::navigator::actions::tool_entries(None, postgres, &[]);
+        let tools = crate::navigator::actions::tool_entries(None, engine, &[]);
         with_tools(
             entries,
             crate::navigator::actions::tools_now(tools, connected, checked),
@@ -586,7 +588,9 @@ impl Sidebar {
                 };
                 let text = match action {
                     CopyName => saved.config.name,
+                    // A database file's "URL" and "host" are its path.
                     CopyUrl => connection_url(&saved.config),
+                    _ if saved.config.engine.is_file() => connection_url(&saved.config),
                     _ => saved.config.host,
                 };
                 copy(text, cx);
@@ -1125,7 +1129,19 @@ mod tests {
                 Status::Disconnected
             };
             let entries = menu(&subject, &status, &[], None, 0, read_only, false);
-            let tools = tools_now(tool_entries(None, postgres, &[]), connected, read_only);
+            let tools = tools_now(
+                tool_entries(
+                    None,
+                    if postgres {
+                        kerno_core::Engine::Postgres
+                    } else {
+                        kerno_core::Engine::MySql
+                    },
+                    &[],
+                ),
+                connected,
+                read_only,
+            );
             labels(&with_tools(entries, tools))
                 .into_iter()
                 .find(|label| label.starts_with("Tools ▸"))

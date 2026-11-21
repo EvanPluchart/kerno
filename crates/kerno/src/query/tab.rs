@@ -2796,11 +2796,7 @@ impl QueryTab {
             };
             // In manual-commit mode the first statement opens a transaction.
             if manual && session.tx_state() == TxState::Idle {
-                let begin = if session.dialect().has_schemas() {
-                    "BEGIN"
-                } else {
-                    "START TRANSACTION"
-                };
+                let begin = session.dialect().begin_sql();
                 let Ok(beginning) =
                     cx.update(|_, cx| bridge::spawn(cx, exec::collect(session.clone(), begin)))
                 else {
@@ -3790,12 +3786,25 @@ impl QueryTab {
         let Some(grid) = self.pane_grid(pane) else {
             return;
         };
-        // The output is one cell, or one line per row for text plans.
+        // The output is one cell, or one line per row for text plans; a row
+        // of several columns (SQLite's id, parent, notused, detail) is one
+        // line of its cells separated by tabs.
         let raw = {
             let grid = grid.read(cx).delegate();
             (0..grid.row_count())
-                .filter_map(|row| grid.value_at(row, 1).and_then(|(_, value)| value))
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .filter_map(|row| {
+                    let cells: Vec<Option<&[u8]>> = (1..)
+                        .map_while(|column| grid.value_at(row, column))
+                        .map(|(_, value)| value)
+                        .collect();
+                    cells.iter().any(Option::is_some).then(|| {
+                        cells
+                            .iter()
+                            .map(|cell| String::from_utf8_lossy(cell.unwrap_or_default()))
+                            .collect::<Vec<_>>()
+                            .join("\t")
+                    })
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -4496,11 +4505,7 @@ impl QueryTab {
                         bridge::spawn(cx, async move {
                             let began = manual && session.tx_state() == TxState::Idle;
                             if began {
-                                let begin = if session.dialect().has_schemas() {
-                                    "BEGIN"
-                                } else {
-                                    "START TRANSACTION"
-                                };
+                                let begin = session.dialect().begin_sql();
                                 exec::collect(session.clone(), begin).await.map_err(whole)?;
                             }
                             let ran = if session.tx_state() == TxState::Idle {

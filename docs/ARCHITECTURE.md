@@ -1,6 +1,6 @@
 # Architecture
 
-Kerno is a Cargo workspace of four crates. The dependency direction is one way: the app depends on the
+Kerno is a Cargo workspace of five crates. The dependency direction is one way: the app depends on the
 drivers and the core; the drivers depend on the core; the core depends on neither.
 
 | Crate | Role |
@@ -8,6 +8,7 @@ drivers and the core; the drivers depend on the core; the core depends on neithe
 | `crates/kerno-core` | Engine-neutral core, no UI dependency: the `Driver`, `Session` and `Dialect` traits, the value and result model, connection settings, SSH tunnel, secrets, app storage, SQL helpers (splitting, parameters, classification, completion, formatting; all on Kerno's own tolerant lexer, no SQL parser crate, D-010), table browsing and its filter (`browse.rs`), export and import, pending-edit SQL, table drafts and their DDL, the rule that decides whether a query result can be edited (`editable.rs`), the figures of a selection of cells (`aggregate.rs`), environments (`environment.rs`), the plain-words explanation of connection failures (`error::explain`), the client tools (`tools.rs`) and the update rules (`update.rs`). |
 | `crates/kerno-postgres` | `PostgresDriver` on `tokio-postgres` with rustls. |
 | `crates/kerno-mysql` | `MysqlDriver` on `mysql_async`; one driver for MySQL and MariaDB. |
+| `crates/kerno-sqlite` | `SqliteDriver` on the bundled `rusqlite`: a database file, each session's connection owned by a thread of its own (D-102). |
 | `crates/kerno` | The app binary (GPUI through the `gpui-kit` facade, D-001 in [DECISIONS.md](DECISIONS.md)): windows, views, actions, keymap, theme. |
 
 The pinned toolchain is in `rust-toolchain.toml`; dependency licences are checked by `deny.toml`.
@@ -37,9 +38,15 @@ time, except `cancel`, which never waits.
   `DatabaseSizes`, `TableSizes`, `Settings`) or `None`; `cancel_session` and `terminate_session` act on
   another session by id.
 
-There are no transaction methods. A transaction is ordinary SQL sent through `execute`; `tx_state` reports
-what the server says. Cancelling works through a side channel of the engine (PostgreSQL cancel request,
-`KILL QUERY` on a second connection for MySQL).
+There are no transaction methods. A transaction is ordinary SQL sent through `execute` (opened with
+`Dialect::begin_sql`); `tx_state` reports what the server says. Cancelling works through a side channel of the
+engine (PostgreSQL cancel request, `KILL QUERY` on a second connection for MySQL, SQLite's interrupt).
+
+A database file (SQLite, `Engine::is_file`) is a `ConnectionConfig::file` and `ConnectParams::file` instead of
+a host, port and user; nothing of it goes through the secret store, a tunnel or a password source. Its driver is
+blocking: each session's connection lives on a thread of its own, the sink moves to that thread while a
+statement runs (`ExecSink::stop_signal` lets `execute` see a consumer that left), and the thread waits in
+`end_row` for demand.
 
 `Dialect` (`dialect.rs`, returned by `Session::dialect`) holds everything that is text rather than I/O.
 Required methods: `engine`, `has_schemas`, `lex_rules`, `quote_ident`, `quote_string`, `quote_bytes`,
@@ -285,9 +292,14 @@ This is the path for the engines in [ROADMAP.md](ROADMAP.md). The existing MySQL
 for a second driver; the PostgreSQL crate is the model for an engine with schemas.
 
 1. **Engine value.** Add a variant to `Engine` in `kerno-core/src/config.rs` and complete its methods
-   (`label`, `default_port`, `default_user`, URL scheme). The compiler then lists every exhaustive `match`
-   that needs the new arm: the core (`testing.rs`, `tools.rs`), the app (`connections/form.rs`,
-   `connections/dialog.rs`, `structure/editor.rs`, `backup_dialog.rs`, `engine_logo.rs`).
+   (`label`, `is_file`, `default_port`, `default_user`, URL scheme) and `LexRules::of`. The compiler then
+   lists every exhaustive `match` that needs the new arm: the core (`testing.rs`, `tools.rs`, `password.rs`,
+   `config.rs`), the app (`connections/form.rs`, `connections/dialog.rs`, `structure/editor.rs`,
+   `database_dialog.rs`, `transfer_dialog.rs`, `engine_logo.rs`) and the test servers' matches of the UI tests.
+   Decide each arm; where a feature has no equivalent, give the `Dialect` (or `ClientFamily::of`, for the
+   client tools) a refusing default and let the UI grey or hide the entry, as K29 did for SQLite. Search also
+   for `== Engine::` and `!= Engine::`: those comparisons put a new engine on one side without the compiler
+   saying so.
 2. **A crate** `crates/kerno-<engine>` with a driver type implementing `Driver`, and a session type
    implementing `Session` (connect with TLS and the tunnelled host, `execute` honouring the sink contract
    above, cancel from another task, introspection, `ddl`, completion catalog, admin queries). Put the

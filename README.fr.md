@@ -7,7 +7,7 @@
 
 <p align="center">
   Un client de base de données rapide et natif pour macOS et Linux.<br>
-  PostgreSQL, MySQL et MariaDB. Écrit en Rust. Open source.
+  PostgreSQL, MySQL, MariaDB et SQLite. Écrit en Rust. Open source.
 </p>
 
 <p align="center">

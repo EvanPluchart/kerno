@@ -401,6 +401,9 @@ fn layout_key(engine: Engine, schema: &str, table: &str) -> String {
     let database = match engine {
         Engine::Postgres => "kerno",
         Engine::MySql | Engine::MariaDb => "",
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     };
     serde_json::to_string(&[database, schema, table]).unwrap()
 }

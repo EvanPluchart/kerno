@@ -19,7 +19,9 @@ use gpui_kit::{
     ParentElement as _, SharedString, Styled as _, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::Engine;
-use kerno_core::tools::{BackupFormat, BackupOptions, DumpMethod, EngineBackup, RestoreOptions};
+use kerno_core::tools::{
+    BackupFormat, BackupOptions, ClientFamily, DumpMethod, EngineBackup, RestoreOptions,
+};
 
 use super::{BackupDialog, Input, Loaded, Mode, Purpose, Step, View, is_view, refusal_text};
 use crate::settings_ui::{self, OptionCards};
@@ -27,10 +29,10 @@ use crate::settings_ui::{self, OptionCards};
 /// The formats the simple view offers, the default first: PostgreSQL's
 /// custom archive (restored whole or in part, compressed) or a plain
 /// script; MySQL and MariaDB write a script only.
-fn simple_formats(engine: Engine) -> &'static [BackupFormat] {
-    match engine {
-        Engine::Postgres => &[BackupFormat::Custom, BackupFormat::Sql],
-        Engine::MySql | Engine::MariaDb => &[BackupFormat::Sql],
+fn simple_formats(family: ClientFamily) -> &'static [BackupFormat] {
+    match family {
+        ClientFamily::Postgres => &[BackupFormat::Custom, BackupFormat::Sql],
+        ClientFamily::MySql => &[BackupFormat::Sql],
     }
 }
 
@@ -190,7 +192,7 @@ impl BackupDialog {
                 let defaults = BackupOptions::new(self.engine, self.database.clone());
                 note(!self.selection.complete, "the objects ticked");
                 note(
-                    !simple_formats(self.engine).contains(&self.backup.format),
+                    !simple_formats(self.family).contains(&self.backup.format),
                     "the format",
                 );
                 note(self.backup.content != defaults.content, "the content");
@@ -231,7 +233,7 @@ impl BackupDialog {
         match self.mode {
             Mode::Backup => {
                 let mut defaults = BackupOptions::new(self.engine, self.database.clone());
-                if simple_formats(self.engine).contains(&self.backup.format) {
+                if simple_formats(self.family).contains(&self.backup.format) {
                     defaults.format = self.backup.format;
                 }
                 self.backup = defaults;
@@ -386,7 +388,7 @@ impl BackupDialog {
             return;
         };
         let mut name = name.to_string_lossy().into_owned();
-        let chosen = simple_formats(self.engine).iter().find_map(|format| {
+        let chosen = simple_formats(self.family).iter().find_map(|format| {
             name.strip_suffix(&format!(".{}", format.extension()))
                 .filter(|stem| !stem.is_empty())
                 .map(|stem| (*format, stem.to_string()))
@@ -470,12 +472,12 @@ impl BackupDialog {
 
     /// What a restore does to the database, said before it runs.
     fn restore_warning(&self) -> String {
-        let tail = match self.engine {
-            Engine::Postgres if self.restore.single_transaction => {
+        let tail = match self.family {
+            ClientFamily::Postgres if self.restore.single_transaction => {
                 " It runs in one transaction: if a statement fails, nothing is kept."
             }
-            Engine::Postgres => " A failure keeps what ran before it.",
-            Engine::MySql | Engine::MariaDb => {
+            ClientFamily::Postgres => " A failure keeps what ran before it.",
+            ClientFamily::MySql => {
                 " MySQL and MariaDB apply it statement by statement: a failure keeps what was \
                  already applied."
             }
@@ -528,7 +530,7 @@ impl BackupDialog {
                 .child(SharedString::from(why.clone()))
                 .test_text(why),
         };
-        let formats = simple_formats(self.engine);
+        let formats = simple_formats(self.family);
         let format = if formats.len() > 1 {
             let entity = cx.entity();
             let selected = formats
@@ -699,7 +701,7 @@ impl BackupDialog {
             let text = format!(
                 "{} To run it anyway, open Advanced settings… and allow it on its Client commands \
                  step.",
-                refusal_text(found, self.engine, &self.database)
+                refusal_text(found, self.family, &self.database)
             );
             parts.push(
                 div()

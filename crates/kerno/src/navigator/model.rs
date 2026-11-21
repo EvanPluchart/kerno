@@ -179,6 +179,9 @@ pub struct Item {
 pub struct Tree {
     /// Whether databases hold schemas (PostgreSQL) or tables (MySQL).
     has_schemas: bool,
+    /// The engine has no stored routines or events (SQLite): no folders
+    /// for them.
+    no_routines: bool,
     roots: Vec<Node>,
     filter: String,
     /// The connection's object filters, by [`filter_key`].
@@ -196,6 +199,13 @@ impl Tree {
             has_schemas,
             ..Self::default()
         }
+    }
+
+    /// The tree of an engine with or without stored routines and events
+    /// (see [`kerno_core::Dialect::has_routines`]).
+    pub fn with_routines(mut self, routines: bool) -> Self {
+        self.no_routines = !routines;
+        self
     }
 
     /// Replaces the tree with the server's databases: `current` (the
@@ -298,7 +308,7 @@ impl Tree {
 
     /// Stores the answer to a load.
     pub fn finish(&mut self, id: &str, outcome: Result<Loaded, String>) {
-        let has_schemas = self.has_schemas;
+        let (has_schemas, routines) = (self.has_schemas, !self.no_routines);
         let Some(node) = self.node_mut(id) else {
             return;
         };
@@ -306,7 +316,13 @@ impl Tree {
             Err(message) => Children::Failed(message),
             Ok(Loaded::Schemas(schemas)) => Children::Loaded(schema_nodes(node, schemas)),
             Ok(Loaded::Objects(objects)) => {
-                Children::Loaded(object_groups(node, *objects, has_schemas))
+                let mut groups = object_groups(node, *objects, has_schemas);
+                if !routines {
+                    groups.retain(|group| {
+                        !matches!(group.kind, NodeKind::Group(Group::Routines | Group::Events))
+                    });
+                }
+                Children::Loaded(groups)
             }
             Ok(Loaded::Structure(structure)) => {
                 Children::Loaded(structure_nodes(node, *structure, has_schemas))

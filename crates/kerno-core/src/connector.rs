@@ -199,6 +199,7 @@ impl Connector {
                 .map(str::to_string)
                 .or_else(|| self.config.database.clone())
                 .filter(|name| !name.is_empty()),
+            file: self.config.file.clone(),
             tls: self.config.tls.clone(),
             read_only: self.config.read_only,
             options: self.config.options.clone(),

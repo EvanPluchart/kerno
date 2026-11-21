@@ -1178,6 +1178,10 @@ impl ImportSetup {
 
 /// `user@host:port` of a connection, and its tunnel's host and jumps.
 fn server(config: &ConnectionConfig) -> String {
+    // A database file (SQLite): its path.
+    if config.engine.is_file() {
+        return kerno_core::config::connection_url(config);
+    }
     let mut text = format!("{}@{}:{}", config.user, config.host, config.port);
     if let Some(ssh) = &config.ssh {
         text.push_str(&format!(" through {}", ssh.host));

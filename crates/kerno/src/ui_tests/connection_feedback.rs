@@ -34,6 +34,9 @@ fn url(engine: Engine, password: &str, host: &str, port: u16, database: &str) ->
         Engine::MySql | Engine::MariaDb => {
             format!("mysql://kerno:{password}@{host}:{port}/{database}?ssl-mode=DISABLED")
         }
+        kerno_core::Engine::Sqlite => {
+            unreachable!("SQLite has no test server: these tests run on the server engines")
+        }
     }
 }
 

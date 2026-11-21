@@ -21,6 +21,7 @@ use kerno_core::Engine;
 const POSTGRESQL: &str = "engines/postgresql.svg";
 const MYSQL: &str = "engines/mysql.svg";
 const MARIADB: &str = "engines/mariadb.svg";
+const SQLITE: &str = "engines/sqlite.svg";
 
 // The glyphs of the schema tree, the query toolbar, the main toolbar and the
 // side list of Settings, from the same Lucide set as the UI kit's.
@@ -100,6 +101,7 @@ impl AssetSource for Assets {
             POSTGRESQL => Some(include_bytes!("../assets/engines/postgresql.svg")),
             MYSQL => Some(include_bytes!("../assets/engines/mysql.svg")),
             MARIADB => Some(include_bytes!("../assets/engines/mariadb.svg")),
+            SQLITE => Some(include_bytes!("../assets/engines/sqlite.svg")),
             // Kerno's own mark and lockups, under `brand/`.
             _ => crate::brand::FILES
                 .iter()
@@ -138,6 +140,8 @@ pub fn engine_logo(engine: Engine, size: Pixels, cx: &App) -> AnyElement {
         // A single-colour mark, drawn in one flat colour as the vendor's
         // own black and reversed variants are: dark on light, light on dark.
         Engine::MariaDb => mark(MARIADB, size, cx),
+        // Single-colour too (Simple Icons), drawn the same way.
+        Engine::Sqlite => mark(SQLITE, size, cx),
     }
 }
 

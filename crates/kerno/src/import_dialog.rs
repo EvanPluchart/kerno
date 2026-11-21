@@ -737,8 +737,12 @@ impl ImportDialog {
                     // A row refused after the table was created on its own:
                     // the core dropped it. An error (the CREATE itself, a
                     // lost connection) says nothing of the table.
-                    let created_alone =
-                        this.existing.is_none() && this.engine(cx) != Engine::Postgres;
+                    let created_alone = this.existing.is_none()
+                        && this
+                            .connections
+                            .read(cx)
+                            .meta_session(&this.target.connection)
+                            .is_some_and(|meta| !meta.dialect().transactional_ddl());
                     this.step = match outcome {
                         Ok(report) if report.failed.is_none() => {
                             (this.on_imported)(&table, window, cx);

@@ -27,6 +27,10 @@ pub struct LexRules {
     pub question_parameters: bool,
     /// The client-side `DELIMITER` command changes the statement separator (MySQL).
     pub delimiter_command: bool,
+    /// A routine's or trigger's body is a `BEGIN … END` block whose `;`
+    /// stay inside the statement (MySQL, SQLite triggers); otherwise only
+    /// PostgreSQL's `BEGIN ATOMIC` is one.
+    pub begin_blocks: bool,
 }
 
 impl LexRules {
@@ -40,6 +44,7 @@ impl LexRules {
         double_quoted_strings: false,
         question_parameters: false,
         delimiter_command: false,
+        begin_blocks: false,
     };
 
     /// MySQL and MariaDB.
@@ -52,7 +57,33 @@ impl LexRules {
         double_quoted_strings: true,
         question_parameters: true,
         delimiter_command: true,
+        begin_blocks: true,
     };
+
+    /// SQLite: `"name"` and `` `name` `` quote names, strings have no
+    /// backslash escapes, `?` is a parameter.
+    pub const SQLITE: Self = Self {
+        dollar_quotes: false,
+        backslash_escapes: false,
+        hash_comments: false,
+        nested_comments: false,
+        backtick_identifiers: true,
+        double_quoted_strings: false,
+        question_parameters: true,
+        delimiter_command: false,
+        begin_blocks: true,
+    };
+
+    /// The rules an engine starts from, before a session says more (MySQL's
+    /// `NO_BACKSLASH_ESCAPES`): for text written while no session is open.
+    pub fn of(engine: crate::config::Engine) -> Self {
+        use crate::config::Engine;
+        match engine {
+            Engine::Postgres => Self::POSTGRES,
+            Engine::MySql | Engine::MariaDb => Self::MYSQL,
+            Engine::Sqlite => Self::SQLITE,
+        }
+    }
 }
 
 /// What a token is.

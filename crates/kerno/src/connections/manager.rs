@@ -442,8 +442,10 @@ impl Connections {
             .and_then(|runtime| runtime.secrets.clone());
         let store = AppState::get(cx).secrets.clone();
         let original_id = original.id.clone();
+        let file = original.config.engine.is_file();
         let loading = bridge::spawn_blocking(cx, move || match known {
             Some(secrets) => Ok(secrets),
+            None if file => Ok(Secrets::default()),
             None => secrets::load_secrets(store.as_ref(), &original_id),
         });
         cx.spawn(async move |this, cx| {
@@ -504,9 +506,13 @@ impl Connections {
             .get(id)
             .and_then(|runtime| runtime.secrets.clone());
         let store = AppState::get(cx).secrets.clone();
+        let file = self
+            .get(id)
+            .is_some_and(|saved| saved.config.engine.is_file());
         let id = id.to_string();
         bridge::spawn_blocking(cx, move || match known {
             Some(secrets) => Ok(secrets),
+            None if file => Ok(Secrets::default()),
             None => secrets::load_secrets(store.as_ref(), &id),
         })
     }
@@ -927,10 +933,13 @@ impl Connections {
         let config = saved.config.clone();
         let connection_id = saved.id.clone();
 
+        let file = config.engine.is_file();
         let loading = bridge::spawn_blocking(cx, {
             let id = connection_id.clone();
             move || match known_secrets {
                 Some(secrets) => Ok(secrets),
+                // A database file has no secret: the store is not read.
+                None if file => Ok(Secrets::default()),
                 None => secrets::load_secrets(store.as_ref(), &id),
             }
         });
@@ -1427,6 +1436,10 @@ fn persist(
             (true, Some(id)) => storage.add_connection(&id, &config).map(|()| id)?,
             (_, id) => storage.save_connection(id.as_deref(), &config)?,
         };
+        // A database file has no secret: the secret store is not touched.
+        if config.engine.is_file() {
+            return Ok(id);
+        }
         if config.save_password {
             secrets::save_secrets(store.as_ref(), &id, &secrets)?;
         } else {

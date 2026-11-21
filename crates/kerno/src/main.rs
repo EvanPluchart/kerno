@@ -327,7 +327,8 @@ fn start(
             .map(|home| std::path::PathBuf::from(home).join(".ssh/known_hosts"));
         let drivers = Drivers::default()
             .with(kerno_postgres::PostgresDriver)
-            .with(kerno_mysql::MysqlDriver);
+            .with(kerno_mysql::MysqlDriver)
+            .with(kerno_sqlite::SqliteDriver);
         // The system's OpenSSH (J2); `KERNO_SSH_CONFIG` names another file.
         let openssh = kerno_core::openssh::OpenSshEnv::detect(
             std::env::var_os("PATH").as_deref(),

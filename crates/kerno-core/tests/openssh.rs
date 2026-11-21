@@ -68,6 +68,7 @@ fn through(engine: Engine, ssh: SshConfig) -> ConnectionConfig {
     config.port = match engine {
         Engine::Postgres => 5432,
         Engine::MySql | Engine::MariaDb => 3306,
+        Engine::Sqlite => unreachable!("SQLite has no server to tunnel to"),
     };
     config.ssh = Some(ssh);
     config
@@ -122,6 +123,7 @@ async fn probe(tunnel: &Tunnel, config: &ConnectionConfig) {
                 stream.read_exact(&mut answer).await.unwrap();
                 assert_eq!(answer[4], 10, "MySQL's handshake");
             }
+            Engine::Sqlite => unreachable!("SQLite has no server to tunnel to"),
         }
     };
     tokio::time::timeout(Duration::from_secs(15), read)

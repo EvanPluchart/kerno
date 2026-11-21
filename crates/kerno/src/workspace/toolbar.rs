@@ -262,6 +262,9 @@ pub struct Facts {
     /// The active tab is about one object (a table's data or structure, a
     /// table form, a server's administration): its place cannot change.
     pub fixed: bool,
+    /// The connection is a database file (SQLite): no server to administer
+    /// and no client tools yet.
+    pub file: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +312,7 @@ pub fn why_not(item: Item, facts: Facts) -> Option<&'static str> {
             Link::Closed => Some("not connected"),
             Link::Open | Link::Connecting => None,
         },
+        Dashboard | Tools if facts.file => Some("a database file has no server tools"),
         Reconnect | Dashboard | Search => link(None),
         ReadOnly | Tools => (facts.link == Link::None).then_some("no connection"),
         Commit => no_query.or_else(|| transaction(true)),
@@ -371,7 +375,18 @@ impl Workspace {
                     | OpenTab::TableEditor(_)
             )
         );
-        Facts { link, query, fixed }
+        let file = self.command_connection(cx).is_some_and(|id| {
+            self.connections
+                .read(cx)
+                .get(&id)
+                .is_some_and(|saved| saved.config.engine.is_file())
+        });
+        Facts {
+            link,
+            query,
+            fixed,
+            file,
+        }
     }
 
     /// Where the active tab works, whatever its kind; a table's tab is on
@@ -947,9 +962,9 @@ fn tools_menu(workspace: &Entity<Workspace>, mut menu: PopupMenu, cx: &mut App) 
         return menu;
     };
     let connected = matches!(connections.status(&id), Status::Connected { .. });
-    let postgres = saved.config.engine == Engine::Postgres;
+    let engine = saved.config.engine;
     let groups = tools_now(
-        tool_entries(None, postgres, &[]),
+        tool_entries(None, engine, &[]),
         connected,
         saved.config.read_only,
     );
@@ -1115,6 +1130,7 @@ mod tests {
                 target: true,
             }),
             fixed: false,
+            file: false,
         }
     }
 
@@ -1183,6 +1199,7 @@ mod tests {
                 target: false,
             }),
             fixed: false,
+            file: false,
         };
         assert_eq!(why_not(Connection, no_target), None);
         assert_eq!(why_not(Target, no_target), Some("no connection"));
@@ -1192,6 +1209,7 @@ mod tests {
             link: Link::Open,
             query: None,
             fixed: true,
+            file: false,
         };
         assert_eq!(
             reasons(table_tab),
@@ -1239,6 +1257,7 @@ mod tests {
                 link: Link::of(&status),
                 query: None,
                 fixed: false,
+                file: false,
             };
             for (item, action) in [
                 (Connect, SidebarAction::Connect),

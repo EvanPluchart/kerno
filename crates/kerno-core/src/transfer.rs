@@ -149,6 +149,12 @@ pub fn map_type(from: Engine, to: Engine, column: &ColumnInfo) -> Result<Mapped,
         };
     }
     match (from, to) {
+        // ponytail: no type mapping to or from SQLite yet (D-102): its
+        // declared types are free text; add one with tests when it comes.
+        (Engine::Sqlite, _) | (_, Engine::Sqlite) => Err(Unmapped(format!(
+            "copying tables between SQLite and {} is still to come in Kerno",
+            if from == Engine::Sqlite { to } else { from }.label()
+        ))),
         (Engine::Postgres, _) => postgres_to_mysql(to, column),
         (_, Engine::Postgres) => mysql_to_postgres(column),
         _ => between_mysql_and_mariadb(to, column),
@@ -1120,7 +1126,7 @@ impl<P: Fn(TransferEvent)> Job<'_, P> {
         }
         let insert = format!("{head}{}", rows.join(", "));
         let written = async {
-            run_sql(&self.target, "START TRANSACTION").await?;
+            run_sql(&self.target, self.target.dialect().begin_sql()).await?;
             run_sql(&self.target, &insert).await?;
             run_sql(&self.target, "COMMIT").await
         }

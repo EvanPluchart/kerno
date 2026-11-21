@@ -28,22 +28,33 @@ pub const SSH_PORT: u16 = 52222;
 /// which reaches it as `kerno-ssh:22`.
 pub const SSH_JUMP_PORT: u16 = 52223;
 
+/// What a SQLite test asked of a container: there is none.
+const NO_CONTAINER: &str = "SQLite has no test container: its tests open files they create";
+
 /// Host port a test container listens on.
+///
+/// # Panics
+/// For SQLite, which needs no server.
 pub fn port(engine: Engine) -> u16 {
     match engine {
         Engine::Postgres => 55432,
         Engine::MySql => 53306,
         Engine::MariaDb => 53307,
+        Engine::Sqlite => panic!("{NO_CONTAINER}"),
     }
 }
 
 /// Name the container has on the compose network, as the SSH bastion
 /// resolves it.
+///
+/// # Panics
+/// For SQLite, which needs no server.
 pub fn service_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "kerno-postgres",
         Engine::MySql => "kerno-mysql",
         Engine::MariaDb => "kerno-mariadb",
+        Engine::Sqlite => panic!("{NO_CONTAINER}"),
     }
 }
 
@@ -72,8 +83,11 @@ fn check(name: &str, port: u16) -> bool {
 }
 
 /// Whether the test container of `engine` is up. Prints a `SKIPPED` line
-/// when it is not.
+/// when it is not. Always true for SQLite, which needs none.
 pub fn available(engine: Engine) -> bool {
+    if engine.is_file() {
+        return true;
+    }
     exclusive_run();
     check(service_name(engine), port(engine))
 }
@@ -193,6 +207,7 @@ pub fn openssh_config(engine: Engine) -> ConnectionConfig {
     config.port = match engine {
         Engine::Postgres => 5432,
         Engine::MySql | Engine::MariaDb => 3306,
+        Engine::Sqlite => panic!("{NO_CONTAINER}"),
     };
     config.ssh = Some(SshConfig {
         host: "kerno-behind-jump".into(),
@@ -267,6 +282,7 @@ pub fn params(engine: Engine) -> ConnectParams {
         user: config.user,
         password: Some(Secret::new(DB_PASSWORD)),
         database: config.database,
+        file: None,
         tls: config.tls,
         read_only: false,
         options: BTreeMap::new(),
