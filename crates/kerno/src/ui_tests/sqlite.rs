@@ -125,6 +125,8 @@ fn the_fixture_file_is_browsed_queried_and_edited(cx: &mut TestAppContext) {
     assert_eq!(app.tree(cx)[0], "main", "{:#?}", app.tree(cx));
     // A database file cannot make another database.
     assert!(app.why_not(cx, Action::CreateDatabase, &["main"]).is_some());
+    // The compare has no SQLite side yet: its entry says so (it did nothing).
+    assert!(app.why_not(cx, Action::CompareWith, &["main"]).is_some());
 
     app.run_in_new_tab(
         cx,

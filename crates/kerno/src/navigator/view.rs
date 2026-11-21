@@ -1611,6 +1611,11 @@ impl Navigator {
             (Action::CreateSchema, _) if dialect.create_schema_sql("name").is_err() => {
                 Some("this database has no schemas")
             }
+            // The compare has no SQLite side yet (K30): said here, not a
+            // menu entry that does nothing.
+            (Action::CompareWith, _) if saved.config.engine.is_file() => {
+                Some("comparing SQLite schemas is not supported yet")
+            }
             // PostgreSQL cannot drop the database a session is in.
             (Action::Drop, Some(ObjectRef::Database(name)))
                 if dialect.has_schemas() && meta.database().as_deref() == Some(name.as_str()) =>
