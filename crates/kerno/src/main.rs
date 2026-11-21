@@ -54,10 +54,7 @@ use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 
 use gpui_kit::component::{TitleBar, WindowExt as _};
-use gpui_kit::{
-    App, AppContext as _, Bounds, Focusable as _, Menu, MenuItem, WindowBounds, WindowOptions, px,
-    size,
-};
+use gpui_kit::{App, AppContext as _, Focusable as _, Menu, MenuItem, WindowOptions, px, size};
 use kerno_core::config::{Secret, parse_connection_url};
 use kerno_core::instance::{self, Invocation};
 use kerno_core::storage::AppPaths;
@@ -299,18 +296,11 @@ fn start(
     // The menu bar was set by `bind_keys`, which builds it again whenever
     // the shortcuts change (K20).
 
-    let mut window_size = size(px(1280.), px(800.));
-    if let Some(display) = cx.primary_display() {
-        let available = display.bounds().size;
-        window_size.width = window_size.width.min(available.width * 0.9);
-        window_size.height = window_size.height.min(available.height * 0.9);
-    }
+    // Where it was last time (K28), else centred.
+    let (window_bounds, display_id) = crate::state::window_bounds(startup.window.as_ref(), cx);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            window_size,
-            cx,
-        ))),
+        window_bounds: Some(window_bounds),
+        display_id,
         window_min_size: Some(size(px(720.), px(440.))),
         // Linux: the desktop entry's `StartupWMClass` matches it, so the
         // window takes the installed icon; X11 also gets the icon itself.

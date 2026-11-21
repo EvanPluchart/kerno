@@ -2756,3 +2756,36 @@ filters Installed / Available / To update, and Install, Update, Drop with the SQ
 - Not done: extensions installed in the database whose control file has since been removed from the server are
   not listed (the read starts from `pg_available_extensions`, as before); an install's own requirements'
   "who may install" is not checked before running (the server's refusal says it).
+
+## D-101 — Four defects of daily use: window place, dark selection, notifications, New SQL editor (K28; 2026-11-21)
+
+- **The window's place is a setting** (`"window"` in the settings table, a `WindowPlacement`): the frame in
+  logical pixels as the platform reports it, the display's UUID (stable across replugs, unlike its id), and
+  Windowed / Maximized / Fullscreen. It is written 400 ms after the window stops moving or resizing (GPUI's bounds
+  observer, the tabs' delay) off the UI thread, and again in the quit flush. At start it is used only when its
+  display is connected and the window's top (40 px across, its title bar) is on it; otherwise the centred default
+  as before. macOS reports a zoomed window as Windowed with its frame, so "maximised" comes back as that frame
+  there; full screen comes back as full screen. Only the main window: the start-failure window keeps its own.
+- **Dark selection as painted.** The kit paints `table.active.background` and `list.active.background` at most
+  20 % opaque whatever the file says, so the dark file's opaque `#323B20` and `#2A311E` came out grey (1.02:1).
+  They are now Lime written with its opacity, `#C8F03C2A` (16.5 %): painted over a row it is `#323B20`, the colour
+  the earlier choice meant (1.53:1 against a row, 1.48 against a stripe), and the same tint for list items and the
+  sidebar's tree. On a selected cell of a hovered row (the usual state right after a click) the muted text of NULL
+  fell to 4.11:1, so dark `muted.foreground` goes one step lighter, `#9AA4B0` → `#A3ADB9` (4.57:1 there, 7.9:1 on
+  the background). The other way, a fainter tint (`0x21`) with the old muted text, gave 1.37:1: too close to the
+  complaint. The test measures what is painted, as the light ones already did.
+- **A range takes the cell's tint**, not `selection.background`: that token is also the selected text of the
+  editor and the inputs, where a brighter tint would lower the comment colour's contrast (already 4.15:1). The
+  text selection is unchanged; the light range moves from `#D8F477` at 30 % to the Lime wash, the same look.
+  The cell (or row, or column) the table already tints as its own selection is not tinted a second time: a
+  doubled tint would bring muted text under 4.5:1 on the range's anchor.
+- **Notifications at the bottom right**, as DBeaver's, 68 px above the window's bottom: the status bar (24 px), a
+  tab's one-line footer (fetch buttons, the data pager) and a gap. They cover grid rows for their time on screen,
+  never a toolbar. A footer wrapped on two lines in a narrow group can still be partly covered.
+- **New SQL editor connects first** on whatever path it is called (⌘T, toolbar, menu, palette), through the
+  sidebar's existing `pending_editor`: one place, so failures, cancelled prompts and the environment's rules
+  behave as the connection's own "New SQL editor" did. A remembered connection that was deleted since gives the
+  unbound tab, as nothing selected does.
+- Not done: the light theme's `list.active.background` (`#F1F8D6`, opaque) is painted at 20 % too and a selected
+  tree or list item hardly shows in light (pinned by the brand test as written); the record view's current column
+  and the dark text selection keep `selection.background` at 30 % (faint, unchanged).

@@ -1062,6 +1062,56 @@ impl TableLayout {
     }
 }
 
+/// Where the main window was and how large (K28), stored as a setting and
+/// reopened there at the next start.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowPlacement {
+    /// The display it was on, by the platform's id of it (a UUID), when the
+    /// platform gives one.
+    pub display: Option<String>,
+    /// The window's frame in logical pixels, in that display's coordinates
+    /// as the platform reports them (for a maximised or full-screen window,
+    /// the frame it goes back to).
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub state: WindowState,
+}
+
+/// How the main window was shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowState {
+    #[default]
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+impl WindowPlacement {
+    /// Of `displays` (each its id and its frame `x, y, width, height`), the
+    /// one to reopen the window on: the display it was on, still connected,
+    /// with enough of the window's top on it to grab it by its title bar.
+    /// `None` puts the window back at the default place.
+    pub fn display_among(&self, displays: &[(Option<&str>, [f32; 4])]) -> Option<usize> {
+        // ponytail: a fixed strip of title bar must stay reachable; a window
+        // dragged mostly off its display but still grabbable comes back as is.
+        const GRAB: f32 = 40.0;
+        if !(self.width >= GRAB && self.height >= GRAB) {
+            return None;
+        }
+        displays.iter().position(|(id, [x, y, width, height])| {
+            let across = (self.x + self.width).min(x + width) - self.x.max(*x);
+            *id == self.display.as_deref()
+                && across >= GRAB
+                && self.y >= *y
+                && self.y <= y + height - GRAB
+        })
+    }
+}
+
 /// Creates an empty file only its owner can read or write.
 fn create_private(path: &Path) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
@@ -2643,5 +2693,81 @@ mod tests {
         // A layout written by a later version with more fields still reads.
         let later: TableLayout = serde_json::from_str(r#"{"hidden":["a"],"future":1}"#).unwrap();
         assert_eq!(later.hidden, ["a"]);
+    }
+
+    fn placement() -> WindowPlacement {
+        WindowPlacement {
+            display: Some("display-a".into()),
+            x: 120.0,
+            y: 60.0,
+            width: 1400.0,
+            height: 900.0,
+            state: WindowState::Maximized,
+        }
+    }
+
+    #[test]
+    fn a_window_placement_is_stored_and_read_back() {
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(storage.setting::<WindowPlacement>("window").unwrap(), None);
+        storage.set_setting("window", &placement()).unwrap();
+        assert_eq!(
+            storage.setting::<WindowPlacement>("window").unwrap(),
+            Some(placement())
+        );
+        // Written without a state: a plain window.
+        let plain: WindowPlacement =
+            serde_json::from_str(r#"{"display":null,"x":0,"y":0,"width":800,"height":600}"#)
+                .unwrap();
+        assert_eq!(plain.state, WindowState::Windowed);
+    }
+
+    #[test]
+    fn a_window_off_every_display_goes_back_to_the_default_place() {
+        let laptop = (Some("display-b"), [0.0, 0.0, 1512.0, 982.0]);
+        let screen = (Some("display-a"), [0.0, 0.0, 2560.0, 1440.0]);
+        // On its display, found among others.
+        assert_eq!(placement().display_among(&[laptop, screen]), Some(1));
+        // Its display is gone.
+        assert_eq!(placement().display_among(&[laptop]), None);
+        assert_eq!(placement().display_among(&[]), None);
+        // The display is smaller now, or the window was moved off it: its
+        // title bar is out of reach.
+        let small = (Some("display-a"), [0.0, 0.0, 1000.0, 50.0]);
+        assert_eq!(placement().display_among(&[small]), None);
+        for (x, y) in [
+            (2540.0, 60.0),
+            (-1380.0, 60.0),
+            (120.0, -10.0),
+            (120.0, 1420.0),
+        ] {
+            let moved = WindowPlacement {
+                x,
+                y,
+                ..placement()
+            };
+            assert_eq!(moved.display_among(&[screen]), None, "at {x}, {y}");
+        }
+        // Mostly off but still grabbed by its top: kept.
+        let edge = WindowPlacement {
+            x: 2400.0,
+            ..placement()
+        };
+        assert_eq!(edge.display_among(&[screen]), Some(0));
+        // A platform that names no display: matched by its frame alone.
+        let unnamed = WindowPlacement {
+            display: None,
+            ..placement()
+        };
+        assert_eq!(
+            unnamed.display_among(&[(None, [0.0, 0.0, 2560.0, 1440.0])]),
+            Some(0)
+        );
+        // A frame that was never a window's.
+        let empty = WindowPlacement {
+            width: 0.0,
+            ..placement()
+        };
+        assert_eq!(empty.display_among(&[screen]), None);
     }
 }

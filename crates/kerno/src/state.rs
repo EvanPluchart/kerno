@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, BorrowAppContext as _, Global, SharedString, Task};
+use gpui_kit::{
+    App, BorrowAppContext as _, Bounds, DisplayId, Global, SharedString, Task, Window,
+    WindowBounds, point, px, size,
+};
 use kerno_core::secrets::{self, SecretStore};
-use kerno_core::storage::{AppPaths, SavedConnection, Storage};
+use kerno_core::storage::{AppPaths, SavedConnection, Storage, WindowPlacement, WindowState};
 
 use crate::bridge;
 use crate::settings::Settings;
@@ -18,6 +21,71 @@ pub const ACTIVE_TAB_KEY: &str = "tabs.active";
 
 /// Storage key of the groups of tabs (K19): see `workspace::panes::SavedPane`.
 pub const TAB_LAYOUT_KEY: &str = "tabs.layout";
+
+/// Storage key of where the main window was (K28).
+pub const WINDOW_KEY: &str = "window";
+
+/// Where the main window opens and on which display: where `stored` says,
+/// when its display is still there and the window still on it; otherwise
+/// centred on the main display, 1280 × 800 at most.
+pub fn window_bounds(
+    stored: Option<&WindowPlacement>,
+    cx: &App,
+) -> (WindowBounds, Option<DisplayId>) {
+    if let Some(stored) = stored {
+        let displays = cx.displays();
+        let ids: Vec<Option<String>> = (displays.iter())
+            .map(|display| display.uuid().ok().map(|uuid| uuid.to_string()))
+            .collect();
+        let frames: Vec<(Option<&str>, [f32; 4])> = (displays.iter().zip(&ids))
+            .map(|(display, id)| {
+                let frame = display.bounds();
+                let [x, y] = [frame.origin.x, frame.origin.y].map(f32::from);
+                let [width, height] = [frame.size.width, frame.size.height].map(f32::from);
+                (id.as_deref(), [x, y, width, height])
+            })
+            .collect();
+        if let Some(index) = stored.display_among(&frames) {
+            let frame = Bounds::new(
+                point(px(stored.x), px(stored.y)),
+                size(px(stored.width), px(stored.height)),
+            );
+            let bounds = match stored.state {
+                WindowState::Windowed => WindowBounds::Windowed(frame),
+                WindowState::Maximized => WindowBounds::Maximized(frame),
+                WindowState::Fullscreen => WindowBounds::Fullscreen(frame),
+            };
+            return (bounds, Some(displays[index].id()));
+        }
+    }
+    let mut window_size = size(px(1280.), px(800.));
+    if let Some(display) = cx.primary_display() {
+        let available = display.bounds().size;
+        window_size.width = window_size.width.min(available.width * 0.9);
+        window_size.height = window_size.height.min(available.height * 0.9);
+    }
+    let centred = Bounds::centered(None, window_size, cx);
+    (WindowBounds::Windowed(centred), None)
+}
+
+/// Where `window` is now, to open it there next time.
+pub fn window_placement(window: &Window, cx: &App) -> WindowPlacement {
+    let (state, frame) = match window.window_bounds() {
+        WindowBounds::Windowed(frame) => (WindowState::Windowed, frame),
+        WindowBounds::Maximized(frame) => (WindowState::Maximized, frame),
+        WindowBounds::Fullscreen(frame) => (WindowState::Fullscreen, frame),
+    };
+    WindowPlacement {
+        display: (window.display(cx))
+            .and_then(|display| display.uuid().ok())
+            .map(|uuid| uuid.to_string()),
+        x: frame.origin.x.into(),
+        y: frame.origin.y.into(),
+        width: frame.size.width.into(),
+        height: frame.size.height.into(),
+        state,
+    }
+}
 
 /// App-wide state, available as a GPUI global.
 pub struct AppState {
@@ -51,6 +119,8 @@ pub struct Startup {
     pub active_tab: usize,
     /// The groups of the tabs, when stored and readable (K19).
     pub tab_layout: Option<crate::workspace::panes::SavedPane>,
+    /// Where the main window was, when stored and readable (K28).
+    pub window: Option<WindowPlacement>,
 }
 
 impl Startup {
@@ -63,6 +133,7 @@ impl Startup {
         let active_tab = storage.setting(ACTIVE_TAB_KEY)?.unwrap_or(0);
         // A layout that cannot be read is no reason not to start: one group.
         let tab_layout = storage.setting(TAB_LAYOUT_KEY).unwrap_or(None);
+        let window = storage.setting(WINDOW_KEY).unwrap_or(None);
         Ok(Self {
             paths: paths.clone(),
             storage,
@@ -72,6 +143,7 @@ impl Startup {
             tabs,
             active_tab,
             tab_layout,
+            window,
         })
     }
 }

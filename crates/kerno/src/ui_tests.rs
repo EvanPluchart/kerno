@@ -46,6 +46,7 @@ mod brackets;
 mod connection_feedback;
 mod coverage;
 mod critique;
+mod daily_use;
 mod editing_v11;
 mod editor_v11;
 mod environments;

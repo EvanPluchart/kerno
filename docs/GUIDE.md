@@ -403,10 +403,10 @@ menu with Copy name. MySQL and MariaDB have no extensions.
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
-tabs, history, saved queries and tasks) is in one SQLite file, `kerno.db`, in its data folder:
-`~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux. Beside it: `logs/` (a file a
-day, the last seven), `known_hosts` (the SSH host keys you accepted in Kerno), `folder-icons/`, and
-`backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Passwords are in
+tabs, where the window was and how large, history, saved queries and tasks) is in one SQLite file, `kerno.db`,
+in its data folder: `~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux. Beside it:
+`logs/` (a file a day, the last seven), `known_hosts` (the SSH host keys you accepted in Kerno),
+`folder-icons/`, and `backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Passwords are in
 the system keychain, never in this folder. `KERNO_DATA_DIR=<folder>` puts all of it in another folder for a
 run.
 
@@ -533,7 +533,7 @@ reachable from the command palette.
 | Cmd+P | Open table (quick open) |
 | Cmd+B | Toggle sidebar |
 | Cmd+Alt+F | Filter the schema tree |
-| Cmd+T | New query tab |
+| Cmd+T | New query tab (on the connection selected in the sidebar, connected first if it is not) |
 | Cmd+W / Cmd+Shift+W | Close tab / close all tabs of the group |
 | Ctrl+Tab / Ctrl+Shift+Tab, also Cmd+Alt+Right / Left (Super on Linux) and Ctrl+PageDown / PageUp | Next / previous tab of the group |
 | Cmd+Alt+Shift+L / Cmd+Alt+Shift+I | Split right / split down (the tab goes to a new group) |

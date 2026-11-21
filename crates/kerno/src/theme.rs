@@ -11,7 +11,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, Div, ElementId, Hsla, InteractiveElement as _, Stateful, Styled as _, Window, div, px, rgb,
+    Anchor, App, Div, ElementId, Hsla, InteractiveElement as _, Pixels, Stateful, Styled as _,
+    Window, div, px, rgb,
 };
 use kerno_core::ConnectionConfig;
 use kerno_core::environment::{self, Tint};
@@ -20,6 +21,10 @@ use serde::{Deserialize, Serialize};
 /// The theme file: surface levels, text levels, accent, semantic colours,
 /// grid lines and selection for both modes.
 const THEME_JSON: &str = include_str!("../assets/themes/kerno.json");
+
+/// How far notifications sit from the bottom of the window: above the
+/// status bar (24 px) and a tab's footer (about 30 px), and a gap.
+pub const NOTIFICATION_BOTTOM: Pixels = px(24. + 32. + 12.);
 
 const LIGHT: &str = "Kerno Light";
 const DARK: &str = "Kerno Dark";
@@ -79,6 +84,11 @@ pub fn init(appearance: Appearance, cx: &mut App) -> anyhow::Result<()> {
     Theme::update(cx, |theme| {
         theme.light_theme = light;
         theme.dark_theme = dark;
+        // At the bottom right, as DBeaver's, clear of the status bar and of
+        // a tab's footer (its pager, its fetch buttons), not over the
+        // toolbar of the tab where the kit puts them (K28).
+        theme.notification.placement = Anchor::BottomRight;
+        theme.notification.margins.bottom = NOTIFICATION_BOTTOM;
     });
     apply(appearance, None, cx);
     Ok(())
@@ -205,12 +215,25 @@ fn read_preview(dark: bool) -> Preview {
         .as_array()
         .and_then(|themes| themes.iter().find(|theme| theme["mode"] == mode))
         .map(|theme| &theme["colors"]);
-    let [window, bar, sidebar, border, text, muted, selection, accent] = PREVIEW_KEYS.map(|key| {
-        colors
+    let read = |key: &str| {
+        let digits = colors
             .and_then(|colors| colors[key].as_str())
-            .and_then(|hex| u32::from_str_radix(hex.trim_start_matches('#').get(..6)?, 16).ok())
-            .unwrap_or_default()
-    });
+            .map(|hex| hex.trim_start_matches('#'))
+            .unwrap_or_default();
+        let color = (digits.get(..6))
+            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+            .unwrap_or_default();
+        let alpha = (digits.get(6..8)).and_then(|alpha| u8::from_str_radix(alpha, 16).ok());
+        (color, alpha)
+    };
+    let [window, bar, sidebar, border, text, muted, selection, accent] =
+        PREVIEW_KEYS.map(|key| read(key).0);
+    // A selection written with its opacity is drawn as the kit paints it on
+    // the sidebar: at most 20 % of it (K28).
+    let selection = match read(PREVIEW_KEYS[6]).1 {
+        Some(alpha) => mix(sidebar, selection, (f64::from(alpha) / 255.0).min(0.2)),
+        None => selection,
+    };
     Preview {
         window,
         bar,
@@ -478,28 +501,46 @@ mod tests {
         super::contrast(hex(a), hex(b))
     }
 
-    /// The most of `table.active.background` the kit lets through: it draws
-    /// a selected cell's or row's tint at most 20 % opaque, whatever the file
-    /// says (gpui-component's `clamp_alpha` in `theme/schema.rs`).
+    /// The most of `table.active.background` and `list.active.background`
+    /// the kit lets through: it draws a selected cell's, row's or list item's
+    /// tint at most 20 % opaque, whatever the file says (gpui-component's
+    /// `clamp_alpha` in `theme/schema.rs`), and `selection.background` (a
+    /// range of cells, selected text) at most 30 %.
     const ACTIVE_ALPHA: f64 = 0.2;
+    const SELECTION_ALPHA: f64 = 0.3;
 
     /// `table.active.background` as painted over `row`, as `0xRRGGBB`.
     fn selected_on(theme: &ThemeEntry, row: &str) -> u32 {
-        let tint = &theme.colors["table.active.background"];
+        painted(theme, "table.active.background", row)
+    }
+
+    /// The selection tint `key` as painted over `under`, as `0xRRGGBB`.
+    fn painted(theme: &ThemeEntry, key: &str, under: &str) -> u32 {
+        let tint = &theme.colors[key];
         let digits = tint.trim_start_matches('#');
         let alpha = match digits.get(6..8) {
             Some(alpha) => f64::from(u8::from_str_radix(alpha, 16).unwrap()) / 255.0,
             None => 1.0,
         };
-        super::mix(hex(&theme.colors[row]), hex(tint), alpha.min(ACTIVE_ALPHA))
+        let most = match key {
+            "selection.background" => SELECTION_ALPHA,
+            _ => ACTIVE_ALPHA,
+        };
+        super::mix(hex(&theme.colors[under]), hex(tint), alpha.min(most))
     }
 
-    /// A colour of the theme as it is painted: the selection's tint over a
-    /// plain row, every other colour as written.
+    /// A colour of the theme as it is painted: a selection's tint over a
+    /// plain row, list or editor, every other colour as written.
     fn color(theme: &ThemeEntry, key: &str) -> String {
         match key {
             "table.active.background" => {
                 format!("#{:06X}", selected_on(theme, "table.background"))
+            }
+            "list.active.background" => {
+                format!("#{:06X}", painted(theme, key, "list.background"))
+            }
+            "selection.background" => {
+                format!("#{:06X}", painted(theme, key, "background"))
             }
             _ => theme.colors[key].clone(),
         }
@@ -756,18 +797,62 @@ mod tests {
         assert!(failures.is_empty(), "below 3:1:\n{}", failures.join("\n"));
     }
 
-    /// A selected row stands out from the rows around it in the dark
-    /// theme (where it carries no light-on-dark wash): at least 1.45:1
-    /// against a plain and a striped row. (The light theme's Lime wash is
-    /// a brand rule and carries the Olive marker.)
+    /// A selected row, cell or range, and a selected item of a list or of
+    /// the sidebar's tree, stand out in the dark theme, measured as the kit
+    /// paints them (K28: the selection was written opaque, painted at 20 %
+    /// and came out at 1.02:1, while this test read it as written). A row's
+    /// tint is painted over the grid (the kit drops a selected row's stripe
+    /// and hover); a cell's, each cell of a range too (the grid tints a
+    /// range with it), over its row, plain, striped or hovered; a list
+    /// item's over the list, the sidebar or a popup. Each is a Lime tint (`assets/brand/BRAND.md`) at least 1.45:1
+    /// from what it is painted on and from the plain and striped rows, and
+    /// the text, the muted text of NULL and links read on it (4.5:1).
     #[test]
     fn a_selected_row_stands_out_in_the_dark_theme() {
+        const LIME: &str = "#C8F03C";
         let themes = themes();
-        let dark = &themes[1].colors;
-        for row in ["table.background", "table.even.background"] {
-            let ratio = contrast(&dark["table.active.background"], &dark[row]);
-            assert!(ratio >= 1.45, "selected row on {row} is {ratio:.2}:1");
+        let dark = &themes[1];
+        assert_eq!(dark.mode, "dark");
+        let stripes = ["table.background", "table.even.background"];
+        let mut cases: Vec<(&str, &str, &[&str])> = Vec::new();
+        for under in [
+            "table.background",
+            "table.even.background",
+            "table.hover.background",
+        ] {
+            cases.push(("table.active.background", under, &stripes));
         }
+        for under in [
+            "list.background",
+            "sidebar.background",
+            "popover.background",
+        ] {
+            cases.push(("list.active.background", under, &[]));
+        }
+        let mut failures = Vec::new();
+        for (tint, under, around) in cases {
+            let shown = painted(dark, tint, under);
+            let others = around.iter().filter(|other| **other != under);
+            for other in std::iter::once(&under).chain(others) {
+                let ratio = super::contrast(shown, hex(&dark.colors[*other]));
+                if ratio < 1.45 {
+                    failures.push(format!("{tint} on {under} is {ratio:.2}:1 from {other}"));
+                }
+            }
+            let off = (hue(&format!("#{shown:06X}")) - hue(LIME)).abs();
+            if off > 10.0 {
+                failures.push(format!(
+                    "{tint} on {under} is #{shown:06X}, not a Lime tint"
+                ));
+            }
+            for text in ["foreground", "muted.foreground", "link"] {
+                let ratio = super::contrast(hex(&dark.colors[text]), shown);
+                if ratio < 4.5 {
+                    failures.push(format!("{text} on {tint} on {under} is {ratio:.2}:1"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// K21: the grids have visible rows and columns. A first user found the
@@ -1087,7 +1172,12 @@ mod tests {
                 preview.accent,
             ];
             for (key, value) in PREVIEW_KEYS.iter().zip(drawn) {
-                assert_eq!(value, hex(&theme.colors[*key]), "{}: {key}", theme.name);
+                // A colour written with its opacity, as painted on the sidebar.
+                let written = match theme.colors[*key].len() {
+                    9 => painted(&theme, key, "sidebar.background"),
+                    _ => hex(&theme.colors[*key]),
+                };
+                assert_eq!(value, written, "{}: {key}", theme.name);
             }
         }
         assert_ne!(super::preview(false), super::preview(true));

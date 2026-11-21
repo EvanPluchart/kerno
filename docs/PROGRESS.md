@@ -1003,3 +1003,22 @@ Still open (for the owner):
   `tests/fixtures/generated` linked from the main checkout for the run: the worktree has no SSH keys or TLS
   certificates of its own); fmt and clippy clean.
 - Still to do: the final captures (`m12-extensions-*`), the owner's look at the manager.
+
+## 2026-11-21 — K28: four defects of daily use
+
+- Found in real use, each cause read in the code before the fix (D-101): the window always opened centred; the
+  dark theme's selection was written opaque and painted by the kit at 20 % (1.02:1); notifications sat at the top
+  right over the toolbars; ⌘T on a selected connection that was not open gave a tab bound to nothing.
+- Now: the window's frame, display and state are stored with the settings (after it stops moving, and at quit)
+  and restored on that display, centred as before when the display or the window's top is gone; the dark
+  selection of rows, cells, ranges, lists and the tree is Lime at 16.5 % (1.53:1 painted), muted text one step
+  lighter for NULL on a selected cell of a hovered row; notifications at the bottom right above the status bar and
+  a tab's footer; "New SQL editor" from every way in connects first and opens the tab on the connection, no tab
+  when it fails or is cancelled.
+- Seen while working: a selected row, cell and range and an error notification over a query tab, rendered
+  offscreen in both themes (temporary test, not committed).
+- Tests: two core, one theme test rewritten to measure what is painted, four UI tests in
+  `ui_tests/daily_use.rs`, each seen failing under a mutation. `cargo test -p kerno`: 784 pass; `kerno-core`
+  passes (with `tests/fixtures/generated` linked from the main checkout); fmt, clippy and deny clean.
+- Not proved in a real window: the restore of a real window's place, maximised or full screen (test context
+  only). Still to do: the final captures (`m12-grid-selection-*`, `m12-notification-*`).

@@ -73,7 +73,7 @@ use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::settings::TabLayout;
 use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
-use crate::state::{ACTIVE_TAB_KEY, AppState, TAB_LAYOUT_KEY};
+use crate::state::{ACTIVE_TAB_KEY, AppState, TAB_LAYOUT_KEY, WINDOW_KEY};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{PROPERTIES_SECTION, StructureTab, StructureTabEvent};
 use crate::tabs::{
@@ -88,7 +88,7 @@ use kerno_core::browse::Filter;
 use kerno_core::erd::Scope as DiagramScope;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::{CellValue, RowSql};
-use kerno_core::storage::SavedQuery;
+use kerno_core::storage::{SavedQuery, WindowPlacement};
 use kerno_core::{Engine, TxState};
 
 /// How long after the last change the open tabs are written to storage.
@@ -506,6 +506,10 @@ pub struct Workspace {
     next_query_number: usize,
     palette: Entity<CommandState>,
     pending_save: Option<Task<()>>,
+    /// Where the window was last seen, and its write waiting for the window
+    /// to stop moving (K28).
+    window_placement: Option<WindowPlacement>,
+    pending_window_save: Option<Task<()>>,
     /// A connection being opened for "New SQL editor": its tab opens once
     /// it is connected.
     pending_editor: Option<String>,
@@ -586,10 +590,22 @@ impl Workspace {
         // Text typed in the last moments before quitting is not lost.
         let flush_on_quit = cx.on_app_quit(|this, cx| {
             let (tabs, settings) = (this.save_tabs(cx), AppState::flush_settings(cx));
+            let placement = this.save_window(cx);
             async move {
                 tabs.await;
                 settings.await;
+                placement.await;
             }
+        });
+        // Where the window is, written a moment after it stops moving (K28).
+        let window_moved = cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_placement = Some(crate::state::window_placement(window, cx));
+            this.pending_window_save = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SAVE_TABS_DELAY).await;
+                if let Ok(save) = this.update(cx, |this, cx| this.save_window(cx)) {
+                    save.await;
+                }
+            }));
         });
         // The window's close button quits as Quit does: it asks first what
         // that would end (C15), so the window itself never closes here.
@@ -624,6 +640,8 @@ impl Workspace {
             next_query_number: 1,
             palette,
             pending_save: None,
+            window_placement: None,
+            pending_window_save: None,
             pending_editor: None,
             tab_target,
             shown_tab: Rc::new(RefCell::new(Vec::new())),
@@ -649,6 +667,7 @@ impl Workspace {
             _subscriptions: vec![
                 follow_system,
                 flush_on_quit,
+                window_moved,
                 connection_events,
                 navigator_events,
                 sidebar_events,
@@ -2261,6 +2280,19 @@ impl Workspace {
         }));
     }
 
+    /// Writes where the window was last seen, if it was.
+    fn save_window(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let Some(placement) = self.window_placement.clone() else {
+            return Task::ready(());
+        };
+        let storage = AppState::get(cx).storage.clone();
+        bridge::spawn_blocking(cx, move || {
+            if let Err(error) = storage.set_setting(WINDOW_KEY, &placement) {
+                tracing::error!(%error, "could not store where the window is");
+            }
+        })
+    }
+
     /// Writes the open tabs to storage now.
     fn save_tabs(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let snapshots: Vec<TabSnapshot> = self
@@ -2298,9 +2330,30 @@ impl Workspace {
 
     // Commands ----------------------------------------------------------------
 
+    /// "New SQL editor": on the connection being browsed, connected first
+    /// when it is not (K28); unbound when there is none.
     fn new_query_tab(&mut self, _: &NewQueryTab, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.default_target(cx);
-        self.new_query_on(target, window, cx);
+        let current = (self.sidebar.read(cx).navigator().read(cx).connection())
+            .filter(|id| self.connections.read(cx).get(id).is_some());
+        match current.map(str::to_string) {
+            Some(id) => self.new_editor_on(&id, window, cx),
+            None => self.new_query_on(None, window, cx),
+        }
+    }
+
+    /// A new query tab on the connection `id`: at once when it is connected,
+    /// else once it is (with its prompts), and none when it is not.
+    fn new_editor_on(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.connections.read(cx).status(id),
+            Status::Connected { .. }
+        ) {
+            self.new_query_on(Some(connection_target(id)), window, cx);
+        } else {
+            self.pending_editor = Some(id.to_string());
+            self.connections
+                .update(cx, |connections, cx| connections.connect(id, cx));
+        }
     }
 
     /// Opens an empty "Query N" tab running on `target`.
@@ -3975,19 +4028,7 @@ impl Workspace {
             SidebarEvent::SetReadOnly(id, read_only) => {
                 self.set_read_only(id.clone(), *read_only, window, cx)
             }
-            SidebarEvent::NewEditor(id) => {
-                if matches!(
-                    self.connections.read(cx).status(id),
-                    Status::Connected { .. }
-                ) {
-                    self.new_query_on(Some(connection_target(id)), window, cx);
-                } else {
-                    // Connect first (with its prompts); the tab follows.
-                    self.pending_editor = Some(id.clone());
-                    self.connections
-                        .update(cx, |connections, cx| connections.connect(id, cx));
-                }
-            }
+            SidebarEvent::NewEditor(id) => self.new_editor_on(id, window, cx),
         }
     }
 

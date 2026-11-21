@@ -2134,6 +2134,17 @@ impl Grid {
         }
     }
 
+    /// Whether the table paints its own selection's tint on this cell: the
+    /// anchor cell, or a cell of the anchor row or column.
+    fn table_tints(&self, row: usize, column: usize) -> bool {
+        match self.anchor {
+            TableSelection::Cell(at_row, at_column) => (at_row, at_column) == (row, column),
+            TableSelection::Row(at_row) => at_row == row,
+            TableSelection::Column(at_column) => at_column == column,
+            TableSelection::None => false,
+        }
+    }
+
     /// The selection as text. A single cell is its value as it is; anything
     /// larger is written in `format`. `table` names the target of `INSERT`s.
     pub fn copy_text(
@@ -3191,7 +3202,13 @@ impl TableDelegate for Grid {
                             .when(!current, |marker| marker.size_0()),
                     )
             })
-            .when(self.in_range(row, column), |cell| cell.bg(theme.selection))
+            // A range is tinted as a selected cell is (K28: the text
+            // selection's tint, painted at 30 %, hardly showed in dark), once:
+            // not where the table already tints its own selection.
+            .when(
+                self.in_range(row, column) && !self.table_tints(row, column),
+                |cell| cell.bg(theme.table_active),
+            )
             // Shift and click stretches the selection to this cell; a plain
             // click is the table's.
             .on_mouse_down(
