@@ -267,6 +267,7 @@ fn tree_entry(action: Action) -> Palette {
         Action::EditColumn | Action::Properties => Command("edit_object"),
         Action::ViewDiagram => Command("view_diagram"),
         Action::CompareWith => Command("compare_schemas"),
+        Action::ExportSchema => Command("export_schema"),
     }
 }
 
@@ -701,6 +702,7 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
         Action::Properties,
         Action::ViewDiagram,
         Action::CompareWith,
+        Action::ExportSchema,
     ];
     let mut palettes: Vec<(String, Palette)> = actions
         .iter()

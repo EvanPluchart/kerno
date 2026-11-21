@@ -898,3 +898,69 @@ async fn the_er_diagram_reads_the_file() {
     assert!(to_customers, "{:?}", diagram.edges);
     assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
 }
+
+/// K31: a schema document of the file names its tables, views and
+/// trigger, holds only what was picked, and never the file's path.
+#[tokio::test]
+async fn a_schema_document_of_the_file() {
+    use kerno_core::schema_doc::{self, Document, Format, Options, Pick};
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let (file, session) = fixture(dir.path()).await;
+    let document = |side| Document {
+        title: schema_doc::default_title("main", None),
+        engine: Engine::Sqlite,
+        server: schema_doc::server_label(Engine::Sqlite, session.server()),
+        database: "main".into(),
+        schema: None,
+        date: schema_doc::today(),
+        side,
+    };
+    let objects = session.objects("main").await.unwrap();
+    let all = schema_doc::pickable(&objects)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let pick = Pick {
+        relations: all,
+        code: true,
+    };
+    let side = schema_doc::load(
+        session.clone(),
+        "main",
+        &pick,
+        |_| {},
+        &AtomicBool::new(false),
+    )
+    .await
+    .unwrap();
+    let whole = document(side);
+    let path = file.display().to_string();
+    for format in Format::ALL {
+        let text = schema_doc::render(&whole, format, &Options::default(), session.dialect());
+        for table in ["customers", "products", "orders", "order_lines"] {
+            assert!(text.contains(table), "{format:?}: {table}");
+        }
+        if matches!(format, Format::Html | Format::Markdown | Format::Sql) {
+            assert!(text.contains("customer_orders"), "{format:?}");
+            assert!(text.contains("orders_note_default"), "{format:?}");
+        }
+        assert!(!text.contains(&path), "{format:?}");
+        assert!(!text.contains("fixture.db"), "{format:?}");
+    }
+    let pick = Pick {
+        relations: ["orders".to_string()].into(),
+        code: false,
+    };
+    let side = schema_doc::load(
+        session.clone(),
+        "main",
+        &pick,
+        |_| {},
+        &AtomicBool::new(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(side.objects.len(), 1);
+    assert_eq!(side.objects[0].object.name(), "orders");
+}

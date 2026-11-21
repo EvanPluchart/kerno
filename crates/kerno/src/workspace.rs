@@ -1406,6 +1406,14 @@ impl Workspace {
                     DiagramTabEvent::OpenStructure { table } => {
                         this.open_structure(target, table.clone(), RelationKind::Table, window, cx);
                     }
+                    DiagramTabEvent::Document { tables } => {
+                        let schema = tab.read(cx).scope().schema().to_string();
+                        let target = Target {
+                            schema: Some(schema),
+                            ..target
+                        };
+                        this.export_schema(target, tables.clone(), window, cx);
+                    }
                 }
             },
         );
@@ -1556,6 +1564,43 @@ impl Workspace {
     ) {
         let workspace = cx.entity().downgrade();
         crate::compare_dialog::open(self.connections.clone(), workspace, source, window, cx);
+    }
+
+    /// Opens "Export schema…" on the schema of `target`, `tables` ticked
+    /// alone when given (K31).
+    pub fn export_schema(
+        &mut self,
+        target: Target,
+        tables: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::schema_export_dialog::SchemaExportDialog>> {
+        crate::schema_export_dialog::open(self.connections.clone(), target, tables, window, cx)
+    }
+
+    /// The palette's and the Tools menu's "Export Schema…": of the active
+    /// diagram's tables, else of the active tab's schema, else of the
+    /// connection the tree browses.
+    fn export_schema_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(diagram) = self.active_open().and_then(OpenTab::diagram).cloned() {
+            diagram.update(cx, |tab, cx| tab.export_document(cx));
+            return;
+        }
+        match self
+            .active_open()
+            .and_then(|tab| tab.target(cx))
+            .or_else(|| self.default_target(cx))
+        {
+            Some(target) => {
+                self.export_schema(target, Vec::new(), window, cx);
+            }
+            None => window.push_notification(
+                Notification::warning(
+                    "Export schema: connect first, or right-click a schema in the tree.",
+                ),
+                cx,
+            ),
+        }
     }
 
     /// The open compare tabs, in tab order; for tests.
@@ -2718,6 +2763,9 @@ impl Workspace {
             }
             NavigatorEvent::ViewDiagram { target, scope } => {
                 self.open_diagram(target.clone(), scope.clone(), window, cx);
+            }
+            NavigatorEvent::ExportSchema { target, tables } => {
+                self.export_schema(target.clone(), tables.clone(), window, cx);
             }
             NavigatorEvent::ManageExtensions { target, extension } => {
                 self.open_extensions(target.clone(), extension.clone(), window, cx);
@@ -6937,6 +6985,11 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &crate::actions::CopyTables, window, cx| {
                     this.tool_command(ToolEntry::CopyTables, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ExportSchema, window, cx| {
+                    this.export_schema_command(window, cx)
                 }),
             )
             .on_action(

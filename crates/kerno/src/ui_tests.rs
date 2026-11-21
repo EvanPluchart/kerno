@@ -66,6 +66,7 @@ mod password_sources;
 mod portability;
 mod reconnect;
 mod reorder;
+mod schema_export;
 mod script_progress;
 mod settings_look;
 mod shortcuts;

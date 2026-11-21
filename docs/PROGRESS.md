@@ -1065,3 +1065,32 @@ Still open (for the owner):
 - Tests: twelve core unit tests, a round trip per engine (compare, run the script, compare again: identical) on
   PostgreSQL, MySQL and MariaDB in scratch schemas and databases, six UI tests in `ui_tests/compare.rs`; each
   seen failing under a mutation. Two Tools ▸ tests updated for the new entry.
+
+## 2026-11-21 — K31: a schema as a document
+
+- "Export schema…" writes the structure of a schema, everything or the tables and views ticked, as HTML,
+  Markdown, DBML, SQL or Mermaid; the HTML in Kerno's light or dark style or plain black on white, with or
+  without the diagram, one file that asks the network for nothing and prints a page per table. Ways in: the
+  tree (a schema, a database without schemas, a table or a view ticked alone), the ER diagram's "Export
+  document…", Server ▸ Tools and the palette. Structure only, never a row, never the host, user or file path.
+  D-104.
+- The writers are pure core code (`kerno-core/src/schema_doc.rs`, `schema_doc/html.rs`) over the compare's
+  model, read through the compare's loop narrowed to what is ticked; the SQL is the compare's script against an
+  empty schema. One escaping writer per format, each tested with the same hostile schema.
+- The PDF is not done: `krilla` brings a third copy of `read-fonts` and `skrifa` on Linux (D-104 lists the
+  crates); stopped on that point as asked, with `pdf-writer` and `subsetter` as the alternative for the owner to
+  decide.
+- Seen while working: the dialog on HTML, on Markdown, done and empty, offscreen in both themes at 1200 × 800
+  and 900 × 600 (temporary test, not committed); the fixture's HTML in the three styles on screen and printed
+  through headless Chromium, and a 60-column table, the empty document and the hostile one printed. Fixed from
+  them: at 900 × 600 the Export button fell off the dialog (the options now scroll, the file and the buttons
+  stay); the SQL card's preview ran out of its frame; the "Tables" heading stood alone at the foot of a page (a
+  section now starts a page with its first table); a cell's code printed larger than the rest; in a table of long
+  types the short columns were squeezed to a letter wide (header cells no longer wrap, names and comments keep a
+  minimum width).
+- A cancel that lands while the file is written leaves no file: it is written as `<name>.part` and put in place
+  only if the export was not cancelled.
+- Tests: eighteen core unit tests (golden text per format, the hostile schema, the styles' contrast), a read-only
+  driver test per engine (PostgreSQL, MySQL, MariaDB on the fixtures, SQLite on a file it makes), six UI tests in
+  `ui_tests/schema_export.rs` and a unit test of the file's write; each but one seen failing under a mutation
+  (the read-only and production test guards against a question that does not exist).

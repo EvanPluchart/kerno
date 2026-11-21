@@ -41,8 +41,17 @@ use crate::tabs::{TabSnapshot, Target};
 /// What the diagram asks of the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagramTabEvent {
-    OpenData { table: TableRef },
-    OpenStructure { table: TableRef },
+    OpenData {
+        table: TableRef,
+    },
+    OpenStructure {
+        table: TableRef,
+    },
+    /// "Export document…": the schema's document, these tables ticked
+    /// (K31).
+    Document {
+        tables: Vec<String>,
+    },
 }
 
 /// A file the diagram is written to.
@@ -610,6 +619,20 @@ impl DiagramTab {
         }
     }
 
+    /// "Export document…": asks the workspace for the schema's document,
+    /// the tables of the diagram's schema ticked.
+    pub fn export_document(&mut self, cx: &mut Context<Self>) {
+        if self.state != State::Ready || self.diagram.nodes.is_empty() {
+            return;
+        }
+        let schema = self.scope.schema();
+        let tables = (self.diagram.nodes.iter())
+            .filter(|node| node.table.schema == schema)
+            .map(|node| node.table.name.clone())
+            .collect();
+        cx.emit(DiagramTabEvent::Document { tables });
+    }
+
     /// Asks where to write the file, then writes it.
     pub fn choose_export(
         &mut self,
@@ -809,6 +832,15 @@ impl DiagramTab {
             .child(export(ExportFormat::Svg, "erd-export-svg", cx))
             .child(export(ExportFormat::Png, "erd-export-png", cx))
             .child(export(ExportFormat::Mermaid, "erd-export-mermaid", cx))
+            .child(
+                Button::new("erd-export-document")
+                    .ghost()
+                    .small()
+                    .label("Export document…")
+                    .tooltip("The schema of these tables as a document: HTML, Markdown, DBML, SQL")
+                    .disabled(!ready)
+                    .on_click(cx.listener(|this, _, _, cx| this.export_document(cx))),
+            )
             .child(
                 Button::new("erd-refresh")
                     .ghost()
@@ -1174,6 +1206,9 @@ fn canvas_menu(menu: PopupMenu, view: &Entity<DiagramTab>) -> PopupMenu {
         }))
         .item(item(ExportFormat::Mermaid.label(), |this, window, cx| {
             this.choose_export(ExportFormat::Mermaid, window, cx)
+        }))
+        .item(item("Export document…", |this, _, cx| {
+            this.export_document(cx)
         }))
         .separator()
         .item(item("Refresh", |this, window, cx| this.reload(window, cx)))

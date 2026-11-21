@@ -451,6 +451,31 @@ What only the target has is dropped only when "Also drop what only the target ha
 why, with the source's definition. Swap and Refresh compare again; a row's menu opens the object in the source
 or the target.
 
+## Export a schema as a document
+
+Right-click a schema (a database on MySQL, MariaDB and SQLite) and choose "Export schema…", or a table or a view
+to start with it alone; in an ER diagram, "Export document…" starts with its tables; Server ▸ Tools ▸ Export
+Schema… and the palette start from the active tab. The dialog lists the tables and views, all ticked: search,
+All and None act on what is shown. "Also routines, sequences, types and triggers" adds those with their DDL.
+Only the structure is read: no row, nothing changed, so a read-only or production connection exports too.
+
+Pick what the document is for:
+
+- **HTML**: one page to read, send or print, for a team or a client: the diagram, a table of contents, then
+  every table with its columns, keys, constraints and indexes, and the views. In Kerno's light or dark style or
+  plain black on white; it opens in any browser, asks the network for nothing, and prints a page per table (the
+  dark style prints on white). Print it to PDF from the browser.
+- **Markdown**: a data dictionary for a wiki or a pull request, and a compact form of the schema to give an AI
+  assistant.
+- **DBML**: the tables and their references, to draw on dbdiagram.io or publish with dbdocs.
+- **SQL**: the statements that create what is ticked, in an order that runs (tables, then their keys, then the
+  views): to keep the schema in git or rebuild it elsewhere.
+- **Mermaid**: the diagram, for Markdown files that render Mermaid.
+
+The title starts as `database.schema`; change it as you like. Choose… picks the file (its name starts as
+`<schema>-schema.<ext>`); Export writes it, Cancel stops while it reads, then Show in Finder or Open. A document
+never names the server's host, the user or a database file's path.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open

@@ -125,6 +125,9 @@ pub enum NavigatorEvent {
         target: Target,
         scope: kerno_core::erd::Scope,
     },
+    /// Export the schema of `target` as a document, `tables` ticked alone
+    /// when given (K31).
+    ExportSchema { target: Target, tables: Vec<String> },
     /// Tell the user something went otherwise than asked.
     Warn(String),
     /// Open the extensions manager of a database, on `extension` (K27).
@@ -1234,6 +1237,14 @@ impl Navigator {
                 }
             }
             Action::CompareWith => self.perform_tool(ToolEntry::CompareSchemas, id, window, cx),
+            Action::ExportSchema => {
+                let tables = match &node.kind {
+                    NodeKind::Object(ObjectRef::Relation(table, _)) => vec![table.name.clone()],
+                    _ => Vec::new(),
+                };
+                let target = Self::target_of(connection, &node, true);
+                cx.emit(NavigatorEvent::ExportSchema { target, tables });
+            }
             Action::Backup | Action::Restore => {
                 let entry = if action == Action::Backup {
                     ToolEntry::Backup

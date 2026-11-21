@@ -96,6 +96,9 @@ pub enum Action {
     /// The schema compare with this schema (a database) as the source
     /// (K30).
     CompareWith,
+    /// The structure of this schema (a database), or of this table or view
+    /// alone at first, written as a document (K31).
+    ExportSchema,
 }
 
 impl Action {
@@ -145,6 +148,7 @@ impl Action {
             Action::Properties => "Properties",
             Action::ViewDiagram => "View diagram",
             Action::CompareWith => "Compare with…",
+            Action::ExportSchema => "Export schema…",
         }
     }
 
@@ -203,7 +207,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateDatabase,
             ],
-            vec![ImportCsv, ViewDiagram, CompareWith],
+            vec![ImportCsv, ViewDiagram, CompareWith, ExportSchema],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
@@ -215,7 +219,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateSchema,
             ],
-            vec![ImportCsv, ViewDiagram, CompareWith],
+            vec![ImportCsv, ViewDiagram, CompareWith, ExportSchema],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
@@ -228,7 +232,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 ReadInConsole,
             ],
             // Backup and Truncate are under Tools ▸ ([`tool_entries`]).
-            vec![Export, ImportCsv, ViewDiagram],
+            vec![Export, ImportCsv, ViewDiagram, ExportSchema],
             all_templates.to_vec(),
             vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
@@ -246,7 +250,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 ReadInConsole,
                 Generate(Template::Select),
             ],
-            vec![Export],
+            vec![Export, ExportSchema],
             vec![ShowDdl, EditSource, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
@@ -1218,6 +1222,7 @@ mod tests {
             ExecuteRoutine,
             EditColumn,
             ViewDiagram,
+            ExportSchema,
             // The manager says itself what a read-only connection refuses.
             ManageExtensions,
             ShowInExtensions,

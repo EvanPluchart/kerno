@@ -138,7 +138,7 @@ impl Kind {
         }
     }
 
-    fn of(object: &ObjectRef) -> Option<Kind> {
+    pub(crate) fn of(object: &ObjectRef) -> Option<Kind> {
         Some(match object {
             ObjectRef::Relation(_, RelationKind::View) => Kind::View,
             ObjectRef::Relation(_, RelationKind::MaterializedView) => Kind::MaterializedView,
@@ -185,19 +185,28 @@ pub struct Side {
 /// How far a side's load is: objects read and to read.
 pub type Progress = erd::Progress;
 
-/// Reads what the compare needs of `schema`: the list of its objects, the
-/// structure of each table and the DDL of everything else, eight at a time
-/// (the diagram's loop, [`erd::buffered`]), telling `progress` after each.
-/// Partitions and foreign tables are left out, and so are sequences owned
-/// by a column (they come with their column), aggregates and window
-/// functions, and what the driver cannot print. Stops with
-/// [`Error::Cancelled`] once `cancel` is set.
+/// Reads what the compare needs of `schema` ([`listing`], then [`read`]).
 pub async fn load(
     session: Arc<dyn Session>,
     schema: &str,
     progress: impl Fn(Progress) + Send,
     cancel: &AtomicBool,
 ) -> Result<Side> {
+    let listing = listing(&session, schema).await?;
+    read(session, schema, listing, progress, cancel).await
+}
+
+/// What a load reads of a schema: its tables, by their structure, and its
+/// other objects, by their DDL.
+pub(crate) struct Listing {
+    pub tables: Vec<(TableRef, RelationKind)>,
+    pub others: Vec<ObjectRef>,
+}
+
+/// Lists what a load reads of `schema`. Partitions and foreign tables are
+/// left out, and so are sequences owned by a column (they come with their
+/// column), aggregates and window functions.
+pub(crate) async fn listing(session: &Arc<dyn Session>, schema: &str) -> Result<Listing> {
     let dialect = session.dialect();
     if dialect.has_schemas() {
         // The server then prints this schema's own names unqualified, as it
@@ -258,7 +267,21 @@ pub async fn load(
                 name: trigger.name,
             }),
     );
+    Ok(Listing { tables, others })
+}
 
+/// Reads the objects of `listing`: the structure of each table and the DDL
+/// of everything else, eight at a time (the diagram's loop,
+/// [`erd::buffered`]), telling `progress` after each. What the driver cannot
+/// print is left out. Stops with [`Error::Cancelled`] once `cancel` is set.
+pub(crate) async fn read(
+    session: Arc<dyn Session>,
+    schema: &str,
+    listing: Listing,
+    progress: impl Fn(Progress) + Send,
+    cancel: &AtomicBool,
+) -> Result<Side> {
+    let Listing { tables, others } = listing;
     let total = tables.len() + others.len();
     let mut done = 0;
     progress(Progress { done, total });
@@ -537,7 +560,7 @@ fn retargeted(side: &Side, to: &str, dialect: &dyn Dialect) -> Side {
 }
 
 /// The name an [`Item`] shows.
-fn shown_name(object: &ObjectRef) -> String {
+pub(crate) fn shown_name(object: &ObjectRef) -> String {
     match object {
         ObjectRef::Routine {
             name,

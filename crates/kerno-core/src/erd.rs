@@ -874,15 +874,29 @@ fn mermaid_word(text: &str, prefix: &str) -> String {
     word
 }
 
+/// Text Mermaid takes between double quotes: on one line, without a double
+/// quote (a line break would end the statement and start another, K31).
+fn mermaid_quoted(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => ' ',
+            c => c,
+        })
+        .collect()
+}
+
 /// The diagram as a Mermaid `erDiagram`: one entity per table (named
 /// `schema.table`, quoted), its columns with `PK` / `FK`, and one
 /// relationship per foreign key, `|o` on the referenced side when the key
 /// may be NULL.
 pub fn to_mermaid(diagram: &Diagram) -> String {
-    // A quoted name may hold anything but a double quote.
     let quoted = |node: usize| {
         let table = &diagram.nodes[node].table;
-        format!("\"{}.{}\"", table.schema, table.name.replace('"', "'"))
+        format!(
+            "\"{}\"",
+            mermaid_quoted(&format!("{}.{}", table.schema, table.name))
+        )
     };
     let mut text = String::from("erDiagram\n");
     for (index, node) in diagram.nodes.iter().enumerate() {
@@ -898,7 +912,7 @@ pub fn to_mermaid(diagram: &Diagram) -> String {
             let comment = if name == column.name {
                 String::new()
             } else {
-                format!(" \"{}\"", column.name.replace('"', "'"))
+                format!(" \"{}\"", mermaid_quoted(&column.name))
             };
             let _ = writeln!(
                 text,
@@ -915,7 +929,7 @@ pub fn to_mermaid(diagram: &Diagram) -> String {
             quoted(edge.to),
             if edge.optional { "|o" } else { "||" },
             quoted(edge.from),
-            edge.name.replace('"', "'")
+            mermaid_quoted(&edge.name)
         );
     }
     text

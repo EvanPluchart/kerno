@@ -27,6 +27,7 @@ pub mod pending;
 pub mod plan;
 pub mod result;
 pub mod schema;
+pub mod schema_doc;
 pub mod secrets;
 pub mod sort;
 pub mod sql;

@@ -34,6 +34,7 @@ mod open_url;
 mod portability;
 mod query;
 mod quick_open;
+mod schema_export_dialog;
 mod settings;
 mod settings_ui;
 mod settings_view;
@@ -684,6 +685,7 @@ fn menus() -> Vec<Menu> {
                         command("execute_script"),
                         command("copy_tables"),
                         command("compare_schemas"),
+                        command("export_schema"),
                         separator(),
                         command("foreign_data_wrappers"),
                         separator(),
