@@ -899,11 +899,12 @@ async fn the_er_diagram_reads_the_file() {
     assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
 }
 
-/// K31: a schema document of the file names its tables, views and
-/// trigger, holds only what was picked, and never the file's path.
+/// K31, K32: a schema document of the file names its tables, views and
+/// trigger (the PDF in its outline), holds only what was picked, and never
+/// the file's path.
 #[tokio::test]
 async fn a_schema_document_of_the_file() {
-    use kerno_core::schema_doc::{self, Document, Format, Options, Pick};
+    use kerno_core::schema_doc::{self, Document, Fonts, Format, Options, Pick};
     use std::sync::atomic::AtomicBool;
     let dir = tempfile::tempdir().unwrap();
     let (file, session) = fixture(dir.path()).await;
@@ -937,11 +938,34 @@ async fn a_schema_document_of_the_file() {
     let whole = document(side);
     let path = file.display().to_string();
     for format in Format::ALL {
-        let text = schema_doc::render(&whole, format, &Options::default(), session.dialect());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kerno/assets/fonts");
+        let read = |file: &str| std::fs::read(dir.join(file)).unwrap();
+        let (regular, semibold, mono) = (
+            read("inter/Inter-Regular.ttf"),
+            read("inter/Inter-SemiBold.ttf"),
+            read("jetbrains-mono/JetBrainsMono-Regular.ttf"),
+        );
+        let fonts = Fonts {
+            regular: &regular,
+            semibold: &semibold,
+            mono: &mono,
+        };
+        let bytes = schema_doc::render(
+            &whole,
+            format,
+            &Options::default(),
+            session.dialect(),
+            &fonts,
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
         for table in ["customers", "products", "orders", "order_lines"] {
             assert!(text.contains(table), "{format:?}: {table}");
         }
-        if matches!(format, Format::Html | Format::Markdown | Format::Sql) {
+        if matches!(
+            format,
+            Format::Html | Format::Pdf | Format::Markdown | Format::Sql
+        ) {
             assert!(text.contains("customer_orders"), "{format:?}");
             assert!(text.contains("orders_note_default"), "{format:?}");
         }

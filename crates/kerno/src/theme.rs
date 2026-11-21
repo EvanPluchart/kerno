@@ -56,17 +56,30 @@ impl Appearance {
     }
 }
 
+const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/inter/Inter-Regular.ttf");
+const INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/inter/Inter-SemiBold.ttf");
+const MONO_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf");
+
+/// The embedded typefaces a schema document's PDF embeds in its turn (K32):
+/// the same bytes, not a second copy in the binary.
+pub fn document_fonts() -> kerno_core::schema_doc::Fonts<'static> {
+    kerno_core::schema_doc::Fonts {
+        regular: INTER_REGULAR,
+        semibold: INTER_SEMIBOLD,
+        mono: MONO_REGULAR,
+    }
+}
+
 /// Registers the embedded typefaces and Kerno's themes, and applies
 /// `appearance`.
 pub fn init(appearance: Appearance, cx: &mut App) -> anyhow::Result<()> {
     cx.text_system().add_fonts(vec![
-        Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Regular.ttf").as_slice()),
+        Cow::Borrowed(INTER_REGULAR),
         Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Italic.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Medium.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-SemiBold.ttf").as_slice()),
-        Cow::Borrowed(
-            include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf").as_slice(),
-        ),
+        Cow::Borrowed(INTER_SEMIBOLD),
+        Cow::Borrowed(MONO_REGULAR),
         Cow::Borrowed(
             include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Italic.ttf").as_slice(),
         ),

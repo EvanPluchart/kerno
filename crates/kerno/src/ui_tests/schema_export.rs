@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kerno_core::schema_doc::{Format, Style};
+use kerno_core::schema_doc::{Format, PageSize, Style};
 
 use gpui_kit::component::WindowExt as _;
 
@@ -116,7 +116,8 @@ fn each_format_writes_its_file(cx: &mut TestAppContext) {
                 app.export_now(cx, &dialog),
                 format!("done: {}", path.display())
             );
-            let text = std::fs::read_to_string(&path).unwrap();
+            // The PDF names its tables in its outline, which is not compressed.
+            let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
             for table in ["customers", "orders", "order_items", "products"] {
                 assert!(text.contains(table), "{engine:?} {format:?}: {table}");
             }
@@ -247,7 +248,7 @@ fn the_style_cards_choose_the_look_of_the_html(cx: &mut TestAppContext) {
     app.on_export(cx, &dialog, |dialog, _, cx| dialog.again(cx));
     // The format cards: Markdown has no style.
     app.step(cx, |window, cx| {
-        window.within("schema-export-format").click(1usize, cx)
+        window.within("schema-export-format").click(2usize, cx)
     });
     assert_eq!(cx.update(|cx| dialog.read(cx).format()), Format::Markdown);
     assert!(!app.has(cx, "schema-export-style"));
@@ -362,4 +363,44 @@ fn enter_chooses_the_file_then_exports(cx: &mut TestAppContext) {
         cx.update(|cx| dialog.read(cx).state_text())
             .starts_with("done")
     );
+}
+
+/// K32: the PDF card writes a `.pdf` file; the paper choice, shown for the PDF only, changes its
+/// pages' size.
+#[gpui_kit::test]
+fn the_pdf_card_writes_a_pdf_on_the_paper_chosen(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = connected(cx, Engine::Postgres);
+    let target = target(&app, cx, Engine::Postgres);
+    let dialog = app.export_dialog(cx, target, vec!["customers".into(), "orders".into()]);
+    assert!(!app.has(cx, ("schema-export-page", 0usize)));
+    app.step(cx, |window, cx| {
+        window.within("schema-export-format").click(1usize, cx)
+    });
+    assert_eq!(cx.update(|cx| dialog.read(cx).format()), Format::Pdf);
+    assert!(app.has(cx, crate::settings_ui::check_id("schema-export-style", 0)));
+    assert!(
+        app.has(cx, ("schema-export-page", 0usize)) && app.has(cx, ("schema-export-page", 1usize))
+    );
+    let a4 = dir.path().join("shop.pdf");
+    app.choose(cx, &a4);
+    assert!(app.export_now(cx, &dialog).starts_with("done"));
+    let bytes = std::fs::read(&a4).unwrap();
+    assert!(bytes.starts_with(b"%PDF-"));
+    let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(has(&bytes, b"/MediaBox[0 0 595.276 841.89]"));
+    app.on_export(cx, &dialog, |dialog, _, cx| {
+        dialog.again(cx);
+        // Below the fold of the test window: the choice itself, as its chip sets it.
+        dialog.set_page(PageSize::Letter, cx);
+    });
+    let letter = dir.path().join("shop-letter.pdf");
+    app.choose(cx, &letter);
+    assert!(app.export_now(cx, &dialog).starts_with("done"));
+    let bytes = std::fs::read(&letter).unwrap();
+    assert!(has(&bytes, b"/MediaBox[0 0 612 792]"));
+    assert!(!has(&bytes, b"/MediaBox[0 0 595.276"));
 }

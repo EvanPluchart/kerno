@@ -9,7 +9,7 @@ use crate::dialect::test_support::AnsiDialect;
 use crate::result::TypeKind;
 use crate::schema::{ConstraintInfo, ForeignKeyInfo, IndexInfo, RoutineKind};
 
-fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
+pub(super) fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
     ColumnInfo {
         name: name.into(),
         data_type: data_type.into(),
@@ -26,7 +26,7 @@ fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
     }
 }
 
-fn table(name: &str, structure: TableStructure) -> Object {
+pub(super) fn table(name: &str, structure: TableStructure) -> Object {
     Object {
         object: ObjectRef::Relation(TableRef::new("shop", name), RelationKind::Table),
         definition: Definition::Table(structure),
@@ -43,7 +43,7 @@ fn ddl(object: ObjectRef, text: &str) -> Object {
 /// Customers and their orders: an identity key, a unique email, a key
 /// with ON DELETE CASCADE, a default string and a check, an index, a view
 /// and a function.
-fn shop() -> Document {
+pub(super) fn shop() -> Document {
     let customers = TableStructure {
         columns: vec![
             ColumnInfo {
@@ -168,7 +168,7 @@ const HOSTILE_TABLE: &str = "x\"><script>alert(1)</script>";
 const HOSTILE_COMMENT: &str = "ok\nDROP TABLE kerno_test_victim;";
 const HOSTILE_COLUMN: &str = "a|b`c\"d";
 
-fn hostile() -> Document {
+pub(super) fn hostile() -> Document {
     let structure = TableStructure {
         columns: vec![
             ColumnInfo {
@@ -204,19 +204,42 @@ fn hostile() -> Document {
     }
 }
 
+/// The fonts the app embeds, read from its assets.
+pub(super) fn fonts() -> Fonts<'static> {
+    static DATA: std::sync::OnceLock<[Vec<u8>; 3]> = std::sync::OnceLock::new();
+    let data = DATA.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kerno/assets/fonts");
+        let read = |file: &str| std::fs::read(dir.join(file)).expect("the app's font");
+        [
+            read("inter/Inter-Regular.ttf"),
+            read("inter/Inter-SemiBold.ttf"),
+            read("jetbrains-mono/JetBrainsMono-Regular.ttf"),
+        ]
+    });
+    Fonts {
+        regular: &data[0],
+        semibold: &data[1],
+        mono: &data[2],
+    }
+}
+
+fn text_of(doc: &Document, format: Format, options: &Options) -> String {
+    let bytes = render(doc, format, options, &AnsiDialect, &fonts()).expect("written");
+    String::from_utf8(bytes).expect("text")
+}
+
 fn rendered(doc: &Document, format: Format) -> String {
-    render(doc, format, &Options::default(), &AnsiDialect)
+    text_of(doc, format, &Options::default())
 }
 
 fn html(doc: &Document, style: Style) -> String {
-    render(
+    text_of(
         doc,
         Format::Html,
         &Options {
             style,
-            diagram: true,
+            ..Options::default()
         },
-        &AnsiDialect,
     )
 }
 
@@ -519,7 +542,9 @@ fn the_three_styles() {
 
 #[test]
 fn every_style_keeps_text_readable() {
-    // WCAG AA: 4.5:1 for text on the page and on table headers and code.
+    // WCAG AA: 4.5:1 for text on the page and on table headers and code. The PDF
+    // draws the same pairs: text, muted text and the accent on its pages, muted
+    // labels and code on the surface, the diagram's headers.
     for style in Style::ALL {
         let c = colours(style);
         for (what, colour) in [
@@ -540,14 +565,13 @@ fn every_style_keeps_text_readable() {
 
 #[test]
 fn the_diagram_is_left_out_when_not_asked_or_without_tables() {
-    let without = render(
+    let without = text_of(
         &shop(),
         Format::Html,
         &Options {
             diagram: false,
             ..Options::default()
         },
-        &AnsiDialect,
     );
     assert!(!without.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" width="));
     assert!(!without.contains("href=\"#diagram\""));

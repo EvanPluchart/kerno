@@ -28,7 +28,7 @@ use gpui_kit::{
 use kerno_core::erd::Progress;
 use kerno_core::format::byte_size;
 use kerno_core::schema::RelationKind;
-use kerno_core::schema_doc::{self, Document, Format, Options, Pick, Style};
+use kerno_core::schema_doc::{self, Document, Format, Options, PageSize, Pick, Style};
 use kerno_core::{Error, describe};
 
 use crate::bridge;
@@ -73,6 +73,7 @@ pub struct SchemaExportDialog {
     format: Format,
     style: Style,
     diagram: bool,
+    page: PageSize,
     title: Entity<InputState>,
     output: Option<PathBuf>,
     /// The file chosen exists; the save panel of macOS already asked.
@@ -158,12 +159,12 @@ pub fn open(
 /// Writes `text` beside `path` as `<name>.part`, then puts it in place
 /// unless the export was cancelled meanwhile: a cancelled export leaves no
 /// file, and never half of one.
-fn write_file(text: &str, path: &Path, cancel: &AtomicBool) -> kerno_core::Result<u64> {
+fn write_file(bytes: &[u8], path: &Path, cancel: &AtomicBool) -> kerno_core::Result<u64> {
     let failed = |error| Error::io(format!("{} could not be written", path.display()), error);
     let mut part = path.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
-    std::fs::write(&part, text.as_bytes()).map_err(failed)?;
+    std::fs::write(&part, bytes).map_err(failed)?;
     if cancel.load(Ordering::Acquire) {
         let _ = std::fs::remove_file(&part);
         return Err(Error::Cancelled);
@@ -172,7 +173,7 @@ fn write_file(text: &str, path: &Path, cancel: &AtomicBool) -> kerno_core::Resul
         let _ = std::fs::remove_file(&part);
         failed(error)
     })?;
-    Ok(text.len() as u64)
+    Ok(bytes.len() as u64)
 }
 
 /// `#rrggbb` as GPUI's colour.
@@ -226,6 +227,7 @@ impl SchemaExportDialog {
             format: Format::Html,
             style: Style::KernoLight,
             diagram: true,
+            page: PageSize::A4,
             title,
             output: None,
             replaces: false,
@@ -340,6 +342,11 @@ impl SchemaExportDialog {
 
     pub fn set_style(&mut self, style: Style, cx: &mut Context<Self>) {
         self.style = style;
+        cx.notify();
+    }
+
+    pub fn set_page(&mut self, page: PageSize, cx: &mut Context<Self>) {
+        self.page = page;
         cx.notify();
     }
 
@@ -489,6 +496,7 @@ impl SchemaExportDialog {
         let options = Options {
             style: self.style,
             diagram: self.diagram,
+            page: self.page,
         };
         let title = Some(self.title.read(cx).value().trim().to_string())
             .filter(|title| !title.is_empty())
@@ -546,13 +554,19 @@ impl SchemaExportDialog {
                                     };
                                     let (writer, stopped) = (session.clone(), cancel.clone());
                                     tokio::task::spawn_blocking(move || {
-                                        let text = schema_doc::render(
+                                        let bytes = schema_doc::render(
                                             &document,
                                             format,
                                             &options,
                                             writer.dialect(),
-                                        );
-                                        write_file(&text, &path, &stopped)
+                                            &crate::theme::document_fonts(),
+                                        )
+                                        .map_err(|why| {
+                                            Error::Unsupported(format!(
+                                                "the document could not be written: {why}"
+                                            ))
+                                        })?;
+                                        write_file(&bytes, &path, &stopped)
                                     })
                                     .await
                                     .unwrap_or_else(|panic| {
@@ -673,6 +687,24 @@ impl SchemaExportDialog {
                             .child(bar(0.3, muted))
                             .child(bar(0.2, muted))
                     })),
+            ),
+            // A page: the lockup's place, a heading and lines.
+            Format::Pdf => page.child(
+                h_flex().size_full().justify_center().child(
+                    v_flex()
+                        .w(px(34.))
+                        .h_full()
+                        .gap(px(3.))
+                        .p(px(4.))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(border)
+                        .child(div().h(px(4.)).w(px(12.)).rounded_sm().bg(accent))
+                        .child(bar(0.9, theme.foreground.opacity(0.6)))
+                        .child(bar(0.7, muted))
+                        .child(bar(0.8, muted))
+                        .child(bar(0.6, muted)),
+                ),
             ),
             Format::Markdown => page.font_family(theme.mono_font_family.clone()).child(
                 v_flex()
@@ -914,7 +946,7 @@ impl SchemaExportDialog {
                 cx,
             ),
         ];
-        if self.format == Format::Html {
+        if matches!(self.format, Format::Html | Format::Pdf) {
             let selected = Style::ALL.iter().position(|style| *style == self.style);
             let styles = Style::ALL.into_iter().fold(
                 OptionCards::new("schema-export-style", selected, move |index, _, cx| {
@@ -928,12 +960,35 @@ impl SchemaExportDialog {
                     .gap_2()
                     .child(div().w(px(420.)).child(styles))
                     .child(
-                        Checkbox::new("schema-export-diagram")
-                            .label("Include the diagram")
-                            .checked(self.diagram)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_diagram(*checked, cx)
-                            })),
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                Checkbox::new("schema-export-diagram")
+                                    .label("Include the diagram")
+                                    .checked(self.diagram)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.set_diagram(*checked, cx)
+                                    })),
+                            )
+                            // The paper, for the PDF only.
+                            .when(self.format == Format::Pdf, |row| {
+                                row.child(div().ml_4().text_sm().text_color(muted).child("Paper"))
+                                    .children(PageSize::ALL.into_iter().enumerate().map(
+                                        |(index, page)| {
+                                            crate::theme::chip(
+                                                ("schema-export-page", index),
+                                                self.page == page,
+                                            )
+                                            .xsmall()
+                                            .label(page.label())
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.set_page(page, cx)
+                                                }),
+                                            )
+                                        },
+                                    ))
+                            }),
                     ),
                 cx,
             ));
@@ -1193,12 +1248,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shop-schema.md");
         assert!(matches!(
-            write_file("# shop", &path, &AtomicBool::new(true)),
+            write_file(b"# shop", &path, &AtomicBool::new(true)),
             Err(Error::Cancelled)
         ));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(
-            write_file("# shop", &path, &AtomicBool::new(false)).unwrap(),
+            write_file(b"# shop", &path, &AtomicBool::new(false)).unwrap(),
             6
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# shop");

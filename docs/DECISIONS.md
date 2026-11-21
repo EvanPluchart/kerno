@@ -2951,7 +2951,7 @@ unchanged. Choices:
   changes under a view that reads it is refused by PostgreSQL (the view must go first, by hand); enum labels
   added to a type are not written as `ALTER TYPE … ADD VALUE`.
 
-## D-104 — A schema as a document: DBML, Markdown, SQL, Mermaid, HTML; PDF stopped on its library (K31; 2026-11-21)
+## D-104 — A schema as a document: DBML, Markdown, SQL, Mermaid, HTML; the PDF in K32 (K31; 2026-11-21)
 
 The owner's request of 2026-11-21: export the schema of a database, everything or the tables picked, to PDF,
 DBML or other formats, the HTML and the PDF in Kerno's style by default with a plain white one. Choices:
@@ -3011,7 +3011,7 @@ DBML or other formats, the HTML and the PDF in Kerno's style by default with a p
   `<name>.part` and put in place only if the export was not cancelled meanwhile, so a cancelled export leaves no
   file. The options scroll in a short window; the file and the buttons stay in view. Read-only and production
   connections export without a question: nothing is written to the database.
-- **PDF stopped, as the brief said to stop.** `krilla` 0.8.2 (MIT OR Apache-2.0, `cargo deny` clean on paper)
+- **The PDF went to K32 (D-105), on another library.** `krilla` 0.8.2 (MIT OR Apache-2.0, `cargo deny` clean on paper)
   depends on `subsetter` with its `variable-fonts` feature, which brings `skrifa` 0.42 and `write-fonts` 0.48 and,
   with them, `read-fonts` 0.39. The tree already has `skrifa` 0.40 and 0.44 and `read-fonts` 0.37 and 0.41, but
   only through `gpui-pre-wgpu` (Linux): a macOS build would compile one copy, a Linux build (a shipped target,
@@ -3019,11 +3019,67 @@ DBML or other formats, the HTML and the PDF in Kerno's style by default with a p
   to `Cargo.lock`: `krilla` 0.8.2, `pdf-writer` 0.15.0, `read-fonts` 0.39.2, `skrifa` 0.42.1, `subsetter` 0.2.6,
   `tiny-skia-path` 0.12.0 (beside 0.11.4), `write-fonts` 0.48.1, `xmp-writer` 0.3.3 (`rustybuzz` 0.20.1 for its
   `simple-text` is already there). The embedded Inter and JetBrains Mono are static fonts (no `fvar` table), so
-  the variable-font path buys nothing here. The alternative, for the owner to decide: `pdf-writer` 0.15 and
-  `subsetter` 0.2.6 without `variable-fonts` (about 21,000 lines, no duplicate), glyphs and advances from the
-  `ttf-parser` / `rustybuzz` already in the tree, a CID font with its ToUnicode map written by Kerno (selectable,
-  searchable text), the diagram drawn as vectors from the ER layout, the lockup from its path data. Meanwhile the
-  HTML prints to PDF from any browser with the print rules above.
-- **Not in this version:** the PDF; a page size choice (it belongs to the PDF); DBML enums and table groups;
+  the variable-font path buys nothing here. K32 writes it with `pdf-writer` 0.15 and `subsetter` 0.2.6 without
+  `variable-fonts` instead (D-105).
+- **Not in this version:** the PDF and its page size (K32, D-105); DBML enums and table groups;
   `IF NOT EXISTS` in the SQL (the dialects do not write it); a document of several schemas; saving the export as
   a task.
+
+## D-105 — The schema document as a PDF, with pdf-writer and subsetter (K32; 2026-11-21)
+
+K31 stopped on the PDF (D-104): `krilla` brings a third copy of `read-fonts` and `skrifa` on Linux. The
+coordinator decided, under the owner's "fast and light" request (the owner can veto it): `pdf-writer` 0.15 and
+`subsetter` 0.2.6 with `default-features = false`, the only two packages `Cargo.lock` gains (14,825 and
+4,925 lines of source). `kurbo` 0.13.1 and `flate2` were already in the tree, through usvg and russh, and are
+now direct dependencies of `kerno-core` at the version locked. No logic of krilla is ported. Choices:
+
+- **No `ttf-parser`, no `rustybuzz`.** The brief named `ttf-parser` (or `rustybuzz`) for the glyphs and
+  advances; RustSec marks both unmaintained (RUSTSEC-2026-0192 for `ttf-parser`, RUSTSEC-2026-0206 of 2026-07-11
+  for `rustybuzz`, which points to `harfrust`), and `deny.toml`'s `unmaintained = "workspace"` refuses a new
+  direct dependency on either (their copies under GPUI were accepted before). The agent did not add an exception
+  to `deny.toml`: `schema_doc/pdf/sfnt.rs` reads the few tables needed (the table directory, `head`, `hhea`,
+  `hmtx`, `cmap` formats 12 and 4, `post`, `OS/2`, `name`), about 280 lines with its tests, every read checked,
+  a short or missing table an error and never a panic. Its glyphs, advances and metrics for the three fonts were
+  checked against `ttf-parser`'s before it was removed. `skrifa` 0.44 (already in the lock, maintained) was the
+  other way: it costs a macOS build `read-fonts` and `skrifa` (about 130,000 lines) that today compile on Linux
+  only.
+
+- **One function for every format.** `schema_doc::render` returns the file's bytes for each format and takes the
+  fonts; the PDF is `schema_doc/pdf.rs`, pure, unit-tested. The fonts are a parameter: the app passes the Inter
+  Regular, Inter SemiBold and JetBrains Mono Regular it already embeds (`theme::document_fonts`, one copy in the
+  binary), the tests read the files by path.
+- **Real text.** Each character drawn gets a CID (1, 2, …); a Type0 font over a CID font (TrueType outlines) of
+  the subset `subsetter` makes, a CIDToGIDMap stream from CID to the subset's glyph, a ToUnicode map from CID to
+  the character. So the text is selected, copied and searched as written, and a character the fonts lack is
+  drawn as their missing glyph yet still maps back to itself. Glyphs and advances come from `sfnt.rs`: no
+  kerning, no shaping, no fallback font (a `ponytail:` comment says where to go: shape with a maintained shaper,
+  `harfrust`, and add a fallback font).
+- **Untrusted text** reaches the file as glyph ids in strings written by `pdf-writer` (`Str`, escaped) and as the
+  outline's text strings (`TextStr`, on one line); resource names, font names and colours are Kerno's own.
+- **Layout.** A4 (default) or US Letter, margins of 50 pt at the sides and 56 and 62 pt at the top and bottom;
+  Inter 9 pt for text, 7.5 pt in tables, JetBrains Mono for names, types, defaults and DDL. The same content and
+  order as the HTML. Two passes: the first lays the document out and notes the page of each section, table, view
+  and routine; the second writes those page numbers in the contents, on the same lines, so nothing moves. Each
+  table starts a page (as the printed HTML), and so do the diagram and each section; a table's rows continue on
+  the next page with the header row drawn again, a cell wraps between words and then between characters, a DDL
+  block keeps its indentation and continues on the next page. A footer on every page: the title (cut with an
+  ellipsis) and "page n of N".
+- **The diagram** is drawn from `erd::layout` and `erd::route` (boxes with rounded corners, the header bands,
+  rows, `PK`/`FK` marks, types right-aligned, edges with their crow's feet and bars) on a page of its own, scaled
+  to fit the page's width and the height left under its heading, never enlarged: a large schema is small on paper
+  but drawn as vectors, so a reader zooms into it. It does not continue on other pages.
+- **The lockup** is the brand files' shapes (`kerno-horizontal.svg`, and `-reversed.svg` with its Night tile on
+  the dark style), read from their path data with `kurbo`, 32 pt high (102 pt wide, above BRAND.md's minimum),
+  with one disk height of clear space under it. Plain has no logo, no "Generated by Kerno", no creator.
+- **Styles.** The colours are the HTML's (`Colours`), so the same contrast test holds them. Kerno dark keeps
+  dark pages in the PDF (the reader chose that style; the HTML's print rules exist because a browser's print
+  dialog is not a choice).
+- **Outline and links.** Bookmarks: Diagram, Tables and each table, Views and each, routines and the rest and
+  each; the contents' lines are links to their page. Document info: the title; the creator "Kerno" for the Kerno
+  styles. No producer.
+- **Size and time.** Streams compressed with `flate2`. The fixture's `shop` (7 tables, 2 views and the code)
+  makes a 12-page PDF of 66 KB in Kerno light, 66 KB dark, 63 KB plain, written in 7.7 ms by a release build.
+- **The dialog**: the PDF card second among six; the style cards and "Include the diagram" for HTML and PDF;
+  "Paper" A4 / US Letter beside them for the PDF only; written through the `.part` then rename path as bytes.
+- **Not in this version:** kerning and complex scripts, a fallback font, a diagram over several pages, a
+  landscape page, tagged PDF for screen readers, PDF/A.

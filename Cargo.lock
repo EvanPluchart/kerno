@@ -4432,9 +4432,12 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "directories",
+ "flate2",
  "futures-util",
  "kerno-core",
  "keyring",
+ "kurbo 0.13.1",
+ "pdf-writer",
  "percent-encoding",
  "rusqlite",
  "russh",
@@ -4444,6 +4447,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "subsetter",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -6054,6 +6058,18 @@ checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
  "digest 0.11.3",
  "hmac 0.13.0",
+]
+
+[[package]]
+name = "pdf-writer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e456864a7a304047bff84977dc6fb162bd956475d40ba50b2dcecaada7f753"
+dependencies = [
+ "bitflags 2.13.2",
+ "itoa",
+ "memchr",
+ "ryu",
 ]
 
 [[package]]
@@ -8220,6 +8236,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "subsetter"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38803281d1c23166c5ebcb455439a5d2afe711cc909cf88af72448c297756ad6"
+dependencies = [
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]

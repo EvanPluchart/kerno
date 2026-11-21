@@ -1077,9 +1077,8 @@ Still open (for the owner):
 - The writers are pure core code (`kerno-core/src/schema_doc.rs`, `schema_doc/html.rs`) over the compare's
   model, read through the compare's loop narrowed to what is ticked; the SQL is the compare's script against an
   empty schema. One escaping writer per format, each tested with the same hostile schema.
-- The PDF is not done: `krilla` brings a third copy of `read-fonts` and `skrifa` on Linux (D-104 lists the
-  crates); stopped on that point as asked, with `pdf-writer` and `subsetter` as the alternative for the owner to
-  decide.
+- The PDF was not done here: `krilla` brings a third copy of `read-fonts` and `skrifa` on Linux (D-104 lists the
+  crates); it came in K32 with `pdf-writer` and `subsetter` (D-105).
 - Seen while working: the dialog on HTML, on Markdown, done and empty, offscreen in both themes at 1200 × 800
   and 900 × 600 (temporary test, not committed); the fixture's HTML in the three styles on screen and printed
   through headless Chromium, and a 60-column table, the empty document and the hostile one printed. Fixed from
@@ -1094,3 +1093,24 @@ Still open (for the owner):
   driver test per engine (PostgreSQL, MySQL, MariaDB on the fixtures, SQLite on a file it makes), six UI tests in
   `ui_tests/schema_export.rs` and a unit test of the file's write; each but one seen failing under a mutation
   (the read-only and production test guards against a question that does not exist).
+
+## 2026-11-21 — K32: the schema document as a PDF
+
+- The schema document is now written as a PDF too: the HTML's content on A4 or US Letter pages, in Kerno light,
+  Kerno dark or Plain, with the diagram and the lockup as vectors, a contents page whose entries are links with
+  their page numbers, a bookmark per table, view and routine, header rows repeated on every page a table
+  continues on, and "page n of N" at the foot of each page. Its text can be searched and copied: the fonts are
+  embedded as subsets with a map back to each character. D-105.
+- Two packages added, `pdf-writer` and `subsetter` (without `variable-fonts`); `kurbo` and `flate2`, already in
+  the tree, are now direct dependencies of `kerno-core`. `ttf-parser` and `rustybuzz`, named for the fonts, are
+  marked unmaintained by RustSec and refused by `cargo deny` as direct dependencies: a small reader of the font
+  tables needed (`sfnt.rs`) takes their place, checked against `ttf-parser`'s values first. The fonts are the
+  ones the app already embeds, not a second copy.
+- Seen while working: every page of the fixture's PDF in the three styles, the hostile schema, a 60-column table
+  of 300-character types and an empty pick, rasterised with `pdftoppm` (nothing on its stderr) and read back with
+  `pdftotext`; the dialog with the PDF card and its finished state, light and dark, 1200 × 800 and 900 × 600.
+  Fixed from them: a DDL block lost its indentation.
+- Tests: ten core unit tests that read the PDF back without a reader (its objects, ToUnicode maps and shown
+  strings) or check the font reader against `ttf-parser`'s values, two of the font reader's character maps, the
+  driver tests of K31 extended to the PDF on PostgreSQL, MySQL, MariaDB and SQLite, one UI test; each seen failing
+  under a mutation.

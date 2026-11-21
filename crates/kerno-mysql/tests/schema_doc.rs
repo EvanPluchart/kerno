@@ -11,8 +11,39 @@ use std::sync::atomic::AtomicBool;
 
 use common::engines;
 use kerno_core::Session;
-use kerno_core::schema_doc::{self, Document, Format, Options, Pick};
+use kerno_core::schema_doc::{self, Document, Fonts, Format, Options, Pick};
 use kerno_core::testing;
+
+/// The fonts the app embeds, read from its assets.
+fn fonts() -> Fonts<'static> {
+    static DATA: std::sync::OnceLock<[Vec<u8>; 3]> = std::sync::OnceLock::new();
+    let data = DATA.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kerno/assets/fonts");
+        let read = |file: &str| std::fs::read(dir.join(file)).expect("the app's font");
+        [
+            read("inter/Inter-Regular.ttf"),
+            read("inter/Inter-SemiBold.ttf"),
+            read("jetbrains-mono/JetBrainsMono-Regular.ttf"),
+        ]
+    });
+    Fonts {
+        regular: &data[0],
+        semibold: &data[1],
+        mono: &data[2],
+    }
+}
+
+fn rendered(doc: &Document, format: Format, session: &Arc<dyn Session>) -> String {
+    let bytes = schema_doc::render(
+        doc,
+        format,
+        &Options::default(),
+        session.dialect(),
+        &fonts(),
+    )
+    .expect("written");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 async fn document(session: &Arc<dyn Session>, pick: &Pick) -> Document {
     let side = schema_doc::load(
@@ -55,7 +86,7 @@ async fn a_document_names_the_tables_there_and_only_those_picked() {
         let params = testing::params(engine);
         let port = params.port.to_string();
         for format in Format::ALL {
-            let text = schema_doc::render(&whole, format, &Options::default(), session.dialect());
+            let text = rendered(&whole, format, &session);
             for table in [
                 "customers",
                 "categories",
@@ -65,7 +96,10 @@ async fn a_document_names_the_tables_there_and_only_those_picked() {
             ] {
                 assert!(text.contains(table), "{engine:?} {format:?}: {table}");
             }
-            if matches!(format, Format::Html | Format::Markdown | Format::Sql) {
+            if matches!(
+                format,
+                Format::Html | Format::Pdf | Format::Markdown | Format::Sql
+            ) {
                 assert!(text.contains("order_totals"), "{engine:?} {format:?}");
                 assert!(text.contains("active_customers"), "{engine:?} {format:?}");
             }
@@ -78,7 +112,15 @@ async fn a_document_names_the_tables_there_and_only_those_picked() {
                     engine.label().to_lowercase(),
                     format.extension()
                 ));
-                std::fs::write(path, &text).unwrap();
+                let bytes = schema_doc::render(
+                    &whole,
+                    format,
+                    &Options::default(),
+                    session.dialect(),
+                    &fonts(),
+                )
+                .expect("written");
+                std::fs::write(path, bytes).unwrap();
             }
         }
         // A subset holds only what was picked.
@@ -98,12 +140,7 @@ async fn a_document_names_the_tables_there_and_only_those_picked() {
             .collect();
         names.sort_unstable();
         assert_eq!(names, ["order_totals", "orders"], "{engine:?}");
-        let markdown = schema_doc::render(
-            &picked,
-            Format::Markdown,
-            &Options::default(),
-            session.dialect(),
-        );
+        let markdown = rendered(&picked, Format::Markdown, &session);
         assert!(markdown.contains("### `orders`"));
         assert!(!markdown.contains("### `customers`"), "{engine:?}");
         session.close().await;

@@ -39,6 +39,16 @@ rustls.workspace = true
 rustls-native-certs.workspace = true
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 serde-saphyr = "1.3"
+# The schema document as a PDF (K32, D-105): the only two packages added for
+# it, `subsetter` without `variable-fonts` (which would bring skrifa and
+# write-fonts). The others were already in the tree, at the version locked:
+# the brand's path data (through usvg), stream compression (through russh and
+# mysql_async). The fonts' glyphs and advances are read in schema_doc/pdf/sfnt.rs:
+# ttf-parser and rustybuzz are unmaintained (RUSTSEC-2026-0192, -0206).
+pdf-writer = "0.15"
+subsetter = { version = "0.2.6", default-features = false }
+kurbo = "=0.13.1"
+flate2 = "1.1"
 # Already in the tree through rust_xlsxwriter.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 

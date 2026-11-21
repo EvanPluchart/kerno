@@ -464,7 +464,12 @@ Pick what the document is for:
 - **HTML**: one page to read, send or print, for a team or a client: the diagram, a table of contents, then
   every table with its columns, keys, constraints and indexes, and the views. In Kerno's light or dark style or
   plain black on white; it opens in any browser, asks the network for nothing, and prints a page per table (the
-  dark style prints on white). Print it to PDF from the browser.
+  dark style prints on white).
+- **PDF**: the same document ready to print or send, on A4 or US Letter (the Paper choice under the styles): a
+  contents page whose entries lead to their pages, the diagram drawn to fit a page (zoom into it: it is drawn,
+  not an image), a page per table whose rows continue on the next pages with their header, a bookmark per
+  table, the title and "page n of N" at the foot of each page. Its text can be searched and copied. The dark
+  style keeps its dark pages; pick Kerno light or Plain to print.
 - **Markdown**: a data dictionary for a wiki or a pull request, and a compact form of the schema to give an AI
   assistant.
 - **DBML**: the tables and their references, to draw on dbdiagram.io or publish with dbdocs.
