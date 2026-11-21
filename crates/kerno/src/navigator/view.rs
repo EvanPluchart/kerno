@@ -1233,6 +1233,7 @@ impl Navigator {
                     cx.emit(NavigatorEvent::ViewDiagram { target, scope });
                 }
             }
+            Action::CompareWith => self.perform_tool(ToolEntry::CompareSchemas, id, window, cx),
             Action::Backup | Action::Restore => {
                 let entry = if action == Action::Backup {
                     ToolEntry::Backup

@@ -9,6 +9,8 @@ mod backup_dialog;
 mod bench;
 mod brand;
 mod bridge;
+mod compare_dialog;
+mod compare_tab;
 mod connections;
 mod data;
 mod database_dialog;
@@ -681,6 +683,7 @@ fn menus() -> Vec<Menu> {
                         MenuItem::action("Restore Database…", RestoreDatabase),
                         command("execute_script"),
                         command("copy_tables"),
+                        command("compare_schemas"),
                         separator(),
                         command("foreign_data_wrappers"),
                         separator(),

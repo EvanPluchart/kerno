@@ -93,6 +93,9 @@ pub enum Action {
     /// The ER diagram of a schema (a MySQL database), or of a table and its
     /// neighbours (DBeaver's "View Diagram", J18).
     ViewDiagram,
+    /// The schema compare with this schema (a database) as the source
+    /// (K30).
+    CompareWith,
 }
 
 impl Action {
@@ -141,6 +144,7 @@ impl Action {
             Action::EditColumn => "Edit column…",
             Action::Properties => "Properties",
             Action::ViewDiagram => "View diagram",
+            Action::CompareWith => "Compare with…",
         }
     }
 
@@ -185,6 +189,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Object(ObjectRef::Database(_)) if has_schemas => {
             vec![
                 vec![NewQueryHere, CreateSchema, CreateDatabase],
+                vec![CompareWith],
                 vec![Properties, CopyName, CopyQualifiedName],
                 vec![Drop],
             ]
@@ -198,7 +203,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateDatabase,
             ],
-            vec![ImportCsv, ViewDiagram],
+            vec![ImportCsv, ViewDiagram, CompareWith],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Drop],
         ],
@@ -210,7 +215,7 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 CreateView,
                 CreateSchema,
             ],
-            vec![ImportCsv, ViewDiagram],
+            vec![ImportCsv, ViewDiagram, CompareWith],
             vec![Properties, ShowDdl, CopyName, CopyQualifiedName],
             vec![Rename, Drop],
         ],
@@ -390,6 +395,8 @@ pub enum ToolEntry {
     CopyTables,
     /// The extensions manager of a PostgreSQL database (K27).
     Extensions,
+    /// The schema compare, with this schema or database as the source (K30).
+    CompareSchemas,
 }
 
 impl ToolEntry {
@@ -411,6 +418,7 @@ impl ToolEntry {
             Self::Tasks => "Tasks".into(),
             Self::CopyTables => "Copy tables to another connection…".into(),
             Self::Extensions => "Extensions…".into(),
+            Self::CompareSchemas => "Compare schemas…".into(),
         }
     }
 
@@ -475,6 +483,11 @@ pub fn tool_entries(
         // It reads here and writes on the other connection: on an object
         // of the tree only, never greyed by this one being read-only.
         (CopyTables, backup && object.is_some()),
+        // Reads both sides; the script opens in a query tab.
+        (
+            CompareSchemas,
+            matches!(object, Some(ObjectRef::Database(_) | ObjectRef::Schema(_))),
+        ),
     ];
     let mut groups = vec![
         client_tools
@@ -1327,7 +1340,7 @@ mod tests {
         // entry greyed "on a trigger" on a table).
         // K27: a database also leads to its extensions.
         let mut database_tail = with_tail(&[
-            "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…",
+            "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…, Compare schemas…",
             "Analyze…, Vacuum…",
         ]);
         database_tail[2] = "Foreign data wrappers…, Extensions…".into();
@@ -1335,7 +1348,7 @@ mod tests {
         assert_eq!(
             tool_labels(Some(&schema), &pg),
             with_tail(&[
-                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…"
+                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…, Compare schemas…"
             ])
         );
         assert_eq!(
@@ -1383,7 +1396,7 @@ mod tests {
         let mysql_tail = &tail[1..];
         assert_eq!(
             tool_labels(Some(&database), &mysql),
-            ["Back up…, Restore…, Execute script…, Copy tables to another connection…"]
+            ["Back up…, Restore…, Execute script…, Copy tables to another connection…, Compare schemas…"]
                 .iter()
                 .chain(mysql_tail)
                 .map(|group| group.to_string())
@@ -1429,6 +1442,7 @@ mod tests {
             (ToolEntry::Tasks, false),
             (ToolEntry::CopyTables, false),
             (ToolEntry::Extensions, false),
+            (ToolEntry::CompareSchemas, false),
         ] {
             assert_eq!(entry.writes(), writes, "{entry:?}");
         }

@@ -1023,7 +1023,7 @@ Still open (for the owner):
 - Not proved in a real window: the restore of a real window's place, maximised or full screen (test context
   only). Still to do: the final captures (`m12-grid-selection-*`, `m12-notification-*`).
 
-## 2026-11-21 — K29: SQLite, the third engine family (ROADMAP item 4)
+## 2026-11-21 — K29: SQLite, the third engine family (ROADMAP's SQLite item)
 
 - A new crate `kerno-sqlite` on the bundled `rusqlite` already in the workspace (no new dependency; the
   `column_decltype` feature): a connection is a database file, chosen or made empty with New file…, never
@@ -1046,4 +1046,22 @@ Still open (for the owner):
 - Review: the table form no longer shows its comment fields on an engine without comments
   (`Engine::has_comments`; SQLite refused them only once typed); the UI test of the refused alter checks it and
   was seen failing with the capability switched.
-- Still to do: the final captures (`m12-sqlite-*`); what ROADMAP item 4 lists as still to come.
+- Still to do: the final captures (`m12-sqlite-*`); what ROADMAP's SQLite item lists as still to come.
+
+## 2026-11-21 — K30: schema compare (ROADMAP item 1)
+
+- Compare two schemas (two databases on MySQL and MariaDB) of the same engine family: a dialog picks the source
+  (the model) and the target, a tab lists tables, views, routines, sequences, types and triggers only in the
+  source, only in the target, different or the same, says what differs in plain words with both definitions
+  side by side, and "Open script" opens the script that brings the target to the source in a query tab on the
+  target, where nothing runs by itself. Drops of what only the target has are comments until asked for. Ways in:
+  Server ▸ Tools, the palette, a schema's or database's Tools ▸ and "Compare with…". D-103.
+- The diff is core code (`kerno-core/src/compare.rs`) over `TableStructure` and `table_draft::changes`; the
+  diagram's read loop is shared (`erd::buffered`); two provided dialect methods write constraints.
+- Seen while working: the dialog, the tab with a table selected, the script and the identical state rendered
+  offscreen in both themes (temporary test, not committed).
+- A name with a line break could end a comment of the script and leave SQL to run (the security review):
+  one function now writes every comment line, split on every line break.
+- Tests: twelve core unit tests, a round trip per engine (compare, run the script, compare again: identical) on
+  PostgreSQL, MySQL and MariaDB in scratch schemas and databases, six UI tests in `ui_tests/compare.rs`; each
+  seen failing under a mutation. Two Tools ▸ tests updated for the new entry.

@@ -4,6 +4,7 @@
 pub mod aggregate;
 pub mod ai;
 pub mod browse;
+pub mod compare;
 pub mod config;
 pub mod connector;
 pub mod dialect;

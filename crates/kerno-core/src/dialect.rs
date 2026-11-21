@@ -343,6 +343,26 @@ pub trait Dialect: Send + Sync {
         default_alter_table_sql(self, table, changes)
     }
 
+    /// The statement that adds a check, unique or exclusion constraint to
+    /// `table`, `definition` as [`crate::schema::ConstraintInfo::definition`]
+    /// prints it (`CHECK (price >= 0)`, `UNIQUE (email)`).
+    fn add_constraint_sql(&self, table: &TableRef, name: &str, definition: &str) -> String {
+        format!(
+            "ALTER TABLE {} ADD CONSTRAINT {} {definition}",
+            self.table_name(table),
+            self.quote_ident(name)
+        )
+    }
+
+    /// The statement that drops the constraint `name` of `table`.
+    fn drop_constraint_sql(&self, table: &TableRef, name: &str) -> String {
+        format!(
+            "ALTER TABLE {} DROP CONSTRAINT {}",
+            self.table_name(table),
+            self.quote_ident(name)
+        )
+    }
+
     /// The isolation levels a session can be set to, weakest first (the
     /// main toolbar's transaction mode lists them). The default is the
     /// standard's four.
@@ -561,7 +581,7 @@ fn default_create_table_sql<D: Dialect + ?Sized>(dialect: &D, draft: &TableDraft
 }
 
 /// What [`Dialect::alter_table_sql`] writes by default.
-fn default_alter_table_sql<D: Dialect + ?Sized>(
+pub(crate) fn default_alter_table_sql<D: Dialect + ?Sized>(
     dialect: &D,
     table: &TableRef,
     changes: &[TableChange],

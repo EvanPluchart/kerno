@@ -188,6 +188,29 @@ pub struct Loaded {
 /// Tables whose structure is read at once.
 const CONCURRENT: usize = 8;
 
+/// Runs `read` on each of `items`, [`CONCURRENT`] at a time, and hands the
+/// results to `each` in the items' order. Stops with [`Error::Cancelled`]
+/// once `cancel` is set, or at the first error `each` returns. Shared by the
+/// diagram and the schema compare ([`crate::compare::load`]).
+pub(crate) async fn buffered<T, R, F>(
+    items: Vec<T>,
+    read: impl FnMut(T) -> F,
+    cancel: &AtomicBool,
+    mut each: impl FnMut(R) -> Result<()>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = R>,
+{
+    let mut reading = futures_util::stream::iter(items.into_iter().map(read)).buffered(CONCURRENT);
+    while let Some(result) = reading.next().await {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        each(result)?;
+    }
+    Ok(())
+}
+
 /// Reads the diagram of `scope`: the list of tables, then their structures,
 /// [`CONCURRENT`] at a time, telling `progress` after each. Stops with
 /// [`Error::Cancelled`] once `cancel` is set. A table that cannot be read
@@ -224,18 +247,14 @@ pub async fn load(
     });
     let mut skipped = Vec::new();
     let mut first_error = None;
-    let mut reading = futures_util::stream::iter(tables.into_iter().map(|table| {
+    let reading = |table: TableRef| {
         let session = session.clone();
         async move {
             let structure = session.table_structure(&table).await;
             (table, structure)
         }
-    }))
-    .buffered(CONCURRENT);
-    while let Some((table, structure)) = reading.next().await {
-        if cancel.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
-        }
+    };
+    buffered(tables, reading, cancel, |(table, structure)| {
         match structure {
             Ok(structure) => read.push((table, structure)),
             Err(error) => {
@@ -247,7 +266,9 @@ pub async fn load(
             done: read.len() + skipped.len(),
             total,
         });
-    }
+        Ok(())
+    })
+    .await?;
     if read.is_empty()
         && let Some(error) = first_error
     {

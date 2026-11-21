@@ -214,6 +214,7 @@ fn tool_entry(object: bool, entry: &ToolEntry) -> Palette {
         ToolEntry::Tasks => Command("show_tasks"),
         ToolEntry::CopyTables => Command("copy_tables"),
         ToolEntry::Extensions => Command("install_extension"),
+        ToolEntry::CompareSchemas => Command("compare_schemas"),
     }
 }
 
@@ -265,6 +266,7 @@ fn tree_entry(action: Action) -> Palette {
         // F4 (`edit_action`): a column's form, a table's Properties.
         Action::EditColumn | Action::Properties => Command("edit_object"),
         Action::ViewDiagram => Command("view_diagram"),
+        Action::CompareWith => Command("compare_schemas"),
     }
 }
 
@@ -698,6 +700,7 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
         Action::EditColumn,
         Action::Properties,
         Action::ViewDiagram,
+        Action::CompareWith,
     ];
     let mut palettes: Vec<(String, Palette)> = actions
         .iter()
@@ -728,6 +731,7 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
             ToolEntry::Tasks,
             ToolEntry::CopyTables,
             ToolEntry::Extensions,
+            ToolEntry::CompareSchemas,
         ]
         .map(|entry| (entry.label(), tool_entry(true, &entry))),
     );

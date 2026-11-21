@@ -43,6 +43,7 @@ mod ai_endpoints;
 mod alter_form;
 mod backup_simple;
 mod brackets;
+mod compare;
 mod connection_feedback;
 mod coverage;
 mod critique;

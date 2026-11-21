@@ -395,7 +395,7 @@ impl TableDraft {
 
 /// Whether a [`TableDraft`] can describe `index` (see
 /// [`TableDraft::from_structure`]).
-fn is_editable(index: &IndexInfo, structure: &TableStructure) -> bool {
+pub(crate) fn is_editable(index: &IndexInfo, structure: &TableStructure) -> bool {
     !index.primary
         && !index.backs_constraint
         && index.predicate.is_none()

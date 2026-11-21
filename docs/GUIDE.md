@@ -427,6 +427,30 @@ cancelled while it runs, and a refusal says why in plain words before the server
 selected row (Install… or Update), the arrows move in the list, ⌘F goes to the search, and each row has its
 menu with Copy name. MySQL and MariaDB have no extensions.
 
+## Compare two schemas
+
+Server ▸ Tools ▸ Compare Schemas… (or the palette, or "Compare with…" and Tools ▸ "Compare schemas…" on a
+schema or a database of the tree) asks for two sides: the **source**, the model, and the **target**, what the
+script will change. Each is a saved connection (a click connects it), its database and its schema; on MySQL and
+MariaDB the database is the schema. ⇄ exchanges them. Both must be of the same kind: two PostgreSQL schemas, or
+two MySQL or MariaDB databases; another pairing is refused before anything is read.
+
+The compare tab reads both at once (each side's progress shows, Cancel stops it) and lists tables, views,
+materialized views, functions, procedures, sequences, types and triggers, grouped by kind, each marked `+` only
+in the source, `−` only in the target, `≠` different or `=` the same. The filters count them; "Same" is hidden
+until picked. Select an object to read what differs in plain words ("column `price`: numeric(10,2) →
+numeric(12,2)", "index `orders_customer_idx` is missing in the target") and both definitions side by side.
+Names are compared as the server compares them; a renamed object shows as one only in the source and one only
+in the target. Rows are never read.
+
+Each object has a checkbox: ticked ones go into the script (All and None act on what is shown). "Open script"
+opens the script that brings the target to the source in a new query tab on the target: nothing has run. Read
+it, then run it there; the connection's rules apply (a read-only target refuses it, production asks twice).
+What only the target has is dropped only when "Also drop what only the target has" is ticked; otherwise its
+`DROP` statements are comments. What cannot be changed in place (a type, a sequence) is a comment that says
+why, with the source's definition. Swap and Refresh compare again; a row's menu opens the object in the source
+or the target.
+
 ## Where Kerno keeps its data
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open

@@ -6,16 +6,12 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 
 ## Beyond v1, in order
 
-1. **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22). Reads `table_structure` and `ddl` from two sessions,
-   diffs the engine-neutral `TableStructure` values in `kerno-core`, and writes the migration with the
-   dialect's `alter_table_sql` and `create_table_sql`. No new trait method; the diff is core code with unit
-   tests.
-2. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
+1. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
    row identity the table view already computes, and merges the two streams. Applying differences reuses the
    pending-edit SQL and its transactional apply. No trait change.
-3. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
+2. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
    `LIMIT/OFFSET`; its output is SQL text in a query tab. No trait change.
-4. **SQLite**: built (K29, D-102; see below), still to come for it: backup and restore (`VACUUM INTO`,
+3. **SQLite**: built (K29, D-102; see below), still to come for it: backup and restore (`VACUUM INTO`,
    `.dump`); the engine's tools under Tools ▸ (ANALYZE, VACUUM, integrity check); copying tables to or from a
    SQLite connection (J13 needs a type mapping of its own); opening a file from the shell (`kerno shop.db`,
    `sqlite://` URLs); attached databases and `temp`; the 12-step table rebuild behind the alters SQLite cannot
@@ -23,24 +19,30 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
    editing the rows of a query result (column origins, `column_metadata`); loadable extensions; check
    constraints in the structure tabs; a column whose rows mix storage classes shown cell by cell (the result
    model has one kind per column).
-5. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
+4. **Other engines**, one crate each, through the same layer: SQL Server, Oracle, ClickHouse, DuckDB. Each
    brings its own `Dialect` (quoting, `LIMIT` or `TOP`/`FETCH`, `explain`, `parse_plan`), its introspection
    queries, a `TypeKind` mapping and a cancel mechanism. Where a feature has no equivalent, the provided
    `Dialect` defaults refuse and the UI hides the entry (as it does for engines without schemas). If a new
    engine needs a capability the trait cannot express, add a method with a refusing default rather than a
    branch on the engine name in the UI.
-6. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
+5. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
    the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
-7. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
+6. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
    migrations) and never carries secrets: those stay in the OS secret store. Opt-in, with a visible account.
-8. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
+7. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
     session capability, so it waits for a use for it.
+
+Built in v1.2 and no longer on this list: **Schema compare** (NAV-57, CM-21, CM-59, TOOL-22; K30, D-103): two
+schemas of the same engine family, the script that brings one to the other opened in a query tab, never run;
+still to come: another engine pairing (a type mapping, as J13's copy has), a SQL file against a live schema,
+whole servers (several schemas at once), privileges and owners, saving a comparison, `ALTER TYPE … ADD VALUE` for
+new enum labels, and a column type changed under a view (the view dropped and created around it).
 
 Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47; J18, D-069), read-only; still to come: editing the schema
 from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
 **AI assistant** (TOOL-24; J17, D-068), opt-in and local first; left for later: streaming answers, per-connection opt-out, tool calls.
 Their FEATURES rows are J18 and J17.
-**SQLite** (item 4; K29, D-102), the first engine beyond v1: a `kerno-sqlite` crate on the bundled `rusqlite`,
+**SQLite** (item 3; K29, D-102), the first engine beyond v1: a `kerno-sqlite` crate on the bundled `rusqlite`,
 a connection that is a file (`ConnectionConfig::file`), `has_schemas` false with one database `main`, cancel as
 SQLite's interrupt, `admin_query` `None` for every view, and the capabilities it needed added to the trait with
 defaults (`Dialect::begin_sql`, `transactional_ddl`, `has_routines`, `ExecSink::stop_signal`). Its FEATURES row

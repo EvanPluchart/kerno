@@ -2792,7 +2792,7 @@ filters Installed / Available / To update, and Install, Update, Drop with the SQ
 
 ## D-102 — SQLite, the third engine family: a connection is a file (K29; 2026-11-21)
 
-ROADMAP item 4, so that someone can open a SQLite file and work in it every day. Choices taken with the
+ROADMAP's SQLite item, so that someone can open a SQLite file and work in it every day. Choices taken with the
 coordinator before the work, then the ones made on the way:
 
 - **No new dependency.** `rusqlite` 0.42 with the bundled SQLite, already kerno-core's for the app's store, in a
@@ -2875,7 +2875,78 @@ coordinator before the work, then the ones made on the way:
   database and create schema in the tree. Copying tables to or from SQLite is refused by the type mapping
   (`transfer::map_type`) until it has one of its own. Query results are not editable (no column origins);
   table data is.
-- Not done (ROADMAP item 4, "still to come"): backup and restore (`VACUUM INTO`, `.dump`), the engine's tools
+- Not done (ROADMAP's SQLite item, "still to come"): backup and restore (`VACUUM INTO`, `.dump`), the engine's tools
   (ANALYZE, VACUUM, integrity check), copying tables to or from SQLite, `kerno file.db` and `sqlite://` URLs,
   attached databases and `temp`, the 12-step table rebuild, keying a keyless table on `rowid`, editing query
   results, loadable extensions, check constraints in the structure.
+
+## D-103 — Schema compare: the diff in core, the script opened in a query tab, never run (K30; 2026-11-21)
+
+Item 1 of `docs/ROADMAP.md` (NAV-57, CM-21, CM-59, TOOL-22). DBeaver Community's simple compare
+(`org.jkiss.dbeaver.tools.compare.simple`) was read for the flow (pick objects, a report of what differs); its
+migration script is in the paid editions, not looked for. No logic is ported, so `THIRD_PARTY_NOTICES.md` is
+unchanged. Choices:
+
+- **What is compared.** Tables by their `TableStructure`: columns (type, nullable, default, comment,
+  auto-increment, `ON UPDATE`, invisible, and the order where the engine can move a column), primary key,
+  unique, check and exclusion constraints, indexes, foreign keys, the table comment. Views, materialized views,
+  functions, procedures, sequences, types and triggers by the DDL the driver prints, whitespace aside. Rows are
+  never read. Left out: partitions, foreign tables, aggregates and window functions, MySQL events, a sequence owned
+  by a column (it comes with its column), whatever the driver cannot print.
+- **Sides.** A source (the model) and a target (what the script changes), each a saved connection with its
+  database and schema; on MySQL and MariaDB the database is the schema. The dialog picks them as the copy dialog
+  (J13) does: a click connects, the password is asked as usual.
+- **Same family only.** `compare::Family::of` (core, `matches!`, no wildcard arm on `Engine`) puts PostgreSQL
+  alone and MySQL with MariaDB; another pairing, or an engine without a family, is refused in plain words in the
+  dialog before anything is read.
+- **Names** compare as the engine compares them: exactly on PostgreSQL; on MySQL and MariaDB columns, indexes,
+  constraints and routines without case, tables, views and triggers as written (a Linux server's
+  `lower_case_table_names = 0`; a macOS server stores names in lower case anyway). A renamed object is one only
+  in the source and one only in the target: the view says the compare cannot tell a rename.
+- **Schema names.** Each side's session enters its schema first (`SET search_path`, on engines with schemas, as
+  the query tab does), so the server prints that schema's own names unqualified on both sides; what is still
+  qualified (a function's header, an index definition, MySQL's view bodies, a foreign key's table) has the source
+  schema's name rewritten to the target's, a textual rewrite (a `ponytail:` comment says a name in a string
+  literal is rewritten too).
+- **How a table differs.** The source's structure becomes a `TableDraft` tied by name to the target's columns,
+  indexes and keys, and `table_draft::changes` gives the changes the structure editor would make; the target's
+  dialect writes them (`alter_table_sql`, per change when it refuses the whole). Constraints and indexes a draft
+  cannot hold are compared by name and definition: a changed one is dropped and added again
+  (`Dialect::add_constraint_sql` / `drop_constraint_sql`, provided with standard SQL, and the index's own
+  definition). A move the engine cannot make (PostgreSQL) is no difference: there the column order is not
+  compared, and an added column goes last.
+- **The script** brings the target to the source in an order that works: types and sequences, constraint
+  drops, new tables (their foreign keys left out), table changes, constraint and index adds, foreign keys,
+  routines, views, triggers, then drops of what only the target has (triggers, views, routines, keys between
+  dropped tables, tables, types). A changed view or routine goes through `replace_source_sql`; a changed trigger
+  is dropped and created; a changed type or sequence is a comment with the reason and the source's definition.
+  Whatever the dialect refuses is a comment that says why, never left out silently. Each block starts with a
+  comment naming its object.
+- **Comments cannot be escaped.** Names, connection names and server texts reach the script's comments (a
+  block's heading, a reason, a definition written as a comment): one function, `compare::commented`, writes
+  every `--` line of the script and the tab's heading, splitting on every line break (`\r\n`, `\n`, a lone `\r`,
+  U+0085, U+2028, U+2029), so a name holding a line break never ends its comment and leaves SQL to run (found by
+  the security review of the first version, which used `str::lines` and wrote headings by hand).
+- **Drops are opt-in.** Tables, other objects and columns only the target has are listed; their drops are
+  comments until "Also drop what only the target has" is ticked. Indexes, keys and constraints only the target
+  has are dropped in any case: they hold no data, and the table would not match without it.
+- **Nothing runs from the compare.** "Open script" opens the script in a new query tab bound to the target
+  (its connection, database and schema), headed by which side it brings to which; it is run there, under the
+  connection's rules (confirmations, `read_only`, production's second confirmation). A read-only target says so
+  in the tab and the script still opens.
+- **The view** is a tab (one per pair of sides, not restored after a restart): both sides and Swap, Refresh,
+  Open script; filters All differences / Only in source / Only in target / Different / Same with counts, Same
+  hidden at first; a search over names; per-object checkboxes with All / None over what is shown; marks
+  `+ − ≠ =` with words; the differences in plain words and both definitions side by side in read-only editors
+  (a table's as its dialect writes it from its structure, so the same writer is on both sides). No line-level
+  diff highlight: the kit has none.
+- **Loading** runs both sides at once, each on a session of its own, eight structures or DDLs at a time (the
+  diagram's loop, now `erd::buffered`, shared); per-side progress, Cancel (Cmd+. too) stops both on the server;
+  the compare itself runs on the blocking pool.
+- **Ways in**: Server ▸ Tools ▸ Compare Schemas… and the palette (the active tab's place as the source), the
+  Tools ▸ "Compare schemas…" of a schema and a database in the tree, and their "Compare with…" (both make it the
+  source).
+- **Not in this version** (ROADMAP item 1): another engine pairing, a SQL file against a live schema, whole
+  servers, privileges and owners, saving a comparison, data compare (item 2). Also known: a column whose type
+  changes under a view that reads it is refused by PostgreSQL (the view must go first, by hand); enum labels
+  added to a type are not written as `ALTER TYPE … ADD VALUE`.

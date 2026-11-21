@@ -208,6 +208,8 @@ gpui_kit::actions!(
         ExecuteScript,
         /// Copies tables with their data to another connection (J13).
         CopyTables,
+        /// Compares two schemas and opens the script between them (K30).
+        CompareSchemas,
         /// The foreign data wrappers of a PostgreSQL database.
         ForeignDataWrappers,
         /// A tool's wizard whose aim is a saved task.
@@ -2160,6 +2162,20 @@ pub const COMMANDS: &[Command] = &[
             "export to database"
         ],
         CopyTables
+    ),
+    command!(
+        "compare_schemas",
+        "Compare Schemas…",
+        "Server",
+        [],
+        [
+            "schema compare",
+            "diff",
+            "migration script",
+            "synchronize",
+            "compare databases"
+        ],
+        CompareSchemas
     ),
     command!(
         "foreign_data_wrappers",
