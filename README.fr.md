@@ -292,8 +292,8 @@ test sont décrites dans le [guide](docs/GUIDE.md#build-from-source).
 
 ## État du projet
 
-Version 0.2.0. Elle couvre PostgreSQL, MySQL et MariaDB sous macOS (Apple
-Silicon) et Linux (x86_64 et arm64). D'autres moteurs, la comparaison de schémas et d'autres fonctions sont
+Version 0.3.0. Elle couvre PostgreSQL, MySQL, MariaDB et SQLite sous macOS (Apple
+Silicon) et Linux (x86_64 et arm64). D'autres moteurs, la comparaison de données et d'autres fonctions sont
 sur la [feuille de route](docs/ROADMAP.md).
 
 ## Licence

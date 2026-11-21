@@ -273,8 +273,8 @@ Debian이나 Ubuntu에서는 먼저 `sudo scripts/install-linux-deps.sh`로 시�
 
 ## 현황
 
-버전 0.2.0입니다. macOS(Apple Silicon)와 Linux(x86_64, arm64)에서 PostgreSQL, MySQL, MariaDB를
-지원합니다. 다른 엔진, 스키마 비교 등은 [로드맵](docs/ROADMAP.md)에 있습니다.
+버전 0.3.0입니다. macOS(Apple Silicon)와 Linux(x86_64, arm64)에서 PostgreSQL, MySQL, MariaDB, SQLite를
+지원합니다. 다른 엔진, 데이터 비교 등은 [로드맵](docs/ROADMAP.md)에 있습니다.
 
 ## 라이선스
 

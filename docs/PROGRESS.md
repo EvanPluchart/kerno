@@ -1158,3 +1158,24 @@ Still open (for the owner):
 - Tests: thirteen core unit tests of the file and of the move between stores (a fake keychain), one of the
   error's words, one manager test, one UI test; each but two plain round trips seen failing under a mutation.
   Captures of the Passwords page, light and dark, at two sizes.
+
+## 2026-11-21 — Release 0.3.0: a pass in the real app, then the version
+
+- The owner's word: « release 0.3.0 ». Before it, a pass in the real application (a copy of the release
+  bundle of `cd9a401`, a scratch data folder, driven through its window): the start from a URL, the selection
+  in both themes, the schema export (PDF 10 pages with its text read back by `pdftotext`, HTML without a
+  script, DBML of one table; no host, port or password in any file), the schema compare (22 differences,
+  "Open script" ran nothing: the target was read again and is unchanged), the extensions manager (read),
+  SQLite (a file chosen in the panel, browsed, queried, one cell edited and applied), Kerno's password file
+  (`secrets.kerno` and `secrets.key` in mode 0600, the password in neither, a reconnect after a restart without
+  any question), the window back at its place and size, and the simple backup view.
+- Fixed from it: "Compare with…" on a SQLite database did nothing (the compare has no SQLite side yet): the
+  entry is now disabled with its reason. `the_fixture_file_is_browsed_queried_and_edited` holds it.
+- Seen and left for after the release: in a window 700 px high, the result of "Test connection" pushes the
+  connection dialog's buttons below the window; the toolbar's "New SQL editor" follows the connection the
+  tree is browsing (the active tab's), not a row of another connection just selected; a test with a typed
+  password says "Password from Kerno's file" before it is saved; the compare dialog's schema fields are free
+  text; save panels open in the home folder each time; a data folder with a very long path leaves the
+  single-instance socket unopened (a warning in the log).
+- Version 0.3.0 in `Cargo.toml` and the four READMEs (SQLite named, schema compare off the roadmap line),
+  notes in `docs/release-notes/v0.3.0.md` with what the keychain asks once after the update.
