@@ -98,10 +98,38 @@ command line; a server key you choose to trust is added to your known_hosts. `KE
 Kerno pass another configuration file to `ssh` (`-F`). The **built-in** client needs no `ssh` and is the one for
 a password login; it takes Ed25519 and ECDSA key files and the keys of an SSH agent, not RSA key files.
 
+## Where passwords are kept
+
+**Settings ▸ Passwords ▸ Keep saved passwords in** chooses where the passwords, SSH passwords, key passphrases
+and AI keys you save are kept:
+
+- **Kerno's file** (the default on macOS): `secrets.kerno` in Kerno's data folder, encrypted (AES-256-GCM)
+  with a random key kept in `secrets.key` beside it, both readable by your account only. Nothing asks for your
+  password. It keeps them out of plain sight: a copy or a backup of the file, a file search, a shared screen
+  or another user of the computer shows nothing. It does not keep them from a program running under your
+  account, which can read both files: the level of DBeaver's saved passwords, `~/.pgpass` or an SSH key
+  without a passphrase.
+- **macOS Keychain** or **Secret Service** (the default on Linux: GNOME Keyring, KWallet): the system's store,
+  guarded by your login. On macOS, Kerno's builds are not signed with an Apple Developer ID, so the Keychain asks
+  for your login password again, once per saved password, after every update. On Linux without a Secret
+  Service running, passwords are kept until Kerno quits (the status bar says so).
+
+The change applies from the next connect, without a restart. A password saved in the other place moves the
+first time it is used: with Kerno's file, a password Kerno saved in the keychain before is read there once
+(macOS may ask one last time), then only from the file; the keychain is never written or emptied from then on,
+so its old copy stays there until you delete it in Keychain Access (items named "Kerno"). Back on the keychain,
+what the file holds moves to the keychain and leaves the file. A connection set to **Ask each time** saves
+nothing and reads neither. If the file cannot be read (damaged, or its key file missing or replaced), Kerno
+says so when it needs a password, sets it aside as `secrets.kerno.damaged` (with its key) and asks for the
+password again; nothing is overwritten. The new file then looks in the keychain once more, so a password the
+keychain still holds from before comes back from there, even an older one. `KERNO_SECRET_STORE=memory`, `file` or `keychain` uses that store alone
+for a run, whatever the setting says, and moves nothing.
+
 ## Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf
 
-The connection dialog's **Password from** list says where the database password comes from. **Keychain**
-(the default) keeps it in the system secret store; left empty, Kerno reads `~/.pgpass` (or `PGPASSFILE`) for
+The connection dialog's **Password from** list says where the database password comes from. The first choice,
+named after where saved passwords are kept (**Kerno's file** or **macOS Keychain**, see above), saves it
+there; left empty, Kerno reads `~/.pgpass` (or `PGPASSFILE`) for
 PostgreSQL and the `password` of the `[client]` group of `~/.my.cnf` for MySQL and MariaDB, as their own tools
 do (`!include` lines of `.my.cnf` are not followed). A `.pgpass` that other users can read, or a `.my.cnf`
 anyone can change, is ignored, and the error says so. **Ask each time** asks at every connect. **Command**
@@ -121,7 +149,7 @@ have read it in the connection's settings and clicked "I trust this command".
 `kerno postgres://ada@db.example.com:5432/shop` opens that connection (`postgresql://`, `mysql://` and
 `mariadb://` too; `sslmode` and other parameters as in the connection dialog). A saved connection to the same
 engine, host, port, user and database is used when there is one; otherwise the connection opens **unsaved**:
-marked in the sidebar, kept for this run only, its password in memory, never in the keychain, until "Save
+marked in the sidebar, kept for this run only, its password in memory, never saved, until "Save
 connection…" in its menu stores it. When Kerno is already running, the URL opens in its window, which comes to
 the front. `kerno --version` and `kerno --help` print and exit.
 
@@ -142,7 +170,7 @@ edited, and the saved tasks. The environments your connections use always go wit
 password, passphrase or key, no local client folder and no folder picture. **Import Connections…** first lists
 what the file adds, replaces (same id; same name for a task) or leaves as it is, then asks for each connection
 written where its password comes from: **Enter now** (kept in the secret store), **Ask when connecting**, or,
-when the secret store already holds secrets under that connection's id, **Use the keychain's saved secrets**
+when the secret store already holds secrets under that connection's id, **Use the saved secrets**
 (the database password and the SSH password or key passphrase, all or none), which names where each will be
 sent and never shows them. A saved password is linked automatically only to a connection this copy of Kerno
 already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
@@ -175,8 +203,8 @@ click; each endpoint keeps its own model and its own key. Three ways to add one:
   `~/.pi/agent/models.json` and the variables `OPENAI_BASE_URL` / `OPENAI_API_KEY`, and lists the
   OpenAI-compatible providers it found (`api: openai-completions`) with their address, models and whether they
   have a key; the others are listed as skipped with the reason. **Import ticked** saves the ones you tick: the
-  address, the models with the names the file gives them ("Qwen · gpu1 · low"), and the key in the system's
-  secret store (never in Kerno's files or logs). A key written as an environment variable's name is read from
+  address, the models with the names the file gives them ("Qwen · gpu1 · low"), and the key where saved
+  passwords are kept (never in the settings or the logs). A key written as an environment variable's name is read from
   that variable when you import; if it is not set, or the key comes from a command (`!…`, which Kerno never
   runs), the endpoint is imported without a key and the page says so: type it in **API key of …**. Kerno
   started from the Dock or the Finder sees the variables macOS gives it, not those of your shell.
@@ -487,8 +515,10 @@ Everything Kerno remembers (saved connections without their passwords, folders, 
 tabs, where the window was and how large, history, saved queries and tasks) is in one SQLite file, `kerno.db`,
 in its data folder: `~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux. Beside it:
 `logs/` (a file a day, the last seven), `known_hosts` (the SSH host keys you accepted in Kerno),
-`folder-icons/`, and `backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Passwords are in
-the system keychain, never in this folder. `KERNO_DATA_DIR=<folder>` puts all of it in another folder for a
+`folder-icons/`, and `backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Saved passwords
+are in `secrets.kerno` (encrypted, its key in `secrets.key`) or in the system keychain, as Settings ▸ Passwords
+says ([above](#where-passwords-are-kept)); `secrets.lock` is an empty file held while one is written.
+`KERNO_DATA_DIR=<folder>` puts all of it in another folder for a
 run.
 
 Before a new version of Kerno changes the layout of `kerno.db`, it copies the file into `backups/` as
@@ -513,10 +543,11 @@ the short version. To build them yourself, `scripts/bundle-macos.sh` builds `dis
 `scripts/bundle-linux.sh` builds the Linux packages (below).
 
 On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
-(`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). Kerno reads each saved password from
-the keychain once per run. An ad-hoc signature changes with every build, so the keychain asks for your login
-password again after each rebuild; "Always allow" stops it for that build. A stable identity avoids it, and an update installed by Kerno
-keeps the signature of its release: an ad-hoc one makes the keychain ask again once.
+(`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). This matters only when Settings ▸
+Passwords keeps passwords in the macOS Keychain (Kerno's own file, the default, asks nothing): Kerno then reads
+each saved password from the keychain once per run, and as an ad-hoc signature changes with every build and
+every update, the keychain asks for your login password again after each one, once per saved password; "Always
+allow" stops it for that build. A stable identity avoids it.
 
 ### Linux
 

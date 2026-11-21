@@ -442,10 +442,10 @@ impl Connections {
             .and_then(|runtime| runtime.secrets.clone());
         let store = AppState::get(cx).secrets.clone();
         let original_id = original.id.clone();
-        let file = original.config.engine.is_file();
+        let nothing_saved = original.config.engine.is_file() || !original.config.save_password;
         let loading = bridge::spawn_blocking(cx, move || match known {
             Some(secrets) => Ok(secrets),
-            None if file => Ok(Secrets::default()),
+            None if nothing_saved => Ok(Secrets::default()),
             None => secrets::load_secrets(store.as_ref(), &original_id),
         });
         cx.spawn(async move |this, cx| {
@@ -506,13 +506,13 @@ impl Connections {
             .get(id)
             .and_then(|runtime| runtime.secrets.clone());
         let store = AppState::get(cx).secrets.clone();
-        let file = self
+        let nothing_saved = self
             .get(id)
-            .is_some_and(|saved| saved.config.engine.is_file());
+            .is_some_and(|saved| saved.config.engine.is_file() || !saved.config.save_password);
         let id = id.to_string();
         bridge::spawn_blocking(cx, move || match known {
             Some(secrets) => Ok(secrets),
-            None if file => Ok(Secrets::default()),
+            None if nothing_saved => Ok(Secrets::default()),
             None => secrets::load_secrets(store.as_ref(), &id),
         })
     }
@@ -933,13 +933,14 @@ impl Connections {
         let config = saved.config.clone();
         let connection_id = saved.id.clone();
 
-        let file = config.engine.is_file();
+        let nothing_saved = config.engine.is_file() || !config.save_password;
         let loading = bridge::spawn_blocking(cx, {
             let id = connection_id.clone();
             move || match known_secrets {
                 Some(secrets) => Ok(secrets),
-                // A database file has no secret: the store is not read.
-                None if file => Ok(Secrets::default()),
+                // A database file has no secret, and "ask each time" saves
+                // none (`persist`): no store is read (K33).
+                None if nothing_saved => Ok(Secrets::default()),
                 None => secrets::load_secrets(store.as_ref(), &id),
             }
         });
@@ -1056,14 +1057,14 @@ impl Connections {
                     });
                 }
                 let keep_alive = self.watch(id, cx);
-                let persistent = AppState::get(cx).secrets.is_persistent();
+                let saved_in = saved_in(cx);
                 let runtime = self.runtime.entry(id.to_string()).or_default();
                 let asked = runtime.typed_secret || !config.save_password;
                 runtime.password_origin = origin_text(
                     connector.password_origin().as_ref(),
                     connector.password_warning().as_deref(),
                     asked,
-                    persistent,
+                    saved_in,
                 );
                 runtime.connector = Some(connector);
                 runtime.meta = Some(meta);
@@ -1280,7 +1281,7 @@ impl Connections {
     ) -> Task<kerno_core::Result<TestReport>> {
         let driver = self.drivers.get(config.engine);
         let host_keys = self.host_keys(trusted_fingerprint, cx);
-        let persistent = AppState::get(cx).secrets.is_persistent();
+        let saved_in = saved_in(cx);
         bridge::spawn(cx, async move {
             let asked = !config.save_password;
             let connector = Connector::open(driver?, config, secrets, &host_keys).await?;
@@ -1294,7 +1295,7 @@ impl Connections {
                 connector.password_origin().as_ref(),
                 connector.password_warning().as_deref(),
                 asked,
-                persistent,
+                saved_in,
             );
             Ok(TestReport {
                 version,
@@ -1337,21 +1338,28 @@ impl Connections {
 
 /// Where a connection's password came from, in the words of the dialog and
 /// the navigator (J3): `asked` when the user typed it for this run, a
-/// password file that was ignored when no password was sent.
+/// password file that was ignored when no password was sent; `saved_in`
+/// names where saved secrets are, `None` when in memory only.
 pub fn origin_text(
     origin: Option<&PasswordOrigin>,
     ignored: Option<&str>,
     asked: bool,
-    persistent: bool,
+    saved_in: Option<&str>,
 ) -> Option<String> {
-    Some(match origin {
-        None => ignored?.to_string(),
-        Some(PasswordOrigin::Given) if asked => "Password asked".to_string(),
-        Some(PasswordOrigin::Given) if persistent => "Password from the keychain".to_string(),
-        Some(PasswordOrigin::Given) => "Password remembered until Kerno quits".to_string(),
-        Some(PasswordOrigin::File(file)) => format!("Password from {file}"),
-        Some(PasswordOrigin::Command(name)) => format!("Password from the command `{name}`"),
+    Some(match (origin, saved_in) {
+        (None, _) => ignored?.to_string(),
+        (Some(PasswordOrigin::Given), _) if asked => "Password asked".to_string(),
+        (Some(PasswordOrigin::Given), Some(store)) => format!("Password from {store}"),
+        (Some(PasswordOrigin::Given), None) => "Password remembered until Kerno quits".to_string(),
+        (Some(PasswordOrigin::File(file)), _) => format!("Password from {file}"),
+        (Some(PasswordOrigin::Command(name)), _) => format!("Password from the command `{name}`"),
     })
+}
+
+/// Where the store in use keeps saved secrets, `None` when in memory only.
+fn saved_in(cx: &App) -> Option<&'static str> {
+    let store = &AppState::get(cx).secrets;
+    store.is_persistent().then(|| store.name())
 }
 
 /// Whether the connection's own session answers a ping. A timeout once may

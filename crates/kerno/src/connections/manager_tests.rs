@@ -44,6 +44,7 @@ fn fixture(cx: &mut TestAppContext) -> Fixture {
             paths: AppPaths::under(dir.path().to_path_buf()),
             storage: storage.clone(),
             secrets: secrets.clone(),
+            secret_stores: crate::state::memory_stores,
             settings: Settings::default(),
             appearance_override: None,
         });
@@ -905,4 +906,74 @@ fn deleting_a_folder_drops_its_look_and_its_unused_image(cx: &mut TestAppContext
     wait_until(cx, "the looks to be stored", |_| {
         Settings::load(&app.storage).folder_looks == expected
     });
+}
+
+/// A store that counts its reads, standing for the keychain (K33).
+#[derive(Default)]
+struct CountingReads {
+    store: MemorySecretStore,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl SecretStore for CountingReads {
+    fn get(&self, key: &str) -> kerno_core::Result<Option<Secret>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.store.get(key)
+    }
+    fn set(&self, key: &str, secret: &Secret) -> kerno_core::Result<()> {
+        self.store.set(key, secret)
+    }
+    fn delete(&self, key: &str) -> kerno_core::Result<()> {
+        self.store.delete(key)
+    }
+    fn is_persistent(&self) -> bool {
+        true
+    }
+}
+
+/// K33: a connection set to "ask each time" saves no secret, so no store is read for it: not
+/// to connect it, edit it or duplicate it (with Kerno's file in use, a read could reach the
+/// keychain). Mutation seen: `|| !config.save_password` removed from `connect` (one read per
+/// secret, three).
+#[gpui_kit::test]
+fn an_ask_each_time_connection_reads_no_store(cx: &mut TestAppContext) {
+    let app = fixture(cx);
+    let counting = Arc::new(CountingReads::default());
+    let store: Arc<dyn SecretStore> = counting.clone();
+    cx.update(|cx| cx.global_mut::<AppState>().secrets = store);
+    let mut config = pg();
+    config.save_password = false;
+    // Saved by an earlier run: nothing of them is known in this one.
+    let connected = app.storage.save_connection(None, &config).unwrap();
+    let edited = app.storage.save_connection(None, &config).unwrap();
+    cx.update(|cx| app.connections.update(cx, |c, cx| c.reload(cx)));
+    wait_until(cx, "the list read again", |cx| {
+        cx.update(|cx| app.connections.read(cx).saved().len()) == 2
+    });
+
+    app.connect(cx, &connected);
+    assert_eq!(app.settle(cx, &connected), Status::WaitingForInput);
+    assert_eq!(app.last_request(), Some(InputRequest::DatabasePassword));
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |c, cx| c.cancel_input(&connected, cx))
+    });
+
+    let editing = cx.update(|cx| app.connections.read(cx).secrets_of(&edited, cx));
+    let found = Rc::new(RefCell::new(None));
+    let slot = found.clone();
+    cx.update(|cx| {
+        cx.spawn(async move |_| *slot.borrow_mut() = Some(editing.await))
+            .detach()
+    });
+    wait_until(cx, "the secrets to edit", |_| found.borrow().is_some());
+    assert_eq!(
+        found.borrow_mut().take().unwrap().unwrap(),
+        Secrets::default()
+    );
+    cx.update(|cx| app.connections.update(cx, |c, cx| c.duplicate(&edited, cx)));
+    wait_until(cx, "the copy", |cx| {
+        cx.update(|cx| app.connections.read(cx).saved().len()) == 3
+    });
+    assert_eq!(counting.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

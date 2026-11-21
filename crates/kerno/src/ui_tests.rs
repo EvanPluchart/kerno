@@ -68,6 +68,7 @@ mod reconnect;
 mod reorder;
 mod schema_export;
 mod script_progress;
+mod secret_store;
 mod settings_look;
 mod shortcuts;
 mod sidebar_tree;
@@ -114,6 +115,7 @@ fn open(cx: &mut TestAppContext, storage: Arc<Storage>) -> Fixture {
             paths: AppPaths::under(data_dir.path().to_path_buf()),
             storage: storage.clone(),
             secrets: Arc::new(MemorySecretStore::default()),
+            secret_stores: crate::state::memory_stores,
             settings,
             appearance_override: None,
         });

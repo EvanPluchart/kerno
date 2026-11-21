@@ -103,8 +103,8 @@ L'interface de Kerno est en anglais : les noms de boutons et de menus ci-dessous
 - Tunnels SSH par votre propre OpenSSH : les hôtes de `~/.ssh/config`, les hôtes de rebond et les chaînes
   de bastions, les agents SSH comme 1Password, et tous les types de clés. Un client intégré couvre les
   connexions par mot de passe.
-- Les mots de passe restent dans le trousseau du système. Ils peuvent aussi venir d'une commande, d'AWS RDS
-  IAM, de 1Password, de `~/.pgpass` ou de `~/.my.cnf`.
+- Les mots de passe sont enregistrés chiffrés, dans le fichier de Kerno ou dans le trousseau du système, au
+  choix. Ils peuvent aussi venir d'une commande, d'AWS RDS IAM, de 1Password, de `~/.pgpass` ou de `~/.my.cnf`.
 - Quand une connexion échoue, Kerno dit d'abord ce qui s'est passé en mots simples (hôte introuvable,
   connexion refusée, mauvais mot de passe, échec TLS) et quoi essayer, puis montre le message du serveur.
 
@@ -238,9 +238,14 @@ de requêtes :
 - **L'assistant IA**, seulement après que vous l'avez allumé, seulement vers le point d'accès que vous avez
   indiqué, seulement quand vous le demandez.
 
-Les mots de passe, les phrases secrètes SSH et les clés d'API vivent dans le trousseau du système (Trousseau
-de macOS, Secret Service sous Linux), jamais dans un fichier ni dans un journal. Les détails sont dans le
-[guide](docs/GUIDE.md#ai-assistant-and-what-it-sends).
+Les mots de passe, les phrases secrètes SSH et les clés d'API ne sont jamais écrits en clair, ni dans un
+journal. Sous macOS, Kerno les garde par défaut dans son propre fichier chiffré, dans son dossier de données,
+la clé dans un second fichier à côté : rien ne demande votre mot de passe, et une copie du fichier ne montre
+rien, mais un programme lancé sous votre compte pourrait lire les deux fichiers, comme avec DBeaver ou
+`~/.pgpass`. Réglages ▸ Passwords peut les garder dans le Trousseau de macOS à la place : les versions de Kerno
+ne sont pas signées avec un identifiant Developer ID d'Apple, le Trousseau redemande alors votre mot de passe
+de session après chaque mise à jour. Sous Linux, ils restent par défaut dans le Secret Service. Les détails sont
+dans le [guide](docs/GUIDE.md#where-passwords-are-kept).
 
 ## Performances
 

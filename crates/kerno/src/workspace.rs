@@ -2345,7 +2345,7 @@ impl Workspace {
             }),
             TabAction::AboutMemoryOnly => window.open_alert_dialog(cx, |alert, _, _| {
                 alert.title("Passwords kept in memory only").description(
-                    "No system secret store (macOS Keychain or a Secret Service on Linux) can be used, so Kerno writes no password to disk: each password is asked for when you connect and forgotten when Kerno quits. Start a Secret Service (GNOME Keyring, KWallet) and restart Kerno to save them.",
+                    "Kerno writes no password to disk in this run: each password is asked for when you connect and forgotten when Kerno quits. Either KERNO_SECRET_STORE=memory is set, or Settings ▸ Passwords keeps them in the system keychain and none can be used (no Secret Service running on Linux). Choose “Kerno's file” there to save them, or start a Secret Service (GNOME Keyring, KWallet) and restart Kerno.",
                 )
             }),
             TabAction::ShowMessages => {
@@ -5598,7 +5598,7 @@ fn shortcut(action: &dyn gpui_kit::Action, cx: &App) -> Option<String> {
 }
 
 /// The status bar's warning when no system secret store is in use.
-const MEMORY_ONLY: &str = "Passwords are kept in memory only (no system secret store in use)";
+const MEMORY_ONLY: &str = "Passwords are kept in memory only (no secret store in use)";
 
 // Ending what sessions hold before they close; the keyboard after a dialog --
 

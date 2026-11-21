@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use kerno_core::config::FolderLook;
 use kerno_core::environment::{self, EnvironmentDef};
+use kerno_core::secrets::StoreChoice;
 use kerno_core::sql::FormatOptions;
 use kerno_core::storage::Storage;
 use kerno_core::tools::ClientFamily;
@@ -151,6 +152,9 @@ pub struct Settings {
     pub value_panel: bool,
     /// Its width, in points.
     pub value_panel_width: f32,
+    /// Where saved passwords are kept (K33, D-106): Kerno's file by default
+    /// on macOS, the Secret Service elsewhere.
+    pub secret_store: StoreChoice,
 }
 
 /// How the open tabs are laid out above (or beside) the tab on screen.
@@ -235,6 +239,7 @@ impl Default for Settings {
             ai: kerno_core::ai::AiSettings::default(),
             value_panel: false,
             value_panel_width: 380.0,
+            secret_store: StoreChoice::default(),
         }
     }
 }
@@ -415,6 +420,7 @@ mod tests {
             },
             value_panel: true,
             value_panel_width: 512.0,
+            secret_store: StoreChoice::Keychain,
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);

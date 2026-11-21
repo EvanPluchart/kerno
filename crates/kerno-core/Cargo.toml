@@ -49,6 +49,12 @@ pdf-writer = "0.15"
 subsetter = { version = "0.2.6", default-features = false }
 kurbo = "=0.13.1"
 flate2 = "1.1"
+# Kerno's own password file (K33, D-106), both already in the tree at the
+# version locked: the AEAD through russh's ssh-cipher, the random source
+# through several crates. No default features: aes-gcm's would pull aead's
+# getrandom; the nonce and the key come from getrandom itself.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
+getrandom = "0.3.4"
 # Already in the tree through rust_xlsxwriter.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 

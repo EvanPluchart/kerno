@@ -28,7 +28,7 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 5. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
    the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
 6. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
-   migrations) and never carries secrets: those stay in the OS secret store. Opt-in, with a visible account.
+   migrations) and never carries secrets: those stay on the machine, in Kerno's file or the keychain (D-106). Opt-in, with a visible account.
 7. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
     session capability, so it waits for a use for it.
 

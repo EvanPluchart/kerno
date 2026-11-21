@@ -95,8 +95,8 @@ Windows 빌드는 없습니다.
 - SSL/TLS를 모든 모드로 지원하며, 사용자의 인증서를 쓸 수 있습니다.
 - 사용자가 쓰는 OpenSSH를 통해 SSH 터널을 엽니다. `~/.ssh/config`의 호스트, 점프 호스트와 배스천 체인,
   1Password 같은 SSH 에이전트, 모든 키 유형을 사용할 수 있습니다. 비밀번호 로그인은 내장 클라이언트가 처리합니다.
-- 비밀번호는 시스템 키체인에 보관됩니다. 명령, AWS RDS IAM, 1Password, `~/.pgpass`, `~/.my.cnf`에서
-  가져올 수도 있습니다.
+- 비밀번호는 암호화되어 Kerno 자체 파일이나 시스템 키체인 중 선택한 곳에 저장됩니다. 명령, AWS RDS IAM,
+  1Password, `~/.pgpass`, `~/.my.cnf`에서 가져올 수도 있습니다.
 - 연결에 실패하면 Kerno는 먼저 무슨 일이 일어났는지(호스트를 찾을 수 없음, 연결 거부, 잘못된 비밀번호,
   TLS 실패)와 무엇을 시도하면 되는지를 쉬운 말로 알려 주고, 그다음 서버가 보낸 메시지를 그대로 보여 줍니다.
 
@@ -223,8 +223,13 @@ Kerno는 사용자나 사용자의 데이터에 관한 어떤 정보도 보내�
   포함하지 않습니다. Settings ▸ Updates에서 끄거나 `KERNO_NO_UPDATE_CHECK=1`로 끌 수 있습니다.
 - **AI 어시스턴트**는 사용자가 켠 뒤에만, 사용자가 설정한 엔드포인트로만, 사용자가 요청할 때만 요청을 보냅니다.
 
-비밀번호, SSH 패스프레이즈, API 키는 시스템 키체인(macOS Keychain, Linux Secret Service)에 보관되며, 파일이나
-로그에는 남지 않습니다. 자세한 내용은 [가이드](docs/GUIDE.md#ai-assistant-and-what-it-sends)에 있습니다.
+비밀번호, SSH 패스프레이즈, API 키는 평문으로 기록되지 않으며 로그에도 남지 않습니다. macOS에서는 기본적으로
+Kerno 데이터 폴더의 암호화된 자체 파일에 보관되고, 키는 그 옆의 두 번째 파일에 있습니다. 비밀번호를 묻는 창이
+없고 파일 사본만으로는 아무것도 보이지 않지만, 사용자 계정으로 실행되는 프로그램은 두 파일을 모두 읽을 수
+있습니다(DBeaver나 `~/.pgpass`와 같은 수준). Settings ▸ Passwords에서 macOS Keychain을 고를 수도 있습니다.
+Kerno 빌드는 Apple Developer ID로 서명되지 않으므로, 이 경우 업데이트할 때마다 Keychain이 로그인 비밀번호를
+다시 묻습니다. Linux에서는 기본적으로 Secret Service에 보관됩니다. 자세한 내용은
+[가이드](docs/GUIDE.md#where-passwords-are-kept)에 있습니다.
 
 ## 성능
 

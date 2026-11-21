@@ -95,8 +95,8 @@ There is no Windows build.
 - SSL/TLS in every mode, with your certificates.
 - SSH tunnels through your own OpenSSH: the hosts of `~/.ssh/config`, jump hosts and bastion chains, SSH
   agents such as 1Password, and every key type. A built-in client covers password logins.
-- Passwords stay in the system keychain. They can also come from a command, AWS RDS IAM, 1Password,
-  `~/.pgpass` or `~/.my.cnf`.
+- Passwords are saved encrypted, in Kerno's own file or the system keychain, as you choose. They can also
+  come from a command, AWS RDS IAM, 1Password, `~/.pgpass` or `~/.my.cnf`.
 - When a connection fails, Kerno first says what happened in plain words (host not found, connection
   refused, wrong password, TLS failure) and what to try, then shows the server's own message.
 
@@ -221,8 +221,13 @@ databases:
   no identifier. Turn it off in Settings ▸ Updates or with `KERNO_NO_UPDATE_CHECK=1`.
 - **The AI assistant**, only once you have turned it on, only to the endpoint you set, only when you ask.
 
-Passwords, SSH passphrases and API keys live in the system keychain (macOS Keychain, Linux Secret Service),
-never in a file or a log. Details in the [guide](docs/GUIDE.md#ai-assistant-and-what-it-sends).
+Passwords, SSH passphrases and API keys are never written in plain text, nor in a log. On macOS Kerno keeps
+them by default in its own encrypted file, in its data folder, with the key in a second file beside it: nothing
+asks for your password, and a copy of the file shows nothing, but a program running under your account could
+read both files, as with DBeaver or `~/.pgpass`. Settings ▸ Passwords can keep them in the macOS Keychain
+instead: Kerno's builds are not signed with an Apple Developer ID, so the Keychain then asks for your login
+password again after every update. On Linux they stay in the Secret Service by default. Details in the
+[guide](docs/GUIDE.md#where-passwords-are-kept).
 
 ## Performance
 

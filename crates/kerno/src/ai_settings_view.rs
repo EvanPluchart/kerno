@@ -75,6 +75,16 @@ impl AiSources {
     }
 }
 
+/// Where saved keys are, as the end of a sentence ("in Kerno's file"): the
+/// store Settings ▸ Passwords chose (K33).
+fn kept_where(cx: &App) -> String {
+    let store = &AppState::get(cx).secrets;
+    match store.is_persistent() {
+        true => format!("in {}", store.name()),
+        false => "in memory until Kerno quits".to_string(),
+    }
+}
+
 /// What Import says it reads, and Detect asks.
 fn sources_note() -> String {
     let ports: Vec<String> = (endpoints::LOCAL_SERVERS.iter())
@@ -277,6 +287,7 @@ impl AiSettingsView {
     /// that it was saved when `say_saved` (an import says its own line).
     fn store_key(&mut self, base: String, key: Secret, say_saved: bool, cx: &mut Context<Self>) {
         let secrets = AppState::get(cx).secrets.clone();
+        let kept = kept_where(cx);
         let host = ai::endpoint(&base).map_or_else(|_| base.clone(), |found| found.host);
         let saving = bridge::spawn_blocking(cx, move || secrets.set(&ai::key_name(&base), &key));
         self.tasks.push(cx.spawn(async move |this, cx| {
@@ -284,11 +295,7 @@ impl AiSettingsView {
             let _ = this.update(cx, |this, cx| {
                 match saved {
                     Ok(()) if !say_saved => return,
-                    Ok(()) => {
-                        this.key_note = Some(format!(
-                            "Key saved in the system's secret store, for {host} only."
-                        ))
-                    }
+                    Ok(()) => this.key_note = Some(format!("Key saved {kept}, for {host} only.")),
                     Err(error) => {
                         this.key_note =
                             Some(format!("The key of {host} could not be saved: {error}"))
@@ -488,9 +495,10 @@ impl AiSettingsView {
             .filter(|(_, ticked)| *ticked)
             .map(|(found, _)| found)
             .collect();
+        let kept = kept_where(cx);
         let mut said = vec![match chosen.len() {
-            1 => "1 endpoint imported; its key, if any, is in the system's secret store.".into(),
-            n => format!("{n} endpoints imported; their keys are in the system's secret store."),
+            1 => format!("1 endpoint imported; its key, if any, is kept {kept}."),
+            n => format!("{n} endpoints imported; their keys are kept {kept}."),
         }];
         for found in chosen {
             let saved = Self::settings(cx)
@@ -1172,9 +1180,10 @@ impl Render for AiSettingsView {
             .child({
                 let line = match &self.key_note {
                     Some(note) => note.clone(),
-                    None => "Each endpoint's key is kept in the system's secret store, never in \
-                             Kerno's files or logs."
-                        .into(),
+                    None => format!(
+                        "Each endpoint's key is kept {}, never in the settings or the logs.",
+                        kept_where(cx)
+                    ),
                 };
                 div()
                     .id("ai-key-note")

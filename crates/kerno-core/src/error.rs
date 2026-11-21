@@ -753,6 +753,13 @@ const SECRET_STORE: &str = if cfg!(target_os = "macos") {
 /// serve (C14), from `secrets.rs`'s `secret_error` text: what the store
 /// said, never a secret. Each case names a next step.
 fn secret_store_words(text: &str) -> (FailureKind, String, String) {
+    // Kerno's own file (K33) words its failures itself: what happened, then
+    // what to do.
+    if text.starts_with(crate::secrets::FILE_PROBLEM) {
+        let (headline, next) = text.split_once(". ").unwrap_or((text, ""));
+        let headline = format!("{}.", headline.trim_end_matches('.'));
+        return (FailureKind::SecretStore, headline, next.to_string());
+    }
     let store = SECRET_STORE;
     let ask = "or set Password to “Ask each time” in the connection's settings.";
     let (headline, next) = if any(
@@ -1320,6 +1327,35 @@ mod tests {
             );
             assert_eq!(explained.raw, raw);
         }
+    }
+
+    /// K33: a failure of Kerno's password file is not told as a keychain
+    /// prompt: its own words, what happened then what to do. Mutation
+    /// seen: the `FILE_PROBLEM` branch removed (keychain advice comes back).
+    #[test]
+    fn a_password_file_failure_says_what_happened_and_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::secrets::FileSecretStore::new(dir.path());
+        crate::secrets::SecretStore::set(&store, "a", &crate::config::Secret::new("pw")).unwrap();
+        std::fs::remove_file(dir.path().join(crate::secrets::KEY_FILE)).unwrap();
+        let raw = crate::secrets::SecretStore::get(&store, "a")
+            .unwrap_err()
+            .to_string();
+        let explained = explain(&raw, &config());
+        assert_eq!(explained.kind, FailureKind::SecretStore);
+        assert_eq!(
+            explained.headline,
+            "Kerno's password file could not be read: its key file secrets.key is missing."
+        );
+        assert!(
+            explained
+                .next_step
+                .starts_with("It was set aside as secrets.kerno.damaged"),
+            "{}",
+            explained.next_step
+        );
+        assert!(explained.next_step.contains("enter the password again"));
+        assert!(!explained.next_step.contains(SECRET_STORE));
     }
 
     #[test]

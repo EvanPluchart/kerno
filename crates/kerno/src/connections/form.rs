@@ -96,7 +96,8 @@ impl SshAuthKind {
 /// Where the database password comes from, as chosen in the dialog (J3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PasswordChoice {
-    /// Saved in the secret store (or `~/.pgpass` / `~/.my.cnf` when empty).
+    /// Saved in the secret store, Kerno's file or the keychain (or
+    /// `~/.pgpass` / `~/.my.cnf` when empty).
     #[default]
     Keychain,
     /// Asked at each connect.
@@ -118,11 +119,11 @@ impl PasswordChoice {
         Self::OnePassword,
     ];
 
-    /// The label; `persistent` is false when no system secret store is used.
-    pub fn label(self, persistent: bool) -> &'static str {
+    /// The label; `saved_in` names where saved secrets are ("Kerno's
+    /// file", "macOS Keychain"), `None` when they are in memory only.
+    pub fn label(self, saved_in: Option<&'static str>) -> &'static str {
         match self {
-            Self::Keychain if persistent => "Keychain",
-            Self::Keychain => "Until Kerno quits",
+            Self::Keychain => saved_in.unwrap_or("Until Kerno quits"),
             Self::Ask => "Ask each time",
             Self::Command => "Command",
             Self::RdsIam => "AWS RDS IAM",

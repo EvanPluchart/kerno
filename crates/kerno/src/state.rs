@@ -1,6 +1,7 @@
 //! What the whole app shares: where its files are, its storage, the secret
 //! store and the settings.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::component::WindowExt as _;
@@ -9,7 +10,7 @@ use gpui_kit::{
     App, BorrowAppContext as _, Bounds, DisplayId, Global, SharedString, Task, Window,
     WindowBounds, point, px, size,
 };
-use kerno_core::secrets::{self, SecretStore};
+use kerno_core::secrets::{self, SecretStore, StoreChoice};
 use kerno_core::storage::{AppPaths, SavedConnection, Storage, WindowPlacement, WindowState};
 
 use crate::bridge;
@@ -94,8 +95,13 @@ pub struct AppState {
     /// Kerno's SQLite store. Synchronous: call it through
     /// [`bridge::spawn_blocking`] once the app is running.
     pub storage: Arc<Storage>,
-    /// The OS secret store, or memory when there is none.
+    /// Where saved secrets are: Kerno's file or the system store, as the
+    /// settings say (K33), or memory when neither can be used.
     pub secrets: Arc<dyn SecretStore>,
+    /// Builds `secrets` for a choice of Settings ▸ Passwords:
+    /// [`secrets::app_store`] in the app; tests give one that never
+    /// reaches the real keychain.
+    pub secret_stores: fn(StoreChoice, &Path) -> Arc<dyn SecretStore>,
     /// The user's settings.
     pub settings: Settings,
     /// A theme pinned for this run only (`KERNO_APPEARANCE`), which takes
@@ -168,7 +174,8 @@ impl AppState {
         cx.set_global(AppState {
             paths: startup.paths.clone(),
             storage: startup.storage.clone(),
-            secrets: secrets::default_store(),
+            secrets: secrets::app_store(startup.settings.secret_store, &startup.paths.data_dir),
+            secret_stores: secrets::app_store,
             settings: startup.settings.clone(),
             appearance_override,
         });
@@ -217,6 +224,15 @@ impl AppState {
         }
     }
 
+    /// Keeps saved passwords in `choice` from the next read on, without a
+    /// restart (K33): what was in the other place moves at its first read.
+    pub fn set_secret_store(choice: StoreChoice, cx: &mut App) {
+        Self::update_settings(cx, |settings| settings.secret_store = choice);
+        cx.update_global::<AppState, _>(|state, _| {
+            state.secrets = (state.secret_stores)(choice, &state.paths.data_dir);
+        });
+    }
+
     /// Writes the settings not stored yet; for quitting.
     pub fn flush_settings(cx: &mut App) -> Task<()> {
         let saver = cx.default_global::<SettingsSaver>().saver.clone();
@@ -225,6 +241,13 @@ impl AppState {
             saver.write_next(&storage, false);
         })
     }
+}
+
+/// The secret store of tests, whatever the choice: memory, never the real
+/// keychain.
+#[cfg(test)]
+pub fn memory_stores(_: StoreChoice, _: &Path) -> Arc<dyn SecretStore> {
+    Arc::new(secrets::MemorySecretStore::default())
 }
 
 /// No settings write is pending or running, for tests.
@@ -352,6 +375,7 @@ mod tests {
                 paths: AppPaths::under(dir.path().to_path_buf()),
                 storage: storage.clone(),
                 secrets: Arc::new(MemorySecretStore::default()),
+                secret_stores: memory_stores,
                 settings: Settings::default(),
                 appearance_override: None,
             });

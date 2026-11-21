@@ -1121,8 +1121,8 @@ impl ImportSetup {
                             && self.plan.connections[index] == ImportAction::Add,
                         |this| {
                             this.child(div().text_xs().text_color(muted).child(
-                                "Saved under a new id: the keychain entry stays with the \
-                                 connection that has it.",
+                                "Saved under a new id: the saved secrets stay with the \
+                                 connection that has them.",
                             ))
                         },
                     )
@@ -1197,14 +1197,14 @@ fn server(config: &ConnectionConfig) -> String {
 fn link_label(config: &ConnectionConfig) -> String {
     let database = format!("{}@{}:{}", config.user, config.host, config.port);
     match &config.ssh {
-        None => format!("Use the keychain's saved secrets (database password → {database})"),
+        None => format!("Use the saved secrets (database password → {database})"),
         Some(ssh) => {
             let mut tunnel = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
             if let Some(jump) = ssh.jump.as_deref().filter(|jump| !jump.is_empty()) {
                 tunnel.push_str(&format!(" via {jump}"));
             }
             format!(
-                "Use the keychain's saved secrets (database password → {database}; SSH password \
+                "Use the saved secrets (database password → {database}; SSH password \
                  and key passphrase → {tunnel})"
             )
         }

@@ -100,8 +100,8 @@ No hay compilación para Windows.
 - Túneles SSH a través de tu propio OpenSSH: los hosts de `~/.ssh/config`, hosts de salto y cadenas de
   bastiones, agentes SSH como 1Password y todos los tipos de clave. Un cliente integrado cubre los inicios de
   sesión con contraseña.
-- Las contraseñas permanecen en el llavero del sistema. También pueden provenir de un comando, de AWS RDS
-  IAM, de 1Password, de `~/.pgpass` o de `~/.my.cnf`.
+- Las contraseñas se guardan cifradas, en el archivo propio de Kerno o en el llavero del sistema, a elegir.
+  También pueden provenir de un comando, de AWS RDS IAM, de 1Password, de `~/.pgpass` o de `~/.my.cnf`.
 - Cuando una conexión falla, Kerno primero explica con palabras sencillas lo que ha pasado (host no
   encontrado, conexión rechazada, contraseña incorrecta, fallo de TLS) y qué probar, y después muestra el
   mensaje del propio servidor.
@@ -235,9 +235,13 @@ de petición:
 - **El asistente de IA**, solo una vez que lo has activado, solo hacia el endpoint que hayas configurado y solo
   cuando lo pides.
 
-Las contraseñas, las frases de contraseña de SSH y las claves de API se guardan en el llavero del sistema
-(Keychain de macOS, Secret Service de Linux), nunca en un archivo ni en un registro. Los detalles están en la
-[guía](docs/GUIDE.md#ai-assistant-and-what-it-sends).
+Las contraseñas, las frases de contraseña de SSH y las claves de API nunca se escriben en claro, ni en un
+registro. En macOS, Kerno las guarda por defecto en su propio archivo cifrado, en su carpeta de datos, con la
+clave en un segundo archivo al lado: nada le pide su contraseña y una copia del archivo no muestra nada, pero un
+programa que se ejecute con su cuenta podría leer los dos archivos, como con DBeaver o `~/.pgpass`. Ajustes ▸
+Passwords puede guardarlas en el Keychain de macOS: las versiones de Kerno no están firmadas con un Developer ID
+de Apple, así que el Keychain vuelve a pedir la contraseña de su sesión tras cada actualización. En Linux siguen
+por defecto en el Secret Service. Los detalles están en la [guía](docs/GUIDE.md#where-passwords-are-kept).
 
 ## Rendimiento
 

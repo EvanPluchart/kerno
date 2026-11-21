@@ -1165,7 +1165,8 @@ impl ConnectionDialog {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let memory_only = !AppState::get(cx).secrets.is_persistent();
+        let store = &AppState::get(cx).secrets;
+        let saved_in = store.is_persistent().then(|| store.name());
         let swatch = |key: Option<&'static str>, cx: &mut Context<Self>| {
             let id = SharedString::from(format!("color-{}", key.unwrap_or("none")));
             theme::swatch(id, key, self.form.color.as_deref() == key, cx).on_click(cx.listener(
@@ -1183,7 +1184,7 @@ impl ConnectionDialog {
         // A database file: the file in place of the server's fields, which
         // are hidden, not disabled (D-102).
         let file_engine = self.form.engine.is_file();
-        let password = (!file_engine).then(|| self.render_password(!memory_only, cx));
+        let password = (!file_engine).then(|| self.render_password(saved_in, cx));
         let file_field = file_engine.then(|| self.render_file(cx));
 
         v_flex()
@@ -1359,19 +1360,23 @@ impl ConnectionDialog {
     /// list: the choice beside the fields of each, the command line as it
     /// will run with "Run now", and its confirmation when it came from an
     /// imported file. Kept to a few lines: the General tab is tall already.
-    fn render_password(&self, persistent: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_password(
+        &self,
+        saved_in: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let choice = self.form.password_choice;
         let view = cx.entity();
         let picker = Button::new("conn-password-source")
             .outline()
-            .label(choice.label(persistent))
+            .label(choice.label(saved_in))
             .dropdown_caret(true)
             .tooltip("Where the password comes from")
             .dropdown_menu(move |mut menu: PopupMenu, _, _| {
                 for option in PasswordChoice::ALL {
                     let view = view.clone();
                     menu = menu.item(
-                        PopupMenuItem::new(option.label(persistent))
+                        PopupMenuItem::new(option.label(saved_in))
                             .checked(option == choice)
                             .on_click(move |_, _, cx| {
                                 view.update(cx, |this, cx| {

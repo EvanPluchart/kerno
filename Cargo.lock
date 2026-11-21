@@ -4430,10 +4430,12 @@ dependencies = [
 name = "kerno-core"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "directories",
  "flate2",
  "futures-util",
+ "getrandom 0.3.4",
  "kerno-core",
  "keyring",
  "kurbo 0.13.1",

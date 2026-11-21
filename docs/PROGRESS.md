@@ -1134,3 +1134,27 @@ Still open (for the owner):
   view, a dropdown, the command palette, the schema export and compare dialogs, light and dark, before and after.
 - Tests: the dark-only selection test of K28 becomes one for both themes, plus one for selected text; each seen
   failing with each old value put back.
+
+## 2026-11-21 — K33: passwords in Kerno's own encrypted file, so macOS stops asking
+
+- The owner was asked for his login password by the macOS keychain after every update ("je veux pas qu'on
+  demande de mot de passe"). The cause is the ad-hoc signature, which changes at each build: macOS asks again
+  once per keychain item. He chose DBeaver's way: on macOS, saved passwords now go by default into Kerno's own
+  encrypted file in the data folder (`secrets.kerno`, AES-256-GCM, its key in `secrets.key`, both readable by
+  his account only); no prompt. Settings ▸ Passwords keeps them in the macOS Keychain instead, and says what
+  each choice protects: the file keeps them out of plain sight, not from a program running under his account.
+  Linux keeps the Secret Service by default. D-106, which notes that `CLAUDE.md` §1's line on the OS secret
+  store is now the owner's to update.
+- Nothing to retype: a password saved in the keychain before is read there once, at the first connect, edit or
+  duplicate that needs it (macOS may ask one last time), then kept in the file; the keychain is never written or
+  emptied while the file is in use. Back on the keychain, the file's passwords move there. The setting applies
+  without a restart. "Ask each time" no longer reads any store.
+- A file that cannot be decrypted is set aside as `secrets.kerno.damaged`, said once in plain words, never
+  overwritten; writes go through a lock, a temporary file and a rename, so two Kerno processes or a crash lose
+  nothing. `KERNO_SECRET_STORE` takes `file` and `keychain` besides `memory`.
+- `aes-gcm` and `getrandom`, already in the tree, are direct dependencies of `kerno-core`; no package added.
+- Wording that named the keychain for any saved password now names the place in use ("Password from Kerno's
+  file", the AI key lines, "Use the saved secrets", the memory-only alert).
+- Tests: thirteen core unit tests of the file and of the move between stores (a fake keychain), one of the
+  error's words, one manager test, one UI test; each but two plain round trips seen failing under a mutation.
+  Captures of the Passwords page, light and dark, at two sizes.

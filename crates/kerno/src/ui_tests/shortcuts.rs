@@ -417,7 +417,11 @@ fn the_settings_search_finds_the_shortcuts_page(cx: &mut TestAppContext) {
     app.press(cx, &["secondary-,"]);
     app.type_text(cx, "keymap");
     assert!(app.has(cx, "row-shortcuts"));
-    app.click(cx, ("settings-open", 9usize));
+    let index = crate::settings_view::SECTIONS
+        .iter()
+        .position(|(_, label)| *label == "Shortcuts")
+        .unwrap();
+    app.click(cx, ("settings-open", index));
     app.wait_until(cx, "the shortcuts page", |app, cx| {
         app.has(cx, "shortcuts-filter")
     });

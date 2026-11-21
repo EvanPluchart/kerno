@@ -1,5 +1,5 @@
 //! The settings (Cmd+,): appearance, fonts, editor, grid, confirmations,
-//! tools, environments, updates, AI and the keyboard shortcuts. Each choice
+//! tools, environments, updates, AI, passwords and the keyboard shortcuts. Each choice
 //! applies at once and is stored.
 
 use gpui_kit::assets::IconName;
@@ -29,6 +29,7 @@ use crate::state::AppState;
 use crate::theme::{self, Appearance};
 use crate::workspace::Workspace;
 use crate::{actions, bridge};
+use kerno_core::secrets::StoreChoice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
@@ -41,11 +42,12 @@ pub(crate) enum Section {
     Environments,
     Updates,
     Ai,
+    Passwords,
     Shortcuts,
 }
 
 /// Shortcuts comes last: the sections before it keep their places (K20).
-pub(crate) const SECTIONS: [(Section, &str); 10] = [
+pub(crate) const SECTIONS: [(Section, &str); 11] = [
     (Section::Appearance, "Appearance"),
     (Section::Fonts, "Fonts"),
     (Section::Editor, "Editor"),
@@ -55,6 +57,7 @@ pub(crate) const SECTIONS: [(Section, &str); 10] = [
     (Section::Environments, "Environments"),
     (Section::Updates, "Updates"),
     (Section::Ai, "AI"),
+    (Section::Passwords, "Passwords"),
     (Section::Shortcuts, "Shortcuts"),
 ];
 
@@ -71,6 +74,7 @@ impl Section {
             Self::Environments => IconName::Layers,
             Self::Updates => IconName::RefreshCw,
             Self::Ai => IconName::Bot,
+            Self::Passwords => IconName::Lock,
             Self::Shortcuts => IconName::Keyboard,
         }
     }
@@ -84,6 +88,7 @@ impl Section {
             Self::Grid => "How results and table data are fetched and shown.",
             Self::Confirmations => "When Kerno asks before it runs or closes something.",
             Self::Updates => "Whether Kerno looks for a newer version, and how.",
+            Self::Passwords => "Where the passwords and passphrases you save are kept.",
             // A view of its own: the row's line says what it holds.
             Self::Tools | Self::Environments => ROWS
                 .iter()
@@ -132,6 +137,7 @@ pub(crate) enum Kind {
     Environments,
     Updates,
     Ai,
+    SecretStore,
     Shortcuts,
 }
 
@@ -486,6 +492,28 @@ pub(crate) static ROWS: &[Row] = &[
             "reasoning",
         ],
     },
+    // K33 (D-106): the owner's request of 2026-11-21.
+    Row {
+        kind: Kind::SecretStore,
+        section: Section::Passwords,
+        key: "settings-secret-store",
+        label: "Keep saved passwords in",
+        description: SECRET_STORE_DESCRIPTION,
+        keywords: &[
+            "password",
+            "passwords",
+            "passphrase",
+            "secret",
+            "secrets",
+            "keychain",
+            "secret service",
+            "gnome keyring",
+            "kwallet",
+            "encrypted",
+            "prompt",
+            "security",
+        ],
+    },
     // K20: the owner's request of 2026-11-20.
     Row {
         kind: Kind::Shortcuts,
@@ -616,9 +644,32 @@ pub(crate) fn override_line(kind: Kind, settings: &Settings) -> Option<String> {
         }
         // `tools::client_for`: the connection's folder before the default.
         Kind::LocalClients => LOCAL_CLIENT_OVERRIDE.to_string(),
+        // `secrets::app_store`: the variable gives one store alone.
+        Kind::SecretStore => "KERNO_SECRET_STORE wins: when it is set (memory, file or keychain), \
+             that store is used alone and nothing moves from the other one."
+            .to_string(),
         _ => return None,
     })
 }
+
+/// What each place of Settings ▸ Passwords means, in plain words (K33,
+/// D-106): what Kerno's file protects and what it does not, and why the
+/// keychain asks again.
+const SECRET_STORE_DESCRIPTION: &str = if cfg!(target_os = "macos") {
+    "Kerno's file: one encrypted file in Kerno's data folder, its key in a second file beside \
+     it. No prompt; a copy of the file, a file search or another user of this Mac sees nothing, \
+     but a program running under your account could read both files, as with DBeaver or \
+     ~/.pgpass. macOS Keychain: guarded by your login, but macOS asks for your password again \
+     after every update of Kerno, which is not signed by Apple. A password saved in the other \
+     place moves here the first time it is used."
+} else {
+    "Kerno's file: one encrypted file in Kerno's data folder, its key in a second file beside \
+     it. No prompt; a copy of the file, a file search or another user of this computer sees \
+     nothing, but a program running under your account could read both files, as with DBeaver \
+     or ~/.pgpass. Secret Service: GNOME Keyring or KWallet, guarded by your login; without \
+     one running, passwords are kept until Kerno quits. A password saved in the other place \
+     moves here the first time it is used."
+};
 
 /// The override line of Settings ▸ Local clients, shown in its view too.
 pub(crate) const LOCAL_CLIENT_OVERRIDE: &str =
@@ -1292,6 +1343,28 @@ impl SettingsView {
                     None => toggle,
                 }
             }
+            // K33: one chip per place, the change in use from the next read.
+            Kind::SecretStore => h_flex()
+                .gap_2()
+                .child(label(row.label))
+                .children(
+                    StoreChoice::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, choice)| {
+                            theme::chip(
+                                SharedString::from(format!("secret-store-{index}")),
+                                settings.secret_store == choice,
+                            )
+                            .small()
+                            .label(choice.label())
+                            .on_click(move |_, window, cx| {
+                                AppState::set_secret_store(choice, cx);
+                                window.refresh();
+                            })
+                        }),
+                )
+                .into_any_element(),
             Kind::LocalClients | Kind::Environments | Kind::Ai | Kind::Shortcuts if searching => {
                 let section = row.section;
                 let index = SECTIONS
@@ -1707,8 +1780,17 @@ mod tests {
         // A section's name finds its rows.
         assert_eq!(found("updates").len(), 1);
         // "update" is also the statement the confirmation is about.
+        // On macOS the keychain's prompt after an update is said too (K33).
         let sections: Vec<Section> = found("update").into_iter().map(|(s, _)| s).collect();
-        assert_eq!(sections, [Section::Confirmations, Section::Updates]);
+        let mut expected = vec![Section::Confirmations, Section::Updates];
+        if cfg!(target_os = "macos") {
+            expected.push(Section::Passwords);
+        }
+        assert_eq!(sections, expected);
+        assert_eq!(
+            found("keychain"),
+            [(Section::Passwords, vec!["Keep saved passwords in"])]
+        );
         // Words start a word: "rap" is inside "wrap", not its start.
         assert_eq!(search("rap"), Some(Vec::new()));
     }
@@ -1807,6 +1889,7 @@ mod tests {
                 Kind::ConfirmCloseTab,
                 Kind::LocalClients,
                 Kind::Updates,
+                Kind::SecretStore,
             ]
         );
         // One shape: who wins, then what it does.

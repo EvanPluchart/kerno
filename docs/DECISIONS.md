@@ -3131,3 +3131,84 @@ picked or current rows of Kerno's dialogs).
   hovered with `accent`, hover with `list.hover.background`.
 - `CLAUDE.md` §3 says selected rows use Lime wash in light: that line is out of date, the owner's word of
   2026-11-21 wins. `assets/brand/BRAND.md` updated (Olive's role, Lime wash retired).
+
+## D-106 — Passwords in Kerno's own encrypted file by default on macOS, the keychain as a choice (K33; 2026-11-21)
+
+The owner, with a screenshot of the macOS keychain dialog: "pourquoi on doit h24 faire le mot de passe ? On n'en
+a pas besoin sur dbeaver, je veux pas qu'on demande de mot de passe, c'est chiant pour rien". Asked how to
+remove the prompts, he chose **"Fichier Kerno"**: as DBeaver, passwords go into Kerno's own encrypted file,
+readable by him alone, with no prompt, for him and every user; the keychain stays available in Settings. He was
+told the cost: a malicious program running under his account could read them.
+
+**Cause, established.** Kerno's builds are signed ad hoc: their designated requirement is the code's hash, which
+changes with every rebuild and every update, so macOS no longer recognises the program that the keychain items
+trust and asks for the login password again, once per item. There is no Developer ID. Not a Kerno bug; `CLAUDE.md` §3
+item 9's "read each secret at most once per app run" only cut it to once per item and per build.
+
+**This overrides one point of `CLAUDE.md` §1** ("Passwords … live in the OS secret store …"): the default place
+on macOS. That line of `CLAUDE.md` now disagrees with the code and is the owner's to update (an agent may not
+edit it). What stays absolute: never in plain text on disk, never in logs, never in crash output.
+
+- **The file.** `secrets.kerno` in the data directory (it follows `KERNO_DATA_DIR`): one JSON map of every
+  secret that goes through the store (connection passwords, SSH passwords, key passphrases, AI keys), sealed
+  with AES-256-GCM (`aes-gcm` 0.11.1, already in the tree through `ssh-cipher`; no default features), a fresh
+  96-bit nonce from `getrandom` (0.3.4, already in the tree) per write, the header as associated data. The key:
+  256 random bits in `secrets.key` beside it. Both, and the empty `secrets.lock`, are created mode 0600 (the
+  `open` sets it, never a `chmod` after); the directory is left as it is. `Cargo.lock` gains no package, only
+  two edges of `kerno-core`; `cargo deny check` is clean.
+- **Threat model, exactly.** The file keeps the passwords out of plain sight: a copy or backup of the secrets
+  file alone, a synced folder, a file search, a shared screen, another user of the machine (0600) see nothing.
+  It does not protect them from a program running as the same user, which can read the key file as well: the
+  level of DBeaver's saved passwords, `~/.pgpass` and an SSH key without a passphrase. A backup that copies the
+  whole data folder copies the key too. No wording in the app or the docs claims more.
+- **Writes.** Each change takes an exclusive `flock` on `secrets.lock` (`std::fs::File::lock`), re-reads and
+  decrypts the file, changes its one key, and replaces the file atomically: `secrets.kerno.tmp` created with
+  `create_new` and 0600, written, `fsync`ed, renamed over the file, then the directory `fsync`ed (best effort;
+  on macOS `sync_all` is `F_FULLFSYNC`). Nothing is cached in memory between calls, so two Kerno processes on
+  one data directory (the single-instance socket usually prevents it) never erase each other's secrets: the
+  simplest correct thing, a global lock, as the store is written a few times a day. A stale temporary file
+  from a crash is removed under the lock.
+- **Failures in plain words, never a secret, never a panic.** A secrets file that does not decrypt (changed,
+  cut short, not a Kerno file, another key, a key of the wrong size, the key file missing) is never overwritten
+  and no key is ever generated over it: it is renamed to `secrets.kerno.damaged` (then `secrets.kerno-2.damaged`,
+  …, never over an earlier copy), with its key file, and the call fails once with "Kerno's password file could
+  not be read: <why>. It was set aside as … in Kerno's data folder: enter the password again, and Kerno saves it
+  in a new file." The next call starts a new file. serde's messages, which could quote decrypted text, are never
+  kept. A write that fails says "… could not be written: <why>. The passwords saved before are kept."
+  `error::explain` gives these their own words (what happened, what to do), not the keychain's advice. Known
+  gap: the new file has never seen any key, so the next reads fall back to the system store once more; a
+  password saved in the keychain before K33 comes back from there (macOS may ask again once per item), even if
+  it was removed or changed in Kerno since. A fix would mark a fresh file as having nothing to fall back on.
+- **Which store.** Settings ▸ Passwords ▸ "Keep saved passwords in": **Kerno's file** or the system store
+  (**macOS Keychain**, **Secret Service** on Linux), with one sentence saying what each means. Default: Kerno's
+  file on macOS (existing settings, which lack the field, get it); on Linux unchanged: the Secret Service, memory
+  only when none runs. The choice applies from the next read without a restart (`AppState::set_secret_store`
+  builds the store again; the system store's per-run cache is one process-wide instance, so switching back and
+  forth reads no key twice). `KERNO_SECRET_STORE` wins over the setting: `memory` as before, `file` (Kerno's file
+  alone, the keychain never touched: for checks on a scratch data folder) and `keychain` (the system store
+  alone); each gives one store and moves nothing. Settings says so on its override line.
+- **Migration, once per key, both ways (`ChosenStore`).** The file holds, per key, a secret or a mark "removed
+  here". With the file in use, a key the file has never seen is read from the system store once and the answer
+  written in the file (the secret, or the mark): macOS may ask one last time per item, at a connect, edit or
+  duplicate the user asked for, and never again for it. A system store that refuses that read (Deny) counts as
+  having nothing: the app asks for the password and keeps the typed one in the file. With the file in use the
+  system store is never written or deleted: a delete of an item another build created may itself make the
+  keychain ask, and the owner asked for no prompt. So a removed secret is a mark in the file, which keeps the
+  keychain's old copy from coming back; that copy stays in the keychain, still guarded by it, until the user
+  removes it in Keychain Access (the guide says so). With the system store in use the file drains: a secret
+  found there (newer, written while the file was in use) is moved to the system store and leaves the file, a
+  mark deletes the system store's copy, and every write removes the key from the file; switching back to the
+  file then reads the system store once more and gets its latest value.
+- **Nothing else reaches the keychain while the file is in use.** No probe at startup (the system store is not
+  opened until a fallback read needs it), no listing, no delete. A connection set to "Ask each time" saves no
+  secret (`persist` deletes them) and is no longer read anywhere at connect, edit or duplicate. An import's
+  question "does this id have saved secrets?" (`has_secrets`) asks only the store in use (`SecretStore::peek`):
+  a connection whose password is still only in the keychain is then shown as having none, and importing over it
+  with "Ask when connecting" marks it removed; accepted, as an import over an unmigrated connection is rare.
+- **Words.** The dialog's first "Password from" choice is named after the place ("Kerno's file", "macOS
+  Keychain"; "Until Kerno quits" in memory), as are "Password from …" after a connect or a test, the AI key
+  lines, the import's link choice ("Use the saved secrets") and the memory-only alert (which now names
+  `KERNO_SECRET_STORE=memory` and the setting).
+- **Not done:** no master password (it would bring the prompt back); no use of the macOS Data Protection
+  keychain or of a Developer ID (none exists); the old keychain items are not deleted; non-UTF-8 secrets cannot
+  exist (`Secret` wraps a `String`); the plaintext is not zeroised in memory, as no `Secret` is today.
