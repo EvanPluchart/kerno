@@ -306,8 +306,9 @@ gpui_kit::actions!(
         AddEnumValue,
         /// Renames the enum value selected in the schema tree.
         RenameEnumValue,
-        /// Installs the extension selected in the schema tree.
-        InstallExtension,
+        /// Opens the extensions manager of the database selected in the schema
+        /// tree, or of the active tab (K27).
+        ManageExtensions,
         /// Writes the rows of the table selected in the schema tree to a file.
         ExportObject,
         /// Imports a CSV file into the table selected in the schema tree.
@@ -2485,12 +2486,20 @@ pub const COMMANDS: &[Command] = &[
         RenameEnumValue
     ),
     command!(
+        // K27: the id of the old "Install Selected Extension…", kept so that a
+        // keymap override naming it still binds.
         "install_extension",
-        "Install Selected Extension…",
+        "Manage Extensions…",
         "Navigator",
         [],
-        ["create extension", "postgresql"],
-        InstallExtension
+        [
+            "install extension",
+            "create extension",
+            "update extension",
+            "drop extension",
+            "postgresql"
+        ],
+        ManageExtensions
     ),
     command!(
         "export_object",

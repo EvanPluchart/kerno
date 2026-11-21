@@ -17,7 +17,7 @@ use kerno_core::schema::{
     Tie, TriggerInfo, TypeInfo, TypeShape, like_containing, mentions,
 };
 use kerno_core::sql::{Catalog, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
-use kerno_core::{Error, Result};
+use kerno_core::{Error, Result, Session as _};
 use tokio_postgres::SimpleQueryRow;
 
 use crate::dialect::PgDialect;
@@ -679,16 +679,44 @@ pub(crate) async fn completion_catalog(session: &PgSession) -> Result<Catalog> {
     })
 }
 
+/// Every extension the server has files for, installed in this database or
+/// not (K27), from the catalog views the PostgreSQL docs describe
+/// (`pg_available_extensions`, `pg_available_extension_versions`,
+/// `pg_extension`, `pg_extension_update_paths`). What a version needs (a
+/// superuser, its requirements, a fixed schema) is read from the row of the
+/// installed version, else of the default one. The update paths read
+/// script files on the server: only for installed extensions. `trusted`
+/// came with PostgreSQL 13; before it, `superuser` alone said who may
+/// install, which `trusted = false` keeps.
 pub(crate) async fn extensions(session: &PgSession) -> Result<Vec<ExtensionInfo>> {
-    let rows = session
-        .query(
-            "SELECT a.name, a.installed_version, a.default_version, n.nspname, a.comment \
-             FROM pg_catalog.pg_available_extensions a \
-             LEFT JOIN pg_catalog.pg_extension e ON e.extname = a.name \
-             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
-             ORDER BY a.installed_version IS NULL, a.name",
-        )
-        .await?;
+    let trusted = if session.server().version_number.0 >= 13 {
+        "v.trusted"
+    } else {
+        "false"
+    };
+    let sql = format!(
+        "SELECT a.name, a.installed_version, a.default_version, n.nspname, a.comment, \
+           (SELECT pg_catalog.array_to_json(pg_catalog.array_agg(x.version))::text \
+              FROM pg_catalog.pg_available_extension_versions x WHERE x.name = a.name), \
+           CASE WHEN e.oid IS NOT NULL THEN \
+             (SELECT pg_catalog.array_to_json(pg_catalog.array_agg(p.target))::text \
+                FROM pg_catalog.pg_extension_update_paths(a.name) p \
+               WHERE p.source = a.installed_version AND p.path IS NOT NULL) END, \
+           pg_catalog.array_to_json(v.requires)::text, \
+           coalesce(e.extrelocatable, v.relocatable), v.schema, \
+           coalesce(v.superuser, true), coalesce({trusted}, false) \
+         FROM pg_catalog.pg_available_extensions a \
+         LEFT JOIN pg_catalog.pg_extension e ON e.extname = a.name \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         LEFT JOIN pg_catalog.pg_available_extension_versions v \
+           ON v.name = a.name AND v.version = coalesce(a.installed_version, a.default_version) \
+         ORDER BY a.installed_version IS NULL, a.name"
+    );
+    let rows = session.query(&sql).await?;
+    let sorted = |mut versions: Vec<String>| {
+        versions.sort_by(|a, b| kerno_core::schema::compare_versions(a, b));
+        versions
+    };
     Ok(rows
         .iter()
         .map(|row| ExtensionInfo {
@@ -697,6 +725,13 @@ pub(crate) async fn extensions(session: &PgSession) -> Result<Vec<ExtensionInfo>
             default_version: opt(row, 2),
             schema: opt(row, 3),
             comment: opt(row, 4),
+            versions: sorted(list(row, 5)),
+            update_targets: sorted(list(row, 6)),
+            requires: list(row, 7),
+            relocatable: flag(row, 8),
+            fixed_schema: opt(row, 9),
+            superuser: flag(row, 10),
+            trusted: flag(row, 11),
         })
         .collect())
 }

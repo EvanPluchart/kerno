@@ -213,6 +213,7 @@ fn tool_entry(object: bool, entry: &ToolEntry) -> Palette {
         ToolEntry::NewTask => Command("create_task"),
         ToolEntry::Tasks => Command("show_tasks"),
         ToolEntry::CopyTables => Command("copy_tables"),
+        ToolEntry::Extensions => Command("install_extension"),
     }
 }
 
@@ -247,7 +248,7 @@ fn tree_entry(action: Action) -> Palette {
         Action::CreateEnum => Command("create_enum"),
         Action::AddEnumValue => Command("add_enum_value"),
         Action::RenameEnumValue => Command("rename_enum_value"),
-        Action::InstallExtension => Command("install_extension"),
+        Action::ManageExtensions | Action::ShowInExtensions => Command("install_extension"),
         Action::EditSource => Command("edit_object_source"),
         Action::Export => Command("export_object"),
         Action::ImportCsv => Command("import_csv_into_object"),
@@ -667,7 +668,8 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
         Action::CreateSchema,
         Action::CreateDatabase,
         Action::EditSource,
-        Action::InstallExtension,
+        Action::ManageExtensions,
+        Action::ShowInExtensions,
         Action::CreateEnum,
         Action::AddEnumValue,
         Action::RenameEnumValue,
@@ -722,6 +724,7 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
             ToolEntry::NewTask,
             ToolEntry::Tasks,
             ToolEntry::CopyTables,
+            ToolEntry::Extensions,
         ]
         .map(|entry| (entry.label(), tool_entry(true, &entry))),
     );

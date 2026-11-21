@@ -2702,3 +2702,57 @@ The owner found the backup wizard had too many things: a simple mode by default,
   there is written without Kerno's own "Replace …" (`agreed_replace`; the review's change, the first version
   asked twice). A path typed or kept from the default name still gets Kerno's question, and so does every file
   on Linux, where the panel is the desktop's portal and may not ask.
+
+## D-100 — PostgreSQL extensions: a manager per database, the tree lists installed ones only (K27; 2026-11-20)
+
+The owner did not like the extensions under each database: about fifty "not installed" rows mixed with the
+installed ones, nothing on what an extension is for, no choice of schema or version, no update, nothing on what
+an extension requires. He approved a manager per database: a page with a search, each extension's description,
+filters Installed / Available / To update, and Install, Update, Drop with the SQL shown first. Choices:
+
+- **A tab, not a dialog.** The list is long and the user reads it while working (as the administration tab):
+  a tab of the central area, one per connection and database (opening it again shows the one there), not
+  restored after a restart (as the Tasks view: it holds nothing of the user's and reads the server when shown).
+  It reads on a session of its own in its database, closed once read; Cmd+. and the tab closing stop the read on
+  the server (K15); a statement it runs can be cancelled the same way (K2).
+- **The tree keeps the installed extensions** (name and version, the count on the folder once it is opened: the
+  folder stays lazy, so a database's first level reads nothing more than before). The folder's double click and
+  Enter open the manager (its chevron and the arrows still open it in the tree); its menu, an installed
+  extension's menu, Tools ▸ Extensions… on a PostgreSQL database (beside Foreign data wrappers…) and the palette's
+  "Manage Extensions…" (which replaces "Install Selected Extension…" and keeps its id, `install_extension`, so that a keymap override naming it still binds) lead there.
+- **What is shown is read from the catalog, never guessed or fetched.** One query joins
+  `pg_available_extensions` with the row of `pg_available_extension_versions` for the installed version, else
+  the default one (`superuser`, `trusted`, `relocatable`, `schema`, `requires`), every version the server has,
+  and, for installed extensions only, the targets of `pg_extension_update_paths` from the installed version (the
+  function reads script files on the server: not for fifty available ones). "Update available" means the
+  installed version differs from the default one and the server has a path to it. `trusted` exists from
+  PostgreSQL 13; before it the query reads `false` and `superuser` alone says who may install, which was the
+  rule then (the details say so). Installed extensions read their relocatability from `pg_extension`. The
+  descriptions are the control files' comments.
+- **Statements**: `CREATE EXTENSION name [SCHEMA s] [VERSION 'v'] [CASCADE]` (no `IF NOT EXISTS` any more: the
+  manager knows it is not installed, and the old clause hid a chosen schema or version behind a notice),
+  `ALTER EXTENSION name UPDATE [TO 'v']`, `ALTER EXTENSION name SET SCHEMA s`, `DROP EXTENSION name [CASCADE]`.
+  Versions are string literals, names quoted identifiers. `SCHEMA` and `VERSION` are written only when the user
+  picked something other than what the server would choose (its current schema, the default version); an
+  extension whose control file fixes a schema has no schema picker and no `SCHEMA`. `CASCADE` is added when a
+  requirement is not installed, followed through the requirements' own (what the server installs), and the
+  confirmation names them before running, in the same schema unless their control file fixes another.
+- **The usual confirmation and rules**: `sql_confirm` with the connection's environment (a production
+  connection asks twice); a drop lists what it reaches with K14's reader (moved to
+  `navigator::view::read_dependents`, shared with the tree); a read-only connection disables every action and
+  says why in a line under the toolbar and on the buttons. After a statement the list is read again and the
+  tree's "Extensions" folder of that database is refreshed when it is loaded.
+- **Refusals in plain words first** (K9's message after): SQLSTATE 42501 on an install is "Only a superuser can
+  install …: it is not a trusted extension" when the catalog says so, else "This user may not install …: that
+  takes the right to create objects in the database …"; on other statements "only its owner or a superuser
+  can"; 58P01 or the server's "no installation script" / "no update path" is "The server has no files for this
+  version …: install the extension's package for that version on the server's machine first".
+- **Behaviour reference**: DBeaver's `PostgreCreateExtensionDialog` (a schema picker defaulting to the server's
+  schema, the list with versions and descriptions) and `PostgreDatabase`'s read of `pg_available_extensions`
+  were read for behaviour; no logic was ported (the catalog reads are written from the PostgreSQL docs), so
+  `THIRD_PARTY_NOTICES.md` is unchanged.
+- **Narrow groups** (K19): the toolbar wraps; under 640 px of the tab's width the details go under the list
+  instead of beside it (the width is measured at each frame).
+- Not done: extensions installed in the database whose control file has since been removed from the server are
+  not listed (the read starts from `pg_available_extensions`, as before); an install's own requirements'
+  "who may install" is not checked before running (the server's refusal says it).

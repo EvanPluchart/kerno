@@ -72,8 +72,8 @@ pub enum NodeKind {
     Group(Group),
     /// A column of a table or view.
     Column { table: TableRef, name: String },
-    /// A PostgreSQL extension, installed in the database or available.
-    Extension { name: String, installed: bool },
+    /// A PostgreSQL extension installed in the database.
+    Extension { name: String },
     /// A value of a PostgreSQL enum type.
     EnumValue { ty: TableRef, value: String },
     /// A primary key, unique, check or exclusion constraint of a table.
@@ -312,7 +312,10 @@ impl Tree {
                 Children::Loaded(structure_nodes(node, *structure, has_schemas))
             }
             Ok(Loaded::Extensions(extensions)) => {
-                Children::Loaded(extension_nodes(node, extensions))
+                let nodes = extension_nodes(node, extensions);
+                // The folder is read when opened: its count shows from then.
+                node.hint = Some(nodes.len().to_string());
+                Children::Loaded(nodes)
             }
         };
         // Folders that were open before a refresh are open after it. A
@@ -557,29 +560,24 @@ fn schema_nodes(database: &Node, schemas: Vec<SchemaInfo>) -> Vec<Node> {
     nodes
 }
 
+/// The installed extensions, with their version (K27): the ones that are
+/// only available are in the extensions manager, not in the tree.
 fn extension_nodes(group: &Node, extensions: Vec<ExtensionInfo>) -> Vec<Node> {
-    // Installed ones first; the rest can be installed.
-    let (installed, available): (Vec<_>, Vec<_>) = extensions
+    extensions
         .into_iter()
-        .partition(|extension| extension.installed_version.is_some());
-    installed
-        .into_iter()
-        .chain(available)
-        .map(|extension| Node {
-            hint: Some(match &extension.installed_version {
-                Some(version) => version.clone(),
-                None => "not installed".into(),
-            }),
-            muted: extension.installed_version.is_none(),
-            ..child(
-                group,
-                &format!("ext:{}", extension.name),
-                NodeKind::Extension {
-                    name: extension.name.clone(),
-                    installed: extension.installed_version.is_some(),
-                },
-                extension.name,
-            )
+        .filter_map(|extension| {
+            let version = extension.installed_version?;
+            Some(Node {
+                hint: Some(version),
+                ..child(
+                    group,
+                    &format!("ext:{}", extension.name),
+                    NodeKind::Extension {
+                        name: extension.name.clone(),
+                    },
+                    extension.name,
+                )
+            })
         })
         .collect()
 }

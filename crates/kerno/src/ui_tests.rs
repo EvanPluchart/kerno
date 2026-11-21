@@ -50,6 +50,7 @@ mod editing_v11;
 mod editor_v11;
 mod environments;
 mod erd;
+mod extensions;
 mod feedback;
 mod fk_preview;
 mod folders;
@@ -2554,38 +2555,48 @@ fn extensions_are_installed_and_dropped_from_the_tree(cx: &mut TestAppContext) {
     );
     let app = connected(cx, Engine::Postgres);
     let extensions = ["kerno_ui_ext", "Extensions"];
-    app.open_path(cx, &["kerno_ui_ext", "Extensions", "citext"]);
-    // Installed extensions come first: a new database has only plpgsql.
-    let first = |app: &Fixture, cx: &mut TestAppContext| {
+    app.open_path(cx, &["kerno_ui_ext", "Extensions", "plpgsql"]);
+    // K27: the folder lists what is installed only; a new database has only
+    // plpgsql. The rest is in the extensions manager.
+    let listed = |app: &Fixture, cx: &mut TestAppContext| {
         let tree = app.tree(cx);
         let database = tree
             .iter()
-            .position(|line| *line == row(0, "kerno_ui_ext"))?;
+            .position(|line| *line == row(0, "kerno_ui_ext"))
+            .unwrap();
         let folder = database
             + tree[database..]
                 .iter()
-                .position(|line| *line == row(1, "Extensions"))?;
-        tree.get(folder + 1).cloned()
+                .position(|line| *line == row(1, "Extensions"))
+                .unwrap();
+        tree[folder + 1..]
+            .iter()
+            .take_while(|line| line.starts_with("    "))
+            .map(|line| line.trim().to_string())
+            .collect::<Vec<_>>()
     };
-    assert_eq!(first(&app, cx), Some(row(2, "plpgsql")));
+    assert_eq!(listed(&app, cx), ["plpgsql"]);
 
-    app.act(
-        cx,
-        Action::InstallExtension,
-        &["kerno_ui_ext", "Extensions", "citext"],
-    );
+    // Installed from the manager, it shows in the tree.
+    app.act(cx, Action::ManageExtensions, &extensions);
+    let tab = app.extensions_manager(cx);
+    app.wait_until(cx, "the extensions", |_, cx| {
+        cx.update(|cx| tab.read(cx).state_text()) == "ready"
+    });
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| tab.ask_install("citext", window, cx))
+    });
     assert!(app.has(cx, "sql-preview"));
     app.click(cx, "sql-confirm");
     app.wait_until(cx, "the install", |app, cx| {
-        first(app, cx) == Some(row(2, "citext"))
+        listed(app, cx) == ["citext", "plpgsql"]
     });
 
+    // Dropped from the tree, it leaves it.
     app.act(cx, Action::Drop, &["kerno_ui_ext", "Extensions", "citext"]);
     app.click(cx, "sql-confirm");
-    app.wait_until(cx, "the drop", |app, cx| {
-        first(app, cx) == Some(row(2, "plpgsql"))
-    });
-    assert!(app.shows(cx, &[&extensions[..], &["citext"]].concat()));
+    app.wait_until(cx, "the drop", |app, cx| listed(app, cx) == ["plpgsql"]);
+    assert!(!app.shows(cx, &[&extensions[..], &["citext"]].concat()));
 }
 
 #[gpui_kit::test]

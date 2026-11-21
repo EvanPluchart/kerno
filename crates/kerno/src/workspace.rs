@@ -62,6 +62,7 @@ use crate::connections::manager::{
 };
 use crate::data::tab::{DataTab, DataTabEvent};
 use crate::erd_tab::{DiagramTab, DiagramTabEvent};
+use crate::extensions_tab::{ExtensionsTab, ExtensionsTabEvent};
 use crate::import_dialog::{self, ImportDialog};
 use crate::library::{self, Library, Shelf};
 use crate::navigator::actions::Action as TreeAction;
@@ -207,6 +208,9 @@ enum OpenTab {
     Tasks(Entity<TasksView>),
     /// An ER diagram (J18).
     Diagram(Entity<DiagramTab>),
+    /// The extensions manager of a PostgreSQL database (K27); not restored
+    /// after a restart.
+    Extensions(Entity<ExtensionsTab>),
 }
 
 impl OpenTab {
@@ -259,6 +263,13 @@ impl OpenTab {
         }
     }
 
+    fn extensions(&self) -> Option<&Entity<ExtensionsTab>> {
+        match self {
+            OpenTab::Extensions(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     /// A restored tab reads nothing, and opens no session, until it is
     /// shown.
     fn defer_until_shown(&self, cx: &mut App) {
@@ -267,6 +278,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             // A query tab opens its session on its first run.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
@@ -279,6 +291,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Admin(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             // Called at every frame: the Tasks view reads its list when it
             // opens and when a task changes, never from here.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
@@ -294,7 +307,8 @@ impl OpenTab {
             | OpenTab::Admin(_)
             | OpenTab::TableEditor(_)
             | OpenTab::Tasks(_)
-            | OpenTab::Diagram(_) => {}
+            | OpenTab::Diagram(_)
+            | OpenTab::Extensions(_) => {}
         }
     }
 
@@ -307,6 +321,7 @@ impl OpenTab {
             OpenTab::TableEditor(tab) => tab.entity_id(),
             OpenTab::Tasks(tab) => tab.entity_id(),
             OpenTab::Diagram(tab) => tab.entity_id(),
+            OpenTab::Extensions(tab) => tab.entity_id(),
         }
     }
 
@@ -343,9 +358,11 @@ impl OpenTab {
                 0 => Vec::new(),
                 count => vec![Loss::Pending(count)],
             },
-            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {
-                Vec::new()
-            }
+            OpenTab::Structure(_)
+            | OpenTab::Admin(_)
+            | OpenTab::Tasks(_)
+            | OpenTab::Diagram(_)
+            | OpenTab::Extensions(_) => Vec::new(),
             OpenTab::TableEditor(tab) => {
                 if tab.read(cx).dirty(cx) {
                     vec![Loss::Form]
@@ -365,6 +382,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Diagram(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::Extensions(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -378,6 +396,7 @@ impl OpenTab {
             OpenTab::Admin(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::TableEditor(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Diagram(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::Extensions(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -391,6 +410,7 @@ impl OpenTab {
             OpenTab::TableEditor(tab) => tab.focus_handle(cx),
             OpenTab::Tasks(tab) => tab.focus_handle(cx),
             OpenTab::Diagram(tab) => tab.focus_handle(cx),
+            OpenTab::Extensions(tab) => tab.focus_handle(cx),
         }
     }
 
@@ -402,7 +422,7 @@ impl OpenTab {
             OpenTab::Structure(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Admin(tab) => Some(tab.read(cx).snapshot()),
             OpenTab::Diagram(tab) => Some(tab.read(cx).snapshot()),
-            OpenTab::TableEditor(_) | OpenTab::Tasks(_) => None,
+            OpenTab::TableEditor(_) | OpenTab::Tasks(_) | OpenTab::Extensions(_) => None,
         }
     }
 
@@ -415,6 +435,7 @@ impl OpenTab {
             OpenTab::TableEditor(tab) => tab.read(cx).title(),
             OpenTab::Tasks(tab) => tab.read(cx).title(),
             OpenTab::Diagram(tab) => tab.read(cx).title(),
+            OpenTab::Extensions(tab) => tab.read(cx).title(),
         }
     }
 
@@ -427,9 +448,11 @@ impl OpenTab {
                 tab.file().is_some() && tab.unsaved() || tab.pending_count(cx) > 0
             }
             OpenTab::Data(tab) => tab.read(cx).pending_count(cx) > 0,
-            OpenTab::Structure(_) | OpenTab::Admin(_) | OpenTab::Tasks(_) | OpenTab::Diagram(_) => {
-                false
-            }
+            OpenTab::Structure(_)
+            | OpenTab::Admin(_)
+            | OpenTab::Tasks(_)
+            | OpenTab::Diagram(_)
+            | OpenTab::Extensions(_) => false,
             OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
         };
         let title = self.title(cx);
@@ -449,6 +472,7 @@ impl OpenTab {
             OpenTab::TableEditor(tab) => tab.read(cx).status(cx),
             OpenTab::Tasks(tab) => tab.read(cx).status(cx),
             OpenTab::Diagram(tab) => tab.read(cx).status(cx),
+            OpenTab::Extensions(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -461,6 +485,7 @@ impl OpenTab {
             OpenTab::TableEditor(tab) => tab.clone().into(),
             OpenTab::Tasks(tab) => tab.clone().into(),
             OpenTab::Diagram(tab) => tab.clone().into(),
+            OpenTab::Extensions(tab) => tab.clone().into(),
         }
     }
 }
@@ -1371,6 +1396,101 @@ impl Workspace {
         tab
     }
 
+    /// Shows the extensions manager of a PostgreSQL database, on `extension`
+    /// when given: in the tab that already shows that database, else in a
+    /// new one (K27).
+    pub fn open_extensions(
+        &mut self,
+        target: Target,
+        extension: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ExtensionsTab> {
+        let target = Target {
+            schema: None,
+            database: target.database.clone().or_else(|| {
+                self.connections
+                    .read(cx)
+                    .meta_session(&target.connection)
+                    .and_then(|meta| meta.database())
+            }),
+            ..target
+        };
+        let open = self.tabs.iter().position(|tab| {
+            tab.extensions()
+                .is_some_and(|tab| tab.read(cx).target() == &target)
+        });
+        let tab = match open {
+            Some(index) => {
+                self.activate_tab(index, window, cx);
+                self.tabs[index]
+                    .extensions()
+                    .expect("an extensions tab")
+                    .clone()
+            }
+            None => {
+                let connections = self.connections.clone();
+                let tab = cx.new(|cx| ExtensionsTab::new(target, connections, window, cx));
+                // One subscription per tab: `close_tab_at` drops it with the tab.
+                let subscription =
+                    cx.subscribe(&tab, |this, tab, event: &ExtensionsTabEvent, cx| {
+                        let ExtensionsTabEvent::Changed = event;
+                        let target = tab.read(cx).target().clone();
+                        let database = tab.read(cx).database().to_string();
+                        let navigator = this.sidebar.read(cx).navigator().clone();
+                        navigator.update(cx, |navigator, cx| {
+                            navigator.refresh_extensions(&target.connection, &database, cx)
+                        });
+                    });
+                self.tab_subscriptions.insert(tab.entity_id(), subscription);
+                self.tabs.push(OpenTab::Extensions(tab.clone()));
+                self.adopt_last_tab();
+                self.activate_tab(self.active_index(), window, cx);
+                tab
+            }
+        };
+        if let Some(extension) = extension {
+            tab.update(cx, |tab, cx| tab.select_when_read(extension, window, cx));
+        }
+        tab
+    }
+
+    /// The palette's "Manage Extensions…": of the database selected in the
+    /// tree, else of the active tab's PostgreSQL database; says why when
+    /// there is none.
+    fn manage_extensions_command(
+        &mut self,
+        _: &crate::actions::ManageExtensions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigator = self.sidebar.read(cx).navigator().clone();
+        if navigator.read(cx).has_selected_object(cx) {
+            self.on_tree(TreeAction::ManageExtensions, window, cx);
+            return;
+        }
+        let target = self
+            .active_open()
+            .and_then(|tab| tab.target(cx))
+            .filter(|target| {
+                self.connections
+                    .read(cx)
+                    .meta_session(&target.connection)
+                    .is_some_and(|meta| meta.engine() == kerno_core::Engine::Postgres)
+            });
+        match target {
+            Some(target) => {
+                self.open_extensions(target, None, window, cx);
+            }
+            None => window.push_notification(
+                Notification::warning(
+                    "Manage Extensions: select a database of a PostgreSQL connection in the tree first.",
+                ),
+                cx,
+            ),
+        }
+    }
+
     /// The palette's "View ER Diagram": of the table of the active
     /// structure tab, else of what is selected in the schema tree.
     fn view_diagram_command(
@@ -1395,6 +1515,15 @@ impl Workspace {
     #[cfg(test)]
     pub fn diagram_tab_at(&self, index: usize) -> Option<Entity<DiagramTab>> {
         self.tabs.get(index)?.diagram().cloned()
+    }
+
+    /// The open extensions managers, in tab order; for tests.
+    #[cfg(test)]
+    pub fn extensions_tabs(&self) -> Vec<Entity<ExtensionsTab>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.extensions().cloned())
+            .collect()
     }
 
     /// Opens the administration of a server in a tab of its own.
@@ -1684,6 +1813,7 @@ impl Workspace {
             // Their reads, which a lock can hold, are stopped too.
             OpenTab::Structure(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             OpenTab::Tasks(_) => {}
         }
         // A closed query tab can be opened again, with its text.
@@ -2424,6 +2554,9 @@ impl Workspace {
             }
             NavigatorEvent::ViewDiagram { target, scope } => {
                 self.open_diagram(target.clone(), scope.clone(), window, cx);
+            }
+            NavigatorEvent::ManageExtensions { target, extension } => {
+                self.open_extensions(target.clone(), extension.clone(), window, cx);
             }
             NavigatorEvent::Warn(text) => window
                 .push_notification(Notification::warning(SharedString::from(text.clone())), cx),
@@ -3446,6 +3579,9 @@ impl Workspace {
             ToolEntry::Tasks => {
                 self.open_tasks(window, cx);
             }
+            ToolEntry::Extensions => {
+                self.open_extensions(target, None, window, cx);
+            }
             ToolEntry::Backup
             | ToolEntry::GlobalBackup
             | ToolEntry::Restore
@@ -3750,6 +3886,7 @@ impl Workspace {
         match self.active_open() {
             Some(OpenTab::Structure(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             Some(OpenTab::Diagram(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            Some(OpenTab::Extensions(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             _ => {}
         }
     }
@@ -6843,11 +6980,7 @@ impl Render for Workspace {
                     this.on_tree(TreeAction::RenameEnumValue, window, cx)
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &crate::actions::InstallExtension, window, cx| {
-                    this.on_tree(TreeAction::InstallExtension, window, cx)
-                }),
-            )
+            .on_action(cx.listener(Self::manage_extensions_command))
             .on_action(
                 cx.listener(|this, _: &crate::actions::ExportObject, window, cx| {
                     this.on_tree(TreeAction::Export, window, cx)

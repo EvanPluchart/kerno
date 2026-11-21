@@ -46,7 +46,10 @@ pub enum Action {
     CreateSchema,
     CreateDatabase,
     EditSource,
-    InstallExtension,
+    /// Opens the extensions manager of the database (K27).
+    ManageExtensions,
+    /// Opens the extensions manager on this extension (K27).
+    ShowInExtensions,
     CreateEnum,
     AddEnumValue,
     RenameEnumValue,
@@ -111,7 +114,8 @@ impl Action {
             Action::CreateSchema => "Create schema…",
             Action::CreateDatabase => "Create database…",
             Action::EditSource => "Edit source",
-            Action::InstallExtension => "Install…",
+            Action::ManageExtensions => "Manage extensions…",
+            Action::ShowInExtensions => "Show in the extensions manager",
             Action::CreateEnum => "Create enum…",
             Action::AddEnumValue => "Add value…",
             Action::RenameEnumValue => "Rename value…",
@@ -153,7 +157,6 @@ impl Action {
                 | Action::CreateSchema
                 | Action::CreateDatabase
                 | Action::EditSource
-                | Action::InstallExtension
                 | Action::CreateEnum
                 | Action::AddEnumValue
                 | Action::RenameEnumValue
@@ -270,14 +273,10 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
         NodeKind::Group(Group::Triggers) => vec![vec![CreateTrigger]],
         NodeKind::Group(Group::Events) => vec![vec![CreateEvent]],
         NodeKind::Group(Group::Columns) => vec![vec![AddColumn]],
+        NodeKind::Group(Group::Extensions) => vec![vec![ManageExtensions]],
         NodeKind::Group(_) => Vec::new(),
         NodeKind::EnumValue { .. } => vec![vec![CopyName], vec![AddEnumValue, RenameEnumValue]],
-        NodeKind::Extension { installed, .. } => {
-            vec![
-                vec![CopyName],
-                vec![if *installed { Drop } else { InstallExtension }],
-            ]
-        }
+        NodeKind::Extension { .. } => vec![vec![ShowInExtensions, CopyName], vec![Drop]],
         // F4 opens the table's form on the column; "Open structure" shows
         // the table the column is in.
         NodeKind::Column { .. } => vec![
@@ -389,6 +388,8 @@ pub enum ToolEntry {
     Tasks,
     /// Copies tables with their data to another connection (J13).
     CopyTables,
+    /// The extensions manager of a PostgreSQL database (K27).
+    Extensions,
 }
 
 impl ToolEntry {
@@ -409,6 +410,7 @@ impl ToolEntry {
             Self::NewTask => "Create new task…".into(),
             Self::Tasks => "Tasks".into(),
             Self::CopyTables => "Copy tables to another connection…".into(),
+            Self::Extensions => "Extensions…".into(),
         }
     }
 
@@ -509,7 +511,12 @@ pub fn tool_entries(
         );
     }
     if has_schemas {
-        groups.push(vec![(ForeignDataWrappers, None)]);
+        let mut group = vec![(ForeignDataWrappers, None)];
+        // Extensions belong to a database (K27).
+        if matches!(object, Some(ObjectRef::Database(_))) {
+            group.push((Extensions, None));
+        }
+        groups.push(group);
     }
     groups.push(vec![
         (Dashboard, None),
@@ -570,6 +577,10 @@ pub fn default_action(node: &Node, has_schemas: bool, table: TableDoubleClick) -
             kind: RoutineKind::Function | RoutineKind::Procedure,
             ..
         }) => Some(Action::EditSource),
+        // The folder of extensions opens their manager; its chevron and the
+        // arrows still open it in the tree (K27).
+        NodeKind::Group(Group::Extensions) => Some(Action::ManageExtensions),
+        NodeKind::Extension { .. } => Some(Action::ShowInExtensions),
         NodeKind::Object(ObjectRef::Schema(_) | ObjectRef::Database(_)) | NodeKind::Group(_) => {
             None
         }
@@ -893,22 +904,31 @@ mod tests {
         assert!(mysql_table.contains(&Drop) && !mysql_table.contains(&DropCascade));
         assert!(pg_database.contains(&Drop) && !pg_database.contains(&DropCascade));
         // Every menu ends with Refresh, in a group of its own.
-        let extension = |installed| NodeKind::Extension {
+        let extension = NodeKind::Extension {
             name: "pg_trgm".into(),
-            installed,
         };
         assert_eq!(
-            actions(&node(extension(true)), true).last(),
+            actions(&node(extension.clone()), true).last(),
             Some(&vec![Refresh])
         );
-        // An extension is installed or dropped, as it is.
+        // K27: an installed extension leads to the manager and drops; its
+        // folder opens the manager, on a double click too.
         assert_eq!(
-            flat(extension(true), true),
-            [CopyName, Drop, DropCascade, Refresh]
+            flat(extension.clone(), true),
+            [ShowInExtensions, CopyName, Drop, DropCascade, Refresh]
         );
         assert_eq!(
-            flat(extension(false), true),
-            [CopyName, InstallExtension, Refresh]
+            flat(NodeKind::Group(Group::Extensions), true),
+            [ManageExtensions, Refresh]
+        );
+        let setting = TableDoubleClick::Data;
+        assert_eq!(
+            default_action(&node(NodeKind::Group(Group::Extensions)), true, setting),
+            Some(ManageExtensions)
+        );
+        assert_eq!(
+            default_action(&node(extension), true, setting),
+            Some(ShowInExtensions)
         );
 
         // A query tab can be opened on a database, a schema, a table, a
@@ -1142,7 +1162,6 @@ mod tests {
             CreateSchema,
             CreateDatabase,
             EditSource,
-            InstallExtension,
             CreateEnum,
             AddEnumValue,
             RenameEnumValue,
@@ -1181,6 +1200,9 @@ mod tests {
             ExecuteRoutine,
             EditColumn,
             ViewDiagram,
+            // The manager says itself what a read-only connection refuses.
+            ManageExtensions,
+            ShowInExtensions,
         ] {
             assert!(!action.writes(), "{action:?}");
         }
@@ -1298,13 +1320,13 @@ mod tests {
         // PostgreSQL: a database, a schema, a table, a materialized view,
         // a view, a trigger. Only what can apply to the kind is listed (no
         // entry greyed "on a trigger" on a table).
-        assert_eq!(
-            tool_labels(Some(&database), &pg),
-            with_tail(&[
-                "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…",
-                "Analyze…, Vacuum…",
-            ])
-        );
+        // K27: a database also leads to its extensions.
+        let mut database_tail = with_tail(&[
+            "Back up…, Global backup…, Restore…, Execute script…, Copy tables to another connection…",
+            "Analyze…, Vacuum…",
+        ]);
+        database_tail[2] = "Foreign data wrappers…, Extensions…".into();
+        assert_eq!(tool_labels(Some(&database), &pg), database_tail);
         assert_eq!(
             tool_labels(Some(&schema), &pg),
             with_tail(&[
@@ -1401,6 +1423,7 @@ mod tests {
             (ToolEntry::NewTask, false),
             (ToolEntry::Tasks, false),
             (ToolEntry::CopyTables, false),
+            (ToolEntry::Extensions, false),
         ] {
             assert_eq!(entry.writes(), writes, "{entry:?}");
         }

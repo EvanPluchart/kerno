@@ -981,3 +981,25 @@ Still open (for the owner):
   without Kerno's second "Replace …" question; Linux keeps Kerno's question.
 - Still to do: the final captures (`m12-backup-simple-*`, `m12-restore-simple-*`), the owner's look at the format
   cards' size and the wording of the MySQL line.
+
+## 2026-11-20 — K27: an extensions manager per PostgreSQL database (the owner's request)
+
+- The owner did not like the extensions in the tree (fifty "not installed" rows, no description, no schema or
+  version, no update, nothing on requirements) and approved a manager per database. K27 in a worktree beside
+  K26: the tree lists installed extensions with their count; a tab per database lists every extension the
+  server has, with its description, versions, state, a search, filters with counts, the details read from the
+  catalog (schema, relocatable, versions, requirements, who may install it), and Install… (schema, version,
+  requirements with `CASCADE` said first), Update, Update to…, Move to schema…, Drop and Drop with cascade (K14's
+  list), each through the usual confirmation and the connection's rules, refusals in plain words first. Ways in:
+  the folder (double click, Enter, menu), an installed extension's menu, Tools ▸ Extensions…, the palette's
+  "Manage Extensions…" (replacing "Install Selected Extension…"). D-100.
+- Seen while working: the manager rendered offscreen in both themes (list, details, confirmation, empty search,
+  narrow group; temporary test, not committed). Fixed from the captures: the selected row out of sight, a version
+  marked "(default) (installed)", two sentences.
+- Tests: core and driver statements and reads (a scratch database each, the fixture's extensions untouched),
+  three unit tests of the tab, seven UI tests (six new in `ui_tests/extensions.rs`, one rewritten), each seen
+  failing under a mutation; `tools_menu.rs`'s database Tools ▸ line updated (K26's file, one assertion, agreed).
+  Whole `cargo test -p kerno`: 774 pass; `kerno-core` and `kerno-postgres` pass (both with the git-ignored
+  `tests/fixtures/generated` linked from the main checkout for the run: the worktree has no SSH keys or TLS
+  certificates of its own); fmt and clippy clean.
+- Still to do: the final captures (`m12-extensions-*`), the owner's look at the manager.

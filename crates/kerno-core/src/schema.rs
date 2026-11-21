@@ -224,7 +224,7 @@ pub struct EventInfo {
 }
 
 /// An extension (PostgreSQL).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtensionInfo {
     /// Name.
     pub name: String,
@@ -234,8 +234,65 @@ pub struct ExtensionInfo {
     pub default_version: Option<String>,
     /// Schema holding the extension's objects, when installed.
     pub schema: Option<String>,
-    /// Description.
+    /// Description: the comment of its control file.
     pub comment: Option<String>,
+    /// Every version the server has files for, oldest first.
+    pub versions: Vec<String>,
+    /// The versions the installed one can be updated to (the server's
+    /// update paths from it); empty when not installed.
+    pub update_targets: Vec<String>,
+    /// The extensions it requires (of the installed version, else of the
+    /// default one).
+    pub requires: Vec<String>,
+    /// Whether its objects can be moved to another schema after install.
+    pub relocatable: bool,
+    /// The schema its control file fixes, when it fixes one: it is
+    /// installed there and nowhere else.
+    pub fixed_schema: Option<String>,
+    /// Whether only a superuser may install it, unless [`Self::trusted`].
+    pub superuser: bool,
+    /// Whether a user with `CREATE` on the database may install it although
+    /// it asks for a superuser (PostgreSQL 13 and later; `false` before).
+    pub trusted: bool,
+}
+
+/// Where an extension stands in a database (K27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtensionState {
+    Installed,
+    /// Installed, and the server has a path to its default version.
+    UpdateAvailable,
+    Available,
+}
+
+impl ExtensionInfo {
+    pub fn state(&self) -> ExtensionState {
+        match (&self.installed_version, &self.default_version) {
+            (None, _) => ExtensionState::Available,
+            (Some(installed), Some(default))
+                if installed != default && self.update_targets.contains(default) =>
+            {
+                ExtensionState::UpdateAvailable
+            }
+            (Some(_), _) => ExtensionState::Installed,
+        }
+    }
+
+    /// Whether installing it takes a superuser.
+    pub fn needs_superuser(&self) -> bool {
+        self.superuser && !self.trusted
+    }
+}
+
+/// Orders extension versions as numbers where they are (`1.10` after `1.9`),
+/// as text elsewhere.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| -> Vec<(u64, String)> {
+        v.split(['.', '-'])
+            .map(|part| (part.parse().unwrap_or(u64::MAX), part.to_string()))
+            .collect()
+    };
+    parts(a).cmp(&parts(b))
 }
 
 /// Everything a schema contains, for the navigator.
@@ -587,6 +644,46 @@ impl ServerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K27: an update is offered only where the server has a path to the
+    /// default version; versions sort as numbers; a trusted extension needs
+    /// no superuser.
+    #[test]
+    fn extension_states_versions_and_who_may_install() {
+        let extension = |installed: Option<&str>, targets: &[&str]| ExtensionInfo {
+            name: "citext".into(),
+            installed_version: installed.map(str::to_string),
+            default_version: Some("1.6".into()),
+            update_targets: targets.iter().map(|t| t.to_string()).collect(),
+            ..ExtensionInfo::default()
+        };
+        assert_eq!(extension(None, &[]).state(), ExtensionState::Available);
+        assert_eq!(
+            extension(Some("1.6"), &[]).state(),
+            ExtensionState::Installed
+        );
+        assert_eq!(
+            extension(Some("1.4"), &["1.5", "1.6"]).state(),
+            ExtensionState::UpdateAvailable
+        );
+        // A different version with no way to the default one.
+        assert_eq!(
+            extension(Some("1.4"), &["1.5"]).state(),
+            ExtensionState::Installed
+        );
+
+        let mut versions = vec!["1.10", "1.9", "1.5", "1.12", "unpackaged"];
+        versions.sort_by(|a, b| compare_versions(a, b));
+        assert_eq!(versions, ["1.5", "1.9", "1.10", "1.12", "unpackaged"]);
+
+        let mut earth = ExtensionInfo {
+            superuser: true,
+            ..ExtensionInfo::default()
+        };
+        assert!(earth.needs_superuser());
+        earth.trusted = true;
+        assert!(!earth.needs_superuser());
+    }
 
     #[test]
     fn servers_are_named_with_their_product() {

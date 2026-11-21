@@ -661,7 +661,11 @@ async fn extension(session: Arc<dyn Session>, database: String) {
             .installed_version
     };
     assert_eq!(citext(inside.extensions().await.unwrap()), None);
-    exec_ok(&inside, &d.create_extension_sql("citext").unwrap()).await;
+    exec_ok(
+        &inside,
+        &d.create_extension_sql("citext", None, None, false).unwrap(),
+    )
+    .await;
     assert!(citext(inside.extensions().await.unwrap()).is_some());
     assert_eq!(
         scalar(&inside, "SELECT 'A'::citext = 'a'::citext").await,
@@ -669,5 +673,127 @@ async fn extension(session: Arc<dyn Session>, database: String) {
     );
     exec_ok(&inside, &d.drop_extension_sql("citext").unwrap()).await;
     assert_eq!(citext(inside.extensions().await.unwrap()), None);
+    inside.close().await;
+}
+
+/// K27: the list says what each extension is for and needs; one with a
+/// requirement installs with it (`CASCADE`); an older version updates along
+/// the server's path; a relocatable one moves. All in a scratch database:
+/// the fixture database's extensions never change.
+#[tokio::test]
+async fn extensions_say_what_they_need_install_with_cascade_update_and_move() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let database = common::scratch_schema("ext_manager");
+    let cleanup = [format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")];
+    cleaning_up(&session, &cleanup, manager(session.clone(), database)).await;
+}
+
+async fn manager(session: Arc<dyn Session>, database: String) {
+    use kerno_core::schema::{ExtensionInfo, ExtensionState};
+    exec_ok(&session, &format!("CREATE DATABASE {database}")).await;
+    let mut params = kerno_core::testing::params(common::ENGINE);
+    params.database = Some(database);
+    let inside = common::connect(&params).await.unwrap();
+    let d = inside.dialect();
+    let find = |extensions: &[ExtensionInfo], name: &str| {
+        extensions
+            .iter()
+            .find(|extension| extension.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} is available"))
+    };
+    let all = inside.extensions().await.unwrap();
+    // A new database has plpgsql only, which its control file pins to
+    // pg_catalog; the rest is available, with the server's description.
+    let plpgsql = find(&all, "plpgsql");
+    assert_eq!(plpgsql.state(), ExtensionState::Installed);
+    assert_eq!(plpgsql.fixed_schema.as_deref(), Some("pg_catalog"));
+    assert!(!plpgsql.relocatable);
+    let earth = find(&all, "earthdistance");
+    assert_eq!(earth.state(), ExtensionState::Available);
+    assert!(
+        earth
+            .comment
+            .as_deref()
+            .unwrap_or_default()
+            .contains("distance")
+    );
+    assert_eq!(earth.requires, ["cube"]);
+    // Not trusted on PostgreSQL 13 and later: a superuser only.
+    assert!(earth.needs_superuser());
+    let citext = find(&all, "citext");
+    assert!(citext.trusted && !citext.needs_superuser());
+    assert!(citext.relocatable && citext.fixed_schema.is_none());
+    assert!(
+        citext.versions.len() > 1 && citext.versions.last() == citext.default_version.as_ref(),
+        "{:?}",
+        citext.versions
+    );
+    assert_eq!(find(&all, "cube").state(), ExtensionState::Available);
+
+    // earthdistance brings cube with it, in the schema asked for.
+    exec_ok(&inside, "CREATE SCHEMA kerno_test_geo").await;
+    exec_ok(
+        &inside,
+        &d.create_extension_sql("earthdistance", Some("kerno_test_geo"), None, true)
+            .unwrap(),
+    )
+    .await;
+    let all = inside.extensions().await.unwrap();
+    for name in ["earthdistance", "cube"] {
+        let extension = find(&all, name);
+        assert_eq!(extension.state(), ExtensionState::Installed, "{name}");
+        assert_eq!(
+            extension.schema.as_deref(),
+            Some("kerno_test_geo"),
+            "{name}"
+        );
+    }
+
+    // The oldest citext the server has, then up to the default version.
+    let (oldest, default) = (
+        citext.versions[0].clone(),
+        citext.default_version.clone().unwrap(),
+    );
+    exec_ok(
+        &inside,
+        &d.create_extension_sql("citext", None, Some(&oldest), false)
+            .unwrap(),
+    )
+    .await;
+    let old = find(&inside.extensions().await.unwrap(), "citext");
+    assert_eq!(old.installed_version.as_deref(), Some(oldest.as_str()));
+    assert_eq!(old.state(), ExtensionState::UpdateAvailable);
+    assert!(old.update_targets.contains(&default), "{old:?}");
+    exec_ok(&inside, &d.update_extension_sql("citext", None).unwrap()).await;
+    let updated = find(&inside.extensions().await.unwrap(), "citext");
+    assert_eq!(updated.installed_version, Some(default));
+    assert_eq!(updated.state(), ExtensionState::Installed);
+    assert!(updated.update_targets.is_empty(), "{updated:?}");
+
+    // Relocatable: its objects move.
+    exec_ok(&inside, "CREATE SCHEMA kerno_test_moved").await;
+    exec_ok(
+        &inside,
+        &d.move_extension_sql("citext", "kerno_test_moved").unwrap(),
+    )
+    .await;
+    assert_eq!(
+        find(&inside.extensions().await.unwrap(), "citext")
+            .schema
+            .as_deref(),
+        Some("kerno_test_moved")
+    );
+    assert_eq!(
+        scalar(
+            &inside,
+            "SELECT n.nspname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE t.typname = 'citext'"
+        )
+        .await,
+        "kerno_test_moved"
+    );
     inside.close().await;
 }

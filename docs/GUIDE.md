@@ -20,6 +20,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
 - [Backup and restore](#backup-and-restore)
+- [PostgreSQL extensions](#postgresql-extensions)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
 - [Install](#install)
 - [Build from source](#build-from-source)
@@ -372,6 +373,32 @@ extra arguments, another user, **Save as task…**. **Simple view** goes back; w
 does not show was changed, it says which and asks before putting them back to their defaults. Tools ▸ Back up…
 on a schema or a table, a new task and a saved task open in the wizard; the global backup (`pg_dumpall`) and
 Execute script are wizards only.
+
+## PostgreSQL extensions
+
+Under each database of a PostgreSQL connection, the "Extensions" folder lists the extensions installed in it,
+with their version and, once opened, their number. Everything else is in the database's extensions manager: a
+double click or Enter on the folder, "Manage extensions…" in its menu, "Show in the extensions manager" on an
+installed extension, Tools ▸ Extensions… on the database, or "Manage Extensions…" in the palette (for the
+database selected in the tree, else the active tab's).
+
+The manager lists every extension the server has files for: its name, what it is for (the description its own
+files give), its version, and whether it is installed, has an update, or is available. Search over names and
+descriptions; filter All, Installed, Available or To update, each with its count. Select one to see the schema
+it is in or would go to, whether it can be moved later, the versions the server has, what it requires (and
+whether that is installed), and who may install it: a trusted extension any user who may create objects in the
+database, the others a superuser (servers before PostgreSQL 13 have no trusted extensions). An extension the
+server does not list is not on the server's machine yet: install its package there first (for example from
+your distribution's PostgreSQL packages), then it shows up.
+
+Install… takes the schema and the version picked above it (the server's defaults otherwise); what it requires
+and is not installed is named in the confirmation and installed with it (`CASCADE`). Update goes to the default
+version, "Update to…" to another one the server has a path to; "Move to schema…" is there when the extension
+allows it; Drop… lists what depends on it, and "Drop with cascade…" drops that too. Each shows its SQL first,
+follows the connection's rules (nothing on a read-only connection, a second click on production), can be
+cancelled while it runs, and a refusal says why in plain words before the server's message. Enter acts on the
+selected row (Install… or Update), the arrows move in the list, ⌘F goes to the search, and each row has its
+menu with Copy name. MySQL and MariaDB have no extensions.
 
 ## Where Kerno keeps its data
 

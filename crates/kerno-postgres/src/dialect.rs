@@ -292,10 +292,39 @@ impl Dialect for PgDialect {
         }
     }
 
-    fn create_extension_sql(&self, name: &str) -> Result<String> {
+    fn create_extension_sql(
+        &self,
+        name: &str,
+        schema: Option<&str>,
+        version: Option<&str>,
+        cascade: bool,
+    ) -> Result<String> {
+        let mut sql = format!("CREATE EXTENSION {}", self.quote_ident(name));
+        if let Some(schema) = schema {
+            sql += &format!(" SCHEMA {}", self.quote_ident(schema));
+        }
+        if let Some(version) = version {
+            sql += &format!(" VERSION {}", self.quote_string(version));
+        }
+        if cascade {
+            sql += " CASCADE";
+        }
+        Ok(sql)
+    }
+
+    fn update_extension_sql(&self, name: &str, version: Option<&str>) -> Result<String> {
+        let mut sql = format!("ALTER EXTENSION {} UPDATE", self.quote_ident(name));
+        if let Some(version) = version {
+            sql += &format!(" TO {}", self.quote_string(version));
+        }
+        Ok(sql)
+    }
+
+    fn move_extension_sql(&self, name: &str, schema: &str) -> Result<String> {
         Ok(format!(
-            "CREATE EXTENSION IF NOT EXISTS {}",
-            self.quote_ident(name)
+            "ALTER EXTENSION {} SET SCHEMA {}",
+            self.quote_ident(name),
+            self.quote_ident(schema)
         ))
     }
 
@@ -832,9 +861,38 @@ mod tests {
     #[test]
     fn extension_and_enum_statements() {
         let d = PgDialect;
+        // K27: at the server's defaults; in a schema, at a version, with
+        // what it requires; names quoted, the version a string.
         assert_eq!(
-            d.create_extension_sql("uuid-ossp").unwrap(),
-            "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\""
+            d.create_extension_sql("uuid-ossp", None, None, false)
+                .unwrap(),
+            "CREATE EXTENSION \"uuid-ossp\""
+        );
+        assert_eq!(
+            d.create_extension_sql("earthdistance", Some("geo"), Some("1.1"), true)
+                .unwrap(),
+            "CREATE EXTENSION \"earthdistance\" SCHEMA \"geo\" VERSION '1.1' CASCADE"
+        );
+        assert_eq!(
+            d.create_extension_sql("odd\"name", Some("my schema"), Some("1.0'beta"), false)
+                .unwrap(),
+            "CREATE EXTENSION \"odd\"\"name\" SCHEMA \"my schema\" VERSION '1.0''beta'"
+        );
+        assert_eq!(
+            d.create_extension_sql("citext", None, None, true).unwrap(),
+            "CREATE EXTENSION \"citext\" CASCADE"
+        );
+        assert_eq!(
+            d.update_extension_sql("citext", None).unwrap(),
+            "ALTER EXTENSION \"citext\" UPDATE"
+        );
+        assert_eq!(
+            d.update_extension_sql("citext", Some("1.6")).unwrap(),
+            "ALTER EXTENSION \"citext\" UPDATE TO '1.6'"
+        );
+        assert_eq!(
+            d.move_extension_sql("odd\"name", "Ext schema").unwrap(),
+            "ALTER EXTENSION \"odd\"\"name\" SET SCHEMA \"Ext schema\""
         );
         assert_eq!(
             d.drop_extension_sql("citext").unwrap(),

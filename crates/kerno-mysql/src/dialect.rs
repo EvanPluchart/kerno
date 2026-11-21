@@ -1202,7 +1202,9 @@ mod tests {
         // Extensions and standalone enums are PostgreSQL's.
         let t = TableRef::new("shop", "t");
         for result in [
-            mariadb.create_extension_sql("x"),
+            mariadb.create_extension_sql("x", None, None, false),
+            mariadb.update_extension_sql("x", None),
+            mariadb.move_extension_sql("x", "s"),
             mariadb.drop_extension_sql("x"),
             mariadb.create_enum_sql(&t, &[]),
             mariadb.add_enum_value_sql(&t, "a", None),

@@ -60,6 +60,8 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
             "Open dashboard, Session manager, Lock manager",
             "Create new task…, Tasks",
         ];
+        // K27: a database also leads to its extensions manager.
+        let database_tail = ["Foreign data wrappers…, Extensions…", tail[1], tail[2]];
         let app = connected(cx, Engine::Postgres);
         app.open_path(cx, &table);
         app.open_path(cx, &matview);
@@ -71,7 +73,7 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
                 "Analyze…, Vacuum…",
             ]
         );
-        assert_eq!(database[2..], tail);
+        assert_eq!(database[2..], database_tail);
         // A schema has no maintenance tool of its own: no group for it.
         let schema_menu = app.tool_menu(cx, &schema);
         assert_eq!(
@@ -117,7 +119,7 @@ fn the_tools_submenu_says_what_applies_per_engine_and_kind_of_node(cx: &mut Test
             database[1].starts_with("Analyze… (read-only connection)"),
             "{database:?}"
         );
-        assert_eq!(database[2..], tail);
+        assert_eq!(database[2..], database_tail);
         assert_eq!(
             app.tool_menu(cx, &table)[1],
             "Analyze… (read-only connection), Vacuum… (read-only connection), Truncate… \

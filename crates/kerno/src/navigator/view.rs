@@ -127,6 +127,11 @@ pub enum NavigatorEvent {
     },
     /// Tell the user something went otherwise than asked.
     Warn(String),
+    /// Open the extensions manager of a database, on `extension` (K27).
+    ManageExtensions {
+        target: Target,
+        extension: Option<String>,
+    },
     /// Open a Tools ▸ entry (not a maintenance tool: the navigator opens
     /// those) on `target`: a wizard on the database, with only `tables`
     /// (a table's backup) or the schema of `target` ticked, the
@@ -671,6 +676,55 @@ impl Navigator {
         if let Some(id) = id {
             self.refresh(connection, &id, cx);
         }
+    }
+
+    /// Reads the "Extensions" folder of `database` again, when the tree
+    /// shows it loaded: what the extensions manager changed (K27).
+    pub fn refresh_extensions(&mut self, connection: &str, database: &str, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree(connection) else {
+            return;
+        };
+        fn find(tree: &model::Tree, items: &[model::Item], database: &str) -> Option<String> {
+            items.iter().find_map(|item| {
+                let node = tree.node(&item.id)?;
+                if node.kind == NodeKind::Group(Group::Extensions) && node.database == database {
+                    matches!(node.children, model::Children::Loaded(_)).then(|| item.id.clone())
+                } else {
+                    find(tree, &item.children, database)
+                }
+            })
+        }
+        if let Some(id) = find(tree, &tree.items(), database) {
+            self.refresh(connection, &id, cx);
+        }
+    }
+
+    /// Whether a node of a connection's tree is selected (not a folder or a
+    /// connection row).
+    pub fn has_selected_object(&self, cx: &App) -> bool {
+        self.tree_state
+            .read(cx)
+            .selected_item()
+            .is_some_and(|item| self.object(&item.id).is_some())
+    }
+
+    /// Opens the extensions manager of the database `node` is in, on the
+    /// extension `node` is, if it is one (K27); MySQL has none.
+    fn manage_extensions(&mut self, connection: &str, node: &Node, cx: &mut Context<Self>) {
+        if !self.has_schemas(connection, cx) {
+            cx.emit(NavigatorEvent::Warn(
+                "Extensions are PostgreSQL's: MySQL and MariaDB have none.".into(),
+            ));
+            return;
+        }
+        let extension = match &node.kind {
+            NodeKind::Extension { name } => Some(name.clone()),
+            _ => None,
+        };
+        cx.emit(NavigatorEvent::ManageExtensions {
+            target: Self::target_of(connection, node, false),
+            extension,
+        });
     }
 
     /// Stops the reads of the tree of `connection` and closes its sessions;
@@ -1260,11 +1314,13 @@ impl Navigator {
             Action::CreateDatabase if self.offers_database_options(connection, cx) => {
                 self.create_database_form(id, window, cx);
             }
+            Action::ManageExtensions | Action::ShowInExtensions => {
+                self.manage_extensions(connection, &node, cx)
+            }
             Action::Rename
             | Action::Drop
             | Action::CreateSchema
             | Action::CreateDatabase
-            | Action::InstallExtension
             | Action::CreateEnum
             | Action::AddEnumValue
             | Action::RenameEnumValue
@@ -2218,29 +2274,6 @@ impl Navigator {
                     "Created the database.".to_string(),
                 )
             }
-            Action::InstallExtension => {
-                let NodeKind::Extension {
-                    name: extension, ..
-                } = &node.kind
-                else {
-                    return;
-                };
-                let Ok(sql) = dialect_of.dialect().create_extension_sql(extension) else {
-                    return;
-                };
-                (
-                    format!("Install extension “{name}”?"),
-                    format!(
-                        "Its types, functions and operators are added to the database “{}”.",
-                        node.database
-                    ),
-                    Statement::Fixed(sql),
-                    "Install",
-                    false,
-                    After::Refresh(above.clone()),
-                    format!("Installed extension {name}."),
-                )
-            }
             Action::CreateEnum => {
                 let Some(schema) = node.schema.clone() else {
                     return;
@@ -2355,10 +2388,6 @@ impl Navigator {
                 "Adding the value…".into(),
                 "The value was not added.".into(),
             ),
-            Action::InstallExtension => (
-                format!("Installing extension {name}…"),
-                format!("The extension “{name}” was not installed."),
-            ),
             Action::CreateSchema => (
                 "Creating the schema…".into(),
                 "The schema was not created.".into(),
@@ -2458,26 +2487,7 @@ impl Navigator {
         let database = self
             .has_schemas(connection, cx)
             .then(|| database.to_string());
-        let opening = self
-            .connections
-            .read(cx)
-            .open_session(connection, database, cx);
-        cx.spawn(async move |_, cx| {
-            let session = opening.await?;
-            // Dropped with this task, when the dialog goes first.
-            let (_waiting, gone) = tokio::sync::oneshot::channel::<()>();
-            cx.update(|cx| {
-                bridge::spawn(cx, async move {
-                    let found = tokio::select! {
-                        found = session.dependents(&change) => found,
-                        _ = gone => Err(Error::Cancelled),
-                    };
-                    session.close().await;
-                    found
-                })
-            })
-            .await
-        })
+        read_dependents(&self.connections, connection, database, change, cx)
     }
 
     /// Runs a confirmed statement on a session of its own, closed once it
@@ -2810,8 +2820,13 @@ impl Navigator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((connection, node)) = self.selected_node(window, cx) {
-            self.run_entry(&connection, action, &node, window, cx);
+        match self.selected_node(window, cx) {
+            // Any node of a database leads to its extensions (K27).
+            Some((connection, node)) if action == Action::ManageExtensions => {
+                self.manage_extensions(&connection, &node, cx)
+            }
+            Some((connection, node)) => self.run_entry(&connection, action, &node, window, cx),
+            None => {}
         }
     }
 
@@ -3760,6 +3775,36 @@ fn connection_of(id: &str) -> Option<&str> {
         RowId::Connection(connection) | RowId::Object { connection, .. } => Some(connection),
         RowId::Folder(_) | RowId::FolderNote(_) => None,
     }
+}
+
+/// What else `change` reaches (C11), read on a session of its own on
+/// `database` (C3); the task dropped (the dialog closed, answered) stops it
+/// on the server and closes the session. The tree's drops and the
+/// extensions manager's (K27) read it this way.
+pub fn read_dependents(
+    connections: &Entity<Connections>,
+    connection: &str,
+    database: Option<String>,
+    change: Change,
+    cx: &mut App,
+) -> Task<kerno_core::Result<Vec<Dependent>>> {
+    let opening = connections.read(cx).open_session(connection, database, cx);
+    cx.spawn(async move |cx| {
+        let session = opening.await?;
+        // Dropped with this task, when the dialog goes first.
+        let (_waiting, gone) = tokio::sync::oneshot::channel::<()>();
+        cx.update(|cx| {
+            bridge::spawn(cx, async move {
+                let found = tokio::select! {
+                    found = session.dependents(&change) => found,
+                    _ = gone => Err(Error::Cancelled),
+                };
+                session.close().await;
+                found
+            })
+        })
+        .await
+    })
 }
 
 /// A row of the forest as the tree widget takes it. What a closed row

@@ -16,6 +16,7 @@ mod engine_logo;
 mod environments_view;
 mod erd_tab;
 mod export_dialog;
+mod extensions_tab;
 mod fdw_dialog;
 mod folder_dialog;
 mod import_dialog;

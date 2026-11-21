@@ -488,7 +488,11 @@ impl FdwDialog {
 
     /// Installs a wrapper's extension, once confirmed.
     fn install(&mut self, extension: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Ok(sql) = self.meta.dialect().create_extension_sql(&extension) else {
+        let Ok(sql) = self
+            .meta
+            .dialect()
+            .create_extension_sql(&extension, None, None, false)
+        else {
             return;
         };
         let view = cx.entity();

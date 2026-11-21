@@ -265,9 +265,33 @@ pub trait Dialect: Send + Sync {
     }
 
     /// The statement that installs the extension `name` in the connected
-    /// database. `Unsupported` on engines without extensions.
-    fn create_extension_sql(&self, name: &str) -> Result<String> {
-        let _ = name;
+    /// database: in `schema` and at `version` when given (the server's
+    /// current schema and default version otherwise), with the extensions
+    /// it requires when `cascade`. `Unsupported` on engines without
+    /// extensions.
+    fn create_extension_sql(
+        &self,
+        name: &str,
+        schema: Option<&str>,
+        version: Option<&str>,
+        cascade: bool,
+    ) -> Result<String> {
+        let _ = (name, schema, version, cascade);
+        Err(Error::Unsupported("extensions".into()))
+    }
+
+    /// The statement that updates the installed extension `name` to
+    /// `version`, or to its default version when `None`. `Unsupported` on
+    /// engines without extensions.
+    fn update_extension_sql(&self, name: &str, version: Option<&str>) -> Result<String> {
+        let _ = (name, version);
+        Err(Error::Unsupported("extensions".into()))
+    }
+
+    /// The statement that moves the objects of the extension `name` to
+    /// `schema`. `Unsupported` on engines without extensions.
+    fn move_extension_sql(&self, name: &str, schema: &str) -> Result<String> {
+        let _ = (name, schema);
         Err(Error::Unsupported("extensions".into()))
     }
 
@@ -1028,7 +1052,9 @@ mod tests {
         let view = ObjectRef::Relation(t.clone(), RelationKind::View);
         for result in [
             d.replace_source_sql(&view, "CREATE VIEW v AS SELECT 1"),
-            d.create_extension_sql("x"),
+            d.create_extension_sql("x", Some("s"), Some("1.0"), true),
+            d.update_extension_sql("x", None),
+            d.move_extension_sql("x", "s"),
             d.drop_extension_sql("x"),
             d.create_enum_sql(&t, &["a".into()]),
             d.add_enum_value_sql(&t, "a", None),
