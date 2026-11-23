@@ -40,7 +40,7 @@ new enum labels, and a column type changed under a view (the view dropped and cr
 
 Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47; J18, D-069), read-only; still to come: editing the schema
 from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
-**AI assistant** (TOOL-24; J17, D-068), opt-in and local first; left for later: streaming answers, per-connection opt-out, tool calls.
+**AI assistant** (TOOL-24; J17, D-068), opt-in and local first; streamed answers came with K51 (D-120); left for later: per-connection opt-out, tool calls.
 Their FEATURES rows are J18 and J17.
 **SQLite** (item 3; K29, D-102), the first engine beyond v1: a `kerno-sqlite` crate on the bundled `rusqlite`,
 a connection that is a file (`ConnectionConfig::file`), `has_schemas` false with one database `main`, cancel as
@@ -56,7 +56,7 @@ starts when the owner names it, and all keep J17's rules (opt-in, the endpoint t
 unless sample rows are ticked, "What is sent", nothing run by itself):
 
 1. **A conversation in a side panel.** Follow-ups refine the answer ("add the date filter", "no, by
-   customer"), with the editor's query as context.
+   customer"), with the editor's query as context. Done (K51, D-120), answers streamed.
 2. **Ask in the editor.** A shortcut opens a field at the cursor; the proposal is shown as a before / after
    diff to accept or refuse.
 3. **Fix an error in one click.** From a failed statement, the fix is proposed as a diff in the editor, with

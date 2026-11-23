@@ -564,6 +564,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::submenu(menu(
                     "AI Assistant",
                     vec![
+                        command("toggle_ai_panel"),
+                        command("ai_new_conversation"),
+                        separator(),
                         command("ai_write_sql"),
                         command("ai_explain_query"),
                         command("ai_explain_plan"),

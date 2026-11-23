@@ -162,6 +162,10 @@ pub struct Settings {
     pub value_panel: bool,
     /// Its width, in points.
     pub value_panel_width: f32,
+    /// The AI assistant's panel is shown at the right of the window (K51).
+    pub ai_panel: bool,
+    /// Its width, in points (`ai_view::WIDTHS`).
+    pub ai_panel_width: f32,
     /// Where saved passwords are kept (K33, D-106): Kerno's file by default
     /// on macOS, the Secret Service elsewhere.
     pub secret_store: StoreChoice,
@@ -268,6 +272,8 @@ impl Default for Settings {
             ai: kerno_core::ai::AiSettings::default(),
             value_panel: false,
             value_panel_width: 380.0,
+            ai_panel: false,
+            ai_panel_width: 400.0,
             secret_store: StoreChoice::default(),
         }
     }
@@ -313,6 +319,11 @@ impl Settings {
             self.value_panel_width,
             &VALUE_PANEL_WIDTHS,
             default.value_panel_width,
+        );
+        self.ai_panel_width = clamp(
+            self.ai_panel_width,
+            &crate::ai_view::WIDTHS,
+            default.ai_panel_width,
         );
         self.format = self.format.sanitized();
         if !matches!(self.tab_size, 2 | 4) {
@@ -492,6 +503,8 @@ mod tests {
             },
             value_panel: true,
             value_panel_width: 512.0,
+            ai_panel: true,
+            ai_panel_width: 333.0,
             secret_store: StoreChoice::Keychain,
         };
         changed.save(&storage).unwrap();
@@ -687,10 +700,11 @@ mod tests {
         storage
             .set_setting(
                 KEY,
-                &serde_json::json!({"ui_font_size": 90, "grid_font_size": 1, "tab_size": 3, "null_text": " "}),
+                &serde_json::json!({"ui_font_size": 90, "grid_font_size": 1, "tab_size": 3, "null_text": " ", "ai_panel_width": 50}),
             )
             .unwrap();
         let loaded = Settings::load(&storage);
+        assert_eq!(loaded.ai_panel_width, 320.0);
         assert_eq!(loaded.ui_font_size, 18.0);
         assert_eq!(loaded.grid_font_size, 11.0);
         assert_eq!(loaded.tab_size, 2);

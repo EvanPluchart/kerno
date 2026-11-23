@@ -118,3 +118,76 @@ fn an_endpoint_that_is_down_is_said_in_plain_words() {
     assert!(text.contains("127.0.0.1"), "{text}");
     assert!(!text.contains("sk-kerno-down"), "{text}");
 }
+
+/// K51: an answer written as it comes (server-sent events) is told piece by piece and comes
+/// back whole, its reasoning left out; a server that does not stream gives it at once.
+#[test]
+fn a_streamed_answer_arrives_piece_by_piece() {
+    use std::time::Duration;
+    let fake = FakeAi::streaming(
+        &[
+            "<think>maybe DELETE</think>Here:\n```sql\nSELECT ",
+            "1;\n```",
+        ],
+        Duration::from_millis(50),
+    );
+    let mut pieces = Vec::new();
+    let answer = ai::chat_stream(
+        &settings(&fake, true),
+        None,
+        &payload(),
+        &ai::Stopper::default(),
+        &mut |piece| pieces.push(piece.to_string()),
+    )
+    .unwrap();
+    assert_eq!(answer, "Here:\n```sql\nSELECT 1;\n```");
+    assert_eq!(pieces.len(), 2);
+    assert_eq!(fake.answered(), 1);
+    // The payload asks for it.
+    let body: serde_json::Value = serde_json::from_slice(&fake.requests()[0].body).unwrap();
+    assert_eq!(body["stream"], true);
+    // A server that answers whole.
+    let whole = FakeAi::start("```sql\nSELECT 2;\n```");
+    let mut pieces = Vec::new();
+    let answer = ai::chat_stream(
+        &settings(&whole, true),
+        None,
+        &payload(),
+        &ai::Stopper::default(),
+        &mut |piece| pieces.push(piece.to_string()),
+    )
+    .unwrap();
+    assert_eq!(answer, "```sql\nSELECT 2;\n```");
+    assert_eq!(pieces, [answer]);
+}
+
+/// K51: Stop in the middle of a streamed answer closes the connection at once: the call ends
+/// with `Stopped` after the pieces that came, and the endpoint sees the client go.
+#[test]
+fn a_streamed_answer_is_stopped_in_the_middle() {
+    use std::time::{Duration, Instant};
+    // The second piece would come long after the test.
+    let fake = FakeAi::streaming(&["SELECT", " 1;"], Duration::from_secs(120));
+    let stop = ai::Stopper::default();
+    let stopper = stop.clone();
+    let started = Instant::now();
+    let mut pieces = Vec::new();
+    let answer = ai::chat_stream(
+        &settings(&fake, true),
+        None,
+        &payload(),
+        &stop,
+        &mut |piece| {
+            pieces.push(piece.to_string());
+            stopper.stop();
+        },
+    );
+    assert_eq!(answer, Err(AiError::Stopped));
+    assert_eq!(pieces, ["SELECT"]);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.closed() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!((fake.closed(), fake.answered()), (1, 0));
+}

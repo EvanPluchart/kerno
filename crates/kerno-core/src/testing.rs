@@ -580,6 +580,26 @@ impl FakeAi {
 
     /// A fake answering `answer` after `delay`.
     pub fn start_with(answer: &str, delay: Duration) -> Self {
+        Self::scripted(vec![Reply::Whole(answer.to_string())], delay)
+    }
+
+    /// A fake answering its chat requests with `answers` in turn (the last one again after).
+    pub fn start_answers(answers: &[&str]) -> Self {
+        let replies = answers
+            .iter()
+            .map(|a| Reply::Whole(a.to_string()))
+            .collect();
+        Self::scripted(replies, Duration::ZERO)
+    }
+
+    /// A fake that writes its answer as server-sent events, one per piece of `pieces`, `gap`
+    /// apart, then `[DONE]` (K51).
+    pub fn streaming(pieces: &[&str], gap: Duration) -> Self {
+        let pieces = pieces.iter().map(|p| p.to_string()).collect();
+        Self::scripted(vec![Reply::Stream(pieces, gap)], Duration::ZERO)
+    }
+
+    fn scripted(replies: Vec<Reply>, delay: Duration) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake AI");
         listener
             .set_nonblocking(true)
@@ -587,7 +607,7 @@ impl FakeAi {
         let port = listener.local_addr().expect("the fake's port").port();
         let log = std::sync::Arc::new(std::sync::Mutex::new(AiLog::default()));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let (shared, answer) = (log.clone(), answer.to_string());
+        let (shared, replies) = (log.clone(), std::sync::Arc::new(replies));
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -603,8 +623,8 @@ impl FakeAi {
                             continue;
                         };
                         shared.lock().unwrap().connections += 1;
-                        let (log, answer) = (shared.clone(), answer.clone());
-                        tokio::spawn(fake_ai_serve(stream, log, answer, delay));
+                        let (log, replies) = (shared.clone(), replies.clone());
+                        tokio::spawn(fake_ai_serve(stream, log, replies, delay));
                     }
                 };
                 tokio::select! {
@@ -646,10 +666,35 @@ impl FakeAi {
     }
 }
 
+/// What the fake answers a chat request.
+#[derive(Clone)]
+enum Reply {
+    Whole(String),
+    /// Server-sent events, one per piece, this long apart.
+    Stream(Vec<String>, Duration),
+}
+
+/// Waits `delay` unless the client closes the connection first (then `true`).
+async fn held_until_gone(stream: &mut tokio::net::TcpStream, delay: Duration) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0; 1024];
+    let held = tokio::time::sleep(delay);
+    tokio::pin!(held);
+    loop {
+        tokio::select! {
+            () = &mut held => return false,
+            read = stream.read(&mut buffer) => match read {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => {}
+            },
+        }
+    }
+}
+
 async fn fake_ai_serve(
     mut stream: tokio::net::TcpStream,
     log: std::sync::Arc<std::sync::Mutex<AiLog>>,
-    answer: String,
+    replies: std::sync::Arc<Vec<Reply>>,
     delay: Duration,
 ) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -686,27 +731,55 @@ async fn fake_ai_serve(
         }
     }
     let models = line.contains("/models");
-    log.lock().unwrap().requests.push(AiRequest {
-        line,
-        headers,
-        body,
-    });
-    // The delay, unless the client closes the connection first.
-    let held = tokio::time::sleep(delay);
-    tokio::pin!(held);
-    let gone = loop {
-        tokio::select! {
-            () = &mut held => break false,
-            read = stream.read(&mut buffer) => match read {
-                Ok(0) | Err(_) => break true,
-                Ok(_) => {}
-            },
-        }
+    let reply = {
+        let mut log = log.lock().unwrap();
+        let asked = (log.requests.iter())
+            .filter(|request| !request.line.contains("/models"))
+            .count();
+        log.requests.push(AiRequest {
+            line,
+            headers,
+            body,
+        });
+        replies[asked.min(replies.len() - 1)].clone()
     };
-    if gone {
+    // The delay, unless the client closes the connection first.
+    if held_until_gone(&mut stream, delay).await {
         log.lock().unwrap().closed += 1;
         return;
     }
+    let answer = match reply {
+        Reply::Stream(pieces, gap) if !models => {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            for (index, piece) in pieces.iter().enumerate() {
+                if index > 0 && held_until_gone(&mut stream, gap).await {
+                    log.lock().unwrap().closed += 1;
+                    return;
+                }
+                let event =
+                    serde_json::json!({"choices": [{"index": 0, "delta": {"content": piece}}]});
+                if stream
+                    .write_all(format!("data: {event}\n\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    log.lock().unwrap().closed += 1;
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            let _ = stream.write_all(b"data: [DONE]\n\n").await;
+            let _ = stream.shutdown().await;
+            log.lock().unwrap().answered += 1;
+            return;
+        }
+        Reply::Stream(pieces, _) => pieces.concat(),
+        Reply::Whole(answer) => answer,
+    };
     let reply = if models {
         serde_json::json!({"object": "list", "data": [{"id": "other-model"}, {"id": "fake-model"}]})
     } else {

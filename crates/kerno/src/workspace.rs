@@ -5766,6 +5766,7 @@ impl Workspace {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(mode.label())
                     }))
+                    .children(crate::ai_view::status_item(cx))
                     .children(self.update_item(cx))
                     .when(memory_only, |this| {
                         this.child(self.render_status_item(
@@ -6518,6 +6519,15 @@ impl Workspace {
                 QueryTab::set_stacked(!AppState::get(cx).settings.stack_results, window, cx)
             }),
         )
+        // K51: the AI panel at the right of the window, from anywhere.
+        .on_action(cx.listener(|this, _: &actions::ToggleAiPanel, window, cx| {
+            crate::ai_view::toggle(this.active_query_tab().cloned(), window, cx)
+        }))
+        .on_action(
+            cx.listener(|this, _: &actions::AiNewConversation, window, cx| {
+                crate::ai_view::new_conversation(this.active_query_tab().cloned(), window, cx)
+            }),
+        )
         // J17: an "AI: …" command run outside a query tab (a query tab
         // that has the keyboard takes it first).
         .on_action(cx.listener(|this, _: &actions::AiWriteSql, window, cx| {
@@ -7076,7 +7086,14 @@ impl Render for Workspace {
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
 
-        let main = resizable_panel().child(self.render_tabs(cx));
+        // The AI assistant's panel at the right of the tabs (K51).
+        let tabs = self.render_tabs(cx).into_any_element();
+        let main = resizable_panel().child(crate::ai_view::beside(
+            tabs,
+            self.active_query_tab(),
+            window,
+            cx,
+        ));
         let body = if sidebar_visible {
             h_resizable("workspace")
                 .child(

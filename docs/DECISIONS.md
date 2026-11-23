@@ -3659,3 +3659,47 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   2,530 bytes before, 3,510 after (`kerno-postgres` `ai_context::the_shop_schema_before_and_after`).
 - **Waiting.** While structures are read the preview says "(reading the tables' keys and indexes…)" and Send
   waits, as for sample rows. A table that cannot be read is described by its catalog names and types.
+
+## D-120 — The AI assistant as a conversation in a panel at the right of the window (K51; 2026-11-23)
+
+- **Where.** A panel at the right of the window, beside the tabs (under the toolbar, over the status bar),
+  as DBeaver's AI Chat is a view of the workbench, not of an editor. It shows the conversation of the active
+  query tab; with no query tab active it says that a conversation belongs to one. Shown and hidden by "AI:
+  Show or Hide the Assistant" (⇧⌘J, Ctrl+Shift+J on Linux; palette, Query ▸ AI Assistant), its Close button
+  and the status bar's "AI" entry (there while the assistant is on or the panel shown). Shown and width are
+  settings (`ai_panel`, `ai_panel_width`, 320 to 720 points, 400 by default), kept across runs.
+- **One conversation per query tab, for the run only.** It lives in the tab (`QueryTab::ai_chat`) and goes
+  with it: closing the tab stops its request in flight. It is never written to disk: it holds the model's
+  text and the user's questions, the simplest way to keep nothing by surprise, and nothing to clear in
+  Settings. "New conversation" (head of the panel, palette) clears the active tab's.
+- **Messages.** One builder, `ai::build_chat(context, earlier turns, message, model)`; `build_payload` is it
+  with no turn (D-068's "only way a body is made" holds). The system message is the rules and the schema
+  context, once per send; each action's instruction moved from the system message into its user turn
+  (`Action::message`), so a conversation can mix actions and plain follow-ups. Only whole exchanges are
+  history: a question stopped or failed is shown with its note and not sent again.
+- **Budget.** At most 20 earlier turns and 40,000 characters of them go with a message; beyond, the oldest
+  exchanges are left out whole (the history never starts with an answer) and the thread says "Earlier
+  messages are no longer sent" at that place. Nothing is summarised by the model. The new message always
+  goes; the editor's query in it is cut at 20,000 characters and says so.
+- **The editor's query** (the selection, else the statement at the cursor, as Run statement takes it) goes
+  with a plain message or a Write SQL as a chip, on at each new message, removable for one. Not with Explain
+  query, plan or error, whose statement is their subject. It is read again when the editor's selection or
+  length changed while the panel shows (a comparison per frame, the split only then), and at Send; in a
+  script over 1,000,000 characters only a selection is taken.
+- **Sample rows** stay opt-in per message and go in that send's system message only. The model's answer to
+  that message may quote them, and that answer goes back as a turn with the next messages, to the same
+  endpoint: the owner's to veto (the other way is to leave such an exchange out of the history).
+- **The four actions** ("AI: Write SQL…", "Explain query", "Explain plan", "Explain error", and the two
+  buttons) open the panel on their tab with the message ready (its subject as a chip, the field focused);
+  none sends by itself, as before. The panel of one request inside the query tab is gone.
+- **Insert** (in place of the editor's selection, or on its own line at the cursor), **Replace** (the
+  selection, else the statement at the cursor; its tooltip names it; else as Insert) and **Copy** under each
+  closed SQL block of a whole answer; each edit one undo step, nothing run. A proposed fix is now inserted at
+  the cursor like any SQL (Replace puts it in place of the failed statement), no longer after the text.
+- **Streaming, built.** Every chat asks `"stream": true`; an answer sent as server-sent events is read as it
+  comes (`ai::chat_stream`), within the same 4 MB and 5 minutes; a server that answers in one JSON body is
+  read as before. Stop closes the connection at once; what came of the answer is dropped (only whole answers
+  are kept and sent again) and "Stopped" said. A model's `<think>` is left out while it arrives too. Text is
+  drawn as prose and code blocks only: no markup, no link, no image.
+- **Keyboard**: Enter sends, Shift+Enter makes a line (the kit's `submit_on_enter`), Escape gives the
+  keyboard back to the editor.

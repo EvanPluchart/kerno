@@ -338,6 +338,9 @@ fn switching_the_active_endpoint_switches_where_the_next_request_goes(cx: &mut T
     app.click(cx, "ai-endpoint-picker");
     app.click_label(cx, "Second · other-model");
     assert_eq!(settings_now(cx).ai.endpoint, second.base());
+    // K51: the next message of the conversation.
+    app.click(cx, "ai-sentence");
+    app.type_text(cx, "count them again");
     send_and_wait(&app, cx);
     assert_eq!((first.requests().len(), second.requests().len()), (1, 1));
     let body = String::from_utf8(second.requests()[0].body.clone()).unwrap();
@@ -352,6 +355,8 @@ fn switching_the_active_endpoint_switches_where_the_next_request_goes(cx: &mut T
     app.tap(cx, ("ai-use", 0usize));
     assert_eq!(settings_now(cx).ai.endpoint, first.base());
     app.press(cx, &["escape"]);
+    app.click(cx, "ai-sentence");
+    app.type_text(cx, "and once more");
     let panel = panel(&app, cx).unwrap();
     app.step(cx, |window, cx| {
         panel.update(cx, |panel, cx| panel.send(window, cx))

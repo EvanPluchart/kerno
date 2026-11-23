@@ -199,6 +199,26 @@ The assistant is off until **Settings → AI ▸ Enable the AI assistant** is ti
 request is ever made, not even Detect or Test: its entries say "turn on in Settings → AI" and do nothing.
 Import and Add by hand work while it is off: they read only files and what you type.
 
+### The conversation panel
+
+The assistant answers in a panel at the right of the window (**AI: Show or Hide the Assistant**, ⇧⌘J,
+Ctrl+Shift+J on Linux; also Query ▸ AI Assistant, the palette and the **AI** entry of the status bar). Its
+width is yours: drag its edge, between 320 and 720 points; it is remembered. Each query tab has its own
+conversation, kept while the tab is open and never written to disk; switching tabs switches the
+conversation, and **New conversation** clears it.
+
+- Type a question or describe a query, then **Enter** (Shift+Enter makes a new line; Escape goes back to
+  the editor). Follow-ups ("add the date filter", "no, by customer") go with the earlier messages, so the
+  model refines its own answer. A long conversation sends its latest messages only (20 at most, 40,000
+  characters): the thread marks where "Earlier messages are no longer sent".
+- **The editor's query** (the selection, else the statement at the cursor) goes with a message as a chip;
+  click its × to leave it out of that message.
+- **AI: Write SQL…**, **Explain query**, **Explain plan**, **Explain error** and the **Explain … with AI**
+  buttons open the panel with that request ready: you send it.
+- Answers appear as they are written when the server streams them; **Stop** closes the request and drops
+  what came. Under each SQL block: **Insert** (in place of the selection, or on its own line at the cursor),
+  **Replace** (the selection, else the statement at the cursor) and **Copy**. Nothing runs until you run it.
+
 ### Endpoints
 
 Settings → AI keeps several named endpoints, any OpenAI-compatible server: one is active, and requests go to
@@ -244,9 +264,11 @@ type, by name or id). **List models** fills the list from the endpoint; an impor
 
 ### What a request holds
 
-- the instruction for the action, and your sentence, the statement (the selection or the one at the
-  cursor), the plan on screen, or the statement and the server's error message (which may quote a value:
-  the preview shows it before you send);
+- your message: your words, with the instruction of the action that opened it and its subject (the
+  statement, the plan on screen, or the statement and the server's error message, which may quote a value:
+  the preview shows it before you send), and the editor's query unless you removed its chip;
+- the earlier messages of the conversation and the model's answers to them, within the limit above (an
+  answer to a message sent with sample rows may quote them);
 - the engine, its version and the current database; the names of the schemas; the tables the statement or
   the sentence names, in the order it names them (else the tables of the tab's schema): their names, column
   names and types and foreign keys, 200 tables at most with their columns, then names only;
@@ -254,17 +276,16 @@ type, by name or id). **List models** fills the list from the endpoint; an impor
   meanwhile): which columns refuse NULL (`not null`), the primary key, the foreign keys and the indexes,
   one line each under the table's name (100 columns, 12 keys and 12 indexes a table, the rest counted). Never
   a default, a comment, a check or a count of rows;
-- rows only when you tick **Include sample rows (first 5 rows of the tables above)** for that request (up to
-  10 tables); the tick is off again at every new request.
+- rows only when you tick **Include sample rows (first 5 rows of the tables above)** for that message (up to
+  10 tables); the tick is off again at every new message.
 
 **What is sent…** in the panel shows the exact bytes before you send them; Settings → AI ▸ **What was sent**
 lists every request of the session (time, endpoint, body), in memory only. The key goes as `Authorization:
 Bearer …` and nowhere else (previews and the log show `Bearer ***`). The answer is shown as text: nothing in it
 runs or opens anything. Models that think aloud (Qwen, DeepSeek, GLM variants) have their reasoning left out,
 whether it comes in its own field or between `<think>` and `</think>`: the panel, Copy and Insert get the
-answer only. **Insert** puts its SQL in the editor (at the cursor, selected, one undo step; a proposed fix goes
-after your text as a new statement) and you run it yourself, through the usual confirmations, read-only and
-production rules. An answer may take up to 5 minutes (a reasoning model on a server of your network thinks
+answer only. **Insert** and **Replace** put a block's SQL in the editor (selected, one undo step) and you run
+it yourself, through the usual confirmations, read-only and production rules. An answer may take up to 5 minutes (a reasoning model on a server of your network thinks
 before it answers); **Stop** closes the request at once.
 
 ## Vim mode

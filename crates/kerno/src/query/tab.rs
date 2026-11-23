@@ -7592,6 +7592,58 @@ impl QueryTab {
                 }
             },
         };
+        // K51: the panel beside the window, on this tab's conversation, the
+        // request ready in its field (sent when the user sends it); once this
+        // tab is no longer being updated.
+        let (tab, draft) = (
+            cx.entity(),
+            crate::ai_view::Draft {
+                action: Some(action),
+                text: String::new(),
+            },
+        );
+        window.defer(cx, move |window, cx| {
+            crate::ai_view::open(&tab, draft, window, cx)
+        });
+    }
+
+    /// This tab's AI conversation, made at its first use (K51).
+    pub fn ai_chat(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::ai_view::AiPanel> {
+        if let Some(panel) = &self.ai {
+            return panel.clone();
+        }
+        let (tab, editor, facts) = (
+            cx.entity().downgrade(),
+            self.editor.clone(),
+            self.ai_facts(cx),
+        );
+        let panel = cx.new(|cx| crate::ai_view::AiPanel::new(tab, editor, facts, window, cx));
+        self.ai = Some(panel.clone());
+        panel
+    }
+
+    /// The editor's selection, else the statement at the cursor, with its
+    /// place in the editor's text: what the AI panel attaches and replaces.
+    pub fn ai_statement(&self, cx: &App) -> Option<(String, std::ops::Range<usize>)> {
+        let editor = self.editor.read(cx);
+        let selection = editor.selected_range();
+        if let Some(selected) = editor.text().to_string().get(selection.clone())
+            && !selected.trim().is_empty()
+        {
+            return Some((selected.to_string(), selection));
+        }
+        let statement = self.statements(Scope::AtCursor, cx).into_iter().next()?;
+        Some((statement.sql, statement.place?))
+    }
+
+    /// What the AI assistant is told of this tab: its connection's engine
+    /// and version, its database and schema, its completion catalog, the
+    /// session to read rows and structures on.
+    pub fn ai_facts(&self, cx: &App) -> crate::ai_view::Facts {
         let database = self.choices(cx).database;
         let connections = self.connections.read(cx);
         let connection = self.target.as_ref().map(|target| target.connection.clone());
@@ -7623,7 +7675,7 @@ impl QueryTab {
                 search_path: vec![database.clone()],
             });
         }
-        let facts = crate::ai_view::Facts {
+        crate::ai_view::Facts {
             catalog,
             engine: engine
                 .map(|engine| engine.label().to_string())
@@ -7638,20 +7690,10 @@ impl QueryTab {
                 .as_ref()
                 .and_then(|target| target.schema.clone()),
             session,
-        };
-        let (tab, editor) = (cx.entity().downgrade(), self.editor.clone());
-        self.ai =
-            Some(cx.new(|cx| crate::ai_view::AiPanel::new(tab, editor, action, facts, window, cx)));
-        cx.notify();
+        }
     }
 
-    /// Closes the AI panel.
-    pub fn close_ai(&mut self, cx: &mut Context<Self>) {
-        self.ai = None;
-        cx.notify();
-    }
-
-    /// The AI panel, while open; for tests.
+    /// The AI conversation, once made; for tests.
     #[cfg(test)]
     pub fn ai_panel(&self) -> Option<&Entity<crate::ai_view::AiPanel>> {
         self.ai.as_ref()
@@ -7965,16 +8007,6 @@ impl Render for QueryTab {
                     .child(resizable_panel().child(results)),
             ),
         });
-        // The AI assistant's answers at the side (J17).
-        let area = match self.ai.clone() {
-            Some(panel) => h_flex()
-                .flex_1()
-                .min_h_0()
-                .child(area.h_full().min_w_0())
-                .child(panel)
-                .into_any_element(),
-            None => area.into_any_element(),
-        };
         v_flex()
             .id("query-tab")
             .key_context("QueryTab")

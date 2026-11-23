@@ -1393,3 +1393,16 @@ Still open (for the owner):
 - Tests: `ai::tests::{a_table_read_in_full_says_nulls_keys_and_indexes_and_no_value,
   a_table_read_in_full_stays_within_its_caps}`, the drivers' `ai_context` tests (PostgreSQL, MySQL, MariaDB)
   and `the_ai_context_says_nulls_keys_and_indexes` (SQLite), the UI tests of `ui_tests/ai.rs`.
+- After an automated review: an index part that is not exactly a column's name is sent as `(expression)`, an
+  index of expressions only is left out (tests with expression and partial indexes holding literals).
+
+## 2026-11-23 — K51: the AI assistant as a conversation in a side panel
+
+- A panel at the right of the window holds the active query tab's conversation (one per tab, for the run):
+  follow-ups go with the earlier turns within a budget (20 turns, 40,000 characters) that says when the oldest
+  are left out; the editor's query as a removable chip; Insert, Replace and Copy under each SQL block; answers
+  streamed when the server streams; the four "AI: …" actions open it with their message ready (D-120).
+- Core API for K52 and K53: `ai::build_chat`, `Action::message`, `ai::with_query`, `ai::Turn`,
+  `ai::left_out`, `ai::chat_stream`, `ai::segments`; app: `ai_view::open(tab, Draft)`,
+  `QueryTab::{ai_facts, ai_statement, ai_chat}`, `AiPanel::{insert_sql, replace_sql}`.
+- Tests: `ai::chat::tests` (7), `tests/ai.rs` (2 new), `ui_tests/ai_chat.rs` (9), the J17 UI tests adapted.

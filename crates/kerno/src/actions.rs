@@ -513,6 +513,10 @@ gpui_kit::actions!(
         AiExplainPlan,
         /// Asks the AI assistant to explain the error on screen.
         AiExplainError,
+        /// Shows or hides the AI assistant's panel (K51).
+        ToggleAiPanel,
+        /// Clears the active query tab's AI conversation (K51).
+        AiNewConversation,
     ]
 );
 
@@ -1958,6 +1962,30 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["assistant", "llm", "fix", "ollama"],
         AiExplainError
+    ),
+    // K51: the conversation panel at the right of the window.
+    command!(
+        "toggle_ai_panel",
+        "AI: Show or Hide the Assistant",
+        "AI assistant",
+        ["secondary-shift-j"],
+        [
+            "assistant",
+            "llm",
+            "chat",
+            "conversation",
+            "panel",
+            "ollama"
+        ],
+        ToggleAiPanel
+    ),
+    command!(
+        "ai_new_conversation",
+        "AI: New Conversation",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "chat", "clear", "reset"],
+        AiNewConversation
     ),
     command!(
         "close_tab",

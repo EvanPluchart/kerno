@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::Secret;
 use crate::dialect::Dialect;
@@ -29,9 +29,14 @@ use crate::driver::Session;
 use crate::schema::{RelationKind, TableRef, TableStructure};
 use crate::sql::Catalog;
 
+pub mod chat;
 pub mod endpoints;
 mod tls;
 
+pub use chat::{
+    MAX_QUERY, MAX_TURN_CHARS, MAX_TURNS, Role, Segment, Turn, build_chat, left_out, segments,
+    with_query,
+};
 pub use endpoints::{Model, Reach, SavedEndpoint};
 
 /// How long a chat request may take, from connect to the last byte of the answer: a reasoning
@@ -124,24 +129,31 @@ impl Action {
         }
     }
 
+    /// The user message of this action (K51): its instruction, then what it is about. It goes
+    /// in the user's turn, so a conversation may mix actions and follow-ups.
+    pub fn message(&self, engine: &str) -> String {
+        format!("{}\n\n{}", self.instructions(engine), self.request())
+    }
+
     fn instructions(&self, engine: &str) -> String {
+        let engine = if engine.is_empty() { "SQL" } else { engine };
         match self {
             Self::WriteSql { .. } => format!(
-                "Write one {engine} SQL statement for the user's request, using only the tables \
-                 and columns below. Give the statement in one ```sql block, then at most two \
+                "Write one {engine} SQL statement for this request, using only the tables and \
+                 columns described. Give the statement in one ```sql block, then at most two \
                  sentences about it."
             ),
             Self::ExplainQuery { .. } => format!(
-                "Explain what the user's {engine} query does, clause by clause, in plain words. \
-                 Point out anything that looks wrong or slow."
+                "Explain what this {engine} query does, clause by clause, in plain words. Point \
+                 out anything that looks wrong or slow."
             ),
             Self::ExplainPlan { .. } => format!(
-                "Explain the user's {engine} query plan in plain words: what each step does, \
-                 which step costs the most and why, and what could make the query faster."
+                "Explain this {engine} query plan in plain words: what each step does, which \
+                 step costs the most and why, and what could make the query faster."
             ),
             Self::ExplainError { .. } => format!(
-                "Explain the {engine} error the user got, in plain words, and propose a fix: \
-                 the corrected statement in one ```sql block."
+                "Explain this {engine} error in plain words, and propose a fix: the corrected \
+                 statement in one ```sql block."
             ),
         }
     }
@@ -602,23 +614,11 @@ pub fn sample_sql(dialect: &dyn Dialect, table: &TableRef) -> String {
     )
 }
 
-/// The request body of `action`, an OpenAI-compatible chat completion: the only way one is
-/// made. The model hears the instructions and the context, then the user's request.
+/// The request body of `action` alone, an OpenAI-compatible chat completion: [`build_chat`]
+/// with no earlier turn (K52's one answer for a statement goes through it). The model hears its
+/// rules and the context, then the action's instruction and subject.
 pub fn build_payload(action: &Action, context: &Context, model: &str) -> Value {
-    let system = format!(
-        "You are the assistant of Kerno, a database client. {}\nAnswer in plain text. Kerno \
-         never runs what you write: the user reads it and decides.\n\n{}",
-        action.instructions(&context.engine),
-        context.describe()
-    );
-    json!({
-        "model": model,
-        "stream": false,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": action.request()},
-        ],
-    })
+    build_chat(context, &[], &action.message(&context.engine), model)
 }
 
 /// The bytes sent for `payload`, and shown by the "What is sent" preview: pretty-printed JSON.
@@ -838,9 +838,7 @@ pub fn request_until(
     send(settings, key, call, stop, timeout)
 }
 
-/// The one function that opens a socket for the assistant's requests (Detect goes through it
-/// too, with its own timeout), only after [`gate`]. The one other connection is the issuer
-/// check of a refused certificate (`tls::issuer`), to the same host, after the same gate.
+/// [`exchange`] with the answer read whole: the body, or a streamed completion's answer.
 fn send(
     settings: &AiSettings,
     key: Option<&Secret>,
@@ -848,6 +846,24 @@ fn send(
     stop: &Stopper,
     timeout: Duration,
 ) -> Result<String, AiError> {
+    match exchange(settings, key, call, stop, timeout, &mut |_| {})? {
+        Reply::Body(text) => Ok(text),
+        Reply::Streamed(answer) => answer,
+    }
+}
+
+/// The one function that opens a socket for the assistant's requests (Detect goes through it
+/// too, with its own timeout), only after [`gate`]. The one other connection is the issuer
+/// check of a refused certificate (`tls::issuer`), to the same host, after the same gate. An
+/// answer streamed as server-sent events is read as it comes, each piece told to `on_text`.
+fn exchange(
+    settings: &AiSettings,
+    key: Option<&Secret>,
+    call: &Call,
+    stop: &Stopper,
+    timeout: Duration,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<Reply, AiError> {
     let endpoint = gate(settings)?;
     let mut config = ureq::Agent::config_builder()
         // Only the configured host: no proxy from the environment, no redirect.
@@ -898,6 +914,25 @@ fn send(
     };
     let mut response = sent.map_err(stopped)?;
     let status = response.status().as_u16();
+    // An answer written as it comes (K51): read event by event, within the same cap.
+    let streamed = (response.headers().get("content-type"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim_start().starts_with("text/event-stream"));
+    if streamed && (200..300).contains(&status) {
+        let reader = response.body_mut().with_config().limit(MAX_ANSWER).reader();
+        let read = chat::read_stream(reader, on_text);
+        // Stopped: the connection closed under the reader, whatever it read since.
+        if stop.0.lock().map(|state| state.stopped).unwrap_or(true) {
+            return Err(AiError::Stopped);
+        }
+        return match read {
+            Ok(answer) => Ok(Reply::Streamed(answer)),
+            Err(error) => Err(AiError::Network(format!(
+                "The answer of {} stopped before its end.\n{error}",
+                endpoint.host
+            ))),
+        };
+    }
     let text = response
         .body_mut()
         .with_config()
@@ -909,7 +944,15 @@ fn send(
         let text: String = text.trim().chars().take(300).collect();
         return Err(AiError::Status(status, text));
     }
-    Ok(text)
+    Ok(Reply::Body(text))
+}
+
+/// What [`send`] read.
+enum Reply {
+    /// The whole body (a list of models, a completion that is not streamed).
+    Body(String),
+    /// A streamed completion: its answer, or why it is not one.
+    Streamed(Result<String, AiError>),
 }
 
 /// A failed connection or read, in plain words first, then the client's own message.
@@ -985,8 +1028,31 @@ pub fn chat_until(
     payload: &Value,
     stop: &Stopper,
 ) -> Result<String, AiError> {
-    let text = request_until(settings, key, &Call::Chat(payload.clone()), stop)?;
-    answer_text(&text)
+    chat_stream(settings, key, payload, stop, &mut |_| {})
+}
+
+/// [`chat_until`], telling `on_text` the answer's pieces as they arrive (K51): each piece of a
+/// streamed answer (`"stream": true`, server-sent events), or the whole answer at once from a
+/// server that does not stream. The pieces are raw: a model's `<think>…</think>` is in them;
+/// the answer returned is without it ([`strip_reasoning`]). Stop closes the connection at once
+/// ([`AiError::Stopped`]); the answer is capped as a whole one is. Blocking: run it off the UI
+/// thread.
+pub fn chat_stream(
+    settings: &AiSettings,
+    key: Option<&Secret>,
+    payload: &Value,
+    stop: &Stopper,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<String, AiError> {
+    let call = Call::Chat(payload.clone());
+    match exchange(settings, key, &call, stop, CHAT_TIMEOUT, on_text)? {
+        Reply::Body(text) => {
+            let answer = answer_text(&text)?;
+            on_text(&answer);
+            Ok(answer)
+        }
+        Reply::Streamed(answer) => answer,
+    }
 }
 
 /// The answer of a chat completion's body, without the model's reasoning: a reasoning field
@@ -1116,6 +1182,7 @@ mod tests {
     use super::*;
     use crate::schema::{ColumnInfo, ConstraintInfo, ForeignKeyInfo, IndexInfo};
     use crate::sql::{CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
+    use serde_json::json;
 
     fn relation(name: &str, columns: &[(&str, &str)]) -> CatalogRelation {
         CatalogRelation {
@@ -1458,8 +1525,14 @@ mod tests {
         );
         let payload = build_payload(&action, &context, "llama3");
         assert_eq!(payload["model"], "llama3");
-        assert_eq!(payload["stream"], false);
-        assert_eq!(payload["messages"][1]["content"], "list the customers");
+        // K51: the answer as it is written; the instruction in the user's turn, before it.
+        assert_eq!(payload["stream"], true);
+        let user = payload["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            user.starts_with("Write one PostgreSQL SQL statement"),
+            "{user}"
+        );
+        assert!(user.ends_with("\n\nlist the customers"), "{user}");
         let system = payload["messages"][0]["content"].as_str().unwrap();
         assert!(
             system.contains("- shop.customers (table): id bigint, email text"),
@@ -1499,7 +1572,9 @@ mod tests {
         let user = build_payload(&plan, &context, "m")["messages"][1]["content"].clone();
         assert_eq!(
             user,
-            "Query:\n```sql\nselect 1\n```\n\nPlan:\n```\nSeq Scan\n```"
+            "Explain this SQL query plan in plain words: what each step does, which step costs \
+             the most and why, and what could make the query faster.\n\nQuery:\n```sql\nselect \
+             1\n```\n\nPlan:\n```\nSeq Scan\n```"
         );
         let error = Action::ExplainError {
             sql: "selec 1".into(),
@@ -1513,7 +1588,7 @@ mod tests {
                 .contains("Error:\nsyntax error")
         );
         assert!(
-            payload["messages"][0]["content"]
+            payload["messages"][1]["content"]
                 .as_str()
                 .unwrap()
                 .contains("propose a fix")

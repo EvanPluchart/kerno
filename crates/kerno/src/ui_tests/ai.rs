@@ -239,9 +239,15 @@ fn the_body_is_the_preview_and_holds_rows_only_with_the_tick(cx: &mut TestAppCon
     let requests = fake.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].body, preview.as_bytes());
-    // Sent, the tick goes back off: the next Send carries no row.
+    // Sent, the tick goes back off: the next message carries no row (K51: the earlier turns
+    // go with it, the rows of the system message do not).
     assert!(!cx.update(|cx| panel.read(cx).include_samples()));
-    assert!(!previewed(&app, cx).unwrap().contains(ROW_VALUE));
+    app.click(cx, "ai-sentence");
+    app.type_text(cx, "and by city");
+    wait_for_details(&app, cx);
+    let next = previewed(&app, cx).unwrap();
+    assert!(next.contains("list the customers"), "{next}");
+    assert!(!next.contains(ROW_VALUE), "{next}");
     // The sample rows were read off the history.
     assert_eq!(history_len(&app), history);
 }
@@ -445,9 +451,10 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
     let outcomes = app.outcomes(cx);
     app.click(cx, "ai-insert");
     ran_nothing(&app, cx, &outcomes);
+    // K51: at the cursor, on its own line, as every Insert (Replace takes the statement's place).
     assert_eq!(
         app.active_query(cx).1,
-        format!("{bad}\n\nSELECT count(*) FROM shop.customers;")
+        format!("{bad}\nSELECT count(*) FROM shop.customers;")
     );
     cx.run_until_parked();
     assert_eq!(history_len(&app), history);
@@ -464,9 +471,10 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
         body.contains("Plan:") && body.contains("shop.orders"),
         "{body}"
     );
-    assert!(!app.has(cx, "ai-insert"), "an explanation is not inserted");
 
-    // The statement at the cursor, among two.
+    // The statement at the cursor, among two (the keyboard back in the editor: K51's panel
+    // keeps it after a send).
+    app.click(cx, "query-editor");
     app.press(cx, &["secondary-a", "backspace"]);
     app.type_text(
         cx,
@@ -481,8 +489,10 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
     );
     app.click(cx, "ai-copy");
     assert_eq!(app.clipboard(cx), Some(ai::unfenced(ANSWER)));
+    // K51: Close hides the panel; the conversation stays with its tab.
     app.click(cx, "ai-close");
-    assert!(panel(&app, cx).is_none());
+    assert!(!app.has(cx, "ai-panel"));
+    assert!(panel(&app, cx).is_some());
 }
 
 /// C3: Stop closes the request's connection at once ("Stopped"): the endpoint, holding the
@@ -498,6 +508,11 @@ fn a_request_is_stopped(cx: &mut TestAppContext) {
     write_sql(&app, cx, "anything");
     let panel = panel(&app, cx).unwrap();
     let send_and_stop = |cx: &mut TestAppContext, sent: usize| {
+        // K51: a sent message leaves the field empty.
+        if sent > 1 {
+            app.click(cx, "ai-sentence");
+            app.type_text(cx, "anything again");
+        }
         app.click(cx, "ai-send");
         assert!(cx.update(|cx| panel.read(cx).sending()));
         app.wait_until(cx, "the request", |_, _| fake.requests().len() == sent);
@@ -531,6 +546,8 @@ fn a_request_is_stopped(cx: &mut TestAppContext) {
     // A request after them is answered (by an endpoint that answers at once).
     let quick = FakeAi::start(ANSWER);
     enable(cx, &quick.base(), true);
+    app.click(cx, "ai-sentence");
+    app.type_text(cx, "once more");
     send_and_wait(&app, cx);
     assert_eq!(answer(&app, cx).as_deref(), Some(ANSWER));
     assert_eq!((fake.answered(), quick.answered()), (0, 1));
