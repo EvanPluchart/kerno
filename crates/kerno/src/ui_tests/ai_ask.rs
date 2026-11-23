@@ -349,13 +349,15 @@ fn columns_and_a_data_tab_on(engine: Engine, cx: &mut TestAppContext) {
         matches!(asked(app, cx), Some(Ask::Columns { columns, .. }) if columns[0].0 == "placed_at")
     });
 
-    // The palette on the data tab: its table.
+    // The palette on the data tab: its table, in the tab of the questions before (its editor is
+    // still empty).
     app.open_table(cx, "kerno", "orders", RelationKind::Table);
-    let tabs = query_tabs(&app, cx);
+    assert_eq!(query_tabs(&app, cx), 1);
     app.dispatch(cx, actions::AiExplainTable);
     app.wait_until(cx, "the palette's question", |app, cx| {
-        query_tabs(app, cx) == tabs + 1 && matches!(asked(app, cx), Some(Ask::ExplainTable(_)))
+        matches!(asked(app, cx), Some(Ask::ExplainTable(_)))
     });
+    assert_eq!(query_tabs(&app, cx), 1);
     cx.run_until_parked();
     assert_eq!(fake.connections(), 0);
 }
@@ -555,4 +557,72 @@ fn a_table_tabs_statement_goes_without_its_literals(cx: &mut TestAppContext) {
     assert!(preview.contains("email = ? AND id < ?"), "{preview}");
     assert!(!preview.contains(&format!("'{value}'")), "{preview}");
     assert!(!preview.contains(number), "{preview}");
+}
+
+/// Questions about tables, one after the other, go to one tab named for its subject ("Ask ·
+/// orders"), told apart from the table's own data tab; once the user typed in that tab's editor,
+/// it is theirs and the next question opens another.
+#[gpui_kit::test]
+fn asks_in_a_row_share_one_tab_until_the_user_types_in_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let fake = FakeAi::start(ANSWER);
+    let app = connected(cx, Engine::Postgres);
+    enable(cx, &fake.base(), true);
+    let customers = ["kerno", "shop", "Tables", "customers"];
+    let orders = ["kerno", "shop", "Tables", "orders"];
+    app.open_path(cx, &customers);
+    app.open_path(cx, &orders);
+    app.act(cx, Action::OpenData, &customers);
+    let titles = |cx: &mut TestAppContext| cx.update(|cx| app.workspace.read(cx).tab_titles(cx));
+    let ask_tab = |cx: &mut TestAppContext| {
+        cx.update(|cx| app.workspace.read(cx).ask_tab())
+            .expect("an ask tab")
+    };
+    // Five questions in a row: one tab, named for the last subject.
+    for (path, entry) in [
+        (&customers, "Explain this table"),
+        (&orders, "Explain this table"),
+        (&customers, "Ask about this table…"),
+        (&orders, "Write a query on this table…"),
+        (&customers, "Generate test data…"),
+    ] {
+        tree_ai(&app, cx, path, entry);
+        let subject = path[3];
+        app.wait_until(cx, "the question", |app, cx| {
+            asked(app, cx).is_some_and(|ask| ask.tables()[0].name == subject)
+        });
+    }
+    assert_eq!(query_tabs(&app, cx), 1, "{:?}", titles(cx));
+    let first = ask_tab(cx);
+    let listed = titles(cx);
+    assert!(
+        listed.contains(&"Ask · customers".to_string()),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&"customers".to_string()),
+        "the data tab keeps its title: {listed:?}"
+    );
+    assert_eq!(
+        listed.iter().filter(|t| t.starts_with("Ask")).count(),
+        1,
+        "{listed:?}"
+    );
+
+    // The user writes in it: the next question opens a tab of its own.
+    let editor = cx.update(|cx| first.read(cx).editor().clone());
+    app.step(cx, |window, cx| {
+        editor.update(cx, |editor, cx| editor.set_value("select 1", window, cx))
+    });
+    tree_ai(&app, cx, &orders, "Explain this table");
+    app.wait_until(cx, "the second tab", |app, cx| query_tabs(app, cx) == 2);
+    let second = ask_tab(cx);
+    assert_ne!(second.entity_id(), first.entity_id());
+    assert_eq!(cx.update(|cx| second.read(cx).title()), "Ask · orders");
+    assert_eq!(cx.update(|cx| first.read(cx).title()), "Ask · customers");
+    assert_eq!(cx.update(|cx| first.read(cx).sql(cx)), "select 1");
+    cx.run_until_parked();
+    assert_eq!(fake.connections(), 0);
 }

@@ -3717,9 +3717,15 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   a palette command ("AI: Explain This Table"…) acting on the active data or structure tab's table, else the
   active result, else the node selected in the tree, and an entry of Query ▸ AI Assistant.
 - **Where the conversation lives.** Conversations belong to query tabs (K51). On a query's result it is that
-  tab's. On a table, a data tab or a structure tab a new query tab opens on the table's connection, in its
-  schema (a MySQL table's database), titled with the table's name: the user's script is never mixed into it,
-  and its empty editor attaches nothing. One tab per question asked this way; not reused.
+  tab's. On a table, a data tab or a structure tab a query tab opens on the table's connection, in its
+  schema (a MySQL table's database), titled "Ask · customers" (told apart from the table's own data tab
+  "customers"): the user's script is never mixed into it, and its empty editor attaches nothing. The next
+  question about a table of the same connection and database goes to that tab while its editor is still
+  empty (asks never write in it), renamed for the new subject; its conversation goes on, the earlier
+  exchanges kept in sight and sent within D-120's budget (New conversation clears them), the new subject as
+  the chip. A tab the user typed in (an Insert counts) is theirs: the next question opens another. The real
+  app's pass found five asks leaving five tabs titled "customers" (2026-11-23). "Open in a new tab" of
+  "Generate test data…" still opens a tab of its own, "Test data".
 - **Nothing goes by itself.** As D-120's four actions (K51's `open`): each entry opens the panel with its
   subject as a chip (× takes it off), the keyboard in the message field, and the whole first message in "What
   is sent…"; Enter or Send sends. The entries that need a

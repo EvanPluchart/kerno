@@ -234,8 +234,10 @@ Assistant, on the active tab's table or result, else on the table selected in th
 
 Each opens the panel with what it asks shown as a chip (its × removes it) and the keyboard in the message
 field: nothing goes until you press Enter, and **What is sent…** shows the whole message. A question about a
-table goes to a new query tab on the table's connection and schema; one about a query's result goes to that
-query tab's conversation. The table and the tables linked to it by foreign keys are described first, with
+table goes to a query tab titled for it ("Ask · customers") on the table's connection and schema; the next
+one on the same connection goes to the same tab while you have not typed in its editor, and the conversation
+goes on with the new table as its subject. A question about a query's result goes to that query tab's
+conversation. The table and the tables linked to it by foreign keys are described first, with
 their keys and indexes. A result's values never go unless you tick **Include its first 20 rows** or, for a
 selection, **Include the selected values**, which says how many cells go; the tick is off at each message.
 Generated test data is offered with **Open in a new tab** under its SQL: a query tab on the same connection,

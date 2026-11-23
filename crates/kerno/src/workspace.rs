@@ -531,6 +531,9 @@ pub struct Workspace {
     closed: Vec<TabSnapshot>,
     /// Number given to the next "Query N" tab.
     next_query_number: usize,
+    /// The query tab the last AI question about a table opened ("Ask · customers"), which the next
+    /// one on its connection and database takes while its editor is empty (K53).
+    ask_tab: Option<WeakEntity<QueryTab>>,
     palette: Entity<CommandState>,
     pending_save: Option<Task<()>>,
     /// Where the window was last seen, and its write waiting for the window
@@ -666,6 +669,7 @@ impl Workspace {
             panes: panes::Layout::default(),
             closed: Vec::new(),
             next_query_number: 1,
+            ask_tab: None,
             palette,
             pending_save: None,
             window_placement: None,
@@ -2957,9 +2961,33 @@ impl Workspace {
             },
             None => target,
         };
-        let title = table.map_or_else(|| "Query".to_string(), |table| table.name);
-        let tab = self.open_query(title, "", Some(target), window, cx);
+        let title = ask_title(table.as_ref().map(|table| table.name.as_str()));
+        // The tab of the last question, on the same connection and database, while its editor is
+        // still empty: its conversation goes on with this subject. A tab typed in is the user's.
+        let reused = (self.ask_tab.as_ref().and_then(WeakEntity::upgrade)).filter(|tab| {
+            let open = self.index_of(tab.entity_id()).is_some();
+            let same = (tab.read(cx).target()).is_some_and(|its| {
+                its.connection == target.connection && its.database == target.database
+            });
+            open && same && tab.read(cx).sql(cx).trim().is_empty()
+        });
+        let tab = match reused {
+            Some(tab) => {
+                tab.update(cx, |tab, cx| tab.set_title(title, cx));
+                self.show_query_tab(&tab, window, cx);
+                self.schedule_save(cx);
+                tab
+            }
+            None => self.open_query(title, "", Some(target), window, cx),
+        };
+        self.ask_tab = Some(tab.downgrade());
         ai_ask::open(&tab, ask, caution, window, cx);
+    }
+
+    /// The tab the last AI question about a table went to; for tests.
+    #[cfg(test)]
+    pub fn ask_tab(&self) -> Option<Entity<QueryTab>> {
+        self.ask_tab.as_ref().and_then(WeakEntity::upgrade)
     }
 
     /// K53: an entry of the AI ▸ menus from the palette: on the active data
@@ -7868,5 +7896,14 @@ impl Render for Workspace {
             })
             .child(div().flex_1().min_h_0().child(body))
             .child(self.render_status_bar(cx))
+    }
+}
+
+/// The title of a query tab opened by an AI question about `table` (K53): told apart from the
+/// table's own data or structure tab ("customers"), short.
+fn ask_title(table: Option<&str>) -> String {
+    match table {
+        Some(table) => format!("Ask · {table}"),
+        None => "Ask".to_string(),
     }
 }
