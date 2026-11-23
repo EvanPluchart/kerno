@@ -1384,3 +1384,12 @@ Still open (for the owner):
 - Tests: `ui_tests::k49` (three, PostgreSQL, MySQL, MariaDB, SQLite), `theme::tests::foreign_key_marks_meet_wcag`;
   each seen failing under a mutation (`docs/plans/M12.md`, K49). Frame times with and without keys alike
   (`docs/BENCH.md`, offscreen).
+
+## 2026-11-23 — K50: the AI assistant's richer context
+
+- The tables a request is about are described with each column's nullability, the primary key, the foreign
+  keys and the indexes, read when the request opens (30 tables at most, the ones a statement names first); no
+  default, comment or value. On `shop`: 2,530 bytes before, 3,510 after (D-119).
+- Tests: `ai::tests::{a_table_read_in_full_says_nulls_keys_and_indexes_and_no_value,
+  a_table_read_in_full_stays_within_its_caps}`, the drivers' `ai_context` tests (PostgreSQL, MySQL, MariaDB)
+  and `the_ai_context_says_nulls_keys_and_indexes` (SQLite), the UI tests of `ui_tests/ai.rs`.

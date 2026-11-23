@@ -14,7 +14,7 @@
 //! The answer is untrusted text: nothing in it runs or opens anything ([`sql_block`] only
 //! picks the SQL the user may insert).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 
 use crate::config::Secret;
 use crate::dialect::Dialect;
-use crate::schema::{RelationKind, TableRef};
+use crate::driver::Session;
+use crate::schema::{RelationKind, TableRef, TableStructure};
 use crate::sql::Catalog;
 
 pub mod endpoints;
@@ -43,6 +44,18 @@ pub const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_TABLES: usize = 200;
 /// Table names listed beyond [`MAX_TABLES`].
 pub const MAX_NAMES: usize = 1000;
+/// Tables (the first ones described) whose structure is read for a request (K50): each
+/// column's nullability, the primary key, the foreign keys and the indexes. Beyond, the
+/// catalog's names and types.
+pub const MAX_DETAILED: usize = 30;
+/// Per table: columns described (beyond, their count), and indexes and foreign keys described
+/// from its structure (beyond, their count).
+pub const MAX_COLUMNS: usize = 100;
+pub const MAX_INDEXES: usize = 12;
+pub const MAX_KEYS: usize = 12;
+/// Structures read at once, and how long one may take.
+const DETAIL_CONCURRENT: usize = 4;
+const DETAIL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Rows per table when sample rows are included, and the tables sampled.
 pub const SAMPLE_ROWS: u64 = 5;
 pub const SAMPLE_TABLES: usize = 10;
@@ -102,7 +115,7 @@ impl Action {
     }
 
     /// The text whose table names choose the tables described.
-    fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         match self {
             Self::WriteSql { sentence } => sentence,
             Self::ExplainQuery { sql }
@@ -165,6 +178,165 @@ pub struct Table {
     pub columns: Vec<(String, String)>,
     /// `customer_id -> shop.customers(id)`.
     pub foreign_keys: Vec<String>,
+    /// What its structure says beyond names and types, once read ([`read_details`]); it
+    /// replaces `columns` and `foreign_keys` in the text.
+    pub detail: Option<Detail>,
+}
+
+/// What the model is told of a table beyond names and types (K50): each column's type and
+/// whether it can be NULL, the primary key, the foreign keys, the indexes. Nothing else of its
+/// structure: no default expression, comment, check, index predicate or definition, which can
+/// hold values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    /// Name, type, NULL allowed; the first [`MAX_COLUMNS`].
+    pub columns: Vec<(String, String, bool)>,
+    /// Columns left out beyond [`MAX_COLUMNS`].
+    pub more_columns: usize,
+    /// In key order.
+    pub primary_key: Vec<String>,
+    /// `(customer_id) references shop.customers (id)`; the first [`MAX_KEYS`].
+    pub foreign_keys: Vec<String>,
+    /// Unique, and the columns or expressions; the first [`MAX_INDEXES`] other than the
+    /// primary key's.
+    pub indexes: Vec<(bool, Vec<String>)>,
+    /// Foreign keys and indexes left out beyond their caps.
+    pub more_keys: usize,
+    pub more_indexes: usize,
+}
+
+impl Detail {
+    /// The detail of a table from its structure, within the caps.
+    pub fn of(structure: &TableStructure) -> Detail {
+        let mut primary: Vec<(u32, &str)> = (structure.columns.iter())
+            .filter_map(|c| c.primary_key_position.map(|p| (p, c.name.as_str())))
+            .collect();
+        primary.sort_unstable();
+        // Only names go: a key part that is not exactly one of the table's columns (an
+        // expression such as `coalesce(code, 'N/A')`, which can hold a value) is never sent.
+        let names: HashSet<&str> = (structure.columns.iter())
+            .map(|c| c.name.as_str())
+            .collect();
+        let column = |part: &str| -> Option<String> {
+            let part = part.trim();
+            // `placed_at DESC`: the column, then its order, kept as the word it is.
+            let (name, order) = match part.rsplit_once(' ') {
+                Some((name, order))
+                    if order.eq_ignore_ascii_case("asc") || order.eq_ignore_ascii_case("desc") =>
+                {
+                    (name.trim(), Some(order.to_lowercase()))
+                }
+                _ => (part, None),
+            };
+            let unquoted = name
+                .strip_prefix('"')
+                .and_then(|name| name.strip_suffix('"'))
+                .or_else(|| name.strip_prefix('`').and_then(|n| n.strip_suffix('`')))
+                .unwrap_or(name);
+            let found = names.get(unquoted)?;
+            Some(match order {
+                Some(order) => format!("{found} {order}"),
+                None => found.to_string(),
+            })
+        };
+        let keys: Vec<String> = (structure.foreign_keys.iter())
+            .filter(|key| key.columns.iter().all(|c| names.contains(c.as_str())))
+            .map(|key| {
+                format!(
+                    "({}) references {}.{} ({})",
+                    key.columns.join(", "),
+                    key.referenced_table.schema,
+                    key.referenced_table.name,
+                    key.referenced_columns.join(", ")
+                )
+            })
+            .collect();
+        // An expression part is said as `(expression)`; an index of expressions only is left
+        // out, and a partial index's predicate is never read.
+        let indexes: Vec<(bool, Vec<String>)> = (structure.indexes.iter())
+            .filter(|index| !index.primary)
+            .filter_map(|index| {
+                let parts: Vec<Option<String>> =
+                    index.columns.iter().map(|part| column(part)).collect();
+                parts.iter().any(Option::is_some).then(|| {
+                    let parts = parts
+                        .into_iter()
+                        .map(|part| part.unwrap_or_else(|| "(expression)".into()))
+                        .collect();
+                    (index.unique, parts)
+                })
+            })
+            .collect();
+        Detail {
+            columns: (structure.columns.iter())
+                .take(MAX_COLUMNS)
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                .collect(),
+            more_columns: structure.columns.len().saturating_sub(MAX_COLUMNS),
+            primary_key: primary.into_iter().map(|(_, name)| name.into()).collect(),
+            more_keys: keys.len().saturating_sub(MAX_KEYS),
+            foreign_keys: keys.into_iter().take(MAX_KEYS).collect(),
+            more_indexes: indexes.len().saturating_sub(MAX_INDEXES),
+            indexes: indexes.into_iter().take(MAX_INDEXES).collect(),
+        }
+    }
+
+    /// The lines of a table described in full, under its name.
+    fn describe(&self, text: &mut String) {
+        for (name, data_type, nullable) in &self.columns {
+            let null = if *nullable { "" } else { " not null" };
+            text.push_str(&format!("\n  {name} {data_type}{null}"));
+        }
+        if self.more_columns > 0 {
+            text.push_str(&format!("\n  … {} more columns", self.more_columns));
+        }
+        if !self.primary_key.is_empty() {
+            text.push_str(&format!(
+                "\n  primary key ({})",
+                self.primary_key.join(", ")
+            ));
+        }
+        for key in &self.foreign_keys {
+            text.push_str(&format!("\n  foreign key {key}"));
+        }
+        if self.more_keys > 0 {
+            text.push_str(&format!("\n  … {} more foreign keys", self.more_keys));
+        }
+        for (unique, columns) in &self.indexes {
+            let kind = if *unique { "unique" } else { "index" };
+            text.push_str(&format!("\n  {kind} ({})", columns.join(", ")));
+        }
+        if self.more_indexes > 0 {
+            text.push_str(&format!("\n  … {} more indexes", self.more_indexes));
+        }
+    }
+}
+
+/// Reads the structure of `tables` (at most [`MAX_DETAILED`] of them, in order) for the
+/// model, [`DETAIL_CONCURRENT`] at a time, each within [`DETAIL_TIMEOUT`]: run it off the UI
+/// thread, on the session the catalog was read from. A table that cannot be read is returned
+/// with why; the request then describes it by its catalog names and types.
+pub async fn read_details(
+    session: Arc<dyn Session>,
+    tables: Vec<TableRef>,
+) -> Vec<(TableRef, Result<Detail, String>)> {
+    use futures_util::StreamExt as _;
+    let reading = tables.into_iter().take(MAX_DETAILED).map(|table| {
+        let session = session.clone();
+        async move {
+            let read = tokio::time::timeout(DETAIL_TIMEOUT, session.table_structure(&table)).await;
+            let detail = match read {
+                Ok(Ok(structure)) => Ok(Detail::of(&structure)),
+                Ok(Err(error)) => Err(crate::describe(&error).to_string()),
+                Err(_) => Err("the server took too long".to_string()),
+            };
+            (table, detail)
+        }
+    });
+    futures_util::stream::iter(reading)
+        .buffered(DETAIL_CONCURRENT)
+        .collect()
+        .await
 }
 
 /// The first rows of one table, sent only when the user ticked "include sample rows".
@@ -190,29 +362,37 @@ pub struct Context {
 }
 
 impl Context {
-    /// The context of `action` from the catalog a query tab loaded for completion: the tables
-    /// the SQL or the sentence names, else the tables of `schema` (the tab's, or the first of
-    /// the search path); the first [`MAX_TABLES`] with their columns, then names only. No
-    /// sample rows.
+    /// The context of a request from the catalog a query tab loaded for completion: the
+    /// tables `text` (the SQL, the sentence, the conversation) names, in the order it names
+    /// them, else the tables of `schema` (the tab's, or the first of the search path); the
+    /// first [`MAX_TABLES`] with their columns, then names only. No sample rows, no details:
+    /// [`Context::detail_tables`] says which tables [`read_details`] reads.
     pub fn from_catalog(
         catalog: &Catalog,
         engine: &str,
         server_version: Option<String>,
         database: Option<String>,
         schema: Option<&str>,
-        action: &Action,
+        text: &str,
     ) -> Context {
-        let words: Vec<String> = action
-            .text()
+        // Each word, at its first place in the text.
+        let mut words: std::collections::HashMap<String, usize> = Default::default();
+        let split = text
             .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect();
+            .filter(|word| !word.is_empty());
+        for (at, word) in split.enumerate() {
+            words.entry(word.to_lowercase()).or_insert(at);
+        }
+        // A word equal to the name, or one `s` apart.
         let named = |name: &str| {
             let name = name.to_lowercase();
-            words.iter().any(|word| {
-                *word == name || format!("{word}s") == name || format!("{name}s") == *word
-            })
+            let plural = words.get(&format!("{name}s"));
+            let singular = name.strip_suffix('s').and_then(|stem| words.get(stem));
+            [words.get(&name), plural, singular]
+                .into_iter()
+                .flatten()
+                .min()
+                .copied()
         };
         let all = || {
             catalog
@@ -220,8 +400,14 @@ impl Context {
                 .iter()
                 .flat_map(|schema| schema.relations.iter().map(move |r| (schema, r)))
         };
-        let mut chosen: Vec<_> = all()
-            .filter(|(_, relation)| named(&relation.name))
+        let mut placed: Vec<_> = all()
+            .filter_map(|(schema, relation)| Some((named(&relation.name)?, schema, relation)))
+            .collect();
+        // Stable: tables named at the same place keep the catalog's order.
+        placed.sort_by_key(|(at, _, _)| *at);
+        let mut chosen: Vec<_> = placed
+            .into_iter()
+            .map(|(_, schema, relation)| (schema, relation))
             .collect();
         if chosen.is_empty() {
             let current = schema
@@ -271,6 +457,7 @@ impl Context {
                     } else {
                         Vec::new()
                     },
+                    detail: None,
                 }
             })
             .collect();
@@ -295,6 +482,29 @@ impl Context {
             .collect()
     }
 
+    /// The tables whose structure [`read_details`] reads: the first [`MAX_DETAILED`]
+    /// described with their columns, the ones the text names first.
+    pub fn detail_tables(&self) -> Vec<TableRef> {
+        self.tables
+            .iter()
+            .filter(|table| !table.columns.is_empty())
+            .take(MAX_DETAILED)
+            .map(|table| TableRef::new(&table.schema, &table.name))
+            .collect()
+    }
+
+    /// Gives the tables their details, where `details` has them.
+    pub fn add_details(&mut self, details: &std::collections::HashMap<TableRef, Detail>) {
+        for table in &mut self.tables {
+            if table.columns.is_empty() {
+                continue;
+            }
+            table.detail = details
+                .get(&TableRef::new(&table.schema, &table.name))
+                .cloned();
+        }
+    }
+
     /// The context as the text of the system message.
     fn describe(&self) -> String {
         let mut text = format!("Database engine: {}", self.engine);
@@ -309,15 +519,29 @@ impl Context {
             .tables
             .iter()
             .partition(|table| !table.columns.is_empty());
-        text.push_str("\nTables and columns (name type):");
+        text.push_str(
+            "\nTables and columns (name type; `not null`, keys and indexes where they were read):",
+        );
         if full.is_empty() {
             text.push_str(" none known");
         }
         for table in full {
             let kind = if table.view { "view" } else { "table" };
-            let columns: Vec<String> = (table.columns.iter())
+            if let Some(detail) = &table.detail {
+                text.push_str(&format!("\n- {}.{} ({kind})", table.schema, table.name));
+                detail.describe(&mut text);
+                continue;
+            }
+            let mut columns: Vec<String> = (table.columns.iter())
+                .take(MAX_COLUMNS)
                 .map(|(name, data_type)| format!("{name} {data_type}"))
                 .collect();
+            if table.columns.len() > MAX_COLUMNS {
+                columns.push(format!(
+                    "… {} more columns",
+                    table.columns.len() - MAX_COLUMNS
+                ));
+            }
             text.push_str(&format!(
                 "\n- {}.{} ({kind}): {}",
                 table.schema,
@@ -890,6 +1114,7 @@ pub fn placed(text: &str, range: std::ops::Range<usize>, sql: &str) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ColumnInfo, ConstraintInfo, ForeignKeyInfo, IndexInfo};
     use crate::sql::{CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogSchema};
 
     fn relation(name: &str, columns: &[(&str, &str)]) -> CatalogRelation {
@@ -955,28 +1180,246 @@ mod tests {
     #[test]
     fn the_context_holds_the_tables_named_else_the_current_schema() {
         let action = write("Total of the orders of each customer");
-        let context = Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, &action);
+        let context =
+            Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, action.text());
+        // In the order the text names them (K50).
         let names: Vec<&str> = context.tables.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["customers", "orders"]);
+        assert_eq!(names, ["orders", "customers"]);
         assert_eq!(context.schemas, ["public", "shop"]);
         assert_eq!(
-            context.tables[1].foreign_keys,
+            context.tables[0].foreign_keys,
             ["customer_id -> shop.customers(id)"]
         );
         // Nothing named: the tab's schema, else the first of the search path.
         let action = write("how many rows?");
-        let context =
-            Context::from_catalog(&catalog(), "PostgreSQL", None, None, Some("shop"), &action);
+        let context = Context::from_catalog(
+            &catalog(),
+            "PostgreSQL",
+            None,
+            None,
+            Some("shop"),
+            action.text(),
+        );
         assert_eq!(context.tables.len(), 3);
-        let context = Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, &action);
+        let context =
+            Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, action.text());
         assert_eq!(context.tables[0].name, "all_types");
         // From SQL too, qualified or not.
         let action = Action::ExplainQuery {
             sql: "select * from shop.products p".into(),
         };
-        let context = Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, &action);
+        let context =
+            Context::from_catalog(&catalog(), "PostgreSQL", None, None, None, action.text());
         assert_eq!(context.tables.len(), 1);
         assert!(context.sample_rows.is_none());
+    }
+
+    fn column(name: &str, data_type: &str, nullable: bool, pk: Option<u32>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            kind: crate::TypeKind::Text,
+            nullable,
+            default: None,
+            generation: None,
+            on_update: None,
+            invisible: false,
+            primary_key_position: pk,
+            comment: None,
+            collation: None,
+            enum_values: Vec::new(),
+        }
+    }
+
+    fn index(name: &str, columns: &[&str], unique: bool, primary: bool) -> IndexInfo {
+        IndexInfo {
+            name: name.into(),
+            columns: columns.iter().map(|c| (*c).into()).collect(),
+            unique,
+            primary,
+            backs_constraint: primary,
+            method: "btree".into(),
+            predicate: None,
+            definition: None,
+        }
+    }
+
+    /// `shop.order_items` as a server describes it, with what must never be sent: a default
+    /// holding a value, comments, a check, a partial index's predicate, index definitions.
+    fn order_items() -> TableStructure {
+        let mut quantity = column("quantity", "integer", false, None);
+        quantity.default = Some("'kerno-default-value'::text".into());
+        quantity.comment = Some("kerno-column-comment".into());
+        let mut partial = index("items_big_idx", &["quantity"], false, false);
+        partial.predicate = Some("quantity > 4242".into());
+        partial.definition = Some("CREATE INDEX items_big_idx … WHERE quantity > 4242".into());
+        let key = |columns: &[&str], table: &str, referenced: &[&str]| ForeignKeyInfo {
+            name: format!("{table}_fk"),
+            table: TableRef::new("shop", "order_items"),
+            columns: columns.iter().map(|c| (*c).into()).collect(),
+            referenced_table: TableRef::new("shop", table),
+            referenced_columns: referenced.iter().map(|c| (*c).into()).collect(),
+            on_update: "NO ACTION".into(),
+            on_delete: "CASCADE".into(),
+        };
+        TableStructure {
+            columns: vec![
+                column("order_id", "bigint", false, Some(1)),
+                column("line_no", "smallint", false, Some(2)),
+                column("product_id", "bigint", false, None),
+                quantity,
+                column("note", "text", true, None),
+            ],
+            indexes: vec![
+                index("order_items_pkey", &["order_id", "line_no"], true, true),
+                index("order_items_product_idx", &["product_id"], false, false),
+                index("order_items_note_key", &["note"], true, false),
+                partial,
+                // Expressions can hold values: never sent, said as `(expression)`.
+                index(
+                    "items_mixed_idx",
+                    &["\"line_no\" DESC", "lower(note || 'kerno-literal-1')"],
+                    false,
+                    false,
+                ),
+                index(
+                    "items_expression_idx",
+                    &["coalesce(note, 'kerno-literal-2')"],
+                    true,
+                    false,
+                ),
+            ],
+            constraints: vec![ConstraintInfo {
+                name: "quantity_check".into(),
+                kind: crate::schema::ConstraintKind::Check,
+                columns: vec!["quantity".into()],
+                definition: "CHECK ((quantity > 4243))".into(),
+            }],
+            foreign_keys: vec![
+                key(&["order_id"], "orders", &["id"]),
+                key(&["product_id"], "products", &["id"]),
+            ],
+            comment: Some("kerno-table-comment".into()),
+            ..TableStructure::default()
+        }
+    }
+
+    /// K50: a table read in full says each column's type and whether it can be NULL, the
+    /// primary key, the foreign keys and the indexes, as a short text a person reads; nothing
+    /// that can hold a value (defaults, comments, checks, predicates, definitions).
+    #[test]
+    fn a_table_read_in_full_says_nulls_keys_and_indexes_and_no_value() {
+        let mut catalog = catalog();
+        catalog.schemas[1].relations.push(relation(
+            "order_items",
+            &[("order_id", "bigint"), ("line_no", "smallint")],
+        ));
+        let action = Action::ExplainPlan {
+            sql: "select * from shop.order_items i join shop.customers c on true".into(),
+            plan: "Nested Loop".into(),
+        };
+        let mut context =
+            Context::from_catalog(&catalog, "PostgreSQL", None, None, None, action.text());
+        // The tables the statement names, in its order, are the ones read in full.
+        let items = TableRef::new("shop", "order_items");
+        assert_eq!(
+            context.detail_tables(),
+            [items.clone(), TableRef::new("shop", "customers")]
+        );
+        let details = [(items, Detail::of(&order_items()))].into_iter().collect();
+        context.add_details(&details);
+        let system = build_payload(&action, &context, "m")["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            system.contains(
+                "- shop.order_items (table)\n  order_id bigint not null\n  line_no smallint not \
+                 null\n  product_id bigint not null\n  quantity integer not null\n  note text\n  \
+                 primary key (order_id, line_no)\n  foreign key (order_id) references \
+                 shop.orders (id)\n  foreign key (product_id) references shop.products (id)\n  \
+                 index (product_id)\n  unique (note)\n  index (quantity)\n  index (line_no \
+                 desc, (expression))\n- shop.customers \
+                 (table): id bigint, email text"
+            ),
+            "{system}"
+        );
+        for never in [
+            "kerno-default-value",
+            "kerno-column-comment",
+            "kerno-table-comment",
+            "kerno-literal",
+            "coalesce",
+            "lower(",
+            "4242",
+            "4243",
+            "CREATE INDEX",
+            "pkey",
+        ] {
+            assert!(!system.contains(never), "{never}:\n{system}");
+        }
+    }
+
+    /// K50: a table with more columns, keys or indexes than its caps says how many are left
+    /// out; at most [`MAX_DETAILED`] tables are read.
+    #[test]
+    fn a_table_read_in_full_stays_within_its_caps() {
+        let mut structure = order_items();
+        structure.columns = (0..MAX_COLUMNS + 7)
+            .map(|n| column(&format!("c{n}"), "int", true, None))
+            .collect();
+        // The foreign keys' column.
+        structure.columns[0].name = "order_id".into();
+        structure.indexes = (0..MAX_INDEXES + 3)
+            .map(|n| index(&format!("i{n}"), &["c1"], false, false))
+            .collect();
+        let key = structure.foreign_keys[0].clone();
+        structure.foreign_keys = vec![key; MAX_KEYS + 2];
+        let detail = Detail::of(&structure);
+        assert_eq!(detail.columns.len(), MAX_COLUMNS);
+        assert_eq!(
+            (detail.more_columns, detail.more_indexes, detail.more_keys),
+            (7, 3, 2)
+        );
+        let mut text = String::new();
+        detail.describe(&mut text);
+        assert!(
+            text.contains("\n  c99 int\n  … 7 more columns\n  foreign key"),
+            "{text}"
+        );
+        assert!(text.contains("\n  … 2 more foreign keys"), "{text}");
+        assert!(
+            text.ends_with("\n  index (c1)\n  … 3 more indexes"),
+            "{text}"
+        );
+        // A table of the catalog alone is capped the same way.
+        let wide = relation(
+            "wide",
+            &(0..MAX_COLUMNS + 1)
+                .map(|n| (format!("c{n}"), "int".to_string()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(n, t)| (n.as_str(), t.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let relations = std::iter::once(wide)
+            .chain((0..MAX_DETAILED + 3).map(|n| relation(&format!("t{n}"), &[("id", "int")])))
+            .collect();
+        let catalog = Catalog {
+            schemas: vec![CatalogSchema {
+                name: "big".into(),
+                relations,
+                routines: Vec::new(),
+            }],
+            search_path: vec!["big".into()],
+        };
+        let context = Context::from_catalog(&catalog, "MySQL", None, None, None, "x");
+        assert_eq!(context.detail_tables().len(), MAX_DETAILED);
+        let system = build_payload(&write("x"), &context, "m")["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(system.contains(", c99 int, … 1 more columns\n"), "{system}");
     }
 
     #[test]
@@ -992,7 +1435,7 @@ mod tests {
             }],
             search_path: vec!["big".into()],
         };
-        let context = Context::from_catalog(&catalog, "MySQL", None, None, None, &write("x"));
+        let context = Context::from_catalog(&catalog, "MySQL", None, None, None, "x");
         assert_eq!(context.tables.len(), MAX_TABLES + 5);
         assert!(context.tables[MAX_TABLES - 1].columns.len() == 1);
         assert!(context.tables[MAX_TABLES].columns.is_empty());
@@ -1011,7 +1454,7 @@ mod tests {
             Some("17.2".into()),
             Some("kerno".into()),
             None,
-            &action,
+            action.text(),
         );
         let payload = build_payload(&action, &context, "llama3");
         assert_eq!(payload["model"], "llama3");

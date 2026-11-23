@@ -62,9 +62,18 @@ pub(super) fn write_sql(app: &Fixture, cx: &mut TestAppContext, sentence: &str) 
     assert!(app.has(cx, "ai-panel"));
     app.click(cx, "ai-sentence");
     app.type_text(cx, sentence);
+    wait_for_details(app, cx);
+}
+
+/// K50: the structures of the tables the request is about are read before Send.
+pub(super) fn wait_for_details(app: &Fixture, cx: &mut TestAppContext) {
+    app.wait_until(cx, "the tables' keys and indexes", |app, cx| {
+        panel(app, cx).is_none_or(|panel| cx.update(|cx| !panel.read(cx).reading_details()))
+    });
 }
 
 pub(super) fn send_and_wait(app: &Fixture, cx: &mut TestAppContext) {
+    wait_for_details(app, cx);
     app.click(cx, "ai-send");
     app.wait_until(cx, "the answer", |app, cx| {
         if let Some(failure) = failure(app, cx) {
@@ -163,6 +172,19 @@ fn the_body_is_the_preview_and_holds_rows_only_with_the_tick(cx: &mut TestAppCon
         assert!(preview.contains(name), "{name} missing:\n{preview}");
     }
     assert!(!preview.contains(ROW_VALUE), "{preview}");
+    // K50: the table the sentence names, with its keys and indexes, read when the request
+    // opened; no default or comment of its structure.
+    for line in [
+        r"- shop.customers (table)\n  id bigint not null\n  email shop.email not null",
+        r"\n  phone character varying(32)\n",
+        r"\n  primary key (id)",
+        r"\n  unique (email)",
+    ] {
+        assert!(preview.contains(line), "{line} missing:\n{preview}");
+    }
+    for never in ["now()", "People who can place orders", "Free-form labels"] {
+        assert!(!preview.contains(never), "{never}:\n{preview}");
+    }
     send_and_wait(&app, cx);
     let requests = fake.requests();
     assert_eq!(requests.len(), 1);
@@ -572,6 +594,9 @@ fn the_context_is_built_on_mysql_and_mariadb(cx: &mut TestAppContext) {
             "{preview}"
         );
         assert!(preview.contains("kerno.customers (table)"), "{preview}");
+        // K50: its keys and indexes, read on MySQL and MariaDB too.
+        assert!(preview.contains(r"\n  primary key (id)"), "{preview}");
+        assert!(preview.contains(r"\n  unique (email)"), "{preview}");
         // Only the tab's database: MySQL's schemas are databases.
         assert!(preview.contains(r"Schemas: kerno\nTables"), "{preview}");
         assert!(!preview.contains("kerno_analytics"), "{preview}");

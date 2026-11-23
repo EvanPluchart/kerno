@@ -248,8 +248,12 @@ type, by name or id). **List models** fills the list from the endpoint; an impor
   cursor), the plan on screen, or the statement and the server's error message (which may quote a value:
   the preview shows it before you send);
 - the engine, its version and the current database; the names of the schemas; the tables the statement or
-  the sentence names (else the tables of the tab's schema): their names, column names and types and foreign
-  keys, 200 tables at most with their columns, then names only;
+  the sentence names, in the order it names them (else the tables of the tab's schema): their names, column
+  names and types and foreign keys, 200 tables at most with their columns, then names only;
+- for the first 30 of those tables, read when the request opens ("reading the tables' keys and indexes…"
+  meanwhile): which columns refuse NULL (`not null`), the primary key, the foreign keys and the indexes,
+  one line each under the table's name (100 columns, 12 keys and 12 indexes a table, the rest counted). Never
+  a default, a comment, a check or a count of rows;
 - rows only when you tick **Include sample rows (first 5 rows of the tables above)** for that request (up to
   10 tables); the tick is off again at every new request.
 

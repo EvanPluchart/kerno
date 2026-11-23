@@ -988,3 +988,79 @@ async fn a_schema_document_of_the_file() {
     assert_eq!(side.objects.len(), 1);
     assert_eq!(side.objects[0].object.name(), "orders");
 }
+
+/// K50 (D-119): what the AI assistant tells the model of a file's tables: each column's type
+/// and whether it can be NULL, the keys and the indexes, the tables a statement names first;
+/// no default and no index predicate.
+#[tokio::test]
+async fn the_ai_context_says_nulls_keys_and_indexes() {
+    use kerno_core::ai::{self, Action, Context};
+    let dir = tempfile::tempdir().unwrap();
+    let (_file, session) = fixture(dir.path()).await;
+    let action = Action::ExplainQuery {
+        sql: "select * from order_lines l join orders o on o.id = l.order_id".into(),
+    };
+    let catalog = session.completion_catalog().await.unwrap();
+    let mut context = Context::from_catalog(&catalog, "SQLite", None, None, None, action.text());
+    assert_eq!(
+        context.detail_tables(),
+        [
+            TableRef::new("main", "order_lines"),
+            TableRef::new("main", "orders")
+        ]
+    );
+    let details: std::collections::HashMap<_, _> =
+        ai::read_details(session.clone(), context.detail_tables())
+            .await
+            .into_iter()
+            .map(|(table, detail)| (table, detail.unwrap()))
+            .collect();
+    context.add_details(&details);
+    let system = ai::build_payload(&action, &context, "m")["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for line in [
+        "- main.order_lines (table)\n  order_id INTEGER not null\n  line_no INTEGER not null",
+        "\n  primary key (order_id, line_no)",
+        "\n  foreign key (sku) references main.products (sku)",
+        "\n  index (sku)",
+        // Its default (1) is not said.
+        "\n  quantity INTEGER not null\n",
+        "- main.orders (table)\n  id INTEGER not null",
+        "\n  note TEXT\n",
+        "\n  foreign key (customer_id) references main.customers (id)",
+        "\n  index (customer_id)",
+    ] {
+        assert!(system.contains(line), "{line:?} missing:\n{system}");
+    }
+    for never in ["quantity > 0", "DEFAULT 1"] {
+        assert!(!system.contains(never), "{never}:\n{system}");
+    }
+
+    // Indexes on expressions can hold values: only column names are sent.
+    for sql in [
+        "CREATE INDEX kerno_test_lower ON orders (lower(note), placed_on)",
+        "CREATE UNIQUE INDEX kerno_test_coalesce ON orders (coalesce(note, 'kerno-literal-1'))",
+        "CREATE INDEX kerno_test_partial ON orders (placed_on) WHERE note <> 'kerno-literal-2'",
+    ] {
+        run(&session, sql).await.unwrap();
+    }
+    let read = ai::read_details(session.clone(), vec![TableRef::new("main", "orders")]).await;
+    let details: std::collections::HashMap<_, _> = read
+        .into_iter()
+        .map(|(table, detail)| (table, detail.unwrap()))
+        .collect();
+    context.add_details(&details);
+    let system = ai::build_payload(&action, &context, "m")["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        system.contains("\n  index ((expression), placed_on)"),
+        "{system}"
+    );
+    for never in ["kerno-literal", "lower(", "coalesce"] {
+        assert!(!system.contains(never), "{never}:\n{system}");
+    }
+}

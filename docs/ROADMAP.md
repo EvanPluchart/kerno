@@ -64,7 +64,7 @@ unless sample rows are ticked, "What is sent", nothing run by itself):
 4. **From a right-click.** On a table or a result: ask about this table, explain these columns, generate test
    data.
 5. **A richer context.** Foreign keys, indexes and types sent with the schema, for joins that hold and real
-   advice on plans.
+   advice on plans. Done (K50, D-119): nullability, primary keys and indexes added for up to 30 tables.
 
 ## Limits found on the way
 

@@ -5,6 +5,7 @@
 //! answer, as text. An answer runs nothing: its SQL is inserted in the editor when the user
 //! clicks Insert.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui_kit::base::TestTextExt as _;
@@ -20,7 +21,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
     WeakEntity, Window, div, px,
 };
-use kerno_core::ai::{self, Action, AiSettings, Context as AiContext, Sample};
+use kerno_core::ai::{self, Action, AiSettings, Context as AiContext, Detail, Sample};
 use kerno_core::schema::TableRef;
 use kerno_core::sql::Catalog;
 use kerno_core::storage::now_ms;
@@ -172,6 +173,12 @@ pub struct AiPanel {
     /// The rows read for the tick, for these tables; `None` while reading.
     samples: Option<Result<Vec<Sample>, String>>,
     samples_for: Vec<TableRef>,
+    /// The structures read for the context (K50), and the tables asked for so far; read when
+    /// the request opens and when the tables it is about change, each once.
+    details: HashMap<TableRef, Detail>,
+    details_asked: HashSet<TableRef>,
+    /// Readings of structures in flight.
+    details_reading: usize,
     show_preview: bool,
     /// An API key is stored for the endpoint (read off the UI thread, again when the active
     /// endpoint changes).
@@ -205,6 +212,7 @@ impl AiPanel {
                 window,
                 |this: &mut Self, _, event: &InputEvent, window, cx| match event {
                     InputEvent::Change => {
+                        this.load_details(cx);
                         if this.include_samples {
                             this.load_samples(cx);
                         }
@@ -234,6 +242,9 @@ impl AiPanel {
             include_samples: false,
             samples: None,
             samples_for: Vec::new(),
+            details: HashMap::new(),
+            details_asked: HashSet::new(),
+            details_reading: 0,
             show_preview: false,
             has_key: false,
             key_for: String::new(),
@@ -243,6 +254,7 @@ impl AiPanel {
             _subscriptions: subscriptions,
         };
         panel.read_key(cx);
+        panel.load_details(cx);
         panel
     }
 
@@ -346,20 +358,69 @@ impl AiPanel {
         }
     }
 
-    /// What the model is told of the database, without rows.
+    /// What the model is told of the database, without rows: the catalog's names and types,
+    /// and the structures read so far.
     fn context(&self, cx: &App) -> AiContext {
-        AiContext::from_catalog(
+        let mut context = AiContext::from_catalog(
             &self.facts.catalog,
             &self.facts.engine,
             self.facts.server_version.clone(),
             self.facts.database.clone(),
             self.facts.schema.as_deref(),
-            &self.action(cx),
-        )
+            self.action(cx).text(),
+        );
+        context.add_details(&self.details);
+        context
     }
 
-    /// The exact payload Send would send; `None` while the sample rows are being read.
+    /// Whether structures are being read for the context.
+    pub fn reading_details(&self) -> bool {
+        self.details_reading > 0
+    }
+
+    /// Reads the structures of the tables the request is about that were not asked for yet
+    /// (K50): off the UI thread, on the catalog's session, at most [`ai::MAX_DETAILED`]. A
+    /// table that cannot be read stays described by the catalog's names and types.
+    fn load_details(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.facts.session.clone() else {
+            return;
+        };
+        let tables: Vec<TableRef> = (self.context(cx).detail_tables().into_iter())
+            .filter(|table| !self.details_asked.contains(table))
+            .collect();
+        if tables.is_empty() {
+            return;
+        }
+        self.details_asked.extend(tables.iter().cloned());
+        self.details_reading += 1;
+        let reading = bridge::spawn(cx, ai::read_details(session, tables));
+        self.tasks.push(cx.spawn(async move |this, cx| {
+            let read = reading.await;
+            let _ = this.update(cx, |this, cx| {
+                this.details_reading -= 1;
+                for (table, detail) in read {
+                    match detail {
+                        Ok(detail) => {
+                            this.details.insert(table, detail);
+                        }
+                        Err(why) => tracing::debug!(
+                            "AI context: the structure of {}.{} was not read: {why}",
+                            table.schema,
+                            table.name
+                        ),
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The exact payload Send would send; `None` while the sample rows or the structures are
+    /// being read.
     pub fn payload(&self, cx: &App) -> Option<serde_json::Value> {
+        if self.reading_details() {
+            return None;
+        }
         let mut context = self.context(cx);
         if self.include_samples {
             context.sample_rows = Some(self.samples.clone()?.ok()?);
@@ -568,6 +629,7 @@ impl AiPanel {
             .unwrap_or_else(|_| "(no endpoint set)".into());
         let body = match self.payload(cx) {
             Some(payload) => ai::preview(&payload),
+            None if self.reading_details() => "(reading the tables' keys and indexes…)".into(),
             None => "(reading the sample rows…)".into(),
         };
         let key = if self.has_key {
@@ -598,7 +660,7 @@ impl Render for AiPanel {
         let sending = self.sending();
         let empty_sentence =
             matches!(self.action(cx), Action::WriteSql { sentence } if sentence.trim().is_empty());
-        let reading = self.include_samples && self.samples.is_none();
+        let reading = self.include_samples && self.samples.is_none() || self.reading_details();
         let subject: Option<AnyElement> = match &self.action {
             Action::WriteSql { .. } => self.sentence.as_ref().map(|input| {
                 div()
@@ -760,7 +822,7 @@ impl Render for AiPanel {
             .children(subject)
             .child(
                 div().text_xs().text_color(muted).child(SharedString::from(format!(
-                    "Sent with it: the schema names and {described} table{} with their columns and types{}.",
+                    "Sent with it: the schema names and {described} table{} with their columns and types, keys and indexes{}.",
                     if described == 1 { "" } else { "s" },
                     if self.include_samples { ", and their first rows" } else { "" }
                 ))),

@@ -3625,3 +3625,37 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   results name no table and stay as before too. A SQLite table's data has both.
 - WCAG: the link colour reaches 3:1 on every surface the marks are drawn on, the lowest 3.87:1 (light, an
   edited cell of a hovered row); `theme::tests::foreign_key_marks_meet_wcag`.
+
+## D-119 — The AI assistant's context: nullability, keys and indexes (K50; 2026-11-23)
+
+- **What is added**, for the tables a request is described with: each column's type and whether it can be
+  NULL, the primary key, the foreign keys (columns, the table and columns they reference) and the indexes
+  (their columns, unique or not), from `TableStructure`. The context holds names, types, nullability and
+  key membership only; everything else of a structure is dropped by construction (`Detail::of` copies
+  nothing else): defaults, comments, checks, generated columns' expressions, partial indexes' predicates,
+  index definitions, row counts, each of which can hold a value.
+- **An index part is sent only when it is exactly the name of one of the table's columns** (quotes and a
+  trailing `ASC`/`DESC` aside). Any other part (`lower(email)`, `(data->>'kind')`, `coalesce(code, 'N/A')`)
+  is sent as the fixed word `(expression)`; an index none of whose parts is a column is left out. A foreign
+  key is sent only when its columns are the table's; its referenced table and columns are catalog names. A
+  column's type is the engine's text for it: a MySQL `enum('a','b')` or `set(…)` carries its labels (a type's
+  definition, already sent by J17's context, not a row's value; the owner's to veto).
+  An automated review of the first form of this commit found expression parts sent as written; the tests
+  with expression and partial indexes holding literals (core, PostgreSQL, MySQL, SQLite) fail without the
+  check.
+- **Where it comes from.** Types and foreign keys were already in the tab's completion catalog. Nullability,
+  keys and indexes are read with `Session::table_structure` when the request opens, on the catalog's session,
+  off the UI thread (4 at a time, 15 s each), each table once per panel. The navigator turns structures into
+  tree nodes and keeps no `TableStructure`, and the one cache of structures (the data tab's) belongs to that
+  tab: neither is reachable from a query tab without reshaping them, so they are not reused.
+- **Bounds.** 30 tables read in full (`MAX_DETAILED`), the first of those chosen: the ones the text names, in
+  the order it names them (a plan's or an error's statement first), else the tab's schema; per table 100
+  columns, 12 foreign keys and 12 indexes, the rest counted ("… 7 more columns"). The 200 / 1,000 caps of
+  D-068 stay; tables 31 to 200 keep the one-line form of names and types, which also gets the 100-column cap.
+- **Form.** Under `- shop.orders (table)`, one line per column (`customer_id bigint not null`), then
+  `primary key (…)`, `foreign key (…) references shop.customers (id)`, `index (…)` or `unique (…)`: a
+  `CREATE TABLE`-like sketch a person reads in "What is sent…", not JSON.
+- **Size**, the request of a sentence naming no table on the test server's whole `shop` schema (9 tables):
+  2,530 bytes before, 3,510 after (`kerno-postgres` `ai_context::the_shop_schema_before_and_after`).
+- **Waiting.** While structures are read the preview says "(reading the tables' keys and indexes…)" and Send
+  waits, as for sample rows. A table that cannot be read is described by its catalog names and types.
