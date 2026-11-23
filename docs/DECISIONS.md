@@ -3533,3 +3533,13 @@ finding each missing piece by running the restore again is what had to end.
 - Outside text: control characters dropped, `**`, backticks and links' addresses removed, the summary and each
   lead capped, eight leads at most then "…and more". CLAUDE.md §1's sentence on the update check (one request
   to GitHub's releases page, which sends nothing else) is now short of this second request: the owner's to edit.
+
+## D-116 — Calendar versions from 2026.11.1 (the owner, 2026-11-23)
+
+- The owner's choice, after 0.3.1: versions are `YYYY.M.N`, the year, the month and the number of the release
+  in that month, starting at 1 (2026.11.1, 2026.11.2, then 2026.12.1). The month has no leading zero: Cargo's
+  versions are three plain numbers (`2027.1.1`, never `2027.01.1`).
+- Nothing in the code changed for it: the update check compares three numbers (`update::Version`), so 2026.11.1
+  is newer than every 0.x and is offered to them; the artifact names carry the version as written. It is one
+  way: a 0.x published after it would never be offered.
+- No pre-release suffix: the update check reads three numbers only.

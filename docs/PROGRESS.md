@@ -1346,3 +1346,19 @@ Still open (for the owner):
 - Tests: `dbeaver::tests::dbeavers_own_types_become_environments_to_create`,
   `ui_tests::dbeaver_import::environments_are_shown_chosen_and_created_once`.
 
+
+## 2026-11-23 — Release 2026.11.1: the day's reports on 0.3.1, and calendar versions
+
+- Asked by the owner ("release 2026.11.1"). K39 to K47 in a day, from a first outside user and the owner
+  trying each item in a test build: the owner checked every one himself in the app; no pass by an agent.
+- After the agents' commits, done in the main session at the owner's word: ⌘← closes connections and folders
+  too; the restore's list file moved from the shared temporary directory to Kerno's data directory, mode 0600
+  (an automated review found it); "Faster: restore on N connections at once" in the simple restore view (450 s
+  to 219 s on the owner's production backup); a restore that went to the end past ignored errors is no longer
+  called a failure.
+- Versions are calendar ones from this release (D-116).
+- One test is timing-dependent and failed once under load, then passed three times alone:
+  `ui_tests::grid_v11::a_million_fetched_rows_are_searched_off_the_ui_thread` (it asserts a background scan is
+  still running right after a click). To make robust.
+- Asked and left for the next release: a faster backup (pg_dump on several connections writes a directory, not
+  one file).
