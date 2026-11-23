@@ -388,7 +388,15 @@ fn object<'a>(map: &'a Map<String, Value>, key: &str) -> Vec<(&'a String, &'a Ma
 fn text(map: &Map<String, Value>, key: &str) -> Option<String> {
     let text = match map.get(key)? {
         Value::String(text) => text.clone(),
-        Value::Number(number) => number.to_string(),
+        // DBeaver reads a properties map back as doubles and writes it so
+        // (Gson): a port saved once comes out as `2222.0`. A whole number
+        // is its integer, whatever way it was written.
+        Value::Number(number) => match number.as_f64() {
+            Some(value) if number.as_i64().is_none() && value.fract() == 0.0 => {
+                format!("{value:.0}")
+            }
+            _ => number.to_string(),
+        },
         Value::Bool(flag) => flag.to_string(),
         _ => return None,
     };
@@ -1021,6 +1029,34 @@ mod tests {
         assert_eq!(shop.secrets.ssh_password, None);
         // Debug never shows them.
         assert!(!format!("{export:?}").contains("pg-secret"));
+    }
+
+    /// A user's report of 2026-11-23: a tunnel on port 2222 was imported
+    /// on 22. DBeaver writes a handler's numbers as it read them, doubles.
+    #[test]
+    fn a_port_written_as_a_double_is_read() {
+        for (written, port) in [
+            (serde_json::json!(2222.0), 2222),
+            (serde_json::json!(2222), 2222),
+            (serde_json::json!("2222"), 2222),
+        ] {
+            let file = serde_json::json!({
+                "connections": {"postgres-jdbc-1": {
+                    "provider": "postgresql", "driver": "postgres-jdbc", "name": "Shop",
+                    "configuration": {
+                        "host": "db.example.com", "port": 5433.0, "database": "shop",
+                        "handlers": {"ssh_tunnel": {
+                            "enabled": true,
+                            "properties": {"host": "bastion.example.com", "port": written}
+                        }}
+                    }
+                }}
+            });
+            let export = read(file.to_string().as_bytes(), false, &envs(), &PALETTE).unwrap();
+            let config = find(&export, "Shop").config.as_ref().unwrap();
+            assert_eq!(config.port, 5433, "{file}");
+            assert_eq!(config.ssh.as_ref().unwrap().port, port, "{file}");
+        }
     }
 
     #[test]
