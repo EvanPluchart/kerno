@@ -378,26 +378,29 @@ so `ciw` followed by typed text is undone in two steps (the deletion, then the t
 
 ## Updates
 
-Kerno asks GitHub on its own: at launch and every 6 hours it sends a `HEAD` request to
-`https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with the redirect not
-followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and reads the version in
-the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. When a newer version is
-found (and checks are on), it also reads that release's notes file from GitHub to show what it brings in the
-update dialog; nothing about you is sent. Behind a proxy, `curl`
-uses the `HTTPS_PROXY` variable when Kerno was started from a shell that sets it; started from the Dock or a
-desktop launcher it has no proxy, and a network that allows nothing else simply finds no update (database
-drivers are built in: nothing is downloaded to connect). Turn it off in
-Settings ▸ Updates, or for a run with `KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you
-click it. An update is installed only after its SHA-256 matches the release's `SHA256SUMS`; the
-[architecture notes](ARCHITECTURE.md#the-update-check) give the details.
+Kerno asks GitHub on its own: at launch, then whenever 6 hours have passed by the clock (a computer that slept
+checks within two minutes of waking, so a Kerno left open learns of a new version without a restart), it sends a
+`HEAD` request to `https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with
+the redirect not followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and
+reads the version in the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. When
+a newer version is found (and checks are on), it also reads that release's notes file from GitHub to show what
+it brings in the update dialog; nothing about you is sent. Behind a proxy, `curl` uses the `HTTPS_PROXY`
+variable when Kerno was started from a shell that sets it; started from the Dock or a desktop launcher it has
+no proxy, and a network that allows nothing else simply finds no update (database drivers are built in:
+nothing is downloaded to connect). Turn it off in Settings ▸ Updates, or for a run with
+`KERNO_NO_UPDATE_CHECK=1`; Help ▸ Check for Updates… asks only when you click it. An update is installed only
+after its SHA-256 matches the release's `SHA256SUMS`; the [architecture
+notes](ARCHITECTURE.md#the-update-check) give the details.
 
-When a check at launch (or every 6 hours) finds a new version, a window says so once per run: the new version,
-the one you have, and what Update does on your copy (an installed `Kerno.app` or archive replaces itself and
-starts again; any other copy opens the release page). **What's new** opens the release page in your browser.
-**Update** installs as the status bar item does; **Later** closes it, and the next launch asks again; **Skip
-this version** stops the window for that version (a newer one asks again). No key acts in it while you type:
-Enter and Space do nothing, Escape is Later, and Tab goes to Later first and to Update last; it waits while another dialog is open. The status bar item stays in
-every case, a skipped version included; Settings ▸ Updates shows the skipped version with **Ask again**.
+When a check at launch (or 6 hours later) finds a new version, a window says so once per version and run (a
+newer one found later in the same run is offered too): the new version, the one you have, and what Update does
+on your copy (an installed `Kerno.app` or archive replaces itself and starts again; any other copy opens the
+release page). **What's new** opens the release page in your browser. **Update** installs as the status bar
+item does; **Later** closes it, and the next launch asks again; **Skip this version** stops the window for
+that version (a newer one asks again). No key acts in it while you type: Enter and Space do nothing, Escape is
+Later, and Tab goes to Later first and to Update last; it waits while another dialog is open. The status bar
+item stays in every case, a skipped version included; Settings ▸ Updates shows the skipped version with
+**Ask again**.
 
 ## Settings, environments and what wins
 

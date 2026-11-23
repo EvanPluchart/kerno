@@ -18,15 +18,18 @@ use std::io::Read as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui_kit::Global;
 use kerno_core::update::{self as releases, Version};
 use sha2::{Digest as _, Sha256};
 
-/// The first check, once the window is up; then one every `EVERY`.
+/// The first check, once the window is up; then one every `EVERY` of wall time (K57, D-123),
+/// looked at every `TICK`: the executor's timer stops while the computer sleeps, the wall clock
+/// does not.
 pub const FIRST: Duration = Duration::from_secs(3);
 pub const EVERY: Duration = Duration::from_secs(6 * 3600);
+pub const TICK: Duration = Duration::from_secs(60);
 
 /// Runs the external programs of an update. One trait for `curl`, `hdiutil`, `ditto`, `tar`
 /// and the relaunch, so a test fake sees (and asserts) every argument array.
@@ -510,12 +513,20 @@ pub struct Updates {
     pub phase: Phase,
     /// A check is under way.
     pub checking: bool,
-    /// The version the update dialog was shown for in this run (D-097): it shows once per run.
+    /// The newest version the update dialog was shown for in this run (D-097, D-123): once per
+    /// version, and never for one older than it.
     pub offered: Option<Version>,
     /// The version whose notes were asked for in this run (K43): once per version.
     pub notes_asked: Option<Version>,
     /// What a newer version brings, once its notes were read.
     pub notes: Option<(Version, releases::WhatsNew)>,
+    /// The wall clock; a test sets its own.
+    pub clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    /// When a check was last sent in this run, by the wall clock (K57).
+    pub last_check: Option<SystemTime>,
+    /// The wall clock and the executor's clock at the last look of [`Updates::due`]: their
+    /// gaps differ by the time the computer slept.
+    looked: Option<(SystemTime, Instant)>,
 }
 
 impl Global for Updates {}
@@ -532,7 +543,32 @@ impl Updates {
             offered: None,
             notes_asked: None,
             notes: None,
+            clock: Arc::new(SystemTime::now),
+            last_check: None,
+            looked: None,
         }
+    }
+
+    /// Whether a timed check is due now (K57, D-123): none was sent yet, or `EVERY` of wall
+    /// time has passed since the last one, the computer awake or asleep in between. Not at the
+    /// first look after a sleep, though: the network may not be back yet, and the next look, a
+    /// `TICK` later, checks. `timer` is the executor's clock, which stops during a sleep.
+    pub fn due(&mut self, timer: Instant) -> bool {
+        let now = (self.clock)();
+        let woke = self.looked.is_some_and(|(wall, at)| {
+            now.duration_since(wall).unwrap_or_default()
+                > timer.saturating_duration_since(at) + TICK
+        });
+        self.looked = Some((now, timer));
+        // The clock was set back: the interval starts again from now.
+        if self.last_check.is_some_and(|last| last > now) {
+            self.last_check = Some(now);
+        }
+        !woke
+            && self.last_check.is_none_or(|last| {
+                now.duration_since(last)
+                    .is_ok_and(|elapsed| elapsed >= EVERY)
+            })
     }
 }
 
@@ -996,6 +1032,53 @@ pub mod tests {
             install_target(&prefix.join("bin/kerno"), "linux"),
             Install::Page
         );
+    }
+
+    /// K57 (D-123): a timed check is due after `EVERY` of wall time, the computer asleep or not,
+    /// never at the first look after a sleep, and a clock set back starts the interval again.
+    #[test]
+    fn a_timed_check_is_due_after_six_hours_of_wall_time_and_not_right_at_a_wake() {
+        let wall = Arc::new(Mutex::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 30),
+        ));
+        let mut updates = Updates::new(
+            Fake::new(|_, _| Ok(Vec::new())),
+            "0.1.0",
+            Install::Page,
+            "/".into(),
+        );
+        let clock = wall.clone();
+        updates.clock = Arc::new(move || *clock.lock().unwrap());
+        let mut timer = Instant::now();
+        // `by` of wall time, of which `awake` counted by the timer.
+        let mut pass = |updates: &mut Updates, by: Duration, awake: Duration| {
+            *wall.lock().unwrap() += by;
+            timer += awake;
+            updates.due(timer)
+        };
+        // None sent yet: due.
+        assert!(pass(&mut updates, Duration::ZERO, Duration::ZERO));
+        updates.last_check = Some((updates.clock)());
+        // Awake: due at six hours, not a minute before.
+        for _ in 0..359 {
+            assert!(!pass(&mut updates, TICK, TICK));
+        }
+        assert!(pass(&mut updates, TICK, TICK));
+        // Asleep for six hours: not at the first look, at the next one.
+        updates.last_check = Some((updates.clock)());
+        assert!(!pass(&mut updates, EVERY, TICK));
+        assert!(pass(&mut updates, TICK, TICK));
+        // Asleep for five hours: not due, whatever the looks.
+        updates.last_check = Some((updates.clock)());
+        assert!(!pass(&mut updates, Duration::from_secs(5 * 3600), TICK));
+        assert!(!pass(&mut updates, TICK, TICK));
+        assert!(!pass(&mut updates, TICK, Duration::ZERO));
+        // The clock set back a day: the interval starts again from there.
+        *wall.lock().unwrap() -= Duration::from_secs(24 * 3600);
+        assert!(!pass(&mut updates, Duration::ZERO, Duration::ZERO));
+        assert_eq!(updates.last_check, Some((updates.clock)()));
+        assert!(!pass(&mut updates, EVERY - TICK, EVERY - TICK));
+        assert!(pass(&mut updates, TICK, TICK));
     }
 
     #[test]

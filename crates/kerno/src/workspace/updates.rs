@@ -2,7 +2,9 @@
 //! (CLAUDE.md §3 item 12, docs/DECISIONS.md D-045). The steps that run commands are
 //! `crate::update`; Recto's `viewer/update.rs` (MIT, same owner) is the model: the same
 //! timing, the same item, the same "declining keeps the checked download for the next click".
-//! A timed check that finds a new version also opens a dialog, once per run (D-097).
+//! A timed check that finds a new version also opens a dialog, once per version per run (D-097,
+//! D-123); the timed checks follow the wall clock, so a computer that slept checks once it wakes
+//! (K57).
 
 use std::path::PathBuf;
 
@@ -66,6 +68,22 @@ fn set_phase(cx: &mut App, phase: Phase) {
     cx.update_global::<Updates, _>(|updates, _| updates.phase = phase);
 }
 
+/// A newer `version` found by a check becomes the item's: over nothing, a version offered or
+/// failed, or an older one downloaded but not installed (K57: its download removed). A download
+/// or an install under way keeps its state, and so does a download of this same version.
+fn found_newer(cx: &mut App, version: Version) {
+    match phase(cx) {
+        Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..)) => {
+            set_phase(cx, Phase::Available(version))
+        }
+        Some(Phase::Ready(ready, file)) if version > ready => {
+            remove_download(&file);
+            set_phase(cx, Phase::Available(version));
+        }
+        _ => {}
+    }
+}
+
 fn phase(cx: &App) -> Option<Phase> {
     cx.try_global::<Updates>()
         .map(|updates| updates.phase.clone())
@@ -89,22 +107,47 @@ pub fn update_label(cx: &App) -> Option<(String, bool)> {
 }
 
 impl Workspace {
-    /// Checks 3 s after the window opens, then every 6 hours while it lives. Each check reads
-    /// the setting and whether this run may check at all ([`Updates`] installed).
+    /// Checks 3 s after the window opens, then whenever 6 hours of wall time have passed since
+    /// the last check (K57, D-123): looked at every minute while the window lives, and when the
+    /// window becomes active again. Each check reads the setting and whether this run may check
+    /// at all ([`Updates`] installed).
     pub fn start_update_checks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(update::FIRST).await;
+            let first = this.update_in(cx, |this, window, cx| {
+                // Due unless one was asked for in these 3 s; the first look of the clocks.
+                this.check_if_due(window, cx);
+                // Only after the first check: the window's activation at launch adds none.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() {
+                        this.check_if_due(window, cx);
+                    }
+                })
+                .detach();
+            });
+            // The window is gone: nothing keeps checking.
+            if first.is_err() {
+                return;
+            }
             loop {
-                let checked =
-                    this.update_in(cx, |this, window, cx| this.check_updates(false, window, cx));
-                // The window is gone: nothing keeps checking.
-                if checked.is_err() {
+                cx.background_executor().timer(update::TICK).await;
+                let looked = this.update_in(cx, |this, window, cx| this.check_if_due(window, cx));
+                if looked.is_err() {
                     break;
                 }
-                cx.background_executor().timer(update::EVERY).await;
             }
         })
         .detach();
+    }
+
+    /// A timed check, when one is due ([`Updates::due`]).
+    fn check_if_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().now();
+        if cx.try_global::<Updates>().is_some()
+            && cx.update_global::<Updates, _>(|updates, _| updates.due(timer))
+        {
+            self.check_updates(false, window, cx);
+        }
     }
 
     /// The About window's "Check for updates" (K42): the same check as Help ▸ Check for
@@ -189,7 +232,10 @@ impl Workspace {
             return;
         }
         let (runner, current) = (updates.runner.clone(), updates.current.clone());
-        cx.update_global::<Updates, _>(|updates, _| updates.checking = true);
+        cx.update_global::<Updates, _>(|updates, _| {
+            updates.checking = true;
+            updates.last_check = Some((updates.clock)());
+        });
         let task = bridge::spawn_blocking(cx, move || update::check(&*runner, &current));
         cx.spawn_in(window, async move |this, cx| {
             let found = task.await;
@@ -213,15 +259,8 @@ impl Workspace {
         });
         // Asked from the About window (K42): the answer is said there.
         if cx.try_global::<AboutCheck>() == Some(&AboutCheck::Checking) {
-            if let Ok(Some(version)) = &found
-                && matches!(
-                    phase(cx),
-                    Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..))
-                )
-            {
-                set_phase(cx, Phase::Available(*version));
-            }
             if let Ok(Some(version)) = &found {
+                found_newer(cx, *version);
                 self.ask_notes(*version, cx);
             }
             cx.set_global(match found {
@@ -236,14 +275,8 @@ impl Workspace {
         }
         match found {
             Ok(Some(version)) => {
-                // A download or an install under way keeps its state. A skipped version keeps
-                // its item too (D-097): only the dialog is left out.
-                if matches!(
-                    phase(cx),
-                    Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..))
-                ) {
-                    set_phase(cx, Phase::Available(version));
-                }
+                // A skipped version keeps its item too (D-097): only the dialog is left out.
+                found_newer(cx, version);
                 if !manual {
                     self.offer_update(version, window, cx);
                 }
@@ -273,9 +306,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the update dialog for `version`, unless it was shown in this run already (for any
-    /// version), the version was skipped, or the item is no longer about it. Over another
-    /// dialog it waits: `keep_focus` calls this again once none is open.
+    /// Opens the update dialog for `version`, unless it was shown in this run already for this
+    /// version or a newer one (D-123), the version was skipped, or the item is no longer about
+    /// it. Over another dialog it waits: `keep_focus` calls this again once none is open.
     pub(super) fn offer_update(
         &mut self,
         version: Version,
@@ -286,7 +319,7 @@ impl Workspace {
             return;
         };
         let skipped = AppState::get(cx).settings.skipped_update.as_deref();
-        if updates.offered.is_some()
+        if updates.offered.is_some_and(|offered| offered >= version)
             || updates.phase != Phase::Available(version)
             || skipped == Some(version.to_string().as_str())
         {
@@ -559,6 +592,11 @@ impl Workspace {
         let Some(updates) = cx.try_global::<Updates>() else {
             return;
         };
+        // A newer version found while the quit question was open replaced this download (K57):
+        // the item now offers that one.
+        if updates.phase != Phase::Ready(version, file.clone()) {
+            return;
+        }
         let (runner, target) = (updates.runner.clone(), updates.target.clone());
         set_phase(cx, Phase::Installing(version));
         cx.notify();

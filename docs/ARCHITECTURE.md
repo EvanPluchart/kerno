@@ -237,8 +237,9 @@ Updates…" are `workspace/updates.rs`.
   `releases/latest`. A 302 naming one of Kerno's own release tags with a plain `X.Y.Z` strictly newer than the
   running version is an offer. Every URL is built from constants and the parsed numbers, never from server text.
   No `curl`, no check.
-- At launch and every 6 hours. Off: Settings ▸ Updates, `KERNO_NO_UPDATE_CHECK=1` (also for "Check for Updates…"),
-  and bench mode installs no updater at all.
+- At launch, then when 6 hours of wall time have passed (D-123: looked at every minute and when the window is
+  activated; within two minutes of a wake). Off: Settings ▸ Updates, `KERNO_NO_UPDATE_CHECK=1` (also for
+  "Check for Updates…"), and bench mode installs no updater at all.
 - Installing downloads `SHA256SUMS` and the artifact (size-capped, HTTPS only), verifies the SHA-256 and never runs
   an unverified file. On macOS it swaps the `.app` bundle by rename and keeps the old one for rollback; on Linux it
   replaces the tarball's files one by one, each by rename. A download that fails verification is deleted; where an install is not possible the release page opens instead.

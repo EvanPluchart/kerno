@@ -2585,7 +2585,7 @@ we should do as DBeaver does: a window that opens at every launch unless one cli
   a strictly newer version opens the dialog, unless the dialog was already shown in this run (for any version),
   or that version is the skipped one, or the status bar item is no longer about it (a download or an install
   under way). A later check of the same run, of the same version or a newer one, only updates the status bar
-  item. Help ▸ Check for Updates… keeps its notification and opens no dialog: it was asked for, and its answer
+  item (changed by D-123: a newer one is offered too). Help ▸ Check for Updates… keeps its notification and opens no dialog: it was asked for, and its answer
   points at the item. Nothing changes when the check is off (Settings ▸ Updates, `KERNO_NO_UPDATE_CHECK`, a
   bench run, a test build), offline, or when the version is not strictly newer.
 - **What it says.** "Kerno X.Y.Z is available", "You have A.B.C.", and what Update does on this copy
@@ -3833,3 +3833,31 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   panel": the exchange appended to the tab's conversation, each question as typed and as sent with its
   answer). The editor menu's two entries are added after the panel's by `ai_inline::editor_entries`, disabled
   with "(turn on in Settings → AI)" while off; the palette commands say how to turn it on and open nothing.
+
+## D-123 — An update found while Kerno stays open: the wall clock, and once per version (K57; 2026-11-23)
+
+Two users had to quit and reopen Kerno to be offered an update: the 6-hour timer of the checks counts only
+the time the computer is awake (GPUI's timer, like `Instant`, stops in a sleep), so on a laptop six hours of
+timer could be days; and the dialog showed once per run whatever the version.
+
+- **The wall clock.** After the check 3 s after the window opens (D-045, unchanged), the timed checks look
+  every minute (`update::TICK`) and when the window becomes active again; a check is due when none was sent
+  in this run or six hours of wall time (`SystemTime`, through `Updates::clock`, which a test sets) have
+  passed since the last one sent, timed or asked for (Help ▸ Check for Updates…, the About window). A minute's
+  look costs one comparison of two clocks, nothing else.
+- **A wake.** The look that first sees a sleep (the wall clock ahead of the executor's clock by more than a
+  minute) does not check: the network is often not back at that moment, and a failed check waits six hours.
+  The next look, a minute of waking time later, checks: within two minutes of the wake. The window activated
+  before that look waits too. On macOS and Linux the executor's clock is `Instant`, which stops in a sleep
+  (`CLOCK_UPTIME_RAW`, `CLOCK_MONOTONIC`); a clock that counted it would only skip this wait.
+- **Never more often.** Inside the interval nothing is sent, however often the window is activated; the
+  clock set back starts the interval again from there rather than checking at once. `last_check` lives for the
+  run: each launch checks after 3 s, as before. Checks turned off send nothing; turned on again, the next look
+  checks if the interval has passed. Offline is silent and waits the interval, as before (no retry sooner).
+- **Once per version.** The dialog shows once per version per run: a version newer than the one offered is
+  offered too (D-097's "a newer one only updates the status bar item" no longer holds); the same one or an
+  older one (a release withdrawn) is not. Later and Skip this version keep their meaning.
+- **A download not installed.** A version downloaded and checked but not installed (the quit question
+  declined, `Phase::Ready`) gives way to a newer version found by a check: its download is removed, the item
+  and the dialog offer the newer one. The same version keeps the download for the next click. If the quit
+  question was on screen when the newer one arrived, answering it installs nothing: the item offers the newer.

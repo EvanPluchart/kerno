@@ -29,6 +29,20 @@ fn allow_updates(
     app.step(cx, |_, _| ());
 }
 
+/// Gives the updater a wall clock that moves with the test's timer, plus the returned time the
+/// computer spent asleep, which the timer does not count (K57).
+fn wall_clock(cx: &mut TestAppContext) -> Arc<std::sync::Mutex<Duration>> {
+    let executor = cx.executor();
+    let (start, base) = (executor.now(), std::time::SystemTime::now());
+    let slept = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let asleep = slept.clone();
+    cx.update(|cx| {
+        cx.global_mut::<Updates>().clock =
+            Arc::new(move || base + (executor.now() - start) + *asleep.lock().unwrap())
+    });
+    slept
+}
+
 fn phase(cx: &mut TestAppContext) -> Phase {
     cx.update(|cx| cx.global::<Updates>().phase.clone())
 }
@@ -178,6 +192,7 @@ fn the_timed_checks_run_three_seconds_after_the_window_opens_then_every_six_hour
     let temp = tempfile::tempdir().unwrap();
     let fake = Fake::new(|_, _| Ok(redirect_to("v0.1.0")));
     allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    wall_clock(cx);
     let workspace = app.workspace.clone();
     app.step(cx, |window, cx| {
         workspace.update(cx, |workspace, cx| {
@@ -531,7 +546,9 @@ fn next_run(
 }
 
 #[gpui_kit::test]
-fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_run(cx: &mut TestAppContext) {
+fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_version_per_run(
+    cx: &mut TestAppContext,
+) {
     let app = open(cx, memory_storage());
     let temp = tempfile::tempdir().unwrap();
     let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
@@ -565,7 +582,8 @@ fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_run(cx: &m
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
     assert_eq!(checks(&fake), 1);
 
-    // The 6-hour check of the same run: the status bar is enough, for that version or a newer.
+    // The 6-hour check of the same run: the status bar is enough for that version (D-097); a
+    // newer one is offered then (K57, D-123), once; an older one, never again.
     check(&app, cx, false);
     assert!(!app.dialog_open(cx));
     cx.update(|cx| {
@@ -574,6 +592,17 @@ fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_run(cx: &m
     });
     check(&app, cx, false);
     assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert!(update_dialog(&app, cx));
+    assert!(paints(&app, cx, "Kerno 0.3.0 is available"));
+    app.click(cx, "update-dialog-later");
+    check(&app, cx, false);
+    assert!(!app.dialog_open(cx));
+    cx.update(|cx| {
+        let older = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+        cx.global_mut::<Updates>().runner = older;
+    });
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
     assert!(!app.dialog_open(cx));
 
     // Help ▸ Check for Updates… says it in a notification, not with the dialog.
@@ -952,4 +981,181 @@ fn the_dialog_shows_what_the_release_brings_once_its_notes_arrive(cx: &mut TestA
     cx.run_until_parked();
     assert_eq!(checks(&fake), 1);
     assert_eq!(notes_requests(&fake), 0);
+}
+
+/// The window becoming active again, as when the user comes back to it.
+fn come_back(app: &Fixture, cx: &mut TestAppContext) {
+    gpui_kit::VisualTestContext::from_window(app.window.into(), cx).deactivate_window();
+    app.step(cx, |window, _| window.activate_window());
+}
+
+/// K57 (D-123): the timed checks follow the wall clock. A computer that slept six hours checks
+/// within two minutes of waking (not at once: the network may not be back), the window becoming
+/// active checks when a check is due, and never inside the interval; with checks off, nothing.
+#[gpui_kit::test]
+fn a_kerno_left_open_checks_after_six_hours_of_wall_time_even_through_a_sleep(
+    cx: &mut TestAppContext,
+) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.1.0")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    let slept = wall_clock(cx);
+    let sleep = |by: u64| *slept.lock().unwrap() += Duration::from_secs(by);
+    let workspace = app.workspace.clone();
+    app.step(cx, |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.start_update_checks(window, cx)
+        })
+    });
+    let advance = |app: &Fixture, cx: &mut TestAppContext, by: Duration| {
+        cx.executor().advance_clock(by);
+        app.wait_until(cx, "the checks", |_, cx| {
+            cx.update(|cx| !cx.global::<Updates>().checking)
+        });
+        checks(&fake)
+    };
+    assert_eq!(advance(&app, cx, crate::update::FIRST), 1);
+
+    // Six hours asleep: the timer counted none of them. Not at the wake, a minute after.
+    sleep(6 * 3600);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 1);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 2);
+    // Five hours asleep, then the window comes back: inside the interval, nothing.
+    sleep(5 * 3600);
+    for _ in 0..3 {
+        assert_eq!(advance(&app, cx, crate::update::TICK), 2);
+    }
+    come_back(&app, cx);
+    assert_eq!(advance(&app, cx, Duration::ZERO), 2);
+    // An hour more asleep, the window back at the wake: due, but a minute later.
+    sleep(3600);
+    come_back(&app, cx);
+    assert_eq!(advance(&app, cx, Duration::ZERO), 2);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 3);
+
+    // Awake six hours less half a minute: not yet. Half a minute later the window comes back
+    // before the next look: it checks at once, and once.
+    assert_eq!(
+        advance(&app, cx, crate::update::EVERY - Duration::from_secs(30)),
+        3
+    );
+    sleep(30);
+    come_back(&app, cx);
+    assert_eq!(advance(&app, cx, Duration::ZERO), 4);
+    come_back(&app, cx);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 4);
+
+    // Checks off in Settings: a day passes, nothing is asked. Turned on again: the next look.
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = false));
+    sleep(24 * 3600);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 4);
+    come_back(&app, cx);
+    assert_eq!(advance(&app, cx, crate::update::TICK), 4);
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = true));
+    assert_eq!(advance(&app, cx, crate::update::TICK), 5);
+    assert_eq!(fake.calls().len(), 5, "only the checks");
+}
+
+/// K57: a newer version found after an older one was downloaded but not installed (the quit
+/// question declined) replaces it, and its download is removed; the same version, or a
+/// download under way, keeps its state.
+#[gpui_kit::test]
+fn a_newer_version_replaces_one_downloaded_but_not_installed(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let latest = |tag: &'static str| Fake::new(move |_, _| Ok(redirect_to(tag)));
+    let folder = temp.path().join("kerno-update-1");
+    std::fs::create_dir(&folder).unwrap();
+    let file = folder.join("Kerno-0.2.0.dmg");
+    std::fs::write(&file, "checked").unwrap();
+
+    // The same version: the checked download stays for the next click.
+    allow_updates(
+        &app,
+        cx,
+        latest("v0.2.0"),
+        "0.1.0",
+        Install::Page,
+        temp.path(),
+    );
+    set_phase(&app, cx, Phase::Ready(v("0.2.0"), file.clone()));
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Ready(v("0.2.0"), file.clone()));
+    assert!(file.is_file());
+    app.press(cx, &["escape"]);
+
+    // A newer one: offered, the old download gone.
+    cx.update(|cx| cx.global_mut::<Updates>().runner = latest("v0.3.0"));
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert!(!folder.exists(), "the old download is removed");
+    assert!(update_dialog(&app, cx));
+    assert!(paints(&app, cx, "Kerno 0.3.0 is available"));
+    assert_eq!(
+        label(cx).as_deref(),
+        Some("Kerno 0.3.0 is available · Update")
+    );
+    app.press(cx, &["escape"]);
+
+    // A download under way keeps going.
+    allow_updates(
+        &app,
+        cx,
+        latest("v0.3.0"),
+        "0.1.0",
+        Install::Page,
+        temp.path(),
+    );
+    set_phase(&app, cx, Phase::Downloading(v("0.2.0")));
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Downloading(v("0.2.0")));
+}
+
+/// K57: the quit question of an install open, a newer version found meanwhile: answering it
+/// installs nothing, and the item offers the newer one.
+#[gpui_kit::test]
+fn a_newer_version_found_during_the_quit_question_installs_nothing(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    let temp = tempfile::tempdir().unwrap();
+    let (_apps, bundle) = applications();
+    let fake = release_runner(release(&sha256_hex(b"the release")));
+    allow_updates(
+        &app,
+        cx,
+        fake.clone(),
+        "0.1.0",
+        Install::App(bundle.clone()),
+        temp.path(),
+    );
+    app.press(cx, &["secondary-t"]);
+    app.open_transaction(cx, "select 1 as kerno_ui_update_newer");
+    set_phase(&app, cx, Phase::Available(v("0.2.0")));
+    app.click(cx, "status-update-button");
+    app.wait_until(cx, "the quit question", |app, cx| {
+        app.has(cx, "end-question")
+    });
+    let Phase::Ready(_, file) = phase(cx) else {
+        panic!("not ready: {:?}", phase(cx))
+    };
+    cx.update(|cx| cx.global_mut::<Updates>().runner = Fake::new(|_, _| Ok(redirect_to("v0.3.0"))));
+    check(&app, cx, false);
+    assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert!(!file.exists());
+    app.click(cx, "end-rollback");
+    app.wait_until(cx, "the rollback", |app, cx| {
+        app.tx_state(cx) == kerno_core::TxState::Idle
+    });
+    cx.run_until_parked();
+    assert_eq!(phase(cx), Phase::Available(v("0.3.0")));
+    assert_eq!(bundle_says(&bundle), "old");
+    assert!(
+        !fake
+            .calls()
+            .iter()
+            .any(|(program, _)| { program.ends_with("open") || program.ends_with("hdiutil") })
+    );
 }

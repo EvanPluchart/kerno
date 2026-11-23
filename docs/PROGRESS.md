@@ -1477,3 +1477,14 @@ Still open (for the owner):
   All (the same code as the grid's keys); greyed where nothing focused takes one. The keys do what they did.
 - Tests: `ui_tests::k54::the_edit_menu_has_the_systems_editing_entries` (PostgreSQL fixture read only, the pending
   changes left unapplied), each part seen failing under a mutation.
+
+## 2026-11-23 — K57: a Kerno left open learns of a new version
+
+- Two users had to restart Kerno to be offered an update: the 6-hour timer of the checks stops while the
+  computer sleeps, and the dialog showed once per run. The checks now follow the wall clock: looked at every
+  minute and when the window is activated again, one is sent when six hours have passed since the last, within
+  two minutes of a wake, never inside the interval (D-123). A newer version found later in the same run opens
+  the dialog too; a version downloaded but not installed gives way to a newer one, its download removed.
+- Tests: `update::tests::a_timed_check_is_due_after_six_hours_of_wall_time_and_not_right_at_a_wake` and four UI
+  tests in `ui_tests/updates.rs` (one renamed, one moved onto the wall clock), each seen failing under a
+  mutation (`docs/plans/M12.md`, K57). No request leaves the machine in them (the fake runner).
