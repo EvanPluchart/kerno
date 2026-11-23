@@ -3903,7 +3903,8 @@ K41 reported a tunnel's jump server as not imported. DBeaver keeps them in the S
 - **What a hop cannot have in Kerno.** `ssh -J` hands a hop Kerno's `-F` file only, never `-i`,
   `IdentityAgent` or a passphrase answer for another key; and OpenSSH logs in with no password here. So a hop's
   key file, its agent socket, its password and a key kept inside DBeaver are said, each with what to do
-  (`ssh-add <path>`, or the host in `~/.ssh/config`); the hop is imported anyway, with its host, port and user,
+  (`ssh-add`, or the host in `~/.ssh/config`; a path read in the file is quoted as what DBeaver used, never
+  inside a command to paste: it is the file's, not the user's); the hop is imported anyway, with its host, port and user,
   so the connection opens once the user's SSH setup has the key. A hop's saved password or passphrase is not
   imported: Kerno has no place for one (its secrets are the database password, the tunnel's password and the
   tunnel key's passphrase) and its OpenSSH tunnel would not use it; never put in the tunnel's own.

@@ -179,15 +179,24 @@ pub fn tunnel_args(
 
 /// Whether `text` is safe as a host, user or jump-host list for `ssh`:
 /// OpenSSH puts jump hosts in a shell command (ProxyJump), so nothing that a
-/// shell would read as more than a word.
+/// shell would read as more than a word, and nothing `ssh` would read as an
+/// option: neither a word nor the host after its `user@` starts with `-`, and
+/// in a list that holds for each jump host, not only the first.
 pub fn safe_ssh_word(text: &str, list: bool) -> bool {
-    !text.is_empty()
-        && text.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
-                || (list && c == ',')
-        })
-        && !text.starts_with('-')
+    let word = |word: &str| {
+        let host = word.rsplit('@').next().unwrap_or(word);
+        !word.is_empty()
+            && !word.starts_with('-')
+            && !host.trim_start_matches('[').starts_with('-')
+            && word.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
+            })
+    };
+    if list {
+        text.split(',').all(word)
+    } else {
+        word(text)
+    }
 }
 
 // The tunnel ---------------------------------------------------------------------
@@ -983,6 +992,17 @@ mod tests {
         ] {
             assert!(!safe_ssh_word(word, true), "{word}");
         }
+        // An option hidden after the first jump host, or after a user.
+        for word in [
+            "j1,-D8080",
+            "j1,,j2",
+            "j1,",
+            "ops@-D8080:22",
+            "ops@[-w0]:22",
+        ] {
+            assert!(!safe_ssh_word(word, true), "{word}");
+        }
+        assert!(!safe_ssh_word("ops@-D8080", false));
     }
 
     #[test]

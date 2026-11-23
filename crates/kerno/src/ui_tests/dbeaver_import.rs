@@ -315,8 +315,8 @@ fn the_preview_and_the_report_say_what_to_check_for_each_connection(cx: &mut Tes
         }
     });
     std::fs::write(&path, json.to_string()).unwrap();
-    let key = "jump server “jump.example.com”: its key file is not passed to it: load it with \
-               ssh-add /keys/hop, or name it for that host in ~/.ssh/config";
+    let key = "jump server “jump.example.com”: its key file is not passed to it (DBeaver used \
+               “/keys/hop”): load that key with ssh-add, or name it for that host in ~/.ssh/config";
     let pasted = "certificate pasted in DBeaver, not in a file: save it to a file and choose it \
                   on the SSL tab";
     let not_created = "connection type “Preprod” not created: put in Local";

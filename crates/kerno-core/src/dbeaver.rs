@@ -768,9 +768,11 @@ fn jump_servers(props: &Map<String, Value>) -> Result<Vec<Hop>, String> {
                 format!("{hop} logs in with your default SSH agent, not the one at {socket}")
             }),
             Some("PUBLIC_KEY") => Some(match text(props, &key("keyPath")) {
+                // The path is the file's: said as what DBeaver had, never inside a
+                // command a user could paste into a terminal.
                 Some(path) => format!(
-                    "{hop}: its key file is not passed to it: load it with ssh-add {path}, or \
-                     name it for that host in ~/.ssh/config"
+                    "{hop}: its key file is not passed to it (DBeaver used “{path}”): load that \
+                     key with ssh-add, or name it for that host in ~/.ssh/config"
                 ),
                 None => format!(
                     "{hop}: its SSH key is kept inside DBeaver: save it to a file, then load it \
@@ -1285,8 +1287,9 @@ mod tests {
         assert_eq!(
             shop.not_mapped,
             [
-                "jump server “jump.example.com”: its key file is not passed to it: load it with \
-                 ssh-add /home/me/.ssh/hop, or name it for that host in ~/.ssh/config"
+                "jump server “jump.example.com”: its key file is not passed to it (DBeaver used \
+                 “/home/me/.ssh/hop”): load that key with ssh-add, or name it for that host in \
+                 ~/.ssh/config"
             ]
         );
         // The hop's saved passphrase has no place in Kerno: never in the tunnel's.
