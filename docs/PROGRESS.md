@@ -1255,3 +1255,24 @@ Still open (for the owner):
   a failure with and without "continue on error", a cancel, a disconnect, a refused write, an edit, the next
   run, a result read again; and the drawing beside wrapped, folded, zoomed and far-down lines without a
   server), each seen failing under a mutation of its part.
+
+## 2026-11-23 — Release 0.3.1: K35 to K38, a pass in the real app, then the version
+
+- Asked by the owner ("release 0.3.1") once K35 to K38 were in: the four first reports of a user replacing
+  DBeaver by Kerno. With them, `url` 2.5.9 for RUSTSEC-2026-0592, published after 0.3.0.
+- A pass in the real app on the bundle of `016c783` (a scratch data directory, the in-memory secret store, the
+  test servers): the marks of a running script move in real time and the status bar's time goes up; a table
+  loads at the end of its rows by the size chosen in the footer, on `analytics.big_table` too; a connection's
+  "SQL scripts" lists a saved query and a file, connects first and never opens twice; a restore of a backup
+  owned by a role the server lacks fails with the plain words, and "Restore without owners and privileges…"
+  restores it. Nothing blocking.
+- Found by the pass and left for later: a path typed in the restore's File field is taken only at Return or
+  Tab, with "Restore…" disabled until then and nothing saying so; a table tab whose connection was closed still
+  shows its fetch and edit buttons; the query bar's icons move when Cancel appears; the running mark's halo is
+  too faint to be seen breathing; the fetch size of a tab is not kept across a restart (as D-109 decided). One
+  row of the fixture had been changed by hand before the pass (`shop.customers` 1's e-mail): no test reads it.
+- Also seen in K37's timing and not looked into: a script of 5,000 statements gets slower as its result tabs
+  pile up.
+- The full check on the release commit `38a2740`: 1,908 tests, 0 failed. `scripts/release.sh 0.3.1`: the
+  macOS disk image and six Linux packages, each started in ubuntu:20.04 and debian:13. Pushed, tagged
+  `v0.3.1` and published at the owner's word.
