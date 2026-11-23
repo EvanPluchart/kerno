@@ -1488,3 +1488,9 @@ Still open (for the owner):
 - Tests: `update::tests::a_timed_check_is_due_after_six_hours_of_wall_time_and_not_right_at_a_wake` and four UI
   tests in `ui_tests/updates.rs` (one renamed, one moved onto the wall clock), each seen failing under a
   mutation (`docs/plans/M12.md`, K57). No request leaves the machine in them (the fake runner).
+
+## 2026-11-24 — K56: seven small defects of dialogs and tabs
+
+- In a window less than about 750 px high, a failed "Test connection" pushed the connection dialog's buttons
+  out of the window. The fields now scroll above the result and the buttons, which stay in view down to 560 px;
+  the other tall dialogs were checked at that height and pass.

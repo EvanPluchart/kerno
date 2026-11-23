@@ -36,7 +36,11 @@ impl Fixture {
     }
 
     /// Opens the import preview of `path`, once it is read.
-    fn import_preview(&self, cx: &mut TestAppContext, path: PathBuf) -> Entity<ImportSetup> {
+    pub(super) fn import_preview(
+        &self,
+        cx: &mut TestAppContext,
+        path: PathBuf,
+    ) -> Entity<ImportSetup> {
         let slot: Rc<RefCell<Option<Entity<ImportSetup>>>> = Rc::default();
         let (connections, filled) = (self.connections.clone(), slot.clone());
         self.step(cx, move |window, cx| {

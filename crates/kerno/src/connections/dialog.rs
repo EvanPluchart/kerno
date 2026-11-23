@@ -10,6 +10,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::text::TextView;
@@ -2180,8 +2181,23 @@ fn short_version(banner: &str) -> &str {
     line.split(" on ").next().unwrap_or(line).trim()
 }
 
+/// What the kit draws around the dialog's view (its title, paddings and
+/// margins to the window's edges), with room to spare: a short window
+/// shortens the view, whose fields scroll, and never cuts the buttons.
+const DIALOG_CHROME: f32 = 110.;
+/// A tab's body keeps this height when the window has room for it, so the
+/// buttons do not move from tab to tab.
+const BODY_HEIGHT: f32 = 392.;
+/// The engines and the tab bar above the body, and the buttons below.
+const AROUND_BODY: f32 = 200.;
+/// The tallest a test's result gets: a longer one scrolls in its box, the
+/// buttons below it.
+const RESULT_HEIGHT: f32 = 120.;
+
 impl Render for ConnectionDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let height = (window.viewport_size().height - px(DIALOG_CHROME)).max(px(240.));
+        let body_height = (height - px(AROUND_BODY)).clamp(px(0.), px(BODY_HEIGHT));
         let sections = self.sections();
         let selected = sections
             .iter()
@@ -2201,30 +2217,56 @@ impl Render for ConnectionDialog {
                 .any(|error| section_of(error.field) == section)
         };
         let danger = cx.theme().danger;
+        let test = self.render_test(cx);
+        // The engines, the tabs and their fields scroll when the window is
+        // too short for them; the test's result (in a box of its own) and
+        // the buttons stay in view below.
         v_flex()
+            .id("conn-dialog")
+            .test_support()
+            .max_h(height)
             .gap_4()
             .pt_2()
-            .child(self.render_engines(cx))
             .child(
-                TabBar::new("conn-sections")
-                    .underline()
-                    .selected_index(selected)
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        if let Some((section, _)) = this.sections().get(*index) {
-                            this.section = *section;
-                            cx.notify();
-                        }
-                    }))
-                    .children(sections.iter().map(|(section, label)| {
-                        Tab::new().label(*label).when(has_error(*section), |tab| {
-                            tab.suffix(div().size(px(6.)).rounded_full().bg(danger))
-                        })
-                    })),
+                v_flex()
+                    .gap_4()
+                    // Room for the scrollbar beside the fields.
+                    .pr_3()
+                    .child(self.render_engines(cx))
+                    .child(
+                        TabBar::new("conn-sections")
+                            .underline()
+                            .selected_index(selected)
+                            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                                if let Some((section, _)) = this.sections().get(*index) {
+                                    this.section = *section;
+                                    cx.notify();
+                                }
+                            }))
+                            .children(sections.iter().map(|(section, label)| {
+                                Tab::new().label(*label).when(has_error(*section), |tab| {
+                                    tab.suffix(div().size(px(6.)).rounded_full().bg(danger))
+                                })
+                            })),
+                    )
+                    .child(div().min_h(body_height).child(body))
+                    .overflow_y_scrollbar(),
             )
-            .child(div().min_h(px(392.)).child(body))
-            .child(self.render_test(cx))
+            .when(!matches!(self.test, TestState::NotRun), |this| {
+                this.child(
+                    // As tall as the result (the kit's scrollable would
+                    // always take the whole maximum).
+                    div()
+                        .id("conn-test-result")
+                        .flex_none()
+                        .max_h(px(RESULT_HEIGHT))
+                        .overflow_y_scroll()
+                        .child(test),
+                )
+            })
             .child(
                 h_flex()
+                    .flex_none()
                     .justify_between()
                     .child(
                         Button::new("conn-test")
