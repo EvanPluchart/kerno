@@ -68,6 +68,7 @@ mod portability;
 mod reconnect;
 mod reorder;
 mod restore_roles;
+mod run_marks;
 mod schema_export;
 mod script_progress;
 mod secret_store;

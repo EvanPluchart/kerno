@@ -64,6 +64,7 @@ use super::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner, table_size};
 use super::occurrences::Occurrences;
 use super::params;
 use super::plan_view;
+use super::run_marks::{self, Mark, Trace};
 use super::tx_log::{self, TxLogEntry};
 use super::value_panel::{self, ValuePanel};
 use crate::actions::{
@@ -86,9 +87,11 @@ use crate::tabs::{self, Choices, EditorFacts, ResultFacts, TabAction, TabSnapsho
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Statement {
     sql: String,
-    /// Byte offset of the statement in the editor's text, when it runs as
-    /// written there.
-    origin: Option<usize>,
+    /// The bytes of the editor's text the statement was read from. With
+    /// parameters bound, `sql` is no longer that text: the server's error
+    /// positions are then not marked (`mark_error` compares), the margin's
+    /// marks still are (K37).
+    place: Option<std::ops::Range<usize>>,
     /// Why it is not sent: a write on a read-only target of a run on
     /// several connections (J14), shown in its place.
     refused: Option<Failure>,
@@ -469,6 +472,10 @@ pub enum Activity {
     },
 }
 
+/// How often a tab is drawn again while a statement runs: its time in the
+/// status bar goes up, its mark in the margin breathes (K37).
+const RUN_TICK: Duration = Duration::from_millis(250);
+
 /// Rows a stacked result shows before its grid scrolls (J11).
 const STACK_ROWS: usize = 12;
 /// The height of a stacked result's header.
@@ -603,6 +610,10 @@ pub struct QueryTab {
     auto_refresh_stopped: Option<&'static str>,
     /// The frames around the bracket at the cursor and its match.
     brackets: input::RangeDecorationCollection,
+    /// Where the last run from the editor stands, drawn in its margin (K37).
+    trace: Rc<RefCell<Trace>>,
+    /// The tab is drawn again every [`RUN_TICK`] while a statement runs.
+    ticking: bool,
     /// The other occurrences of the word or selection at the cursor.
     occurrences: Occurrences,
     /// The rollback of a transaction left idle, armed for the length of
@@ -678,6 +689,10 @@ impl QueryTab {
             editor
                 .lsp_mut()
                 .set_completion_highlighter(Rc::new(completion::highlight));
+            // The strip of a run's marks (K37), kept for good: one made at
+            // the first run would push the text aside then.
+            editor.create_gutter_decorations_collection(Vec::new(), cx);
+            editor.set_gutter_decorations_width(run_marks::STRIP, cx);
             editor.create_range_decorations_collection(Vec::new(), cx)
         });
         let occurrences = Occurrences::new(&editor, cx);
@@ -686,6 +701,9 @@ impl QueryTab {
         let edits = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.occurrences.text_changed();
+                // A run's marks describe the text it ran: an edit ends them,
+                // and a run still going marks nothing more (K37).
+                this.trace.borrow_mut().clear();
                 if let Some(vim) = this.vim.as_mut() {
                     vim.text_changed();
                 }
@@ -801,6 +819,8 @@ impl QueryTab {
             auto_refresh: None,
             auto_refresh_stopped: None,
             brackets,
+            trace: Rc::default(),
+            ticking: false,
             occurrences,
             idle_rollback: None,
             session_watch: None,
@@ -816,6 +836,7 @@ impl QueryTab {
         let idle = cx.observe_in(&cx.entity(), window, |this: &mut Self, _, window, cx| {
             this.watch_idle_transaction(window, cx);
             this.watch_session(window, cx);
+            this.tick_while_running(cx);
         });
         tab._subscriptions.push(idle);
         tab.follow_connection(cx);
@@ -1410,6 +1431,7 @@ impl QueryTab {
                 );
                 self.active_result = self.results.len() - 1;
                 self.show_results();
+                self.trace.borrow_mut().stopped(Mark::Failed);
             }
             self.stop(cx);
             self.close_session(cx);
@@ -1750,7 +1772,7 @@ impl QueryTab {
         let selection = editor.selected_range();
         let from = |source: &str, base: usize, span: &kerno_core::sql::StatementSpan| Statement {
             sql: span.text(source).to_string(),
-            origin: Some(base + span.range.start),
+            place: Some(base + span.range.start..base + span.range.end),
             refused: None,
         };
         if scope != Scope::FromCursor
@@ -2045,6 +2067,7 @@ impl QueryTab {
     fn stop(&mut self, cx: &mut Context<Self>) {
         // Dropping the run drops the execution, which stops the statement.
         if self.run.take().is_some() {
+            self.trace.borrow_mut().stopped(Mark::Cancelled);
             // A target of a run on several connections stops with it (J14).
             self.end_script(Stage::Cancelled, None, cx);
             for pane in &mut self.results {
@@ -2381,13 +2404,7 @@ impl QueryTab {
                                 .position(|known| *known == label(index, key))?;
                             Some(values[position].to_sql(meta.dialect()))
                         }),
-                        // Positions the server reports are in the text it got,
-                        // not in the editor's.
-                        origin: if params.is_empty() {
-                            statement.origin
-                        } else {
-                            None
-                        },
+                        place: statement.place.clone(),
                         refused: None,
                     })
                     .collect();
@@ -2667,7 +2684,7 @@ impl QueryTab {
             .iter()
             .map(|span| Statement {
                 sql: span.text(&text).to_string(),
-                origin: Some(span.range.start),
+                place: Some(span.range.clone()),
                 refused: None,
             })
             .collect();
@@ -2746,6 +2763,28 @@ impl QueryTab {
         cx: &mut Context<Self>,
     ) {
         self.stop(cx);
+        // A run from the editor replaces the marks of the last one, and marks
+        // its own (an edit clears them in place); a result read again (no
+        // place in the text) marks nothing and leaves them (K37).
+        let trace = statements
+            .iter()
+            .any(|statement| statement.place.is_some())
+            .then(|| {
+                let places = statements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, statement)| Some((index, statement.place.clone()?)));
+                self.trace = Rc::new(RefCell::new(Trace::new(
+                    self.editor.read(cx).text(),
+                    places,
+                )));
+                self.trace.clone()
+            });
+        let mark = move |index: usize, mark: Mark| {
+            if let Some(trace) = &trace {
+                trace.borrow_mut().set(index, mark);
+            }
+        };
         self.generation += 1;
         self.requery = self.next_requery.take();
         self.widths = std::mem::take(&mut self.next_widths);
@@ -2839,6 +2878,7 @@ impl QueryTab {
                 if let Some(refusal) = statement.refused.clone() {
                     let _ = this.update(cx, |this, cx| {
                         this.push_pane(statement.sql.clone(), Outcome::Failed(refusal), None, None);
+                        mark(index, Mark::Refused);
                         if let Some(script) = this.scripting() {
                             script.refused += 1;
                         }
@@ -2873,6 +2913,7 @@ impl QueryTab {
                         total,
                         since: started,
                     };
+                    mark(index, Mark::Running);
                     cx.notify();
                 });
                 // A plan is asked for by wrapping the statement.
@@ -2933,6 +2974,7 @@ impl QueryTab {
                                         // The rows asked for are here: the tab is not
                                         // waiting for the server any more.
                                         this.activity = Activity::Idle;
+                                        mark(index, Mark::Done);
                                         let took = *took.get_or_insert_with(|| started.elapsed());
                                         if let Some(pane) = this.pane_mut(id) {
                                             pane.elapsed = Some(took);
@@ -3074,6 +3116,14 @@ impl QueryTab {
                     && explain.is_none()
                     && matches!(status, HistoryStatus::Ok);
                 let _ = this.update(cx, |this, cx| {
+                    mark(
+                        index,
+                        match status {
+                            HistoryStatus::Ok => Mark::Done,
+                            HistoryStatus::Error => Mark::Failed,
+                            HistoryStatus::Cancelled => Mark::Cancelled,
+                        },
+                    );
                     let ended = Ended {
                         started_at_ms,
                         elapsed: took.unwrap_or_else(|| started.elapsed()),
@@ -3085,7 +3135,7 @@ impl QueryTab {
                     // The history holds what was sent: an EXPLAIN is one.
                     let recorded = Statement {
                         sql: sent.clone(),
-                        origin: statement.origin.filter(|_| explain.is_none()),
+                        place: statement.place.clone().filter(|_| explain.is_none()),
                         refused: None,
                     };
                     this.statement_ended(&recorded, ended, cx)
@@ -3201,10 +3251,10 @@ impl QueryTab {
                 ));
             }
         }
-        if let (Some(origin), Some(failure)) = (statement.origin, &failure)
+        if let (Some(place), Some(failure)) = (&statement.place, &failure)
             && let Some(position) = failure.position
         {
-            self.mark_error(origin, &statement.sql, position, &failure.message, cx);
+            self.mark_error(place.start, &statement.sql, position, &failure.message, cx);
         }
         // A `BEGIN` typed in auto-commit opens one; a `COMMIT` typed, or
         // MySQL's DDL, ends it.
@@ -3307,7 +3357,8 @@ impl QueryTab {
         self.editor.update(cx, |editor, cx| {
             let text = editor.text().to_string();
             let (start, end) = (origin + at, (origin + at + word).min(text.len()));
-            // The text changed since the run started: nothing sure to mark.
+            // The text changed since the run started, or the statement sent
+            // is not the one written (parameters bound): nothing sure to mark.
             if text.get(origin..origin + statement.len()) != Some(statement) {
                 return;
             }
@@ -3381,6 +3432,73 @@ impl QueryTab {
     /// Whether a statement is running.
     pub fn running(&self) -> bool {
         matches!(self.activity, Activity::Running { .. })
+    }
+
+    /// What the status bar says while the tab waits for the server: which
+    /// statement of the run, and for how long it has been running (K37).
+    pub fn running_text(&self) -> Option<String> {
+        let Activity::Running {
+            index,
+            total,
+            since,
+        } = self.activity
+        else {
+            return None;
+        };
+        let time = duration_text(since.elapsed());
+        Some(if total > 1 {
+            format!("running statement {} of {total} · {time}", index + 1)
+        } else {
+            format!("running · {time}")
+        })
+    }
+
+    /// What the marks of the last run from the editor say, in words, once
+    /// it ended (K37).
+    pub fn trace_text(&self, cx: &App) -> Option<String> {
+        if self.running() {
+            return None;
+        }
+        self.trace
+            .borrow()
+            .summary(self.editor.read(cx).text().len())
+    }
+
+    /// The marks of the last run from the editor, in the order of the
+    /// text; for tests.
+    #[cfg(test)]
+    pub fn run_marks(&self) -> Vec<Option<Mark>> {
+        self.trace.borrow().marks()
+    }
+
+    /// The marks of the last run, to read or set; for tests.
+    #[cfg(test)]
+    pub fn trace_for_tests(&self) -> &Rc<RefCell<Trace>> {
+        &self.trace
+    }
+
+    /// Draws the tab again every [`RUN_TICK`] while a statement runs.
+    fn tick_while_running(&mut self, cx: &mut Context<Self>) {
+        if self.ticking || !self.running() {
+            return;
+        }
+        self.ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(RUN_TICK).await;
+                let going = this.update(cx, |this, cx| {
+                    this.ticking = this.running();
+                    if this.ticking {
+                        cx.notify();
+                    }
+                    this.ticking
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// The databases the tab can switch to.
@@ -4768,7 +4886,7 @@ impl QueryTab {
         self.execute(
             vec![Statement {
                 sql,
-                origin: None,
+                place: None,
                 refused: None,
             }],
             false,
@@ -5220,7 +5338,7 @@ impl QueryTab {
         self.execute(
             vec![Statement {
                 sql,
-                origin: None,
+                place: None,
                 refused: None,
             }],
             false,
@@ -7732,7 +7850,11 @@ impl Render for QueryTab {
                         editor.font_features(gpui_kit::FontFeatures::disable_ligatures())
                     })
                     .context_menu(|menu, _, _| menu),
-            );
+            )
+            // Where the last run stands, in the margin (K37): after the
+            // editor, so that its layout of this frame is the one read.
+            .relative()
+            .child(run_marks::overlay(self.editor.clone(), self.trace.clone()));
         // Vim mode (J19) puts its key handlers and command field around
         // it, only while it is on.
         let editor = if self.vim.is_some() {

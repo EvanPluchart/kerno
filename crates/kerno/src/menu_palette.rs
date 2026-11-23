@@ -500,6 +500,7 @@ fn every_entry() -> Vec<Found> {
         StatusItem::ReadOnly,
         StatusItem::Transaction,
         StatusItem::Running,
+        StatusItem::RunTrace,
         StatusItem::Pending,
         StatusItem::Rows,
         StatusItem::Timing,

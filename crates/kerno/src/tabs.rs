@@ -696,6 +696,8 @@ pub enum StatusItem {
     ReadOnly,
     Transaction,
     Running,
+    /// Where the last run from the editor ended, while its marks show (K37).
+    RunTrace,
     Pending,
     Rows,
     Timing,
@@ -716,6 +718,7 @@ impl StatusItem {
             Self::ReadOnly => "status-read-only",
             Self::Transaction => "status-transaction",
             Self::Running => "status-running",
+            Self::RunTrace => "status-run-trace",
             Self::Pending => "status-pending",
             Self::Rows => "status-rows",
             Self::Timing => "status-timing",
@@ -813,7 +816,9 @@ pub fn status_menu(item: StatusItem, text: &str, facts: &StatusFacts) -> Vec<Ent
             enabled(TabAction::ReviewChanges),
             enabled(TabAction::DiscardChanges),
         ],
-        StatusItem::Rows | StatusItem::Timing => vec![enabled(TabAction::CopyText(text.into()))],
+        StatusItem::Rows | StatusItem::Timing | StatusItem::RunTrace => {
+            vec![enabled(TabAction::CopyText(text.into()))]
+        }
         StatusItem::MemoryOnly => vec![enabled(TabAction::AboutMemoryOnly)],
         StatusItem::Update => vec![
             enabled(TabAction::Update),

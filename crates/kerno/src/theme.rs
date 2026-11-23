@@ -916,6 +916,26 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// K37: the marks of a run in the editor's margin, each a shape in its
+    /// own colour, at 3:1 (WCAG's floor for what is not text) on the
+    /// editor and on its active line, in both themes.
+    #[test]
+    fn the_marks_of_a_run_read_on_the_editor_in_both_themes() {
+        let mut failures = Vec::new();
+        for theme in themes() {
+            for under in ["editor.background", "editor.active_line.background"] {
+                let surface = theme.editor(under);
+                for mark in crate::query::run_marks::Mark::ALL {
+                    let ratio = contrast(&theme.colors[mark.theme_key()], &surface);
+                    if ratio < 3.0 {
+                        failures.push(format!("{} {mark:?} on {under}: {ratio:.2}", theme.name));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Selected text in the editor and the inputs is seen at a glance too
     /// ([`SEEN`] from the editor and from its active line; it was 1.07:1 in
     /// light, 1.20:1 in dark), the text reads on it (4.5:1) and every syntax

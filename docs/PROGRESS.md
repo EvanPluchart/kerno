@@ -1233,3 +1233,25 @@ Still open (for the owner):
 - From the keyboard: "SQL Scripts of Selected Connection…" (a picker to type a name) and "Open SQL File on
   Selected Connection…". A copy starts with no scripts, a deleted connection takes its list with it, and an
   export of connections carries no path.
+
+## 2026-11-23 — K37: where a running script stands, in the editor's margin
+
+- A first user outside the owner, replacing DBeaver: DBeaver's ruler shows where a long script stands, Kerno's
+  editor showed nothing. Now the margin left of the line numbers marks each statement the run reached the moment
+  it starts and ends: running (a play sign in a halo that breathes), done (a tick), failed (a cross), cancelled (a
+  square), refused on a read-only connection (a barred circle); nothing beside the statements not reached. The
+  status bar's "running…" says "running statement 3 of 12 · 4.20 s", the time going up while it runs; after
+  the run it says the marks in words ("statement 3 of 12 failed", "12 of 12 statements done"). D-110.
+- After the run the marks stay as its trace until the next run from the editor or the first edit; an edit during
+  the run clears them too. A single statement is marked as well. Nothing moves the cursor, the selection or the
+  view.
+- The kit's gutter marks are flat bars of one colour, so the marks are drawn by Kerno over the editor from the
+  editor's own layout of the frame (soft wrap, folds, zoom, line numbers off); the kit's strip is reserved once,
+  so every query editor's text sits 16 px further right.
+- Measured: a script of 5,000 one-row inserts took 1,138 s before and 1,159 s after (+1.8 %, debug test harness,
+  one run each: within noise; in both the rate fell from about 12 to about 3 inserts a second as results piled
+  up); the margin's layout of a frame with 5,000 marked statements takes 5.4 µs.
+- Tests: five unit tests, one theme test, nine UI tests (PostgreSQL and MySQL: in the middle of a run, after it,
+  a failure with and without "continue on error", a cancel, a disconnect, a refused write, an edit, the next
+  run, a result read again; and the drawing beside wrapped, folded, zoomed and far-down lines without a
+  server), each seen failing under a mutation of its part.

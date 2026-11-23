@@ -11,6 +11,7 @@ pub mod grid_view;
 mod occurrences;
 mod params;
 pub mod plan_view;
+pub mod run_marks;
 pub mod tab;
 pub mod tx_log;
 pub mod value_panel;

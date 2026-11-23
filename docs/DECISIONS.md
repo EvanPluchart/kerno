@@ -3393,3 +3393,69 @@ opened in tabs.
 - **Not done.** A connection opened from a URL and never saved (J4) keeps its list in the settings under its
   temporary id after it is gone; nothing shows it. The files are not checked for existence when the menu
   opens (that is I/O); a click finds out.
+
+## D-110 — Where a running script stands, in the editor's left margin (K37; 2026-11-23)
+
+A first user outside the owner, moving from DBeaver to Kerno 0.3.0: in DBeaver the bar on the left of the
+editor shows where a long script stands, in real time; in Kerno nothing did. DBeaver (read for behaviour, no code
+taken): `ScriptPositionColumn` (`ui.editors.base`) is a ruler column that every 200 ms draws an arrow beside each
+line of the queries running now (`SQLEditor.getCurrentLines`), and in script mode the editor scrolls to the
+running statement (`showStatementInEditor(query, false)`, `revealRange`); a failure becomes a problem marker.
+
+- **What Kerno marks.** Every statement the run reached, in the margin left of the line numbers, the moment it
+  starts and ends: running (a play sign in a halo that breathes, 1.2 s a breath), done (a tick), failed (a
+  cross), cancelled (a square), refused (a barred circle: a write not sent on a read-only connection, J14).
+  Nothing beside a statement not reached yet. A statement of several rows has a thin line down its rows. Each
+  mark is a shape, not a colour alone; the colours are the theme's info, success, danger, muted text and
+  warning, from 4.62:1 (light, on the active line) to 10.05:1 (dark) on the editor and its active line
+  (`the_marks_of_a_run_read_on_the_editor_in_both_themes` holds 3:1, WCAG's floor for what is not text). Where
+  two marks share a row (two statements on a line, statements inside one fold) a failure or the running one is
+  painted last.
+- **Where a run stopped.** The statements after a failure (without "continue on error") or a cancel stay bare:
+  the cross or the square says where it stopped, and a 5,000-statement script cut at its third statement does
+  not fill the margin with "not run". The task's "skipped" has no mark of its own for that reason; refused
+  writes have theirs. A statement the connection cut off under the run (Disconnect, a server gone) is marked
+  failed; a run stopped otherwise (a new run, another connection picked) leaves its running statement
+  cancelled. The first page of a statement's rows ends its mark (done): from then on the tab is not waiting for
+  the server, and later pages come when the user scrolls.
+- **Words.** The status bar's "running…" of a query tab says "running statement 3 of 12 · 4.20 s" (one
+  statement: "running · 1.20 s"), the time of the statement now running, going up four times a second; a
+  ticker draws the tab again every 250 ms only while a statement runs. Once a run of several statements ended,
+  a status bar item says the marks in words while they show: "statement 3 of 12 failed" (or cancelled, refused:
+  the first of those), else "12 of 12 statements done". The marks have no tooltip: see below.
+- **A single statement** run alone is marked too (running, then its end): it costs nothing and reads as the
+  same thing; its tick stays until the next run or an edit, like a script's.
+- **After the run** the marks stay as its trace until the next run from the editor or the first edit of the
+  text, during the run too, which then marks nothing more (the status bar keeps counting). Clearing is the
+  simplest correct choice: following the edits (the kit tracks ranges) would keep "done" beside a statement
+  whose text was changed after it ran, and leave a mark on a line boundary for a statement deleted outright. The
+  edit is seen through `InputEvent::Change`; a `set_value`, which emits none, is caught when it changes the
+  text's length (the vim mode's ponytail, J19). A result read again (a filter, auto-refresh, Run again: no place
+  in the text) leaves the marks alone.
+- **The user's hands.** No cursor move, selection change or scroll (tested before and after a run). DBeaver
+  scrolls to the running statement; making the view follow it while the user has not scrolled is a case for the
+  owner, not built.
+- **What the kit gave, what Kerno draws.** gpui-component 0.9.1 has gutter decorations
+  (`create_gutter_decorations_collection`): a strip before the line numbers, flat bars of one colour per range,
+  tracked through edits, wrapped rows and folds handled, only visible rows painted. A bar has no shape and no
+  hover, so the marks are drawn by Kerno (`query/run_marks.rs`): a canvas placed after the editor in the same
+  parent, whose prepaint reads the editor's layout of the same frame (`visible_row_range`, `line_height`, the
+  scrolled `text_bounds`, `input_bounds`, `display_map` for the rows of a buffer line across soft wrap and
+  folds), as the kit's own gutter computes its bars. The kit's collection is kept, empty, only to reserve the
+  strip (12 px, plus the kit's 4 px gap): it is made with the editor, so every query editor's text sits 16 px
+  further right, always; made at the first run, it would push the text aside while the user types. No fork, no
+  patch of the kit. Not followed: an inline completion's ghost lines (Kerno shows none) and the overscroll
+  bounce.
+- **Cost.** A mark changes in O(log n) (a binary search in the statements of the run); a frame looks at the
+  statements of the rows on screen only (two binary searches, then those rows). A script of 5,000 one-row
+  inserts took 1,138 s before and 1,159 s after in the debug test harness (+1.8 %, one run each with other
+  builds on the machine: within noise; the insert rate fell from about 12 to about 3 a second as results piled
+  up, in both); the margin's layout of a frame with 5,000 marked statements, 5.4 µs. The 250 ms ticker does not
+  run under the test clock: its redraws are in neither number.
+- **The statement's place.** `Statement.origin` (a byte offset, dropped when parameters were bound) became
+  `place`, the range of the editor's text it was read from, kept when parameters are bound: a script with
+  parameters is marked too. The server's error position is still marked only when the text sent is the text
+  written (`mark_error` compares them), as before.
+- **Not done.** No tooltip per mark: the canvas has no hover, and a GPUI tooltip belongs to an element (one over
+  the whole strip would keep the words of the mark it first showed); the shapes and the status bar say it. The
+  window of a run on several connections does not say "statement k of n" (each target's tab does, when shown).

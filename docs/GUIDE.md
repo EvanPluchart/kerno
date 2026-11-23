@@ -17,6 +17,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
+- [Where a running script stands](#where-a-running-script-stands)
 - [Rows as you scroll](#rows-as-you-scroll)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
@@ -343,6 +344,18 @@ back a transaction left idle for 10 min."), and **Edit environments…** opens t
 Every entry of a context menu and every toolbar button is also a command of the palette (Cmd+K), except the
 ones that only make sense where they are: one entry per connection, database, schema, folder or foreign key,
 the value or column under the pointer, the text field's own Cut, Copy and Paste.
+
+## Where a running script stands
+
+While statements run (Run script, a selection of several, Run statement), the margin left of the line numbers
+marks each statement the run has reached, the moment it starts and ends: a play sign in a halo that breathes for
+the one the server is working on, a tick for one that went well, a cross for one that failed, a square for one
+you cancelled (⌘.), a barred circle for a write refused on a read-only connection. A statement not reached yet
+has no mark, so after a failure or a cancel the last mark shows where the run stopped. The status bar says
+"running statement 3 of 12 · 4.20 s", the time of the statement now running, and once the run ended what the
+marks say ("statement 3 of 12 failed", "12 of 12 statements done"). The marks stay after the run, until
+you run again from the editor or change the text (a change during the run ends them too; the status bar keeps
+counting). Nothing moves your cursor, your selection or the view while the script runs.
 
 ## Rows as you scroll
 

@@ -5492,7 +5492,19 @@ impl Workspace {
             items.push((StatusItem::Transaction, text, Some(color)));
         }
         if running {
-            items.push((StatusItem::Running, "running…".into(), None));
+            // A query tab says which statement of its run, and for how long
+            // (K37); its ticker draws the window again while it runs.
+            let text = self
+                .active_query_tab()
+                .and_then(|tab| tab.read(cx).running_text())
+                .unwrap_or_else(|| "running…".into());
+            items.push((StatusItem::Running, text, None));
+        } else if let Some(text) = self
+            .active_query_tab()
+            .and_then(|tab| tab.read(cx).trace_text(cx))
+        {
+            // The marks of the last run in words (K37).
+            items.push((StatusItem::RunTrace, text, None));
         }
         if pending > 0 {
             items.push((
