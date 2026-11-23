@@ -2715,8 +2715,13 @@ impl Workspace {
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_alert_dialog(cx, |alert, _, cx| {
-            alert.width(px(440.)).child(crate::brand::about(cx))
+        cx.set_global(updates::AboutCheck::Idle);
+        let workspace = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let (beside, under) = updates::about_check(workspace.clone(), cx);
+            alert
+                .width(px(440.))
+                .child(crate::brand::about(beside, under, cx))
         });
     }
 
@@ -2754,6 +2759,7 @@ impl Workspace {
                     let target = target.clone();
                     // Ranked for what is typed: the list follows the query.
                     let query = palette.read(cx).query(cx);
+                    let recent = AppState::get(cx).settings.recent_commands.clone();
                     let confirmed = palette.clone();
                     let mut command = Command::new(&palette)
                         .bordered(false)
@@ -2763,8 +2769,13 @@ impl Workspace {
                         .on_confirm(move |index, window, cx| {
                             window.close_dialog(cx);
                             let query = confirmed.read(cx).query(cx);
-                            if let Some(command) = palette_command(&query, index.section, index.row)
+                            let recent = AppState::get(cx).settings.recent_commands.clone();
+                            if let Some(command) =
+                                palette_command(&query, &recent, index.section, index.row)
                             {
+                                AppState::update_settings(cx, |settings| {
+                                    settings.remember_command(command.id)
+                                });
                                 let action = (command.action)();
                                 let target = target.clone();
                                 window.defer(cx, move |window, cx| {
@@ -2773,7 +2784,7 @@ impl Workspace {
                                 });
                             }
                         });
-                    for (group, commands) in palette_groups(&query) {
+                    for (group, commands) in palette_groups(&query, &recent) {
                         command = command.group(CommandGroup::new().label(group).items(
                             commands.into_iter().map(|command| {
                                 CommandItem::new()
@@ -4314,6 +4325,9 @@ impl Workspace {
             SidebarEvent::ImportConnections => {
                 self.import_connections(&ImportConnections, window, cx)
             }
+            SidebarEvent::ImportFromDbeaver => {
+                self.import_from_dbeaver(&crate::actions::ImportFromDbeaver, window, cx)
+            }
             SidebarEvent::Tool(id, entry) => {
                 self.run_tool(connection_target(id), entry.clone(), Vec::new(), window, cx)
             }
@@ -4649,6 +4663,36 @@ impl Workspace {
             .collect();
         crate::portability::open_import(path, self.connections.clone(), tasks_views, window, cx)
             .detach();
+    }
+
+    /// Asks for a DBeaver project export (`.dbp`) or `data-sources.json`,
+    /// then previews what it imports (K41).
+    fn import_from_dbeaver(
+        &mut self,
+        _: &crate::actions::ImportFromDbeaver,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picking = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        let connections = self.connections.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = picking.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let opening = cx.update(|window, cx| {
+                    crate::dbeaver_import::open(path, connections, window, cx)
+                });
+                if let Ok(opening) = opening {
+                    opening.await;
+                }
+            }
+        })
+        .detach();
     }
 
     // Rendering ---------------------------------------------------------------
@@ -5231,6 +5275,11 @@ impl Workspace {
             .ghost()
             .xsmall()
             .flex_none()
+            // Its hover a small square centred on the cross, inside the tab
+            // with room on every side (K40).
+            .size(px(16.))
+            .mx_1()
+            .rounded_sm()
             .icon(IconName::Close)
             .tooltip("Close tab")
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -6851,8 +6900,21 @@ fn connection_target(id: &str) -> Target {
 /// order, when nothing is typed; otherwise one list of the matches, the
 /// title itself first, then titles that start with it, then the others
 /// (other words of a title, keywords) in display order.
-fn palette_groups(query: &str) -> Vec<(&'static str, Vec<&'static actions::Command>)> {
+pub(crate) fn palette_groups(
+    query: &str,
+    recent: &[String],
+) -> Vec<(&'static str, Vec<&'static actions::Command>)> {
     let mut groups: Vec<(&'static str, Vec<&'static actions::Command>)> = Vec::new();
+    // With nothing typed, the commands run last from the palette come first
+    // (K45); an id no command has any more is dropped. Typing ranks every
+    // command as before, with no boost for a recent one.
+    let recent: Vec<&'static actions::Command> = recent
+        .iter()
+        .filter_map(|id| actions::COMMANDS.iter().find(|command| command.id == id))
+        .collect();
+    if query.is_empty() && !recent.is_empty() {
+        groups.push(("Recently used", recent));
+    }
     for command in actions::COMMANDS {
         match groups.iter_mut().find(|(group, _)| *group == command.group) {
             Some((_, commands)) => commands.push(command),
@@ -6890,8 +6952,17 @@ fn palette_groups(query: &str) -> Vec<(&'static str, Vec<&'static actions::Comma
 }
 
 /// The command at a palette position, for `query`.
-fn palette_command(query: &str, section: usize, row: usize) -> Option<&'static actions::Command> {
-    palette_groups(query).get(section)?.1.get(row).copied()
+fn palette_command(
+    query: &str,
+    recent: &[String],
+    section: usize,
+    row: usize,
+) -> Option<&'static actions::Command> {
+    palette_groups(query, recent)
+        .get(section)?
+        .1
+        .get(row)
+        .copied()
 }
 
 impl Focusable for Workspace {
@@ -7224,6 +7295,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::explain_statement))
             .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::import_connections))
+            .on_action(cx.listener(Self::import_from_dbeaver))
             .on_action(cx.listener(Self::export_connections))
             .on_action(cx.listener(Self::new_connection_folder))
             .on_action(cx.listener(Self::refresh_connections))

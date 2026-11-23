@@ -6,12 +6,12 @@ use gpui_kit::{Keystroke, TestAppContext};
 
 use super::*;
 
-fn keymap_file(cx: &mut TestAppContext) -> std::path::PathBuf {
+pub(super) fn keymap_file(cx: &mut TestAppContext) -> std::path::PathBuf {
     cx.update(|cx| AppState::get(cx).paths.keymap())
 }
 
 /// Opens Settings ▸ Shortcuts and waits for it to read the keymap file.
-fn open_shortcuts(app: &Fixture, cx: &mut TestAppContext) {
+pub(super) fn open_shortcuts(app: &Fixture, cx: &mut TestAppContext) {
     app.dispatch(cx, actions::OpenKeyboardShortcuts);
     app.wait_until(cx, "the shortcuts page", |app, cx| {
         app.has(cx, "shortcuts-filter") || app.has(cx, "shortcuts-unreadable")
@@ -19,7 +19,7 @@ fn open_shortcuts(app: &Fixture, cx: &mut TestAppContext) {
 }
 
 /// Types `query` in the page's filter, in place of what was there.
-fn filter(app: &Fixture, cx: &mut TestAppContext, query: &str) {
+pub(super) fn filter(app: &Fixture, cx: &mut TestAppContext, query: &str) {
     app.click(cx, "shortcuts-filter");
     app.press(cx, &["secondary-a", "backspace"]);
     app.type_text(cx, query);
@@ -31,7 +31,7 @@ fn close_settings(app: &Fixture, cx: &mut TestAppContext) {
 }
 
 /// The text painted inside the element `id`.
-fn text_of(app: &Fixture, cx: &mut TestAppContext, id: &'static str) -> String {
+pub(super) fn text_of(app: &Fixture, cx: &mut TestAppContext, id: &'static str) -> String {
     let id = gpui_kit::ElementId::from(id);
     app.step(cx, |window, _| {
         gpui_kit::base::test_support::texts(window)
@@ -48,7 +48,7 @@ fn sidebar_visible(cx: &mut TestAppContext) -> bool {
 }
 
 /// The command whose binding wins for `key` where the keyboard is now.
-fn winner(app: &Fixture, cx: &mut TestAppContext, key: &str) -> Option<String> {
+pub(super) fn winner(app: &Fixture, cx: &mut TestAppContext, key: &str) -> Option<String> {
     app.step(cx, |window, cx| {
         let stroke = Keystroke::parse_with_os(key, actions::HOST_OS).unwrap();
         let keymap = cx.key_bindings();

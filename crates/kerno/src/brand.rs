@@ -5,7 +5,7 @@
 //! stretched. Their viewBoxes already carry the clear space (one
 //! disk height, 44 units on the 256 grid).
 
-use gpui_kit::component::{ActiveTheme as _, StyledExt as _, v_flex};
+use gpui_kit::component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Styled as _,
@@ -88,13 +88,14 @@ fn about_lines() -> [String; 5] {
         // Two balanced lines, broken where the sentence breaks.
         "A fast, native database client\nfor PostgreSQL, MySQL and MariaDB.".into(),
         "Licensed under MIT or Apache-2.0, at your option.".into(),
-        "Nothing leaves your machine: no telemetry, no update checks.".into(),
+        "No telemetry: only the update check asks GitHub, and it can be turned off.".into(),
         "Third-party notices: THIRD_PARTY_NOTICES.md".into(),
     ]
 }
 
-/// The body of the About window: the lockup, then what Kerno is.
-pub fn about(cx: &App) -> impl IntoElement {
+/// The body of the About window: the lockup, then what Kerno is. `beside` sits beside the
+/// version and `under` under it (the update check, K42).
+pub fn about(beside: impl IntoElement, under: impl IntoElement, cx: &App) -> impl IntoElement {
     let [version, what, licence, privacy, notices] = about_lines();
     let muted = cx.theme().muted_foreground;
     v_flex()
@@ -103,13 +104,16 @@ pub fn about(cx: &App) -> impl IntoElement {
         .gap_1()
         .child(lockup(px(240.), cx))
         .child(
-            div()
+            h_flex()
                 .id("about-version")
                 .test_support()
                 .mt_2()
-                .font_semibold()
-                .child(version),
+                .gap_2()
+                .items_center()
+                .child(div().font_semibold().child(version))
+                .child(beside),
         )
+        .child(under)
         .child(
             v_flex()
                 .id("about-what")
@@ -154,7 +158,7 @@ mod tests {
         let text = lines.join("\n");
         for needle in [
             "MIT or Apache-2.0",
-            "Nothing leaves your machine",
+            "No telemetry",
             "THIRD_PARTY_NOTICES.md",
         ] {
             assert!(text.contains(needle), "{needle}");

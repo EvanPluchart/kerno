@@ -178,6 +178,12 @@ sent and never shows them. A saved password is linked automatically only to a co
 already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
 unlinked cannot read any of the old secrets. Files written by earlier versions still import.
 
+**Import from DBeaver…** (File menu, the sidebar's menu, the palette) takes a DBeaver project export (in
+DBeaver, File ▸ Export ▸ Project: a `.dbp` file) or a `data-sources.json`. It lists the folders and their
+connections, ticked, or greyed with the reason; untick what you do not want, then Import. The scripts become
+saved queries of their connection. **Also import the saved passwords** (off by default) puts them in this
+computer's secret store. Importing the same file again adds nothing twice.
+
 ## AI assistant and what it sends
 
 **What it is for.** Turned on, the assistant does three things, only when you ask: it writes SQL from a
@@ -381,6 +387,12 @@ added, the scroll waits; "Fetch more" puts the new rows above the added one. A t
 is read again from its first row at each load (the server keeps no order between two reads of it), so no row
 shows twice and none is missed.
 
+A sort, a filter, a refresh or an Apply goes back to the first row and leaves the columns scrolled where they
+were. The WHERE field proposes the table's columns as you type, with their type, then what a condition is made
+of (AND, OR, IN, IS NULL, LIKE, ILIKE on PostgreSQL, BETWEEN…): Tab or Enter takes one, quoted when the name
+needs it, Escape closes the list; with the list closed, Enter applies the filter. The order, widths, hidden and
+pinned columns and the sort of a table are kept for the next time it is opened, after a restart too.
+
 ## The value panel
 
 ⌃⌥V or F7 (or "Value" in the footer of a result or a table, or "Toggle Value Panel" in the palette and the Data menu)
@@ -470,6 +482,14 @@ belongs to the user you connect as, without the backup's grants. It asks first, 
 **Leave out the backup's owners and privileges** before the first run too (PostgreSQL archives only; it is off
 by default, which keeps the owners). A plain SQL script sets its owners in its own text, so psql cannot leave
 them out: create the role on the server, or back up again as a compressed archive.
+
+Before a PostgreSQL archive is restored, Kerno reads its list and asks the server what it lacks. An extension
+the backup needs and the server does not offer (its files are installed on the machine PostgreSQL runs on, not
+by a restore) is said above the settings, with **Leave it out of the restore** ticked: the restore then runs
+with pg_restore's `--use-list`, and the command says which entries it leaves out. Roles that own the backup's
+objects and that the server lacks tick **Leave out the backup's owners and privileges**, with the reason. When
+the server has everything, nothing is shown. A failed `CREATE EXTENSION` is said after the run too, and an
+archive gets one button that restores again without what the server lacks.
 
 **Advanced settings…** opens the full wizard on what the screen holds (the file, the format, the client): the
 objects to back up (schemas and tables), every option of the tool, the file name pattern with its variables,

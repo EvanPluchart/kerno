@@ -14,6 +14,7 @@ mod compare_tab;
 mod connections;
 mod data;
 mod database_dialog;
+mod dbeaver_import;
 mod engine_logo;
 mod environments_view;
 mod erd_tab;
@@ -455,6 +456,7 @@ fn menus() -> Vec<Menu> {
             "Kerno",
             vec![
                 MenuItem::action("About Kerno", About),
+                command("check_for_updates"),
                 separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 command("search_settings"),
@@ -486,6 +488,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Restore Database…", RestoreDatabase),
                 separator(),
                 MenuItem::action("Import Connections…", ImportConnections),
+                MenuItem::action("Import from DBeaver…", actions::ImportFromDbeaver),
                 MenuItem::action("Export Connections…", ExportConnections),
                 separator(),
                 MenuItem::action("Close Tab", CloseTab),
@@ -851,5 +854,16 @@ mod tests {
         assert!(found.contains(&("revert_cells".to_string(), false)));
         assert!(found.contains(&("commit_transaction".to_string(), true)));
         assert!(found.contains(&("quick_open".to_string(), true)));
+    }
+
+    /// K42: the app's own menu, where macOS users look, checks for updates too.
+    #[test]
+    fn the_first_menu_checks_for_updates() {
+        let mut found = Vec::new();
+        ids(&menus()[0].items, &mut found);
+        assert!(
+            found.iter().any(|(id, _)| id == "check_for_updates"),
+            "{found:?}"
+        );
     }
 }

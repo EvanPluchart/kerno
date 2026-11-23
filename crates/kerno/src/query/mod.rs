@@ -2,7 +2,7 @@
 //! and showing what they return.
 
 mod comment;
-mod completion;
+pub mod completion;
 pub mod distinct;
 pub mod edit;
 pub mod find;

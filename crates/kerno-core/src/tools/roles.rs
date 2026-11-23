@@ -32,8 +32,23 @@ pub struct RefusedRole {
 /// 1) of the SQL script psql ran, for psql's `psql:<file>:n:` lines.
 pub fn refused_roles<S: AsRef<str>>(
     log: &[S],
-    mut script_line: impl FnMut(u64) -> Option<String>,
+    script_line: impl FnMut(u64) -> Option<String>,
 ) -> Vec<RefusedRole> {
+    let mut found = Vec::new();
+    for (statement, error) in failed_statements(log, script_line) {
+        add(&mut found, &statement, &error);
+    }
+    found
+}
+
+/// The failed statements of a restore's `log` that name roles or create an
+/// extension, each with the server's message about it (K35, K39): read
+/// after a label ending in a colon (pg_restore), or from the script's line
+/// psql points at.
+pub(super) fn failed_statements<S: AsRef<str>>(
+    log: &[S],
+    mut script_line: impl FnMut(u64) -> Option<String>,
+) -> Vec<(String, String)> {
     let lines: Vec<&str> = log.iter().map(AsRef::as_ref).collect();
     let mut found = Vec::new();
     let mut at = 0;
@@ -43,11 +58,11 @@ pub fn refused_roles<S: AsRef<str>>(
             continue;
         };
         let error = error_above(&lines, at);
-        add(&mut found, first, &error);
+        found.push((first.to_string(), error.clone()));
         // The other statements of the same command, one per line.
         at += 1;
         while at < lines.len() && is_statement(lines[at].trim()) {
-            add(&mut found, lines[at].trim(), &error);
+            found.push((lines[at].trim().to_string(), error.clone()));
             at += 1;
         }
     }
@@ -59,7 +74,7 @@ pub fn refused_roles<S: AsRef<str>>(
     if let Some((number, error)) = psql
         && let Some(statement) = script_line(number)
     {
-        add(&mut found, statement.trim(), error);
+        found.push((statement.trim().to_string(), error.to_string()));
     }
     found
 }
@@ -77,12 +92,18 @@ fn add(found: &mut Vec<RefusedRole>, statement: &str, error: &str) {
     }
 }
 
-/// Whether `text` starts one of the statements that name roles, as
-/// pg_dump writes them.
+/// Whether `text` starts one of the statements that name roles or create
+/// an extension, as pg_dump writes them.
 fn is_statement(text: &str) -> bool {
-    ["ALTER ", "GRANT ", "REVOKE ", "SET SESSION AUTHORIZATION "]
-        .iter()
-        .any(|start| text.starts_with(start))
+    [
+        "ALTER ",
+        "GRANT ",
+        "REVOKE ",
+        "SET SESSION AUTHORIZATION ",
+        "CREATE EXTENSION ",
+    ]
+    .iter()
+    .any(|start| text.starts_with(start))
 }
 
 /// The statement a line prints after a label ending in a colon, in any
@@ -117,7 +138,7 @@ fn psql_line(line: &str) -> Option<u64> {
 
 /// Whether `name` stands in `text` as a whole name, not inside a longer
 /// one (`kerno` is not named by `kerno_reader`).
-fn named_in(text: &str, name: &str) -> bool {
+pub(super) fn named_in(text: &str, name: &str) -> bool {
     let part_of_name = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     text.match_indices(name).any(|(at, _)| {
         !text[..at].chars().next_back().is_some_and(part_of_name)

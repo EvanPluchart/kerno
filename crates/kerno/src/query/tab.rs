@@ -583,6 +583,9 @@ pub struct QueryTab {
     /// are (by the run being prepared, then the run in progress).
     next_find: Option<find::Carried>,
     carried_find: Option<find::Carried>,
+    /// How far its columns were scrolled, carried the same way (K40).
+    next_scroll: Option<gpui_kit::Pixels>,
+    carried_scroll: Option<gpui_kit::Pixels>,
     /// "Open in its own tab" showed the results in tabs while they are
     /// stacked (J11): until the next run.
     unstacked: bool,
@@ -806,6 +809,8 @@ impl QueryTab {
             widths: HashMap::new(),
             next_find: None,
             carried_find: None,
+            next_scroll: None,
+            carried_scroll: None,
             unstacked: false,
             stacking: AppState::get(cx).settings.stack_results,
             stack_list: ListState::new(0, ListAlignment::Top, px(200.)),
@@ -1489,7 +1494,11 @@ impl QueryTab {
         let catalog = self.catalog.clone();
         self.editor.update(cx, |editor, _| {
             editor.lsp_mut().completion_provider = session.map(|session| {
-                Rc::new(SqlCompletion { catalog, session }) as Rc<dyn CompletionProvider>
+                Rc::new(SqlCompletion {
+                    catalog,
+                    session,
+                    prefix: String::new(),
+                }) as Rc<dyn CompletionProvider>
             });
         });
     }
@@ -1550,6 +1559,7 @@ impl QueryTab {
         let provider = SqlCompletion {
             catalog: self.catalog.clone(),
             session,
+            prefix: String::new(),
         };
         provider
             .items(&gpui_kit::component::input::Rope::from(sql), cursor)
@@ -2789,6 +2799,7 @@ impl QueryTab {
         self.requery = self.next_requery.take();
         self.widths = std::mem::take(&mut self.next_widths);
         self.carried_find = self.next_find.take();
+        self.carried_scroll = self.next_scroll.take();
         self.unstacked = false;
         self.clear_results();
         self.notices.clear();
@@ -4021,8 +4032,9 @@ impl QueryTab {
                 self.remember_result_filter(&requery.statement, &requery.filter, cx);
             }
         }
+        let scrolled = self.carried_scroll.take();
         let table = cx.new(|cx| {
-            TableState::new(grid, window, cx)
+            let table = TableState::new(grid, window, cx)
                 .col_resizable(true)
                 .col_movable(true)
                 .sortable(true)
@@ -4030,7 +4042,14 @@ impl QueryTab {
                 .col_selectable(true)
                 .cell_selectable(true)
                 // The grid numbers its rows itself.
-                .row_header(false)
+                .row_header(false);
+            // Read again, its columns stay scrolled as they were (K40).
+            if let Some(x) = scrolled {
+                table
+                    .horizontal_scroll_handle
+                    .set_offset(gpui_kit::point(x, gpui_kit::px(0.)));
+            }
+            table
         });
         // Whether the rows take changes: what the statement and the
         // columns say at once, then what the table says.
@@ -5326,6 +5345,9 @@ impl QueryTab {
             .map(|grid| Grid::widths(grid.read(cx)))
             .unwrap_or_default();
         self.next_find = self.pane_grid(id).and_then(|grid| find::carried(&grid, cx));
+        self.next_scroll = self
+            .pane_grid(id)
+            .map(|grid| grid.read(cx).horizontal_scroll_handle.offset().x);
         self.next_requery = Some(Requery {
             filter,
             sort,
@@ -7822,20 +7844,8 @@ impl Render for QueryTab {
             // DBeaver #2316): the kit's list knows only Enter, and its Tab
             // indents. Before the editor sees the key; otherwise Tab indents.
             .capture_action(cx.listener(|this, _: &input::IndentInline, window, cx| {
-                let editor = this.editor.clone();
-                if !AppState::get(cx).settings.tab_accepts_completion
-                    || !editor.read(cx).completion_menu_state().open
-                {
-                    return;
-                }
-                let accept = Box::new(input::Enter {
-                    secondary: false,
-                    shift: false,
-                });
                 // The list lets the key go on: stopped after it took it.
-                if editor.update(cx, |editor, cx| {
-                    editor.route_overlay_action(accept, window, cx)
-                }) {
+                if completion::tab_accepts(&this.editor, window, cx) {
                     cx.stop_propagation();
                 }
             }))

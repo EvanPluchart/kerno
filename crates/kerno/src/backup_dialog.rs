@@ -178,6 +178,12 @@ struct Input {
     /// The database a PostgreSQL archive was made from, which pg_restore
     /// `--create` creates (from `pg_restore --list`).
     archive_database: Option<String>,
+    /// A PostgreSQL archive's list (`pg_restore --list`), when it could be
+    /// read: what the restore needs is checked from it, and an extension
+    /// is left out through it (K39).
+    list: Option<Arc<str>>,
+    /// The extensions that list creates, read once off the UI thread.
+    extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +219,21 @@ struct RoleFailure {
     retry: bool,
     /// The user the restore connected as.
     user: String,
+    /// The extensions whose creation failed and that the server does not
+    /// offer (K39).
+    extensions: Vec<String>,
+    /// Those extensions can be left out: the archive's list names them.
+    leavable: bool,
+}
+
+/// What a PostgreSQL archive needs that the server does not have, found
+/// before the run (K39, D-112).
+#[derive(Debug, Clone, Default)]
+struct Preflight {
+    /// Extensions the archive creates that the server does not offer.
+    extensions: Vec<String>,
+    /// Roles owning the archive's objects that the server does not have.
+    owners: Vec<String>,
 }
 
 impl RoleFailure {
@@ -227,7 +248,20 @@ impl RoleFailure {
                 && options.single_transaction
                 && !(options.no_owner && options.no_privileges),
             user,
+            extensions: Vec::new(),
+            leavable: false,
         }
+    }
+
+    /// "Restore again" leaves out the backup's owners and privileges.
+    fn retry_owners(&self) -> bool {
+        self.retry && !self.refused.is_empty()
+    }
+
+    /// "Restore again" leaves out the extensions the server lacks: an
+    /// archive whose list names them, restored in one transaction.
+    fn retry_extensions(&self) -> bool {
+        !self.script && self.single_transaction && self.leavable && !self.extensions.is_empty()
     }
 }
 
@@ -320,8 +354,16 @@ pub struct BackupDialog {
     /// The explicit opt-in to a file's client commands; reset per file.
     allow_commands: bool,
     step: Step,
-    /// The roles a failed restore names, once read from its output.
+    /// The roles and extensions a failed restore names, once read from its
+    /// output.
     roles: Option<RoleFailure>,
+    /// What the archive to restore needs that the server lacks (K39).
+    preflight: Option<Preflight>,
+    /// The archive's extensions the restore leaves out (`--use-list`).
+    leave_out: Vec<String>,
+    /// The preflight ticked "Leave out the backup's owners and privileges":
+    /// the next file chosen unticks it.
+    owners_ticked: bool,
     /// The command that runs or ran, as shown.
     shown_command: Option<String>,
     /// The file or folder the backup writes.
@@ -623,6 +665,9 @@ impl BackupDialog {
             allow_commands: false,
             step: Step::Preparing,
             roles: None,
+            preflight: None,
+            leave_out: Vec::new(),
+            owners_ticked: false,
             agreed_replace: None,
             shown_command: None,
             output: None,
@@ -798,6 +843,11 @@ impl BackupDialog {
         let generation = self.generation;
         self.tool_state = ToolState::Probing;
         self.input = None;
+        self.preflight = None;
+        self.leave_out.clear();
+        if std::mem::take(&mut self.owners_ticked) {
+            (self.restore.no_owner, self.restore.no_privileges) = (false, false);
+        }
         self.allow_commands = false;
         let settings = &AppState::get(cx).settings;
         let family = self.family;
@@ -830,6 +880,7 @@ impl BackupDialog {
                     {
                         (this.restore.no_owner, this.restore.no_privileges) = (false, false);
                     }
+                    this.check_archive(cx);
                     cx.notify();
                 }
             });
@@ -1594,6 +1645,7 @@ impl BackupDialog {
                 options.auth_user = self.auth_user_value(cx);
                 options.allow_client_commands = self.allow_commands;
                 options.tool_version = version;
+                options.use_list = self.use_list(cx);
                 tools::restore_command(path, &params, &options)
             }
             Mode::ExecuteScript => {
@@ -1826,7 +1878,7 @@ impl BackupDialog {
                     script,
                     restore: &self.restore,
                 }),
-                statement: Statement::Fixed(command.display()),
+                statement: Statement::Fixed(self.shown(&command)),
                 action: if script { "Run" } else { "Restore" },
                 destructive: true,
                 connection: self.name.clone(),
@@ -1851,7 +1903,7 @@ impl BackupDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.shown_command = Some(command.display());
+        self.shown_command = Some(self.shown(&command));
         self.output = output.as_ref().map(|(path, _)| path.clone());
         self.log.clear();
         self.roles = None;
@@ -1868,6 +1920,18 @@ impl BackupDialog {
             .stdin
             .is_some()
             .then(|| (command.sent.clone(), total.clone()));
+        // The archive's list without the left-out extensions (K39).
+        let list = self
+            .use_list(cx)
+            .filter(|path| {
+                let arg = format!("--use-list={}", path.display());
+                command.args.contains(&arg)
+            })
+            .zip(match &self.input {
+                Some(Ok(input)) => input.list.clone(),
+                _ => None,
+            })
+            .map(|(path, list)| (path, list, self.left_out()));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
         let running = bridge::spawn(cx, async move {
             let started = std::time::SystemTime::now();
@@ -1876,14 +1940,31 @@ impl BackupDialog {
             {
                 total.store(meta.len(), Ordering::Relaxed);
             }
-            let outcome = tools::run(
-                command,
-                move |line| {
-                    let _ = sender.send(line);
-                },
-                cancel,
-            )
-            .await;
+            let written = match &list {
+                None => Ok(()),
+                Some((path, list, left_out)) => {
+                    write_new(path, &tools::list_without(list, left_out))
+                }
+            };
+            let outcome = match written {
+                Ok(()) => {
+                    tools::run(
+                        command,
+                        move |line| {
+                            let _ = sender.send(line);
+                        },
+                        cancel,
+                    )
+                    .await
+                }
+                Err(error) => Err(Error::Config(format!(
+                    "Kerno could not write the archive's list for pg_restore: {error}. Nothing \
+                     was run."
+                ))),
+            };
+            if let Some((path, ..)) = &list {
+                let _ = std::fs::remove_file(path);
+            }
             let mut ended = Ended {
                 outcome,
                 size: None,
@@ -2144,15 +2225,17 @@ impl BackupDialog {
         cx.notify();
     }
 
-    /// Reads the roles the failed restore names from its output (and, for
-    /// psql, from the script's line it points at), then asks the server
-    /// which of them it does not have: only those are said to be missing.
+    /// Reads the roles and the extensions the failed restore names from its
+    /// output (and, for psql, from the script's line it points at), then
+    /// asks the server which of them it does not have: only those are said
+    /// to be missing.
     fn check_roles(&mut self, cx: &mut Context<Self>) {
         let Some(Ok(input)) = &self.input else {
             return;
         };
         let script = input.format == BackupFormat::Sql;
         let path = input.path.clone();
+        let listed = input.extensions.clone();
         let log: Vec<String> = self.log.iter().map(|line| line.to_string()).collect();
         let started = self.started;
         let user = self
@@ -2162,50 +2245,44 @@ impl BackupDialog {
         let failure = RoleFailure::new(script, &self.restore, user);
         let meta = self.connections.read(cx).meta_session(&self.connection);
         let reading = bridge::spawn_blocking(cx, move || {
-            tools::refused_roles(&log, |number| {
-                script.then(|| script_line(&path, number)).flatten()
-            })
+            let line = |number| script.then(|| script_line(&path, number)).flatten();
+            (
+                tools::refused_roles(&log, line),
+                tools::refused_extensions(&log, line),
+            )
         });
         self.tasks.push(cx.spawn(async move |this, cx| {
-            let refused = reading.await;
-            if refused.is_empty() {
+            let (refused, extensions) = reading.await;
+            if refused.is_empty() && extensions.is_empty() {
                 return;
             }
-            let missing = match meta {
-                None => None,
-                Some(meta) => {
-                    let names: Vec<String> = refused
-                        .iter()
-                        .map(|role| meta.dialect().quote_string(&role.name))
-                        .collect();
-                    let sql = format!(
-                        "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname IN ({})",
-                        names.join(", ")
-                    );
-                    let asking = cx.update(|cx| bridge::spawn(cx, exec::collect(meta, sql)));
-                    asking.await.ok().map(|collected| {
-                        let present: Vec<String> = collected
-                            .results
-                            .first()
-                            .map(|result| result.rows())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|row| row.into_iter().next().flatten())
-                            .collect();
-                        refused
-                            .iter()
-                            .map(|role| role.name.clone())
-                            .filter(|name| !present.contains(name))
-                            .collect()
-                    })
-                }
-            };
+            let names: Vec<String> = refused.iter().map(|role| role.name.clone()).collect();
+            let asking = cx.update(|cx| {
+                bridge::spawn(cx, async move {
+                    let meta = meta?;
+                    let roles = absent(&meta, ROLES, &names).await;
+                    // An extension is said only when the server says it does
+                    // not offer it: a refusal for another reason (rights)
+                    // names it too.
+                    let extensions = absent(&meta, EXTENSIONS, &extensions)
+                        .await
+                        .unwrap_or_default();
+                    Some((roles, extensions))
+                })
+            });
+            let (missing, extensions) = asking.await.unwrap_or_default();
+            if refused.is_empty() && extensions.is_empty() {
+                return;
+            }
+            let leavable = extensions.iter().all(|name| listed.contains(name));
             let _ = this.update(cx, |this, cx| {
                 // A run started since has its own output.
                 if this.started == started {
                     this.roles = Some(RoleFailure {
                         refused,
                         missing,
+                        extensions,
+                        leavable,
                         ..failure
                     });
                     cx.notify();
@@ -2214,12 +2291,135 @@ impl BackupDialog {
         }));
     }
 
-    /// The failure view's "Restore without owners and privileges…": the
-    /// same restore with pg_restore's `--no-owner --no-privileges`, which
-    /// the wizard's two checkboxes show; asked first like any restore.
+    /// Before the run (K39): reads from the archive's list the extensions it
+    /// creates and the roles owning its objects, and asks the server which
+    /// it lacks. Missing extensions are left out unless the user keeps
+    /// them; missing owners tick "Leave out the backup's owners and
+    /// privileges". Nothing is shown when the server cannot be asked.
+    fn check_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(Input {
+            list: Some(list),
+            extensions,
+            ..
+        })) = &self.input
+        else {
+            return;
+        };
+        let (list, extensions) = (list.clone(), extensions.clone());
+        let Some(meta) = self.connections.read(cx).meta_session(&self.connection) else {
+            return;
+        };
+        let generation = self.generation;
+        let asking = bridge::spawn(cx, async move {
+            let lacking = absent(&meta, EXTENSIONS, &extensions).await?;
+            let roles = names_of(&meta, "SELECT rolname FROM pg_catalog.pg_roles".into()).await?;
+            Some(Preflight {
+                extensions: lacking,
+                owners: tools::missing_owners(&list, &roles),
+            })
+        });
+        self.tasks.push(cx.spawn(async move |this, cx| {
+            let Some(found) = asking.await else {
+                return;
+            };
+            if found.extensions.is_empty() && found.owners.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.leave_out = found.extensions.clone();
+                if !found.owners.is_empty() && !this.without_owners() {
+                    (this.restore.no_owner, this.restore.no_privileges) = (true, true);
+                    this.owners_ticked = true;
+                }
+                this.preflight = Some(found);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The archive's extensions this restore leaves out: those ticked that
+    /// its list names.
+    fn left_out(&self) -> Vec<String> {
+        match &self.input {
+            Some(Ok(Input {
+                list: Some(_),
+                extensions,
+                ..
+            })) if self.mode == Mode::Restore => self
+                .leave_out
+                .iter()
+                .filter(|name| extensions.contains(name))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Where the list without the left-out extensions is written for
+    /// `--use-list` (built in the run's task, removed after it): in Kerno's
+    /// own data directory, not the temporary one, which other users of the
+    /// machine share on Linux and where a name they can guess could be
+    /// taken first.
+    fn use_list(&self, cx: &App) -> Option<PathBuf> {
+        (!self.left_out().is_empty()).then(|| {
+            AppState::get(cx).paths.data_dir.join(format!(
+                "restore-{}-{}.list",
+                std::process::id(),
+                self.generation
+            ))
+        })
+    }
+
+    /// The command as shown to the user: with `--use-list`, what it leaves
+    /// out of the archive, in words.
+    fn shown(&self, command: &ToolCommand) -> String {
+        let mut text = command.display();
+        let left_out = self.left_out();
+        if !left_out.is_empty()
+            && command
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--use-list="))
+        {
+            let one = left_out.len() == 1;
+            let names: Vec<String> = left_out.iter().map(|name| format!("“{name}”")).collect();
+            text.push_str(&format!(
+                "  # leaves out of the archive {} {} (the entries that create {it} and comment \
+                 on {it})",
+                if one {
+                    "the extension"
+                } else {
+                    "the extensions"
+                },
+                simple::listed(&names),
+                it = if one { "it" } else { "them" },
+            ));
+        }
+        text
+    }
+
+    /// The failure view's "Restore without …": the same restore without
+    /// what the server lacks, the backup's owners and privileges
+    /// (pg_restore's `--no-owner --no-privileges`, the wizard's two
+    /// checkboxes) and the extensions it does not offer (`--use-list`);
+    /// asked first like any restore.
     pub fn restore_without_owners(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.restore.no_owner = true;
-        self.restore.no_privileges = true;
+        if let Some(failure) = &self.roles {
+            if failure.retry_owners() {
+                self.restore.no_owner = true;
+                self.restore.no_privileges = true;
+            }
+            if failure.retry_extensions() {
+                for name in &failure.extensions {
+                    if !self.leave_out.contains(name) {
+                        self.leave_out.push(name.clone());
+                    }
+                }
+            }
+        }
         self.start(window, cx);
     }
 
@@ -2310,7 +2510,7 @@ impl BackupDialog {
                     format!("refused: line {}: {}", found.line, found.command)
                 }
                 (ToolState::Ready { .. }, _) => match self.command(cx) {
-                    Ok(command) => format!("ready: {}", command.display()),
+                    Ok(command) => format!("ready: {}", self.shown(&command)),
                     Err(problem) => format!("not ready: {problem}"),
                 },
             },
@@ -2321,6 +2521,22 @@ impl BackupDialog {
     #[cfg(test)]
     pub fn log(&self) -> Vec<String> {
         self.log.iter().map(|line| line.to_string()).collect()
+    }
+
+    /// The archive's list as read before the run; for tests.
+    #[cfg(test)]
+    pub fn archive_list(&self) -> Option<String> {
+        match &self.input {
+            Some(Ok(input)) => input.list.as_deref().map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// Leaves `names` out of the restore, as the preflight's checkbox does;
+    /// for tests.
+    #[cfg(test)]
+    pub fn set_leave_out(&mut self, names: Vec<String>) {
+        self.leave_out = names;
     }
 
     /// The command that would run now, scan included; for tests.
@@ -2577,6 +2793,8 @@ fn examine(job: Job) -> Examined {
         format,
         refusal: None,
         archive_database: None,
+        list: None,
+        extensions: Vec::new(),
     };
     if let ToolState::Ready { path, install, .. } = &state {
         if format == BackupFormat::Sql {
@@ -2601,7 +2819,11 @@ fn examine(job: Job) -> Examined {
                 }
             }
         } else {
-            input.archive_database = archive_database(path, &file);
+            if let Some(list) = archive_list(path, &file) {
+                input.archive_database = tools::list_database(&list);
+                input.extensions = tools::list_extensions(&list);
+                input.list = Some(list.into());
+            }
         }
     }
     Examined {
@@ -2611,25 +2833,77 @@ fn examine(job: Job) -> Examined {
     }
 }
 
-/// The database a PostgreSQL archive was dumped from, as `pg_restore
-/// --list` prints it (`;     dbname: shop`), read with the archive's own
-/// pg_restore. Blocking.
-fn archive_database(pg_restore: &Path, archive: &Path) -> Option<String> {
+/// A PostgreSQL archive's list, as `pg_restore --list` prints it with the
+/// archive's own pg_restore; `None` when it could not be read. Blocking.
+fn archive_list(pg_restore: &Path, archive: &Path) -> Option<String> {
     let output = std::process::Command::new(pg_restore)
         .arg("--list")
         .arg(archive)
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .take(40)
-        .find_map(|line| {
-            line.trim_start_matches(';')
-                .trim()
-                .strip_prefix("dbname:")
-                .map(|name| name.trim().to_string())
-        })
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Writes `text` to `path` as a new file of this user's only: a file left
+/// there by an earlier run of Kerno is removed first, and nothing is
+/// written through a link another user put there.
+fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // It names the backup's objects: this user's to read, nobody else's.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
+}
+
+/// The server's roles, by name.
+const ROLES: &str = "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname IN";
+/// The extensions the server offers (their files are installed), by name.
+const EXTENSIONS: &str = "SELECT name FROM pg_catalog.pg_available_extensions WHERE name IN";
+
+/// The first column of what `sql` returns on `meta`; `None` when it could
+/// not be asked. Runs on the Tokio side.
+async fn names_of(meta: &Arc<dyn Session>, sql: String) -> Option<Vec<String>> {
+    let collected = exec::collect(meta.clone(), sql).await.ok()?;
+    Some(
+        collected
+            .results
+            .first()
+            .map(|result| result.rows())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.into_iter().next().flatten())
+            .collect(),
+    )
+}
+
+/// Which of `names` the catalog `select` (ending in `… IN`) does not
+/// return: the roles or extensions the server lacks.
+async fn absent(meta: &Arc<dyn Session>, select: &str, names: &[String]) -> Option<Vec<String>> {
+    if names.is_empty() {
+        return Some(Vec::new());
+    }
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|name| meta.dialect().quote_string(name))
+        .collect();
+    let present = names_of(meta, format!("{select} ({})", quoted.join(", "))).await?;
+    Some(
+        names
+            .iter()
+            .filter(|name| !present.contains(name))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Line `number` (from 1) of the script at `path`, as psql counted it.
@@ -2644,9 +2918,59 @@ fn script_line(path: &Path, number: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&line).into_owned())
 }
 
-/// What the failure view says first about refused roles (K35): what
-/// happened, in plain words, then what to do; the tool's output below.
+/// What the failure view says first about refused roles (K35) and
+/// extensions the server lacks (K39): what happened, in plain words, then
+/// what to do; the tool's output below.
 fn roles_text(failure: &RoleFailure) -> String {
+    let mut parts = Vec::new();
+    if !failure.refused.is_empty() {
+        parts.push(owners_text(failure));
+    }
+    if !failure.extensions.is_empty() {
+        parts.push(extensions_text(failure));
+    }
+    parts.join(" ")
+}
+
+/// What the failure view says about extensions the server does not offer.
+fn extensions_text(failure: &RoleFailure) -> String {
+    let one = failure.extensions.len() == 1;
+    let names: Vec<String> = failure
+        .extensions
+        .iter()
+        .map(|name| format!("“{name}”"))
+        .collect();
+    let (it, extension) = if one {
+        ("it", "extension")
+    } else {
+        ("them", "extensions")
+    };
+    let mut text = format!(
+        "The backup needs the {extension} {}, which this server does not have. A restore cannot \
+         install an extension: its files are installed on the machine PostgreSQL runs on.",
+        simple::listed(&names)
+    );
+    text.push_str(&if failure.script {
+        format!(
+            " A plain SQL script creates {it} in its own text, so psql cannot leave {it} out. \
+             Install {it} on that machine, then restore again; or back up again as a compressed \
+             archive, which a restore can run without {it}."
+        )
+    } else if failure.retry_extensions() {
+        format!(
+            " Restore again without {it}: what in the backup uses {it} may then fail, and is \
+             said here. Or install {it} on that machine, then restore again."
+        )
+    } else if !failure.single_transaction {
+        format!(" pg_restore went on past {it}: the rest is restored, except what uses {it}.")
+    } else {
+        format!(" Install {it} on that machine, then restore again.")
+    });
+    text
+}
+
+/// What the failure view says about refused roles (K35).
+fn owners_text(failure: &RoleFailure) -> String {
     let missing: Vec<&RefusedRole> = failure
         .refused
         .iter()
@@ -3885,11 +4209,105 @@ impl BackupDialog {
         rows
     }
 
+    /// What the archive needs that the server lacks, said before Start
+    /// (K39): each missing extension, left out unless unticked; the
+    /// missing owners, and that the backup's owners and privileges are
+    /// left out for them.
+    pub(super) fn render_preflight(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let found = self.preflight.as_ref()?;
+        let theme = cx.theme();
+        let quoted = |names: &[String]| {
+            let names: Vec<String> = names.iter().map(|name| format!("“{name}”")).collect();
+            simple::listed(&names)
+        };
+        let mut block = v_flex()
+            .id("restore-preflight")
+            .test_support()
+            .gap_1()
+            .p_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.warning);
+        if !found.extensions.is_empty() {
+            let one = found.extensions.len() == 1;
+            let text = format!(
+                "This backup needs the {} {}, which this server does not have.",
+                if one { "extension" } else { "extensions" },
+                quoted(&found.extensions)
+            );
+            let hint = format!(
+                "A restore cannot install an extension: its files are installed on the machine \
+                 PostgreSQL runs on. What in the backup uses {} may then fail.",
+                if one { "it" } else { "them" }
+            );
+            let leaving = found
+                .extensions
+                .iter()
+                .all(|name| self.leave_out.contains(name));
+            block = block
+                .child(
+                    div()
+                        .text_sm()
+                        .child(SharedString::from(text.clone()))
+                        .test_text(text),
+                )
+                .child(
+                    Checkbox::new("restore-leave-out")
+                        .label(if one {
+                            "Leave it out of the restore"
+                        } else {
+                            "Leave them out of the restore"
+                        })
+                        .checked(leaving)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.leave_out = if *checked {
+                                this.preflight
+                                    .as_ref()
+                                    .map(|found| found.extensions.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(hint.clone()))
+                        .test_text(hint),
+                );
+        }
+        if !found.owners.is_empty() {
+            let one = found.owners.len() == 1;
+            let user = self
+                .auth_user_value(cx)
+                .or_else(|| self.params.as_ref().map(|params| params.user.clone()))
+                .unwrap_or_default();
+            let text = format!(
+                "This backup gives its objects to the {} {}, which this server does not have: \
+                 the backup's owners and privileges are left out, and what it restores belongs \
+                 to “{user}”.",
+                if one { "role" } else { "roles" },
+                quoted(&found.owners)
+            );
+            block = block.child(
+                div()
+                    .text_sm()
+                    .child(SharedString::from(text.clone()))
+                    .test_text(text),
+            );
+        }
+        Some(block.into_any_element())
+    }
+
     fn render_restore_settings(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let mut rows = self.render_input_file(cx);
         if self.input.is_none() {
             return rows;
         }
+        rows.extend(self.render_preflight(cx));
         let r = &self.restore;
         let archive = matches!(&self.input, Some(Ok(input)) if input.format != BackupFormat::Sql);
         let options = match self.family {
@@ -4375,7 +4793,7 @@ impl BackupDialog {
                 if matches!(self.tool_state, ToolState::Ready { .. })
                     && (!self.mode.writes() || self.input.is_some())
                 {
-                    let command = self.command(cx).map(|command| command.display());
+                    let command = self.command(cx).map(|command| self.shown(&command));
                     body.push(Self::field("Command", self.render_command(command, cx), cx));
                 }
             }
@@ -4484,7 +4902,21 @@ impl BackupDialog {
                 let reveal = (*success && !self.mode.writes())
                     .then(|| self.output.clone())
                     .flatten();
-                let retry = self.roles.as_ref().is_some_and(|failure| failure.retry);
+                let retry = self.roles.as_ref().and_then(|failure| {
+                    let one = failure.extensions.len() == 1;
+                    match (failure.retry_owners(), failure.retry_extensions()) {
+                        (false, false) => None,
+                        (true, false) => Some("Restore without owners and privileges…"),
+                        (false, true) if one => Some("Restore without this extension…"),
+                        (false, true) => Some("Restore without these extensions…"),
+                        (true, true) if one => {
+                            Some("Restore without owners, privileges and this extension…")
+                        }
+                        (true, true) => {
+                            Some("Restore without owners, privileges and these extensions…")
+                        }
+                    }
+                });
                 return footer
                     .justify_end()
                     .child(copy)
@@ -4507,11 +4939,11 @@ impl BackupDialog {
                             .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
                     )
                     .map(|this| {
-                        if retry {
+                        if let Some(label) = retry {
                             this.child(close("Close")).child(
                                 Button::new("restore-without-owners")
                                     .primary()
-                                    .label("Restore without owners and privileges…")
+                                    .label(label)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.restore_without_owners(window, cx)
                                     })),
@@ -4756,6 +5188,47 @@ mod tests {
         assert!(!script.retry && roles_text(&script).contains("psql cannot leave them out"));
     }
 
+    /// K39: an extension the server lacks, after a failure.
+    #[test]
+    fn a_missing_extension_is_said_with_what_to_do() {
+        let failure = |script: bool, single_transaction: bool, leavable: bool| {
+            let mut options =
+                RestoreOptions::new(Engine::Postgres, "kerno", "/tmp/x", BackupFormat::Custom);
+            options.single_transaction = single_transaction;
+            let mut failure = RoleFailure::new(script, &options, "kerno".into());
+            failure.extensions = vec!["pgaudit".into()];
+            failure.leavable = leavable;
+            failure
+        };
+        let archive = failure(false, true, true);
+        assert!(archive.retry_extensions() && !archive.retry_owners());
+        assert_eq!(
+            roles_text(&archive),
+            "The backup needs the extension “pgaudit”, which this server does not have. A \
+             restore cannot install an extension: its files are installed on the machine \
+             PostgreSQL runs on. Restore again without it: what in the backup uses it may then \
+             fail, and is said here. Or install it on that machine, then restore again."
+        );
+        let script = failure(true, true, false);
+        assert!(!script.retry_extensions());
+        assert!(roles_text(&script).ends_with(
+            "A plain SQL script creates it in its own text, so psql cannot leave it out. Install \
+             it on that machine, then restore again; or back up again as a compressed archive, \
+             which a restore can run without it."
+        ));
+        let went_on = failure(false, false, true);
+        assert!(!went_on.retry_extensions());
+        assert!(
+            roles_text(&went_on).ends_with(
+                "pg_restore went on past it: the rest is restored, except what uses it."
+            )
+        );
+        // A list that could not be read cannot leave it out.
+        let unread = failure(false, true, false);
+        assert!(!unread.retry_extensions());
+        assert!(roles_text(&unread).ends_with(" Install it on that machine, then restore again."));
+    }
+
     #[test]
     fn mysql_through_a_tunnel_with_verify_full_is_refused() {
         let mut config = ConnectionConfig::new(Engine::MySql);
@@ -4805,6 +5278,8 @@ mod tests {
             format,
             refusal: None,
             archive_database: Some("shop".into()),
+            list: None,
+            extensions: Vec::new(),
         };
         let pg = RestoreOptions::new(Engine::Postgres, "shop_copy", "/b", BackupFormat::Sql);
         let my = RestoreOptions::new(Engine::MySql, "shop_copy", "/b", BackupFormat::Sql);

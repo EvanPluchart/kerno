@@ -408,6 +408,12 @@ impl Navigator {
         gpui_kit::Focusable::focus_handle(self.filter.read(cx), cx).is_focused(window)
     }
 
+    /// The text of the filter field; for tests.
+    #[cfg(test)]
+    pub fn filter_text(&self, cx: &App) -> String {
+        self.filter.read(cx).value().to_string()
+    }
+
     /// Where the window writes the active query tab's target.
     pub fn tab_target(&self) -> Rc<RefCell<Option<Target>>> {
         self.tab_target.clone()

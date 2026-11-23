@@ -665,6 +665,7 @@ impl BackupDialog {
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.restore.no_owner = *checked;
                                 this.restore.no_privileges = *checked;
+                                this.owners_ticked = false;
                                 cx.notify();
                             })),
                     )
@@ -703,7 +704,8 @@ impl BackupDialog {
                                     })),
                             ),
                     )
-                    .children(read),
+                    .children(read)
+                    .children(self.render_preflight(cx)),
                 cx,
             ),
             row(
@@ -804,7 +806,10 @@ impl BackupDialog {
                 )
                 .when(self.show_command && has_command, |this| {
                     this.child(
-                        self.render_command(self.command(cx).map(|command| command.display()), cx),
+                        self.render_command(
+                            self.command(cx).map(|command| self.shown(&command)),
+                            cx,
+                        ),
                     )
                 })
                 .into_any_element(),

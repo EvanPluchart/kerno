@@ -241,6 +241,8 @@ pub fn complete(
         typing,
         catalog,
         mysql: rules.backtick_identifiers,
+        // Only PostgreSQL's rules have dollar quotes.
+        postgres: rules.dollar_quotes,
     }
     .offer(&mut sink);
     sink.prefix.append(&mut sink.inner);
@@ -1102,6 +1104,8 @@ struct Query<'a> {
     catalog: &'a Catalog,
     /// MySQL keeps unquoted names as written; PostgreSQL folds them.
     mysql: bool,
+    /// PostgreSQL, which has `ILIKE` (K40).
+    postgres: bool,
 }
 
 impl<'a> Query<'a> {
@@ -1870,6 +1874,9 @@ impl<'a> Query<'a> {
                 sink.keywords(&["WHEN", "THEN", "ELSE", "END"]);
             }
             sink.keywords(after_operand(clause));
+            if clause == Clause::Where && self.postgres {
+                sink.keywords(&["ILIKE"]);
+            }
             if clause == Clause::On {
                 sink.keywords(AFTER_FROM);
             }
@@ -2366,6 +2373,39 @@ mod tests {
         let completion = pg("|SELECT 1");
         starts(&completion, &[("SELECT", Keyword), ("INSERT", Keyword)]);
         assert_eq!(completion.replace, 0..0);
+    }
+
+    /// What a condition is made of, after a column in WHERE (K40); `ILIKE`
+    /// only where the engine has it.
+    #[test]
+    fn after_a_column_in_where_come_the_words_of_a_condition() {
+        let words = [
+            "AND",
+            "OR",
+            "IN",
+            "NOT IN",
+            "IS NULL",
+            "IS NOT NULL",
+            "LIKE",
+            "BETWEEN",
+        ];
+        let postgres = pg("SELECT * FROM shop.customers WHERE email |");
+        let postgres = labels(&postgres);
+        for word in words.iter().chain(&["ILIKE"]) {
+            assert!(postgres.contains(word), "{word}: {postgres:?}");
+        }
+        let mysql = my("SELECT * FROM shop.customers WHERE email |");
+        let mysql = labels(&mysql);
+        for word in words {
+            assert!(mysql.contains(&word), "{word}: {mysql:?}");
+        }
+        assert!(!mysql.contains(&"ILIKE"), "{mysql:?}");
+        let start = pg("SELECT * FROM shop.customers WHERE |");
+        let start = labels(&start);
+        assert!(
+            start.contains(&"email") && start.contains(&"NOT"),
+            "{start:?}"
+        );
     }
 
     #[test]

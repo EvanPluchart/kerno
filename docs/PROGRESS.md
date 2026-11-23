@@ -1276,3 +1276,53 @@ Still open (for the owner):
 - The full check on the release commit `38a2740`: 1,908 tests, 0 failed. `scripts/release.sh 0.3.1`: the
   macOS disk image and six Linux packages, each started in ubuntu:20.04 and debian:13. Pushed, tagged
   `v0.3.1` and published at the owner's word.
+
+## 2026-11-23 — K40: a table's columns stay scrolled, its WHERE completes, the close cross
+
+- Reported on 0.3.1 by the owner and a first outside user (D-113). A sort, a filter, a refresh or an Apply on a
+  table keeps the columns scrolled where they were; a result read again on the server too (no test for that one).
+- The WHERE field of a table proposes its columns with their type, then AND, OR, IN, IS NULL, LIKE, ILIKE on
+  PostgreSQL, BETWEEN; Tab and Enter take one, quoted when needed; Enter with the list closed applies.
+- Verified: a column's order after a drag, widths, hidden, pinned and sort come back after closing the tab and
+  after a restart. The close cross of a tab has a small centred hover.
+- Tests: three UI tests (PostgreSQL and MySQL) and one core test, each seen failing under a mutation.
+
+## 2026-11-23 — K41: import from DBeaver
+
+- "Import from DBeaver…" (File ▸, sidebar, palette) reads a `.dbp` or a `data-sources.json`, previews folders and
+  connections (ticked, or greyed with why), then imports PostgreSQL, MySQL, MariaDB and SQLite connections with
+  their folder, environment, colour, SSH and SSL; scripts become saved queries; passwords only when ticked;
+  nothing twice. D-114. Written from DBeaver's source; no real export was available to check it.
+
+## 2026-11-23 — K44: ⌘← collapses the schema tree from the tree
+
+- "Collapse Schema Tree" is a key of the tree (context `Navigator`, group Navigator in Settings ▸ Shortcuts) with
+  ⌘← (Ctrl+Left on Linux) by default; in the tree's filter and the editor ⌘← still goes to the line's start.
+- Tests: `ui_tests/k44.rs`, `cmd_left_collapses_the_tree_only_from_the_tree`, `a_key_of_the_text_fields_is_taken_for_a_command_of_the_tree`.
+
+## 2026-11-23 — K39: a restore whose archive needs an extension the server does not have
+
+- The K35 user's second failure of the same restore: `CREATE EXTENSION pgaudit`, not available on the laptop's
+  server. Before Start, Kerno now reads the archive's list and asks the server which extensions and owning roles
+  it lacks, says so above the settings, leaves the extensions out through `--use-list` (ticked by default) and
+  ticks the owners' box (D-112).
+- After a failure, a failed `CREATE EXTENSION` is said in plain words, and one retry leaves out the extension
+  and the owners at once.
+- Tests: three core tests on the real list of pg_restore 18.7 and the user's block, one unit test, three UI
+  tests (two with a stand-in pg_restore and the real server's answers, one with the real tools on scratch
+  databases); K35's real-tools test unticks the box the preflight now ticks. Each seen failing under a mutation.
+
+## 2026-11-23 — K42: "Check for updates" in the About window
+
+- The About window has "Check for updates" beside the version: the same check as Help ▸ Check for Updates…,
+  its answer said there (the latest version, a newer one with Update, offline, or checks off in Settings or by
+  `KERNO_NO_UPDATE_CHECK`, which send nothing); the Kerno menu has "Check for Updates…" too.
+- Why 0.3.1 was not offered to a Kerno left open: the 6-hour timer counts the Mac's awake time only (GPUI's
+  `dispatch_after` on `DispatchTime::NOW`), and the dialog shows once per run. The interval is unchanged.
+
+## 2026-11-23 — K45: the palette's "Recently used"
+
+- ⌘K with nothing typed lists first the last five commands run from the palette (`Settings::recent_commands`, ids
+  only, older settings load empty), the latest first and highlighted; typing ranks as before, with no boost.
+- Tests: `settings::tests::recent_commands_keep_the_last_five_latest_first_once_each`, `ui_tests/k45.rs`.
+

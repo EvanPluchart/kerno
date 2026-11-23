@@ -23,6 +23,8 @@ gpui_kit::actions!(
         NewConnection,
         /// Adds the connections of an exported file.
         ImportConnections,
+        /// Adds the connections, folders and scripts of a DBeaver export.
+        ImportFromDbeaver,
         /// Writes the saved connections, without secrets, to a file.
         ExportConnections,
         /// Makes a connection folder at the top level.
@@ -587,6 +589,21 @@ pub const COMMANDS: &[Command] = &[
         ImportConnections
     ),
     command!(
+        "import_from_dbeaver",
+        "Import from DBeaver…",
+        "Connections",
+        [],
+        [
+            "dbeaver",
+            "dbp",
+            "project",
+            "data-sources",
+            "migrate",
+            "scripts"
+        ],
+        ImportFromDbeaver
+    ),
+    command!(
         "export_connections",
         "Export Connections…",
         "Connections",
@@ -627,13 +644,16 @@ pub const COMMANDS: &[Command] = &[
         ["reload", "navigator", "objects"],
         RefreshSchemaTree
     ),
+    // VS Code's ⌘← (Ctrl+Left elsewhere) on its lists: a key of the tree, so
+    // the text fields keep it for the start of the line (K44).
     command!(
         "collapse_schema_tree",
         "Collapse Schema Tree",
-        "Connections",
-        [],
+        "Navigator",
+        ["secondary-left"],
         ["close", "navigator", "objects"],
-        CollapseSchemaTree
+        CollapseSchemaTree,
+        "Navigator"
     ),
     command!(
         "focus_navigator_filter",

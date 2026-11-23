@@ -3346,6 +3346,19 @@ status bar. Its behaviour was read; no code was ported.
   frame: 7.72 ms on average, median 7.32, 99th percentile 13.75, longest 36.05. These are the time to lay out,
   paint and render one frame offscreen, not the app's interval between frames on a display.
 
+## D-114 — Import from DBeaver (K41; 2026-11-23)
+
+- **Source.** DBeaver Community (Apache-2.0, ported, named in `THIRD_PARTY_NOTICES.md`): the `.dbp` layout of
+  `ProjectExportWizard`, the JSON of `DataSourceSerializerModern`/`DataSourceParser`, the cipher of
+  `DefaultValueEncryptor` (AES-128-CBC, IV first, `BaseProjectImpl`'s built-in key). A bare `data-sources.json`
+  is read too; the pre-6.1.3 XML is refused in plain words. Checked against the source, not a real export.
+- **Caps.** Read in memory, never extracted: the file 64 MB, an entry 16 MB (the read itself capped), 64 MB in
+  all, 20,000 entries, a script 1 MB (skipped and listed); `..` and absolute paths ignored; only counts logged.
+- **Passwords.** The credentials file is decrypted for the user names; passwords are dropped as read unless
+  "Also import the saved passwords" is ticked, then read again at Import and written by `save_secrets` only.
+- **Dependencies.** `aes` 0.9.4 and `cbc` 0.2.1 direct (already locked, `aes-gcm`'s cipher); `zip` no longer
+  optional. No new package in `Cargo.lock`.
+
 ## D-111 — A connection's SQL scripts, in its right-click menu (K38; 2026-11-23)
 
 The owner: when he right-clicks a connection, he wants a submenu with every SQL script linked to it, "like a
@@ -3459,3 +3472,53 @@ running statement (`showStatementInEditor(query, false)`, `revealRange`); a fail
 - **Not done.** No tooltip per mark: the canvas has no hover, and a GPUI tooltip belongs to an element (one over
   the whole strip would keep the words of the mark it first showed); the shapes and the status bar say it. The
   window of a run on several connections does not say "statement k of n" (each target's tab does, when shown).
+
+## D-113 — A table's data tab keeps its columns scrolled, its WHERE completes (K40; 2026-11-23)
+
+Reported on 0.3.1 by the owner and a first outside user.
+
+- **The horizontal scroll is the grid's, carried.** Every read from the first row builds a new grid; the new
+  one takes the old one's horizontal offset (sort, filter, refresh, Apply, reset layout), the first row stays
+  the one shown. A result read again on the server (its sort, its filter) carries it the same way (no test covers that path).
+- **The WHERE field is the kit's code editor on one line.** The kit's single-line `InputState` has no
+  completion provider (only `EditorState` has `lsp_mut`), so the field is an `EditorState`: no line numbers,
+  no search, `submit_on_enter` (Enter applies with the list closed, takes a proposal with it open), 24 px high.
+  Tab takes a proposal (J1's setting), else goes to the next control. Shift+Enter would put a line break in it,
+  harmless in a condition.
+- **One completion engine.** The editor's `SqlCompletion` completes the text as the end of `SELECT * FROM
+  schema.table WHERE`, with a catalog of this one table, so columns come with their type and quoted as the
+  engine needs; GROUP BY, ORDER BY, LIMIT and RETURNING are dropped there. `ILIKE` is now proposed after an
+  operand of WHERE on PostgreSQL, in the editor too.
+- **Layout per table, verified.** Order after a drag, widths, hidden and pinned columns and the sort are kept
+  after closing the tab and after a restart (J6; the order now has its test). Written half a second after the
+  last change, so a quit within that half second loses it.
+- **The close cross.** 16 px square, rounded small, 4 px left and right of it, in the three tab layouts; not
+  looked at in a capture (none taken in this batch).
+- **Not done.** The "Filter the result on the server" field under a query result keeps its plain input (no
+  proposals); Ctrl+Space does not open the WHERE list (the command is scoped to the query editor).
+
+## D-112 — A restore whose archive needs an extension the server does not have (K39; 2026-11-23)
+
+The K35 user, once the owners were left out, met the next failure of the same restore: `CREATE EXTENSION IF NOT
+EXISTS pgaudit` ("extension "pgaudit" is not available"). A restore cannot install an extension's files, and
+finding each missing piece by running the restore again is what had to end.
+
+- **Asked before the run.** For a PostgreSQL archive, the `pg_restore --list` Kerno already ran for the
+  database name is kept; its extensions and owners are read from it (no server) and the connection's metadata
+  session is asked `pg_available_extensions` (cluster-wide) and `pg_roles`, off the UI thread. Only what the
+  server lacks is said. If the list or the server cannot be read, nothing is shown and the restore runs as before.
+- **Ticked by default.** A missing extension is left out unless unticked (its absence makes the restore fail
+  anyway); missing owners tick K35's box, said with the reason, and the next file chosen unticks what the
+  preflight ticked (D-108: owners never dropped silently). Leaving out goes through pg_restore's own
+  `--use-list`: the list with the extension's `EXTENSION` and `COMMENT - EXTENSION` entries commented out,
+  written as a new file (`create_new`, never through a link) in the temporary folder and removed after the run.
+  The command shown and confirmed ends with "# leaves out of the archive the extension “…” (…)". What uses the
+  extension may then fail: that failure is said, not hidden.
+- **After a failure** the failed `CREATE EXTENSION` is read from the SQL the tool printed, as K35 (any language),
+  and said only when `pg_available_extensions` lacks it (a refusal for rights names it too). One button retries
+  without everything the view names (owners, privileges, extensions), through the same confirmations.
+- **Owners in the list are printed bare.** An owner is matched against the whole end of the entry line, so a
+  server role whose name holds a space is never taken for missing; a missing one with a space is named by its
+  last word. The leave-out is not saved in a task: the check runs again at each open.
+- Not done: no server here truly lacks an extension; the "not available" answer is the test server's own for
+  `pgaudit`, through a stand-in pg_restore. Kerno never installs, updates or drops an extension for a restore.

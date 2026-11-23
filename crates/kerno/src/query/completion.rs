@@ -5,10 +5,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::component::input::{CompletionProvider, Rope, RopeExt as _};
-use gpui_kit::{App, Task, Window};
+use gpui_kit::base::input;
+use gpui_kit::component::input::{CompletionProvider, EditorState, Rope, RopeExt as _, TabSize};
+use gpui_kit::{App, Context, Entity, Task, Window};
 use kerno_core::Session;
-use kerno_core::sql::{Catalog, complete};
+use kerno_core::schema::{RelationKind, TableRef};
+use kerno_core::sql::{Catalog, CatalogColumn, CatalogRelation, CatalogSchema, complete};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit, Range, TextEdit,
 };
@@ -23,17 +25,33 @@ pub struct SqlCompletion {
     /// The connection's session, for its dialect: how the text is lexed
     /// and names are quoted.
     pub session: Arc<dyn Session>,
+    /// The statement the text goes on: empty in the editor, `SELECT * FROM
+    /// t WHERE ` in a condition field (K40).
+    pub prefix: String,
 }
+
+/// What a condition field offers no proposal of: the rest of a statement.
+const NOT_A_CONDITION: [&str; 4] = ["GROUP BY", "ORDER BY", "LIMIT", "RETURNING"];
 
 impl SqlCompletion {
     /// The proposals at byte `offset` of `text`.
     pub fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
-        let sql = text.to_string();
+        let at = self.prefix.len();
+        let sql = format!("{}{text}", self.prefix);
+        let offset = offset + at;
         let dialect = self.session.dialect();
         let catalog = self.catalog.borrow();
-        let completion = complete(&sql, offset, &catalog, dialect.lex_rules(), &|name| {
+        let mut completion = complete(&sql, offset, &catalog, dialect.lex_rules(), &|name| {
             dialect.quote_ident(name)
         });
+        if at > 0 {
+            completion
+                .items
+                .retain(|item| !NOT_A_CONDITION.contains(&item.label.as_str()));
+        }
+        if completion.replace.start < at {
+            return Vec::new();
+        }
         let word = &sql[completion.replace.clone()];
         // A word typed in full (`join`, `orders`) needs no list: Enter goes
         // to the editor. One more letter brings the list back.
@@ -48,8 +66,8 @@ impl SqlCompletion {
         let typed = sql[completion.replace.start..offset.max(completion.replace.start)]
             .trim_start_matches(['"', '`']);
         let range = Range::new(
-            text.offset_to_position(completion.replace.start),
-            text.offset_to_position(completion.replace.end),
+            text.offset_to_position(completion.replace.start - at),
+            text.offset_to_position(completion.replace.end - at),
         );
         completion
             .items
@@ -97,4 +115,84 @@ pub fn highlight(_: &str, item: &CompletionItem) -> Vec<std::ops::Range<usize>> 
         item.filter_text.as_deref().unwrap_or_default(),
         item,
     )
+}
+
+/// Completion in a field that holds a condition on `table`, whose columns
+/// and their types are `columns` (K40): what the editor proposes after
+/// `SELECT * FROM table WHERE`.
+pub fn condition_completion(
+    session: Arc<dyn Session>,
+    table: &TableRef,
+    columns: Vec<CatalogColumn>,
+) -> Rc<dyn CompletionProvider> {
+    let dialect = session.dialect();
+    let prefix = format!(
+        "SELECT * FROM {}.{} WHERE ",
+        dialect.quote_ident(&table.schema),
+        dialect.quote_ident(&table.name)
+    );
+    let catalog = Catalog {
+        schemas: vec![CatalogSchema {
+            name: table.schema.clone(),
+            relations: vec![CatalogRelation {
+                name: table.name.clone(),
+                kind: RelationKind::Table,
+                columns,
+                foreign_keys: Vec::new(),
+            }],
+            routines: Vec::new(),
+        }],
+        search_path: vec![table.schema.clone()],
+    };
+    Rc::new(SqlCompletion {
+        catalog: Rc::new(RefCell::new(Arc::new(catalog))),
+        session,
+        prefix,
+    })
+}
+
+/// A one-line field for a SQL condition (K40): the kit's plain input has no
+/// completion, its editor has; Enter applies (`PressEnter`) unless the list
+/// is open.
+pub fn condition_field(
+    placeholder: &'static str,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) -> EditorState {
+    let mut field = EditorState::new(window, cx)
+        .language("sql")
+        .line_number(false)
+        .searchable(false)
+        .soft_wrap(false)
+        .submit_on_enter(true)
+        .tab_size(TabSize {
+            tab_size: 2,
+            hard_tabs: false,
+        })
+        .placeholder(placeholder)
+        .default_value(value);
+    field
+        .lsp_mut()
+        .set_completion_highlighter(Rc::new(highlight));
+    field
+}
+
+/// Tab on `editor` (J1): accepts the highlighted completion when the list
+/// is open and the setting says so; returns whether it did.
+pub fn tab_accepts(editor: &Entity<EditorState>, window: &mut Window, cx: &mut App) -> bool {
+    if !crate::state::AppState::get(cx)
+        .settings
+        .tab_accepts_completion
+        || !editor.read(cx).completion_menu_state().open
+    {
+        return false;
+    }
+    let accept = Box::new(input::Enter {
+        secondary: false,
+        shift: false,
+    });
+    editor.update(cx, |editor, cx| {
+        editor.route_overlay_action(accept, window, cx)
+    })
 }

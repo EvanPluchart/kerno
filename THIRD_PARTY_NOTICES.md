@@ -107,6 +107,11 @@ screenshot, name, colour or wording of either is included.
   - `crates/kerno-mysql/src/capabilities.rs`: the list of what depends on the MySQL or MariaDB server's
     version follows the version gates of `MySQLDataSource.java`, `MySQLUtils.java` and
     `MySQLPlanAnalyser.java` (K22).
+  - `crates/kerno-core/src/dbeaver.rs`: reading DBeaver's project export (K41) follows
+    `ProjectExportWizard.java` (the archive's layout), `DataSourceSerializerModern.java` and
+    `DataSourceParser.java` (the connections, folders, connection types, network handlers and saved
+    credentials), `DefaultValueEncryptor.java` and `BaseProjectImpl.java` (the credentials file's cipher, its
+    key and the script bindings of `project-metadata.json`).
 - **Beekeeper Studio** (https://github.com/beekeeper-studio/beekeeper-studio, GPL-3.0) was read to understand
   behaviour and user experience only. None of its code was translated or copied, and its commercially
   licensed directories were never opened.

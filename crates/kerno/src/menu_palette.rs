@@ -164,6 +164,7 @@ fn sidebar_entry(subject: &Subject, action: &SidebarAction) -> Palette {
         A::NewConnection => Command("new_connection"),
         A::NewFolder => Command("new_connection_folder"),
         A::ImportConnections => Command("import_connections"),
+        A::ImportFromDbeaver => Command("import_from_dbeaver"),
         A::Paste => Command("paste_connection"),
         A::Refresh if *subject == Subject::List => Command("refresh_connections"),
         A::Refresh => Command("refresh_object"),

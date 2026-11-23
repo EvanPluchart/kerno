@@ -7,14 +7,16 @@
 use std::path::PathBuf;
 
 use gpui_kit::base::TestTextExt as _;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, BorrowAppContext as _, Context, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, Styled as _, TestSupportExt as _, Window, div, px,
+    AnyElement, App, BorrowAppContext as _, Context, Global, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, Styled as _, TestSupportExt as _, WeakEntity, Window, div,
+    px,
 };
 use kerno_core::update::{Version, release_page};
 
@@ -105,6 +107,27 @@ impl Workspace {
         .detach();
     }
 
+    /// The About window's "Check for updates" (K42): the same check as Help ▸ Check for
+    /// Updates…, its answer said in the About window. Checks turned off in Settings or by
+    /// `KERNO_NO_UPDATE_CHECK` send nothing and say so.
+    pub fn check_from_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let off = if cx.try_global::<Updates>().is_none() {
+            Some("Update checks are off for this run: KERNO_NO_UPDATE_CHECK is set.")
+        } else if !AppState::get(cx).settings.check_updates {
+            Some("Update checks are turned off in Settings ▸ Updates.")
+        } else {
+            None
+        };
+        cx.set_global(match off {
+            Some(why) => AboutCheck::Failed(why.into()),
+            None => AboutCheck::Checking,
+        });
+        if off.is_none() {
+            self.check_updates(true, window, cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn check_for_updates(
         &mut self,
         _: &CheckForUpdates,
@@ -161,6 +184,26 @@ impl Workspace {
             updates.checking = false;
             updates.current.clone()
         });
+        // Asked from the About window (K42): the answer is said there.
+        if cx.try_global::<AboutCheck>() == Some(&AboutCheck::Checking) {
+            if let Ok(Some(version)) = &found
+                && matches!(
+                    phase(cx),
+                    Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..))
+                )
+            {
+                set_phase(cx, Phase::Available(*version));
+            }
+            cx.set_global(match found {
+                Ok(Some(version)) => AboutCheck::Newer(version),
+                Ok(None) => AboutCheck::Latest(current),
+                Err(why) => AboutCheck::Failed(format!(
+                    "Kerno could not reach GitHub to check (offline?): {why}."
+                )),
+            });
+            cx.notify();
+            return;
+        }
         match found {
             Ok(Some(version)) => {
                 // A download or an install under way keeps its state. A skipped version keeps
@@ -515,4 +558,80 @@ fn remove_download(file: &std::path::Path) {
     if let Some(folder) = file.parent() {
         let _ = std::fs::remove_dir_all(folder);
     }
+}
+
+/// Where the About window's "Check for updates" stands (K42); absent until it is clicked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AboutCheck {
+    #[default]
+    Idle,
+    Checking,
+    /// Up to date: this version.
+    Latest(String),
+    Newer(Version),
+    /// Why it did not or could not check, in plain words.
+    Failed(String),
+}
+
+impl Global for AboutCheck {}
+
+/// The About window's "Check for updates" button, to sit beside the version, and the line that
+/// says its answer (with Update when a newer version is found), to sit under it.
+pub fn about_check(workspace: WeakEntity<Workspace>, cx: &App) -> (AnyElement, AnyElement) {
+    let state = cx.try_global::<AboutCheck>().cloned().unwrap_or_default();
+    let checking = state == AboutCheck::Checking;
+    let button = Button::new("about-check-updates")
+        .small()
+        .outline()
+        .label("Check for updates")
+        .disabled(checking)
+        .on_click({
+            let workspace = workspace.clone();
+            move |_, window, cx| {
+                let _ = workspace.update(cx, |this, cx| this.check_from_about(window, cx));
+            }
+        })
+        .into_any_element();
+    let text = match &state {
+        AboutCheck::Idle => None,
+        AboutCheck::Checking => Some("Checking…".to_string()),
+        AboutCheck::Latest(current) => Some(format!("Kerno {current} is the latest version.")),
+        AboutCheck::Newer(version) => Some(format!("Kerno {version} is available.")),
+        AboutCheck::Failed(why) => Some(why.clone()),
+    };
+    let newer = match state {
+        AboutCheck::Newer(version) => Some(version),
+        _ => None,
+    };
+    let line = v_flex()
+        .items_center()
+        .gap_1()
+        .text_sm()
+        .when_some(text, |line, text| {
+            let text = SharedString::from(text);
+            line.child(
+                div()
+                    .id("about-update-state")
+                    .test_support()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text.clone())
+                    .test_text(text),
+            )
+        })
+        .when_some(newer, |line, _| {
+            line.child(
+                Button::new("about-update")
+                    .small()
+                    .primary()
+                    .label("Update")
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let _ = workspace.update(cx, |this, cx| {
+                            this.update_action(TabAction::Update, window, cx)
+                        });
+                    }),
+            )
+        })
+        .into_any_element();
+    (button, line)
 }

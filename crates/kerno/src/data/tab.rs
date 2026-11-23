@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::input::IndentInline;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::table::{TableEvent, TableSelection, TableState};
@@ -39,6 +40,7 @@ use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
+use crate::query::completion;
 use crate::query::distinct;
 use crate::query::edit;
 use crate::query::grid::{CopyFormat, EditTarget, Grid, GridAction, LoadRows, Owner, SortOnServer};
@@ -299,7 +301,8 @@ pub struct DataTab {
     hidden: bool,
     structure: Option<Arc<TableStructure>>,
     filter_rows: Vec<FilterRow>,
-    raw_filter: Entity<InputState>,
+    /// The WHERE typed by hand, with the table's columns proposed (K40).
+    raw_filter: Entity<EditorState>,
     /// The filter the rows on screen were read with.
     applied: Filter,
     /// The column sorted on and whether descending.
@@ -377,9 +380,12 @@ impl DataTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let raw_filter = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("SQL condition, for example: total > 100 AND status = 'paid'")
-                .default_value(filter.raw.clone())
+            completion::condition_field(
+                "SQL condition, for example: total > 100 AND status = 'paid'",
+                filter.raw.clone(),
+                window,
+                cx,
+            )
         });
         let subscriptions = vec![
             cx.subscribe_in(
@@ -1048,6 +1054,22 @@ impl DataTab {
         self.counting = true;
         self.state = State::Ready;
         self.remember_filter(&session, cx);
+        // The WHERE field proposes this table's columns (K40).
+        let provider = completion::condition_completion(
+            session.clone(),
+            &self.table,
+            structure
+                .columns
+                .iter()
+                .map(|column| kerno_core::sql::CatalogColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                })
+                .collect(),
+        );
+        self.raw_filter.update(cx, |field, _| {
+            field.lsp_mut().completion_provider = Some(provider);
+        });
 
         let mut store = ResultStore::new(result.columns.clone());
         for batch in result.batches {
@@ -1143,15 +1165,27 @@ impl DataTab {
             .grid
             .as_ref()
             .and_then(|old| crate::query::find::carried(old, cx));
+        // The columns stay scrolled as they were: a sort, a filter, a
+        // refresh or an Apply goes back to the first row only (K40).
+        let scrolled = self
+            .grid
+            .as_ref()
+            .map(|old| old.read(cx).horizontal_scroll_handle.offset().x);
         let table = cx.new(|cx| {
-            TableState::new(grid, window, cx)
+            let table = TableState::new(grid, window, cx)
                 .col_resizable(true)
                 .col_movable(true)
                 .sortable(true)
                 .row_selectable(true)
                 .col_selectable(true)
                 .cell_selectable(true)
-                .row_header(false)
+                .row_header(false);
+            if let Some(x) = scrolled {
+                table
+                    .horizontal_scroll_handle
+                    .set_offset(gpui_kit::point(x, px(0.)));
+            }
+            table
         });
         self.grid_subscriptions = vec![
             cx.subscribe_in(
@@ -1263,6 +1297,12 @@ impl DataTab {
             .and_then(|(column, descending)| Some((columns.get(column)?.name.clone(), descending)));
         self.remember_layout(cx);
         self.restart(window, cx);
+    }
+
+    /// The WHERE field; for tests.
+    #[cfg(test)]
+    pub fn raw_filter(&self) -> &Entity<EditorState> {
+        &self.raw_filter
     }
 
     /// What the layout of the table is stored under; for tests.
@@ -2647,12 +2687,20 @@ impl DataTab {
                             .child("WHERE"),
                     )
                     .child(
-                        div().flex_1().min_w(FILTER_MIN_WIDTH).child(
-                            Input::new(&self.raw_filter)
-                                .small()
-                                .id("filter-raw")
-                                .font_family(theme.mono_font_family.clone()),
-                        ),
+                        div()
+                            .id("filter-raw")
+                            .test_support()
+                            .flex_1()
+                            .min_w(FILTER_MIN_WIDTH)
+                            // Tab takes a proposal (J1) or goes to the next
+                            // control: the field is one line, nothing to indent.
+                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                                if !completion::tab_accepts(&this.raw_filter, window, cx) {
+                                    window.focus_next(cx);
+                                }
+                                cx.stop_propagation();
+                            }))
+                            .child(Editor::new(&self.raw_filter).small().h(px(24.))),
                     )
                     .child(history_button(
                         "filter-history",

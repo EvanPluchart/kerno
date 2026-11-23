@@ -10,8 +10,7 @@ workspace = true
 
 [features]
 # Facts about the kerno-* test containers, for integration tests.
-# `xlsx::read`, which unzips a workbook in tests.
-test-support = ["dep:zip"]
+test-support = []
 
 [dependencies]
 tokio.workspace = true
@@ -55,8 +54,13 @@ flate2 = "1.1"
 # getrandom; the nonce and the key come from getrandom itself.
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 getrandom = "0.3.4"
-# Already in the tree through rust_xlsxwriter.
-zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+# Already in the tree through rust_xlsxwriter: reading DBeaver's project
+# export (K41, D-114), and `xlsx::read` in tests.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# DBeaver's saved credentials (K41, D-114), AES-128-CBC: both already in the
+# tree at the version locked, on the cipher aes-gcm uses.
+aes = "0.9.4"
+cbc = { version = "0.2.1", default-features = false, features = ["block-padding"] }
 
 [dev-dependencies]
 # The crate's own integration tests use its test support.

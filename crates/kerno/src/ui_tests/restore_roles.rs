@@ -299,6 +299,13 @@ fn an_archive_from_another_server_restores_without_its_owners(cx: &mut TestAppCo
     open_file(&app, cx, &dialog, &file);
     let state = app.wait_backup(cx, &dialog, &["ready", "file", "no tool"]);
     assert!(state.starts_with("ready: "), "{state}");
+    // Since K39 the archive's list says so before the run and ticks the
+    // box; the user unticks it, and the restore fails as before.
+    app.wait_until(cx, "the preflight", |app, cx| {
+        app.has(cx, "restore-preflight")
+    });
+    assert!(args(cx, &dialog).contains(&"--no-owner".into()));
+    app.tap(cx, "simple-no-owner");
     restore(&app, cx, &dialog, false);
     assert!(
         app.wizard_state(cx, &dialog)

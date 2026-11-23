@@ -96,8 +96,12 @@ use crate::error::{Error, Result};
 use crate::schema::TableRef;
 use crate::ssh::Tunnel;
 
+mod archive;
 mod roles;
 
+pub use archive::{
+    list_database, list_extensions, list_without, missing_owners, refused_extensions,
+};
 pub use roles::{RefusedRole, refused_roles};
 
 /// A client tool Kerno runs.
@@ -1260,6 +1264,10 @@ pub struct RestoreOptions {
     /// the file is scanned instead of relying on the tool's own sandbox.
     #[serde(skip)]
     pub tool_version: Option<ToolVersion>,
+    /// pg_restore `--use-list`: the archive's list with entries left out
+    /// (K39, [`list_without`]), written by the caller before the run.
+    #[serde(skip)]
+    pub use_list: Option<PathBuf>,
 }
 
 impl RestoreOptions {
@@ -1287,6 +1295,7 @@ impl RestoreOptions {
             auth_user: None,
             allow_client_commands: false,
             tool_version: None,
+            use_list: None,
         }
     }
 }
@@ -1930,7 +1939,8 @@ pub fn restore_command(
         || options.create
         || options.no_owner
         || options.no_privileges
-        || options.jobs.is_some();
+        || options.jobs.is_some()
+        || options.use_list.is_some();
     let params = with_user(params, &options.auth_user);
     match (params.engine, options.format) {
         (Engine::Postgres, BackupFormat::Sql) => {
@@ -1992,6 +2002,9 @@ pub fn restore_command(
             args.push(format!("--format={}", format.letter()));
             if let Some(jobs) = options.jobs {
                 args.push(format!("--jobs={jobs}"));
+            }
+            if let Some(list) = &options.use_list {
+                args.push(format!("--use-list={}", list.display()));
             }
             for (on, flag) in [
                 (options.clean, "--clean"),
@@ -4277,8 +4290,12 @@ mod tests {
             ]
         );
         type Change = fn(&mut RestoreOptions);
-        let cases: [(Change, &[&str]); 9] = [
+        let cases: [(Change, &[&str]); 10] = [
             (|o| o.format = BackupFormat::Directory, &["--format=d"]),
+            (
+                |o| o.use_list = Some("/tmp/k.list".into()),
+                &["--use-list=/tmp/k.list"],
+            ),
             (|o| o.format = BackupFormat::Tar, &["--format=t"]),
             (|o| o.clean = true, &["--clean"]),
             (
@@ -4349,6 +4366,7 @@ mod tests {
             (|o: &mut RestoreOptions| o.clean = true) as Change,
             |o| o.no_owner = true,
             |o| o.jobs = Some(2),
+            |o| o.use_list = Some("/tmp/k.list".into()),
         ] {
             assert!(matches!(psql(change), Err(Error::Unsupported(_))));
         }

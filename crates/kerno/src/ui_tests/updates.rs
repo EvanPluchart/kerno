@@ -806,3 +806,59 @@ fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppCon
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
     assert_eq!(bundle_says(&bundle), "old");
 }
+
+/// K42: the About window's "Check for updates" says its answer there: checks switched off by
+/// the environment or in Settings (no request), the latest version, a newer one with Update,
+/// a failure.
+#[gpui_kit::test]
+fn the_about_window_checks_for_updates_and_says_the_answer(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    app.dispatch(cx, actions::About);
+    let ask = |app: &Fixture, cx: &mut TestAppContext| {
+        app.tap(cx, "about-check-updates");
+        app.wait_until(cx, "the answer", |app, cx| {
+            app.has(cx, "about-update-state") && !paints(app, cx, "Checking…")
+        });
+    };
+    // KERNO_NO_UPDATE_CHECK: no updater installed.
+    ask(&app, cx);
+    assert!(paints(
+        &app,
+        cx,
+        "Update checks are off for this run: KERNO_NO_UPDATE_CHECK is set."
+    ));
+
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = false));
+    ask(&app, cx);
+    assert!(paints(
+        &app,
+        cx,
+        "Update checks are turned off in Settings ▸ Updates."
+    ));
+    assert!(curl_args(&fake).is_empty(), "nothing asked");
+
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = true));
+    ask(&app, cx);
+    assert!(paints(&app, cx, "Kerno 0.2.0 is available."));
+    assert!(app.has(cx, "about-update"));
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+    assert_eq!(curl_args(&fake).len(), 1);
+
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.1.0")));
+    allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+    ask(&app, cx);
+    assert!(paints(&app, cx, "Kerno 0.1.0 is the latest version."));
+    assert!(!app.has(cx, "about-update"));
+
+    let fake = Fake::new(|_, _| Err("curl: (6) Could not resolve host: github.com".into()));
+    allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+    ask(&app, cx);
+    assert!(paints(
+        &app,
+        cx,
+        "Kerno could not reach GitHub to check (offline?): curl: (6) Could not resolve host"
+    ));
+}

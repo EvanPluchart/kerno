@@ -397,7 +397,7 @@ fn a_million_fetched_rows_are_searched_off_the_ui_thread(cx: &mut TestAppContext
 
 /// The table key a layout is stored under, for a table of the fixture's
 /// connection.
-fn layout_key(engine: Engine, schema: &str, table: &str) -> String {
+pub(super) fn layout_key(engine: Engine, schema: &str, table: &str) -> String {
     let database = match engine {
         Engine::Postgres => "kerno",
         Engine::MySql | Engine::MariaDb => "",
@@ -409,7 +409,7 @@ fn layout_key(engine: Engine, schema: &str, table: &str) -> String {
 }
 
 /// The layout stored for a table of the first connection.
-fn stored_layout(
+pub(super) fn stored_layout(
     app: &Fixture,
     cx: &mut TestAppContext,
     key: &str,
@@ -419,7 +419,7 @@ fn stored_layout(
 }
 
 /// Waits until the delayed write of a layout reached storage.
-fn wait_for_layout(
+pub(super) fn wait_for_layout(
     app: &Fixture,
     cx: &mut TestAppContext,
     key: &str,

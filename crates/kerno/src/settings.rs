@@ -147,6 +147,9 @@ pub struct Settings {
     /// (K38): the connection's SQL scripts ▸. A file used with two
     /// connections is in both lists.
     pub connection_scripts: BTreeMap<String, Vec<PathBuf>>,
+    /// The commands run last from the palette, by id, the latest first, at
+    /// most [`RECENT_COMMANDS`] (K45).
+    pub recent_commands: Vec<String>,
     /// How the open tabs are laid out (DBeaver #7114, #23248).
     pub tab_layout: TabLayout,
     /// A multi-statement run shows its results one under the other in one
@@ -191,6 +194,9 @@ impl TabLayout {
 
 /// How many `.sql` files the main toolbar lists.
 pub const RECENT_SCRIPTS: usize = 10;
+
+/// How many commands the palette's "Recently used" lists (K45).
+pub const RECENT_COMMANDS: usize = 5;
 
 /// How many `.sql` files each connection keeps in its list (K38).
 pub const CONNECTION_SCRIPTS: usize = 10;
@@ -256,6 +262,7 @@ impl Default for Settings {
             recent_scripts: Vec::new(),
             script_connections: BTreeMap::new(),
             connection_scripts: BTreeMap::new(),
+            recent_commands: Vec::new(),
             tab_layout: TabLayout::SingleRow,
             stack_results: false,
             ai: kerno_core::ai::AiSettings::default(),
@@ -343,6 +350,14 @@ impl Settings {
     /// Stores the settings.
     pub fn save(&self, storage: &Storage) -> kerno_core::Result<()> {
         storage.set_setting(KEY, self)
+    }
+
+    /// Puts the command `id` first in the palette's recent commands, once,
+    /// keeping the last [`RECENT_COMMANDS`] (K45).
+    pub fn remember_command(&mut self, id: &str) {
+        self.recent_commands.retain(|recent| recent != id);
+        self.recent_commands.insert(0, id.to_string());
+        self.recent_commands.truncate(RECENT_COMMANDS);
     }
 
     /// Puts `path` first in the recent scripts, once, keeping the last
@@ -457,6 +472,7 @@ mod tests {
             recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
             script_connections: [(PathBuf::from("/tmp/a.sql"), "c1".to_string())].into(),
             connection_scripts: [("c1".to_string(), vec![PathBuf::from("/tmp/a.sql")])].into(),
+            recent_commands: vec!["about".into()],
             tab_layout: TabLayout::Vertical,
             stack_results: true,
             ai: kerno_core::ai::AiSettings {
@@ -480,6 +496,15 @@ mod tests {
         };
         changed.save(&storage).unwrap();
         assert_eq!(Settings::load(&storage), changed);
+    }
+
+    #[test]
+    fn recent_commands_keep_the_last_five_latest_first_once_each() {
+        let mut settings = Settings::default();
+        for id in ["a", "b", "c", "d", "e", "f", "c"] {
+            settings.remember_command(id);
+        }
+        assert_eq!(settings.recent_commands, ["c", "f", "e", "d", "b"]);
     }
 
     #[test]

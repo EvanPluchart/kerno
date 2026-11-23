@@ -47,6 +47,7 @@ pub enum SidebarAction {
     NewConnection,
     NewFolder,
     ImportConnections,
+    ImportFromDbeaver,
     /// Saves a copy of the connection copied last.
     Paste,
     Refresh,
@@ -109,6 +110,7 @@ impl SidebarAction {
             Self::NewConnection => "New connection…",
             Self::NewFolder => "New folder…",
             Self::ImportConnections => "Import connections…",
+            Self::ImportFromDbeaver => "Import from DBeaver…",
             Self::Paste => "Paste",
             Self::Refresh => "Refresh",
             Self::CollapseAll => "Collapse all",
@@ -182,6 +184,7 @@ pub fn menu(
             enabled(NewConnection),
             enabled(NewFolder),
             enabled(ImportConnections),
+            enabled(ImportFromDbeaver),
             Separator,
             Item(Paste, (!copied).then_some("no connection copied")),
             Separator,
@@ -382,6 +385,8 @@ pub enum SidebarEvent {
     Tool(String, ToolEntry),
     /// Ask for a connections file to import.
     ImportConnections,
+    /// Ask for a DBeaver export to import.
+    ImportFromDbeaver,
     /// Close these connections, `action` (“Disconnect “prod””) once what
     /// their tabs hold is ended.
     Disconnect { ids: Vec<String>, action: String },
@@ -604,6 +609,7 @@ impl Sidebar {
                 folder_dialog::open(connections, Target::Edit(path.clone()), window, cx);
             }
             (Subject::List, ImportConnections) => cx.emit(SidebarEvent::ImportConnections),
+            (Subject::List, ImportFromDbeaver) => cx.emit(SidebarEvent::ImportFromDbeaver),
             // The list is read again, and every tree being browsed.
             (Subject::List, Refresh) => {
                 connections.update(cx, |c, cx| c.reload(cx));
@@ -1098,6 +1104,7 @@ mod tests {
                 "New connection…",
                 "New folder…",
                 "Import connections…",
+                "Import from DBeaver…",
                 "—",
                 "Paste (no connection copied)",
                 "—",
@@ -1121,7 +1128,7 @@ mod tests {
                 2,
                 false,
                 false
-            ))[7],
+            ))[8],
             "Collapse all"
         );
         assert_eq!(
@@ -1133,7 +1140,7 @@ mod tests {
                 2,
                 false,
                 false
-            ))[10],
+            ))[11],
             "Disconnect all"
         );
         assert_eq!(
