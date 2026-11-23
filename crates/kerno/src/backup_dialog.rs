@@ -2143,6 +2143,14 @@ impl BackupDialog {
             Err(Error::Cancelled) => HistoryStatus::Cancelled,
             _ => HistoryStatus::Error,
         };
+        let past = (self.mode == Mode::Restore
+            && self.engine == Engine::Postgres
+            && !self.restore.single_transaction)
+            .then(|| {
+                let lines: Vec<&str> = self.log.iter().map(AsRef::as_ref).collect();
+                errors_ignored(&lines).map(|errors| (errors, ignored_commands(&lines)))
+            })
+            .flatten();
         self.step = match ended.outcome {
             Ok(status) if status.success() => {
                 if self.mode == Mode::Backup
@@ -2190,6 +2198,38 @@ impl BackupDialog {
                 Step::Finished {
                     success: true,
                     text,
+                }
+            }
+            // pg_restore outside one transaction goes on past a statement
+            // that fails and still exits with 1: the restore is there, less
+            // those statements. Said as that, not as a failure.
+            Ok(status) if past.is_some() => {
+                let (errors, commands) = past.unwrap_or_default();
+                let restored = self.on_restored.clone();
+                restored(&self.connection, &self.database, window, cx);
+                let which = match commands.as_slice() {
+                    [] => String::new(),
+                    [one] => format!(" The statement that failed: {one}"),
+                    several => format!(
+                        " The statements that failed: {}{}",
+                        several
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        if several.len() > 3 { " …" } else { "" }
+                    ),
+                };
+                Step::Finished {
+                    success: true,
+                    text: format!(
+                        "{program} went to the end ({}) past {errors} error{} it ignored: \
+                         everything else was restored into {}.{which}",
+                        status_text(status),
+                        if errors == 1 { "" } else { "s" },
+                        self.database
+                    ),
                 }
             }
             Ok(status) => Step::Finished {
@@ -2846,6 +2886,55 @@ fn archive_list(pg_restore: &Path, archive: &Path) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// How many errors pg_restore went past: its last line when it reached the
+/// end outside one transaction ends with their number ("warning: errors
+/// ignored on restore: 3"), in whatever language it speaks. `None` when it
+/// stopped instead.
+fn errors_ignored<S: AsRef<str>>(log: &[S]) -> Option<u64> {
+    let last = log
+        .iter()
+        .rev()
+        .map(AsRef::as_ref)
+        .find(|line| !line.trim().is_empty())?;
+    let (_, number) = last
+        .strip_prefix("pg_restore:")?
+        .trim_end()
+        .rsplit_once(':')?;
+    number.trim().parse().ok().filter(|errors| *errors > 0)
+}
+
+/// The statements pg_restore reports as failed: the lines it prints after
+/// a translated label ("Command was: CREATE SCHEMA a;"), which are the only
+/// ones that do not start with its name and hold SQL after a colon.
+fn ignored_commands<S: AsRef<str>>(log: &[S]) -> Vec<String> {
+    const STARTS: [&str; 12] = [
+        "CREATE ",
+        "ALTER ",
+        "COPY ",
+        "GRANT ",
+        "REVOKE ",
+        "COMMENT ",
+        "SET ",
+        "SELECT ",
+        "INSERT ",
+        "DROP ",
+        "REFRESH ",
+        "SECURITY ",
+    ];
+    log.iter()
+        .map(AsRef::as_ref)
+        .filter(|line| !line.starts_with("pg_restore:"))
+        .filter_map(|line| {
+            let (_, sql) = line.split_once(':')?;
+            let sql = sql.trim();
+            STARTS
+                .iter()
+                .any(|start| sql.starts_with(start))
+                .then(|| sql.to_string())
+        })
+        .collect()
 }
 
 /// Writes `text` to `path` as a new file of this user's only: a file left
@@ -5133,6 +5222,45 @@ mod tests {
 
     /// K35: what the failure view says, per case; the retry offered only
     /// where a second run can work.
+    #[test]
+    fn a_restore_that_went_past_errors_is_told_from_one_that_stopped() {
+        // pg_restore's own end of a parallel restore, English and French.
+        let english = [
+            "pg_restore: creating SCHEMA \"archive\"",
+            "pg_restore: error: could not execute query: ERROR:  schema \"archive\" already exists",
+            "Command was: CREATE SCHEMA archive;",
+            "",
+            "pg_restore: finished main parallel loop",
+            "pg_restore: warning: errors ignored on restore: 1",
+        ];
+        assert_eq!(errors_ignored(&english), Some(1));
+        assert_eq!(ignored_commands(&english), ["CREATE SCHEMA archive;"]);
+        let french = [
+            "pg_restore: erreur : could not execute query: ERROR:  schema \"archive\" already exists",
+            "La commande était : CREATE SCHEMA archive;",
+            "pg_restore: attention : erreurs ignorées lors de la restauration : 12",
+            "",
+        ];
+        assert_eq!(errors_ignored(&french), Some(12));
+        assert_eq!(ignored_commands(&french), ["CREATE SCHEMA archive;"]);
+        // A run that stopped: its last line is the error, with no count.
+        let stopped = [
+            "pg_restore: error: could not execute query: ERROR:  role \"app_owner\" does not exist",
+            "Command was: ALTER SCHEMA archive OWNER TO app_owner;",
+        ];
+        assert_eq!(errors_ignored(&stopped), None);
+        let refused = [
+            "pg_restore: error: connection to server at \"localhost\" (::1), port 5432 failed: FATAL:  database \"x\" does not exist",
+        ];
+        assert_eq!(errors_ignored(&refused), None);
+        // Lines of parallel workers that ran into each other are not SQL.
+        let garbled = [
+            "launching item 4891 FK CONSTRAINT t fk_a",
+            " creating INDEX \"public.i\"",
+        ];
+        assert!(ignored_commands(&garbled).is_empty());
+    }
+
     #[test]
     fn a_refused_role_is_said_with_what_to_do() {
         let options = |single_transaction: bool, without: bool| {

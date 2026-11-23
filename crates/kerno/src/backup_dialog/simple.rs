@@ -681,6 +681,55 @@ impl BackupDialog {
                 cx,
             )
         });
+        // pg_restore reads a custom or a directory archive on several
+        // connections at once (`--jobs`), which one transaction rules out:
+        // the owner's restore of a large backup took 450 s on one.
+        let parallel = archive
+            && matches!(
+                &self.input,
+                Some(Ok(input))
+                    if matches!(input.format, BackupFormat::Custom | BackupFormat::Directory)
+            );
+        let speed = parallel.then(|| {
+            let jobs = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            let on =
+                !self.restore.single_transaction && !self.jobs.read(cx).value().trim().is_empty();
+            let hint = "Not all or nothing: if a step fails, pg_restore goes on and what it \
+                        restored stays.";
+            row(
+                "Speed",
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Checkbox::new("simple-parallel")
+                            .label(SharedString::from(format!(
+                                "Faster: restore on {jobs} connections at once"
+                            )))
+                            .checked(on)
+                            .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                                this.restore.single_transaction = !*checked;
+                                let value = if *checked {
+                                    jobs.to_string()
+                                } else {
+                                    String::new()
+                                };
+                                this.jobs
+                                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("simple-parallel-hint")
+                            .test_support()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(hint)
+                            .test_text(hint),
+                    ),
+                cx,
+            )
+        });
         vec![
             row(
                 "File",
@@ -735,6 +784,7 @@ impl BackupDialog {
         ]
         .into_iter()
         .chain(roles)
+        .chain(speed)
         .chain([row("Client", self.simple_client(cx), cx)])
         .collect()
     }
