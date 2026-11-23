@@ -3742,3 +3742,71 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   text, runs nothing)" and stays usable; the panel says the same. Not offered on a view.
 - Not done: a selection of several tables in the tree (the tree has none, D-069). The tree's entries read the
   table's structure once more (the navigator keeps none, D-119); a data or structure tab gives its own.
+
+## D-121 — Ask the assistant in the editor, fix an error in one click, both as a diff (K52; 2026-11-23)
+
+- **What is sent.** "AI: Ask Here…": the schema context of J17 and K50 (the tables the SQL or the sentence
+  names, read in full as D-119 says, "reading…" meanwhile and Send waiting), the selection, else the
+  statement at the cursor, as "the SQL to change", and the sentence. On a line that is empty or blank nothing
+  of the editor goes: the model writes from the sentence alone (`kerno_core::ai::inline::Inline::Ask` with no
+  SQL). "Fix with AI": the statement the server refused and what the error view shows of it (message and
+  code, detail, hint, `Failure::described`) and the character it pointed at, sent at once, no sentence asked
+  (`Inline::Fix`). A refinement is the user's sentence with the turns so far (K51's `Turn`s), the schema
+  once in the system message. The body is `ai::build_chat`'s, as every other request's; no sample rows on
+  either path (there is no place to tick them); each request joins the session's "What was sent" through
+  `ai_view::record_sent` and the card's "What is sent…" / "What was sent…" shows the exact body. SQL to change
+  longer than `MAX_QUERY` (20,000 characters) is refused in words ("select the part to change"), never cut:
+  a cut statement would come back as a diff that drops its end.
+- **The proposal.** Only a closed ```sql block, or a closed block with no language, is a proposal
+  (`inline::proposed_sql`, on K51's `segments`); `sql_block`'s fallback to the whole answer is not used, so
+  prose is never offered to accept. A model that answers bare SQL without a fence gets its text shown with
+  "Open in the panel" and nothing to accept (the owner's to change). Fitted to its place
+  (`inline::replacement`): the buffer's line ending kept (CRLF in, CRLF out); over a statement whose `;` stays
+  after it, the answer's own final `;` left out; at a caret, on its own line (`ai::placed`) and ended by `;`
+  when text follows (else it would join the next statement). An answer equal to the text says "no change".
+- **The diff** is a line diff (`inline::diff`, a longest common subsequence; lines compared without their
+  ending, tabs as written; `ponytail:` past 4 million cells, every old line removed and every new one added).
+  Drawn with the kit where it can: the lines it removes are tinted in the text by a range decoration (fill,
+  the theme's danger at 25 %), and the request's place is framed by one while it waits. The kit's editor has
+  no rows that are not text (no virtual lines, `inline_line.rs` lays out tokens within a row), its inline
+  completion is one ghost string at the caret fed by a provider, its caret-anchored popover is
+  `pub(crate)`, its hover and diagnostic popovers take text only, and its code-action menu opens on the kit's
+  ⌘. that Kerno gives to Cancel; its `diff` component is a virtualised patch viewer with a header, its own
+  focus, keys and a list that needs a fixed height. So the card is Kerno's: one element (`OverEditor`)
+  that lays out its child in prepaint, inside `deferred`, from the editor's layout of that frame (its text
+  bounds, line height and display map, as K37's `run_marks` reads them), under the place's last row, else
+  above its first, always inside the editor's view. Each line of the card says `−`, `+` or nothing before
+  it, in the editor's font, size (the zoom) and line height, tinted danger or success; soft wrap on wraps
+  the card's lines, off scrolls them; ligatures follow the editor's setting.
+- **Contrast** (`theme::tests::a_proposals_lines_read_on_their_tints`): the text on a removed and an added line
+  of the card 14.24:1 and 14.27:1 in light, 12.23:1 and 11.04:1 in dark (danger at 14 %, success at 16 %
+  over the background); the editor's text on a removed line tinted in place (danger at 25 %) 11.91:1 in
+  light, 9.97:1 in dark, every syntax colour above 3:1 there (the selection's rule). The keys in the card's
+  hints and tooltips are written as the system writes them (`actions::shown`: ⌘↩ on macOS, Ctrl+Enter
+  elsewhere).
+- **Keys.** The keyboard is in the card's field while it is shown, so the editor's keys (the completion list,
+  Tab, vim) are untouched. In the field: Enter asks (or refines), ⌘↩ accepts (Kerno's ⌘↩ is Run statement
+  everywhere, D-089: the card catches that command before the window does; the kit's own Ctrl/⌘+Enter event
+  accepts too), Escape rejects and closes, ⌘. stops. In the editor ⌘↩ runs the editor's own text: the
+  proposal is never in the buffer before Accept, so running cannot reach it, and Reject has nothing to undo.
+  ⌘⇧H (Ctrl+Shift+H) opens the field, or gives the keyboard back to an open one; no other default, no key of
+  the kit's fields or editor answers it on either system (tested).
+- **Accept** is the panel's edit: the place selected, `replace` (one undo step), the new text selected; the
+  card is closed first so that its own edit is not taken for a change under it.
+- **Honest states.** A late answer is dropped by a generation bumped at Stop, at an edit that changes or moves
+  the place (`inline::still_there` on every change of the text, and again when the answer arrives), when the
+  tab is left (`QueryTab::hide`) and when it closes (`Drop` closes the request's connection, as the panel's
+  does). After a drop the card says why and keeps only Close; ⌘⇧H starts again where the cursor is. ⌘. stops
+  a waiting request before it cancels a running statement (a second ⌘. does that).
+- **Fix with AI's place.** A result of a statement the server refused keeps the bytes of the editor it was
+  read from (`ResultPane::source`; not an EXPLAIN's, a cancelled one or one cut off by a lost connection). If
+  the text there changed, the one place where the statement is written whole is taken; written twice or
+  not at all, it says "run it again, then Fix with AI". The chip beside the error's mark shows while the mark
+  holds and no field is open; an edit hides it, the button under the error stays.
+- **It respects the tab.** The diff is a proposal of text, as a paste is: a read-only connection, a
+  production environment and vim mode do nothing more here; their rules apply when the user runs the
+  statement.
+- **Shared files.** `ai_view.rs`: `record_sent` (the log is that file's) and `AiPanel::adopt` ("Open in the
+  panel": the exchange appended to the tab's conversation, each question as typed and as sent with its
+  answer). The editor menu's two entries are added after the panel's by `ai_inline::editor_entries`, disabled
+  with "(turn on in Settings → AI)" while off; the palette commands say how to turn it on and open nothing.

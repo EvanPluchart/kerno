@@ -1820,3 +1820,6 @@ mod tests {
 
 // K53 (D-122): what a right-click asks the assistant.
 pub mod ask;
+
+// K52 (D-121): the assistant asked in the editor, and its proposal as a diff.
+pub mod inline;

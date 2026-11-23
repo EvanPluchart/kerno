@@ -58,9 +58,10 @@ unless sample rows are ticked, "What is sent", nothing run by itself):
 1. **A conversation in a side panel.** Follow-ups refine the answer ("add the date filter", "no, by
    customer"), with the editor's query as context. Done (K51, D-120), answers streamed.
 2. **Ask in the editor.** A shortcut opens a field at the cursor; the proposal is shown as a before / after
-   diff to accept or refuse.
+   diff to accept or refuse. Done (K52, D-121): "AI: Ask Here…" (⌘⇧H), Accept as one undo step, refined in
+   place.
 3. **Fix an error in one click.** From a failed statement, the fix is proposed as a diff in the editor, with
-   no panel in between.
+   no panel in between. Done (K52, D-121): "Fix with AI" under the error and beside its mark.
 4. **From a right-click.** On a table or a result: ask about this table, explain these columns, generate test
    data. Done (K53, D-122): the tree, a data or structure tab and a result grid.
 5. **A richer context.** Foreign keys, indexes and types sent with the schema, for joins that hold and real

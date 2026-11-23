@@ -532,6 +532,10 @@ gpui_kit::actions!(
         AiExplainResult,
         /// Asks the AI assistant about the selected cells (K53).
         AiAskAboutSelection,
+        /// Asks the AI assistant at the editor's cursor; its proposal comes as a diff (K52).
+        AiAskHere,
+        /// Asks the AI assistant to fix the failed statement on screen, as a diff (K52).
+        AiFixError,
     ]
 );
 
@@ -2073,6 +2077,31 @@ pub const COMMANDS: &[Command] = &[
             "values"
         ],
         AiAskAboutSelection
+    ),
+    // K52: a field at the cursor, the proposal as a diff to accept or reject.
+    command!(
+        "ai_ask_here",
+        "AI: Ask Here…",
+        "AI assistant",
+        ["secondary-shift-h"],
+        [
+            "assistant",
+            "llm",
+            "inline",
+            "edit",
+            "change",
+            "diff",
+            "ollama"
+        ],
+        AiAskHere
+    ),
+    command!(
+        "ai_fix_error",
+        "AI: Fix Error",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "fix", "correct", "diff", "ollama"],
+        AiFixError
     ),
     command!(
         "close_tab",

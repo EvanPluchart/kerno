@@ -1419,3 +1419,13 @@ Still open (for the owner):
 - Tests: `ai::ask::tests` (8), `ai_view::ask::tests` (2), `ui_tests/ai_ask.rs` (7: PostgreSQL, MySQL, MariaDB,
   SQLite), each seen failing with a one-line mutation; captures `m12-ai-tree-menu`, `m12-ai-explain-table`, `m12-ai-result-menu`,
   `m12-ai-explain-result` (light and dark).
+
+## 2026-11-23 — K52: ask the assistant in the editor, fix an error in one click
+
+- "AI: Ask Here…" (⌘⇧H) opens a field under the statement at the cursor (or the selection, or an empty line);
+  "Fix with AI" under a failed statement's error and beside its mark sends the statement and the error at once.
+  The answer is a diff: the lines it removes tinted in the text, a card of `−` / `+` lines; Accept (⌘↩) is one
+  undo step and runs nothing, Reject (Esc) changes nothing; a further sentence refines it; "Open in the panel"
+  moves the exchange to the tab's conversation (D-121).
+- Tests: `ai::inline::tests` (9), `query::ai_inline::tests` (3), `theme::tests::a_proposals_lines_read_on_their_tints`,
+  `ui_tests::ai_inline` (10, the stand-in endpoint, the PostgreSQL fixture read only).

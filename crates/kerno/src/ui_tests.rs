@@ -42,6 +42,7 @@ mod ai;
 mod ai_ask;
 mod ai_chat;
 mod ai_endpoints;
+mod ai_inline;
 mod alter_form;
 mod backup_simple;
 mod brackets;

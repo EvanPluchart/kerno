@@ -1,6 +1,7 @@
 //! Query tabs: the editor, the connection a tab runs on, running statements
 //! and showing what they return.
 
+pub mod ai_inline;
 mod comment;
 pub mod completion;
 pub mod distinct;

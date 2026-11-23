@@ -361,6 +361,9 @@ pub struct ResultPane {
     /// The connection and database it was read on: its changes are
     /// applied there or nowhere.
     place: Option<(String, Option<String>)>,
+    /// The bytes of the editor's text a statement the server refused was read from, for "Fix
+    /// with AI" (K52); `None` for other outcomes, and when it did not come from the editor.
+    source: Option<std::ops::Range<usize>>,
     /// The grid's selection and double click; dropped with the pane.
     _grid_events: Option<Subscription>,
     /// Finds out whether its rows take changes; dropped with the pane.
@@ -634,6 +637,10 @@ pub struct QueryTab {
     script: Option<ScriptRun>,
     /// The AI assistant's panel at the side, while open (J17).
     ai: Option<Entity<crate::ai_view::AiPanel>>,
+    /// The field asking the assistant at a place of the editor, and its proposal (K52).
+    inline: Option<Entity<super::ai_inline::AiInline>>,
+    /// The failed result whose error is marked in the editor, and where (K52's chip).
+    error_fix: Option<(u64, usize)>,
     /// The value of the selected cell beside the results, while shown (K17).
     value_panel: Option<Entity<ValuePanel>>,
     /// Vim mode (J19), only while Settings ▸ Editor turns it on.
@@ -712,6 +719,10 @@ impl QueryTab {
                 // A run's marks describe the text it ran: an edit ends them,
                 // and a run still going marks nothing more (K37).
                 this.trace.borrow_mut().clear();
+                // The error's place moved: "Fix with AI" stays in the result (K52).
+                if this.error_fix.take().is_some() {
+                    cx.notify();
+                }
                 if let Some(vim) = this.vim.as_mut() {
                     vim.text_changed();
                 }
@@ -837,6 +848,8 @@ impl QueryTab {
             tx_lost: false,
             script: None,
             ai: None,
+            inline: None,
+            error_fix: None,
             value_panel: None,
             vim: None,
             _subscriptions: vec![subscription, edits, cursor_moves, settings, filtering],
@@ -2120,6 +2133,12 @@ impl QueryTab {
     /// Asks the server to cancel the running statement. It ends with the
     /// server's cancellation error and keeps the rows that arrived.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        // A request to the assistant asked in the editor stops first (K52).
+        if let Some(inline) = self.inline.clone()
+            && inline.update(cx, |inline, cx| inline.stop(cx))
+        {
+            return;
+        }
         // A count or a list of values: its statement is cancelled, and it
         // says so when it ends.
         if let Some(side) = &self.side {
@@ -2671,6 +2690,7 @@ impl QueryTab {
             editable: None,
             apply_error: None,
             place: self.place(),
+            source: None,
             _grid_events: None,
             _lookup: None,
         });
@@ -3107,7 +3127,7 @@ impl QueryTab {
                                 } else {
                                     (HistoryStatus::Error, Some(failure.clone()))
                                 });
-                                this.push_pane(
+                                let id = this.push_pane(
                                     statement.sql.clone(),
                                     if cancelled {
                                         Outcome::Cancelled
@@ -3117,6 +3137,15 @@ impl QueryTab {
                                     None,
                                     Some(started.elapsed()),
                                 );
+                                // What the server refused, where the editor has it (K52).
+                                if !cancelled
+                                    && !lost
+                                    && let Some(pane) = this.pane_mut(id)
+                                {
+                                    // Not an EXPLAIN's: its error is of the wrapped text.
+                                    pane.source =
+                                        statement.place.clone().filter(|_| explain.is_none());
+                                }
                                 this.active_result = this.results.len() - 1;
                                 if lost {
                                     this.lost_connection(window, cx);
@@ -3383,13 +3412,17 @@ impl QueryTab {
             .map_or(statement.len() - at, |(end, _)| end)
             .max(statement[at..].chars().next().map_or(0, char::len_utf8));
         let message = SharedString::from(message.to_string());
-        self.editor.update(cx, |editor, cx| {
+        // "Fix with AI" beside the mark, for the failed result last added (K52).
+        let failed = (self.results.last())
+            .filter(|pane| pane.source.is_some() && matches!(pane.outcome, Outcome::Failed(_)))
+            .map(|pane| pane.id);
+        let marked = self.editor.update(cx, |editor, cx| {
             let text = editor.text().to_string();
             let (start, end) = (origin + at, (origin + at + word).min(text.len()));
             // The text changed since the run started, or the statement sent
             // is not the one written (parameters bound): nothing sure to mark.
             if text.get(origin..origin + statement.len()) != Some(statement) {
-                return;
+                return false;
             }
             let range = position_of(&text, start)..position_of(&text, end);
             if let Some(diagnostics) = editor.diagnostics_mut() {
@@ -3400,11 +3433,14 @@ impl QueryTab {
                 );
             }
             cx.notify();
+            true
         });
         self.error_marked = true;
+        self.error_fix = failed.filter(|_| marked).map(|id| (id, origin + at));
     }
 
     fn clear_error_mark(&mut self, cx: &mut Context<Self>) {
+        self.error_fix = None;
         if std::mem::take(&mut self.error_marked) {
             self.editor.update(cx, |editor, cx| {
                 if let Some(diagnostics) = editor.diagnostics_mut() {
@@ -3608,6 +3644,7 @@ impl QueryTab {
                 cx,
             );
             let menu = crate::ai_view::editor_entries(menu, window, cx);
+            let menu = super::ai_inline::editor_entries(menu, cx);
             tabs::fit_window(menu, window)
         }
     }
@@ -5977,6 +6014,10 @@ impl QueryTab {
     /// Another tab is on screen: auto-refresh stops.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.stop_auto_refresh(Some("the tab was hidden"), cx);
+        // A request asked in the editor is closed; its answer is not waited for (K52).
+        if let Some(inline) = self.inline.clone() {
+            inline.update(cx, |inline, cx| inline.left(cx));
+        }
     }
 
     /// One tick of auto-refresh: whether it goes on.
@@ -6589,16 +6630,40 @@ impl QueryTab {
                     },
                 ))
                 .when(AppState::get(cx).settings.ai.enabled, |error| {
+                    let id = pane.id;
                     error.child(
-                        div().pt_1().child(
-                            Button::new("ai-explain-error")
-                                .outline()
-                                .xsmall()
-                                .label("Explain error with AI…")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.ai_request(crate::ai_view::Kind::ExplainError, window, cx)
-                                })),
-                        ),
+                        h_flex()
+                            .pt_1()
+                            .gap_1()
+                            // K52: the fix as a diff on the statement, in the editor.
+                            .when(pane.source.is_some(), |row| {
+                                row.child(
+                                    Button::new("ai-fix-error")
+                                        .primary()
+                                        .xsmall()
+                                        .label("Fix with AI")
+                                        .tooltip(
+                                            "Proposes a corrected statement as a diff in the \
+                                             editor; runs nothing",
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.fix_with_ai(Some(id), window, cx)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("ai-explain-error")
+                                    .outline()
+                                    .xsmall()
+                                    .label("Explain error with AI…")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ai_request(
+                                            crate::ai_view::Kind::ExplainError,
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            ),
                     )
                 })
                 .into_any_element(),
@@ -7979,7 +8044,13 @@ impl Render for QueryTab {
             // Where the last run stands, in the margin (K37): after the
             // editor, so that its layout of this frame is the one read.
             .relative()
-            .child(run_marks::overlay(self.editor.clone(), self.trace.clone()));
+            .child(run_marks::overlay(self.editor.clone(), self.trace.clone()))
+            // The assistant asked at a place, and "Fix with AI" by an error's mark (K52).
+            .children(
+                (self.inline.as_ref())
+                    .map(|inline| super::ai_inline::overlay(&self.editor, inline, cx)),
+            )
+            .children(self.fix_chip(cx));
         // Vim mode (J19) puts its key handlers and command field around
         // it, only while it is on.
         let editor = if self.vim.is_some() {
@@ -8084,5 +8155,173 @@ impl Render for QueryTab {
                     .into_any_element(),
                 None => area.into_any_element(),
             })
+    }
+}
+
+// K52 (D-121): the assistant asked at a place of the editor, and a failed statement fixed; the
+// proposal is a diff drawn by `super::ai_inline`, never written before Accept.
+impl QueryTab {
+    /// Whether the assistant is on; off, says how to turn it on.
+    fn assistant_on(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let on = AppState::get(cx).settings.ai.enabled;
+        if !on {
+            window.push_notification(
+                Notification::warning(SharedString::from(crate::ai_view::OFF_NOTICE)),
+                cx,
+            );
+        }
+        on
+    }
+
+    /// "AI: Ask Here…": a field under the selection, else the statement at the cursor, else the
+    /// cursor's empty line (nothing of the editor is sent then). A field already open takes the
+    /// keyboard again.
+    pub fn ask_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.assistant_on(window, cx) {
+            return;
+        }
+        if let Some(inline) = self.inline.clone()
+            && !inline.read(cx).stale()
+        {
+            inline.update(cx, |inline, cx| inline.focus(window, cx));
+            return;
+        }
+        let range = self.ask_place(cx);
+        self.open_inline(range, super::ai_inline::Subject::Ask, window, cx);
+    }
+
+    /// What "Ask Here" is about: the selection; on an empty line, the cursor alone; else the
+    /// statement at the cursor.
+    fn ask_place(&self, cx: &App) -> std::ops::Range<usize> {
+        let editor = self.editor.read(cx);
+        let text = editor.text().to_string();
+        let (cursor, selection) = (editor.cursor().min(text.len()), editor.selected_range());
+        if text
+            .get(selection.clone())
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return selection;
+        }
+        let start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
+        let end = text[cursor..]
+            .find('\n')
+            .map_or(text.len(), |at| cursor + at);
+        if text[start..end].trim().is_empty() {
+            return cursor..cursor;
+        }
+        (self.ai_statement(cx))
+            .map(|(_, range)| range)
+            .unwrap_or(cursor..cursor)
+    }
+
+    /// "Fix with AI" on the failed result `pane` (else the one marked in the editor, else the
+    /// result on screen): the statement and the server's error are sent at once, the fix comes
+    /// back as a diff on the statement. Nothing runs.
+    pub fn fix_with_ai(&mut self, pane: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.assistant_on(window, cx) {
+            return;
+        }
+        let say = |text: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            window.push_notification(Notification::warning(SharedString::from(text)), cx)
+        };
+        let id = pane
+            .or(self.error_fix.map(|(id, _)| id))
+            .or(self.results.get(self.active_result).map(|pane| pane.id));
+        let Some(pane) = id.and_then(|id| self.results.iter().find(|pane| pane.id == id)) else {
+            return say("No failed statement on screen to fix.", window, cx);
+        };
+        let Outcome::Failed(failure) = &pane.outcome else {
+            return say("No failed statement on screen to fix.", window, cx);
+        };
+        let Some(source) = pane.source.clone() else {
+            return say(
+                "This error is not of a statement read from the editor: Fix with AI works on \
+                 the editor's statements.",
+                window,
+                cx,
+            );
+        };
+        let text = self.editor.read(cx).text().to_string();
+        let mut found = text
+            .match_indices(pane.statement.as_str())
+            .map(|(at, _)| at);
+        let range = if kerno_core::ai::inline::still_there(&text, &source, &pane.statement) {
+            source
+        } else {
+            // Moved by an edit before it, written once in the text: there.
+            match (found.next(), found.next()) {
+                (Some(at), None) => at..at + pane.statement.len(),
+                _ => {
+                    return say(
+                        "The failed statement is no longer in the editor as it ran: run it \
+                         again, then Fix with AI.",
+                        window,
+                        cx,
+                    );
+                }
+            }
+        };
+        let subject = super::ai_inline::Subject::Fix {
+            error: failure.described().to_string(),
+            position: failure.position,
+        };
+        self.open_inline(range, subject, window, cx);
+    }
+
+    fn open_inline(
+        &mut self,
+        range: std::ops::Range<usize>,
+        subject: super::ai_inline::Subject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(old) = self.inline.take() {
+            old.update(cx, |old, cx| old.discard(cx));
+        }
+        let (tab, editor, facts) = (
+            cx.entity().downgrade(),
+            self.editor.clone(),
+            self.ai_facts(cx),
+        );
+        let inline = cx.new(|cx| {
+            super::ai_inline::AiInline::new(tab, editor, facts, range, subject, window, cx)
+        });
+        let closed = cx.subscribe_in(
+            &inline,
+            window,
+            |this: &mut Self, inline, _: &super::ai_inline::InlineEvent, window, cx| {
+                if this.inline.as_ref() == Some(inline) {
+                    this.inline = None;
+                    this.focus_editor(window, cx);
+                    cx.notify();
+                }
+            },
+        );
+        self._subscriptions.push(closed);
+        self.inline = Some(inline);
+        cx.notify();
+    }
+
+    /// "Fix with AI" beside the error's mark in the editor, while the assistant is on and no
+    /// field is open.
+    fn fix_chip(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (id, at) = self.error_fix?;
+        if self.inline.is_some() || !AppState::get(cx).settings.ai.enabled {
+            return None;
+        }
+        let view = cx.entity().downgrade();
+        Some(super::ai_inline::fix_chip(
+            &self.editor,
+            at,
+            move |window, cx| {
+                let _ = view.update(cx, |tab, cx| tab.fix_with_ai(Some(id), window, cx));
+            },
+        ))
+    }
+
+    /// The field asking the assistant at a place, while open; for tests.
+    #[cfg(test)]
+    pub fn ai_inline(&self) -> Option<&Entity<super::ai_inline::AiInline>> {
+        self.inline.as_ref()
     }
 }

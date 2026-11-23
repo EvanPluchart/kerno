@@ -571,6 +571,8 @@ fn menus() -> Vec<Menu> {
                         command("ai_explain_query"),
                         command("ai_explain_plan"),
                         command("ai_explain_error"),
+                        command("ai_ask_here"),
+                        command("ai_fix_error"),
                         // K53: what the AI ▸ menus ask, on the active tab.
                         separator(),
                         command("ai_ask_about_table"),

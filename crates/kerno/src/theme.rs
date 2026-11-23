@@ -984,6 +984,59 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// K52: the lines of a proposal's diff read on their tints, in both themes: the text at 4.5:1
+    /// on a removed or added line of the card (on the background), and on a removed line tinted in
+    /// the editor; the syntax colours there at 3:1, as on a selection.
+    #[test]
+    fn a_proposals_lines_read_on_their_tints() {
+        use crate::query::ai_inline::{ADDED_TINT, MARK_TINT, REMOVED_TINT};
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let tinted = |under: &str, key: &str, amount: f32| {
+                super::mix(hex(under), hex(&theme.colors[key]), f64::from(amount))
+            };
+            let (background, text) = (&theme.colors["background"], &theme.colors["foreground"]);
+            for (key, amount) in [
+                ("danger.background", REMOVED_TINT),
+                ("success.background", ADDED_TINT),
+            ] {
+                let ratio = super::contrast(hex(text), tinted(background, key, amount));
+                println!("{}: text on the card's {key} tint {ratio:.2}:1", theme.name);
+                if ratio < 4.5 {
+                    failures.push(format!("{}: card {key} {ratio:.2}", theme.name));
+                }
+            }
+            let fill = tinted(
+                &theme.editor("editor.background"),
+                "danger.background",
+                MARK_TINT,
+            );
+            let mut texts = theme.syntax();
+            texts.insert(
+                "editor.foreground".into(),
+                theme.editor("editor.foreground"),
+            );
+            for (kind, color) in &texts {
+                let floor = if kind == "editor.foreground" {
+                    4.5
+                } else {
+                    3.0
+                };
+                let ratio = super::contrast(hex(color), fill);
+                if kind == "editor.foreground" || ratio < floor {
+                    println!("{}: {kind} on the removed lines {ratio:.2}:1", theme.name);
+                }
+                if ratio < floor {
+                    failures.push(format!(
+                        "{}: {kind} on the removed lines {ratio:.2}",
+                        theme.name
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Selected text in the editor and the inputs is seen at a glance too
     /// ([`SEEN`] from the editor and from its active line; it was 1.07:1 in
     /// light, 1.20:1 in dark), the text reads on it (4.5:1) and every syntax

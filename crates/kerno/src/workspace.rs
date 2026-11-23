@@ -6660,6 +6660,19 @@ impl Workspace {
                 crate::ai_view::command(crate::ai_view::Kind::ExplainError, tab, window, cx)
             }),
         )
+        // K52: in the editor of the active query tab, else said.
+        .on_action(cx.listener(|this, _: &actions::AiAskHere, window, cx| {
+            match this.active_query_tab().cloned() {
+                Some(tab) => tab.update(cx, |tab, cx| tab.ask_here(window, cx)),
+                None => crate::query::ai_inline::without_tab(window, cx),
+            }
+        }))
+        .on_action(cx.listener(|this, _: &actions::AiFixError, window, cx| {
+            match this.active_query_tab().cloned() {
+                Some(tab) => tab.update(cx, |tab, cx| tab.fix_with_ai(None, window, cx)),
+                None => crate::query::ai_inline::without_tab(window, cx),
+            }
+        }))
         .on_action(
             cx.listener(|this, _: &actions::SelectAllOccurrences, window, cx| {
                 if let Some(tab) = this.active_query_tab().cloned() {

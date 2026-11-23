@@ -140,6 +140,11 @@ struct SentLog(Vec<Sent>);
 
 impl Global for SentLog {}
 
+/// Adds a request sent from elsewhere (K52: the editor's field) to the session's log.
+pub fn record_sent(sent: Sent, cx: &mut App) {
+    cx.default_global::<SentLog>().0.push(sent);
+}
+
 /// The requests the assistant sent during this run, the latest last.
 pub fn sent_log(cx: &App) -> Vec<Sent> {
     cx.try_global::<SentLog>()
@@ -557,6 +562,21 @@ impl AiPanel {
         self.stage = Stage::Ready;
         self.entries.clear();
         self.prepare(Draft::default(), window, cx);
+    }
+
+    /// K52: an exchange begun in the editor, moved here ("Open in the panel"): each question as
+    /// the user typed it and as it was sent, with its whole answer.
+    pub fn adopt(&mut self, exchange: Vec<(String, String, String)>, cx: &mut Context<Self>) {
+        for (shown, sent, answer) in exchange {
+            let chips = vec!["Asked in the editor".to_string()];
+            self.entries.push(Entry::Asked { shown, chips, sent });
+            self.entries.push(Entry::Answer {
+                text: answer,
+                done: true,
+            });
+        }
+        self.thread.scroll_to_bottom();
+        self.refresh(cx);
     }
 
     /// Whether a key is stored for the endpoint, for the preview's `Authorization` line.

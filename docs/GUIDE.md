@@ -311,6 +311,33 @@ answer only. **Insert** and **Replace** put a block's SQL in the editor (selecte
 it yourself, through the usual confirmations, read-only and production rules. An answer may take up to 5 minutes (a reasoning model on a server of your network thinks
 before it answers); **Stop** closes the request at once.
 
+### Ask in the editor, fix an error in one click
+
+**AI: Ask Here…** (⌘⇧H, Ctrl+Shift+H on Linux; also in the editor's right-click menu, the palette and Query ▸
+AI Assistant) opens a small field under the selection, else under the statement at the cursor. Type what you
+want ("only the orders of this year") and press Enter: the request holds the schema context above, that SQL
+as "the SQL to change" and your sentence; never rows. On an empty line nothing of the editor is sent: the
+assistant writes from your sentence alone, and its SQL goes on that line.
+
+The answer comes back as a diff: the lines it would remove are tinted in your text, and a card under them
+shows the proposal line by line, `−` before a removed line, `+` before an added one. Nothing of your text
+changes until **Accept** (⌘↩ in the field, Ctrl+Enter on Linux), which puts the proposal in place as one undo
+step and selects it; nothing runs. **Reject** (Esc) leaves the text, the cursor, the selection and the undo
+history as they were. While the card is shown, ⌘↩ in the editor itself runs the editor's own text, never the
+proposal. Type a further sentence in the same field ("no, by month") and Enter: it goes with the exchange so
+far and the diff is replaced. **Open in the panel** carries the exchange on in the tab's conversation. An
+answer without SQL is shown as its text, with nothing to accept.
+
+**Fix with AI**, under a failed statement's error and beside the error's mark in the editor (or **AI: Fix
+Error** in the palette), sends that statement and what the error view shows (message, code, detail, hint, the
+character the server pointed at) at once; the corrected statement comes back as the same diff on that
+statement. It never runs it. **Explain error with AI…** is still there, in the panel.
+
+While a request waits, the place it is about is framed and the card says "Asking …" with **Stop** (or ⌘.).
+An edit that changes or moves that place, or leaving the tab, closes the request and its answer is never
+shown; the card says so. **What is sent…** in the card shows the exact body; every request joins **What was
+sent** in Settings → AI.
+
 ## Vim mode
 
 Off by default. Turn it on with **Settings → Editor ▸ Vim mode** or the command **Toggle Vim Mode** (palette,
