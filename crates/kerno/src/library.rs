@@ -31,6 +31,32 @@ pub enum Shelf {
     Saved,
 }
 
+/// The saved queries, read off the UI thread: what a connection's menu
+/// lists (K38), which is built while the right-click waits. Read again
+/// after every change to the saved queries.
+#[derive(Default)]
+pub struct SavedQueries(pub Vec<SavedQuery>);
+
+impl gpui_kit::Global for SavedQueries {}
+
+impl SavedQueries {
+    /// The saved queries as last read.
+    pub fn get(cx: &App) -> &[SavedQuery] {
+        cx.try_global::<Self>().map_or(&[], |queries| &queries.0)
+    }
+
+    /// Reads them again from the store.
+    pub fn reload(cx: &mut App) {
+        let storage = AppState::get(cx).storage.clone();
+        let reading = bridge::spawn_blocking(cx, move || storage.saved_queries());
+        cx.spawn(async move |cx| match reading.await {
+            Ok(queries) => cx.update(|cx| cx.set_global(Self(queries))),
+            Err(error) => tracing::warn!(%error, "could not read the saved queries"),
+        })
+        .detach();
+    }
+}
+
 /// Opens the chosen query in a tab: title, text, where it runs.
 type Open = dyn Fn(String, String, Option<Target>, &mut Window, &mut App);
 
@@ -159,7 +185,10 @@ impl Library {
         });
         cx.spawn(async move |this, cx| {
             let _ = removing.await;
-            let _ = this.update(cx, |this, cx| this.reload(cx));
+            let _ = this.update(cx, |this, cx| {
+                this.reload(cx);
+                SavedQueries::reload(cx);
+            });
         })
         .detach();
     }
@@ -375,7 +404,7 @@ impl Render for Library {
                     .when(self.connection.is_some(), |this| {
                         this.child(
                             Checkbox::new("library-only-connection")
-                                .label("This tab's connection only")
+                                .label("This connection only")
                                 .checked(self.only_connection)
                                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                     this.only_connection = *checked;

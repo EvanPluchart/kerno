@@ -4,6 +4,7 @@
 //! database navigator, are defined and carried out here.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -19,7 +20,7 @@ use gpui_kit::{
     Subscription, TestSupportExt as _, Window, div, px,
 };
 use kerno_core::config::{connection_url, in_folder, last_folder_name, parent_folder};
-use kerno_core::storage::SavedConnection;
+use kerno_core::storage::{SavedConnection, SavedQuery};
 
 use crate::actions::NewConnection;
 use crate::connections::dialog::ConnectionDialog;
@@ -82,6 +83,24 @@ pub enum SidebarAction {
     /// Stores a connection opened from a URL (`kerno <url>`), through the
     /// connection dialog.
     SaveConnection,
+    /// Opens one of the connection's SQL scripts ▸ (K38) on it.
+    OpenScript(Script),
+    /// Lists every SQL script of the connection, to find one by its name.
+    AllScripts,
+    /// Asks for a `.sql` file and opens it on the connection.
+    OpenSqlFileHere,
+    /// The saved queries view, on the connection's.
+    SavedQueriesHere,
+}
+
+/// One of a connection's SQL scripts (K38).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Script {
+    /// A saved query of the connection, by id.
+    Saved { id: i64, name: String },
+    /// A `.sql` file last used on it, and the name that tells it from the
+    /// other files listed.
+    File { path: PathBuf, name: String },
 }
 
 impl SidebarAction {
@@ -115,6 +134,12 @@ impl SidebarAction {
             Self::CopyUrl => "Connection URL",
             Self::CopyHost => "Host",
             Self::SaveConnection => "Save connection…",
+            Self::OpenScript(Script::Saved { name, .. } | Script::File { name, .. }) => {
+                return name.clone();
+            }
+            Self::AllScripts => "All scripts…",
+            Self::OpenSqlFileHere => "Open SQL file…",
+            Self::SavedQueriesHere => "Saved queries…",
         }
         .to_string()
     }
@@ -125,7 +150,9 @@ impl SidebarAction {
 pub enum Entry {
     /// An action, and why it cannot be used now when it cannot.
     Item(SidebarAction, Option<&'static str>),
-    Submenu(&'static str, Vec<Entry>),
+    Submenu(SharedString, Vec<Entry>),
+    /// A line that says something and does nothing.
+    Note(&'static str),
     Separator,
 }
 
@@ -204,19 +231,20 @@ pub fn menu(
                 enabled(ReadOnly(checked)),
                 Separator,
                 enabled(NewSqlEditor),
-                Submenu(TOOLS, Vec::new()),
+                Submenu(SCRIPTS.into(), Vec::new()),
+                Submenu(TOOLS.into(), Vec::new()),
                 Separator,
                 enabled(Edit),
                 enabled(Duplicate),
                 enabled(Rename),
-                Submenu("Move to folder", moves),
+                Submenu("Move to folder".into(), moves),
                 Separator,
                 enabled(Delete),
                 Separator,
                 Item(Refresh, not_connected),
                 Separator,
                 Submenu(
-                    "Copy",
+                    "Copy".into(),
                     vec![enabled(CopyName), enabled(CopyUrl), enabled(CopyHost)],
                 ),
             ]
@@ -245,9 +273,102 @@ pub fn with_tools(entries: Vec<Entry>, tools: ToolGroups) -> Vec<Entry> {
     entries
         .into_iter()
         .filter_map(|entry| match entry {
-            Entry::Submenu(TOOLS, _) if items.is_empty() => None,
-            Entry::Submenu(TOOLS, _) => Some(Entry::Submenu(TOOLS, items.clone())),
+            Entry::Submenu(label, _) if label == TOOLS && items.is_empty() => None,
+            Entry::Submenu(label, _) if label == TOOLS => {
+                Some(Entry::Submenu(label, items.clone()))
+            }
             entry => Some(entry),
+        })
+        .collect()
+}
+
+/// The label of a connection's SQL scripts ▸ (K38).
+pub const SCRIPTS: &str = "SQL scripts";
+
+/// How many saved queries SQL scripts ▸ lists: the last saved; "All
+/// scripts…" finds the others.
+pub const MENU_SAVED_QUERIES: usize = 10;
+
+/// `entries` with the connection's SQL scripts ▸ filled: its saved queries
+/// (`saved`, in the store's order: by folder, then name), the last
+/// [`MENU_SAVED_QUERIES`] of them, by folder, then its files (`files`,
+/// the latest first), then the ways to open another.
+pub fn with_scripts(entries: Vec<Entry>, saved: &[SavedQuery], files: &[PathBuf]) -> Vec<Entry> {
+    use Entry::{Item, Note, Separator, Submenu};
+    use SidebarAction::*;
+    let mut ids: Vec<i64> = saved.iter().map(|query| query.id).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.truncate(MENU_SAVED_QUERIES);
+    let mut items: Vec<Entry> = Vec::new();
+    let mut folders: Vec<(String, Vec<Entry>)> = Vec::new();
+    for query in saved.iter().filter(|query| ids.contains(&query.id)) {
+        let item = Item(
+            OpenScript(Script::Saved {
+                id: query.id,
+                name: query.name.clone(),
+            }),
+            None,
+        );
+        match folders.last_mut() {
+            _ if query.folder.is_empty() => items.push(item),
+            Some((folder, inside)) if *folder == query.folder => inside.push(item),
+            _ => folders.push((query.folder.clone(), vec![item])),
+        }
+    }
+    let mut list: Vec<Entry> = (folders.into_iter())
+        .map(|(folder, inside)| Submenu(folder.into(), inside))
+        .chain(items)
+        .collect();
+    if !list.is_empty() && !files.is_empty() {
+        list.push(Separator);
+    }
+    list.extend(files.iter().zip(file_names(files)).map(|(path, name)| {
+        Item(
+            OpenScript(Script::File {
+                path: path.clone(),
+                name,
+            }),
+            None,
+        )
+    }));
+    if list.is_empty() {
+        list.push(Note("No SQL scripts yet"));
+    }
+    list.push(Separator);
+    if saved.len() > MENU_SAVED_QUERIES {
+        list.push(Item(AllScripts, None));
+    }
+    list.extend([Item(OpenSqlFileHere, None), Item(SavedQueriesHere, None)]);
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            Submenu(label, _) if label == SCRIPTS => Submenu(label, list.clone()),
+            entry => entry,
+        })
+        .collect()
+}
+
+/// The name each file is listed under: its own, and its folder after it
+/// when another file listed has the same name.
+pub fn file_names(files: &[PathBuf]) -> Vec<String> {
+    let name = |path: &PathBuf| {
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    };
+    files
+        .iter()
+        .map(|path| {
+            let shared = files
+                .iter()
+                .filter(|other| name(other) == name(path))
+                .count()
+                > 1;
+            match path.parent() {
+                Some(folder) if shared => format!("{} — {}", name(path), folder.display()),
+                _ => name(path),
+            }
         })
         .collect()
 }
@@ -268,6 +389,15 @@ pub enum SidebarEvent {
     Reconnect(String),
     /// Save this read-only flag on the connection, the same way.
     SetReadOnly(String, bool),
+    /// Open this script in a SQL editor on this connection, connecting it
+    /// first when it is closed (K38).
+    OpenScript(String, Script),
+    /// List every SQL script of this connection, to pick one.
+    AllScripts(String),
+    /// Ask for a `.sql` file and open it on this connection.
+    OpenSqlFile(String),
+    /// Show the saved queries, on this connection's.
+    SavedQueries(String),
 }
 
 /// A connection row being dragged onto a folder.
@@ -398,10 +528,12 @@ impl Sidebar {
         };
         let connected = matches!(status, Status::Connected { .. });
         let tools = crate::navigator::actions::tool_entries(None, engine, &[]);
-        with_tools(
+        let entries = with_tools(
             entries,
             crate::navigator::actions::tools_now(tools, connected, checked),
-        )
+        );
+        let (saved, files) = scripts_of(id, cx);
+        with_scripts(entries, &saved, &files)
     }
 
     /// The connection copied last, while it is still saved.
@@ -557,6 +689,12 @@ impl Sidebar {
             }),
             (Subject::Connection(_), NewSqlEditor) => cx.emit(SidebarEvent::NewEditor(id)),
             (Subject::Connection(_), Tool(entry)) => cx.emit(SidebarEvent::Tool(id, entry)),
+            (Subject::Connection(_), OpenScript(script)) => {
+                cx.emit(SidebarEvent::OpenScript(id, script))
+            }
+            (Subject::Connection(_), AllScripts) => cx.emit(SidebarEvent::AllScripts(id)),
+            (Subject::Connection(_), OpenSqlFileHere) => cx.emit(SidebarEvent::OpenSqlFile(id)),
+            (Subject::Connection(_), SavedQueriesHere) => cx.emit(SidebarEvent::SavedQueries(id)),
             (Subject::Connection(_), Edit) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), SaveConnection) => Self::edit(connections, id, window, cx),
             (Subject::Connection(_), Duplicate) => {
@@ -709,6 +847,7 @@ impl Sidebar {
         for entry in entries {
             menu = match entry {
                 Entry::Separator => menu.separator(),
+                Entry::Note(text) => menu.item(PopupMenuItem::new(text).disabled(true)),
                 Entry::Submenu(label, entries) => {
                     let (sidebar, subject) = (sidebar.clone(), subject.clone());
                     let submenu = PopupMenu::build(window, cx, move |menu, window, cx| {
@@ -754,6 +893,20 @@ impl Sidebar {
             Self::fill_menu(sidebar.clone(), subject.clone(), entries, menu, window, cx)
         }
     }
+}
+
+/// The SQL scripts of the connection `id` (K38): its own saved queries
+/// (not those usable with any connection: the saved queries view has
+/// them), in the store's order, and its files, the latest first.
+pub fn scripts_of(id: &str, cx: &App) -> (Vec<SavedQuery>, Vec<PathBuf>) {
+    let saved = (crate::library::SavedQueries::get(cx).iter())
+        .filter(|query| query.connection_id.as_deref() == Some(id))
+        .cloned()
+        .collect();
+    let files = (AppState::get(cx).settings.connection_scripts.get(id))
+        .cloned()
+        .unwrap_or_default();
+    (saved, files)
 }
 
 /// Opens or closes a folder of the sidebar; remembered in the settings.
@@ -922,6 +1075,7 @@ mod tests {
                 Entry::Submenu(label, entries) => {
                     format!("{label} ▸ [{}]", labels(entries).join(", "))
                 }
+                Entry::Note(text) => format!("{text} (disabled)"),
                 Entry::Separator => "—".into(),
             })
             .collect()
@@ -1031,6 +1185,7 @@ mod tests {
                 "Read-only",
                 "—",
                 "New SQL editor",
+                "SQL scripts ▸ []",
                 "Tools ▸ []",
                 "—",
                 "Edit…",
@@ -1063,9 +1218,9 @@ mod tests {
         assert_eq!(open[3], "Disconnect others");
         // Administration and Lock Manager moved under Tools ▸, filled by
         // `with_tools` (see `a_connection_s_tools_say_what_its_state_allows`).
-        assert_eq!(open[7], "Tools ▸ []");
-        assert_eq!(open[16], "Refresh");
-        assert!(open[12].starts_with("Move to folder ▸ [No folder (already there), Work,"));
+        assert_eq!(open[8], "Tools ▸ []");
+        assert_eq!(open[17], "Refresh");
+        assert!(open[13].starts_with("Move to folder ▸ [No folder (already there), Work,"));
         // The read-only entry carries the flag as it is, checked.
         let entries = menu(
             &subject,

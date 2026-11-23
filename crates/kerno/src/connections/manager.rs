@@ -484,6 +484,12 @@ impl Connections {
             let outcome = deleting.await;
             let _ = this.update(cx, |this, cx| match outcome {
                 Ok(()) => {
+                    // Its saved queries went with it; its files leave its
+                    // list (K38).
+                    AppState::update_settings(cx, |settings| {
+                        settings.forget_connection(&deleted_id)
+                    });
+                    crate::library::SavedQueries::reload(cx);
                     this.saved.retain(|connection| connection.id != deleted_id);
                     this.runtime.remove(&deleted_id);
                     this.unsaved.remove(&deleted_id);

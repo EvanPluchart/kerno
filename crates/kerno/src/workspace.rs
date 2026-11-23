@@ -65,7 +65,7 @@ use crate::data::tab::{DataTab, DataTabEvent};
 use crate::erd_tab::{DiagramTab, DiagramTabEvent};
 use crate::extensions_tab::{ExtensionsTab, ExtensionsTabEvent};
 use crate::import_dialog::{self, ImportDialog};
-use crate::library::{self, Library, Shelf};
+use crate::library::{self, Library, SavedQueries, Shelf};
 use crate::navigator::actions::Action as TreeAction;
 use crate::navigator::actions::ToolEntry;
 use crate::navigator::actions::{FilterAction, Template};
@@ -73,7 +73,7 @@ use crate::navigator::view::{Navigator, NavigatorEvent};
 use crate::query::grid::{Grid, GridAction, Panel, RowMove};
 use crate::query::tab::{QueryTab, QueryTabEvent, Scope, TabStatus, duration_text};
 use crate::settings::TabLayout;
-use crate::sidebar::{Sidebar, SidebarAction, SidebarEvent, Subject};
+use crate::sidebar::{Script, Sidebar, SidebarAction, SidebarEvent, Subject};
 use crate::state::{ACTIVE_TAB_KEY, AppState, TAB_LAYOUT_KEY, WINDOW_KEY};
 use crate::structure::editor::{TableEditor, TableEditorEvent};
 use crate::structure::tab::{PROPERTIES_SECTION, StructureTab, StructureTabEvent};
@@ -535,9 +535,9 @@ pub struct Workspace {
     /// to stop moving (K28).
     window_placement: Option<WindowPlacement>,
     pending_window_save: Option<Task<()>>,
-    /// A connection being opened for "New SQL editor": its tab opens once
-    /// it is connected.
-    pending_editor: Option<String>,
+    /// A connection being opened for "New SQL editor" or one of its SQL
+    /// scripts (K38): what opens once it is connected.
+    pending_editor: Option<(String, WhenConnected)>,
     /// Where the active query tab runs, written on each frame for the
     /// schema tree's "Set as default for this tab".
     tab_target: Rc<RefCell<Option<Target>>>,
@@ -655,6 +655,7 @@ impl Workspace {
             }
         });
 
+        SavedQueries::reload(cx);
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
             connections,
@@ -2497,19 +2498,106 @@ impl Workspace {
         }
     }
 
-    /// A new query tab on the connection `id`: at once when it is connected,
-    /// else once it is (with its prompts), and none when it is not.
+    /// A new query tab on the connection `id`.
     fn new_editor_on(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = connection_target(id);
+        self.when_connected(id, window, cx, move |this, window, cx| {
+            this.new_query_on(Some(target), window, cx)
+        });
+    }
+
+    /// Does `then` on the connection `id`: at once when it is connected,
+    /// else once it is (with its prompts), and never when it is not (its
+    /// failure is said in plain words, as any connect's).
+    fn when_connected(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         if matches!(
             self.connections.read(cx).status(id),
             Status::Connected { .. }
         ) {
-            self.new_query_on(Some(connection_target(id)), window, cx);
+            then(self, window, cx);
         } else {
-            self.pending_editor = Some(id.to_string());
+            self.pending_editor = Some((id.to_string(), Box::new(then)));
             self.connections
                 .update(cx, |connections, cx| connections.connect(id, cx));
         }
+    }
+
+    /// Opens one of the SQL scripts of the connection `id` on it (K38).
+    pub(crate) fn open_script(
+        &mut self,
+        id: &str,
+        script: Script,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match script {
+            Script::Saved { id: query, .. } => self.open_saved_query_on(id, query, window, cx),
+            Script::File { path, .. } => {
+                self.open_sql_file_on(path, Some(id.to_string()), window, cx)
+            }
+        }
+    }
+
+    /// Opens the saved query `query` on the connection `id` (K38): the tab
+    /// that holds it already (not a file's, on that connection, with its
+    /// name or its text: a tab saved as a query keeps its own title) is
+    /// shown instead.
+    fn open_saved_query_on(
+        &mut self,
+        id: &str,
+        query: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = (SavedQueries::get(cx).iter())
+            .find(|saved| saved.id == query)
+            .cloned();
+        let Some(query) = found else {
+            window.push_notification(Notification::warning("This saved query was deleted."), cx);
+            return;
+        };
+        let open = self.tabs.iter().position(|tab| {
+            tab.query().is_some_and(|tab| {
+                let tab = tab.read(cx);
+                tab.file().is_none()
+                    && tab.connection_id() == Some(id)
+                    && (tab.title() == query.name || tab.sql(cx) == query.sql)
+            })
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return;
+        }
+        let target = connection_target(id);
+        self.when_connected(id, window, cx, move |this, window, cx| {
+            this.open_query(query.name, &query.sql, Some(target), window, cx);
+        });
+    }
+
+    /// Asks for a `.sql` file and opens it on the connection `id` (K38).
+    fn open_sql_file_here(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let picking = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picking.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.open_sql_file_on(path, Some(id), window, cx)
+                });
+            }
+        })
+        .detach();
     }
 
     /// Opens an empty "Query N" tab running on `target`.
@@ -2971,6 +3059,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_sql_file_on(path, None, window, cx)
+    }
+
+    /// Opens the file at `path` in a tab of its own: on the connection `on`
+    /// when given (picked in its SQL scripts ▸, K38), connected first, else
+    /// where C6 binds it.
+    pub fn open_sql_file_on(
+        &mut self,
+        path: PathBuf,
+        on: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A file that is already open is shown, not opened twice.
         if let Some(index) = self.tabs.iter().position(|tab| {
             tab.query()
@@ -2992,13 +3093,11 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(Err(size)) => this.ask_large_script(path, size, window, cx),
-                Ok(Ok(sql)) => this.open_script_text(path, &sql, window, cx),
+                Ok(Err(size)) => this.ask_large_script(path, size, on, window, cx),
+                Ok(Ok(sql)) => this.open_script_text(path, &sql, on, window, cx),
                 Err(error) => {
-                    // A recent script that went away leaves the list.
-                    AppState::update_settings(cx, |settings| {
-                        settings.recent_scripts.retain(|recent| *recent != path)
-                    });
+                    // A recent script that went away leaves the lists.
+                    AppState::update_settings(cx, |settings| settings.forget_script(&path));
                     window.push_notification(
                         Notification::error(SharedString::from(format!(
                             "{} could not be opened: {error}",
@@ -3012,15 +3111,40 @@ impl Workspace {
         .detach();
     }
 
-    /// Opens `sql`, read from `path`, in a tab bound to the file (K6's rules for its connection).
+    /// Opens `sql`, read from `path`, in a tab bound to the file: on `on`
+    /// once it is connected, else by K6's rules for its connection. A
+    /// connection the user picked binds even where C6 would only propose
+    /// it, as New SQL editor does (K38, D-111).
     fn open_script_text(
         &mut self,
         path: PathBuf,
         sql: &str,
+        on: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (target, proposed) = self.script_target(&path, cx);
+        let Some(id) = on else {
+            let (target, proposed) = self.script_target(&path, cx);
+            self.open_script_tab(path, sql, target, proposed, window, cx);
+            return;
+        };
+        let (sql, target) = (sql.to_string(), connection_target(&id));
+        self.when_connected(&id, window, cx, move |this, window, cx| {
+            this.open_script_tab(path, &sql, Some(target), None, window, cx)
+        });
+    }
+
+    /// Opens `sql`, read from `path`, in a tab bound to the file, running on
+    /// `target` or proposing `proposed`.
+    fn open_script_tab(
+        &mut self,
+        path: PathBuf,
+        sql: &str,
+        target: Option<Target>,
+        proposed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let connection = target.as_ref().map(|target| target.connection.clone());
         let tab = self.open_query(String::new(), sql, target, window, cx);
         AppState::update_settings(cx, |settings| {
@@ -3040,6 +3164,7 @@ impl Workspace {
         &mut self,
         path: PathBuf,
         size: u64,
+        on: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3055,19 +3180,20 @@ impl Workspace {
         );
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
-            let (workspace, path, text) = (workspace.clone(), path.clone(), text.clone());
+            let (workspace, path, text, on) =
+                (workspace.clone(), path.clone(), text.clone(), on.clone());
             dialog
                 .title(title.clone())
                 .w(px(500.))
                 .on_ok(|_, _, _| false)
                 .content(move |content, _, _| {
                     let answer = |id: &'static str, label: &'static str, open: Option<bool>| {
-                        let (workspace, path) = (workspace.clone(), path.clone());
+                        let (workspace, path, on) = (workspace.clone(), path.clone(), on.clone());
                         Button::new(id).label(label).on_click(move |_, window, cx| {
                             window.close_dialog(cx);
-                            let path = path.clone();
+                            let (path, on) = (path.clone(), on.clone());
                             let _ = workspace.update(cx, |this, cx| match open {
-                                Some(true) => this.open_large_script(path, window, cx),
+                                Some(true) => this.open_large_script(path, on, window, cx),
                                 Some(false) => this.run_large_script(path, window, cx),
                                 None => {}
                             });
@@ -3112,13 +3238,19 @@ impl Workspace {
     }
 
     /// "Open in the editor" for a large file: read and opened as any other.
-    fn open_large_script(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_large_script(
+        &mut self,
+        path: PathBuf,
+        on: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let source = path.clone();
         let reading = bridge::spawn_blocking(cx, move || std::fs::read_to_string(&source));
         cx.spawn_in(window, async move |this, cx| {
             let outcome = reading.await;
             let _ = this.update_in(cx, |this, window, cx| match outcome {
-                Ok(sql) => this.open_script_text(path, &sql, window, cx),
+                Ok(sql) => this.open_script_text(path, &sql, on, window, cx),
                 Err(error) => window.push_notification(
                     Notification::error(SharedString::from(format!(
                         "{} could not be opened: {error}",
@@ -3324,12 +3456,15 @@ impl Workspace {
         cx.spawn_in(window, async move |_, cx| {
             let outcome = saving.await;
             let _ = cx.update(|window, cx| match outcome {
-                Ok(_) => window.push_notification(
-                    Notification::success(SharedString::from(format!(
-                        "Saved “{name}”. Find it under Saved Queries."
-                    ))),
-                    cx,
-                ),
+                Ok(_) => {
+                    SavedQueries::reload(cx);
+                    window.push_notification(
+                        Notification::success(SharedString::from(format!(
+                            "Saved “{name}”. Find it under Saved Queries."
+                        ))),
+                        cx,
+                    )
+                }
                 Err(error) => window.push_notification(
                     Notification::error(SharedString::from(format!(
                         "“{name}” was not saved: {error}"
@@ -4190,6 +4325,28 @@ impl Workspace {
                 self.set_read_only(id.clone(), *read_only, window, cx)
             }
             SidebarEvent::NewEditor(id) => self.new_editor_on(id, window, cx),
+            SidebarEvent::OpenScript(id, script) => {
+                self.open_script(id, script.clone(), window, cx)
+            }
+            SidebarEvent::AllScripts(id) => {
+                crate::quick_open::open_scripts(cx.entity(), id.clone(), window, cx)
+            }
+            SidebarEvent::OpenSqlFile(id) => self.open_sql_file_here(id.clone(), window, cx),
+            SidebarEvent::SavedQueries(id) => {
+                let workspace = cx.entity();
+                Library::open(
+                    Shelf::Saved,
+                    Some(id.clone()),
+                    self.connections.clone(),
+                    window,
+                    cx,
+                    move |title, sql, target, window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.open_query(title, &sql, target, window, cx);
+                        });
+                    },
+                );
+            }
         }
     }
 
@@ -4203,11 +4360,12 @@ impl Workspace {
         match event {
             ConnectionsEvent::ListChanged => self.drop_gone_connections(window, cx),
             ConnectionsEvent::StatusChanged { id } => {
-                if self.pending_editor.as_ref() == Some(id) {
+                if (self.pending_editor.as_ref()).is_some_and(|(pending, _)| pending == id) {
                     match self.connections.read(cx).status(id) {
                         Status::Connected { .. } => {
-                            self.pending_editor = None;
-                            self.new_query_on(Some(connection_target(id)), window, cx);
+                            if let Some((_, then)) = self.pending_editor.take() {
+                                then(self, window, cx);
+                            }
                         }
                         Status::Disconnected | Status::Failed { .. } => self.pending_editor = None,
                         Status::Connecting | Status::WaitingForInput => {}
@@ -6195,6 +6353,16 @@ impl Workspace {
             }),
         )
         .on_action(
+            cx.listener(|this, _: &actions::ConnectionScripts, window, cx| {
+                this.on_selected_connection(SidebarAction::AllScripts, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::OpenSqlFileOnConnection, window, cx| {
+                this.on_selected_connection(SidebarAction::OpenSqlFileHere, window, cx)
+            }),
+        )
+        .on_action(
             cx.listener(|this, _: &actions::DeleteConnection, window, cx| {
                 this.on_selected_connection(SidebarAction::Delete, window, cx)
             }),
@@ -6655,6 +6823,9 @@ pub fn handle_quit(window: AnyWindowHandle, workspace: WeakEntity<Workspace>, cx
 fn reload_tasks(workspace: &WeakEntity<Workspace>, cx: &mut App) {
     let _ = workspace.update(cx, |workspace, cx| workspace.reload_tasks(cx));
 }
+
+/// What opens on a connection once it is connected (K28, K38).
+type WhenConnected = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
 fn connection_target(id: &str) -> Target {
     Target {

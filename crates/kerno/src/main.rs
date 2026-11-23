@@ -471,6 +471,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New Connection…", NewConnection),
                 separator(),
                 MenuItem::action("Open SQL File…", OpenSqlFile),
+                command("open_sql_file_on_connection"),
+                command("connection_scripts"),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::action("Save As…", SaveFileAs),
                 command("revert_file"),

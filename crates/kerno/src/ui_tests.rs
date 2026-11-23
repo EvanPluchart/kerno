@@ -45,6 +45,7 @@ mod backup_simple;
 mod brackets;
 mod compare;
 mod connection_feedback;
+mod connection_scripts;
 mod coverage;
 mod critique;
 mod daily_use;

@@ -127,6 +127,10 @@ gpui_kit::actions!(
         ExplainAnalyze,
         /// Opens a `.sql` file in a tab.
         OpenSqlFile,
+        /// Opens a `.sql` file in a tab on the connection selected in the sidebar (K38).
+        OpenSqlFileOnConnection,
+        /// Lists the SQL scripts of the connection selected in the sidebar, to open one (K38).
+        ConnectionScripts,
         /// Writes the active tab to its file.
         SaveFile,
         /// Writes the active tab to a file chosen now.
@@ -824,6 +828,22 @@ pub const COMMANDS: &[Command] = &[
         ["secondary-o"],
         ["load", "script"],
         OpenSqlFile
+    ),
+    command!(
+        "open_sql_file_on_connection",
+        "Open SQL File on Selected Connection…",
+        "Files",
+        [],
+        ["load", "script", "here"],
+        OpenSqlFileOnConnection
+    ),
+    command!(
+        "connection_scripts",
+        "SQL Scripts of Selected Connection…",
+        "Files",
+        [],
+        ["recent", "files", "saved queries", "open", "script"],
+        ConnectionScripts
     ),
     command!(
         "save_file",

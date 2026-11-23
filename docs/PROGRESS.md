@@ -1218,3 +1218,18 @@ Still open (for the owner):
   updated from pages to loads. Offscreen, with 100,000
   rows of `analytics.big_table` loaded: 7.72 ms a frame scrolling, +29 MiB for 90,000 rows, a load of 10,000
   rows in 50 to 68 ms. Captures of the footer, light and dark.
+
+## 2026-11-23 — K38: a connection's SQL scripts, in its right-click menu
+
+- The owner wants, on a right-click on a connection, every SQL script linked to it "like a small folder". A
+  connection's menu now has SQL scripts ▸ beside New SQL editor: its saved queries (the last ten saved, by
+  folder) then the `.sql` files last used in a tab of it; a click opens one on that connection, connecting it
+  first when it is closed, and shows the tab that already holds it instead of opening it twice. D-111.
+- Each connection keeps its own last ten files in the settings, written where Kerno already linked a file to a
+  connection (opening, saving, pointing its tab at one): a file used with two connections is in both lists;
+  older settings start them from each recent file's last connection; the toolbar's recent list is unchanged.
+- The saved queries are kept in memory, read off the UI thread at start and after each change, so the menu
+  never waits on the store. A file gone since is said, leaves every list and connects nothing.
+- From the keyboard: "SQL Scripts of Selected Connection…" (a picker to type a name) and "Open SQL File on
+  Selected Connection…". A copy starts with no scripts, a deleted connection takes its list with it, and an
+  export of connections carries no path.

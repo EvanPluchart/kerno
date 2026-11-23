@@ -195,6 +195,11 @@ fn sidebar_entry(subject: &Subject, action: &SidebarAction) -> Palette {
         A::CopyHost => Command("copy_connection_host"),
         // Editing a connection opened from a URL saves it (`Sidebar::edit`).
         A::SaveConnection => Command("edit_connection"),
+        // SQL scripts ▸ (K38): one entry per script, a list; the palette's command lists the
+        // same scripts of the selected connection, to pick one.
+        A::OpenScript(_) | A::AllScripts => Command("connection_scripts"),
+        A::OpenSqlFileHere => Command("open_sql_file_on_connection"),
+        A::SavedQueriesHere => Command("show_saved_queries"),
     }
 }
 
@@ -398,7 +403,7 @@ fn walk_sidebar(subject: &Subject, entries: Vec<sidebar::Entry>, found: &mut Vec
                 found.push(("sidebar", action.label(), sidebar_entry(subject, &action)))
             }
             sidebar::Entry::Submenu(_, items) => walk_sidebar(subject, items, found),
-            sidebar::Entry::Separator => {}
+            sidebar::Entry::Note(_) | sidebar::Entry::Separator => {}
         }
     }
 }
@@ -539,6 +544,18 @@ fn every_entry() -> Vec<Found> {
                 entries,
                 tool_entries(None, kerno_core::Engine::Postgres, &[]),
             );
+            // SQL scripts ▸ with a saved query in a folder, a file, and "All scripts…".
+            let saved: Vec<kerno_core::storage::SavedQuery> = (1..=sidebar::MENU_SAVED_QUERIES + 1)
+                .map(|id| kerno_core::storage::SavedQuery {
+                    id: id as i64,
+                    connection_id: Some("c1".into()),
+                    folder: "reports".into(),
+                    name: format!("q{id}"),
+                    sql: "select 1".into(),
+                })
+                .collect();
+            let entries =
+                sidebar::with_scripts(entries, &saved, &[std::path::PathBuf::from("/s/a.sql")]);
             walk_sidebar(&subject, entries, &mut found);
         }
     }

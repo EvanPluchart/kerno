@@ -1,7 +1,7 @@
 //! User settings, stored as one value in Kerno's storage.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kerno_core::config::FolderLook;
 use kerno_core::environment::{self, EnvironmentDef};
@@ -142,6 +142,11 @@ pub struct Settings {
     /// first when it is opened again, bound only where it binds silently
     /// (C6).
     pub script_connections: BTreeMap<PathBuf, String>,
+    /// The `.sql` files opened, saved or run in a tab of each connection, by
+    /// connection id, the latest first, at most [`CONNECTION_SCRIPTS`] each
+    /// (K38): the connection's SQL scripts ▸. A file used with two
+    /// connections is in both lists.
+    pub connection_scripts: BTreeMap<String, Vec<PathBuf>>,
     /// How the open tabs are laid out (DBeaver #7114, #23248).
     pub tab_layout: TabLayout,
     /// A multi-statement run shows its results one under the other in one
@@ -186,6 +191,9 @@ impl TabLayout {
 
 /// How many `.sql` files the main toolbar lists.
 pub const RECENT_SCRIPTS: usize = 10;
+
+/// How many `.sql` files each connection keeps in its list (K38).
+pub const CONNECTION_SCRIPTS: usize = 10;
 
 /// The sizes the settings allow, in points.
 pub const UI_FONT_SIZES: std::ops::RangeInclusive<f32> = 12.0..=18.0;
@@ -247,6 +255,7 @@ impl Default for Settings {
             toolbar_hidden: BTreeSet::new(),
             recent_scripts: Vec::new(),
             script_connections: BTreeMap::new(),
+            connection_scripts: BTreeMap::new(),
             tab_layout: TabLayout::SingleRow,
             stack_results: false,
             ai: kerno_core::ai::AiSettings::default(),
@@ -318,6 +327,16 @@ impl Settings {
         self.environments = environment::with_builtins(std::mem::take(&mut self.environments));
         // The AI address of before K23 (or of an older Kerno since): a saved endpoint.
         self.ai.adopt_legacy();
+        // The settings of before K38: each recent file under the connection
+        // it last ran on, so the connections' lists start with them.
+        if self.connection_scripts.is_empty() {
+            for path in self.recent_scripts.iter().rev() {
+                if let Some(connection) = self.script_connections.get(path) {
+                    let list = self.connection_scripts.entry(connection.clone());
+                    list.or_default().insert(0, path.clone());
+                }
+            }
+        }
         self
     }
 
@@ -334,11 +353,34 @@ impl Settings {
         self.recent_scripts.insert(0, path.clone());
         self.recent_scripts.truncate(RECENT_SCRIPTS);
         if let Some(connection) = connection {
+            let list = self
+                .connection_scripts
+                .entry(connection.clone())
+                .or_default();
+            list.retain(|listed| *listed != path);
+            list.insert(0, path.clone());
+            list.truncate(CONNECTION_SCRIPTS);
             self.script_connections.insert(path, connection);
         }
         let recent = &self.recent_scripts;
         self.script_connections
             .retain(|path, _| recent.contains(path));
+    }
+
+    /// A file that could not be opened leaves every list.
+    pub fn forget_script(&mut self, path: &Path) {
+        self.recent_scripts.retain(|recent| recent != path);
+        self.script_connections.remove(path);
+        for list in self.connection_scripts.values_mut() {
+            list.retain(|listed| listed != path);
+        }
+        self.connection_scripts.retain(|_, list| !list.is_empty());
+    }
+
+    /// A deleted connection leaves no list behind (K38).
+    pub fn forget_connection(&mut self, connection: &str) {
+        self.connection_scripts.remove(connection);
+        self.script_connections.retain(|_, id| id != connection);
     }
 }
 
@@ -414,6 +456,7 @@ mod tests {
             toolbar_hidden: ["commit".to_string()].into(),
             recent_scripts: vec![PathBuf::from("/tmp/a.sql")],
             script_connections: [(PathBuf::from("/tmp/a.sql"), "c1".to_string())].into(),
+            connection_scripts: [("c1".to_string(), vec![PathBuf::from("/tmp/a.sql")])].into(),
             tab_layout: TabLayout::Vertical,
             stack_results: true,
             ai: kerno_core::ai::AiSettings {
@@ -478,6 +521,62 @@ mod tests {
         assert_eq!(ran_on("/s/2.sql").as_deref(), Some("c2"));
         assert_eq!(ran_on("/s/1.sql"), None);
         assert_eq!(settings.script_connections.len(), RECENT_SCRIPTS);
+    }
+
+    #[test]
+    fn each_connection_keeps_its_own_last_files() {
+        let mut settings = Settings::default();
+        let path = |n: usize| PathBuf::from(format!("/s/{n}.sql"));
+        for n in 0..14 {
+            settings.remember_script(path(n), Some("a".into()));
+        }
+        // A file used with two connections is in both lists; one saved
+        // from a tab that runs nowhere is in neither.
+        settings.remember_script(path(3), Some("b".into()));
+        settings.remember_script(path(99), None);
+        let a = &settings.connection_scripts["a"];
+        assert_eq!(a.len(), CONNECTION_SCRIPTS);
+        assert_eq!((a[0].clone(), a[9].clone()), (path(13), path(4)));
+        assert_eq!(settings.connection_scripts["b"], [path(3)]);
+        // Again with the first: it moves to the top, once.
+        settings.remember_script(path(5), Some("a".into()));
+        let a = &settings.connection_scripts["a"];
+        assert_eq!((a[0].clone(), a.len()), (path(5), CONNECTION_SCRIPTS));
+        assert_eq!(a.iter().filter(|p| **p == path(5)).count(), 1);
+        // The toolbar's list stays the last ten of every connection.
+        assert_eq!(settings.recent_scripts[..3], [path(5), path(99), path(3)]);
+
+        // A file gone leaves every list; a deleted connection, its own.
+        settings.forget_script(&path(3));
+        assert!(!settings.connection_scripts.contains_key("b"));
+        assert!(!settings.recent_scripts.contains(&path(3)));
+        settings.forget_connection("a");
+        assert!(settings.connection_scripts.is_empty());
+        assert!(!settings.script_connections.values().any(|id| id == "a"));
+    }
+
+    #[test]
+    fn the_settings_of_before_k38_load_with_their_files_under_their_connection() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .set_setting(
+                KEY,
+                &serde_json::json!({
+                    "recent_scripts": ["/s/new.sql", "/s/unbound.sql", "/s/old.sql"],
+                    "script_connections": {"/s/new.sql": "a", "/s/old.sql": "a"},
+                }),
+            )
+            .unwrap();
+        let settings = Settings::load(&storage);
+        assert_eq!(settings.recent_scripts.len(), 3);
+        assert_eq!(
+            settings.connection_scripts,
+            [(
+                "a".to_string(),
+                vec![PathBuf::from("/s/new.sql"), PathBuf::from("/s/old.sql")]
+            )]
+            .into()
+        );
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! Open Table (Cmd+P, DBeaver's Open Database Object): the tables and views
 //! of a connection, found by a few letters of `schema.name`. Enter opens the
-//! rows, Cmd+Enter the structure.
+//! rows, Cmd+Enter the structure. Also the SQL scripts of a connection
+//! (K38), found the same way.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::base::actions::Confirm;
-use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::{
     App, AppContext as _, Entity, InteractiveElement as _, ParentElement as _,
@@ -19,6 +20,7 @@ use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::Catalog;
 
 use crate::bridge;
+use crate::sidebar::Script;
 use crate::tabs::Target;
 use crate::workspace::Workspace;
 
@@ -226,6 +228,121 @@ pub fn open(
                         .child(
                             div()
                                 .id("quick-open-hint")
+                                .test_support()
+                                .aria_label(hint)
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(hint),
+                        ),
+                )
+            })
+    });
+}
+
+/// A group of the scripts picker: its heading, and each script with its label.
+type Listed = (&'static str, Vec<(String, Script)>);
+
+/// Every SQL script of the connection `connection` (K38: what its SQL
+/// scripts ▸ lists, without the menu's limit), found by a few letters;
+/// Enter opens it on the connection, as the menu does.
+pub fn open_scripts(
+    workspace: Entity<Workspace>,
+    connection: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (saved, files) = crate::sidebar::scripts_of(&connection, cx);
+    let saved: Vec<(String, Script)> = (saved.into_iter())
+        .map(|query| {
+            let label = match query.folder.is_empty() {
+                true => query.name.clone(),
+                false => format!("{} / {}", query.folder, query.name),
+            };
+            let (id, name) = (query.id, query.name);
+            (label, Script::Saved { id, name })
+        })
+        .collect();
+    // Each file with its folder, as the toolbar's recent list shows them.
+    let files: Vec<(String, Script)> = (files.iter().zip(crate::sidebar::file_names(&files)))
+        .map(|(path, name)| {
+            let (file, folder) = (path.file_name(), path.parent());
+            let label = format!(
+                "{}  {}",
+                file.map_or_else(|| name.clone(), |file| file.to_string_lossy().into_owned()),
+                folder
+                    .map(|folder| folder.display().to_string())
+                    .unwrap_or_default()
+            );
+            let path = path.clone();
+            (label, Script::File { path, name })
+        })
+        .collect();
+    let groups: Rc<Vec<Listed>> = Rc::new(
+        [("Saved queries", saved), ("Files", files)]
+            .into_iter()
+            .filter(|(_, scripts)| !scripts.is_empty())
+            .collect(),
+    );
+    let state = cx.new(|cx| CommandState::new(window, cx));
+    let focused = Rc::new(std::cell::Cell::new(false));
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (state, groups, focused) = (state.clone(), groups.clone(), focused.clone());
+        let (workspace, connection) = (workspace.clone(), connection.clone());
+        dialog
+            .close_button(false)
+            .p_0()
+            .content(move |content, window, cx| {
+                if !focused.replace(true) {
+                    let state = state.clone();
+                    window.defer(cx, move |window, cx| {
+                        gpui_kit::Focusable::focus_handle(state.read(cx), cx).focus(window, cx)
+                    });
+                }
+                let chosen = groups.clone();
+                let (workspace, connection) = (workspace.clone(), connection.clone());
+                let mut command = Command::new(&state)
+                    .bordered(false)
+                    .rounded(cx.theme().radius_lg)
+                    .placeholder("Type a script's name")
+                    .max_h(px(420.))
+                    .on_confirm(move |index, window, cx| {
+                        let Some((_, script)) = (chosen.get(index.section))
+                            .and_then(|(_, scripts)| scripts.get(index.row))
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        window.close_dialog(cx);
+                        let (workspace, connection) = (workspace.clone(), connection.clone());
+                        window.defer(cx, move |window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.open_script(&connection, script, window, cx)
+                            });
+                        });
+                    });
+                for (label, scripts) in groups.iter() {
+                    command = command.group(CommandGroup::new().label(*label).items(
+                        (scripts.iter()).map(|(label, _)| CommandItem::new().label(label.clone())),
+                    ));
+                }
+                let hint = match groups.is_empty() {
+                    true => {
+                        "No SQL scripts yet: open a .sql file on this connection, or save a \
+                             query of it, and it is listed here."
+                    }
+                    false => "Enter opens it on this connection.",
+                };
+                let muted = cx.theme().muted_foreground;
+                content.child(
+                    v_flex()
+                        .id("connection-scripts")
+                        .test_support()
+                        .child(command)
+                        .child(
+                            div()
+                                .id("connection-scripts-hint")
                                 .test_support()
                                 .aria_label(hint)
                                 .px_3()

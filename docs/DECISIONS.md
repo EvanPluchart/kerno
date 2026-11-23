@@ -3345,3 +3345,51 @@ status bar. Its behaviour was read; no code was ported.
   columnar store, nothing per cell); 1,332 frames drawn while scrolling the 100,000 rows down and up, 150 rows a
   frame: 7.72 ms on average, median 7.32, 99th percentile 13.75, longest 36.05. These are the time to lay out,
   paint and render one frame offscreen, not the app's interval between frames on a display.
+
+## D-111 — A connection's SQL scripts, in its right-click menu (K38; 2026-11-23)
+
+The owner: when he right-clicks a connection, he wants a submenu with every SQL script linked to it, "like a
+small folder". DBeaver's connection menu has SQL Editor ▸ Open SQL script / Recent SQL script, which list the
+script files whose resource property names that data source (`SQLEditorUtils.findScriptList`, read for the
+behaviour; nothing ported). Kerno has no scripts folder: its scripts are the saved queries and the `.sql` files
+opened in tabs.
+
+- **What "linked to a connection" is.** Its saved queries (`connection_id` = this one) and the `.sql` files
+  opened, saved, or pointed at it in a tab of that connection. The queries saved for any connection are not
+  listed: "Saved queries…" at the bottom of the submenu opens the saved queries view on this connection's,
+  which lists them too.
+- **A new list per connection, not C6's map.** `Settings::script_connections` (C6) keeps one connection per
+  file, only for the ten files of the toolbar's list. A new field, `connection_scripts` (connection id → its
+  files, the latest first, ten each), is written by `Settings::remember_script`, which every place that links
+  a file to a connection already calls (opening, saving, `QueryTab::set_target`): no line of `query/tab.rs`
+  changed. A file used with two connections is in both lists. Old settings load as before (`#[serde(default)]`);
+  when the new field is empty, it starts from C6's map, each recent file under the connection it last ran on.
+  The toolbar's recent list is unchanged.
+- **The submenu**, "SQL scripts", beside New SQL editor: the last ten saved queries (by id: the last saved)
+  grouped by folder, a folder as a submenu, then the connection's files (ten at most, so they never overflow),
+  a file by its name, with its folder after a dash when another file listed has the same name (the kit's menu
+  items have no tooltip). Then "All scripts…" when saved queries were left out, "Open SQL file…" (opens it on
+  this connection) and "Saved queries…". With nothing, one disabled line, "No SQL scripts yet", then the last
+  two.
+- **The saved queries are read off the UI thread.** The menu is built while the right-click waits, so it reads
+  a copy (`library::SavedQueries`, a global) read at start and after each change: a query saved, deleted in
+  the library, or deleted with its connection.
+- **A click opens on that connection, connecting first** through New SQL editor's path (K28, now
+  `Workspace::when_connected`): its prompts, its rules, its failure in plain words, nothing opened when it
+  fails. A file is read first, so a file gone since is said, leaves every list and connects nothing. **The pick
+  binds**, even where C6 would only propose the connection (production, a confirm rule, read-only): the user
+  chose this connection by name, as New SQL editor binds. Its environment's confirmations still apply at the
+  first run.
+- **Never twice.** A file already open is shown (the existing check), whatever its tab runs on. A saved query
+  is open when a tab without a file on this connection has its name (the tab opened from it, even edited
+  since) or its text (the tab it was saved from, which keeps its "Query N" title); a tab renamed the same is
+  taken for it.
+- **The keyboard.** Two palette commands on the connection selected in the sidebar: "SQL Scripts of Selected
+  Connection…" opens a picker (the Open Table dialog's form: type to filter, Enter opens) with every saved
+  query and file of the connection, also behind "All scripts…"; "Open SQL File on Selected Connection…".
+- **The link follows the connection.** A copy has a new id and starts with no list; a deleted connection's list
+  and its C6 entries are dropped with it (its saved queries already were). An export of connections (J15)
+  carries configs, folders, environments and tasks, never the settings: no path of a script leaves in it.
+- **Not done.** A connection opened from a URL and never saved (J4) keeps its list in the settings under its
+  temporary id after it is gone; nothing shows it. The files are not checked for existence when the menu
+  opens (that is I/O); a click finds out.

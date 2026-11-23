@@ -20,6 +20,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Rows as you scroll](#rows-as-you-scroll)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
+- [A connection's SQL scripts](#a-connections-sql-scripts)
 - [Backup and restore](#backup-and-restore)
 - [PostgreSQL extensions](#postgresql-extensions)
 - [Where Kerno keeps its data](#where-kerno-keeps-its-data)
@@ -408,6 +409,23 @@ tabs of the group only; "All open tabs" (the arrow at the end of each row) lists
 whose last tab closes goes, and its neighbour takes its space. Kerno shows four groups at most (a 2 × 2 grid):
 past that, Split says so and a dragged tab can only join a group. The groups, their sizes and which tab is where
 come back at the next start.
+
+## A connection's SQL scripts
+
+Right-click a connection ▸ **SQL scripts** lists what you work with on it: the queries you saved from a tab of that
+connection ("Save Query…"), grouped by their folders, the last ten saved, then the last ten `.sql` files you opened
+or saved in a tab of that connection, or whose tab you pointed at it, the latest first. Two files with the same
+name show their folder. A click opens it in a SQL editor on that connection, connecting it first when it is closed
+(with its password prompt, if any); a script already open is shown instead of being opened twice, and a file that
+has gone since is said and leaves the list. "Open SQL file…" opens another file on that connection, "Saved
+queries…" the saved queries view on that connection's (those you saved for any connection are there too), and with
+more than ten saved queries "All scripts…" lists them all to type a name. From the keyboard: select the connection
+in the sidebar, then "SQL Scripts of Selected Connection…" or "Open SQL File on Selected Connection…" in the
+command palette (⌘K).
+
+A file used with two connections is in both lists. A copy of a connection starts with none; deleting a
+connection deletes its saved queries and forgets its files (the files themselves stay on disk). Exported
+connections never carry the paths of these files.
 
 ## Backup and restore
 
