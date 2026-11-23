@@ -1528,3 +1528,6 @@ Still open (for the owner):
 - Tests: core `dbeaver::tests::a_tunnels_jump_servers_become_openssh_jump_hosts`, the double-port test
   extended to the hops, UI `the_preview_and_the_report_say_what_to_check_for_each_connection`, each seen
   failing under a mutation (`docs/plans/M12.md`, K58). Fixtures written from DBeaver's source.
+- Nothing in a query tab's bar moves when a run starts or ends: Cancel (or Stop) sits left of the history and
+  saved-queries buttons, as wide whatever its word, and its room is kept while nothing runs. Test:
+  `ui_tests::k55` (one more, PostgreSQL), seen failing under a mutation.

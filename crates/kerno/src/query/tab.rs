@@ -6195,6 +6195,8 @@ impl QueryTab {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /// The width of Cancel (or Stop), and of its room while nothing runs.
+        const CANCEL_WIDTH: Pixels = px(72.);
         let theme = cx.theme();
         let connections = self.connections.read(cx);
         let saved = self
@@ -6395,6 +6397,27 @@ impl QueryTab {
                 )
             })
             .child(div().flex_1())
+            // Cancel's room is kept while nothing runs, and Cancel and Stop
+            // are as wide: nothing in the bar moves when a run starts or
+            // ends (K55).
+            .child(if waiting {
+                Button::new("tab-cancel")
+                    .outline()
+                    .small()
+                    .flex_none()
+                    .w(CANCEL_WIDTH)
+                    .label(if running { "Cancel" } else { "Stop" })
+                    .tooltip("Cancel the running statement (Cmd+.)")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("tab-cancel-room")
+                    .test_support()
+                    .flex_none()
+                    .w(CANCEL_WIDTH)
+                    .into_any_element()
+            })
             .child(
                 Button::new("tab-history")
                     .ghost()
@@ -6413,16 +6436,6 @@ impl QueryTab {
                         window.dispatch_action(Box::new(ShowSavedQueries), cx)
                     }),
             )
-            .when(waiting, |this| {
-                this.child(
-                    Button::new("tab-cancel")
-                        .outline()
-                        .small()
-                        .label(if running { "Cancel" } else { "Stop" })
-                        .tooltip("Cancel the running statement (Cmd+.)")
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
-                )
-            })
             .child(
                 Button::new("tab-explain")
                     .ghost()

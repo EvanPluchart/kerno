@@ -1,6 +1,9 @@
 //! K55 (the passes in the real app, 2026-11-23): the window's chrome. The
 //! palette finds the words typed in any order, and Escape closes it; the
-//! tab strip never starts inside a tab.
+//! tab strip never starts inside a tab; nothing in a query tab's bar moves
+//! when Cancel comes and goes.
+
+use gpui_kit::Pixels;
 
 use super::*;
 
@@ -160,4 +163,54 @@ fn the_tab_strip_never_starts_inside_a_tab(cx: &mut TestAppContext) {
         app.press(cx, &["secondary-w"]);
         strip_settles(&app, cx, &format!("{layout}, a tab closed"));
     }
+}
+
+/// Where the buttons of a query tab's bar are, right of its pickers.
+fn bar_places(app: &Fixture, cx: &mut TestAppContext) -> Vec<Bounds<Pixels>> {
+    app.step(cx, |window, _| {
+        [
+            "tab-history",
+            "tab-saved",
+            "tab-explain",
+            "tab-run-all",
+            "tab-run",
+            "tab-run-menu",
+        ]
+        .map(|id| window.find(id).bounds())
+        .to_vec()
+    })
+}
+
+/// Cancel appears in the room kept for it while nothing runs: the buttons
+/// of the bar stay where they are when a run starts and when it ends.
+#[gpui_kit::test]
+fn nothing_in_the_query_bar_moves_when_a_run_starts_or_ends(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select pg_sleep(30) as kerno_ui_k55_bar");
+    let idle = bar_places(&app, cx);
+    let room = app.step(cx, |window, _| {
+        window.try_find("tab-cancel-room").map(|room| room.bounds())
+    });
+    assert!(!app.has(cx, "tab-cancel"));
+    app.press(cx, &["secondary-enter"]);
+    app.wait_until(cx, "the statement to start", |app, cx| {
+        app.running(cx) && running_on_server(Engine::Postgres, "kerno_ui_k55_bar")
+    });
+    assert_eq!(bar_places(&app, cx), idle, "while it runs");
+    let cancel = app.step(cx, |window, _| window.find("tab-cancel").bounds());
+    let across = |bounds: Bounds<Pixels>| (bounds.left(), bounds.right());
+    assert_eq!(
+        room.map(across),
+        Some(across(cancel)),
+        "Cancel takes its room"
+    );
+    assert!(!app.has(cx, "tab-cancel-room"));
+    app.press(cx, &["secondary-."]);
+    app.wait_until(cx, "the cancel", |app, cx| !app.running(cx));
+    assert!(!app.has(cx, "tab-cancel"));
+    assert_eq!(bar_places(&app, cx), idle, "after the run");
 }
