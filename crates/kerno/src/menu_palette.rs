@@ -345,6 +345,7 @@ fn grid_entry(action: &GridAction) -> Palette {
         A::GoToColumn => Command("go_to_column"),
         A::Find => Command("find_in_results"),
         A::ResetLayout => Command("reset_table_layout"),
+        A::Ai(entry) => Command(entry.command()),
     }
 }
 
@@ -602,6 +603,11 @@ fn every_entry() -> Vec<Found> {
             stats: false,
         };
         walk_grid("grid cell", cell_menu(&cell), &mut found);
+        // AI ▸ (K53), which the grid adds to its menus.
+        for header in [false, true] {
+            let ai = crate::ai_view::ask::grid_menu(header, true);
+            walk_grid("grid AI", vec![ai], &mut found);
+        }
         walk_grid("grid row", row_menu(&cell), &mut found);
         walk_grid("grid header", header_menu(&column), &mut found);
         walk_grid(
@@ -755,6 +761,11 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
             ToolEntry::CompareSchemas,
         ]
         .map(|entry| (entry.label(), tool_entry(true, &entry))),
+    );
+    // AI ▸ of a table, a view or a column (K53), and the AI button of a data or structure tab.
+    palettes.extend(
+        crate::ai_view::ask::Entry::ALL
+            .map(|entry| (entry.label().into(), Command(entry.command()))),
     );
     for (label, palette) in palettes {
         match palette {

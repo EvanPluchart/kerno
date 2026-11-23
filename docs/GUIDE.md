@@ -219,6 +219,29 @@ conversation, and **New conversation** clears it.
   what came. Under each SQL block: **Insert** (in place of the selection, or on its own line at the cursor),
   **Replace** (the selection, else the statement at the cursor) and **Copy**. Nothing runs until you run it.
 
+### From a right-click
+
+**AI ▸** in the menu of a table, a view or a materialized view of the schema tree, and the **AI** button of a
+table's data tab (in its footer) and structure tab (in its bar), ask about that table: **Ask about this
+table…** (you type the question), **Explain this table** (what it holds and how it relates to the tables it
+references and that reference it), **Write a query on this table…** (as Write SQL, the table named) and
+**Generate test data…** (`INSERT` statements for the number of rows you set, 10 by default, 100 at most,
+that respect the types, NOT NULL, the keys and the foreign keys). On a column of the tree, the column selected
+in a structure tab's Columns, or a result grid's column headers (several when selected), **Explain these
+columns**. In a result grid's menu, **Explain this result** (its statement, column names and types, row
+count) and **Ask about the selection…**. Each is also an "AI: …" command of the palette and of Query ▸ AI
+Assistant, on the active tab's table or result, else on the table selected in the tree.
+
+Each opens the panel with what it asks shown as a chip (its × removes it) and the keyboard in the message
+field: nothing goes until you press Enter, and **What is sent…** shows the whole message. A question about a
+table goes to a new query tab on the table's connection and schema; one about a query's result goes to that
+query tab's conversation. The table and the tables linked to it by foreign keys are described first, with
+their keys and indexes. A result's values never go unless you tick **Include its first 20 rows** or, for a
+selection, **Include the selected values**, which says how many cells go; the tick is off at each message.
+Generated test data is offered with **Open in a new tab** under its SQL: a query tab on the same connection,
+where nothing runs until you run it. On a read-only connection or in production, the entry says that it only
+writes text. While the assistant is off, every entry says "turn on in Settings → AI".
+
 ### Endpoints
 
 Settings → AI keeps several named endpoints, any OpenAI-compatible server: one is active, and requests go to

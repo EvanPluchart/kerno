@@ -1535,13 +1535,26 @@ impl QueryTab {
                         catalog.search_path.retain(|name| *name != schema);
                         catalog.search_path.insert(0, schema);
                     }
-                    let _ = this.update(cx, |this, _| {
+                    let _ = this.update(cx, |this, cx| {
                         *this.catalog.borrow_mut() = Arc::new(catalog);
+                        this.tell_ai_catalog(cx);
                     });
                 }
-                Err(error) => tracing::warn!(%error, "the completion catalog was not loaded"),
+                Err(error) => {
+                    tracing::warn!(%error, "the completion catalog was not loaded");
+                    let _ = this.update(cx, |this, cx| this.tell_ai_catalog(cx));
+                }
             }
         }));
+    }
+
+    /// K53: a conversation opened before the catalog was read is put together again from it
+    /// (or stops waiting for it, when it could not be read).
+    fn tell_ai_catalog(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.ai.clone() {
+            let facts = self.ai_facts(cx);
+            panel.update(cx, |panel, cx| panel.catalog_read(facts, cx));
+        }
     }
 
     /// Whether the completion catalog has arrived; for tests.
@@ -4006,6 +4019,9 @@ impl QueryTab {
                         | GridAction::Generate(_) => {
                             this.edit_result(action, row, column, window, cx)
                         }
+                        GridAction::Ai(entry) => {
+                            this.ask_about_result(id, entry, column, window, cx)
+                        }
                         action => this.result_action(id, action, row, column, window, cx),
                     }
                 });
@@ -5528,6 +5544,32 @@ impl QueryTab {
                 self.read_again(id, String::new(), requery.sort, window, cx)
             }
             _ => {}
+        }
+    }
+
+    /// K53: the AI assistant asked about the result of pane `id`, on this
+    /// tab's conversation; `column` is the header's or the current cell's.
+    fn ask_about_result(
+        &mut self,
+        id: u64,
+        entry: crate::ai_view::ask::Entry,
+        column: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ask = self
+            .results
+            .iter()
+            .find(|pane| pane.id == id)
+            .and_then(|pane| {
+                let grid = pane.grid()?;
+                crate::ai_view::ask::of_grid(entry, &grid, &pane.statement, None, Some(column), cx)
+            });
+        let tab = cx.entity();
+        if let Some(ask) = ask {
+            window.defer(cx, move |window, cx| {
+                crate::ai_view::ask::open(&tab, ask, None, window, cx)
+            });
         }
     }
 

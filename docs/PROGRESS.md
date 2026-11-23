@@ -1406,3 +1406,16 @@ Still open (for the owner):
   `ai::left_out`, `ai::chat_stream`, `ai::segments`; app: `ai_view::open(tab, Draft)`,
   `QueryTab::{ai_facts, ai_statement, ai_chat}`, `AiPanel::{insert_sql, replace_sql}`.
 - Tests: `ai::chat::tests` (7), `tests/ai.rs` (2 new), `ui_tests/ai_chat.rs` (9), the J17 UI tests adapted.
+
+## 2026-11-23 — K53: the AI assistant asked from a right-click
+
+- AI ▸ on a table, a view, a materialized view and a column of the tree, an AI button on a data tab's footer
+  and a structure tab's bar, AI ▸ in a result grid's menus: ask about the table, explain it, write a query
+  on it, generate test data, explain columns, a result or a selection. Each opens the panel with its subject
+  as a chip; nothing is sent before Enter; a result's values only by their own tick (D-122).
+- Core `ai::ask` (new): the first messages, the subject put first in the context (also before the tab's
+  catalog is read), the values the tick sends. App `ai_view/ask.rs` (new) and hooks in the panel, the tree,
+  the grid's menus, the data and structure tabs, the window and the palette.
+- Tests: `ai::ask::tests` (8), `ai_view::ask::tests` (2), `ui_tests/ai_ask.rs` (7: PostgreSQL, MySQL, MariaDB,
+  SQLite), each seen failing with a one-line mutation; captures `m12-ai-tree-menu`, `m12-ai-explain-table`, `m12-ai-result-menu`,
+  `m12-ai-explain-result` (light and dark).

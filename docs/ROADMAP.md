@@ -62,7 +62,7 @@ unless sample rows are ticked, "What is sent", nothing run by itself):
 3. **Fix an error in one click.** From a failed statement, the fix is proposed as a diff in the editor, with
    no panel in between.
 4. **From a right-click.** On a table or a result: ask about this table, explain these columns, generate test
-   data.
+   data. Done (K53, D-122): the tree, a data or structure tab and a result grid.
 5. **A richer context.** Foreign keys, indexes and types sent with the schema, for joins that hold and real
    advice on plans. Done (K50, D-119): nullability, primary keys and indexes added for up to 30 tables.
 

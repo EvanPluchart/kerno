@@ -517,6 +517,21 @@ gpui_kit::actions!(
         ToggleAiPanel,
         /// Clears the active query tab's AI conversation (K51).
         AiNewConversation,
+        /// Asks the AI assistant about the active tab's table, else the
+        /// table selected in the tree (K53).
+        AiAskAboutTable,
+        /// Asks the AI assistant to explain that table (K53).
+        AiExplainTable,
+        /// Asks the AI assistant for a query on that table (K53).
+        AiWriteQueryOnTable,
+        /// Asks the AI assistant for test data for that table (K53).
+        AiGenerateTestData,
+        /// Asks the AI assistant to explain the selected columns (K53).
+        AiExplainColumns,
+        /// Asks the AI assistant to explain the result on screen (K53).
+        AiExplainResult,
+        /// Asks the AI assistant about the selected cells (K53).
+        AiAskAboutSelection,
     ]
 );
 
@@ -1986,6 +2001,78 @@ pub const COMMANDS: &[Command] = &[
         [],
         ["assistant", "llm", "chat", "clear", "reset"],
         AiNewConversation
+    ),
+    // K53: what the AI ▸ menus ask, on the active tab's table or result.
+    command!(
+        "ai_ask_about_table",
+        "AI: Ask About This Table…",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "chat", "question", "table", "view"],
+        AiAskAboutTable
+    ),
+    command!(
+        "ai_explain_table",
+        "AI: Explain This Table",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "describe", "table", "relations", "keys"],
+        AiExplainTable
+    ),
+    command!(
+        "ai_write_query_on_table",
+        "AI: Write a Query on This Table…",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "sql", "select", "table"],
+        AiWriteQueryOnTable
+    ),
+    command!(
+        "ai_generate_test_data",
+        "AI: Generate Test Data…",
+        "AI assistant",
+        [],
+        [
+            "assistant",
+            "llm",
+            "insert",
+            "sample",
+            "fake",
+            "rows",
+            "seed"
+        ],
+        AiGenerateTestData
+    ),
+    command!(
+        "ai_explain_columns",
+        "AI: Explain These Columns",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "describe", "column", "fields"],
+        AiExplainColumns
+    ),
+    command!(
+        "ai_explain_result",
+        "AI: Explain This Result",
+        "AI assistant",
+        [],
+        ["assistant", "llm", "describe", "result", "rows", "grid"],
+        AiExplainResult
+    ),
+    command!(
+        "ai_ask_about_selection",
+        "AI: Ask About the Selection…",
+        "AI assistant",
+        [],
+        [
+            "assistant",
+            "llm",
+            "question",
+            "cells",
+            "selected",
+            "values"
+        ],
+        AiAskAboutSelection
     ),
     command!(
         "close_tab",

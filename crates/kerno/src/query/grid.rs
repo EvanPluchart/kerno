@@ -260,6 +260,8 @@ pub enum GridAction {
     Find,
     /// Forgets the remembered layout of a table's columns.
     ResetLayout,
+    /// Asks the AI assistant about the result, the selection or the columns (K53).
+    Ai(crate::ai_view::ask::Entry),
 }
 
 /// Where "First / Previous / Next / Last row" moves the selection.
@@ -346,6 +348,7 @@ impl GridAction {
             Self::GoToColumn => "Go to column…",
             Self::Find => "Find in results…",
             Self::ResetLayout => "Reset layout",
+            Self::Ai(entry) => entry.label(),
         }
         .to_string()
     }
@@ -712,6 +715,12 @@ pub fn header_menu(facts: &HeaderFacts) -> Vec<Entry> {
         entries.extend([Entry::Separator, enabled(A::ResetLayout)]);
     }
     entries
+}
+
+/// AI ▸ of a grid's menus (K53), greyed while the assistant is off.
+fn ai_menu(header: bool, cx: &App) -> Entry {
+    let on = crate::state::AppState::get(cx).settings.ai.enabled;
+    crate::ai_view::ask::grid_menu(header, on)
 }
 
 /// Runs the entry chosen in a grid menu.
@@ -2549,6 +2558,7 @@ impl Grid {
                     .cell_facts(row, column, many, clipboard, cx),
             )
         });
+        let entries = crate::ai_view::ask::with_ai(entries, ai_menu(false, cx));
         let pick = Self::pick(table, Some(row), column, cx);
         let menu = fill_menu(menu, &entries, &pick, window, cx);
         crate::tabs::fit_window(menu, window)
@@ -2577,6 +2587,7 @@ impl Grid {
                 .is_some_and(|selected| selected.rows.start() != selected.rows.end());
             row_menu(&table.delegate().cell_facts(row, 1, many, false, cx))
         });
+        let entries = crate::ai_view::ask::with_ai(entries, ai_menu(false, cx));
         let pick = Self::pick(table, Some(row), 1, cx);
         let menu = fill_menu(menu, &entries, &pick, window, cx);
         crate::tabs::fit_window(menu, window)
@@ -2591,6 +2602,7 @@ impl Grid {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let entries = header_menu(&table.read(cx).delegate().header_facts(column));
+        let entries = crate::ai_view::ask::with_ai(entries, ai_menu(true, cx));
         let pick = Self::pick(table, None, column, cx);
         let menu = fill_menu(menu, &entries, &pick, window, cx);
         crate::tabs::fit_window(menu, window)

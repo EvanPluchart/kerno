@@ -49,6 +49,7 @@ use super::model::{
     self, Children, Group, Item, LINE_DETAIL, LINE_ERROR, LINE_NEXT, LINE_RETRY, LINE_STATUS,
     Listed, Load, LoadKind, Loaded, Node, NodeKind, Reveal, RowId, Tree,
 };
+use crate::ai_view::ask::{self as ai_ask, Entry as AiEntry};
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status, folder_of};
 use crate::database_dialog;
@@ -130,6 +131,11 @@ pub enum NavigatorEvent {
     ExportSchema { target: Target, tables: Vec<String> },
     /// Tell the user something went otherwise than asked.
     Warn(String),
+    /// Ask the AI assistant this, in a query tab on `target` (K53).
+    AskAi {
+        target: Target,
+        ask: kerno_core::ai::ask::Ask,
+    },
     /// Open the extensions manager of a database, on `extension` (K27).
     ManageExtensions {
         target: Target,
@@ -2861,6 +2867,95 @@ impl Navigator {
         }
     }
 
+    /// K53: AI ▸ of `node`, as its menu shows it: a table's, a view's or a
+    /// materialized view's entries, or a column's.
+    fn ai_entries(&self, connection: &str, node: &Node, cx: &App) -> Option<Vec<AiShown>> {
+        let (entries, view): (&[AiEntry], bool) = match &node.kind {
+            NodeKind::Object(ObjectRef::Relation(_, kind)) => (&AiEntry::TABLE, !kind.is_table()),
+            NodeKind::Column { .. } => (&[AiEntry::ExplainColumns], false),
+            _ => return None,
+        };
+        let on = AppState::get(cx).settings.ai.enabled;
+        let caution = ai_ask::caution(self.connections.read(cx), connection, cx);
+        let shown = |&entry| {
+            let (label, enabled) = ai_ask::shown(entry, on, view, caution.as_deref());
+            (entry, label, enabled)
+        };
+        Some(entries.iter().map(shown).collect())
+    }
+
+    /// K53: an AI ▸ entry on the node `id`: its structure read, then the
+    /// question asked in a query tab on its schema.
+    pub fn ask_ai(
+        &mut self,
+        entry: AiEntry,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((connection, node)) = self.object(id) else {
+            return;
+        };
+        let usable = self.ai_entries(&connection, &node, cx);
+        if !usable.is_some_and(|shown| shown.iter().any(|(e, _, on)| *e == entry && *on)) {
+            return;
+        }
+        let (table, kind, columns) = match &node.kind {
+            NodeKind::Object(ObjectRef::Relation(table, kind)) => (table.clone(), *kind, vec![]),
+            NodeKind::Column { table, name } => {
+                (table.clone(), RelationKind::Table, vec![name.clone()])
+            }
+            _ => return,
+        };
+        let target = Self::target_of(&connection, &node, true);
+        let read = table.clone();
+        let reading = self.read_on(&connection, &node.database, cx, move |session| async move {
+            session.table_structure(&read).await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let read = reading.await;
+            let _ = this.update_in(cx, |_, window, cx| match read {
+                Ok(structure) => {
+                    let ask = ai_ask::of_table(entry, table, kind, &structure, &columns);
+                    if let Some(ask) = ask {
+                        cx.emit(NavigatorEvent::AskAi { target, ask });
+                    }
+                }
+                Err(error) => window.push_notification(
+                    crate::error_notification(format!(
+                        "The structure of {} could not be read: {}",
+                        table.name,
+                        describe(&error)
+                    )),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// K53: an AI ▸ entry on the node selected in the tree (its palette
+    /// command); `false` when that node has no such entry.
+    pub fn ask_ai_on_selected(
+        &mut self,
+        entry: AiEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let selected =
+            (self.tree_state.read(cx).selected_item()).and_then(|item| self.object(&item.id));
+        let Some((connection, node)) = selected else {
+            return false;
+        };
+        let shown = self.ai_entries(&connection, &node, cx);
+        if !shown.is_some_and(|shown| shown.iter().any(|(e, _, on)| *e == entry && *on)) {
+            return false;
+        }
+        let id = model::object_row(&connection, &node.id);
+        self.ask_ai(entry, &id, window, cx);
+        true
+    }
+
     /// What F4 does: opens the selected node's editor (see [`edit_action`]).
     pub fn edit_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((connection, node)) = self.selected_node(window, cx)
@@ -3900,6 +3995,9 @@ fn line_text(text: SharedString, color: gpui_kit::Hsla) -> impl IntoElement {
         .child(text)
 }
 
+/// An AI ▸ entry as the menu shows it: what it asks, its words, usable.
+type AiShown = (AiEntry, String, bool);
+
 /// The menu of the object on the row `id`: each entry says why it cannot
 /// be used, when it cannot.
 fn object_menu(
@@ -3951,6 +4049,8 @@ fn object_menu(
             )
         })
         .collect();
+    // AI ▸ of a table, a view, a materialized view or a column (K53).
+    let ai = navigator.ai_entries(&connection, &node, cx);
     let entry = |label: &str, reason: Option<&str>| match reason {
         Some(reason) => SharedString::from(format!("{label} ({reason})")),
         None => SharedString::from(label.to_string()),
@@ -4024,6 +4124,26 @@ fn object_menu(
             menu = menu
                 .item(PopupMenuItem::submenu("Filter", submenu))
                 .separator();
+        }
+        // AI ▸ last, before Refresh (K53).
+        if index == last
+            && let Some(ai) = &ai
+        {
+            let (view, id, ai) = (view.clone(), id.clone(), ai.clone());
+            let submenu = PopupMenu::build(window, cx, move |mut submenu, _, _| {
+                for (ask, label, enabled) in ai {
+                    let (view, id) = (view.clone(), id.clone());
+                    submenu = submenu.item(
+                        PopupMenuItem::new(SharedString::from(label))
+                            .disabled(!enabled)
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| this.ask_ai(ask, &id, window, cx))
+                            }),
+                    );
+                }
+                submenu
+            });
+            menu = menu.item(PopupMenuItem::submenu("AI", submenu)).separator();
         }
         for (action, reason) in group {
             let (view, id) = (view.clone(), id.clone());

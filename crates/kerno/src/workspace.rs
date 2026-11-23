@@ -54,6 +54,7 @@ use crate::actions::{
 };
 use crate::actions::{DisconnectAll, DisconnectOtherConnections, Quit, ToggleReadOnly};
 use crate::admin::tab::AdminTab;
+use crate::ai_view::ask::{self as ai_ask, Entry as AiEntry};
 use crate::backup_dialog::{self, BackupDialog};
 use crate::bridge;
 use crate::compare_tab::{CompareTab, CompareTabEvent, Sides};
@@ -85,6 +86,7 @@ use crate::theme::{self, Appearance};
 use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::WeakFocusHandle;
 use gpui_kit::component::Disableable as _;
+use kerno_core::ai::ask::Ask;
 use kerno_core::browse::Filter;
 use kerno_core::erd::Scope as DiagramScope;
 use kerno_core::schema::{ObjectRef, RelationKind, TableRef};
@@ -1266,6 +1268,7 @@ impl Workspace {
                         };
                         this.open_query(title.clone(), sql, Some(target), window, cx);
                     }
+                    DataTabEvent::AskAi(ask) => this.ask_ai(target, ask.clone(), window, cx),
                     DataTabEvent::TableGone { table } => {
                         let navigator = this.sidebar.read(cx).navigator().clone();
                         navigator.update(cx, |navigator, cx| {
@@ -1345,6 +1348,7 @@ impl Workspace {
                         let scope = DiagramScope::Around(table.clone());
                         this.open_diagram(target, scope, window, cx);
                     }
+                    StructureTabEvent::AskAi(ask) => this.ask_ai(target, ask.clone(), window, cx),
                 }
             },
         );
@@ -2876,6 +2880,9 @@ impl Workspace {
             NavigatorEvent::ManageExtensions { target, extension } => {
                 self.open_extensions(target.clone(), extension.clone(), window, cx);
             }
+            NavigatorEvent::AskAi { target, ask } => {
+                self.ask_ai(target.clone(), ask.clone(), window, cx)
+            }
             NavigatorEvent::Warn(text) => window
                 .push_notification(Notification::warning(SharedString::from(text.clone())), cx),
             NavigatorEvent::CreateTable { target, schema } => {
@@ -2921,6 +2928,73 @@ impl Workspace {
                     ),
                 }
             }
+        }
+    }
+
+    /// K53: opens a query tab on the table `ask` is about (in its schema; a
+    /// MySQL database's) and the AI panel on it with `ask` ready: nothing is
+    /// sent before the user sends it. Off, it says so and opens nothing.
+    fn ask_ai(&mut self, target: Target, ask: Ask, window: &mut Window, cx: &mut Context<Self>) {
+        if !AppState::get(cx).settings.ai.enabled {
+            let text = crate::ai_view::OFF_NOTICE;
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
+        let table = ask.tables().into_iter().next();
+        let connections = self.connections.read(cx);
+        let has_schemas = (connections.meta_session(&target.connection))
+            .is_some_and(|meta| meta.dialect().has_schemas());
+        let caution = ai_ask::caution(connections, &target.connection, cx);
+        let target = match &table {
+            Some(table) if has_schemas => Target {
+                schema: Some(table.schema.clone()),
+                ..target
+            },
+            Some(table) => Target {
+                database: Some(table.schema.clone()),
+                schema: None,
+                ..target
+            },
+            None => target,
+        };
+        let title = table.map_or_else(|| "Query".to_string(), |table| table.name);
+        let tab = self.open_query(title, "", Some(target), window, cx);
+        ai_ask::open(&tab, ask, caution, window, cx);
+    }
+
+    /// K53: an entry of the AI ▸ menus from the palette: on the active data
+    /// or structure tab's table (or the data tab's rows), else the active
+    /// query tab's result, else the node selected in the tree.
+    fn ask_command(&mut self, entry: AiEntry, window: &mut Window, cx: &mut Context<Self>) {
+        if !AppState::get(cx).settings.ai.enabled {
+            let text = crate::ai_view::OFF_NOTICE;
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
+        let of_table = AiEntry::TABLE.contains(&entry);
+        let grid = if let Some(tab) = self.active_data_tab().cloned() {
+            if of_table {
+                return tab.update(cx, |tab, cx| tab.ask_ai(entry, 0, cx));
+            }
+            tab.read(cx).grid()
+        } else if let Some(tab) = self.active_open().and_then(OpenTab::structure).cloned() {
+            if of_table || entry == AiEntry::ExplainColumns {
+                return tab.update(cx, |tab, cx| tab.ask_ai(entry, cx));
+            }
+            None
+        } else {
+            (self.active_query_tab()).and_then(|tab| tab.read(cx).active_grid())
+        };
+        if let Some(grid) = grid.filter(|_| !of_table) {
+            return Grid::perform(&grid, GridAction::Ai(entry), window, cx);
+        }
+        let navigator = self.navigator(cx);
+        if !navigator.update(cx, |tree, cx| tree.ask_ai_on_selected(entry, window, cx)) {
+            let text = match of_table {
+                true => "Open a table's data or structure, or select a table in the tree, first.",
+                false => "No result on screen: run a statement first.",
+            };
+            window.push_notification(Notification::warning(text), cx);
         }
     }
 
@@ -6526,6 +6600,42 @@ impl Workspace {
         .on_action(
             cx.listener(|this, _: &actions::AiNewConversation, window, cx| {
                 crate::ai_view::new_conversation(this.active_query_tab().cloned(), window, cx)
+            }),
+        )
+        // K53: the entries of the AI ▸ menus, from the palette.
+        .on_action(
+            cx.listener(|this, _: &actions::AiAskAboutTable, window, cx| {
+                this.ask_command(AiEntry::AskTable, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiExplainTable, window, cx| {
+                this.ask_command(AiEntry::ExplainTable, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiWriteQueryOnTable, window, cx| {
+                this.ask_command(AiEntry::WriteQuery, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiGenerateTestData, window, cx| {
+                this.ask_command(AiEntry::TestData, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiExplainColumns, window, cx| {
+                this.ask_command(AiEntry::ExplainColumns, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiExplainResult, window, cx| {
+                this.ask_command(AiEntry::ExplainResult, window, cx)
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &actions::AiAskAboutSelection, window, cx| {
+                this.ask_command(AiEntry::AskSelection, window, cx)
             }),
         )
         // J17: an "AI: …" command run outside a query tab (a query tab

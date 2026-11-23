@@ -3703,3 +3703,42 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   drawn as prose and code blocks only: no markup, no link, no image.
 - **Keyboard**: Enter sends, Shift+Enter makes a line (the kit's `submit_on_enter`), Escape gives the
   keyboard back to the editor.
+
+## D-122 — The AI assistant asked from a right-click (K53; 2026-11-23)
+
+- **Where.** AI ▸ in the schema tree's menu of a table, a view, a materialized view (Ask about this table…,
+  Explain this table, Write a query on this table…, Generate test data…) and of a column (Explain these
+  columns), last before Refresh, after Tools ▸ and Filter ▸; an **AI** button in a data tab's footer (the
+  table's four) and in a structure tab's bar (the four, then Explain these columns on the column selected in
+  Columns); AI ▸ in a result grid's cell and row-number menus (Explain this result, Ask about the selection…)
+  and in its column headers' (Explain these columns: the headers selected, else the one under the pointer),
+  before Refresh where the menu ends with it. Built by the menus, not added to `actions()` nor to the grid's
+  pure `cell_menu`/`row_menu`/`header_menu`, so the lists their tests assert are unchanged. Each entry is also
+  a palette command ("AI: Explain This Table"…) acting on the active data or structure tab's table, else the
+  active result, else the node selected in the tree, and an entry of Query ▸ AI Assistant.
+- **Where the conversation lives.** Conversations belong to query tabs (K51). On a query's result it is that
+  tab's. On a table, a data tab or a structure tab a new query tab opens on the table's connection, in its
+  schema (a MySQL table's database), titled with the table's name: the user's script is never mixed into it,
+  and its empty editor attaches nothing. One tab per question asked this way; not reused.
+- **Nothing goes by itself.** As D-120's four actions (K51's `open`): each entry opens the panel with its
+  subject as a chip (× takes it off), the keyboard in the message field, and the whole first message in "What
+  is sent…"; Enter or Send sends. The entries that need a
+  question (Ask about this table…, Write a query…, Ask about the selection…) send nothing until words are
+  typed. Off, every entry is greyed "(turn on in Settings → AI)" and every command says so and opens nothing.
+- **What goes.** The message is built in core (`kerno_core::ai::ask`) from the table's structure as read
+  (names, types, the tables its foreign keys point to and those pointing to it), never a default, a comment
+  or a value. The subject and the tables linked to it are put first in the context and described in full
+  (K50), whatever words the message holds, from the catalog or, while a fresh tab's catalog is not read yet,
+  from the structure; Send waits for the catalog (`QueryTab::load_catalog` tells the panel when it arrives
+  or fails). A result: its statement (a data tab's is the `SELECT` it ran, filter literals included, shown
+  in the chip), its column names and types, its row count. Values go only by a tick of their own, off at
+  each message: a result's first 20 rows, or the selection's cells (500 at most), each cut at 200 characters,
+  binary values by their size; the tick says how many cells go ("Include the selected values (4 cells)").
+  The tables' "Include sample rows" box is not shown beside it.
+- **Generate test data.** `INSERT` statements for N rows (a field, 10 by default, 1 to 100) that respect
+  types, NOT NULL, keys and foreign keys, naming the tables the rows depend on. Its answers' SQL blocks get
+  "Open in a new tab" (a query tab on the same connection, nothing run) besides Insert. On a read-only
+  connection or an environment that asks twice before a write (production), the entry says "(…: writes
+  text, runs nothing)" and stays usable; the panel says the same. Not offered on a view.
+- Not done: a selection of several tables in the tree (the tree has none, D-069). The tree's entries read the
+  table's structure once more (the navigator keeps none, D-119); a data or structure tab gives its own.

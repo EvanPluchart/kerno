@@ -36,6 +36,7 @@ use kerno_core::storage::TableLayout;
 use kerno_core::{Dialect, Engine, Error, ResultStore, Session, TxState, describe, exec};
 
 use crate::actions::CloseTab;
+use crate::ai_view::ask::{self as ai_ask, Entry as AiEntry};
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::engine_logo::engine_logo;
@@ -75,6 +76,8 @@ pub enum DataTabEvent {
     /// The table is gone from the server (dropped or renamed elsewhere):
     /// the tree lists its schema's tables again.
     TableGone { table: TableRef },
+    /// Ask the AI assistant this, in a query tab on this table (K53).
+    AskAi(kerno_core::ai::ask::Ask),
 }
 
 /// One line of the filter bar.
@@ -2094,8 +2097,25 @@ impl DataTab {
             GridAction::AddRow => self.add_row(window, cx),
             GridAction::Refresh => self.refresh(window, cx),
             GridAction::ResetLayout => self.reset_layout(window, cx),
+            GridAction::Ai(entry) => self.ask_ai(entry, column, cx),
             // The grid runs the others itself.
             _ => {}
+        }
+    }
+
+    /// K53: the AI assistant asked about this table or its rows (the rows
+    /// on screen, read with this tab's statement), in a query tab of its own.
+    pub fn ask_ai(&mut self, entry: AiEntry, column: usize, cx: &mut Context<Self>) {
+        let (Some(structure), Some(session)) = (&self.structure, &self.session) else {
+            return;
+        };
+        let (table, filter, sort) = (&self.table, &self.applied, self.sort.as_ref());
+        let statement = rows_sql(session.dialect(), structure, table, filter, sort, None, 0);
+        let statement = statement.unwrap_or_default();
+        let grid = self.grid.as_ref().map(|grid| (grid, statement.as_str()));
+        let ask = ai_ask::of_data(entry, table, self.kind, structure, grid, column, cx);
+        if let Some(ask) = ask {
+            cx.emit(DataTabEvent::AskAi(ask));
         }
     }
 
@@ -2829,6 +2849,16 @@ impl DataTab {
             }))
             .when(self.grid.is_some(), |footer| {
                 footer.child(value_panel::button("data-value-panel", self.value_panel.as_ref(), cx))
+            })
+            // K53: the AI assistant asked about this table.
+            .when(self.grid.is_some(), |footer| {
+                let view = cx.entity();
+                let pick = Rc::new(move |entry, _: &mut Window, cx: &mut App| {
+                    view.update(cx, |this, cx| this.ask_ai(entry, 0, cx))
+                });
+                let caution = ai_ask::caution(self.connections.read(cx), &self.target.connection, cx);
+                let view = !self.kind.is_table();
+                footer.child(ai_ask::bar_button("data-ai", true, view, caution, None, pick, cx))
             })
             .children(
                 self.grid

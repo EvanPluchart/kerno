@@ -4,6 +4,8 @@
 //! of its own. The comment is the one thing changed from here, through the
 //! confirmation every write takes.
 
+use std::rc::Rc;
+
 use gpui_kit::base::FocusableExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
@@ -46,6 +48,8 @@ pub enum StructureTabEvent {
     EditTable { table: TableRef },
     /// Draw this table and its neighbours in an ER diagram (J18).
     ViewDiagram { table: TableRef },
+    /// Ask the AI assistant this, in a query tab on this table (K53).
+    AskAi(kerno_core::ai::ask::Ask),
 }
 
 /// A list of the structure, shown as a table.
@@ -205,6 +209,44 @@ impl StructureTab {
     pub fn set_table(&mut self, table: TableRef, window: &mut Window, cx: &mut Context<Self>) {
         self.table = table;
         self.reload(window, cx);
+    }
+
+    /// K53: the AI button of the bar: the table's entries, and "Explain
+    /// these columns" on the column selected in Columns.
+    fn ai_button(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let view = cx.entity();
+        let pick = Rc::new(move |entry, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| this.ask_ai(entry, cx))
+        });
+        let columns =
+            Some((self.selected_column(cx).is_none()).then_some("select a column in Columns"));
+        let caution =
+            crate::ai_view::ask::caution(self.connections.read(cx), &self.target.connection, cx);
+        let is_view = !self.kind.is_table();
+        crate::ai_view::ask::bar_button("structure-ai", false, is_view, caution, columns, pick, cx)
+    }
+
+    /// The name of the column selected in Columns, if any.
+    fn selected_column(&self, cx: &App) -> Option<String> {
+        let grid = self.grid_of(List::Columns)?.read(cx);
+        let row = grid.selected_row()?;
+        grid.delegate().rows.get(row)?.get(1).cloned()
+    }
+
+    /// K53: the AI assistant asked about this table, or the column selected
+    /// in Columns, in a query tab of its own.
+    pub fn ask_ai(&mut self, entry: crate::ai_view::ask::Entry, cx: &mut Context<Self>) {
+        let Some(structure) = &self.structure else {
+            return;
+        };
+        let columns: Vec<String> = self.selected_column(cx).into_iter().collect();
+        if entry == crate::ai_view::ask::Entry::ExplainColumns && columns.is_empty() {
+            return;
+        }
+        let (table, kind) = (self.table.clone(), self.kind);
+        if let Some(ask) = crate::ai_view::ask::of_table(entry, table, kind, structure, &columns) {
+            cx.emit(StructureTabEvent::AskAi(ask));
+        }
     }
 
     /// Why the table cannot be edited here, when it cannot.
@@ -717,6 +759,7 @@ impl StructureTab {
                 })
             }))
             .child(div().flex_1())
+            .child(self.ai_button(cx))
             .child(
                 Button::new("structure-refresh")
                     .ghost()

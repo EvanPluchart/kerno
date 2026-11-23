@@ -39,6 +39,7 @@ use crate::workspace::Workspace;
 use crate::{actions, bridge};
 
 mod ai;
+mod ai_ask;
 mod ai_chat;
 mod ai_endpoints;
 mod alter_form;

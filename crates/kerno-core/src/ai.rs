@@ -1817,3 +1817,6 @@ mod tests {
         assert!(!text.contains("sk-tls"), "{text}");
     }
 }
+
+// K53 (D-122): what a right-click asks the assistant.
+pub mod ask;

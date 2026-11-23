@@ -35,6 +35,8 @@ use crate::bridge;
 use crate::query::tab::QueryTab;
 use crate::state::AppState;
 
+pub mod ask;
+
 /// What an entry says while the assistant is off.
 pub const OFF: &str = "turn on in Settings → AI";
 
@@ -408,6 +410,10 @@ pub struct AiPanel {
     details_reading: usize,
     /// What the model is told of the database for the message being written.
     context: AiContext,
+    /// What a right-click asked (K53): the subject of the message being written.
+    asked: Option<ask::Asked>,
+    /// The answers' SQL is offered in a new query tab ("Generate test data…", K53).
+    new_tab: bool,
     entries: Vec<Entry>,
     stage: Stage,
     /// Bumped by Stop, New conversation and each request: a late answer is dropped.
@@ -483,6 +489,8 @@ impl AiPanel {
             details_asked: HashSet::new(),
             details_reading: 0,
             context: AiContext::default(),
+            asked: None,
+            new_tab: false,
             entries: Vec::new(),
             stage: Stage::Ready,
             generation: 0,
@@ -505,6 +513,7 @@ impl AiPanel {
     pub fn prepare(&mut self, draft: Draft, window: &mut Window, cx: &mut Context<Self>) {
         self.facts_again(cx);
         self.action = draft.action;
+        (self.asked, self.new_tab) = (None, false);
         self.include_query = true;
         self.include_samples = false;
         self.input.update(cx, |input, cx| {
@@ -626,7 +635,7 @@ impl AiPanel {
                     | Action::ExplainError { .. }
             )
         );
-        (self.include_query && !own)
+        (self.include_query && !own && self.asked.is_none())
             .then_some(self.editor_query.as_deref())
             .flatten()
     }
@@ -635,6 +644,9 @@ impl AiPanel {
     fn message(&self, cx: &App) -> Option<String> {
         let typed = self.input.read(cx).value().trim().to_string();
         let engine = &self.facts.engine;
+        if let Some(asked) = &self.asked {
+            return asked.message(&typed, engine);
+        }
         let mut message = match &self.action {
             Some(Action::WriteSql { .. }) if typed.is_empty() => return None,
             Some(Action::WriteSql { .. }) => Action::WriteSql { sentence: typed }.message(engine),
@@ -692,6 +704,9 @@ impl AiPanel {
             self.facts.schema.as_deref(),
             &self.naming_text(cx),
         );
+        if let Some(asked) = &self.asked {
+            asked.ask.put_first(&mut context, &self.facts.catalog);
+        }
         context.add_details(&self.details);
         self.context = context;
         self.load_details(cx);
@@ -746,7 +761,7 @@ impl AiPanel {
     /// The exact payload Send would send now; `None` while there is nothing to send, or the
     /// sample rows or the structures are being read.
     pub fn payload(&self, cx: &App) -> Option<serde_json::Value> {
-        if self.reading_details() {
+        if self.reading_details() || self.waiting_catalog() {
             return None;
         }
         let message = self.message(cx)?;
@@ -878,6 +893,9 @@ impl AiPanel {
         if self.include_samples {
             chips.push("Sample rows".to_string());
         }
+        if let Some(asked) = &self.asked {
+            chips.extend(asked.sent_chips());
+        }
         self.entries.push(Entry::Asked {
             shown: typed,
             chips,
@@ -951,6 +969,7 @@ impl AiPanel {
             _task: task,
         };
         self.action = None;
+        self.new_tab |= self.asked.take().is_some_and(|asked| asked.test_data());
         self.include_samples = false;
         self.include_query = true;
         self.input
@@ -1074,6 +1093,7 @@ impl AiPanel {
         let body = match self.payload(cx) {
             Some(payload) => ai::preview(&payload),
             None if self.reading_details() => "(reading the tables' keys and indexes…)".into(),
+            None if self.waiting_catalog() => "(reading the database's tables…)".into(),
             None if self.message(cx).is_none() => {
                 "(nothing to send yet: write a message first)".into()
             }
@@ -1295,6 +1315,7 @@ impl AiPanel {
                                 .child(SharedString::from(code.clone())),
                         )
                         .children(sql.map(|sql| {
+                            let new_tab = self.new_tab_button(id("ai-new-tab", n), sql.clone(), cx);
                             let (insert, replace, copy) = (sql.clone(), sql.clone(), sql);
                             let tip = replace_tip(self.editor_query.as_deref());
                             h_flex()
@@ -1332,6 +1353,7 @@ impl AiPanel {
                                             ))
                                         }),
                                 )
+                                .children(new_tab)
                         }))
                         .into_any_element()
                 }
@@ -1431,7 +1453,9 @@ impl Render for AiPanel {
             .count();
         let sending = self.sending();
         let nothing = self.message(cx).is_none();
-        let reading = self.include_samples && self.samples.is_none() || self.reading_details();
+        let reading = self.include_samples && self.samples.is_none()
+            || self.reading_details()
+            || self.waiting_catalog();
         let samples_note = match &self.samples {
             Some(Err(why)) if self.include_samples => Some(why.clone()),
             _ => None,
@@ -1457,6 +1481,7 @@ impl Render for AiPanel {
                 .into_any_element(),
             );
         }
+        chips.extend(self.asked_chips(cx));
         let status: Option<AnyElement> = match &self.stage {
             Stage::Sending { host, .. } => Some(
                 h_flex()
@@ -1535,14 +1560,15 @@ impl Render for AiPanel {
                     if self.include_samples { ", and their first rows" } else { "" }
                 ))),
             )
-            .child(
+            // A result's own rows have their tick (K53): not the tables' sample rows too.
+            .when(self.asked.as_ref().is_none_or(|a| a.ask.values().is_none()), |panel| panel.child(
                 Checkbox::new("ai-sample-rows")
                     .label("Include sample rows (first 5 rows of the tables above)")
                     .checked(self.include_samples)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.set_include_samples(*checked, cx)
                     })),
-            )
+            ))
             .children(samples_note.map(|why| div().text_xs().text_color(danger).child(SharedString::from(why))))
             .child(
                 h_flex()
