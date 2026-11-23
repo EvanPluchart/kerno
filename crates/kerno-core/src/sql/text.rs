@@ -200,9 +200,49 @@ pub fn occurrences(text: &str, selection: Range<usize>) -> Vec<Range<usize>> {
     found
 }
 
+/// `sql` with every literal replaced by `?`: quoted strings (dollar-quoted
+/// ones too) and numbers go, comments go (they are free text), names and
+/// keywords stay. For what is shown or sent where a value must not be: a
+/// table tab's filter holds values of its rows ("Filter by this value", a
+/// foreign key followed).
+pub fn without_literals(sql: &str, rules: LexRules) -> String {
+    let mut out = String::with_capacity(sql.len());
+    for token in lex(sql, rules) {
+        match token.kind {
+            TokenKind::String | TokenKind::Number => out.push('?'),
+            TokenKind::LineComment | TokenKind::BlockComment => out.push(' '),
+            _ => out.push_str(&sql[token.range]),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literals_go_and_names_stay() {
+        let pg = |sql| without_literals(sql, LexRules::POSTGRES);
+        assert_eq!(
+            pg("SELECT * FROM shop.customers WHERE email = 'ada@example.com' AND id > 42"),
+            "SELECT * FROM shop.customers WHERE email = ? AND id > ?"
+        );
+        // A quote in a string, a dollar-quoted one, a number with an
+        // exponent, a comment that quotes a value: nothing of a value stays.
+        assert_eq!(
+            pg(
+                "WHERE n = 'O''Brien' OR t = $x$se'cret$x$ OR v < 1.5e3 -- was 'old'\nORDER BY \"Full Name\""
+            ),
+            "WHERE n = ? OR t = ? OR v < ?  \nORDER BY \"Full Name\""
+        );
+        assert_eq!(pg("LIMIT 20 OFFSET 40"), "LIMIT ? OFFSET ?");
+        // MySQL: a double-quoted string is a value, a backticked name is a name.
+        assert_eq!(
+            without_literals("WHERE `name` = \"ada\" AND x = 'a\\'b'", LexRules::MYSQL),
+            "WHERE `name` = ? AND x = ?"
+        );
+    }
 
     /// The occurrences, with the cursor or selection marked by `|` (one:
     /// a cursor; two: a selection), as the text each covers at its offset.

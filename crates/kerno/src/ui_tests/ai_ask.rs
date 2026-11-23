@@ -491,3 +491,68 @@ fn explain_this_table_on_a_sqlite_file(cx: &mut TestAppContext) {
     let sent = sent_after_enter(&app, cx, &fake);
     assert_eq!(sent, preview);
 }
+
+/// A table tab's statement goes without its literals (a filter's values are often a row's, from
+/// "Filter by this value" or a foreign key followed): `?` in place of each, whether the values'
+/// box is ticked or not; ticked, the rows go, the statement still without them.
+#[gpui_kit::test]
+fn a_table_tabs_statement_goes_without_its_literals(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let fake = FakeAi::start(ANSWER);
+    let app = connected(cx, Engine::Postgres);
+    enable(cx, &fake.base(), true);
+    let (value, number) = ("customer3@example.com", "9000");
+    let filter = Filter {
+        conditions: Vec::new(),
+        raw: format!("email = '{value}' AND id < {number}"),
+    };
+    let ask = |app: &Fixture, cx: &mut TestAppContext| {
+        app.open_table(cx, "shop", "customers", RelationKind::Table);
+        app.wait_until(cx, "the filtered row", |app, cx| {
+            app.has(cx, "data-ai") && app.data_rows(cx).len() == 1
+        });
+        app.right_click(cx, "table-cell-0:1", None);
+        click_menu_entry(app, cx, "AI");
+        click_menu_entry(app, cx, "Explain this result");
+        app.wait_until(cx, "the question", |app, cx| {
+            matches!(asked(app, cx), Some(Ask::Result { .. }))
+        });
+    };
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the rows", |app, cx| app.has(cx, "data-ai"));
+    app.on_data(cx, |tab, window, cx| {
+        tab.set_filter(filter.clone(), window, cx)
+    });
+
+    // Unticked: the statement and what is sent hold `?`, never the literals.
+    ask(&app, cx);
+    let Some(Ask::Result { shown, .. }) = asked(&app, cx) else {
+        unreachable!()
+    };
+    assert!(
+        shown.statement.contains("email = ? AND id < ?"),
+        "{}",
+        shown.statement
+    );
+    let preview = ready_preview(&app, cx);
+    let sent = sent_after_enter(&app, cx, &fake);
+    assert_eq!(sent, preview);
+    assert!(sent.contains("email = ? AND id < ?"), "{sent}");
+    for literal in [value, number] {
+        assert!(!sent.contains(literal), "{literal} sent:\n{sent}");
+    }
+
+    // Ticked: the rows go, the statement keeps its `?`.
+    ask(&app, cx);
+    app.click(cx, "ai-ask-values");
+    let preview = ready_preview(&app, cx);
+    assert!(
+        preview.contains(value),
+        "the row is sent once ticked:\n{preview}"
+    );
+    assert!(preview.contains("email = ? AND id < ?"), "{preview}");
+    assert!(!preview.contains(&format!("'{value}'")), "{preview}");
+    assert!(!preview.contains(number), "{preview}");
+}

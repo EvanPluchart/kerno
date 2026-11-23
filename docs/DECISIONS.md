@@ -3730,8 +3730,9 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   or a value. The subject and the tables linked to it are put first in the context and described in full
   (K50), whatever words the message holds, from the catalog or, while a fresh tab's catalog is not read yet,
   from the structure; Send waits for the catalog (`QueryTab::load_catalog` tells the panel when it arrives
-  or fails). A result: its statement (a data tab's is the `SELECT` it ran, filter literals included, shown
-  in the chip), its column names and types, its row count. Values go only by a tick of their own, off at
+  or fails). A result: its statement (a data tab's is the `SELECT` it ran with `?` in place of every literal,
+  whatever is ticked: a filter's values are often a row's, from "Filter by this value" or a foreign key
+  followed; `sql::without_literals`), its column names and types, its row count. Values go only by a tick of their own, off at
   each message: a result's first 20 rows, or the selection's cells (500 at most), each cut at 200 characters,
   binary values by their size; the tick says how many cells go ("Include the selected values (4 cells)").
   The tables' "Include sample rows" box is not shown beside it.

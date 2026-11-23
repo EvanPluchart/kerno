@@ -2110,8 +2110,14 @@ impl DataTab {
             return;
         };
         let (table, filter, sort) = (&self.table, &self.applied, self.sort.as_ref());
-        let statement = rows_sql(session.dialect(), structure, table, filter, sort, None, 0);
-        let statement = statement.unwrap_or_default();
+        // The filter holds values of the table's rows ("Filter by this value",
+        // a foreign key followed, what the user typed): the statement goes
+        // with a `?` in place of each, whatever is ticked. The rows
+        // themselves go only with their own tick.
+        let dialect = session.dialect();
+        let statement = rows_sql(dialect, structure, table, filter, sort, None, 0);
+        let statement =
+            kerno_core::sql::without_literals(&statement.unwrap_or_default(), dialect.lex_rules());
         let grid = self.grid.as_ref().map(|grid| (grid, statement.as_str()));
         let ask = ai_ask::of_data(entry, table, self.kind, structure, grid, column, cx);
         if let Some(ask) = ask {
