@@ -3360,7 +3360,22 @@ impl Navigator {
         let saved = &connections.saved()[at];
         let config = &saved.config;
         let password_origin = connections.password_origin(&saved.id);
+        // Its environment, seen before connecting (K47): the name in the
+        // status bar's colours, so it reads as the chrome it will tint. One
+        // that tints nothing (local) adds nothing.
+        let environment = crate::theme::environment_chrome(config, cx).map(|chrome| {
+            let state = crate::state::AppState::get(cx);
+            let name = kerno_core::environment::environment(
+                &state.settings.environments,
+                &config.environment,
+            )
+            .name
+            .clone();
+            (chrome, SharedString::from(name))
+        });
         let (state_label, state_color) = match connections.status(&saved.id) {
+            // The tag takes the engine's place: the logo says it already.
+            Status::Disconnected if environment.is_some() => ("", theme.muted_foreground),
             Status::Disconnected => (config.engine.label(), theme.muted_foreground),
             Status::Connecting if connections.reconnecting(&saved.id) => {
                 ("reconnecting…", theme.warning)
@@ -3434,20 +3449,42 @@ impl Navigator {
                                 }),
                         )
                     })
-                    .child(
-                        div()
-                            .id(("connection-state", at))
-                            .flex_none()
-                            .text_xs()
-                            .text_color(state_color)
-                            .child(state_label)
-                            // Where the password came from (J3).
-                            .when_some(password_origin, |this, origin| {
-                                this.tooltip(move |window, cx| {
-                                    Tooltip::new(origin.clone()).build(window, cx)
+                    .when_some(environment, |this, (chrome, name)| {
+                        let tip = format!("{} · {name} environment", config.engine.label());
+                        this.child(
+                            div()
+                                .id(("connection-env", at))
+                                .test_support()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(chrome.bar)
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(chrome.bar_text)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
                                 })
-                            }),
-                    ),
+                                .child(name.clone())
+                                .test_text(name),
+                        )
+                    })
+                    .when(!state_label.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id(("connection-state", at))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(state_color)
+                                .child(state_label)
+                                // Where the password came from (J3).
+                                .when_some(password_origin, |this, origin| {
+                                    this.tooltip(move |window, cx| {
+                                        Tooltip::new(origin.clone()).build(window, cx)
+                                    })
+                                }),
+                        )
+                    }),
             )
     }
 

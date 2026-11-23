@@ -64,12 +64,19 @@ fn update_does(app: &Fixture, cx: &mut TestAppContext, action: TabAction) {
     });
 }
 
+/// The `curl` calls of the check, the downloads and the install; the release notes read for the
+/// dialog (K43) are counted by [`notes_requests`].
 fn curl_args(fake: &Fake) -> Vec<Vec<String>> {
     fake.calls()
         .into_iter()
-        .filter(|(program, _)| program.ends_with("curl"))
+        .filter(|(program, args)| program.ends_with("curl") && !is_notes(args))
         .map(|(_, args)| args)
         .collect()
+}
+
+fn is_notes(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg.contains("raw.githubusercontent.com"))
 }
 
 #[gpui_kit::test]
@@ -485,6 +492,22 @@ fn the_update_item_answers_a_right_click_and_skip_is_remembered(cx: &mut TestApp
 }
 
 /// Whether the update dialog of D-097 is on screen.
+/// The update checks (`curl --head`) `fake` was asked for.
+fn checks(fake: &Fake) -> usize {
+    curl_args(fake)
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "--head"))
+        .count()
+}
+
+/// The release notes requests `fake` was asked for (K43).
+fn notes_requests(fake: &Fake) -> usize {
+    fake.calls()
+        .iter()
+        .filter(|(_, args)| is_notes(args))
+        .count()
+}
+
 fn update_dialog(app: &Fixture, cx: &mut TestAppContext) -> bool {
     app.has(cx, "update-dialog-title")
 }
@@ -532,14 +555,15 @@ fn a_timed_check_that_finds_a_newer_version_opens_the_dialog_once_per_run(cx: &m
         Some("https://github.com/EvanPluchart/kerno/releases/tag/v0.2.0")
     );
     assert!(update_dialog(&app, cx));
-    assert_eq!(curl_args(&fake).len(), 1);
+    // One check; the release's notes are read too (K43), but no page.
+    assert_eq!(checks(&fake), 1);
 
     // Later closes, stores nothing, keeps the item.
     app.click(cx, "update-dialog-later");
     assert!(!app.dialog_open(cx));
     assert_eq!(settings_now(cx).skipped_update, None);
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
-    assert_eq!(fake.calls().len(), 1);
+    assert_eq!(checks(&fake), 1);
 
     // The 6-hour check of the same run: the status bar is enough, for that version or a newer.
     check(&app, cx, false);
@@ -680,7 +704,7 @@ fn update_in_the_dialog_takes_the_path_of_the_status_bar_item(cx: &mut TestAppCo
         cx.opened_url().as_deref(),
         Some("https://github.com/EvanPluchart/kerno/releases/tag/v0.2.0")
     );
-    assert_eq!(page.calls().len(), 1);
+    assert_eq!(curl_args(&page).len(), 1);
     assert!(!app.dialog_open(cx));
 }
 
@@ -771,7 +795,7 @@ fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppCon
     app.press(cx, &["enter", "space", "enter"]);
     app.type_text(cx, " ");
     assert!(update_dialog(&app, cx));
-    assert_eq!(fake.calls().len(), 1, "only the check");
+    assert_eq!(curl_args(&fake).len(), 1, "only the check");
     assert_eq!(cx.opened_url(), None);
     assert_eq!(settings_now(cx).skipped_update, None);
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
@@ -781,7 +805,7 @@ fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppCon
     app.press(cx, &["escape"]);
     assert!(!app.dialog_open(cx));
     assert_eq!(settings_now(cx).skipped_update, None);
-    assert_eq!(fake.calls().len(), 1);
+    assert_eq!(curl_args(&fake).len(), 1);
     app.type_text(cx, " as one");
     let tab = app.tab(cx);
     assert_eq!(cx.update(|cx| tab.read(cx).sql(cx)), "select 1 as one");
@@ -800,7 +824,7 @@ fn keys_typed_as_the_dialog_arrives_neither_install_nor_skip(cx: &mut TestAppCon
     assert!(update_dialog(&app, cx));
     app.press(cx, &["tab", "a", "n", "d", "space", "tab", "space"]);
     assert!(!app.dialog_open(cx));
-    assert_eq!(fake.calls().len(), 2, "only the two checks");
+    assert_eq!(curl_args(&fake).len(), 2, "only the two checks");
     assert_eq!(cx.opened_url(), None);
     assert_eq!(settings_now(cx).skipped_update, None);
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
@@ -845,7 +869,7 @@ fn the_about_window_checks_for_updates_and_says_the_answer(cx: &mut TestAppConte
     assert!(paints(&app, cx, "Kerno 0.2.0 is available."));
     assert!(app.has(cx, "about-update"));
     assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
-    assert_eq!(curl_args(&fake).len(), 1);
+    assert_eq!(checks(&fake), 1);
 
     let fake = Fake::new(|_, _| Ok(redirect_to("v0.1.0")));
     allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
@@ -861,4 +885,71 @@ fn the_about_window_checks_for_updates_and_says_the_answer(cx: &mut TestAppConte
         cx,
         "Kerno could not reach GitHub to check (offline?): curl: (6) Could not resolve host"
     ));
+}
+
+/// K43: the dialog says what the newer version brings once its notes arrive; a failure leaves
+/// it as it was; with checks off, the notes are never asked for.
+#[gpui_kit::test]
+fn the_dialog_shows_what_the_release_brings_once_its_notes_arrive(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let notes = std::fs::read(format!(
+        "{}/../../docs/release-notes/v0.3.1.md",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let fake = Fake::new(move |_, args| {
+        if args.iter().any(|arg| arg == "--head") {
+            Ok(redirect_to("v0.2.0"))
+        } else {
+            Ok(notes.clone())
+        }
+    });
+    allow_updates(&app, cx, fake.clone(), "0.1.0", Install::Page, temp.path());
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.wait_until(cx, "the notes", |app, cx| app.has(cx, "update-whats-new"));
+    assert!(paints(&app, cx, "Kerno 0.3.1 answers the first reports"));
+    assert!(paints(&app, cx, "• A table's rows load as you scroll."));
+    assert!(paints(&app, cx, "You have 0.1.0."));
+    let asked = fake.calls();
+    let (_, request) = asked
+        .iter()
+        .find(|(_, args)| is_notes(args))
+        .expect("the notes asked for");
+    assert_eq!(
+        request.last().map(String::as_str),
+        Some(
+            "https://raw.githubusercontent.com/EvanPluchart/kerno/v0.2.0/docs/release-notes/v0.2.0.md"
+        )
+    );
+    app.click(cx, "update-dialog-later");
+
+    // A failure: the dialog as before, nothing said.
+    let fake = Fake::new(|_, args| {
+        if args.iter().any(|arg| arg == "--head") {
+            Ok(redirect_to("v0.2.0"))
+        } else {
+            Err("curl: (28) Operation timed out".into())
+        }
+    });
+    next_run(&app, cx, fake.clone(), Install::Page, temp.path());
+    let before = notification_count(&app, cx);
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+    app.wait_until(cx, "the notes asked", |_, _| notes_requests(&fake) == 1);
+    cx.run_until_parked();
+    assert!(!app.has(cx, "update-whats-new"));
+    assert!(paints(&app, cx, "You have 0.1.0."));
+    assert_eq!(notification_count(&app, cx), before);
+    app.click(cx, "update-dialog-later");
+
+    // Checks off: Help ▸ Check for Updates… still asks, but no notes are read.
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    next_run(&app, cx, fake.clone(), Install::Page, temp.path());
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.check_updates = false));
+    check(&app, cx, true);
+    cx.run_until_parked();
+    assert_eq!(checks(&fake), 1);
+    assert_eq!(notes_requests(&fake), 0);
 }

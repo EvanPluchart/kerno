@@ -187,6 +187,87 @@ fn without_the_box_no_password_is_kept(cx: &mut TestAppContext) {
     assert_eq!(app.by_name("Shop").1.user, "shop_owner");
 }
 
+/// K46: each row shows its environment, a row's is changed from its tag,
+/// and DBeaver's own type becomes a Kerno environment with its rules, once.
+#[gpui_kit::test]
+fn environments_are_shown_chosen_and_created_once(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data-sources.json");
+    let mysql = |name: &str, host: &str, kind: &str| {
+        serde_json::json!({"provider": "mysql", "driver": "mysql8", "name": name,
+            "configuration": {"host": host, "user": "u", "type": kind}})
+    };
+    let json = serde_json::json!({
+        "connection-types": {
+            "pp": {"name": "Preprod", "color": "214,250,207", "auto-commit": false,
+                "confirm-execute": true, "confirm-data-change": true}
+        },
+        "connections": {
+            "a": mysql("Pick", "a", "dev"),
+            "b": mysql("Pre", "b", "pp"),
+            "c": mysql("Live", "c", "prod")
+        }
+    });
+    std::fs::write(&path, json.to_string()).unwrap();
+    let environments =
+        |cx: &mut TestAppContext| cx.update(|cx| AppState::get(cx).settings.environments.clone());
+    let before = environments(cx).len();
+
+    let view = app.dbeaver_preview(cx, path.clone());
+    let summary = |cx: &mut TestAppContext| cx.update(|cx| view.read(cx).summary());
+    let shown = summary(cx);
+    for part in [
+        "Pick Import(true) local",
+        "Pre Import(true) preprod",
+        "Live Import(true) production",
+        "new environments [\"Preprod\"] created true",
+    ] {
+        assert!(shown.contains(part), "{part} in {shown}");
+    }
+    for index in 0..3usize {
+        assert!(app.has(cx, ("dbeaver-env", index)), "tag {index}");
+    }
+    assert!(app.has(cx, "dbeaver-new-environments"));
+    // Unticked, the new type's connection goes in local; ticked again, back.
+    cx.update(|cx| view.update(cx, |view, cx| view.set_create_environments(false, cx)));
+    assert!(
+        summary(cx).contains("Pre Import(true) local"),
+        "{}",
+        summary(cx)
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.set_create_environments(true, cx)));
+    // A row's tag opens Kerno's environments, the new one among them.
+    app.click(cx, ("dbeaver-env", 0usize));
+    assert!(super::menu_entry(&app, cx, "Preprod (new)").is_some());
+    super::click_menu_entry(&app, cx, "Production");
+    assert!(
+        summary(cx).contains("Pick Import(true) production"),
+        "{}",
+        summary(cx)
+    );
+    let done = app.dbeaver_import(cx, &view);
+    assert!(done.contains("Imported 3 connections"), "{done}");
+
+    let all = environments(cx);
+    assert_eq!(all.len(), before + 1);
+    let preprod = all.iter().find(|def| def.name == "Preprod").unwrap();
+    assert_eq!(preprod.color_light.as_deref(), Some("#D6FACF"));
+    let rules = &preprod.rules;
+    assert!(!rules.auto_commit && rules.confirm_execute && rules.confirm_edits);
+    assert_eq!(app.by_name("Pre").1.environment, preprod.id);
+    assert_eq!(app.by_name("Pick").1.environment, "production");
+    assert_eq!(app.by_name("Live").1.environment, "production");
+
+    // Again: the type is Kerno's now; nothing is created twice.
+    let view = app.dbeaver_preview(cx, path);
+    let shown = cx.update(|cx| view.read(cx).summary());
+    assert!(shown.contains("new environments []"), "{shown}");
+    assert!(!app.has(cx, "dbeaver-new-environments"));
+    app.dbeaver_import(cx, &view);
+    assert_eq!(environments(cx).len(), before + 1);
+}
+
 #[gpui_kit::test]
 fn a_file_that_is_not_an_export_says_so(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());

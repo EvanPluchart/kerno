@@ -454,7 +454,8 @@ pub(crate) static ROWS: &[Row] = &[
         label: "Check for updates",
         description: "At launch and every 6 hours, Kerno asks \
              https://github.com/EvanPluchart/kerno/releases/latest which version is the newest, \
-             without following the answer; nothing else is sent. Help ▸ Check for Updates… asks \
+             without following the answer; when a newer version is found, it also reads that \
+             release's notes from GitHub. Nothing about you is sent. Help ▸ Check for Updates… asks \
              even when this is off.",
         keywords: &[
             "update", "version", "release", "github", "upgrade", "network",

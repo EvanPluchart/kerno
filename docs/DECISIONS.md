@@ -3522,3 +3522,14 @@ finding each missing piece by running the restore again is what had to end.
   last word. The leave-out is not saved in a task: the check runs again at each open.
 - Not done: no server here truly lacks an extension; the "not available" answer is the test server's own for
   `pgaudit`, through a stand-in pg_restore. Kerno never installs, updates or drops an extension for a restore.
+
+## D-115 — What a newer version brings, read from its notes (K43; 2026-11-23)
+
+- Address: `raw.githubusercontent.com/EvanPluchart/kerno/v<version>/docs/release-notes/v<version>.md`, the notes
+  file of the tag (plain text, fixed once tagged), not the release's API (JSON, rate-limited, more to parse).
+- Asked only when a newer version was found and checks are on (never with Settings off or `KERNO_NO_UPDATE_CHECK`),
+  once per version per run, through the update's `Runner` (`curl`, HTTPS only, no redirect, 5 s, 64 KiB, the
+  check's user agent). The dialog never waits: the block appears when the text arrives; any failure is silent.
+- Outside text: control characters dropped, `**`, backticks and links' addresses removed, the summary and each
+  lead capped, eight leads at most then "…and more". CLAUDE.md §1's sentence on the update check (one request
+  to GitHub's releases page, which sends nothing else) is now short of this second request: the owner's to edit.

@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use crate::config::{
     ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshConfig, TlsMode, folder_path,
 };
-use crate::environment::EnvironmentDef;
+use crate::environment::{self, EnvironmentDef, EnvironmentRules, Tint};
 
 /// The largest file read: a `.dbp` or a `data-sources.json`.
 pub const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -46,6 +46,10 @@ pub struct Export {
     /// Scripts left out, with why: `Scripts/big.sql (over 1 MB)`.
     pub skipped_scripts: Vec<String>,
     pub credentials: Credentials,
+    /// DBeaver's own connection types its connections use that match no
+    /// Kerno environment by name (K46): the environments to create, each
+    /// with an id unused here.
+    pub new_environments: Vec<EnvironmentDef>,
 }
 
 /// The saved user names and passwords (`credentials-config.json`).
@@ -80,6 +84,9 @@ pub struct Connection {
     pub not_mapped: Vec<String>,
     /// The saved password and SSH secret; empty unless asked for.
     pub secrets: Secrets,
+    /// The id, in [`Export::new_environments`], of the environment made of
+    /// its DBeaver type; its `config` stays in local until that is created.
+    pub new_environment: Option<String>,
 }
 
 /// A `.sql` file of the project.
@@ -169,6 +176,7 @@ pub fn read(
                     credentials.as_ref(),
                     &types,
                     environments,
+                    &mut export.new_environments,
                     palette,
                 );
                 if !with_passwords {
@@ -442,6 +450,7 @@ fn map_connection(
     credentials: Option<&Map<String, Value>>,
     types: &[(&String, &Map<String, Value>)],
     environments: &[EnvironmentDef],
+    new_environments: &mut Vec<EnvironmentDef>,
     palette: &[(&str, u32, u32)],
 ) -> Connection {
     let provider = text(json, "original-provider")
@@ -485,6 +494,7 @@ fn map_connection(
         config: Err(String::new()),
         not_mapped: Vec::new(),
         secrets: Secrets::default(),
+        new_environment: None,
     };
     let engine = match engine(&provider, &driver) {
         Ok(engine) => engine,
@@ -529,25 +539,44 @@ fn map_connection(
         connection.secrets.password = password.map(Secret::new);
     }
     // The connection type: DBeaver's three built-ins, else by its name.
+    let mut new_environment = None;
     let kind = text(cfg, "type").unwrap_or_else(|| "dev".into());
     config.environment = match kind.as_str() {
         "dev" => "local".into(),
         "test" => "staging".into(),
         "prod" => "production".into(),
         other => {
-            let name = types
+            let def = types
                 .iter()
                 .find(|(type_id, _)| type_id.as_str() == other)
-                .and_then(|(_, def)| text(def, "name"))
+                .map(|(_, def)| *def);
+            let name = def
+                .and_then(|def| text(def, "name"))
                 .unwrap_or_else(|| other.to_string());
-            match environments
-                .iter()
-                .find(|def| def.name.eq_ignore_ascii_case(&name) || def.id == other)
-            {
+            let same = |def: &&EnvironmentDef| def.name.eq_ignore_ascii_case(&name);
+            match environments.iter().find(|d| same(d) || d.id == other) {
                 Some(def) => def.id.clone(),
+                // Defined in the file: an environment to create (K46).
+                None if def.is_some() => {
+                    let id = match new_environments.iter().find(same) {
+                        Some(made) => made.id.clone(),
+                        None => {
+                            let taken: Vec<EnvironmentDef> = (environments.iter())
+                                .chain(new_environments.iter())
+                                .cloned()
+                                .collect();
+                            let id = environment::unused_id(&taken, &name);
+                            new_environments.push(environment_of(id.clone(), name, def));
+                            id
+                        }
+                    };
+                    new_environment = Some(id);
+                    environment::LOCAL.into()
+                }
+                // Named but not defined: DBeaver itself takes its default.
                 None => {
                     not_mapped.push(format!("connection type “{name}” (put in local)"));
-                    "local".into()
+                    environment::LOCAL.into()
                 }
             }
         }
@@ -650,12 +679,63 @@ fn map_connection(
             other => not_mapped.push(format!("network handler “{other}”")),
         }
     }
+    connection.new_environment = new_environment;
     connection.config = match config.validate() {
         Ok(()) => Ok(config),
         Err(crate::Error::Config(reason)) => Err(format!("Its settings are incomplete: {reason}.")),
         Err(error) => Err(format!("Its settings are incomplete: {error}.")),
     };
     connection
+}
+
+/// A Kerno environment made of a DBeaver connection type (the keys
+/// `DataSourceSerializerModern` reads into a `DBPConnectionType`): its name,
+/// colours and the rules Kerno has. A flag missing from the file is false,
+/// as DBeaver reads it; smart commit and closing idle connections have no
+/// Kerno rule and are left out.
+fn environment_of(id: String, name: String, def: Option<&Map<String, Value>>) -> EnvironmentDef {
+    let empty = Map::new();
+    let def = def.unwrap_or(&empty);
+    let on = |key: &str| flag(def, key).unwrap_or(false);
+    let color_light = text(def, "color").and_then(|rgb| hex_color(&rgb));
+    let color_dark = text(def, "colorDark")
+        .and_then(|rgb| hex_color(&rgb))
+        .or_else(|| color_light.clone());
+    let period = text(def, "close-transactions-period").and_then(|p| p.parse::<u32>().ok());
+    EnvironmentDef {
+        id,
+        name,
+        tint: if color_light.is_some() {
+            Tint::Soft
+        } else {
+            Tint::None
+        },
+        color_light,
+        color_dark,
+        rules: EnvironmentRules {
+            auto_commit: on("auto-commit"),
+            confirm_execute: on("confirm-execute"),
+            confirm_edits: on("confirm-data-change"),
+            confirm_writes_twice: false,
+            read_only: false,
+            close_idle_transactions: period
+                .filter(|period| on("auto-close-transactions") && *period > 0),
+        },
+    }
+}
+
+/// DBeaver's `r,g,b` as `#RRGGBB`; white, DBeaver's "no colour", is none.
+fn hex_color(color: &str) -> Option<String> {
+    let parts: Vec<u8> = color
+        .split(',')
+        .map(|part| part.trim().parse::<u8>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match parts.as_slice() {
+        [255, 255, 255] => None,
+        [r, g, b] => Some(format!("#{r:02X}{g:02X}{b:02X}")),
+        _ => None,
+    }
 }
 
 /// The palette colour within a short distance of DBeaver's `r,g,b`.
@@ -953,6 +1033,82 @@ mod tests {
         let bare = find(&export, "Bare").config.as_ref().unwrap();
         assert_eq!((bare.host.as_str(), bare.user.as_str()), ("h", "u"));
         assert_eq!(bare.environment, "local");
+    }
+
+    /// K46: a DBeaver type of its own becomes one environment to create,
+    /// with its colour and rules; a type Kerno has by name is used; a type
+    /// named but not defined stays local.
+    #[test]
+    fn dbeavers_own_types_become_environments_to_create() {
+        let json = br#"{"connection-types": {
+                "pp": {"name": "Preprod", "color": "214,250,207", "colorDark": "64,89,66",
+                    "auto-commit": false, "confirm-execute": true, "confirm-data-change": true,
+                    "auto-close-transactions": true, "close-transactions-period": 900},
+                "qa": {"name": "staging", "color": "255,255,255"},
+                "dev": {"name": "Development", "color": "255,255,255", "auto-commit": true}
+            },
+            "connections": {
+                "a": {"provider": "postgresql", "driver": "postgres-jdbc", "name": "A",
+                    "configuration": {"host": "a", "user": "u", "type": "pp"}},
+                "b": {"provider": "mysql", "driver": "mysql8", "name": "B",
+                    "configuration": {"host": "b", "user": "u", "type": "pp"}},
+                "c": {"provider": "mysql", "driver": "mysql8", "name": "C",
+                    "configuration": {"host": "c", "user": "u", "type": "qa"}},
+                "d": {"provider": "mysql", "driver": "mysql8", "name": "D",
+                    "configuration": {"host": "d", "user": "u", "type": "gone"}},
+                "e": {"provider": "mysql", "driver": "mysql8", "name": "E",
+                    "configuration": {"host": "e", "user": "u", "type": "dev"}}
+            }}"#;
+        let export = read(json, false, &envs(), &PALETTE).unwrap();
+        assert_eq!(
+            export.new_environments,
+            [EnvironmentDef {
+                id: "preprod".into(),
+                name: "Preprod".into(),
+                color_light: Some("#D6FACF".into()),
+                color_dark: Some("#405942".into()),
+                tint: Tint::Soft,
+                rules: EnvironmentRules {
+                    auto_commit: false,
+                    confirm_execute: true,
+                    confirm_edits: true,
+                    confirm_writes_twice: false,
+                    read_only: false,
+                    close_idle_transactions: Some(900),
+                },
+            }]
+        );
+        for name in ["A", "B"] {
+            let connection = find(&export, name);
+            assert_eq!(connection.new_environment.as_deref(), Some("preprod"));
+            assert_eq!(connection.config.as_ref().unwrap().environment, "local");
+            assert!(
+                connection.not_mapped.is_empty(),
+                "{:?}",
+                connection.not_mapped
+            );
+        }
+        let env = |name| {
+            let connection = find(&export, name);
+            assert_eq!(connection.new_environment, None);
+            connection.config.as_ref().unwrap().environment.clone()
+        };
+        assert_eq!(
+            [env("C"), env("D"), env("E")],
+            ["staging", "local", "local"]
+        );
+        assert_eq!(
+            find(&export, "D").not_mapped,
+            ["connection type “gone” (put in local)"]
+        );
+        // Once Preprod is here, nothing is created again.
+        let mut here = envs();
+        here.push(export.new_environments[0].clone());
+        let again = read(json, false, &here, &PALETTE).unwrap();
+        assert!(again.new_environments.is_empty());
+        let a = find(&again, "A");
+        assert_eq!(a.config.as_ref().unwrap().environment, "preprod");
+        assert_eq!(a.new_environment, None);
     }
 
     #[test]

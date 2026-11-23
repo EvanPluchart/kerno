@@ -218,7 +218,8 @@ Kerno sends nothing about you or your data. It makes two kinds of request beside
 databases:
 
 - **The update check.** At launch and every 6 hours, one request to this repository's releases page, with
-  no identifier. Turn it off in Settings ▸ Updates or with `KERNO_NO_UPDATE_CHECK=1`.
+  no identifier; when a newer version is found, a second one reads that release's notes. Turn it off in
+  Settings ▸ Updates or with `KERNO_NO_UPDATE_CHECK=1`.
 - **The AI assistant**, only once you have turned it on, only to the endpoint you set, only when you ask.
 
 Passwords, SSH passphrases and API keys are never written in plain text, nor in a log. On macOS Kerno keeps

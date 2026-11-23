@@ -9,9 +9,11 @@ use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -21,6 +23,7 @@ use gpui_kit::{
 };
 use kerno_core::config::ConnectionConfig;
 use kerno_core::dbeaver::{self, Credentials, Export};
+use kerno_core::environment::{self, EnvironmentDef};
 use kerno_core::secrets;
 use kerno_core::storage::{SavedConnection, SavedQuery};
 
@@ -51,6 +54,10 @@ pub struct DbeaverImport {
     fates: Vec<Fate>,
     queries: Vec<SavedQuery>,
     passwords: bool,
+    /// The environment picked from each row's tag (K46).
+    picked: Vec<Option<String>>,
+    /// Whether DBeaver's types Kerno has no environment for are created.
+    create_environments: bool,
     step: Step,
     work: Option<Task<()>>,
 }
@@ -181,13 +188,54 @@ impl DbeaverImport {
         Self {
             connections,
             bytes,
+            picked: vec![None; export.connections.len()],
             export,
             fates,
             queries,
             passwords: false,
+            create_environments: true,
             step: Step::Preview,
             work: None,
         }
+    }
+
+    /// The environment row `index` goes in: the one picked from its tag,
+    /// else the one made of its DBeaver type while those are to be created,
+    /// else the file's. A picked one to create counts only while ticked.
+    fn environment_id(&self, index: usize) -> String {
+        let connection = &self.export.connections[index];
+        let file = match &connection.config {
+            Ok(config) => config.environment.clone(),
+            Err(_) => environment::LOCAL.into(),
+        };
+        let id = (self.picked[index].clone()).or_else(|| connection.new_environment.clone());
+        match id {
+            Some(id) if self.create_environments || self.new_environment(&id).is_none() => id,
+            _ => file,
+        }
+    }
+
+    fn new_environment(&self, id: &str) -> Option<&EnvironmentDef> {
+        self.export.new_environments.iter().find(|def| def.id == id)
+    }
+
+    /// The environment `id`: one to create, else one of Kerno's.
+    fn environment_def<'a>(&'a self, id: &str, cx: &'a App) -> &'a EnvironmentDef {
+        self.new_environment(id).unwrap_or_else(|| {
+            environment::environment(&AppState::get(cx).settings.environments, id)
+        })
+    }
+
+    pub fn set_environment(&mut self, index: usize, id: String, cx: &mut Context<Self>) {
+        if let Some(picked) = self.picked.get_mut(index) {
+            *picked = Some(id);
+        }
+        cx.notify();
+    }
+
+    pub fn set_create_environments(&mut self, create: bool, cx: &mut Context<Self>) {
+        self.create_environments = create;
+        cx.notify();
     }
 
     pub fn set_ticked(&mut self, index: usize, ticked: bool, cx: &mut Context<Self>) {
@@ -210,11 +258,55 @@ impl DbeaverImport {
         let environments = state.settings.environments.clone();
         let bytes = self.passwords.then(|| self.bytes.clone());
         let fates = self.fates.clone();
+        // The environments to create that an imported row goes in, created
+        // first; one of that name made since is used, never a second one.
+        let chosen: Vec<String> = (0..fates.len())
+            .map(|index| self.environment_id(index))
+            .collect();
+        let wanted: Vec<EnvironmentDef> = (self.export.new_environments.iter())
+            .filter(|def| {
+                (chosen.iter().zip(&fates))
+                    .any(|(id, fate)| *id == def.id && *fate == Fate::Import(true))
+            })
+            .cloned()
+            .collect();
+        let mut created: BTreeMap<String, String> = BTreeMap::new();
+        if !wanted.is_empty() {
+            AppState::update_settings(cx, |settings| {
+                for def in wanted {
+                    let same = |kept: &&EnvironmentDef| kept.name.eq_ignore_ascii_case(&def.name);
+                    let id = match settings.environments.iter().find(same) {
+                        Some(kept) => kept.id.clone(),
+                        None => {
+                            let id = environment::unused_id(&settings.environments, &def.name);
+                            settings.environments.push(EnvironmentDef {
+                                id: id.clone(),
+                                ..def.clone()
+                            });
+                            id
+                        }
+                    };
+                    created.insert(def.id, id);
+                }
+            });
+            cx.refresh_windows();
+        }
         let plans: Vec<(String, Option<ConnectionConfig>, Vec<String>)> = (self.export.connections)
             .iter()
-            .map(|c| {
-                let config = c.config.as_ref().ok().cloned();
-                (c.id.clone(), config, c.not_mapped.clone())
+            .zip(chosen)
+            .map(|(c, id)| {
+                let mut config = c.config.as_ref().ok().cloned();
+                let mut not_mapped = c.not_mapped.clone();
+                if let Some(config) = &mut config {
+                    config.environment = created.get(&id).cloned().unwrap_or(id);
+                    if let Some(def) = (c.new_environment.as_deref())
+                        .and_then(|made| self.new_environment(made))
+                        .filter(|_| !self.create_environments)
+                    {
+                        not_mapped.push(format!("connection type “{}” (not created)", def.name));
+                    }
+                }
+                (c.id.clone(), config, not_mapped)
             })
             .collect();
         let scripts = self.export.scripts.clone();
@@ -335,20 +427,83 @@ impl DbeaverImport {
         };
         let rows: Vec<String> = (self.export.connections.iter())
             .zip(&self.fates)
-            .map(|(connection, fate)| format!("{} {fate:?}", connection.name))
+            .enumerate()
+            .map(|(index, (connection, fate))| {
+                format!(
+                    "{} {fate:?} {}",
+                    connection.name,
+                    self.environment_id(index)
+                )
+            })
+            .collect();
+        let new: Vec<&str> = (self.export.new_environments.iter())
+            .map(|def| def.name.as_str())
             .collect();
         format!(
-            "{step} | {} | folders {:?} | {} scripts | passwords {}",
+            "{step} | {} | folders {:?} | {} scripts | passwords {} | new environments {new:?} \
+             created {}",
             rows.join(", "),
             self.export.folders,
             self.export.scripts.len(),
-            self.passwords
+            self.passwords,
+            self.create_environments
         )
     }
 
     fn render_preview(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         let (muted, warning) = (theme.muted_foreground, theme.warning);
+        let (dark, border) = (theme.is_dark(), theme.border);
+        let view = cx.entity();
+        // Kerno's environments, then those to create, for each tag's menu.
+        let choices: Vec<(String, String)> = (AppState::get(cx).settings.environments.iter())
+            .map(|def| (def.id.clone(), def.name.clone()))
+            .chain(
+                (self.export.new_environments.iter())
+                    .filter(|_| self.create_environments)
+                    .map(|def| (def.id.clone(), format!("{} (new)", def.name))),
+            )
+            .collect();
+        // The environment of a row, as Settings ▸ Environments draws it;
+        // a click chooses another.
+        let tag = |index: usize| -> AnyElement {
+            let current = self.environment_id(index);
+            let def = self.environment_def(&current, cx);
+            let quiet = def.id == environment::LOCAL;
+            let (view, choices) = (view.clone(), choices.clone());
+            Button::new(("dbeaver-env", index))
+                .ghost()
+                .xsmall()
+                .flex_none()
+                .tooltip("Its environment in Kerno: click to choose another")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(crate::environments_view::swatch(def.color(dark), border))
+                        .child(
+                            div()
+                                .text_xs()
+                                .when(quiet, |this| this.text_color(muted))
+                                .child(SharedString::from(def.name.clone())),
+                        ),
+                )
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (id, name) in &choices {
+                        let (view, id) = (view.clone(), id.clone());
+                        menu = menu.item(
+                            PopupMenuItem::new(name.clone())
+                                .checked(id == current)
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_environment(index, id.clone(), cx)
+                                    })
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element()
+        };
         let row = |index: usize, depth: usize| -> AnyElement {
             let connection = &self.export.connections[index];
             let mut detail = vec![connection.engine.clone()];
@@ -405,7 +560,10 @@ impl DbeaverImport {
                                 .text_xs()
                                 .text_color(muted)
                                 .child(SharedString::from(detail)),
-                        ),
+                        )
+                        .when(matches!(self.fates[index], Fate::Import(_)), |this| {
+                            this.child(tag(index))
+                        }),
                 )
                 .when_some(note, |this, note| {
                     this.child(
@@ -470,12 +628,43 @@ impl DbeaverImport {
             .iter()
             .filter(|fate| **fate == Fate::Import(true))
             .count();
-        vec![
+        let mut body = vec![
             div()
                 .id("dbeaver-items")
                 .max_h(px(360.))
                 .overflow_y_scroll()
                 .child(v_flex().gap_1().children(items))
+                .into_any_element(),
+            v_flex()
+                .gap_1()
+                .when(!self.export.new_environments.is_empty(), |this| {
+                    let names: Vec<&str> = (self.export.new_environments.iter())
+                        .map(|def| def.name.as_str())
+                        .collect();
+                    this.child(
+                        div()
+                            .id("dbeaver-new-environments")
+                            .test_support()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(format!(
+                                "DBeaver has {} Kerno has no environment for: {}.",
+                                count(names.len(), "type", "types"),
+                                names.join(", ")
+                            ))),
+                    )
+                    .child(
+                        Checkbox::new("dbeaver-create-environments")
+                            .label(
+                                "Create these environments, with their colour and rules \
+                                 (otherwise their connections go in Local)",
+                            )
+                            .checked(self.create_environments)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_create_environments(*checked, cx)
+                            })),
+                    )
+                })
                 .into_any_element(),
             div()
                 .id("dbeaver-scripts")
@@ -524,7 +713,12 @@ impl DbeaverImport {
                         .on_click(cx.listener(|this, _, window, cx| this.import(window, cx))),
                 )
                 .into_any_element(),
-        ]
+        ];
+        // No empty slot when every type has its environment.
+        if self.export.new_environments.is_empty() {
+            body.remove(1);
+        }
+        body
     }
 }
 

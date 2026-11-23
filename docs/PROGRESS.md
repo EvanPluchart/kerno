@@ -1326,3 +1326,23 @@ Still open (for the owner):
   only, older settings load empty), the latest first and highlighted; typing ranks as before, with no boost.
 - Tests: `settings::tests::recent_commands_keep_the_last_five_latest_first_once_each`, `ui_tests/k45.rs`.
 
+## 2026-11-23 — K43: what a newer version brings, in the update dialog
+
+- When a newer version is found and checks are on, Kerno reads that release's notes file from its tag on
+  GitHub (once per version, 5 s at most) and the update dialog, and the About window's answer, show its summary
+  and the leads of "New" and "Better" as plain text; a failure leaves the dialog as before (D-115).
+
+## 2026-11-23 — K47: a connection's environment in the sidebar
+
+- A non-local connection's sidebar row shows its environment's name in a tag of the status bar's colours, connected
+  or not, in place of the engine's name; local rows are unchanged. Test:
+  `ui_tests::environments::the_sidebar_shows_an_environment_before_connecting`.
+
+## 2026-11-23 — K46: environments in the DBeaver import
+
+- Each connection of the preview shows its environment as a tag (dot and name); a click chooses another one.
+- DBeaver's own connection types become Kerno environments (colours, auto-commit, confirm execution and data
+  edits, close idle transactions) under "Create these environments", ticked; made once, never twice.
+- Tests: `dbeaver::tests::dbeavers_own_types_become_environments_to_create`,
+  `ui_tests::dbeaver_import::environments_are_shown_chosen_and_created_once`.
+

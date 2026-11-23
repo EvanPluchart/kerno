@@ -230,7 +230,8 @@ Kerno no envía nada sobre ti ni sobre tus datos. Además de las conexiones a tu
 de petición:
 
 - **La comprobación de actualizaciones.** Al iniciar y cada 6 horas, una petición a la página de versiones de
-  este repositorio, sin ningún identificador. Se desactiva en Settings ▸ Updates o con
+  este repositorio, sin ningún identificador; si hay una versión más reciente, una segunda lee las notas de
+  esa versión. Se desactiva en Settings ▸ Updates o con
   `KERNO_NO_UPDATE_CHECK=1`.
 - **El asistente de IA**, solo una vez que lo has activado, solo hacia el endpoint que hayas configurado y solo
   cuando lo pides.

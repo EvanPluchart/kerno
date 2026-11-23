@@ -233,7 +233,8 @@ Kerno n'envoie rien sur vous ni sur vos données. En dehors des connexions à vo
 de requêtes :
 
 - **La vérification des mises à jour.** Au lancement puis toutes les 6 heures, une requête vers la page des
-  versions de ce dépôt, sans aucun identifiant. Désactivez-la dans Settings ▸ Updates ou avec
+  versions de ce dépôt, sans aucun identifiant ; quand une version plus récente existe, une seconde lit les
+  notes de cette version. Désactivez-la dans Settings ▸ Updates ou avec
   `KERNO_NO_UPDATE_CHECK=1`.
 - **L'assistant IA**, seulement après que vous l'avez allumé, seulement vers le point d'accès que vous avez
   indiqué, seulement quand vous le demandez.

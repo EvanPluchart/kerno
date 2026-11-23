@@ -512,6 +512,10 @@ pub struct Updates {
     pub checking: bool,
     /// The version the update dialog was shown for in this run (D-097): it shows once per run.
     pub offered: Option<Version>,
+    /// The version whose notes were asked for in this run (K43): once per version.
+    pub notes_asked: Option<Version>,
+    /// What a newer version brings, once its notes were read.
+    pub notes: Option<(Version, releases::WhatsNew)>,
 }
 
 impl Global for Updates {}
@@ -526,8 +530,23 @@ impl Updates {
             phase: Phase::Idle,
             checking: false,
             offered: None,
+            notes_asked: None,
+            notes: None,
         }
     }
+}
+
+/// What `version` brings, read from its notes (K43); `None` on any failure: the dialog then
+/// stays as it was.
+pub fn read_notes(
+    runner: &dyn Runner,
+    current: &str,
+    version: Version,
+) -> Option<releases::WhatsNew> {
+    let notes = runner
+        .output(&curl(), &releases::notes_args(current, version))
+        .ok()?;
+    releases::whats_new(&notes)
 }
 
 /// Whether the environment turns the check off for this run: `KERNO_NO_UPDATE_CHECK`, or a

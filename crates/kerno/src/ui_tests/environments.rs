@@ -513,3 +513,45 @@ fn an_idle_transaction_is_rolled_back_after_the_period(cx: &mut TestAppContext) 
         app.wait_until(cx, "the end of the transaction", |app, cx| !open(app, cx));
     }
 }
+
+/// The names painted as environment tags in the sidebar, top to bottom.
+fn env_tags(app: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
+    app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|text| text.text().to_string())
+            .filter(|text| ["Staging", "Production", "Pre-release"].contains(&text.as_str()))
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+fn the_sidebar_shows_an_environment_before_connecting(cx: &mut TestAppContext) {
+    let storage = memory_storage();
+    for (name, environment) in [
+        ("Alpha", environment::LOCAL),
+        ("Beta", environment::STAGING),
+        ("Gamma", PRODUCTION),
+    ] {
+        let config = ConnectionConfig {
+            name: name.into(),
+            environment: environment.into(),
+            ..testing::config(Engine::Postgres)
+        };
+        storage.save_connection(None, &config).unwrap();
+    }
+    let app = open(cx, storage);
+    // Not connected: local shows nothing more, the others their tag.
+    assert!(!app.has(cx, ("connection-env", 0usize)));
+    assert!(app.has(cx, ("connection-env", 1usize)));
+    assert!(app.has(cx, ("connection-env", 2usize)));
+    assert_eq!(env_tags(&app, cx), ["Staging", "Production"]);
+
+    // Renamed in Settings: the tag follows at once.
+    open_environments(&app, cx);
+    app.click(cx, ("env-row", 1usize));
+    app.click(cx, "env-name");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "Pre-release");
+    assert_eq!(env_tags(&app, cx), ["Pre-release", "Production"]);
+}

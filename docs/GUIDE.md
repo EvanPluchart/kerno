@@ -297,10 +297,12 @@ so `ciw` followed by typed text is undone in two steps (the deletion, then the t
 
 ## Updates
 
-Kerno makes one request on its own: at launch and every 6 hours it sends a `HEAD` request to
+Kerno asks GitHub on its own: at launch and every 6 hours it sends a `HEAD` request to
 `https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with the redirect not
 followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and reads the version in
-the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. Behind a proxy, `curl`
+the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. When a newer version is
+found (and checks are on), it also reads that release's notes file from GitHub to show what it brings in the
+update dialog; nothing about you is sent. Behind a proxy, `curl`
 uses the `HTTPS_PROXY` variable when Kerno was started from a shell that sets it; started from the Dock or a
 desktop launcher it has no proxy, and a network that allows nothing else simply finds no update (database
 drivers are built in: nothing is downloaded to connect). Turn it off in

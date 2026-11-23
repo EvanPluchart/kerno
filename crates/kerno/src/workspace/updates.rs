@@ -128,6 +128,33 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reads what `version` brings from its notes (K43, D-115), once per version per run, only
+    /// while checks are on; the dialog and the About window show it when it arrives. A failure
+    /// leaves them as they are, silently.
+    fn ask_notes(&mut self, version: Version, cx: &mut Context<Self>) {
+        let Some(updates) = cx.try_global::<Updates>() else {
+            return;
+        };
+        if !AppState::get(cx).settings.check_updates || updates.notes_asked == Some(version) {
+            return;
+        }
+        let (runner, current) = (updates.runner.clone(), updates.current.clone());
+        cx.update_global::<Updates, _>(|updates, _| updates.notes_asked = Some(version));
+        let task =
+            bridge::spawn_blocking(cx, move || update::read_notes(&*runner, &current, version));
+        cx.spawn(async move |this, cx| {
+            if let Some(notes) = task.await {
+                let _ = this.update(cx, |_, cx| {
+                    cx.update_global::<Updates, _>(|updates, _| {
+                        updates.notes = Some((version, notes))
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn check_for_updates(
         &mut self,
         _: &CheckForUpdates,
@@ -193,6 +220,9 @@ impl Workspace {
                 )
             {
                 set_phase(cx, Phase::Available(*version));
+            }
+            if let Ok(Some(version)) = &found {
+                self.ask_notes(*version, cx);
             }
             cx.set_global(match found {
                 Ok(Some(version)) => AboutCheck::Newer(version),
@@ -270,6 +300,7 @@ impl Workspace {
         }
         let title = SharedString::from(format!("Kerno {version} is available"));
         cx.update_global::<Updates, _>(|updates, _| updates.offered = Some(version));
+        self.ask_notes(version, cx);
         let workspace = cx.entity().downgrade();
         let text = |id: &'static str, text: SharedString| {
             div()
@@ -314,6 +345,7 @@ impl Workspace {
                             .gap_3()
                             .text_sm()
                             .child(text("update-dialog-current", have.clone()))
+                            .children(whats_new_block(version, cx))
                             .child(
                                 text("update-dialog-does", does.clone())
                                     .text_color(cx.theme().muted_foreground),
@@ -323,7 +355,7 @@ impl Workspace {
                                     .justify_between()
                                     .gap_2()
                                     .child(
-                                        // The browser fetches the page; Kerno sends nothing.
+                                        // The browser fetches the page; the button sends nothing itself.
                                         Button::new("update-dialog-notes")
                                             .ghost()
                                             .tab_index(2)
@@ -618,6 +650,10 @@ pub fn about_check(workspace: WeakEntity<Workspace>, cx: &App) -> (AnyElement, A
                     .test_text(text),
             )
         })
+        .when_some(
+            newer.and_then(|version| whats_new_block(version, cx)),
+            |line, block| line.child(block),
+        )
         .when_some(newer, |line, _| {
             line.child(
                 Button::new("about-update")
@@ -634,4 +670,35 @@ pub fn about_check(workspace: WeakEntity<Workspace>, cx: &App) -> (AnyElement, A
         })
         .into_any_element();
     (button, line)
+}
+
+/// The "What's new" block of a newer version (K43), once its notes were read: the summary,
+/// then each lead, as plain text.
+pub fn whats_new_block(version: Version, cx: &App) -> Option<AnyElement> {
+    let notes = cx
+        .try_global::<Updates>()?
+        .notes
+        .as_ref()
+        .filter(|(of, _)| *of == version)
+        .map(|(_, notes)| notes.clone())?;
+    let mut lines = vec![notes.summary.clone()];
+    lines.extend(notes.leads.iter().map(|lead| format!("• {lead}")));
+    if notes.more {
+        lines.push("…and more".into());
+    }
+    let text = SharedString::from(lines.join("\n"));
+    Some(
+        v_flex()
+            .id("update-whats-new")
+            .test_support()
+            .gap_1()
+            .child(
+                div()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child("What's new"),
+            )
+            .children(lines.into_iter().map(|line| div().child(line)))
+            .test_text(text)
+            .into_any_element(),
+    )
 }

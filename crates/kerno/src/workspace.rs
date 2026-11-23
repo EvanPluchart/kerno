@@ -4307,11 +4307,15 @@ impl Workspace {
     fn collapse_schema_tree(
         &mut self,
         _: &CollapseSchemaTree,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The whole tree, as VS Code's ⌘← on its explorer: the objects,
+        // then the connections and the folders (the owner's word of
+        // 2026-11-23: closing the objects alone was "not enough").
         let navigator = self.sidebar.read(cx).navigator().clone();
         navigator.update(cx, |navigator, cx| navigator.collapse_all(cx));
+        self.on_list(SidebarAction::CollapseAll, window, cx);
     }
 
     fn on_sidebar_event(

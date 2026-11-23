@@ -561,7 +561,7 @@ impl EnvironmentsView {
 }
 
 /// A colour dot, or an empty ring of `border` when there is no colour.
-fn swatch(color: Option<u32>, border: gpui_kit::Hsla) -> impl IntoElement {
+pub(crate) fn swatch(color: Option<u32>, border: gpui_kit::Hsla) -> impl IntoElement {
     div()
         .flex_none()
         .size(px(10.))

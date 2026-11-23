@@ -10,6 +10,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path};
 
+mod notes;
+
+pub use notes::{NOTES_MAX_BYTES, WhatsNew, notes_args, notes_url, whats_new};
+
 /// Where GitHub redirects to the newest published release; the only address Kerno asks by
 /// itself.
 pub const LATEST_URL: &str = "https://github.com/EvanPluchart/kerno/releases/latest";
