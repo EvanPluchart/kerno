@@ -14039,6 +14039,9 @@ fn a_large_table_shows_its_estimate_and_counts_on_demand(cx: &mut TestAppContext
         app.wait_until(cx, "the estimate", |app, cx| {
             matches!(total(app, cx), Some(Total::About(_)))
         });
+        // The estimate can be known before the rows are back: wait for
+        // them (the state read "loading" once on a busy machine).
+        app.wait_until(cx, "the rows", |app, cx| app.data_state(cx) != "loading");
         let shown = app.data_state(cx);
         assert!(shown.starts_with("Rows 1–1,000 of about "), "{shown}");
         app.click(cx, "data-count");

@@ -363,24 +363,28 @@ fn a_million_fetched_rows_are_searched_off_the_ui_thread(cx: &mut TestAppContext
     });
     app.step(cx, |window, cx| find::open(&grid, window, cx));
 
+    // Where the work ran is read from the count of scans handed to the
+    // background, not from one still running: on a quiet machine a scan
+    // can be over before the test looks (it failed once that way).
+    let scans =
+        |cx: &mut TestAppContext| cx.update(|cx| find::background_scans(grid.read(cx).delegate()));
+    let before = scans(cx);
     let started = Instant::now();
     app.type_text(cx, "user_4242");
     let typing = started.elapsed();
-    assert!(
-        cx.update(|cx| find::scanning(grid.read(cx).delegate())),
-        "the rows are matched off the UI thread"
-    );
+    assert!(scans(cx) > before, "the rows are matched off the UI thread");
     app.wait_until(cx, "the count", |_, cx| {
         !cx.update(|cx| find::scanning(grid.read(cx).delegate()))
     });
     // user_4242 and user_42420 to user_42429, 20 rows each.
     assert_eq!(summary(cx, &grid).unwrap().0, "220 matches");
 
+    let before = scans(cx);
     let started = Instant::now();
     app.click(cx, "grid-find-only");
     let only = started.elapsed();
     // The rows to show are worked out off the UI thread too.
-    assert!(cx.update(|cx| find::scanning(grid.read(cx).delegate())));
+    assert!(scans(cx) > before);
     app.wait_until(cx, "the matching rows", |_, cx| {
         summary(cx, &grid).unwrap().1 == Some(220)
     });

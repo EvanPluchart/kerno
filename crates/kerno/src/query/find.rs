@@ -62,6 +62,10 @@ pub struct Find {
     /// The match last moved to (row and column of the grid), and its rank.
     current: Option<(usize, usize, u64)>,
     job: Option<(Task<()>, StopOnDrop)>,
+    /// How many scans were handed to the background so far: what a test
+    /// reads to know where the work ran, since a scan may be over before
+    /// the test looks at `job`.
+    jobs: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -205,6 +209,7 @@ pub fn restore(table: &Table, carried: Carried, window: &mut Window, cx: &mut Ap
             rows_order: None,
             current: None,
             job: None,
+            jobs: 0,
             _subscriptions: subscriptions,
         });
         follow(state, cx);
@@ -393,6 +398,7 @@ fn follow(state: &mut TableState<Grid>, cx: &mut Context<TableState<Grid>>) {
     });
     let find = state.delegate_mut().find.as_mut().expect("a find");
     find.job = Some((task, StopOnDrop(stop)));
+    find.jobs += 1;
     cx.notify();
 }
 
@@ -761,6 +767,12 @@ pub fn summary(grid: &Grid) -> Summary {
 #[cfg(test)]
 pub fn scanning(grid: &Grid) -> bool {
     grid.find.as_ref().is_some_and(|find| find.job.is_some())
+}
+
+/// How many scans the find of a grid handed to the background; for tests.
+#[cfg(test)]
+pub fn background_scans(grid: &Grid) -> u64 {
+    grid.find.as_ref().map_or(0, |find| find.jobs)
 }
 
 #[cfg(test)]
