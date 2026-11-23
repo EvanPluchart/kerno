@@ -1461,3 +1461,11 @@ Still open (for the owner):
   than tonight: the palette's search wants the words in order; the tab strip clips its leftmost tab when
   there are many; a long data directory leaves the single-instance socket unopened.
 - The full check on the tree prepared: see the release commit's message for the count.
+
+## 2026-11-23 — K54: a foreign key's arrow leaves with the pointer
+
+- The arrow of a hovered foreign-key cell (K49) stayed on its row after the pointer left: once its tab was
+  shown again (after following the arrow), after a double click and Escape, under rows scrolled or read again.
+  The hovered cell now checks for the pointer each frame it is drawn and hears every move until the next one;
+  it is drawn only while the pointer is over that very cell (`docs/plans/M12.md`, K49, corrected).
+- Tests: `ui_tests::k54` (3, PostgreSQL and MySQL, fixtures read only), each seen failing under a mutation.

@@ -66,6 +66,7 @@ mod k40;
 mod k44;
 mod k45;
 mod k49;
+mod k54;
 mod legacy;
 mod menus;
 mod multi_run;

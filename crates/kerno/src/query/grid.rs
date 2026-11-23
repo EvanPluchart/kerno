@@ -22,10 +22,11 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, ElementId, Entity,
-    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, Pixels, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div, font, px,
+    App, AppContext as _, ClipboardItem, Context, DismissEvent, DispatchPhase, Div, ElementId,
+    Entity, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, ParentElement as _, Pixels, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
+    WeakEntity, Window, canvas, div, font, px,
 };
 use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
@@ -987,6 +988,9 @@ pub struct Grid {
     /// The cell of a foreign-key column under the pointer (display row,
     /// column of the grid): its arrow shows.
     hovered: Option<(usize, usize)>,
+    /// Where the pointer left the window, until it moves: GPUI keeps it
+    /// there, inside the cell it left (K54).
+    exited_at: Option<gpui_kit::Point<Pixels>>,
 }
 
 impl Grid {
@@ -1032,6 +1036,7 @@ impl Grid {
             value_panel: None,
             links: Vec::new(),
             hovered: None,
+            exited_at: None,
         }
     }
 
@@ -1118,6 +1123,7 @@ impl Grid {
             value_panel: None,
             links: Vec::new(),
             hovered: None,
+            exited_at: None,
             store,
         }
     }
@@ -2163,6 +2169,12 @@ impl Grid {
         Some((editing.row, editing.column))
     }
 
+    /// The foreign-key cell whose arrow the pointer shows; for tests.
+    #[cfg(test)]
+    pub fn hovered(&self) -> Option<(usize, usize)> {
+        self.hovered
+    }
+
     /// What the grid draws in its cells, row by row (column 0, the row
     /// numbers, left out); for tests.
     #[cfg(test)]
@@ -2791,6 +2803,55 @@ pub(super) fn arrow_element(
                 .text_color(theme.link),
         )
         .into_any_element()
+}
+
+/// Keeps the hovered foreign-key cell's arrow to the pointer (K54). The
+/// cell's own hover listener misses a pointer that leaves once the cell was
+/// drawn anew (its tab shown again, its editor closed, scrolled back, after
+/// a key): each frame the cell is drawn, the pointer is looked for in it,
+/// and until the next frame any move out of it, or out of the window,
+/// takes the arrow away. Only the hovered cell carries it.
+fn hover_watch(table: &Entity<TableState<Grid>>, cell: (usize, usize)) -> impl IntoElement {
+    let (seen, watch) = (table.clone(), table.clone());
+    canvas(
+        move |bounds, window, cx| {
+            let bounds = bounds.intersect(&window.content_mask().bounds);
+            if !bounds.contains(&window.mouse_position()) {
+                window.defer(cx, move |_, cx| unhover(&seen, cell, cx));
+            }
+            bounds
+        },
+        move |_, bounds, window, _| {
+            let left = watch.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Capture && !bounds.contains(&event.position) {
+                    unhover(&watch, cell, cx);
+                }
+            });
+            window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    let at = window.mouse_position();
+                    left.update(cx, |table, _| table.delegate_mut().exited_at = Some(at));
+                    unhover(&left, cell, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// Takes the arrow off `cell` if it is still the hovered one.
+fn unhover(table: &Entity<TableState<Grid>>, cell: (usize, usize), cx: &mut App) {
+    table.update(cx, |table, cx| {
+        let grid = table.delegate_mut();
+        if grid.hovered == Some(cell) {
+            grid.hovered = None;
+            cx.notify();
+        }
+    });
 }
 
 /// What a cell being edited draws, in the grid and in the record view: the
@@ -3436,6 +3497,7 @@ impl TableDelegate for Grid {
         // (K49). Its text is cut before it; without it the cell is as it
         // was, a number aligned to the right edge.
         let link = self.link(source).is_some();
+        let watched = link && self.hovered == Some((row, column));
         let arrow = (link && self.shows_arrow(row, column))
             .then(|| self.jump(row, source))
             .flatten()
@@ -3456,10 +3518,17 @@ impl TableDelegate for Grid {
             // Only a foreign key's cells follow the pointer: the others pay
             // nothing for the arrows.
             .when(link, |cell| {
-                cell.on_hover(cx.listener(move |table, hovered: &bool, _, cx| {
+                cell.on_hover(cx.listener(move |table, hovered: &bool, window, cx| {
                     let grid = table.delegate_mut();
                     let was = grid.hovered;
                     if *hovered {
+                        // Not the pointer that left the window from here
+                        // and has not moved since: GPUI still places it in
+                        // the cell, and the next frame would hover it.
+                        if grid.exited_at == Some(window.mouse_position()) {
+                            return;
+                        }
+                        grid.exited_at = None;
                         grid.hovered = Some((row, column));
                     } else if grid.hovered == Some((row, column)) {
                         grid.hovered = None;
@@ -3545,6 +3614,9 @@ impl TableDelegate for Grid {
             )
             .child(text)
             .children(arrow)
+            .when(watched, |cell| {
+                cell.relative().child(hover_watch(&table, (row, column)))
+            })
             // The table keeps a right click on a cell to itself: each cell
             // opens its own menu, built when it opens.
             .context_menu(move |menu, window, cx| {
