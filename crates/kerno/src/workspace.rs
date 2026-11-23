@@ -27,8 +27,8 @@ use gpui_kit::{
     Anchor, AnyElement, AnyView, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _,
     ClipboardItem, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions,
-    Render, ScrollHandle, SharedString, Styled as _, Subscription, Task, TestSupportExt as _,
-    WeakEntity, Window, div, px,
+    Pixels, Render, ScrollHandle, SharedString, Styled as _, Subscription, Task,
+    TestSupportExt as _, WeakEntity, Window, div, px,
 };
 use kerno_core::config::{ConnectionConfig, Secret};
 
@@ -551,6 +551,8 @@ pub struct Workspace {
     shown_tab: Rc<RefCell<Vec<EntityId>>>,
     /// The scroll of each group's tab strip.
     tab_scrolls: RefCell<std::collections::HashMap<panes::GroupId, ScrollHandle>>,
+    /// Each group's strip, to settle on a tab's start once it stops moving.
+    strip_settles: Rc<RefCell<std::collections::HashMap<panes::GroupId, StripSettle>>>,
     /// The focused group, its active tab, the tab count, the layout, the active
     /// tab's label and whether it shows a transaction badge, as the strip last
     /// scrolled for (a label that grows, an unsaved mark or a badge added, can
@@ -678,6 +680,7 @@ impl Workspace {
             tab_target,
             shown_tab: Rc::new(RefCell::new(Vec::new())),
             tab_scrolls: RefCell::default(),
+            strip_settles: Rc::default(),
             revealed_tab: None,
             all_tabs_scroll: ScrollHandle::new(),
             all_tabs_open: None,
@@ -761,6 +764,7 @@ impl Workspace {
         self.tab_scrolls
             .get_mut()
             .retain(|group, _| groups.contains(group));
+        (self.strip_settles.borrow_mut()).retain(|group, _| groups.contains(group));
     }
 
     /// The tab just pushed at the end of `tabs` joins the focused group, at
@@ -809,6 +813,13 @@ impl Workspace {
             .entry(group)
             .or_default()
             .clone()
+    }
+
+    /// The strip of `group` was scrolled to a tab: once it stops moving, it
+    /// starts on a tab's start (K55).
+    fn settle_strip(&self, group: panes::GroupId) {
+        let mut settles = self.strip_settles.borrow_mut();
+        settles.entry(group).or_default().pending = true;
     }
 
     /// The menu of the tab at `index`: its place in its group's strip, and
@@ -1174,6 +1185,49 @@ impl Workspace {
         });
         let overflow = strip.max_offset();
         (inside, overflow.x > px(0.) || overflow.y > px(0.))
+    }
+
+    /// The tab cut at the start of the focused group's strip (the left of
+    /// one row, the top of the rows and of the side list), if one is; for
+    /// tests (K55).
+    #[cfg(test)]
+    pub fn tab_cut_at_start(&self, cx: &App) -> Option<usize> {
+        self.strip_tabs(cx)
+            .into_iter()
+            .position(|(start, end, edge)| start < edge - px(1.) && end > edge + px(1.))
+    }
+
+    /// The first tab wholly in the focused group's strip; for tests (K55).
+    #[cfg(test)]
+    pub fn first_tab_in_view(&self, cx: &App) -> Option<usize> {
+        self.strip_tabs(cx)
+            .into_iter()
+            .position(|(start, _, edge)| start >= edge - px(1.))
+    }
+
+    /// Each tab of the focused group's strip along its axis, as shown: its
+    /// start and end, and where the strip starts.
+    #[cfg(test)]
+    fn strip_tabs(&self, cx: &App) -> Vec<(Pixels, Pixels, Pixels)> {
+        let strip = self.strip_scroll(self.panes.focused());
+        let (viewport, offset) = (strip.bounds(), strip.offset());
+        let across = AppState::get(cx).settings.tab_layout == TabLayout::SingleRow;
+        let count = (self.panes.group(self.panes.focused())).map_or(0, |group| group.tabs.len());
+        (0..count)
+            .map_while(|index| strip.bounds_for_item(index))
+            .map(|tab| match across {
+                true => (
+                    tab.left() + offset.x,
+                    tab.right() + offset.x,
+                    viewport.left(),
+                ),
+                false => (
+                    tab.top() + offset.y,
+                    tab.bottom() + offset.y,
+                    viewport.top(),
+                ),
+            })
+            .collect()
     }
 
     /// Whether Kerno decided to quit; for tests.
@@ -5017,6 +5071,9 @@ impl Workspace {
                 .on_click(cx.listener({
                     let indices = indices.clone();
                     move |this, position: &usize, window, cx| {
+                        // The kit's reveal of a click leaves part of the
+                        // tab before it showing: settled once it stops.
+                        this.settle_strip(gid);
                         if let Some(index) = indices.get(*position) {
                             this.activate_tab(*index, window, cx)
                         }
@@ -5030,7 +5087,9 @@ impl Workspace {
                         .child(title)
                         .suffix(close)
                 }))
-                .last_empty_space(empty.h_full())
+                // Room after the last tab for the strip to scroll the tab
+                // before it out of view (K55).
+                .last_empty_space(empty.h_full().min_w(strip_room(&scroll, indices.len())))
                 .suffix(tools)
                 .into_any_element(),
             // The rows wrap; past four they scroll, with a scrollbar that
@@ -5234,6 +5293,29 @@ impl Workspace {
                 }
             }))
             .child(area)
+            // After the strip, so that its scroll of this frame is the one read.
+            .child({
+                let settles = self.strip_settles.clone();
+                let workspace = cx.entity_id();
+                let (active, count) = (group.active, indices.len());
+                let across = layout == TabLayout::SingleRow;
+                gpui_kit::canvas(
+                    move |_, window, _| {
+                        settle(
+                            &scroll,
+                            &settles,
+                            gid,
+                            (active, count),
+                            across,
+                            workspace,
+                            window,
+                        )
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_0()
+            })
             .into_any_element()
     }
 
@@ -7095,6 +7177,84 @@ fn connection_target(id: &str) -> Target {
     }
 }
 
+/// A strip of tabs to settle on a tab's start once it stops moving (K55).
+#[derive(Debug, Default, Clone, Copy)]
+struct StripSettle {
+    /// Scrolled to a tab (a reveal, a click), not settled yet. A scroll by
+    /// hand is left where the user puts it.
+    pending: bool,
+    /// Its scroll at the last frame.
+    last: Option<gpui_kit::Point<Pixels>>,
+}
+
+/// The strip of `group` (across: one row; else rows or a list, down), its
+/// tab at `active` of `count`, once it stops moving after a reveal or a
+/// click: the active tab whole, the strip starting on a tab's start
+/// (`tabs::settled_offset`). Read after the strip's layout of the frame.
+fn settle(
+    scroll: &ScrollHandle,
+    settles: &RefCell<std::collections::HashMap<panes::GroupId, StripSettle>>,
+    group: panes::GroupId,
+    (active, count): (usize, usize),
+    across: bool,
+    workspace: EntityId,
+    window: &mut Window,
+) {
+    let offset = scroll.offset();
+    let mut settles = settles.borrow_mut();
+    let state = settles.entry(group).or_default();
+    let moved = state.last != Some(offset);
+    state.last = Some(offset);
+    if !state.pending {
+        return;
+    }
+    if moved {
+        // A scroll or the kit's animation under way: again on the next frame.
+        window.on_next_frame(move |_, cx| cx.notify(workspace));
+        return;
+    }
+    state.pending = false;
+    let along = |bounds: gpui_kit::Bounds<Pixels>| match across {
+        true => (bounds.left(), bounds.right()),
+        false => (bounds.top(), bounds.bottom()),
+    };
+    let tabs: Vec<(Pixels, Pixels)> = (0..count)
+        .map_while(|index| scroll.bounds_for_item(index))
+        .map(along)
+        .collect();
+    if tabs.len() < count {
+        return;
+    }
+    let (viewport, max) = (scroll.bounds(), scroll.max_offset());
+    let (view, at, max) = match across {
+        true => ((viewport.left(), viewport.right()), offset.x, max.x),
+        false => ((viewport.top(), viewport.bottom()), offset.y, max.y),
+    };
+    let settled = tabs::settled_offset(&tabs, view, at, max, active);
+    let to = match across {
+        true => settled.map(|x| gpui_kit::point(x, offset.y)),
+        // The rows and the list scroll down only: a scroll across left by
+        // one row is undone.
+        false => (settled.is_some() || offset.x != px(0.))
+            .then(|| gpui_kit::point(px(0.), settled.unwrap_or(at))),
+    };
+    if let Some(to) = to {
+        scroll.set_offset(to);
+        state.last = Some(to);
+        window.on_next_frame(move |_, cx| cx.notify(workspace));
+    }
+}
+
+/// The room left after the last tab of one row: as wide as its widest
+/// tab, so that the strip can scroll any tab before the active one out of
+/// view (K55); 24 px at least, as before.
+fn strip_room(scroll: &ScrollHandle, count: usize) -> Pixels {
+    (0..count)
+        .filter_map(|index| scroll.bounds_for_item(index))
+        .map(|tab| tab.size.width)
+        .fold(px(24.), Pixels::max)
+}
+
 /// `text` as the palette compares it: lower case, accents aside, words
 /// separated by one space.
 fn palette_folded(text: &str) -> String {
@@ -7270,6 +7430,7 @@ impl Render for Workspace {
         if !self.tabs.is_empty() && self.revealed_tab.as_ref() != Some(&revealed) {
             let scroll = self.strip_scroll(focused);
             scroll.scroll_to_item(self.panes.group(focused).map_or(0, |group| group.active));
+            self.settle_strip(focused);
             // Before the strip's first layout there is no width to scroll
             // in: again on the next frame.
             if scroll.bounds().size.width > px(0.) {

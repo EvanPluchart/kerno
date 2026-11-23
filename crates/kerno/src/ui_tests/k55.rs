@@ -1,5 +1,6 @@
 //! K55 (the passes in the real app, 2026-11-23): the window's chrome. The
-//! palette finds the words typed in any order, and Escape closes it.
+//! palette finds the words typed in any order, and Escape closes it; the
+//! tab strip never starts inside a tab.
 
 use super::*;
 
@@ -83,4 +84,80 @@ fn escape_always_closes_the_palette(cx: &mut TestAppContext) {
         workspace.active_query_tab().map(|tab| tab.read(cx).sql(cx))
     });
     assert_eq!(sql.as_deref(), Some("select 1"));
+}
+
+/// `count` query tabs, the last one active.
+fn query_tabs(count: usize) -> Arc<Storage> {
+    let storage = memory_storage();
+    let tabs: Vec<TabSnapshot> = (1..=count)
+        .map(|number| TabSnapshot::Query {
+            title: format!("Query {number}"),
+            sql: String::new(),
+            target: None,
+            file: None,
+            unsaved: false,
+            source: None,
+        })
+        .collect();
+    storage.save_tabs(&tabs).unwrap();
+    storage
+        .set_setting(crate::state::ACTIVE_TAB_KEY, &(count - 1))
+        .unwrap();
+    storage
+}
+
+/// Draws frames until the strip of tabs stops moving (the kit's reveal of
+/// a clicked tab is animated), then checks that it starts on a tab's start
+/// and shows the active tab whole.
+fn strip_settles(app: &Fixture, cx: &mut TestAppContext, what: &str) {
+    for _ in 0..30 {
+        app.step(cx, |window, _| window.refresh());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (cut, (inside, overflows)) = cx.update(|cx| {
+        let workspace = app.workspace.read(cx);
+        (
+            workspace.tab_cut_at_start(cx),
+            workspace.active_tab_in_view(),
+        )
+    });
+    assert_eq!(cut, None, "{what}: a tab cut at the strip's start");
+    assert!(inside, "{what}: the active tab is whole");
+    assert!(overflows, "{what}: the tabs do not fit");
+}
+
+/// Forty tabs, in each layout: whatever scrolled the strip (a
+/// restore, a tab activated by key, a click on the first tab in view, a new
+/// tab, a closed one), it never starts inside a tab, and the active tab is
+/// whole.
+#[gpui_kit::test]
+fn the_tab_strip_never_starts_inside_a_tab(cx: &mut TestAppContext) {
+    let app = open(cx, query_tabs(40));
+    let layouts: [(Option<Box<dyn gpui_kit::Action>>, &str); 3] = [
+        (None, "one row"),
+        (Some(Box::new(actions::TabsOnSeveralRows)), "rows"),
+        (Some(Box::new(actions::TabsAtTheSide)), "side list"),
+    ];
+    for (action, layout) in layouts {
+        if let Some(action) = action {
+            app.step(cx, |window, cx| window.dispatch_action(action, cx));
+        }
+        strip_settles(&app, cx, &format!("{layout}, the last tab active"));
+        for step in 0..6 {
+            app.dispatch(cx, actions::PreviousTab);
+            strip_settles(&app, cx, &format!("{layout}, {step} back by key"));
+        }
+        app.dispatch(cx, actions::NextTab);
+        strip_settles(&app, cx, &format!("{layout}, one on by key"));
+        // The first tab in view, clicked: the kit's reveal shows part of
+        // the tab before it.
+        let first = cx.update(|cx| app.workspace.read(cx).first_tab_in_view(cx));
+        let first = first.expect("a tab in view");
+        app.click(cx, ("tab-title", first));
+        strip_settles(&app, cx, &format!("{layout}, tab {first} clicked"));
+        app.press(cx, &["secondary-t"]);
+        strip_settles(&app, cx, &format!("{layout}, a new tab"));
+        app.press(cx, &["secondary-w"]);
+        strip_settles(&app, cx, &format!("{layout}, a tab closed"));
+    }
 }

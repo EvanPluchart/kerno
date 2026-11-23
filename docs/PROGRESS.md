@@ -1502,3 +1502,6 @@ Still open (for the owner):
 - The command palette finds the words typed in any order, in a command's name, its section or its keywords,
   accents aside ("theme light", "sql new"); Escape closes it at once, with text typed or not (it cleared the
   text first). Tests: `ui_tests::k55` (3), each seen failing under a mutation.
+- With many tabs open, the strip no longer starts inside a tab (a bare "×", "uery 2"): once scrolled to a tab
+  (a reveal, a click) and still, it starts on a tab's start with the active tab whole, in the three layouts.
+  Tests: `ui_tests::k55` (one more), `tabs::tests`, each seen failing under a mutation.

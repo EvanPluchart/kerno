@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::{App, SharedString, Window, px};
+use gpui_kit::{App, Pixels, SharedString, Window, px};
 use kerno_core::TxState;
 use serde::{Deserialize, Serialize};
 
@@ -1085,6 +1085,78 @@ pub fn transaction_tip(
     }
 }
 
+/// Where a strip of tabs settles once scrolled to its tab `active` (K55):
+/// that tab whole, moving as little as possible, and no tab cut at the
+/// strip's start (the left of one row, the top of the rows and of the side
+/// list), as `whole_start` says. `None` when it is there already.
+pub fn settled_offset(
+    tabs: &[(Pixels, Pixels)],
+    view: (Pixels, Pixels),
+    offset: Pixels,
+    max: Pixels,
+    active: usize,
+) -> Option<Pixels> {
+    let (first, last) = *tabs.get(active)?;
+    let mut at = offset;
+    if last + at > view.1 {
+        at = view.1 - last;
+    }
+    if first + at < view.0 {
+        at = view.0 - first;
+    }
+    let at = at.max(-max).min(px(0.));
+    let at = whole_start(tabs, view, at, max, active).unwrap_or(at);
+    ((at - offset).abs() >= px(0.5)).then_some(at)
+}
+
+/// Where a strip of tabs is scrolled so that no tab is cut at its start,
+/// the tab `active` staying whole (K55); `None` when no tab is cut there,
+/// or when nothing keeps both. The cut tab is shown whole or scrolled out
+/// of view, whichever moves the strip less.
+///
+/// Along the strip's axis: `tabs` are where each tab starts and ends, laid
+/// out unscrolled (shown at their place plus `offset`); `view` is where
+/// the strip starts and ends; `offset` its scroll (0 or less), `max` how
+/// far it scrolls.
+fn whole_start(
+    tabs: &[(Pixels, Pixels)],
+    view: (Pixels, Pixels),
+    offset: Pixels,
+    max: Pixels,
+    active: usize,
+) -> Option<Pixels> {
+    // Laid out in fractions of a pixel: a tab one pixel under the edge is
+    // not cut.
+    let slack = px(1.);
+    let edge = view.0 - offset;
+    let (first, last) = *tabs.get(active)?;
+    let (cut_start, cut_end) = *tabs
+        .iter()
+        .find(|(start, end)| *start < edge - slack && *end > edge + slack)?;
+    // The strip starting at `start`: its offset, when that keeps the active
+    // tab whole and the strip can scroll there.
+    let from = |start: Pixels| {
+        let offset = view.0 - start;
+        let whole = first >= start - slack && last <= start + (view.1 - view.0) + slack;
+        (whole && offset <= px(0.) && offset >= -max - slack).then(|| offset.max(-max))
+    };
+    let shown = from(cut_start);
+    // The next tab (or row) after the cut one, at the start.
+    let hidden = tabs
+        .iter()
+        .map(|(start, _)| *start)
+        .filter(|start| *start >= cut_end - slack)
+        .reduce(|a, b| if b < a { b } else { a })
+        .and_then(from);
+    [shown, hidden].into_iter().flatten().reduce(|a, b| {
+        if (b - offset).abs() < (a - offset).abs() {
+            b
+        } else {
+            a
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1797,5 +1869,60 @@ mod tests {
             "Transaction failed (open for 4 min): a statement of it failed. Roll back (⌃8)."
         );
         assert_eq!(transaction_tip(TxState::Idle, four, None, None), "");
+    }
+
+    /// K55: no tab is cut at the strip's start; the active one stays whole.
+    #[test]
+    fn a_strip_never_starts_inside_a_tab() {
+        // Ten tabs 100 wide from 0, a strip 450 wide at 0 that scrolls to 600.
+        let tabs: Vec<(Pixels, Pixels)> = (0..10)
+            .map(|n| (px(100. * n as f32), px(100. * n as f32 + 100.)))
+            .collect();
+        let at = |offset: f32, active: usize| {
+            whole_start(&tabs, (px(0.), px(450.)), px(offset), px(600.), active)
+        };
+        // At a tab's start, nothing to do.
+        assert_eq!(at(0., 2), None);
+        assert_eq!(at(-300., 5), None);
+        // Tab 9 shown at the end (the strip scrolled to 550): tab 5 is cut
+        // with 50 showing; scrolled out, the strip moves by 50.
+        assert_eq!(at(-550., 9), Some(px(-600.)));
+        // 30 of tab 1 showing: out of view (30 on) moves less than shown
+        // whole (70 back).
+        assert_eq!(at(-170., 3), Some(px(-200.)));
+        // 80 of tab 1 showing: shown whole moves 20.
+        assert_eq!(at(-120., 3), Some(px(-100.)));
+        // The cut tab is the active one: shown whole, whatever it costs.
+        assert_eq!(at(-170., 1), Some(px(-100.)));
+        // Shown whole, the active tab would go past the end: scrolled out.
+        assert_eq!(at(-120., 5), Some(px(-200.)));
+        // Neither keeps the active tab whole (a strip narrower than it).
+        let narrow = whole_start(&tabs, (px(0.), px(80.)), px(-150.), px(920.), 1);
+        assert_eq!(narrow, None);
+        // The strip cannot scroll past its end: shown whole instead.
+        let short = whole_start(&tabs, (px(0.), px(450.)), px(-560.), px(560.), 9);
+        assert_eq!(short, None, "tab 9 would not stay whole either way");
+        let short = whole_start(&tabs, (px(0.), px(450.)), px(-560.), px(560.), 8);
+        assert_eq!(short, Some(px(-500.)));
+        // Rows: tabs side by side share a row; a row cut at the top.
+        let rows: Vec<(Pixels, Pixels)> = (0..12)
+            .map(|n| (px(32. * (n / 3) as f32), px(32. * (n / 3) as f32 + 32.)))
+            .collect();
+        let row = whole_start(&rows, (px(0.), px(64.)), px(-10.), px(64.), 4);
+        assert_eq!(row, Some(px(0.)));
+        // A strip that does not scroll, past an edge a pixel off: nothing.
+        assert_eq!(at(-0.6, 0), None);
+
+        // Settled: the active tab brought whole into view first, moving as
+        // little as possible, then the start on a tab's start.
+        let settled = |offset: f32, active: usize| {
+            settled_offset(&tabs, (px(0.), px(450.)), px(offset), px(600.), active)
+        };
+        assert_eq!(settled(0., 9), Some(px(-600.)));
+        // Tab 4 brought in by 50, then tab 0, cut, scrolled out.
+        assert_eq!(settled(0., 4), Some(px(-100.)));
+        assert_eq!(settled(-600., 2), Some(px(-200.)));
+        assert_eq!(settled(-300., 5), None, "there already");
+        assert_eq!(settled(-170., 3), Some(px(-200.)));
     }
 }
