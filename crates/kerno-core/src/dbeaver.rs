@@ -7,8 +7,9 @@
 //! connection format from `registry/DataSourceSerializerModern.java` and
 //! `registry/DataSourceParser.java`, the credentials file's cipher and key
 //! from `model/impl/app/DefaultValueEncryptor.java` and `BaseProjectImpl.java`,
-//! the script bindings from `BaseProjectImpl.loadMetadata`. Lenient: unknown
-//! fields are ignored, missing ones defaulted.
+//! the script bindings from `BaseProjectImpl.loadMetadata`, an SSH tunnel's
+//! jump servers from `net/ssh/SSHUtils.loadHostConfigurations` (K58). Lenient:
+//! unknown fields are ignored, missing ones defaulted.
 //!
 //! The archive is untrusted: its entries are read in memory, never written
 //! to disk, each one and all of them together under a cap, and an entry
@@ -21,7 +22,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::config::{
-    ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshConfig, TlsMode, folder_path,
+    ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshClient, SshConfig, TlsMode, folder_path,
 };
 use crate::environment::{self, EnvironmentDef, EnvironmentRules, Tint};
 
@@ -80,7 +81,8 @@ pub struct Connection {
     pub user: String,
     /// Kerno's connection, or why there is none.
     pub config: Result<ConnectionConfig, String>,
-    /// What DBeaver set that Kerno left at its default.
+    /// What DBeaver set that Kerno left out or at its default, each said
+    /// with what to check, in plain words.
     pub not_mapped: Vec<String>,
     /// The saved password and SSH secret; empty unless asked for.
     pub secrets: Secrets,
@@ -532,12 +534,15 @@ fn map_connection(
         match connection.port.parse::<u16>() {
             Ok(port) => config.port = port,
             Err(_) if connection.port.is_empty() => {}
-            Err(_) => not_mapped.push(format!("port “{}”", connection.port)),
+            Err(_) => not_mapped.push(format!(
+                "port “{}” is not a number: set to {}, check it",
+                connection.port, config.port
+            )),
         }
         // Not in the file (a project password): the engine's default user.
         if connection.user.is_empty() {
             not_mapped.push(format!(
-                "user name (not in the file; set to {})",
+                "no user name in the file (a project password?): set to {}, enter yours",
                 config.user
             ));
         } else {
@@ -583,7 +588,9 @@ fn map_connection(
                 }
                 // Named but not defined: DBeaver itself takes its default.
                 None => {
-                    not_mapped.push(format!("connection type “{name}” (put in local)"));
+                    not_mapped.push(format!(
+                        "connection type “{name}” is not defined in the file: put in Local"
+                    ));
                     environment::LOCAL.into()
                 }
             }
@@ -592,10 +599,13 @@ fn map_connection(
     if let Some(color) = text(cfg, "color") {
         match palette_color(&color, palette) {
             Some(key) => config.color = Some(key.to_string()),
-            None => not_mapped.push(format!("colour {color}")),
+            None => not_mapped.push(format!(
+                "colour {color} is close to no Kerno colour: none set, choose one"
+            )),
         }
     }
     let handlers = object(cfg, "handlers");
+    let mut jumps = None;
     for (handler, settings) in &handlers {
         if !flag(settings, "enabled").unwrap_or(false) {
             continue;
@@ -617,7 +627,12 @@ fn map_connection(
                             }
                         }
                         None => {
-                            not_mapped.push("SSH key kept in DBeaver (no key file)".into());
+                            not_mapped.push(
+                                "SSH key kept inside DBeaver, not in a file: the tunnel tries \
+                                 your SSH agent; save the key to a file and choose it on the \
+                                 SSH tab"
+                                    .into(),
+                            );
                             SshAuth::default()
                         }
                     },
@@ -629,11 +644,7 @@ fn map_connection(
                         SshAuth::Password
                     }
                 };
-                if text(props, "jumpServerSettings").is_some()
-                    || props.keys().any(|key| key.starts_with("jumpServer"))
-                {
-                    not_mapped.push("SSH jump server".into());
-                }
+                jumps = Some(jump_servers(props));
                 config.ssh = Some(SshConfig {
                     host: text(props, "host").unwrap_or_default(),
                     port: text(props, "port")
@@ -643,7 +654,8 @@ fn map_connection(
                     user: text(&creds, "user")
                         .or_else(|| text(settings, "user"))
                         .unwrap_or_else(|| {
-                            not_mapped.push("SSH user (not in the file; set to yours)".into());
+                            not_mapped
+                                .push("no SSH user in the file: set to yours, check it".into());
                             std::env::var("USER").unwrap_or_default()
                         }),
                     auth,
@@ -662,13 +674,18 @@ fn map_connection(
                 config.tls.cert_file = path(&["ssl.client.cert", "clientCert"]);
                 config.tls.key_file = path(&["ssl.client.key", "clientKey"]);
                 if props.keys().any(|key| key.ends_with(".value")) {
-                    not_mapped.push("certificates pasted in DBeaver (not files)".into());
+                    not_mapped.push(
+                        "certificate pasted in DBeaver, not in a file: save it to a file and \
+                         choose it on the SSL tab"
+                            .into(),
+                    );
                 }
                 config.tls.mode = if handler.as_str() == "postgre_ssl" {
                     match text(props, "sslMode").as_deref().map(TlsMode::parse) {
                         Some(Some(mode)) => mode,
                         Some(None) => {
-                            not_mapped.push("SSL mode".into());
+                            not_mapped
+                                .push("SSL mode unknown to Kerno: set to require, check it".into());
                             TlsMode::Require
                         }
                         None => TlsMode::Require,
@@ -684,8 +701,13 @@ fn map_connection(
                     }
                 };
             }
-            other => not_mapped.push(format!("network handler “{other}”")),
+            other => not_mapped.push(format!(
+                "network setting “{other}” left out: Kerno has no such setting"
+            )),
         }
+    }
+    if let Some(hops) = jumps {
+        apply_jumps(&mut config, hops, not_mapped);
     }
     connection.new_environment = new_environment;
     connection.config = match config.validate() {
@@ -694,6 +716,133 @@ fn map_connection(
         Err(error) => Err(format!("Its settings are incomplete: {error}.")),
     };
     connection
+}
+
+/// A jump server of an SSH tunnel (K58, D-124).
+struct Hop {
+    /// As `ssh -J` takes it, which is how the connection dialog saves it:
+    /// `[user@]host:port`.
+    spec: String,
+    /// What it logs in with that Kerno cannot give it, said.
+    note: Option<String>,
+}
+
+/// The jump servers of a tunnel's `properties`, as DBeaver's
+/// `SSHUtils.loadHostConfigurations` reads them: `jumpServer<i>.` keys from
+/// the first hop on, while `enabled`, at most `jumpServer.count` (5 when
+/// absent). A hop with no host refuses the chain, as DBeaver does.
+fn jump_servers(props: &Map<String, Value>) -> Result<Vec<Hop>, String> {
+    let count = text(props, "jumpServer.count")
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(5);
+    let mut hops = Vec::new();
+    for index in 0..count {
+        let key = |name: &str| format!("jumpServer{index}.{name}");
+        if !flag(props, &key("enabled")).unwrap_or(false) {
+            break;
+        }
+        let Some(host) = text(props, &key("host")) else {
+            return Err(format!(
+                "SSH jump server {} has no host in the file",
+                index + 1
+            ));
+        };
+        let port = text(props, &key("port"))
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(22);
+        let address = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        // Without one, OpenSSH logs in as the local user, as DBeaver does.
+        let user = text(props, &key("name"))
+            .map(|user| format!("{user}@"))
+            .unwrap_or_default();
+        // `-J` hands a hop Kerno's `-F` file only: no key file, agent socket,
+        // password or passphrase of its own (`openssh::tunnel_args`).
+        let hop = format!("jump server “{host}”");
+        let note = match text(props, &key("authType")).as_deref() {
+            Some("AGENT") => text(props, &key("agentAuthSockPath")).map(|socket| {
+                format!("{hop} logs in with your default SSH agent, not the one at {socket}")
+            }),
+            Some("PUBLIC_KEY") => Some(match text(props, &key("keyPath")) {
+                Some(path) => format!(
+                    "{hop}: its key file is not passed to it: load it with ssh-add {path}, or \
+                     name it for that host in ~/.ssh/config"
+                ),
+                None => format!(
+                    "{hop}: its SSH key is kept inside DBeaver: save it to a file, then load it \
+                     with ssh-add or name it for that host in ~/.ssh/config"
+                ),
+            }),
+            _ => Some(format!(
+                "{hop} logs in with a password, which Kerno cannot give it: set up a key for it \
+                 (your SSH agent or ~/.ssh/config)"
+            )),
+        };
+        hops.push(Hop {
+            spec: format!("{user}{address}:{port}"),
+            note,
+        });
+    }
+    Ok(hops)
+}
+
+/// Puts a tunnel's jump servers on Kerno's (K58, D-124): the system's
+/// OpenSSH and its `-J` list, which holds a chain, as the connection dialog
+/// saves them. Left out, and said, when the tunnel logs in with a password
+/// (OpenSSH cannot) or when OpenSSH could not take the result.
+fn apply_jumps(
+    config: &mut ConnectionConfig,
+    hops: Result<Vec<Hop>, String>,
+    not_mapped: &mut Vec<String>,
+) {
+    let hops = match hops {
+        Ok(hops) => hops,
+        Err(why) => {
+            not_mapped.push(format!(
+                "{why}: no jump server imported, add them on the SSH tab"
+            ));
+            return;
+        }
+    };
+    let Some(ssh) = config.ssh.as_ref().filter(|_| !hops.is_empty()) else {
+        return;
+    };
+    let chain: Vec<&str> = hops.iter().map(|hop| hop.spec.as_str()).collect();
+    let named = format!(
+        "SSH jump {} {}",
+        if hops.len() == 1 { "server" } else { "servers" },
+        chain.join(", ")
+    );
+    if ssh.auth == SshAuth::Password {
+        not_mapped.push(format!(
+            "{named} left out: Kerno goes through jump servers with the system's OpenSSH, which \
+             does not log in to the tunnel with a password: choose a key file or your SSH agent \
+             on the SSH tab, then add them as jump hosts"
+        ));
+        return;
+    }
+    let mut with = config.clone();
+    if let Some(ssh) = with.ssh.as_mut() {
+        ssh.client = SshClient::OpenSsh;
+        ssh.jump = Some(chain.join(","));
+    }
+    match with.validate() {
+        Err(error) if config.validate().is_ok() => {
+            let why = match error {
+                crate::Error::Config(why) => why,
+                other => other.to_string(),
+            };
+            not_mapped.push(format!("{named} left out ({why}): add them on the SSH tab"));
+        }
+        _ => {
+            *config = with;
+            not_mapped.extend(hops.into_iter().filter_map(|hop| hop.note));
+        }
+    }
 }
 
 /// A Kerno environment made of a DBeaver connection type (the keys
@@ -985,7 +1134,10 @@ mod tests {
             (Engine::MariaDb, "maria", "staging")
         );
         assert_eq!(config.color, None);
-        assert_eq!(legacy.not_mapped, ["colour 12,34,56"]);
+        assert_eq!(
+            legacy.not_mapped,
+            ["colour 12,34,56 is close to no Kerno colour: none set, choose one"]
+        );
 
         let notes = find(&export, "Notes").config.as_ref().unwrap();
         assert_eq!(notes.engine, Engine::Sqlite);
@@ -1032,7 +1184,8 @@ mod tests {
     }
 
     /// A user's report of 2026-11-23: a tunnel on port 2222 was imported
-    /// on 22. DBeaver writes a handler's numbers as it read them, doubles.
+    /// on 22. DBeaver writes a handler's numbers as it read them, doubles;
+    /// a jump server's port and count too (K58).
     #[test]
     fn a_port_written_as_a_double_is_read() {
         for (written, port) in [
@@ -1047,7 +1200,11 @@ mod tests {
                         "host": "db.example.com", "port": 5433.0, "database": "shop",
                         "handlers": {"ssh_tunnel": {
                             "enabled": true,
-                            "properties": {"host": "bastion.example.com", "port": written}
+                            "properties": {"host": "bastion.example.com", "port": written,
+                                "authType": "AGENT", "jumpServer.count": 1.0,
+                                "jumpServer0.enabled": true,
+                                "jumpServer0.host": "jump.example.com",
+                                "jumpServer0.port": written, "jumpServer0.authType": "AGENT"}
                         }}
                     }
                 }}
@@ -1056,7 +1213,206 @@ mod tests {
             let config = find(&export, "Shop").config.as_ref().unwrap();
             assert_eq!(config.port, 5433, "{file}");
             assert_eq!(config.ssh.as_ref().unwrap().port, port, "{file}");
+            assert_eq!(
+                config.ssh.as_ref().unwrap().jump.as_deref(),
+                Some(format!("jump.example.com:{port}").as_str()),
+                "{file}"
+            );
         }
+    }
+
+    /// A data-sources file with one PostgreSQL connection whose tunnel has
+    /// these `properties`, and the tunnel's saved `credentials`.
+    fn tunnel(properties: Value, credentials: Value) -> Vec<u8> {
+        let sources = serde_json::json!({"connections": {"pg": {
+            "provider": "postgresql", "driver": "postgres-jdbc", "name": "Shop",
+            "configuration": {"host": "db.internal", "port": "5432", "user": "u",
+                "handlers": {"ssh_tunnel": {"enabled": true, "save-password": true,
+                    "properties": properties}}}
+        }}});
+        let credentials = serde_json::json!({"pg": {"network/ssh_tunnel": credentials}});
+        let credentials = encrypt(credentials.to_string().as_bytes(), [3; 16]);
+        archive(
+            "P",
+            &[
+                (".dbeaver/data-sources.json", sources.to_string().as_bytes()),
+                (".dbeaver/credentials-config.json", &credentials),
+            ],
+        )
+    }
+
+    /// K58 (D-124): the jump servers of a tunnel, written with the keys of
+    /// DBeaver's `SSHUtils.saveHostConfiguration`, become Kerno's jump hosts
+    /// through the system's OpenSSH, in their order, as the connection dialog
+    /// saves them; what a hop logs in with that Kerno cannot give it is said.
+    #[test]
+    fn a_tunnels_jump_servers_become_openssh_jump_hosts() {
+        let read_one = |properties: Value, credentials: Value| {
+            let file = tunnel(properties, credentials);
+            let mut export = read(&file, true, &envs(), &PALETTE).unwrap();
+            export.connections.remove(0)
+        };
+        // One hop with its key file, behind a tunnel with a key file.
+        let shop = read_one(
+            serde_json::json!({
+                "host": "bastion.example.com", "port": 22.0, "authType": "PUBLIC_KEY",
+                "keyPath": "/home/me/.ssh/id_ed25519",
+                "jumpServer.count": 1.0,
+                "jumpServer0.enabled": true, "jumpServer0.host": "jump.example.com",
+                "jumpServer0.port": 2222.0, "jumpServer0.name": "hop",
+                "jumpServer0.authType": "PUBLIC_KEY", "jumpServer0.keyPath": "/home/me/.ssh/hop"
+            }),
+            serde_json::json!({"user": "ops", "password": "key-secret",
+                "jumpServer0.password": "hop-secret"}),
+        );
+        let config = shop.config.as_ref().unwrap();
+        let ssh = config.ssh.as_ref().unwrap();
+        assert_eq!(
+            (ssh.client, ssh.jump.as_deref(), ssh.host.as_str(), ssh.port),
+            (
+                SshClient::OpenSsh,
+                Some("hop@jump.example.com:2222"),
+                "bastion.example.com",
+                22
+            )
+        );
+        assert_eq!(
+            ssh.auth,
+            SshAuth::KeyFile {
+                path: "/home/me/.ssh/id_ed25519".into()
+            }
+        );
+        assert_eq!(
+            shop.not_mapped,
+            [
+                "jump server “jump.example.com”: its key file is not passed to it: load it with \
+                 ssh-add /home/me/.ssh/hop, or name it for that host in ~/.ssh/config"
+            ]
+        );
+        // The hop's saved passphrase has no place in Kerno: never in the tunnel's.
+        assert_eq!(
+            shop.secrets.ssh_key_passphrase.as_ref().map(Secret::expose),
+            Some("key-secret")
+        );
+        assert_eq!(shop.secrets.ssh_password, None);
+        assert!(!format!("{:?}", shop.secrets).contains("hop-secret"));
+
+        // Two hops through the agent, the second without a user, on IPv6, its own agent
+        // socket said; the count absent (DBeaver reads up to five); a third hop not enabled
+        // ends the chain, a fourth after it is not read.
+        let chain = read_one(
+            serde_json::json!({
+                "host": "bastion.example.com", "port": "22", "authType": "AGENT",
+                "jumpServer0.enabled": true, "jumpServer0.host": "first.example.com",
+                "jumpServer0.name": "ops", "jumpServer0.authType": "AGENT",
+                "jumpServer1.enabled": "true", "jumpServer1.host": "fd00::5",
+                "jumpServer1.port": 0, "jumpServer1.authType": "AGENT",
+                "jumpServer1.agentAuthSockPath": "/tmp/agent.sock",
+                "jumpServer2.enabled": false, "jumpServer2.host": "off.example.com",
+                "jumpServer3.enabled": true, "jumpServer3.host": "after.example.com"
+            }),
+            serde_json::json!({"user": "ops"}),
+        );
+        let ssh = chain.config.as_ref().unwrap().ssh.as_ref().unwrap();
+        assert_eq!(
+            (ssh.client, ssh.jump.as_deref()),
+            (
+                SshClient::OpenSsh,
+                Some("ops@first.example.com:22,[fd00::5]:22")
+            )
+        );
+        assert_eq!(
+            chain.not_mapped,
+            [
+                "jump server “fd00::5” logs in with your default SSH agent, not the one at \
+                 /tmp/agent.sock"
+            ]
+        );
+
+        // A tunnel that logs in with a password: OpenSSH cannot, the hop is left out, said;
+        // the tunnel and its password as before.
+        let password = read_one(
+            serde_json::json!({
+                "host": "bastion.example.com", "port": 22,
+                "jumpServer.count": 1, "jumpServer0.enabled": true,
+                "jumpServer0.host": "jump.example.com", "jumpServer0.port": 22,
+                "jumpServer0.name": "hop"
+            }),
+            serde_json::json!({"user": "ops", "password": "ssh-secret",
+                "jumpServer0.password": "hop-secret"}),
+        );
+        let ssh = password.config.as_ref().unwrap().ssh.as_ref().unwrap();
+        assert_eq!(
+            (ssh.client, ssh.jump.as_deref(), &ssh.auth),
+            (SshClient::Builtin, None, &SshAuth::Password)
+        );
+        assert_eq!(
+            password.secrets.ssh_password.as_ref().map(Secret::expose),
+            Some("ssh-secret")
+        );
+        assert_eq!(
+            password.not_mapped,
+            [
+                "SSH jump server hop@jump.example.com:22 left out: Kerno goes through jump servers \
+                 with the system's OpenSSH, which does not log in to the tunnel with a password: \
+                 choose a key file or your SSH agent on the SSH tab, then add them as jump hosts"
+            ]
+        );
+
+        // A hop OpenSSH could not take, a hop with no host: left out, said, the tunnel kept.
+        for (hop, said) in [
+            (
+                serde_json::json!({"jumpServer0.enabled": true, "jumpServer0.host": "jump;id",
+                    "jumpServer0.authType": "AGENT"}),
+                "SSH jump server jump;id:22 left out (the jump host “jump;id:22” has characters \
+                 OpenSSH cannot take: use letters, digits and . - _ @ : [ ] (and , between \
+                 hosts)): add them on the SSH tab",
+            ),
+            (
+                serde_json::json!({"jumpServer0.enabled": true, "jumpServer0.authType": "AGENT"}),
+                "SSH jump server 1 has no host in the file: no jump server imported, add them on \
+                 the SSH tab",
+            ),
+        ] {
+            let mut properties = serde_json::json!({"host": "bastion.example.com",
+                "authType": "AGENT"});
+            properties
+                .as_object_mut()
+                .unwrap()
+                .extend(hop.as_object().unwrap().clone());
+            let left = read_one(properties, serde_json::json!({"user": "ops"}));
+            let ssh = left.config.as_ref().unwrap().ssh.as_ref().unwrap();
+            assert_eq!(
+                (ssh.client, ssh.jump.as_deref()),
+                (SshClient::Builtin, None)
+            );
+            assert_eq!(left.not_mapped, [said]);
+        }
+
+        // A hop with a password, one with its key kept inside DBeaver: imported, said.
+        let said = read_one(
+            serde_json::json!({
+                "host": "bastion.example.com", "authType": "AGENT",
+                "jumpServer0.enabled": true, "jumpServer0.host": "a.example.com",
+                "jumpServer1.enabled": true, "jumpServer1.host": "b.example.com",
+                "jumpServer1.authType": "PUBLIC_KEY"
+            }),
+            serde_json::json!({"user": "ops", "jumpServer1.keyValue": "-----BEGIN"}),
+        );
+        let ssh = said.config.as_ref().unwrap().ssh.as_ref().unwrap();
+        assert_eq!(
+            ssh.jump.as_deref(),
+            Some("a.example.com:22,b.example.com:22")
+        );
+        assert_eq!(
+            said.not_mapped,
+            [
+                "jump server “a.example.com” logs in with a password, which Kerno cannot give it: \
+                 set up a key for it (your SSH agent or ~/.ssh/config)",
+                "jump server “b.example.com”: its SSH key is kept inside DBeaver: save it to a \
+                 file, then load it with ssh-add or name it for that host in ~/.ssh/config",
+            ]
+        );
     }
 
     #[test]
@@ -1135,7 +1491,7 @@ mod tests {
         );
         assert_eq!(
             find(&export, "D").not_mapped,
-            ["connection type “gone” (put in local)"]
+            ["connection type “gone” is not defined in the file: put in Local"]
         );
         // Once Preprod is here, nothing is created again.
         let mut here = envs();
@@ -1168,7 +1524,7 @@ mod tests {
         assert_eq!(locked.config.as_ref().unwrap().user, "root");
         assert_eq!(
             locked.not_mapped,
-            ["user name (not in the file; set to root)"]
+            ["no user name in the file (a project password?): set to root, enter yours"]
         );
         // An encrypted configuration cannot be read at all.
         let dbp = archive("P", &[(".dbeaver/data-sources.json", &garbage)]);

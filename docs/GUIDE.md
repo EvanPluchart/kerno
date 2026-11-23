@@ -183,7 +183,10 @@ unlinked cannot read any of the old secrets. Files written by earlier versions s
 DBeaver, File ▸ Export ▸ Project: a `.dbp` file) or a `data-sources.json`. It lists the folders and their
 connections, ticked, or greyed with the reason; untick what you do not want, then Import. The scripts become
 saved queries of their connection. **Also import the saved passwords** (off by default) puts them in this
-computer's secret store. Importing the same file again adds nothing twice.
+computer's secret store. Importing the same file again adds nothing twice. An SSH tunnel's jump servers come
+as its jump hosts (through the system's OpenSSH). Under each connection the preview says what was left out and
+what to check ("To check: certificate pasted in DBeaver, not in a file: save it to a file and choose it on the
+SSL tab"), and the report after the import lists them again, connection by connection.
 
 ## AI assistant and what it sends
 

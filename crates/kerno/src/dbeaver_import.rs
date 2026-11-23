@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -215,6 +216,28 @@ impl DbeaverImport {
         }
     }
 
+    /// What row `index` leaves out and what to check, each once (K58): what
+    /// the file set that Kerno could not take, and its DBeaver type when that
+    /// is not created. The preview and the report say the same.
+    pub fn to_check(&self, index: usize) -> Vec<String> {
+        let connection = &self.export.connections[index];
+        let mut items = connection.not_mapped.clone();
+        let file = connection.config.as_ref().map(|c| c.environment.as_str());
+        if let Some(def) = (connection.new_environment.as_deref())
+            .and_then(|made| self.new_environment(made))
+            .filter(|_| !self.create_environments)
+            .filter(|_| file == Ok(self.environment_id(index).as_str()))
+        {
+            items.push(format!(
+                "connection type “{}” not created: put in Local",
+                def.name
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        items.retain(|item| seen.insert(item.clone()));
+        items
+    }
+
     fn new_environment(&self, id: &str) -> Option<&EnvironmentDef> {
         self.export.new_environments.iter().find(|def| def.id == id)
     }
@@ -294,19 +317,13 @@ impl DbeaverImport {
         let plans: Vec<(String, Option<ConnectionConfig>, Vec<String>)> = (self.export.connections)
             .iter()
             .zip(chosen)
-            .map(|(c, id)| {
+            .enumerate()
+            .map(|(index, (c, id))| {
                 let mut config = c.config.as_ref().ok().cloned();
-                let mut not_mapped = c.not_mapped.clone();
                 if let Some(config) = &mut config {
                     config.environment = created.get(&id).cloned().unwrap_or(id);
-                    if let Some(def) = (c.new_environment.as_deref())
-                        .and_then(|made| self.new_environment(made))
-                        .filter(|_| !self.create_environments)
-                    {
-                        not_mapped.push(format!("connection type “{}” (not created)", def.name));
-                    }
                 }
-                (c.id.clone(), config, not_mapped)
+                (c.id.clone(), config, self.to_check(index))
             })
             .collect();
         let scripts = self.export.scripts.clone();
@@ -346,7 +363,7 @@ impl DbeaverImport {
                         ids.insert(dbeaver_id.clone(), id);
                         written += 1;
                         if !not_mapped.is_empty() {
-                            notes.push(format!("{}: {}", config.name, not_mapped.join(", ")));
+                            notes.push((config.name.clone(), not_mapped.clone()));
                         }
                     }
                     (Fate::Exists(id), _) => {
@@ -519,8 +536,10 @@ impl DbeaverImport {
             }
             detail.retain(|part| !part.is_empty());
             let detail = detail.join(" · ");
+            let to_check = self.to_check(index);
             let (enabled, note) = match &self.fates[index] {
-                Fate::Import(_) => (true, None),
+                Fate::Import(_) if to_check.is_empty() => (true, None),
+                Fate::Import(_) => (true, Some(format!("To check: {}.", to_check.join("; ")))),
                 Fate::Exists(_) => (false, Some("Already here: skipped".to_string())),
                 Fate::Repeat(first) => (
                     false,
@@ -566,12 +585,16 @@ impl DbeaverImport {
                         }),
                 )
                 .when_some(note, |this, note| {
+                    let note = SharedString::from(note);
                     this.child(
                         div()
+                            .id(("dbeaver-note", index))
+                            .test_support()
                             .pl(px(24.))
                             .text_xs()
                             .text_color(if enabled { muted } else { warning })
-                            .child(SharedString::from(note)),
+                            .child(note.clone())
+                            .test_text(note),
                     )
                 })
                 .into_any_element()
@@ -727,18 +750,27 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// What the import wrote, and what it left at Kerno's defaults.
-fn report(connections: usize, queries: usize, notes: &[String], skipped: &[String]) -> String {
+/// What the import wrote, then, connection by connection, what it left out
+/// and what to check (K58).
+fn report(
+    connections: usize,
+    queries: usize,
+    notes: &[(String, Vec<String>)],
+    skipped: &[String],
+) -> String {
     let mut message = format!(
         "Imported {} and {}.",
         count(connections, "connection", "connections"),
         count(queries, "saved query", "saved queries")
     );
     if !notes.is_empty() {
-        message.push_str(&format!(" Left at Kerno's defaults: {}.", notes.join("; ")));
+        message.push_str("\nTo check:");
+        for (name, items) in notes {
+            message.push_str(&format!("\n• {name}: {}.", items.join("; ")));
+        }
     }
     if !skipped.is_empty() {
-        message.push_str(&format!(" Scripts skipped: {}.", skipped.join(", ")));
+        message.push_str(&format!("\nScripts skipped: {}.", skipped.join(", ")));
     }
     message
 }

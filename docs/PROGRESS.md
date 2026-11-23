@@ -1516,3 +1516,15 @@ Still open (for the owner):
   in both fields. Found on the way, in both fields: Enter that took a proposal also applied the condition as it
   was before (MySQL showed it); Enter now only takes the proposal (`docs/plans/M12.md`, K59; D-125).
 - Tests: `ui_tests::k59` (2, PostgreSQL and MySQL, fixtures read only), each seen failing under a mutation.
+
+## 2026-11-24 — K58: the DBeaver import takes jump servers, and says what it leaves out
+
+- A DBeaver tunnel's jump servers (`jumpServer<i>.` properties, read as DBeaver's `SSHUtils` reads them) now
+  come as the connection's jump hosts through the system's OpenSSH, a chain in order, as Kerno's dialog saves
+  them; what a hop logs in with that Kerno cannot give it (its own key file, agent socket, password) is said
+  with what to do; behind a tunnel that logs in with a password they are left out, said (D-124).
+- Every note of the import says what was left out, then what to check, once per connection: under each
+  connection of the preview ("To check: …") and connection by connection in the report.
+- Tests: core `dbeaver::tests::a_tunnels_jump_servers_become_openssh_jump_hosts`, the double-port test
+  extended to the hops, UI `the_preview_and_the_report_say_what_to_check_for_each_connection`, each seen
+  failing under a mutation (`docs/plans/M12.md`, K58). Fixtures written from DBeaver's source.

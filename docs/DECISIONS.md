@@ -3887,3 +3887,33 @@ foreign key was marked only in a table's data and in a result that could be edit
 - **What the result's field also hears.** Being an editor in a query tab, the field now gets the keys bound
   under `QueryTab > mode == editor` (⌘\, ⌥↑/⌥↓, F4, ⇧F4, ⌘⇧L…), which act on the query editor, as they already
   did from the value panel's editor. Left as is: none of them writes in the field or runs its condition.
+
+## D-124 — A DBeaver tunnel's jump servers, and what an import leaves out said with what to do (K58; 2026-11-23)
+
+K41 reported a tunnel's jump server as not imported. DBeaver keeps them in the SSH handler's properties, as
+`SSHUtils.saveHostConfiguration` writes them: `jumpServer.count`, then `jumpServer<i>.enabled`, `.host`,
+`.port`, `.name` (the user), `.authType`, `.keyPath`, `.agentAuthSockPath`, and in the credentials file
+`jumpServer<i>.password` and `.keyValue`; hop 0 is the first one reached.
+
+- **As Kerno's dialog saves them.** The hops become the tunnel's jump hosts (J2): the system's OpenSSH and its
+  `-J` list, `[user@]host:port` in DBeaver's order, a chain of any length (OpenSSH's own limit); the port is
+  always written (DBeaver uses it, never `~/.ssh/config`'s), the user left out when DBeaver has none (OpenSSH
+  then logs in as the local user, as DBeaver does), an IPv6 address in brackets. Read while `enabled`, at most
+  `jumpServer.count` (5 when absent, DBeaver's default); numbers written as doubles are read (`2222.0`).
+- **What a hop cannot have in Kerno.** `ssh -J` hands a hop Kerno's `-F` file only, never `-i`,
+  `IdentityAgent` or a passphrase answer for another key; and OpenSSH logs in with no password here. So a hop's
+  key file, its agent socket, its password and a key kept inside DBeaver are said, each with what to do
+  (`ssh-add <path>`, or the host in `~/.ssh/config`); the hop is imported anyway, with its host, port and user,
+  so the connection opens once the user's SSH setup has the key. A hop's saved password or passphrase is not
+  imported: Kerno has no place for one (its secrets are the database password, the tunnel's password and the
+  tunnel key's passphrase) and its OpenSSH tunnel would not use it; never put in the tunnel's own.
+- **Left out, said.** A tunnel that logs in with a password keeps Kerno's own client, its password and no jump
+  host: OpenSSH cannot log in with a password, and Kerno's own client has no jump hosts. A chain OpenSSH could
+  not take (a word a shell would read: Kerno's rule for jump hosts) or a hop with no host: left out, said, the
+  tunnel as before.
+- **Said with what to check.** Every note of an import says what was left out, then what to do, in plain
+  words ("certificate pasted in DBeaver, not in a file: save it to a file and choose it on the SSL tab"), once
+  per connection. The preview shows them under each connection to import ("To check: …"), and the report after
+  the import lists them connection by connection, one line each; both come from one list
+  (`DbeaverImport::to_check`), DBeaver's type left uncreated included. A connection imported before (by its
+  server, as K41) is still skipped: a re-import does not add the jump host to it.

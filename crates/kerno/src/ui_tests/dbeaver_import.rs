@@ -285,3 +285,74 @@ fn a_file_that_is_not_an_export_says_so(cx: &mut TestAppContext) {
     assert_eq!(*opened.borrow(), Some(false));
     assert!(app.storage.connections().unwrap().is_empty());
 }
+
+/// K58 (D-124): under each connection the preview says what was left out and
+/// what to check, once each; the import's report says the same, connection by
+/// connection. A tunnel's jump server comes as an OpenSSH jump host.
+#[gpui_kit::test]
+fn the_preview_and_the_report_say_what_to_check_for_each_connection(cx: &mut TestAppContext) {
+    use super::tool_wizards::paints;
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data-sources.json");
+    let json = serde_json::json!({
+        "connection-types": {"pp": {"name": "Preprod", "color": "214,250,207"}},
+        "connections": {
+            "a": {"provider": "postgresql", "driver": "postgres-jdbc", "name": "Hop",
+                "configuration": {"host": "db.internal", "user": "u", "type": "pp",
+                    "handlers": {
+                        "ssh_tunnel": {"enabled": true, "user": "ops", "properties": {
+                            "host": "bastion.example.com", "port": 22.0, "authType": "AGENT",
+                            "jumpServer.count": 1.0, "jumpServer0.enabled": true,
+                            "jumpServer0.host": "jump.example.com", "jumpServer0.port": 2222.0,
+                            "jumpServer0.name": "hop", "jumpServer0.authType": "PUBLIC_KEY",
+                            "jumpServer0.keyPath": "/keys/hop"}},
+                        "postgre_ssl": {"enabled": true, "properties": {"sslMode": "require",
+                            "ssl.ca.cert.value": "-----BEGIN", "ssl.client.cert.value": "-----BEGIN"}}
+                    }}},
+            "b": {"provider": "mysql", "driver": "mysql8", "name": "Plain",
+                "configuration": {"host": "b", "user": "u"}}
+        }
+    });
+    std::fs::write(&path, json.to_string()).unwrap();
+    let key = "jump server “jump.example.com”: its key file is not passed to it: load it with \
+               ssh-add /keys/hop, or name it for that host in ~/.ssh/config";
+    let pasted = "certificate pasted in DBeaver, not in a file: save it to a file and choose it \
+                  on the SSL tab";
+    let not_created = "connection type “Preprod” not created: put in Local";
+
+    let view = app.dbeaver_preview(cx, path);
+    // Each item once, under its connection; nothing under the other.
+    assert_eq!(
+        cx.update(|cx| view.read(cx).to_check(0)),
+        [pasted.to_string(), key.to_string()]
+    );
+    assert!(app.has(cx, ("dbeaver-note", 0usize)));
+    assert!(paints(&app, cx, &format!("To check: {pasted}; {key}.")));
+    assert!(!app.has(cx, ("dbeaver-note", 1usize)));
+    // DBeaver's type not created: said there too.
+    cx.update(|cx| view.update(cx, |view, cx| view.set_create_environments(false, cx)));
+    assert!(paints(
+        &app,
+        cx,
+        &format!("To check: {pasted}; {key}; {not_created}.")
+    ));
+
+    let done = app.dbeaver_import(cx, &view);
+    assert!(
+        done.contains(&format!(
+            "Imported 2 connections and 0 saved queries.\nTo check:\n• Hop: {pasted}; {key}; \
+             {not_created}."
+        )),
+        "{done}"
+    );
+    assert!(!done.contains("Plain:"), "{done}");
+    let ssh = app.by_name("Hop").1.ssh.unwrap();
+    assert_eq!(
+        (ssh.client, ssh.jump.as_deref()),
+        (
+            kerno_core::config::SshClient::OpenSsh,
+            Some("hop@jump.example.com:2222")
+        )
+    );
+}

@@ -111,7 +111,8 @@ screenshot, name, colour or wording of either is included.
     `ProjectExportWizard.java` (the archive's layout), `DataSourceSerializerModern.java` and
     `DataSourceParser.java` (the connections, folders, connection types, network handlers and saved
     credentials), `DefaultValueEncryptor.java` and `BaseProjectImpl.java` (the credentials file's cipher, its
-    key and the script bindings of `project-metadata.json`).
+    key and the script bindings of `project-metadata.json`), `SSHUtils.java` (an SSH tunnel's jump servers,
+    K58).
 - **Beekeeper Studio** (https://github.com/beekeeper-studio/beekeeper-studio, GPL-3.0) was read to understand
   behaviour and user experience only. None of its code was translated or copied, and its commercially
   licensed directories were never opened.
