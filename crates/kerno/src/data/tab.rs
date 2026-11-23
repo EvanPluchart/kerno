@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::base::input::{self, IndentInline};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
@@ -57,6 +58,9 @@ use crate::tabs::{TabSnapshot, Target};
 const READ_ONLY_CONNECTION: &str = "read-only connection";
 const VIEW: &str = "view";
 const NO_KEY: &str = "no key";
+/// Why an action that needs the server is greyed while the connection is
+/// closed (K56), in a button's tooltip.
+const NOT_CONNECTED: &str = "not connected";
 
 /// What a data tab asks of the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +701,15 @@ impl DataTab {
         )
     }
 
+    /// What a closed connection leaves of the tab, in one sentence (K56).
+    fn not_connected(&self, cx: &App) -> String {
+        format!(
+            "“{}” is not connected: connect it to read or change the rows of {}.",
+            self.connection_name(cx),
+            self.table.name
+        )
+    }
+
     fn connection_name(&self, cx: &App) -> String {
         self.connections
             .read(cx)
@@ -839,7 +852,8 @@ impl DataTab {
         let place = self
             .grid
             .as_ref()
-            .filter(|_| self.state == State::Ready)
+            // Rows kept on screen while the connection was closed (K56).
+            .filter(|_| matches!(self.state, State::Ready | State::Waiting))
             .map(|table| {
                 let table = table.read(cx);
                 Place {
@@ -1279,6 +1293,14 @@ impl DataTab {
     /// Whether the page can change. With changes waiting it cannot: they
     /// are about the rows on screen.
     fn free_to_move(&self, window: &mut Window, cx: &mut App) -> bool {
+        // Each of them reads the rows again (K56).
+        if !self.connected(cx) {
+            window.push_notification(
+                Notification::warning(SharedString::from(self.not_connected(cx))),
+                cx,
+            );
+            return false;
+        }
         if self.pending_count(cx) == 0 {
             return true;
         }
@@ -1919,6 +1941,9 @@ impl DataTab {
 
     /// Whether the rows take changes, and why not when they do not.
     fn edits(&self, cx: &App) -> edit::Allowed {
+        if !self.connected(cx) {
+            return Err(Some(self.not_connected(cx).into()));
+        }
         if self.pending(cx).is_some() {
             return Ok(());
         }
@@ -2198,6 +2223,11 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<ExportDialog>> {
+        if !self.connected(cx) {
+            let why = SharedString::from(self.not_connected(cx));
+            window.push_notification(Notification::warning(why), cx);
+            return None;
+        }
         export_dialog::open(
             self.connections.clone(),
             self.target.clone(),
@@ -2227,6 +2257,11 @@ impl DataTab {
     /// Shows the statements of the pending changes and, once confirmed,
     /// applies them in one transaction.
     pub fn review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.connected(cx) {
+            let why = SharedString::from(self.not_connected(cx));
+            window.push_notification(Notification::warning(why), cx);
+            return;
+        }
         // What is being typed counts.
         if let Some(table) = &self.grid {
             table.update(cx, |table, cx| {
@@ -2442,8 +2477,17 @@ impl DataTab {
         let pending = self.pending_count(cx);
         let has_selection = self.selection(cx).is_some();
         let busy = self.state == State::Loading || self.applying;
-        let action = |id: &'static str, label: &'static str, tip: &'static str| {
+        fn action(id: &'static str, label: &'static str, tip: impl Into<SharedString>) -> Button {
             Button::new(id).ghost().small().label(label).tooltip(tip)
+        }
+        // What needs the server is greyed while the connection is closed,
+        // and says so (K56).
+        let offline = !self.connected(cx);
+        let needs_server = |tip: &'static str| -> SharedString {
+            match offline {
+                true => format!("{tip} ({NOT_CONNECTED})").into(),
+                false => tip.into(),
+            }
         };
         let chrome = self.chrome(cx);
         h_flex()
@@ -2473,13 +2517,17 @@ impl DataTab {
                     ))),
             )
             .child(
-                action("data-refresh", "Refresh", "Read the rows again")
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                action(
+                    "data-refresh",
+                    "Refresh",
+                    needs_server("Read the rows again"),
+                )
+                .disabled(busy || offline)
+                .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
             )
             // Pending changes stop auto-refresh: no use for it then, and
             // the toolbar keeps its room for them.
-            .when(pending == 0, |bar| {
+            .when(pending == 0 && !offline, |bar| {
                 bar.child(auto_refresh_button(
                     "data-auto-refresh",
                     self.auto_refresh(),
@@ -2489,17 +2537,17 @@ impl DataTab {
             })
             .when(editable, |bar| {
                 bar.child(
-                    action("data-add-row", "Add row", "Add an empty row")
-                        .disabled(self.read_failed())
+                    action("data-add-row", "Add row", needs_server("Add an empty row"))
+                        .disabled(self.read_failed() || offline)
                         .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
                 )
                 .child(
                     action(
                         "data-duplicate",
                         "Duplicate",
-                        "Copy the selected rows as new rows",
+                        needs_server("Copy the selected rows as new rows"),
                     )
-                    .disabled(!has_selection)
+                    .disabled(!has_selection || offline)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.duplicate_rows(None, window, cx)),
                     ),
@@ -2508,9 +2556,9 @@ impl DataTab {
                     action(
                         "data-delete",
                         "Delete",
-                        "Mark the selected rows for deletion",
+                        needs_server("Mark the selected rows for deletion"),
                     )
-                    .disabled(!has_selection)
+                    .disabled(!has_selection || offline)
                     .on_click(
                         cx.listener(|this, _, window, cx| this.delete_rows(None, window, cx)),
                     ),
@@ -2519,9 +2567,9 @@ impl DataTab {
                     action(
                         "data-set-null",
                         "Set NULL",
-                        "Set the selected cells to NULL",
+                        needs_server("Set the selected cells to NULL"),
                     )
-                    .disabled(!has_selection)
+                    .disabled(!has_selection || offline)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_selected(CellValue::Null, window, cx)
                     })),
@@ -2530,9 +2578,9 @@ impl DataTab {
                     action(
                         "data-set-default",
                         "Set default",
-                        "Give the selected cells their column's default",
+                        needs_server("Give the selected cells their column's default"),
                     )
-                    .disabled(!has_selection)
+                    .disabled(!has_selection || offline)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_selected(CellValue::Expression("DEFAULT".into()), window, cx)
                     })),
@@ -2558,8 +2606,9 @@ impl DataTab {
                     action(
                         "data-export",
                         "Export…",
-                        "Write every row matching the filter to a file",
+                        needs_server("Write every row matching the filter to a file"),
                     )
+                    .disabled(offline)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.export(window, cx);
                     })),
@@ -2587,9 +2636,9 @@ impl DataTab {
                     action(
                         "data-review",
                         "Review SQL",
-                        "Show the statements of the pending changes",
+                        needs_server("Show the statements of the pending changes"),
                     )
-                    .disabled(self.applying)
+                    .disabled(self.applying || offline)
                     .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                 )
                 .child(
@@ -2597,8 +2646,10 @@ impl DataTab {
                         .primary()
                         .small()
                         .label("Apply")
-                        .tooltip("Review the SQL, then apply it in one transaction")
-                        .disabled(self.applying)
+                        .tooltip(needs_server(
+                            "Review the SQL, then apply it in one transaction",
+                        ))
+                        .disabled(self.applying || offline)
                         .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                 )
             })
@@ -2695,6 +2746,8 @@ impl DataTab {
                 )
         });
         let filtered = !self.applied.is_empty();
+        // Filtering reads the rows again: not while the connection is closed (K56).
+        let offline = !self.connected(cx);
         v_flex()
             .flex_none()
             .px_2()
@@ -2761,7 +2814,11 @@ impl DataTab {
                             .outline()
                             .small()
                             .label("Filter")
-                            .tooltip("Read the rows the conditions keep (Enter)")
+                            .tooltip(match offline {
+                                true => "Read the rows the conditions keep (not connected)",
+                                false => "Read the rows the conditions keep (Enter)",
+                            })
+                            .disabled(offline)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.apply_filter(window, cx)),
                             ),
@@ -2772,7 +2829,11 @@ impl DataTab {
                                 .ghost()
                                 .small()
                                 .label("Clear")
-                                .tooltip("Show every row again")
+                                .tooltip(match offline {
+                                    true => "Show every row again (not connected)",
+                                    false => "Show every row again",
+                                })
+                                .disabled(offline)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.set_filter(Filter::default(), window, cx)
                                 })),
@@ -2805,7 +2866,10 @@ impl DataTab {
             .text_color(theme.muted_foreground)
             .child(SharedString::from(range))
             .when(
-                matches!(self.total, Some(Total::About(_))) && !self.counting && !loading,
+                matches!(self.total, Some(Total::About(_)))
+                    && !self.counting
+                    && !loading
+                    && self.connected(cx),
                 |bar| {
                     bar.child(
                         Button::new("data-count")
@@ -2887,6 +2951,14 @@ impl DataTab {
             .when(!self.read_failed() && self.grid.is_some(), |footer| {
                 let more = self.has_more(cx);
                 let idle = !(loading || self.appending);
+                // The next rows come from the server (K56).
+                let offline = !self.connected(cx);
+                let tip = |tip: &'static str| -> SharedString {
+                    match offline {
+                        true => format!("{tip} ({NOT_CONNECTED})").into(),
+                        false => tip.into(),
+                    }
+                };
                 let next = self.next_load(cx);
                 let label = match &self.load_error {
                     Some(_) if more => "Try again".to_string(),
@@ -2913,12 +2985,14 @@ impl DataTab {
                             .xsmall()
                             .label(SharedString::from(label))
                             .tooltip_with_action(
-                                "Read the next rows and add them under these; scrolling to \
-                                 the last rows does it too",
+                                tip(
+                                    "Read the next rows and add them under these; scrolling \
+                                     to the last rows does it too",
+                                ),
                                 &crate::actions::FetchMoreRows,
                                 None,
                             )
-                            .disabled(!(more && idle))
+                            .disabled(!(more && idle) || offline)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.fetch_more(false, window, cx)
                             })),
@@ -2930,11 +3004,11 @@ impl DataTab {
                                 .xsmall()
                                 .label("Fetch all")
                                 .tooltip_with_action(
-                                    "Read every row left; Cancel stops it",
+                                    tip("Read every row left; Cancel stops it"),
                                     &crate::actions::FetchAllRows,
                                     None,
                                 )
-                                .disabled(!idle)
+                                .disabled(!idle || offline)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.fetch_more(true, window, cx)
                                 })),
@@ -2979,16 +3053,8 @@ impl DataTab {
 
     fn render_rows(&self, cx: &mut Context<Self>) -> AnyElement {
         match (&self.state, &self.grid) {
-            (State::Waiting, _) => {
-                let connect = Button::new("data-connect")
-                    .primary()
-                    .label("Connect")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let id = this.target.connection.clone();
-                        this.connections
-                            .update(cx, |connections, cx| connections.connect(&id, cx));
-                    }))
-                    .into_any_element();
+            (State::Waiting, None) => {
+                let connect = self.connect_button(cx).into_any_element();
                 self.render_notice(
                     "data-waiting",
                     "Not connected",
@@ -3044,6 +3110,7 @@ impl DataTab {
                 cx,
             ),
             (_, Some(table)) => {
+                let offline = self.state == State::Waiting && !self.connected(cx);
                 let empty = table.read(cx).delegate().total_rows() == 0;
                 let rows = crate::query::grid_view::render(table, cx);
                 let theme = cx.theme();
@@ -3072,9 +3139,53 @@ impl DataTab {
                         )
                     })
                     .into_any_element();
-                value_panel::beside(area, self.value_panel.as_ref(), cx)
+                let rows = value_panel::beside(area, self.value_panel.as_ref(), cx);
+                if !offline {
+                    return rows;
+                }
+                // The rows read before stay readable; what needs the server
+                // waits for Connect (K56).
+                let text = format!(
+                    "“{}” is not connected: these are the rows read before it closed.",
+                    self.connection_name(cx)
+                );
+                let (border, warning) = (cx.theme().border, cx.theme().warning);
+                let connect = self.connect_button(cx).small();
+                v_flex()
+                    .size_full()
+                    .child(
+                        h_flex()
+                            .id("data-offline")
+                            .test_support()
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .gap_3()
+                            .border_b_1()
+                            .border_color(border)
+                            .text_sm()
+                            .text_color(warning)
+                            .child(SharedString::from(text.clone()))
+                            .test_text(text)
+                            .child(connect),
+                    )
+                    .child(div().flex_1().min_h_0().child(rows))
+                    .into_any_element()
             }
         }
+    }
+
+    /// Connects the tab's connection; its rows are read again once it is
+    /// open.
+    fn connect_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("data-connect")
+            .primary()
+            .label("Connect")
+            .on_click(cx.listener(|this, _, _, cx| {
+                let id = this.target.connection.clone();
+                this.connections
+                    .update(cx, |connections, cx| connections.connect(&id, cx));
+            }))
     }
 }
 

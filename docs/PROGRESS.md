@@ -1505,3 +1505,6 @@ Still open (for the owner):
 - With many tabs open, the strip no longer starts inside a tab (a bare "×", "uery 2"): once scrolled to a tab
   (a reveal, a click) and still, it starts on a tab's start with the active tab whole, in the three layouts.
   Tests: `ui_tests::k55` (one more), `tabs::tests`, each seen failing under a mutation.
+- A table tab whose connection was closed kept offering Fetch more, Fetch all, Duplicate, Delete, Set NULL and
+  Set default. Its rows now stay readable under a bar with Connect, and everything that needs the server is
+  greyed with the reason (refused from the keyboard too); Connect reads the rows again where they were.

@@ -301,3 +301,125 @@ fn a_restore_takes_a_typed_path_without_enter(cx: &mut TestAppContext) {
     let state = app.wait_backup(cx, &dialog, &["file:"]);
     assert!(state.contains("script.sqlx"), "{state}");
 }
+
+/// The data tab's actions that need the server.
+const SERVER_ACTIONS: [&str; 7] = [
+    "data-refresh",
+    "data-add-row",
+    "data-duplicate",
+    "data-delete",
+    "data-set-null",
+    "data-set-default",
+    "data-export",
+];
+
+/// Whether each of `ids` is drawn greyed; `None` for one not drawn.
+fn greyed(app: &Fixture, cx: &mut TestAppContext, ids: &[&'static str]) -> Vec<Option<bool>> {
+    app.step(cx, |window, _| {
+        ids.iter()
+            .map(|id| {
+                window
+                    .try_find(*id)
+                    .map(|found| found.disabled() == Some(true))
+            })
+            .collect()
+    })
+}
+
+/// 3. A table tab whose connection closes keeps its rows readable, greys
+/// what needs the server (fetching more, editing, filtering, exporting)
+/// and refuses it from the keyboard too; Connect brings it all back.
+#[gpui_kit::test]
+fn a_table_tab_whose_connection_closed_offers_nothing_that_needs_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.open_table(cx, "shop", "customers", RelationKind::Table);
+    app.wait_until(cx, "the rows", |app, cx| {
+        app.data_state(cx).starts_with("Rows ")
+    });
+    let rows = app.data_rows(cx);
+    app.click(cx, "table-cell-0:1");
+    assert_eq!(greyed(&app, cx, &SERVER_ACTIONS), vec![Some(false); 7]);
+    assert!(!app.has(cx, "data-offline"));
+
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    cx.update(|cx| {
+        app.connections
+            .update(cx, |list, cx| list.disconnect(&id, cx))
+    });
+    app.wait_until(cx, "the closed connection", |app, cx| {
+        app.status(cx, 0) == Status::Disconnected
+    });
+    // The rows stay, under a bar that says why and offers Connect.
+    assert!(app.has(cx, "data-offline") && app.has(cx, "data-connect"));
+    assert!(app.has(cx, "table-cell-0:1"));
+    assert_eq!(app.data_rows(cx), rows);
+    assert_eq!(greyed(&app, cx, &SERVER_ACTIONS), vec![Some(true); 7]);
+    for id in ["filter-apply", "data-fetch-more"] {
+        assert_eq!(greyed(&app, cx, &[id]), [Some(true)], "{id}");
+    }
+    assert!(!app.has(cx, "data-auto-refresh"));
+    // The keyboard and the cell menu are refused as well: nothing becomes
+    // pending.
+    app.click(cx, "table-cell-0:1");
+    app.type_text(cx, "x");
+    app.press(cx, &["enter"]);
+    let tab = app.data(cx);
+    app.step(cx, |window, cx| {
+        tab.update(cx, |tab, cx| {
+            tab.duplicate_rows(None, window, cx);
+            tab.set_selected(kerno_core::sql::CellValue::Null, window, cx);
+        })
+    });
+    assert_eq!(app.pending(cx), 0);
+
+    // Connect: the rows are read again and every action is back.
+    app.click(cx, "data-connect");
+    app.wait_until(cx, "the rows read again", |app, cx| {
+        matches!(app.status(cx, 0), Status::Connected { .. })
+            && app.data_state(cx).starts_with("Rows ")
+    });
+    assert!(!app.has(cx, "data-offline"));
+    app.click(cx, "table-cell-0:1");
+    assert_eq!(greyed(&app, cx, &SERVER_ACTIONS), vec![Some(false); 7]);
+}
+
+/// 3. The same tab restored after a restart: Connect, nothing that needs
+/// the server offered; Connect reads the rows and offers them.
+#[gpui_kit::test]
+fn a_table_tab_restored_closed_offers_connect_only(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let storage = memory_storage();
+    let id = storage
+        .save_connection(None, &testing::config(Engine::Postgres))
+        .unwrap();
+    let target = Target {
+        connection: id.clone(),
+        database: None,
+        schema: None,
+    };
+    storage
+        .save_tabs(&[TabSnapshot::Data {
+            target,
+            schema: "shop".into(),
+            table: "customers".into(),
+            view: false,
+        }])
+        .unwrap();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    kerno_core::secrets::save_secrets(secrets.as_ref(), &id, &testing::secrets()).unwrap();
+    assert!(app.has(cx, "data-waiting") && app.has(cx, "data-connect"));
+    let shown = greyed(&app, cx, &SERVER_ACTIONS);
+    assert!(shown.iter().all(|state| state != &Some(false)), "{shown:?}");
+    app.click(cx, "data-connect");
+    app.wait_until(cx, "the rows", |app, cx| {
+        app.data_state(cx).starts_with("Rows ")
+    });
+    app.click(cx, "table-cell-0:1");
+    assert_eq!(greyed(&app, cx, &SERVER_ACTIONS), vec![Some(false); 7]);
+}
