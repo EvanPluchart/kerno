@@ -3703,6 +3703,22 @@ the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
   drawn as prose and code blocks only: no markup, no link, no image.
 - **Keyboard**: Enter sends, Shift+Enter makes a line (the kit's `submit_on_enter`), Escape gives the
   keyboard back to the editor.
+- **After the first pass in the real app** (four fixes, one commit):
+  - The keyboard never stays in a panel that is gone. Each frame the panel is drawn, the root of the one
+    drawn before is compared with it; when that one went (Close, the command, the status bar, its tab closed
+    or another tab active) and still held the keyboard, the keyboard goes to the active tab's editor, or is
+    let go so that the workspace takes it back when no query tab is active. It was left nowhere: no shortcut
+    and no typing worked until a click.
+  - Insert leaves statements that run each on its own (`ai::insertion`, checked with the statement splitter
+    of the connection's dialect): at a caret, a statement before it that is not ended gets `;` right after
+    its last word (before a trailing comment), in the same edit, one undo step; the SQL gets `;` when a
+    statement follows it. Ending the earlier statement was chosen over a blank line, which the splitter does
+    not take as a separator. A selection is replaced as before; Replace is unchanged.
+  - Enter in another one-line field of the panel ("Rows to generate", K53) sends, as in the message field;
+    Escape there gives the keyboard back to the editor, as everywhere in the panel.
+  - The panel always fits: it is drawn no wider than the area beside the sidebar less an editor of 360
+    points, follows a window made narrower, and takes the width the user chose again when there is room
+    (that width stays remembered; only a drag changes it).
 
 ## D-122 — The AI assistant asked from a right-click (K53; 2026-11-23)
 

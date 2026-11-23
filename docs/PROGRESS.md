@@ -1429,3 +1429,12 @@ Still open (for the owner):
   moves the exchange to the tab's conversation (D-121).
 - Tests: `ai::inline::tests` (9), `query::ai_inline::tests` (3), `theme::tests::a_proposals_lines_read_on_their_tints`,
   `ui_tests::ai_inline` (10, the stand-in endpoint, the PostgreSQL fixture read only).
+
+## 2026-11-23 — The AI panel after its first pass in the real app
+
+- The keyboard comes back to the editor (or the workspace) whatever takes the panel away; Insert ends a
+  statement left without `;` before its SQL, one undo step; Enter in "Rows to generate" sends; the panel is
+  never wider than the window leaves (D-120).
+- Tests: `ai::tests::inserted_sql_runs_as_statements_of_its_own`, `ui_tests::ai_chat::`
+  `{the_keyboard_comes_back_whatever_takes_the_panel_away, enter_in_the_rows_field_sends_and_escape_leaves_it,
+  the_panel_always_fits_in_the_window}`, the Insert tests.

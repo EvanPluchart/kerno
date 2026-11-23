@@ -216,8 +216,11 @@ conversation, and **New conversation** clears it.
 - **AI: Write SQL…**, **Explain query**, **Explain plan**, **Explain error** and the **Explain … with AI**
   buttons open the panel with that request ready: you send it.
 - Answers appear as they are written when the server streams them; **Stop** closes the request and drops
-  what came. Under each SQL block: **Insert** (in place of the selection, or on its own line at the cursor),
-  **Replace** (the selection, else the statement at the cursor) and **Copy**. Nothing runs until you run it.
+  what came. Under each SQL block: **Insert** (in place of the selection, or on its own line at the cursor;
+  a statement before it without its `;` gets one, so that each runs on its own), **Replace** (the
+  selection, else the statement at the cursor) and **Copy**. Nothing runs until you run it.
+- The panel is never wider than the window allows: with a small window or a wide sidebar it narrows, and
+  takes your width again when there is room.
 
 ### From a right-click
 

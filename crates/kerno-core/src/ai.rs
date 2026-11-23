@@ -1177,6 +1177,55 @@ pub fn placed(text: &str, range: std::ops::Range<usize>, sql: &str) -> (String, 
     (format!("{before}{sql}{after}"), before.len())
 }
 
+/// What Insert puts in the editor's `text` at `range` so that the SQL runs as statements of its
+/// own (the real-app pass: `… limit 50` with no `;` and `SELECT …` on the next line read as
+/// one): `(the range replaced, its new text, where the SQL starts in that text)`, one edit, one
+/// undo step. A selection is replaced as [`placed`] does. At a caret, the statement before it,
+/// when it is not ended, is ended with `;` right after its last word; the SQL is ended with `;`
+/// when a statement follows it. Checked with the statement splitter of `rules`.
+pub fn insertion(
+    text: &str,
+    range: std::ops::Range<usize>,
+    sql: &str,
+    rules: crate::sql::LexRules,
+) -> (std::ops::Range<usize>, String, usize) {
+    use crate::sql::split_statements;
+    if !range.is_empty() {
+        let (placed, start) = placed(text, range.clone(), sql);
+        return (range, placed, start);
+    }
+    let at = range.start;
+    let mut sql = sql.trim().to_string();
+    // A statement after the caret: the SQL is ended so that it does not run on into it.
+    if !split_statements(&text[at..], rules).is_empty() && !sql.ends_with(';') {
+        sql.push(';');
+    }
+    let (placed, start) = placed(text, range.clone(), &sql);
+    // The SQL starts a statement of its own once in place: nothing more to do.
+    let candidate = format!("{}{placed}{}", &text[..at], &text[at..]);
+    let starts = |source: &str, offset: usize| {
+        split_statements(source, rules)
+            .iter()
+            .any(|span| span.range.start == offset)
+    };
+    if starts(&candidate, at + start) {
+        return (range, placed, start);
+    }
+    // The statement before it is not ended: `;` right after it, in the same edit.
+    let Some(end) = split_statements(&text[..at], rules)
+        .last()
+        .map(|span| span.range.end)
+    else {
+        return (range, placed, start);
+    };
+    let between = &text[end..at];
+    (
+        end..at,
+        format!(";{between}{placed}"),
+        1 + between.len() + start,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1693,6 +1742,57 @@ mod tests {
         assert_eq!(placed("", 0..0, sql), ("SELECT 2;".into(), 0));
         assert_eq!(placed("a\n  \nb", 3..3, sql), ("SELECT 2;".into(), 0));
         assert_eq!(placed(text, 0..6, sql), ("SELECT 2;".into(), 0));
+    }
+
+    /// The real-app pass after K51: Insert after `… limit 50` (no `;`) made one broken
+    /// statement. After Insert the statement splitter finds the SQL as statements of its own.
+    #[test]
+    fn inserted_sql_runs_as_statements_of_its_own() {
+        use crate::sql::{LexRules, split_statements};
+        let insert = |text: &str, range: std::ops::Range<usize>, sql: &str| {
+            let (replaced, new, start) = insertion(text, range.clone(), sql, LexRules::POSTGRES);
+            let result = format!("{}{new}{}", &text[..replaced.start], &text[replaced.end..]);
+            assert!(
+                new[start..].starts_with(sql.trim().trim_end_matches(';')),
+                "{new:?}"
+            );
+            let statements: Vec<String> = split_statements(&result, LexRules::POSTGRES)
+                .iter()
+                .map(|span| span.text(&result).to_string())
+                .collect();
+            (result, statements)
+        };
+        // Not ended: ended with `;`, in the same edit.
+        let text = "select * from shop.orders limit 50";
+        let (result, statements) = insert(text, text.len()..text.len(), "SELECT 1;");
+        assert_eq!(result, "select * from shop.orders limit 50;\nSELECT 1;");
+        assert_eq!(
+            statements,
+            ["select * from shop.orders limit 50", "SELECT 1"]
+        );
+        // A line comment after it: the `;` goes before the comment, not in it.
+        let text = "select 1 -- the first";
+        let (_, statements) = insert(text, text.len()..text.len(), "SELECT 2;");
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert_eq!(statements[1], "SELECT 2");
+        // Ended: nothing added.
+        let text = "select 1;";
+        let (result, statements) = insert(text, text.len()..text.len(), "SELECT 2;");
+        assert_eq!(result, "select 1;\nSELECT 2;");
+        assert_eq!(statements, ["select 1", "SELECT 2"]);
+        // Empty editor.
+        let (result, statements) = insert("", 0..0, "SELECT 3");
+        assert_eq!((result.as_str(), statements.len()), ("SELECT 3", 1));
+        // Between two statements, the SQL without `;`: ended, so the next one stays its own.
+        let text = "select 1;\n\nselect 3;";
+        let (result, statements) = insert(text, 10..10, "SELECT 2");
+        assert_eq!(result, "select 1;\nSELECT 2;\nselect 3;");
+        assert_eq!(statements, ["select 1", "SELECT 2", "select 3"]);
+        // A selection is replaced, as before.
+        let text = "select 1; select 2";
+        let (result, statements) = insert(text, 10..18, "SELECT 9");
+        assert_eq!(result, "select 1; SELECT 9");
+        assert_eq!(statements, ["select 1", "SELECT 9"]);
     }
 
     #[test]

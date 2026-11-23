@@ -117,8 +117,19 @@ fn insert_and_replace_put_the_sql_where_they_say_and_run_nothing(cx: &mut TestAp
         editor.update(cx, |editor, cx| editor.set_selected_range(end..end, cx))
     });
     app.click(cx, "ai-insert");
-    assert_eq!(app.active_query(cx).1, format!("{text}\nSELECT 3 AS c;"));
+    // The last statement had no `;`: it gets one, so the two run each on its own (the
+    // real-app pass after K51), and one undo step takes both back.
+    let after = app.active_query(cx).1;
+    assert_eq!(after, format!("{text};\nSELECT 3 AS c;"));
+    let statements = kerno_core::sql::split_statements(&after, kerno_core::sql::LexRules::POSTGRES);
+    let statements: Vec<&str> = statements.iter().map(|s| s.text(&after)).collect();
+    assert_eq!(
+        statements,
+        ["select 1 as a", "select 2 as b", "SELECT 3 AS c"]
+    );
     ran_nothing(&app, cx);
+    app.press(cx, &["secondary-z"]);
+    assert_eq!(app.active_query(cx).1, text, "one undo step");
     // Copy takes the block's SQL alone.
     app.click(cx, "ai-copy-sql");
     assert_eq!(app.clipboard(cx).as_deref(), Some("SELECT 3 AS c;"));
@@ -388,4 +399,212 @@ fn a_long_conversation_leaves_out_its_oldest_turns_and_says_so(cx: &mut TestAppC
         "the oldest left out"
     );
     assert!(body.contains("question 0") && body.contains("the last one"));
+}
+
+/// Whether the active query tab's editor has the keyboard.
+fn editor_focused(app: &Fixture, cx: &mut TestAppContext) -> bool {
+    let tab = cx.update(|cx| app.workspace.read(cx).active_query_tab().cloned());
+    let Some(tab) = tab else {
+        return false;
+    };
+    let editor = cx.update(|cx| tab.read(cx).editor().clone());
+    app.step(cx, |window, cx| {
+        editor.read(cx).focus_handle(cx).is_focused(window)
+    })
+}
+
+/// The keyboard is in the panel's message field.
+fn in_the_panel(app: &Fixture, cx: &mut TestAppContext) {
+    app.click(cx, "ai-sentence");
+    assert!(!editor_focused(app, cx));
+}
+
+/// The keyboard reached the editor, and the window's shortcuts work: ⇧⌘J shows the panel
+/// again, typed text lands in the editor.
+fn keyboard_back(app: &Fixture, cx: &mut TestAppContext, how: &str) {
+    for _ in 0..3 {
+        app.step(cx, |window, _| window.refresh());
+    }
+    assert!(
+        editor_focused(app, cx),
+        "{how}: the editor has the keyboard"
+    );
+    let before = app.active_query(cx).1;
+    app.type_text(cx, "x");
+    assert_eq!(
+        app.active_query(cx).1,
+        format!("{before}x"),
+        "{how}: typing"
+    );
+    // ⇧⌘J works: the panel shows (or hides, when its tab closed under it left it shown).
+    let shown = app.has(cx, "ai-panel");
+    app.press(cx, &["secondary-shift-j"]);
+    assert_eq!(app.has(cx, "ai-panel"), !shown, "{how}: ⇧⌘J");
+    if shown {
+        app.press(cx, &["secondary-shift-j"]);
+    }
+}
+
+/// The real-app pass after K51: with the assistant off, Close left the keyboard in a panel no
+/// longer drawn: no shortcut worked and typed text went nowhere. Each way the panel goes, in
+/// each state, the keyboard comes back to the editor (or the workspace with no query tab).
+#[gpui_kit::test]
+fn the_keyboard_comes_back_whatever_takes_the_panel_away(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    for on in [false, true] {
+        enable(cx, "http://127.0.0.1:9/v1", on);
+        // Close.
+        app.press(cx, &["secondary-shift-j"]);
+        in_the_panel(&app, cx);
+        app.click(cx, "ai-close");
+        assert!(!app.has(cx, "ai-panel"));
+        keyboard_back(&app, cx, &format!("Close, on: {on}"));
+        // ⇧⌘J (the panel is shown by `keyboard_back`).
+        in_the_panel(&app, cx);
+        app.press(cx, &["secondary-shift-j"]);
+        assert!(!app.has(cx, "ai-panel"));
+        keyboard_back(&app, cx, &format!("⇧⌘J, on: {on}"));
+        // The status bar's entry (there while the panel shows).
+        in_the_panel(&app, cx);
+        app.click(cx, "status-ai");
+        assert!(!app.has(cx, "ai-panel"));
+        keyboard_back(&app, cx, &format!("the status bar, on: {on}"));
+        // The panel stays, the assistant turned off under it: the keyboard still works.
+        in_the_panel(&app, cx);
+        enable(cx, "http://127.0.0.1:9/v1", false);
+        assert!(app.has(cx, "ai-off"));
+        app.press(cx, &["secondary-shift-j"]);
+        assert!(!app.has(cx, "ai-panel"), "assistant off under it, on: {on}");
+        keyboard_back(&app, cx, &format!("turned off under it, on: {on}"));
+        app.press(cx, &["secondary-shift-j"]);
+    }
+    // Its tab closed with ⌘W, another tab there: that tab's editor.
+    enable(cx, "http://127.0.0.1:9/v1", true);
+    app.press(cx, &["secondary-t"]);
+    app.press(cx, &["secondary-shift-j"]);
+    in_the_panel(&app, cx);
+    app.press(cx, &["secondary-w"]);
+    assert_eq!(app.titles(cx).len(), 1);
+    keyboard_back(&app, cx, "its tab closed");
+    // The last tab closed: the workspace has the keyboard, ⌘T opens a tab.
+    in_the_panel(&app, cx);
+    app.press(cx, &["secondary-w"]);
+    assert!(app.titles(cx).is_empty());
+    for _ in 0..3 {
+        app.step(cx, |window, _| window.refresh());
+    }
+    let workspace = app.workspace.clone();
+    assert!(app.step(cx, |window, cx| {
+        workspace.focus_handle(cx).contains_focused(window, cx)
+    }));
+    app.press(cx, &["secondary-t"]);
+    assert_eq!(app.titles(cx).len(), 1, "⌘T after the last tab closed");
+}
+
+/// The real-app pass after K53: Enter in "Rows to generate" sent nothing. It sends, as Enter in
+/// the message field does; Escape there gives the keyboard back to the editor.
+#[gpui_kit::test]
+fn enter_in_the_rows_field_sends_and_escape_leaves_it(cx: &mut TestAppContext) {
+    use kerno_core::ai::ask::{Ask, Subject};
+    use kerno_core::schema::TableRef;
+    let fake = FakeAi::start(FIRST);
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    enable(cx, &fake.base(), true);
+    let ask = || Ask::TestData {
+        subject: Subject {
+            table: TableRef::new("shop", "orders"),
+            view: false,
+            columns: vec![("id".into(), "bigint".into())],
+            references: Vec::new(),
+            referenced_by: Vec::new(),
+        },
+        rows: 10,
+    };
+    let tab = app.tab(cx);
+    app.step(cx, |window, cx| {
+        crate::ai_view::open(&tab, crate::ai_view::Draft::default(), window, cx)
+    });
+    let panel = panel(&app, cx).unwrap();
+    app.step(cx, |window, cx| {
+        panel.update(cx, |panel, cx| panel.set_ask(ask(), None, window, cx))
+    });
+    // Escape in the field: the editor.
+    app.click(cx, "ai-ask-rows-input");
+    assert!(!editor_focused(&app, cx));
+    app.press(cx, &["escape"]);
+    assert!(editor_focused(&app, cx));
+    // Enter in the field: sent.
+    app.click(cx, "ai-ask-rows-input");
+    app.press(cx, &["secondary-a"]);
+    app.type_text(cx, "3");
+    app.press(cx, &["enter"]);
+    app.wait_until(cx, "the answer", |app, cx| answer(app, cx).is_some());
+    assert_eq!(fake.requests().len(), 1);
+    let sent = messages(&fake, 0);
+    assert!(
+        sent.last().unwrap().1.contains("3 rows"),
+        "{}",
+        sent.last().unwrap().1
+    );
+}
+
+/// The real-app pass after K52: at its widest (720) in a 1,280-point window with the sidebar,
+/// the panel ran past the window's right edge. It is drawn no wider than what the sidebar and
+/// an editor of 360 points leave, follows a window made narrower, and comes back to the width
+/// the user chose once there is room; that width stays remembered.
+#[gpui_kit::test]
+fn the_panel_always_fits_in_the_window(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    enable(cx, "http://127.0.0.1:9/v1", true);
+    cx.update(|cx| AppState::update_settings(cx, |s| s.ai_panel_width = 720.));
+    app.press(cx, &["secondary-shift-j"]);
+    let inside = |app: &Fixture, cx: &mut TestAppContext, width: f32, what: &str| {
+        for _ in 0..4 {
+            app.step(cx, |window, _| window.refresh());
+        }
+        let (panel, editor) = app.step(cx, |window, _| {
+            (
+                window.find("ai-panel").bounds(),
+                window.find("query-editor").bounds(),
+            )
+        });
+        let right = f32::from(panel.origin.x + panel.size.width);
+        assert!(
+            right <= width + 0.5,
+            "{what}: the panel ends at {right} of {width}"
+        );
+        for id in [
+            "ai-new-conversation",
+            "ai-close",
+            "ai-endpoint-picker",
+            "ai-sentence",
+        ] {
+            let part = app.step(cx, |window, _| window.find(id).bounds());
+            let end = f32::from(part.origin.x + part.size.width);
+            assert!(end <= width + 0.5, "{what}: {id} ends at {end} of {width}");
+        }
+        assert!(
+            f32::from(editor.size.width) >= 300.,
+            "{what}: the editor keeps its room ({})",
+            f32::from(editor.size.width)
+        );
+        f32::from(panel.size.width)
+    };
+    cx.simulate_window_resize(app.window.into(), size(px(1280.), px(800.)));
+    let wide = inside(&app, cx, 1280., "1280 × 800");
+    assert!(wide < 720., "narrower than the width chosen: {wide}");
+    cx.simulate_window_resize(app.window.into(), size(px(900.), px(600.)));
+    let narrow = inside(&app, cx, 900., "900 × 600");
+    assert!(narrow < wide, "follows a narrower window: {narrow} {wide}");
+    // Room again: the width chosen, which stayed remembered.
+    cx.simulate_window_resize(app.window.into(), size(px(1900.), px(900.)));
+    let back = inside(&app, cx, 1900., "1900 × 900");
+    assert!((back - 720.).abs() < 1., "the width chosen again: {back}");
+    assert_eq!(
+        cx.update(|cx| AppState::get(cx).settings.ai_panel_width),
+        720.
+    );
 }

@@ -454,7 +454,7 @@ fn the_error_the_plan_and_the_query_are_explained(cx: &mut TestAppContext) {
     // K51: at the cursor, on its own line, as every Insert (Replace takes the statement's place).
     assert_eq!(
         app.active_query(cx).1,
-        format!("{bad}\nSELECT count(*) FROM shop.customers;")
+        format!("{bad};\nSELECT count(*) FROM shop.customers;")
     );
     cx.run_until_parked();
     assert_eq!(history_len(&app), history);
@@ -583,10 +583,11 @@ fn inserted_sql_is_never_glued_to_the_text(cx: &mut TestAppContext) {
     });
     app.click(cx, "ai-insert");
     let sql = "SELECT count(*) FROM shop.customers;";
-    assert_eq!(app.active_query(cx).1, format!("{line}\n{sql}"));
+    // The statement before it, not ended, gets its `;` (the real-app pass after K51).
+    assert_eq!(app.active_query(cx).1, format!("{line};\n{sql}"));
     // A selection is replaced, nothing added around it.
     app.step(cx, |_, cx| {
-        editor.update(cx, |editor, cx| editor.set_selected_range(0..end, cx))
+        editor.update(cx, |editor, cx| editor.set_selected_range(0..end + 1, cx))
     });
     app.click(cx, "ai-insert");
     assert_eq!(app.active_query(cx).1, format!("{sql}\n{sql}"));

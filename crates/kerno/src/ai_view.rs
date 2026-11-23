@@ -13,7 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{EditorState, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -244,20 +244,49 @@ pub fn beside(
     cx: &mut App,
 ) -> AnyElement {
     let settings = &AppState::get(cx).settings;
-    if !settings.ai_panel {
-        return area;
-    }
-    let width = settings.ai_panel_width;
-    let content = match tab {
-        Some(tab) => {
+    let (shown, width) = (settings.ai_panel, settings.ai_panel_width);
+    let id = window.window_handle().window_id();
+    let no_tab_focus = match cx.default_global::<PanelFocus>().no_tab.get(&id) {
+        Some(focus) => focus.clone(),
+        None => {
+            let focus = cx.focus_handle();
+            cx.default_global::<PanelFocus>()
+                .no_tab
+                .insert(id, focus.clone());
+            focus
+        }
+    };
+    let (content, root) = match (shown, tab) {
+        (false, _) => (None, None),
+        (true, Some(tab)) => {
             let panel = tab.update(cx, |tab, cx| tab.ai_chat(window, cx));
             // The editor's statement follows its cursor while the panel shows.
             panel.update(cx, |panel, cx| panel.sync_editor(cx));
-            panel.into_any_element()
+            let root = panel.read(cx).root.clone();
+            (Some(panel.into_any_element()), Some(root))
         }
-        None => no_tab(cx).into_any_element(),
+        (true, None) => (
+            Some(no_tab(&no_tab_focus, cx).into_any_element()),
+            Some(no_tab_focus),
+        ),
     };
+    keep_the_keyboard(root, tab, window, cx);
+    let Some(content) = content else {
+        return area;
+    };
+    let split = match cx.default_global::<PanelFocus>().split.get(&id) {
+        Some(split) => split.clone(),
+        None => {
+            let split = cx.new(|_| ResizableState::default());
+            cx.default_global::<PanelFocus>()
+                .split
+                .insert(id, split.clone());
+            split
+        }
+    };
+    let fitted = fit(&split, width, window, cx);
     h_resizable("ai-dock-split")
+        .with_state(&split)
         .child(
             resizable_panel()
                 .size_range(AREA_MIN..Pixels::MAX)
@@ -265,11 +294,12 @@ pub fn beside(
         )
         .child(
             resizable_panel()
-                .size(px(width))
-                .size_range(px(*WIDTHS.start())..px(*WIDTHS.end()))
+                .size(px(fitted))
+                .size_range(px(fitted.min(*WIDTHS.start()))..px(*WIDTHS.end()))
                 .fixed()
                 .child(content),
         )
+        // At the end of a drag only (not after `fit`'s resizes): the width the user chose.
         .on_resize(|state, _, cx| {
             if let Some(width) = state.read(cx).sizes().get(1) {
                 let width = f32::from(*width).clamp(*WIDTHS.start(), *WIDTHS.end());
@@ -281,11 +311,88 @@ pub fn beside(
         .into_any_element()
 }
 
+/// The width the panel is drawn at: the one remembered (`wanted`), or narrower when the area
+/// beside the sidebar leaves an editor of [`AREA_MIN`] less room (a small window, a wide
+/// sidebar); the remembered one again once there is room. The kit keeps a fixed panel's width
+/// whatever its container, so without this the panel ran past the window's edge (the real-app
+/// pass after K52: 720 points in a 1,280-point window with the sidebar).
+fn fit(split: &Entity<ResizableState>, wanted: f32, window: &mut Window, cx: &mut App) -> f32 {
+    let (container, current) = {
+        let state = split.read(cx);
+        (
+            f32::from(state.container_size()),
+            state.sizes().get(1).copied().map(f32::from),
+        )
+    };
+    // Before the first layout the room is not known.
+    if container <= 0. {
+        return wanted;
+    }
+    let target = wanted.min(container - f32::from(AREA_MIN)).max(0.);
+    if let Some(current) = current
+        && (target - current).abs() >= 1.
+    {
+        let split = split.clone();
+        window.defer(cx, move |window, cx| {
+            split.update(cx, |state, cx| {
+                state.resize_panel(1, px(target), window, cx)
+            });
+        });
+    }
+    target
+}
+
+/// Per window: the root of the panel drawn last (the keyboard may be in it), the root of the
+/// panel shown with no query tab, the split beside the tabs.
+#[derive(Default)]
+struct PanelFocus {
+    last: HashMap<gpui_kit::WindowId, FocusHandle>,
+    no_tab: HashMap<gpui_kit::WindowId, FocusHandle>,
+    split: HashMap<gpui_kit::WindowId, Entity<ResizableState>>,
+}
+
+impl Global for PanelFocus {}
+
+/// The real-app pass after K51: Close with the assistant off left the keyboard in a panel no
+/// longer drawn, and every key and shortcut went nowhere. Whatever takes the panel away (Close,
+/// the command, the status bar, its tab closed or another one active), the keyboard that was in
+/// it goes to the active tab's editor, or to the workspace when no query tab is active.
+fn keep_the_keyboard(
+    root: Option<FocusHandle>,
+    tab: Option<&Entity<QueryTab>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let id = window.window_handle().window_id();
+    let last = match &root {
+        Some(root) => cx
+            .default_global::<PanelFocus>()
+            .last
+            .insert(id, root.clone()),
+        None => cx.default_global::<PanelFocus>().last.remove(&id),
+    };
+    // Still drawn, or the keyboard was not in it (`contains_focused` reads the frame drawn last,
+    // the one that still had it).
+    let Some(last) = last.filter(|last| Some(last) != root.as_ref()) else {
+        return;
+    };
+    if !last.contains_focused(window, cx) {
+        return;
+    }
+    let editor = tab.map(|tab| tab.read(cx).editor().read(cx).focus_handle(cx));
+    window.defer(cx, move |window, cx| match editor {
+        Some(editor) => editor.focus(window, cx),
+        // The workspace takes it back from nowhere (`Workspace::keep_focus`).
+        None => window.blur(cx),
+    });
+}
+
 /// The panel when no query tab is active.
-fn no_tab(cx: &App) -> impl IntoElement {
+fn no_tab(focus: &FocusHandle, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     v_flex()
         .id("ai-panel")
+        .track_focus(focus)
         .test_support()
         .size_full()
         .p_3()
@@ -429,6 +536,8 @@ pub struct AiPanel {
     has_key: bool,
     key_for: String,
     thread: ScrollHandle,
+    /// The panel as a whole: whether the keyboard is somewhere in it.
+    root: FocusHandle,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -503,6 +612,7 @@ impl AiPanel {
             has_key: false,
             key_for: String::new(),
             thread: ScrollHandle::new(),
+            root: cx.focus_handle(),
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -1067,15 +1177,22 @@ impl AiPanel {
     }
 
     /// Puts `sql` in the editor as one undoable edit, selected, in place of the selection or on
-    /// its own line at the cursor ([`ai::placed`]), and runs nothing.
+    /// its own line at the cursor, as statements of their own ([`ai::insertion`]: a statement
+    /// before it not ended gets its `;`), and runs nothing.
     pub fn insert_sql(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rules = (self.facts.session.as_ref())
+            .map_or(kerno_core::sql::LexRules::POSTGRES, |s| {
+                s.dialect().lex_rules()
+            });
         self.editor.update(cx, |editor, cx| {
-            let range = editor.selected_range();
-            let (text, start) = ai::placed(&editor.text().to_string(), range.clone(), sql);
+            let selected = editor.selected_range();
+            let (range, text, start) =
+                ai::insertion(&editor.text().to_string(), selected, sql, rules);
+            let length = text[start..].trim_end().len();
             editor.set_selected_range(range.clone(), cx);
             editor.replace(text, window, cx);
             let start = range.start + start;
-            editor.set_selected_range(start..start + sql.len(), cx);
+            editor.set_selected_range(start..start + length, cx);
         });
         self.focus_editor(window, cx);
     }
@@ -1527,6 +1644,7 @@ impl Render for AiPanel {
         v_flex()
             .id("ai-panel")
             .key_context("AiPanel")
+            .track_focus(&self.root)
             .test_support()
             .size_full()
             .p_3()
@@ -1535,10 +1653,19 @@ impl Render for AiPanel {
             .border_color(border)
             .bg(theme.background)
             .text_sm()
-            // Escape in the message field: the keyboard back to the editor.
+            // Escape in any field of the panel: the keyboard back to the editor.
             .on_action(cx.listener(
                 |this, _: &gpui_kit::component::input::Escape, window, cx| {
                     this.focus_editor(window, cx)
+                },
+            ))
+            // Enter in another one-line field of the panel ("Rows to generate", K53) sends, as
+            // in the message field (which sends on its own `PressEnter`).
+            .on_action(cx.listener(
+                |this, _: &gpui_kit::component::input::Enter, window, cx| {
+                    if !this.input.focus_handle(cx).is_focused(window) {
+                        this.send(window, cx)
+                    }
                 },
             ))
             .child(head(Some(cx), cx))
