@@ -48,6 +48,24 @@ SQLite's interrupt, `admin_query` `None` for every view, and the capabilities it
 defaults (`Dialect::begin_sql`, `transactional_ddl`, `has_routines`, `ExecSink::stop_signal`). Its FEATURES row
 is K29.
 
+## The AI assistant, next (agreed with the owner, 2026-11-23)
+
+Today (J17) the assistant answers one question at a time: write SQL from a sentence, explain a query, a plan
+or an error. It is off by default and reached from the palette. Agreed as the next steps, in this order; each
+starts when the owner names it, and all keep J17's rules (opt-in, the endpoint the user set, schema names only
+unless sample rows are ticked, "What is sent", nothing run by itself):
+
+1. **A conversation in a side panel.** Follow-ups refine the answer ("add the date filter", "no, by
+   customer"), with the editor's query as context.
+2. **Ask in the editor.** A shortcut opens a field at the cursor; the proposal is shown as a before / after
+   diff to accept or refuse.
+3. **Fix an error in one click.** From a failed statement, the fix is proposed as a diff in the editor, with
+   no panel in between.
+4. **From a right-click.** On a table or a result: ask about this table, explain these columns, generate test
+   data.
+5. **A richer context.** Foreign keys, indexes and types sent with the schema, for joins that hold and real
+   advice on plans.
+
 ## Limits found on the way
 
 - **RSA SSH key files with the built-in client** are refused (RUSTSEC-2023-0071, D-013); they work through the
