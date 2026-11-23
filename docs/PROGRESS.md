@@ -1469,3 +1469,11 @@ Still open (for the owner):
   The hovered cell now checks for the pointer each frame it is drawn and hears every move until the next one;
   it is drawn only while the pointer is over that very cell (`docs/plans/M12.md`, K49, corrected).
 - Tests: `ui_tests::k54` (3, PostgreSQL and MySQL, fixtures read only), each seen failing under a mutation.
+
+## 2026-11-23 — K54: the Edit menu's standard entries
+
+- The Edit menu starts with Undo, Redo, Cut, Copy, Paste and Select All, with their keys, as system actions:
+  they act on the focused SQL editor or text field, and on a table's or a result's grid for Copy, Paste and Select
+  All (the same code as the grid's keys); greyed where nothing focused takes one. The keys do what they did.
+- Tests: `ui_tests::k54::the_edit_menu_has_the_systems_editing_entries` (PostgreSQL fixture read only, the pending
+  changes left unapplied), each part seen failing under a mutation.

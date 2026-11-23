@@ -8096,6 +8096,25 @@ impl Render for QueryTab {
                     }
                 }
             }))
+            // Edit ▸ Copy, Paste and Select All, as the keys above.
+            .on_action(cx.listener(|this, _: &input::Copy, _, cx| {
+                this.copy_selection(Some(CopyFormat::Tsv), cx);
+            }))
+            .on_action(cx.listener(|this, _: &input::Paste, window, cx| {
+                let Some(grid) = this.active_grid() else {
+                    return;
+                };
+                if grid.read(cx).focus_handle(cx).is_focused(window) {
+                    edit::paste_clipboard(&grid, this.result_edits(), window, cx);
+                    if let Some(pane) = this.results.get_mut(this.active_result) {
+                        pane.apply_error = None;
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &input::SelectAll, _, cx| {
+                this.select_all_rows(cx);
+            }))
             .child(if stacked {
                 self.render_stacked(cx)
             } else {

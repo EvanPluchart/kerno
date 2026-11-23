@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::input::IndentInline;
+use gpui_kit::base::input::{self, IndentInline};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -1910,6 +1910,13 @@ impl DataTab {
         }
     }
 
+    /// Whether the grid has the keyboard.
+    fn grid_focused(&self, window: &Window, cx: &App) -> bool {
+        self.grid
+            .as_ref()
+            .is_some_and(|table| table.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     /// Whether the rows take changes, and why not when they do not.
     fn edits(&self, cx: &App) -> edit::Allowed {
         if self.pending(cx).is_some() {
@@ -3463,6 +3470,27 @@ impl Render for DataTab {
                             cx.stop_propagation();
                         }
                     }
+                }
+            }))
+            // Edit ▸ Copy, Paste and Select All on the focused grid, as its
+            // keys (the filter's and the cell's fields take theirs first).
+            .on_action(cx.listener(|this, _: &input::Copy, window, cx| {
+                if this.grid_focused(window, cx) {
+                    this.copy_selection(CopyFormat::Tsv, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &input::Paste, window, cx| {
+                if let Some(table) = this.grid.clone().filter(|_| this.grid_focused(window, cx)) {
+                    let edits = this.edits(cx);
+                    edit::paste_clipboard(&table, edits, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &input::SelectAll, window, cx| {
+                if let Some(table) = this.grid.clone().filter(|_| this.grid_focused(window, cx)) {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().select_all();
+                        cx.notify();
+                    });
                 }
             }))
             .child(self.render_toolbar(cx))

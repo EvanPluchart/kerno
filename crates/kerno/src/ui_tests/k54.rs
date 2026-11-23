@@ -200,3 +200,223 @@ fn the_arrow_leaves_after_an_edit_and_under_scrolled_rows(cx: &mut TestAppContex
     assert_eq!(hovered(&grid, cx), None);
     assert_eq!(arrows(&app, cx), Vec::<usize>::new());
 }
+
+/// The entries the Edit menu starts with, in order ("-" for a separator),
+/// with the system action each stands for.
+fn edit_menu(cx: &mut TestAppContext) -> Vec<(String, &'static str)> {
+    use gpui_kit::OsAction;
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let edit = menus.iter().find(|menu| menu.name == "Edit").unwrap();
+    edit.items
+        .iter()
+        .take(9)
+        .map(|item| match item {
+            gpui_kit::OwnedMenuItem::Action {
+                name, os_action, ..
+            } => (
+                name.to_string(),
+                match os_action {
+                    Some(OsAction::Undo) => "undo",
+                    Some(OsAction::Redo) => "redo",
+                    Some(OsAction::Cut) => "cut",
+                    Some(OsAction::Copy) => "copy",
+                    Some(OsAction::Paste) => "paste",
+                    Some(OsAction::SelectAll) => "select all",
+                    None => "",
+                },
+            ),
+            _ => ("-".to_string(), ""),
+        })
+        .collect()
+}
+
+fn menu_action(cx: &mut TestAppContext, name: &str) -> Box<dyn gpui_kit::Action> {
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let edit = menus.iter().find(|menu| menu.name == "Edit").unwrap();
+    edit.items
+        .iter()
+        .find_map(|item| match item {
+            gpui_kit::OwnedMenuItem::Action {
+                name: found,
+                action,
+                ..
+            } if found.as_str() == name => Some(action.boxed_clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no {name} in the Edit menu"))
+}
+
+/// Whether the entry is enabled, as the menu bar asks before it opens
+/// (`is_action_available`, what macOS's menu validation calls).
+fn enabled(cx: &mut TestAppContext, name: &str) -> bool {
+    let action = menu_action(cx, name);
+    cx.update(|cx| cx.is_action_available(action.as_ref()))
+}
+
+/// The Edit menu's entry `name` run as the menu bar runs it: enabled, then
+/// its action given to the window that has the keyboard
+/// (`cx.dispatch_action`, what GPUI's menu callback calls).
+fn from_menu(app: &Fixture, cx: &mut TestAppContext, name: &str) {
+    assert_eq!(
+        cx.update(|cx| cx.active_window()),
+        Some(app.window.into()),
+        "the menu acts on this window"
+    );
+    assert!(enabled(cx, name), "{name} is greyed");
+    let action = menu_action(cx, name);
+    cx.update(|cx| cx.dispatch_action(action.as_ref()));
+    cx.run_until_parked();
+}
+
+/// The Edit menu starts with Undo, Redo, Cut, Copy, Paste and Select All,
+/// grouped as on a Mac and showing the text fields' keys; each acts on the
+/// SQL editor, on a field of one line and on a grid (its Copy, Paste and
+/// Select All), and is greyed where nothing focused takes it.
+#[gpui_kit::test]
+fn the_edit_menu_has_the_systems_editing_entries(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let expected = [
+        ("Undo", "undo"),
+        ("Redo", "redo"),
+        ("-", ""),
+        ("Cut", "cut"),
+        ("Copy", "copy"),
+        ("Paste", "paste"),
+        ("Select All", "select all"),
+        ("-", ""),
+        ("Find…", ""),
+    ]
+    .map(|(name, os)| (name.to_string(), os));
+    assert_eq!(edit_menu(cx), expected);
+    // The key each shows on a Mac: the first binding of its action, which
+    // is what the menu bar reads.
+    if cx.update(|cx| cx.platform_info().is_mac()) {
+        for (name, key) in [
+            ("Undo", "cmd-z"),
+            ("Redo", "cmd-shift-z"),
+            ("Cut", "cmd-x"),
+            ("Copy", "cmd-c"),
+            ("Paste", "cmd-v"),
+            ("Select All", "cmd-a"),
+        ] {
+            let action = menu_action(cx, name);
+            let shown = cx.update(|cx| {
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                keymap
+                    .bindings_for_action(action.as_ref())
+                    .next()
+                    .map(|binding| binding.keystrokes()[0].unparse(gpui_kit::OperatingSystem::Mac))
+            });
+            assert_eq!(shown.as_deref(), Some(key), "{name}");
+        }
+    }
+    drop(app);
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    // The menu bar acts on the active window: the test platform's is
+    // made active, as the app's is when it is in front.
+    app.step(cx, |window, _| window.activate_window());
+
+    // The SQL editor.
+    app.press(cx, &["secondary-t"]);
+    app.type_text(cx, "select 1");
+    from_menu(&app, cx, "Undo");
+    assert_eq!(app.active_query(cx).1, "");
+    from_menu(&app, cx, "Redo");
+    assert_eq!(app.active_query(cx).1, "select 1");
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Cut");
+    assert_eq!(app.active_query(cx).1, "");
+    assert_eq!(app.clipboard(cx).as_deref(), Some("select 1"));
+    from_menu(&app, cx, "Paste");
+    from_menu(&app, cx, "Paste");
+    assert_eq!(app.active_query(cx).1, "select 1select 1");
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Copy");
+    assert_eq!(app.clipboard(cx).as_deref(), Some("select 1select 1"));
+
+    // A field of one line: the schema tree's filter.
+    let tree = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+    let text = |cx: &mut TestAppContext| cx.update(|cx| tree.read(cx).filter_text(cx));
+    app.dispatch(cx, actions::FocusNavigatorFilter);
+    assert!(app.step(cx, |window, cx| tree.read(cx).filter_focused(window, cx)));
+    app.type_text(cx, "zz");
+    from_menu(&app, cx, "Undo");
+    assert_eq!(text(cx), "");
+    from_menu(&app, cx, "Redo");
+    assert_eq!(text(cx), "zz");
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Cut");
+    assert_eq!(text(cx), "");
+    from_menu(&app, cx, "Paste");
+    assert_eq!(text(cx), "zz");
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Copy");
+    assert_eq!(app.clipboard(cx).as_deref(), Some("zz"));
+    app.press(cx, &["secondary-a", "backspace"]);
+
+    // A table's grid: Copy, Select All and Paste (a pending change,
+    // discarded); Undo, Redo and Cut greyed there.
+    app.open_table(cx, "shop", "orders", RelationKind::Table);
+    app.wait_until(cx, "the orders", |app, cx| {
+        app.data_state(cx).starts_with("Rows 1–")
+    });
+    app.click(cx, cell(0, 1));
+    from_menu(&app, cx, "Copy");
+    let first = app.data_rows(cx)[0][0].clone();
+    assert_eq!(app.clipboard(cx), Some(first));
+    for name in ["Undo", "Redo", "Cut"] {
+        assert!(!enabled(cx, name), "{name} is not greyed on the grid");
+    }
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Copy");
+    let all = app.clipboard(cx).unwrap();
+    assert_eq!(all.lines().count(), app.data_rows(cx).len(), "{all}");
+    let customer = app.data_rows(cx)[0][1].clone();
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(format!("{customer}0")));
+    app.click(cx, cell(0, 2));
+    from_menu(&app, cx, "Paste");
+    assert_eq!(app.pending(cx), 1);
+    app.on_data(cx, |tab, _, cx| tab.discard(cx));
+    assert_eq!(app.pending(cx), 0);
+
+    // A query's result grid: the same three. The pending change is left
+    // unapplied.
+    app.run_in_new_tab(
+        cx,
+        "select * from shop.orders order by id limit 3",
+        "secondary-enter",
+    );
+    assert_eq!(app.result_verdict(cx), None, "the rows are one table's");
+    let grid = app.result_grid(cx, 0);
+    let value = |cx: &mut TestAppContext, name: &str| {
+        cx.update(|cx| grid.read(cx).delegate().table_text(0, name))
+            .unwrap()
+    };
+    app.click(cx, cell(0, 1));
+    from_menu(&app, cx, "Copy");
+    assert_eq!(app.clipboard(cx), Some(value(cx, "id")));
+    from_menu(&app, cx, "Select All");
+    from_menu(&app, cx, "Copy");
+    assert_eq!(app.clipboard(cx).unwrap().lines().count(), 3);
+    let customer = value(cx, "customer_id");
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(format!("{customer}0")));
+    app.click(cx, cell(0, 2));
+    from_menu(&app, cx, "Paste");
+    let pending = cx.update(|cx| grid.read(cx).delegate().pending().map(|p| p.count()));
+    assert_eq!(pending, Some(1));
+
+    // Nothing focused that edits: greyed, but Copy, which the window keeps
+    // for text selected in its labels (the kit's root).
+    let workspace = app.workspace.clone();
+    app.step(cx, |window, cx| {
+        workspace.read(cx).focus_handle(cx).focus(window, cx)
+    });
+    for name in ["Undo", "Redo", "Cut", "Paste", "Select All"] {
+        assert!(!enabled(cx, name), "{name} is not greyed");
+    }
+    assert!(enabled(cx, "Copy"));
+}

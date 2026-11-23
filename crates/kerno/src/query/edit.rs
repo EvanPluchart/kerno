@@ -264,6 +264,17 @@ fn allowed(allowed: &Allowed, window: &mut Window, cx: &mut App) -> bool {
     allowed.is_ok()
 }
 
+/// Pastes the clipboard's text into the selected cells, when the rows take
+/// changes: ⌘V in the grid and Edit ▸ Paste.
+pub fn paste_clipboard(table: &Table, edits: Allowed, window: &mut Window, cx: &mut App) {
+    let text = cx.read_from_clipboard().and_then(|item| item.text());
+    if let Some(text) = text.filter(|text| !text.is_empty())
+        && allowed(&edits, window, cx)
+    {
+        paste(table, &text, cx);
+    }
+}
+
 /// What a key typed in the grid does to its rows, the grid focused: paste,
 /// Delete and Backspace set NULL, Enter and F2 type in the selected cell,
 /// Space toggles a boolean. Returns whether it was one of those keys, which
@@ -278,12 +289,7 @@ pub fn on_key(
     let secondary = keystroke.modifiers.secondary(cx) && !keystroke.modifiers.shift;
     match keystroke.key.as_str() {
         "v" if secondary => {
-            let text = cx.read_from_clipboard().and_then(|item| item.text());
-            if let Some(text) = text.filter(|text| !text.is_empty())
-                && allowed(&edits, window, cx)
-            {
-                paste(table, &text, cx);
-            }
+            paste_clipboard(table, edits, window, cx);
             true
         }
         "delete" | "backspace" if !keystroke.modifiers.modified() => {

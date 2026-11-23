@@ -57,8 +57,10 @@ mod workspace;
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 
-use gpui_kit::component::{TitleBar, WindowExt as _};
-use gpui_kit::{App, AppContext as _, Focusable as _, Menu, MenuItem, WindowOptions, px, size};
+use gpui_kit::component::{TitleBar, WindowExt as _, input};
+use gpui_kit::{
+    App, AppContext as _, Focusable as _, Menu, MenuItem, OsAction, WindowOptions, px, size,
+};
 use kerno_core::config::{Secret, parse_connection_url};
 use kerno_core::instance::{self, Invocation};
 use kerno_core::storage::AppPaths;
@@ -497,6 +499,20 @@ fn menus() -> Vec<Menu> {
         menu(
             "Edit",
             vec![
+                // The system's editing entries, for whatever has the
+                // keyboard: the text fields and the SQL editor take them,
+                // and a grid its Copy, Paste and Select All. Their keys are
+                // the fields' own (Cmd+Z, …): a key goes to the focused
+                // element first, the menu only gets what nothing took. With
+                // nothing focused to take one, it is greyed (K54).
+                MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
+                MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
+                separator(),
+                MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
+                MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
+                MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
+                MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+                separator(),
                 MenuItem::action("Find…", FindInEditor),
                 MenuItem::action("Replace…", ReplaceInEditor),
                 separator(),

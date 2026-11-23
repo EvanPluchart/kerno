@@ -810,6 +810,10 @@ Oracle's archived binaries, checked against Oracle's MD5. `scripts/check.sh` sta
 `Cmd` on macOS is `Ctrl` on Linux; `Ctrl` written alone is the Control key on both systems. Every action is also
 reachable from the command palette.
 
+On macOS the Edit menu starts with Undo, Redo, Cut, Copy, Paste and Select All, with their usual keys. They act on
+whatever has the keyboard: the SQL editor and every text field, and a grid for Copy, Paste and Select All; an
+entry is greyed where nothing focused takes it.
+
 | Shortcut | Action |
 | -------- | ------ |
 | Cmd+K | Command palette |
