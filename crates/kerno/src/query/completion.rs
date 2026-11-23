@@ -6,9 +6,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::base::input;
-use gpui_kit::component::input::{CompletionProvider, EditorState, Rope, RopeExt as _, TabSize};
-use gpui_kit::{App, Context, Entity, Task, Window};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::input::{
+    CompletionProvider, Editor, EditorState, Rope, RopeExt as _, TabSize,
+};
+use gpui_kit::{
+    App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
+    Task, TestSupportExt as _, Window, div, px,
+};
 use kerno_core::Session;
+use kerno_core::browse::QUERY_ALIAS;
 use kerno_core::schema::{RelationKind, TableRef};
 use kerno_core::sql::{Catalog, CatalogColumn, CatalogRelation, CatalogSchema, complete};
 use lsp_types::{
@@ -33,6 +40,15 @@ pub struct SqlCompletion {
 /// What a condition field offers no proposal of: the rest of a statement.
 const NOT_A_CONDITION: [&str; 4] = ["GROUP BY", "ORDER BY", "LIMIT", "RETURNING"];
 
+/// What a condition field proposes: columns, functions and the words of a
+/// condition, never the relation it is written on (K59: a result's is
+/// Kerno's own alias).
+fn in_a_condition(item: &kerno_core::sql::CompletionItem) -> bool {
+    use kerno_core::sql::CompletionKind::{Column, Function, Keyword};
+    matches!(item.kind, Column | Function | Keyword)
+        && !NOT_A_CONDITION.contains(&item.label.as_str())
+}
+
 impl SqlCompletion {
     /// The proposals at byte `offset` of `text`.
     pub fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
@@ -45,9 +61,7 @@ impl SqlCompletion {
             dialect.quote_ident(name)
         });
         if at > 0 {
-            completion
-                .items
-                .retain(|item| !NOT_A_CONDITION.contains(&item.label.as_str()));
+            completion.items.retain(in_a_condition);
         }
         if completion.replace.start < at {
             return Vec::new();
@@ -117,37 +131,50 @@ pub fn highlight(_: &str, item: &CompletionItem) -> Vec<std::ops::Range<usize>> 
     )
 }
 
-/// Completion in a field that holds a condition on `table`, whose columns
-/// and their types are `columns` (K40): what the editor proposes after
-/// `SELECT * FROM table WHERE`.
+/// Completion in a field that holds a condition on `table`, or on a
+/// query's result read again as a derived table when `None` (K59), whose
+/// columns and their types are `columns` (K40): what the editor proposes
+/// after `SELECT * FROM table WHERE`.
 pub fn condition_completion(
     session: Arc<dyn Session>,
-    table: &TableRef,
-    columns: Vec<CatalogColumn>,
+    table: Option<&TableRef>,
+    mut columns: Vec<CatalogColumn>,
 ) -> Rc<dyn CompletionProvider> {
     let dialect = session.dialect();
-    let prefix = format!(
-        "SELECT * FROM {}.{} WHERE ",
-        dialect.quote_ident(&table.schema),
-        dialect.quote_ident(&table.name)
-    );
+    // A result is read again as `FROM (…) kerno_q`: its columns are that
+    // alias's, unqualified.
+    let (from, schema, name) = match table {
+        Some(table) => (
+            format!(
+                "{}.{}",
+                dialect.quote_ident(&table.schema),
+                dialect.quote_ident(&table.name)
+            ),
+            table.schema.clone(),
+            table.name.clone(),
+        ),
+        None => (QUERY_ALIAS.into(), QUERY_ALIAS.into(), QUERY_ALIAS.into()),
+    };
+    // A name a result shows twice is proposed once.
+    let mut seen = std::collections::HashSet::new();
+    columns.retain(|column| seen.insert(column.name.clone()));
     let catalog = Catalog {
         schemas: vec![CatalogSchema {
-            name: table.schema.clone(),
+            name: schema.clone(),
             relations: vec![CatalogRelation {
-                name: table.name.clone(),
+                name,
                 kind: RelationKind::Table,
                 columns,
                 foreign_keys: Vec::new(),
             }],
             routines: Vec::new(),
         }],
-        search_path: vec![table.schema.clone()],
+        search_path: vec![schema],
     };
     Rc::new(SqlCompletion {
         catalog: Rc::new(RefCell::new(Arc::new(catalog))),
         session,
-        prefix,
+        prefix: format!("SELECT * FROM {from} WHERE "),
     })
 }
 
@@ -176,6 +203,36 @@ pub fn condition_field(
         .lsp_mut()
         .set_completion_highlighter(Rc::new(highlight));
     field
+}
+
+/// A condition field as drawn, under `id` (K40, K59): one line, 24 px;
+/// Tab takes a proposal (J1) or goes to the next control, the field being
+/// one line with nothing to indent. Enter takes a proposal and only that:
+/// the kit's list lets the key go on, and a second handler of the editor
+/// then applied the half-typed condition (K59, seen on MySQL).
+pub fn condition_input(id: &'static str, field: &Entity<EditorState>) -> impl IntoElement + use<> {
+    let (tab, enter) = (field.clone(), field.clone());
+    div()
+        .id(id)
+        .test_support()
+        .flex_1()
+        .min_w(crate::data::tab::FILTER_MIN_WIDTH)
+        .capture_action(move |_: &input::IndentInline, window, cx| {
+            if !tab_accepts(&tab, window, cx) {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+        })
+        .capture_action(move |action: &input::Enter, window, cx| {
+            if enter.read(cx).completion_menu_state().open {
+                let action = Box::new(action.clone());
+                enter.update(cx, |field, cx| {
+                    field.route_overlay_action(action, window, cx)
+                });
+                cx.stop_propagation();
+            }
+        })
+        .child(Editor::new(field).small().h(px(24.)))
 }
 
 /// Tab on `editor` (J1): accepts the highlighted completion when the list

@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::TestTextExt as _;
-use gpui_kit::base::input::{self, IndentInline};
+use gpui_kit::base::input;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::input::{EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::table::{TableEvent, TableSelection, TableState};
@@ -1080,7 +1080,7 @@ impl DataTab {
         // The WHERE field proposes this table's columns (K40).
         let provider = completion::condition_completion(
             session.clone(),
-            &self.table,
+            Some(&self.table),
             structure
                 .columns
                 .iter()
@@ -2778,22 +2778,7 @@ impl DataTab {
                             .text_color(theme.muted_foreground)
                             .child("WHERE"),
                     )
-                    .child(
-                        div()
-                            .id("filter-raw")
-                            .test_support()
-                            .flex_1()
-                            .min_w(FILTER_MIN_WIDTH)
-                            // Tab takes a proposal (J1) or goes to the next
-                            // control: the field is one line, nothing to indent.
-                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                                if !completion::tab_accepts(&this.raw_filter, window, cx) {
-                                    window.focus_next(cx);
-                                }
-                                cx.stop_propagation();
-                            }))
-                            .child(Editor::new(&self.raw_filter).small().h(px(24.))),
-                    )
+                    .child(completion::condition_input("filter-raw", &self.raw_filter))
                     .child(history_button(
                         "filter-history",
                         &self.history,

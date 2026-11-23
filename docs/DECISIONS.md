@@ -3861,3 +3861,29 @@ timer could be days; and the dialog showed once per run whatever the version.
   declined, `Phase::Ready`) gives way to a newer version found by a check: its download is removed, the item
   and the dialog offer the newer one. The same version keeps the download for the next click. If the quit
   question was on screen when the newer one arrived, answering it installs nothing: the item offers the newer.
+
+## D-125 — The result's filter proposes its columns; foreign keys marked in more results (K59; 2026-11-23)
+
+The owner's request after K40 and K49: the field that filters a query's result had no proposals, and a
+foreign key was marked only in a table's data and in a result that could be edited.
+
+- **One completion path.** The field "Filter the result on the server" is now the code editor on one line
+  that the table's WHERE field is (`completion::condition_field`), drawn by one helper for both
+  (`condition_input`: 24 px, Tab as J1's setting says, else the next control). Its proposals are
+  `condition_completion`'s, given no table: the text completes as the end of `SELECT * FROM kerno_q WHERE`,
+  the alias the result is really read under (`browse::QUERY_ALIAS`, now public), with a catalog of one
+  relation holding the result's columns and their type names (a name the result shows twice once). The
+  proposals are set when the field starts showing a result. A condition field proposes columns, functions and
+  the words of a condition only: no table or alias name (the result's would be Kerno's `kerno_q`), which drops
+  the table's own name from the table's field too.
+- **Enter takes a proposal and only that.** The kit's list lets Enter go on after taking an item; on MySQL a
+  second handler of the editor then applied the condition as it was before the item went in (seen in the
+  result's field: the half-typed `full` run and refused, the field put back to it). The helper takes Enter
+  first while the list is open, routes it to the list and stops it, in both fields.
+- **Show Completions everywhere a code editor is.** Its shortcuts (Ctrl+Space, ⌘I) were bound under
+  `QueryTab > mode == editor`, so they did nothing in a table's tab. They are now bound under `Input && mode ==
+  editor`, as the kit documents: every code editor, the query's and both condition fields; one without
+  proposals (the value panel, a structure's source) ignores them.
+- **What the result's field also hears.** Being an editor in a query tab, the field now gets the keys bound
+  under `QueryTab > mode == editor` (⌘\, ⌥↑/⌥↓, F4, ⇧F4, ⌘⇧L…), which act on the query editor, as they already
+  did from the value panel's editor. Left as is: none of them writes in the field or runs its condition.

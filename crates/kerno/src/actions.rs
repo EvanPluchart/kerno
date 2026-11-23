@@ -1124,7 +1124,9 @@ pub const COMMANDS: &[Command] = &[
         ["ctrl-space", "secondary-i"],
         ["content assist", "autocomplete", "suggest", "proposals"],
         ShowCompletions,
-        "QueryTab > mode == editor"
+        // Every code editor: the query's, and the WHERE fields of a table
+        // and of a result (K59); one without proposals ignores it.
+        "Input && mode == editor"
     ),
     command!(
         "open_table_at_cursor",

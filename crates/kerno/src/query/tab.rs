@@ -75,9 +75,7 @@ use crate::actions::{
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
-use crate::data::tab::{
-    AutoRefresh, FILTER_MIN_WIDTH, auto_refresh_button, history_button, related,
-};
+use crate::data::tab::{AutoRefresh, auto_refresh_button, history_button, related};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::multi_run::{ScriptRun, Stage};
@@ -603,7 +601,7 @@ pub struct QueryTab {
     /// The panes (and `u64::MAX` for the messages) the list holds.
     stack_items: RefCell<Vec<u64>>,
     /// The filter of the result on screen, and the pane it shows.
-    result_filter: Entity<InputState>,
+    result_filter: Entity<EditorState>,
     result_filter_for: Option<u64>,
     /// The statement and filter the field was last given: a result read
     /// again with the same ones (auto-refresh) leaves what is typed alone.
@@ -765,9 +763,13 @@ impl QueryTab {
             .as_ref()
             .and_then(|target| connections.read(cx).get(&target.connection))
             .is_some_and(|saved| saved.config.starts_in_manual_commit(environments));
+        // The table's WHERE field, proposing the result's columns (K59).
         let result_filter = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(
+            completion::condition_field(
                 "Filter the result on the server: a SQL condition, for example total > 100",
+                String::new(),
+                window,
+                cx,
             )
         });
         let filtering = cx.subscribe_in(
@@ -5829,6 +5831,12 @@ impl QueryTab {
         self.result_filter.read(cx).value().to_string()
     }
 
+    /// The filter field above the result; for tests.
+    #[cfg(test)]
+    pub fn result_filter(&self) -> &Entity<EditorState> {
+        &self.result_filter
+    }
+
     /// How the result on screen is read again, and its count; for tests.
     #[cfg(test)]
     pub fn result_requery(&self) -> (Option<Requery>, Option<u64>) {
@@ -6709,14 +6717,10 @@ impl QueryTab {
                     .text_color(theme.muted_foreground)
                     .child("WHERE"),
             )
-            .child(
-                div().flex_1().min_w(FILTER_MIN_WIDTH).child(
-                    Input::new(&self.result_filter)
-                        .small()
-                        .id("result-filter")
-                        .font_family(theme.mono_font_family.clone()),
-                ),
-            )
+            .child(completion::condition_input(
+                "result-filter",
+                &self.result_filter,
+            ))
             .child(history_button(
                 "result-filter-history",
                 &self.result_filter_history(),
@@ -7978,6 +7982,22 @@ impl Render for QueryTab {
             && self.result_filter_for != Some(id)
         {
             self.result_filter_for = Some(id);
+            // It proposes this result's columns, as a table's WHERE field
+            // proposes the table's (K59).
+            let columns = self
+                .pane_columns(id, cx)
+                .into_iter()
+                .map(|column| kerno_core::sql::CatalogColumn {
+                    name: column.name,
+                    data_type: column.type_name,
+                })
+                .collect();
+            let provider = self
+                .meta(cx)
+                .map(|session| completion::condition_completion(session, None, columns));
+            self.result_filter.update(cx, |field, _| {
+                field.lsp_mut().completion_provider = provider;
+            });
             let shown = (requery.statement.clone(), requery.filter.clone());
             if self.result_filter_shown.as_ref() != Some(&shown) {
                 self.result_filter

@@ -1508,3 +1508,11 @@ Still open (for the owner):
 - A table tab whose connection was closed kept offering Fetch more, Fetch all, Duplicate, Delete, Set NULL and
   Set default. Its rows now stay readable under a bar with Connect, and everything that needs the server is
   greyed with the reason (refused from the keyboard too); Connect reads the rows again where they were.
+
+## 2026-11-24 — K59, part 1: the result's filter proposes its columns
+
+- The field "Filter the result on the server" is now the table's WHERE field (K40): it proposes the result's
+  columns with their types, then the words of a condition, with the same keys; Ctrl+Space (⌘I) opens the list
+  in both fields. Found on the way, in both fields: Enter that took a proposal also applied the condition as it
+  was before (MySQL showed it); Enter now only takes the proposal (`docs/plans/M12.md`, K59; D-125).
+- Tests: `ui_tests::k59` (2, PostgreSQL and MySQL, fixtures read only), each seen failing under a mutation.

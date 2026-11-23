@@ -298,7 +298,7 @@ pub enum Source<'a> {
 
 /// The alias of a statement read as a derived table: PostgreSQL before 16
 /// and MySQL want one, and both take it without `AS`.
-const QUERY_ALIAS: &str = "kerno_q";
+pub const QUERY_ALIAS: &str = "kerno_q";
 
 /// One read statement whose result the server can filter, order and
 /// count by reading it as a derived table, as DBeaver does when it cannot

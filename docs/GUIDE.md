@@ -476,7 +476,9 @@ shows twice and none is missed.
 A sort, a filter, a refresh or an Apply goes back to the first row and leaves the columns scrolled where they
 were. The WHERE field proposes the table's columns as you type, with their type, then what a condition is made
 of (AND, OR, IN, IS NULL, LIKE, ILIKE on PostgreSQL, BETWEEN…): Tab or Enter takes one, quoted when the name
-needs it, Escape closes the list; with the list closed, Enter applies the filter. The order, widths, hidden and
+needs it, Escape closes the list; with the list closed, Enter applies the filter. Ctrl+Space (or ⌘I) opens the
+list when it is closed. The field "Filter the result on the server" above a query's result does the same with
+the result's columns, the names the statement gave them included. The order, widths, hidden and
 pinned columns and the sort of a table are kept for the next time it is opened, after a restart too.
 
 ## Foreign keys in the grids
@@ -856,7 +858,7 @@ entry is greyed where nothing focused takes it.
 | Cmd+Shift+I | Format SQL |
 | Cmd+Shift+X / Cmd+Shift+Y | Upper case / lower case |
 | Ctrl+Alt+Shift+W | Toggle soft wrap |
-| Ctrl+Space or Cmd+I | Show completions |
+| Ctrl+Space or Cmd+I | Show completions (editor, WHERE fields) |
 | F4 / Shift+F4 | Open the rows / the structure of the table at the cursor (editor) |
 | F4 | Edit the selected object, connection or folder (sidebar) |
 | F2 / F5 | Rename / refresh the selected object |
