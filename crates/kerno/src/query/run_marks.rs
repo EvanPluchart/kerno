@@ -26,10 +26,29 @@ use gpui_kit::{
 
 /// The width of the strip the marks are drawn in, left of the line numbers.
 pub const STRIP: Pixels = px(12.);
+/// The kit's gap between the strip and the line numbers: the marks are
+/// centred on both, so that the running mark's halo fits there (K55).
+const GAP: Pixels = px(4.);
 /// The largest a mark is drawn.
 const GLYPH: Pixels = px(10.);
-/// One breath of the running mark's halo.
-const BREATH_MS: u128 = 1200;
+/// One breath of the running mark's halo: six of the tab's redraws while a
+/// statement runs (one every 250 ms), so that each breath shows the same
+/// steps (K55, D-127).
+const BREATH_MS: u128 = 1500;
+/// The halo's opacity at the end of an out-breath and at its fullest.
+const HALO_OPACITY: (f32, f32) = (0.0, 0.5);
+/// The halo's width, in the mark's: hidden behind the play sign, then wider
+/// (16 px for a 10 px mark: the strip and the gap after it).
+const HALO_SIZE: (f32, f32) = (1.2, 1.6);
+
+/// The running mark's halo `breath` into its breath (0 to 1): its opacity
+/// and its width in the mark's. Empty at 0, fullest at 0.5, in a smooth
+/// curve with no jump between two breaths.
+pub fn halo(breath: f32) -> (f32, f32) {
+    let swell = 0.5 - 0.5 * (breath * std::f32::consts::TAU).cos();
+    let between = |(low, high): (f32, f32)| low + (high - low) * swell;
+    (between(HALO_OPACITY), between(HALO_SIZE))
+}
 
 /// How a statement of the run stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,14 +318,18 @@ pub fn overlay(
 }
 
 fn paint(layout: &Layout, window: &mut Window, cx: &mut App) {
-    let center_x = layout.clip.origin.x + STRIP / 2.;
+    let center_x = layout.clip.origin.x + (STRIP + GAP) / 2.;
     let glyph = (layout.line_height * 0.6).min(GLYPH);
-    // How far into its breath the running mark's halo is, 0 to 1.
-    let breath = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0., |now| {
-            (now.as_millis() % BREATH_MS) as f32 / BREATH_MS as f32
-        });
+    // How far into its breath the running mark's halo is, 0 to 1; held at
+    // its fullest when the system asks for less motion.
+    let breath = match cx.reduce_motion() {
+        true => 0.5,
+        false => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0., |now| {
+                (now.as_millis() % BREATH_MS) as f32 / BREATH_MS as f32
+            }),
+    };
     window.with_content_mask(
         Some(ContentMask {
             bounds: layout.clip,
@@ -362,14 +385,14 @@ fn paint_glyph(
     match mark {
         Mark::Running => {
             // The halo breathes in and out: the server is at work.
-            let swell = 0.5 - 0.5 * (breath * std::f32::consts::TAU).cos();
-            let halo = side * 1.7;
+            let (opacity, width) = halo(breath);
+            let width = side * width;
             window.paint_quad(
                 fill(
-                    Bounds::centered_at(center, size(halo, halo)),
-                    color.opacity(0.1 + 0.25 * swell),
+                    Bounds::centered_at(center, size(width, width)),
+                    color.opacity(opacity),
                 )
-                .corner_radii(halo / 2.),
+                .corner_radii(width / 2.),
             );
             let mut path = PathBuilder::fill();
             path.move_to(at(-0.32, -0.5));

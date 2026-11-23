@@ -1534,3 +1534,6 @@ Still open (for the owner):
 - The toolbar's "New SQL editor" opened on the active tab's connection even with another selected in the tree.
   It now opens on the tree's selected connection when the keyboard was last there (DBeaver's way), on the active
   tab's otherwise, and its tooltip names it.
+- The running mark (K37) is seen to breathe: 1.5 s a breath, six of the tab's redraws, from no halo to 50 % of the
+  info colour and wider, held still when the system asks for less motion (D-127). Test: `theme::tests`, seen
+  failing with K37's breath. Captures light and dark of the strip, the bar and two frames of the mark, offscreen.

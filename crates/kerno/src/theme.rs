@@ -984,6 +984,30 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// K55: the running mark's halo is seen to breathe. Half a breath apart,
+    /// at its fullest it stands at 2:1 against its faintest, on the editor
+    /// and on its active line, in both themes (K37's halo reached 1.42:1).
+    #[test]
+    fn the_running_marks_halo_is_seen_to_breathe() {
+        use crate::query::run_marks::halo;
+        let (faint, full) = (halo(0.0), halo(0.5));
+        assert!(full.1 > faint.1, "it grows too: {faint:?} {full:?}");
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let info = hex(&theme.colors["info.background"]);
+            for under in ["editor.background", "editor.active_line.background"] {
+                let surface = hex(&theme.editor(under));
+                let shown = |opacity: f32| super::mix(surface, info, f64::from(opacity));
+                let ratio = super::contrast(shown(faint.0), shown(full.0));
+                println!("{} on {under}: {ratio:.2}:1", theme.name);
+                if ratio < 2.0 {
+                    failures.push(format!("{} on {under}: {ratio:.2}", theme.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// K52: the lines of a proposal's diff read on their tints, in both themes: the text at 4.5:1
     /// on a removed or added line of the card (on the background), and on a removed line tinted in
     /// the editor; the syntax colours there at 3:1, as on a selection.

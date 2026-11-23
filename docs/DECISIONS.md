@@ -3416,8 +3416,9 @@ line of the queries running now (`SQLEditor.getCurrentLines`), and in script mod
 running statement (`showStatementInEditor(query, false)`, `revealRange`); a failure becomes a problem marker.
 
 - **What Kerno marks.** Every statement the run reached, in the margin left of the line numbers, the moment it
-  starts and ends: running (a play sign in a halo that breathes, 1.2 s a breath), done (a tick), failed (a
-  cross), cancelled (a square), refused (a barred circle: a write not sent on a read-only connection, J14).
+  starts and ends: running (a play sign in a halo that breathes, 1.5 s a breath since D-127), done (a tick),
+  failed (a cross), cancelled (a square), refused (a barred circle: a write not sent on a read-only connection,
+  J14).
   Nothing beside a statement not reached yet. A statement of several rows has a thin line down its rows. Each
   mark is a shape, not a colour alone; the colours are the theme's info, success, danger, muted text and
   warning, from 4.62:1 (light, on the active line) to 10.05:1 (dark) on the editor and its active line
@@ -3918,3 +3919,24 @@ K41 reported a tunnel's jump server as not imported. DBeaver keeps them in the S
   the import lists them connection by connection, one line each; both come from one list
   (`DbeaverImport::to_check`), DBeaver's type left uncreated included. A connection imported before (by its
   server, as K41) is still skipped: a re-import does not add the jump host to it.
+
+## D-127 — The running mark is seen to breathe (K55; 2026-11-23)
+
+A pass in the real app: the running mark of K37 (D-110), a play sign in a halo that breathed, did not look alive.
+The tab is drawn again every 250 ms while a statement runs (D-110's ticker); the halo went from 10 % to 35 % of the
+info colour over 1.2 s, so two redraws differed by a few per cent of a 17 px disc, mostly hidden by the sign.
+
+- **Period: 1.5 s a breath**, six redraws: each breath shows the same six steps (1.2 s was 4.8 redraws, so the
+  steps drifted from one breath to the next). The redraw rate stays at 250 ms: drawing the tab at the display's
+  rate for as long as a statement runs would keep the processor busy for one mark.
+- **Amplitude: from nothing to 50 %, and wider.** The halo goes from no halo at all (1.2 times the sign's width,
+  behind it) to 50 % of the info colour at 1.6 times its width, on a cosine: no jump between two breaths, no
+  blink, the steps of a breath 0, 12.5, 37.5, 50, 37.5 and 12.5 %. Half a breath apart, the fullest halo stands at
+  2.06:1 (light) to 2.72:1 (dark) against the faintest, on the editor and on its active line; K37's reached 1.42:1
+  to 1.67:1. `theme::tests::the_running_marks_halo_is_seen_to_breathe` holds 2:1 in both themes. The play sign
+  stays solid: its shape says "running", the halo only that the server is still at work.
+- **Room.** At its widest the halo is 16 px for a 10 px sign: the 12 px strip and the kit's 4 px gap before the
+  line numbers. The marks are now centred on both (2 px further right than K37's): K37's halo, centred on the strip
+  alone, was cut flat by the editor's left edge, which a wider halo made plain.
+- **Less motion.** When the system asks for less motion (GPUI's `reduce_motion`), the halo is held at its fullest:
+  the mark still says "running" by its shape and its halo, without moving.
