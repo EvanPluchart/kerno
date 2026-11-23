@@ -218,6 +218,9 @@ pub struct Navigator {
     writes: Vec<Write>,
     /// The last key given to a [`Write`].
     last_write: u64,
+    /// What has the keyboard when the tree has it (the kit keeps its
+    /// handle to itself): taken when a click gives it the focus (K56).
+    tree_focus: Option<gpui_kit::WeakFocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -357,6 +360,7 @@ impl Navigator {
             tab_target: Rc::default(),
             writes: Vec::new(),
             last_write: 0,
+            tree_focus: None,
             _subscriptions: subscriptions,
         };
         navigator.sync(cx);
@@ -3314,13 +3318,34 @@ impl Navigator {
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 view.update(cx, |this, cx| {
-                    this.tree_state
-                        .update(cx, |state, cx| state.focus(window, cx));
+                    this.focus_tree(window, cx);
                     this.select_row(index, cx);
                     this.toggle_row(index, cx);
                 });
             })
             .into_any_element()
+    }
+
+    /// Gives the tree the keyboard, and notes what has it then.
+    fn focus_tree(&mut self, window: &mut Window, cx: &mut App) {
+        self.tree_state
+            .update(cx, |state, cx| state.focus(window, cx));
+        self.tree_focus = window.focused(cx).map(|focus| focus.downgrade());
+    }
+
+    /// Whether `focus` is the tree's: the keyboard is in the tree (K56).
+    pub fn is_tree_focus(&self, focus: &gpui_kit::FocusHandle) -> bool {
+        self.tree_focus
+            .as_ref()
+            .and_then(gpui_kit::WeakFocusHandle::upgrade)
+            .is_some_and(|tree| &tree == focus)
+    }
+
+    /// The connection of the selected row, when a row is selected; not the
+    /// one opened last (K56).
+    pub fn selected_connection(&self, cx: &App) -> Option<String> {
+        let item = self.tree_state.read(cx).selected_item()?;
+        connection_of(&item.id).map(str::to_string)
     }
 
     /// Clicks are the navigator's: the tree's own would open or close the
@@ -3331,8 +3356,7 @@ impl Navigator {
             cx.stop_propagation();
             let count = event.click_count();
             view.update(cx, |this, cx| {
-                this.tree_state
-                    .update(cx, |state, cx| state.focus(window, cx));
+                this.focus_tree(window, cx);
                 this.select_row(index, cx);
                 if count >= 2 {
                     this.open_row(index, window, cx);

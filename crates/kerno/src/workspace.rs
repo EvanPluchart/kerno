@@ -578,6 +578,8 @@ pub struct Workspace {
     dialog_open: bool,
     /// What had the keyboard in the window, while no dialog was open.
     last_focus: Option<WeakFocusHandle>,
+    /// The tree had the keyboard after the tabs (K56): see `note_editor_place`.
+    editor_on_tree: bool,
     /// The last run of a script on several connections (J14): kept so it
     /// goes on, and can be shown again, once its dialog is closed.
     multi_run: Option<Entity<crate::multi_run::MultiRun>>,
@@ -688,6 +690,7 @@ impl Workspace {
             all_tabs_filter,
             dialog_open: false,
             last_focus: None,
+            editor_on_tree: false,
             multi_run: None,
             quit_question: std::rc::Weak::new(),
             pending_update_offer: None,
@@ -6497,6 +6500,7 @@ impl Workspace {
         }
         if self.focus_handle.contains_focused(window, cx) {
             self.last_focus = window.focused(cx).map(|focus| focus.downgrade());
+            self.note_editor_place(window, cx);
         } else if was_open || window.focused(cx).is_none() {
             // The focus nowhere at all (nothing focused yet, or what had it
             // was dropped) also leaves every key and menu-bar command

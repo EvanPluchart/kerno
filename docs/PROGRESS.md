@@ -1531,3 +1531,6 @@ Still open (for the owner):
 - Nothing in a query tab's bar moves when a run starts or ends: Cancel (or Stop) sits left of the history and
   saved-queries buttons, as wide whatever its word, and its room is kept while nothing runs. Test:
   `ui_tests::k55` (one more, PostgreSQL), seen failing under a mutation.
+- The toolbar's "New SQL editor" opened on the active tab's connection even with another selected in the tree.
+  It now opens on the tree's selected connection when the keyboard was last there (DBeaver's way), on the active
+  tab's otherwise, and its tooltip names it.

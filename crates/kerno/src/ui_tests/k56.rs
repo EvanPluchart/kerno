@@ -423,3 +423,84 @@ fn a_table_tab_restored_closed_offers_connect_only(cx: &mut TestAppContext) {
     app.click(cx, "table-cell-0:1");
     assert_eq!(greyed(&app, cx, &SERVER_ACTIONS), vec![Some(false); 7]);
 }
+
+/// The connection of the active query tab.
+fn tab_connection(app: &Fixture, cx: &mut TestAppContext) -> Option<String> {
+    cx.update(|cx| {
+        let tab = app.workspace.read(cx).active_query_tab()?.read(cx);
+        tab.target().map(|target| target.connection.clone())
+    })
+}
+
+/// What the toolbar's "New SQL editor" says it opens on.
+fn editor_tooltip(app: &Fixture, cx: &mut TestAppContext) -> String {
+    app.step(cx, |window, _| {
+        window
+            .find("toolbar-new-editor")
+            .description()
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+/// 4. The toolbar's "New SQL editor" opens on the connection selected in
+/// the tree when the keyboard was last there (connecting it first), on the
+/// active tab's when it was last in the tab; its tooltip says which.
+#[gpui_kit::test]
+fn the_toolbar_opens_an_editor_on_the_connection_selected_in_the_tree(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let storage = memory_storage();
+    let ids: Vec<String> = ["k56 one", "k56 two"]
+        .into_iter()
+        .map(|name| {
+            let config = ConnectionConfig {
+                name: name.into(),
+                ..testing::config(Engine::Postgres)
+            };
+            storage.save_connection(None, &config).unwrap()
+        })
+        .collect();
+    let app = open(cx, storage);
+    let secrets = cx.update(|cx| AppState::get(cx).secrets.clone());
+    for id in &ids {
+        kerno_core::secrets::save_secrets(secrets.as_ref(), id, &testing::secrets()).unwrap();
+    }
+    let row = |app: &Fixture, cx: &mut TestAppContext, id: &str| {
+        cx.update(|cx| {
+            let connections = app.connections.read(cx);
+            connections.saved().iter().position(|saved| saved.id == id)
+        })
+        .unwrap()
+    };
+    // A query tab on the first connection, the keyboard in its editor.
+    let first = row(&app, cx, &ids[0]);
+    app.click(cx, ("connection", first));
+    app.press(cx, &["secondary-t"]);
+    app.wait_until(cx, "the first tab", |app, cx| {
+        tab_connection(app, cx).as_deref() == Some(ids[0].as_str())
+    });
+    app.click(cx, "query-editor");
+    assert_eq!(editor_tooltip(&app, cx), "Open a SQL editor on “k56 one”");
+
+    // The second selected in the tree: the toolbar opens there, connected
+    // first.
+    let second = row(&app, cx, &ids[1]);
+    app.click(cx, ("connection", second));
+    assert_eq!(editor_tooltip(&app, cx), "Open a SQL editor on “k56 two”");
+    app.click(cx, "toolbar-new-editor");
+    app.wait_until(cx, "the tab on the second", |app, cx| {
+        tab_connection(app, cx).as_deref() == Some(ids[1].as_str())
+    });
+    assert_eq!(app.titles(cx).len(), 2);
+
+    // The first selected in the tree, then the keyboard back in the tab:
+    // the active tab's connection (the second) wins.
+    app.click(cx, ("connection", first));
+    app.click(cx, "query-editor");
+    assert_eq!(editor_tooltip(&app, cx), "Open a SQL editor on “k56 two”");
+    app.click(cx, "toolbar-new-editor");
+    app.wait_until(cx, "a third tab", |app, cx| app.titles(cx).len() == 3);
+    assert_eq!(tab_connection(&app, cx).as_deref(), Some(ids[1].as_str()));
+}

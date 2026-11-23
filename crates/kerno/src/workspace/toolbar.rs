@@ -389,6 +389,38 @@ impl Workspace {
         }
     }
 
+    /// Notes whether the keyboard was last in the tree or in a tab: the
+    /// toolbar's "New SQL editor" opens on the tree's selected connection
+    /// after the one, on the active tab's after the other, as DBeaver does
+    /// (K56). A toolbar button taking the focus changes neither.
+    pub(super) fn note_editor_place(&mut self, window: &Window, cx: &App) {
+        let Some(focused) = window.focused(cx) else {
+            return;
+        };
+        if self.navigator(cx).read(cx).is_tree_focus(&focused) {
+            self.editor_on_tree = true;
+        } else if self
+            .tabs
+            .iter()
+            .any(|tab| tab.focus_handle(cx).contains(&focused, window))
+        {
+            self.editor_on_tree = false;
+        }
+    }
+
+    /// The connection the toolbar's "New SQL editor" opens on: the tree's
+    /// selected one when the keyboard was last there, otherwise the
+    /// active tab's (or, without one, the tree's).
+    pub(crate) fn editor_connection(&self, cx: &App) -> Option<String> {
+        let tree = self
+            .navigator(cx)
+            .read(cx)
+            .selected_connection(cx)
+            .filter(|id| self.connections.read(cx).get(id).is_some());
+        tree.filter(|_| self.editor_on_tree)
+            .or_else(|| self.command_connection(cx))
+    }
+
     /// Where the active tab works, whatever its kind; a table's tab is on
     /// its table's schema (its database on MySQL).
     fn shown_target(&self, cx: &App) -> Option<Target> {
@@ -435,7 +467,10 @@ impl Workspace {
 
     /// Does what an item says.
     fn run_item(&mut self, item: Item, window: &mut Window, cx: &mut Context<Self>) {
-        let connection = self.command_connection(cx);
+        let connection = match item {
+            NewEditor => self.editor_connection(cx),
+            _ => self.command_connection(cx),
+        };
         if let Some(reason) = why_not(item, self.toolbar_facts(cx)) {
             // From the palette: say why, do nothing.
             let label = actions::COMMANDS
@@ -614,10 +649,31 @@ impl Workspace {
                     NewConnection => ("toolbar-new-connection-menu", "New connection of an engine"),
                     _ => ("toolbar-new-editor-menu", "Recent SQL scripts"),
                 };
+                // The editor's tooltip names the connection it opens on (K56).
+                let button = match item {
+                    NewEditor => {
+                        let on = self.editor_connection(cx).and_then(|id| {
+                            self.connections
+                                .read(cx)
+                                .get(&id)
+                                .map(|saved| saved.config.name.clone())
+                        });
+                        let text = match on {
+                            Some(name) => format!("{} on “{name}”", item.name()).into(),
+                            None => tooltip(item, reason),
+                        };
+                        icon_button(item, reason).tooltip_with_action(
+                            text,
+                            &actions::NewQueryTab,
+                            None,
+                        )
+                    }
+                    _ => icon_button(item, reason),
+                };
                 DropdownButton::new(menu_id)
                     .ghost()
                     .small()
-                    .button(icon_button(item, reason).on_click(
+                    .button(button.on_click(
                         cx.listener(move |this, _, window, cx| this.run_item(item, window, cx)),
                     ))
                     .menu_accessibility_label(menu_label)
