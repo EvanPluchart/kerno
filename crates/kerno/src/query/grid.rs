@@ -122,6 +122,10 @@ pub struct Selected {
 /// result and whether descending, or `None` for the server's own order.
 pub type SortOnServer = dyn Fn(Option<(usize, bool)>, &mut Window, &mut App);
 
+/// Asks the owner of a table's rows to read the next ones (K36): the
+/// scroll reached the last rows held.
+pub type LoadRows = dyn Fn(&mut Window, &mut App);
+
 /// Runs, for the grid's owner, an entry of a menu that is the owner's
 /// (editing, filters, export…), on the cell at a row and a column of the
 /// grid.
@@ -933,8 +937,11 @@ pub struct Grid {
     edits: Option<Edits>,
     /// Why a table's rows take no change, when they do not.
     read_only: Option<&'static str>,
-    /// Sorting is the server's work (a page of a table), not the grid's.
+    /// Sorting is the server's work (a table's rows), not the grid's.
     sort_on_server: Option<Rc<SortOnServer>>,
+    /// Reads a table's next rows (K36); `requested` above the rows held
+    /// says a read is on its way.
+    load_rows: Option<Rc<LoadRows>>,
     /// Reads a result again in another order (a SELECT's): asked when not
     /// every row is here, as DBeaver's "smart" ordering
     /// (`ResultSetViewer.toggleSortOrder`); the rows here are sorted here.
@@ -991,6 +998,7 @@ impl Grid {
             edits: None,
             read_only: None,
             sort_on_server: None,
+            load_rows: None,
             reorder: None,
             server_sorted: false,
             owner: None,
@@ -1038,23 +1046,25 @@ impl Grid {
         !self.loading() || (self.reorder.is_some() && self.has_more())
     }
 
-    /// One page of `table`, fetched in full and sorted by the server as
-    /// `sort` says. With a target, cells can be edited and the changes wait
-    /// in [`Edits::pending`]; otherwise the rows are read-only for the
-    /// reason given.
-    pub fn page(
+    /// The first rows of `table`, sorted by the server as `sort` says;
+    /// `load_rows` reads the next ones until `complete` (K36). With a
+    /// target, cells can be edited and the changes wait in
+    /// [`Edits::pending`]; otherwise the rows are read-only for the reason
+    /// given.
+    pub fn table_rows(
         store: ResultStore,
         session: Arc<dyn Session>,
         table: TableRef,
         sort: Option<(usize, bool)>,
         target: Result<EditTarget, &'static str>,
-        sort_on_server: Rc<SortOnServer>,
+        (sort_on_server, load_rows): (Rc<SortOnServer>, Rc<LoadRows>),
+        complete: bool,
     ) -> Self {
         let layout = (0..store.columns().len()).collect();
         Self {
             requested: store.row_count() as u64,
             page: 0,
-            complete: true,
+            complete,
             demand: None,
             layout,
             pinned: 0,
@@ -1071,6 +1081,7 @@ impl Grid {
                 .ok()
                 .map(|target| Edits::new(store.columns(), target)),
             sort_on_server: Some(sort_on_server),
+            load_rows: Some(load_rows),
             reorder: None,
             server_sorted: false,
             owner: None,
@@ -1602,6 +1613,45 @@ impl Grid {
         self.demand = None;
     }
 
+    /// A table's next rows are being read (K36): the end of the rows asks
+    /// for no more until they land or are asked for again.
+    pub fn asked(&mut self) {
+        self.requested = self.store.row_count() as u64 + 1;
+    }
+
+    /// A table's rows read by a load (K36): added after those here, or
+    /// (`from_start`) in their place, a read from the first row. `complete`:
+    /// the table has no more.
+    pub fn took_rows(
+        &mut self,
+        batches: Vec<RowBatch>,
+        from_start: bool,
+        complete: bool,
+        cx: &App,
+    ) {
+        // What is typed in a row added here is kept before the new rows go
+        // above that row.
+        let fetched = self.store.row_count();
+        if let Some(edits) = &self.edits
+            && edits.editing.as_ref().is_some_and(|e| e.row >= fetched)
+        {
+            self.commit_edit(cx);
+        }
+        if from_start {
+            self.store = ResultStore::new(self.store.columns().clone());
+            // The find counts the rows again.
+            if let Some(find) = &mut self.find {
+                find.recount();
+            }
+        }
+        for batch in batches {
+            self.store.push(batch);
+        }
+        self.requested = self.store.row_count() as u64;
+        self.complete = complete;
+        self.generation += 1;
+    }
+
     pub fn row_count(&self) -> usize {
         self.store.row_count()
     }
@@ -1674,8 +1724,10 @@ impl Grid {
                 return None;
             }
             if !grid.loading() {
-                return Some(if grid.sort_on_server.is_some() {
-                    "There is no such row on this page."
+                return Some(if grid.load_rows.is_some() && !grid.complete {
+                    "That row is not read yet: Fetch more reads the next rows."
+                } else if grid.load_rows.is_some() {
+                    "The table has fewer rows."
                 } else {
                     "The result has fewer rows."
                 });
@@ -1887,7 +1939,9 @@ impl Grid {
 
     /// Whether the server has, or may have, rows that were not asked for.
     pub fn has_more(&self) -> bool {
-        !self.complete && self.demand.is_some() && self.store.row_count() as u64 >= self.requested
+        !self.complete
+            && (self.demand.is_some() || self.load_rows.is_some())
+            && self.store.row_count() as u64 >= self.requested
     }
 
     /// Whether a click on a header has the server read the result again
@@ -3251,16 +3305,26 @@ impl TableDelegate for Grid {
     // shows matching rows only ("Fetch all" in the find bar does), nor
     // while the rows are sorted here (new rows would land after the sorted
     // ones), nor when Settings turns it off (K21). One page per reach: once
-    // asked, `Grid::has_more` is false until the page is here.
+    // asked, `Grid::has_more` is false until the page is here. A table's
+    // rows (K36) wait while rows are added: the next rows would push the
+    // one being filled in away, under them.
     fn has_more(&self, cx: &App) -> bool {
         Grid::has_more(self)
             && self.filtered().is_none()
             && self.order.is_none()
+            && (self.load_rows.is_none() || self.pending().is_none_or(|p| p.inserted() == 0))
             && crate::state::AppState::get(cx).settings.fetch_on_scroll
     }
 
-    fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {
-        self.fetch_more();
+    fn load_more(&mut self, window: &mut Window, cx: &mut Context<TableState<Self>>) {
+        match self.load_rows.clone() {
+            // The owner reads this grid: it runs once the table is free.
+            Some(load) => {
+                self.asked();
+                window.defer(cx, move |window, cx| load(window, cx));
+            }
+            None => self.fetch_more(),
+        }
         cx.notify();
     }
 }

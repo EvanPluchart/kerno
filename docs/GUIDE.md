@@ -17,7 +17,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
-- [Rows by pages](#rows-by-pages)
+- [Rows as you scroll](#rows-as-you-scroll)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
 - [Backup and restore](#backup-and-restore)
@@ -343,9 +343,9 @@ Every entry of a context menu and every toolbar button is also a command of the 
 ones that only make sense where they are: one entry per connection, database, schema, folder or foreign key,
 the value or column under the pointer, the text field's own Cut, Copy and Paste.
 
-## Rows by pages
+## Rows as you scroll
 
-A query result arrives 1,000 rows at a time (Settings ▸ Grid ▸ "Rows fetched per page"). Its footer says "1,000
+A query result arrives 1,000 rows at a time (Settings ▸ Grid ▸ "Rows fetched at a time"). Its footer says "1,000
 rows fetched, more on the server" while the server holds more. Scrolling to the last rows, with the mouse or
 the keyboard (Page Down, the arrows), fetches the next page by itself, once each time the end is reached: the
 footer says "fetching more…" meanwhile, and Stop (⌘.) cancels it. "Fetch more" (Ctrl+Alt+N) and "Fetch all"
@@ -354,9 +354,18 @@ result" turns the automatic fetch off, for a slow link. It also waits while the 
 and while the rows are sorted in Kerno (a result the server cannot read again in another order), where new rows
 would land out of place.
 
-A table opened from the tree is read by pages instead, ordered and filtered by the server: the footer at the
-bottom right says "Page 2 of 13" (or "of about 13" when the count is the server's estimate) and "Next 1,000
-rows", outlined while there is a next page, turns it; "Previous 1,000 rows" goes back.
+A table or a view opened from the tree is read the same way, ordered and filtered by the server: its next rows
+are read and added under the others when the scroll reaches the last ones, and its footer says "Rows 1–3,000 of
+12,345" ("of about" when the count is the server's estimate). At the bottom right, "Fetch 1,000 more"
+(Ctrl+Alt+N), outlined while the table has more, and "Fetch all" (Ctrl++), which reads load after load with the
+count growing until Cancel stops it. What is on screen stays as each load comes: the selection, the scroll, the
+record view and the changes waiting to be applied. "Fetch size: 1,000" changes how many rows each load reads in
+this tab, from a list or typed ("Other size…", 100 to 10,000); Settings keeps the size of the next table opened.
+Refresh reads again as many rows as are loaded and keeps the selection; a new order or filter starts again from
+one load. A load that fails keeps everything and says why; "Try again" reads it again. While a row is being
+added, the scroll waits; "Fetch more" puts the new rows above the added one. A table without a key, or a view,
+is read again from its first row at each load (the server keeps no order between two reads of it), so no row
+shows twice and none is missed.
 
 ## The value panel
 
@@ -668,7 +677,7 @@ reachable from the command palette.
 | Cmd+Alt+Enter or Alt+P | Run the script from the cursor (editor) |
 | Cmd+Alt+] / Cmd+Alt+[ (or Alt+Down / Alt+Up) | Go to the next / previous statement (editor) |
 | Cmd+. | Cancel the running statement |
-| Ctrl+Alt+N / Ctrl++ | Fetch more rows / fetch all rows |
+| Ctrl+Alt+N / Ctrl++ | Fetch more rows / fetch all rows, of a result or a table |
 | Ctrl+Shift+P | Pin or unpin the result tab |
 | Ctrl+Shift+\ (written Ctrl+\|) | Close the result tab |
 | Cmd+Alt+R or Alt+Shift+T | Show or hide the results panel |

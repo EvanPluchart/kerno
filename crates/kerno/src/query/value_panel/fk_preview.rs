@@ -410,10 +410,11 @@ impl ValuePanel {
     }
 
     /// The grid followed is another: what was read for the last one may have
-    /// changed since. (A new grid starts with no selection, so the key shown
-    /// goes too.)
+    /// changed since, the key shown too (rows read again keep their
+    /// selection, K36: the same key is read again).
     pub(super) fn forget_reads(&mut self) {
         self.preview.cache.clear();
+        self.preview.wanted = None;
     }
 
     /// Stops a read in flight; its session is closed with it.

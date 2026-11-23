@@ -6207,11 +6207,22 @@ impl Workspace {
                 this.on_query(window, cx, |tab, _, cx| tab.cycle_result(false, cx))
             }),
         )
+        // A query result's next rows, or a table's (K36).
         .on_action(cx.listener(|this, _: &actions::FetchMoreRows, window, cx| {
-            this.on_query(window, cx, |tab, _, cx| tab.fetch(false, cx))
+            this.on_rows(
+                window,
+                cx,
+                |tab, window, cx| tab.fetch_more(false, window, cx),
+                |tab, _, cx| tab.fetch(false, cx),
+            )
         }))
         .on_action(cx.listener(|this, _: &actions::FetchAllRows, window, cx| {
-            this.on_query(window, cx, |tab, _, cx| tab.fetch(true, cx))
+            this.on_rows(
+                window,
+                cx,
+                |tab, window, cx| tab.fetch_more(true, window, cx),
+                |tab, _, cx| tab.fetch(true, cx),
+            )
         }))
         .on_action(
             cx.listener(|this, _: &actions::CopyAsCsv, _, cx| this.copy_as(CopyFormat::Csv, cx)),

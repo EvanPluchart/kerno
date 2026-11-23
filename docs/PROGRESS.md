@@ -1199,3 +1199,22 @@ Still open (for the owner):
 - Tests: five core unit tests of the detection, one of the words per case, three UI tests (a stand-in pg_restore
   and psql, and the real tools on `kerno-postgres` with a scratch role whose name needs quotes); each seen
   failing under a mutation. Captures of the failure view and the simple restore, light and dark.
+
+## 2026-11-23 — K36: a table's rows keep loading as you scroll, the fetch size changed in place
+
+- A first user outside the owner, replacing DBeaver: a table's data turned pages while a query's result
+  fetched more at the end, and its size could only be changed in Settings. Now a table's or a view's next rows
+  are read when the scroll reaches the last ones, or on "Fetch more" (Ctrl+Alt+N), and added under those
+  there: the selection, the scroll, the record view and the changes waiting stay. "Fetch all" (Ctrl++) reads
+  load after load, the count growing, until Cancel.
+- The footer: "Rows 1–3,000 of 12,345", "Fetch size: 1,000" (a list, or a size typed, for this tab; Settings
+  keeps the default), "Fetch 1,000 more" outlined while there are more, "All rows fetched" at the end. A load
+  that fails keeps everything, says why and offers "Try again".
+- A table with a key is read by offset in its key's order. A table without a key, or a view, is read again
+  from its first row at each load, in one statement, so no row shows twice and none is skipped (D-109).
+  Refresh and Apply read back as many rows as were loaded and keep the selection; a new order or filter starts
+  from one load. The pages, Previous and Next are gone.
+- Tests: six UI tests (PostgreSQL, and MySQL for the first), each seen failing under a mutation; five tests
+  updated from pages to loads. Offscreen, with 100,000
+  rows of `analytics.big_table` loaded: 7.72 ms a frame scrolling, +29 MiB for 90,000 rows, a load of 10,000
+  rows in 50 to 68 ms. Captures of the footer, light and dark.

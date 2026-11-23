@@ -902,7 +902,7 @@ fn the_filter_and_figures_of_a_table_stay_inside_a_narrow_group(cx: &mut TestApp
         "filter-apply",
         "data-footer",
         "data-record",
-        "data-next",
+        "data-fetch-more",
     ] {
         let control = bounds(&app, cx, id);
         assert!(

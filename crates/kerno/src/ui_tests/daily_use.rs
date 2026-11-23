@@ -153,10 +153,15 @@ fn a_notification_leaves_the_footers_of_a_table_and_a_result_alone(cx: &mut Test
     assert_eq!(covered(&app, cx, &footer), Vec::<&str>::new());
     app.step(cx, |window, cx| window.clear_notifications(cx));
 
-    // A table's data: its pager at the bottom right.
+    // A table's data: its fetch controls at the bottom right (K36).
     app.open_table(cx, "shop", "orders", RelationKind::Table);
-    app.wait_until(cx, "the rows", |app, cx| app.has(cx, "data-next"));
-    let pager = ["data-page", "data-previous", "data-next", "status-bar"];
+    app.wait_until(cx, "the rows", |app, cx| app.has(cx, "data-fetch-more"));
+    let pager = [
+        "data-fetch-size",
+        "data-fetch-more",
+        "data-fetch-all",
+        "status-bar",
+    ];
     assert_eq!(covered(&app, cx, &pager), Vec::<&str>::new());
 }
 

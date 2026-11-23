@@ -20,9 +20,7 @@ use gpui_kit::{
 use crate::connections::manager::Connections;
 use crate::environments_view::EnvironmentsView;
 use crate::local_clients_view::LocalClientsView;
-use crate::settings::{
-    CODE_FONT_SIZES, PAGE_SIZES, Settings, TabLayout, TableDoubleClick, UI_FONT_SIZES,
-};
+use crate::settings::{CODE_FONT_SIZES, Settings, TabLayout, TableDoubleClick, UI_FONT_SIZES};
 use crate::settings_ui::{self, OptionCards};
 use crate::shortcuts_view::ShortcutsView;
 use crate::state::AppState;
@@ -313,9 +311,9 @@ pub(crate) static ROWS: &[Row] = &[
         kind: Kind::PageSize,
         section: Section::Grid,
         key: "settings-page-size",
-        label: "Rows fetched per page",
+        label: "Rows fetched at a time",
         description: "From 100 to 10,000. The next query result and the next table opened use it; \
-             a table already open keeps its size until it is opened again.",
+             a table's footer changes it for that tab (Fetch size).",
         keywords: &["page size", "fetch", "limit", "paging"],
     },
     Row {
@@ -323,8 +321,8 @@ pub(crate) static ROWS: &[Row] = &[
         section: Section::Grid,
         key: "settings-fetch-on-scroll",
         label: "Fetch the next rows when scrolling reaches the end of a result",
-        description: "Off, a result fetches more only from Fetch more and Fetch all: for a slow \
-             link. A table's data keeps its pages.",
+        description: "Off, a result or a table fetches more only from Fetch more and Fetch all: \
+             for a slow link.",
         keywords: &[
             "load more",
             "auto fetch",
@@ -898,10 +896,7 @@ impl SettingsView {
                 if !matches!(event, InputEvent::Change) {
                     return;
                 }
-                let size = input.read(cx).value().trim().replace([',', '_', ' '], "");
-                if let Ok(size) = size.parse::<u32>()
-                    && PAGE_SIZES.contains(&size)
-                {
+                if let Some(size) = crate::settings::page_size(&input.read(cx).value()) {
                     AppState::update_settings(cx, |settings| settings.page_size = size);
                 }
                 cx.notify();
@@ -1485,13 +1480,7 @@ impl SettingsView {
 
     /// Whether the page size typed is one the settings take.
     fn page_size_valid(&self, cx: &App) -> bool {
-        self.page_size
-            .read(cx)
-            .value()
-            .trim()
-            .replace([',', '_', ' '], "")
-            .parse::<u32>()
-            .is_ok_and(|size| PAGE_SIZES.contains(&size))
+        crate::settings::page_size(&self.page_size.read(cx).value()).is_some()
     }
 
     /// The section on screen, or what the search found in all of them.

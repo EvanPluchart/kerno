@@ -3270,3 +3270,78 @@ production backup into a local server that has none of production's roles.
   without an error, the objects created with the orphan definer, failing later when used (ERROR 1449). A user
   without it gets ERROR 1227 at that statement, and the restore stops there, what ran before kept. Nothing
   built.
+
+## D-109 — A table's rows keep loading as you scroll; the size of a load is changed in place (K36; 2026-11-23)
+
+A first user outside the owner, replacing DBeaver by Kerno 0.3.0 (the owner's words, translated): "Load more
+works when you run a query, but in a table it does not: it is still a plain pagination. And the default is
+1,000 per page (set in Settings), but we cannot change it on the fly in our tables as in DBeaver: there you see
+the number per page at the bottom and you click it to change it." DBeaver's data viewer reads the next segment
+when the scroll reaches the end (`ResultSetViewer.readNextSegment`) and holds the fetch size in a box of its
+status bar. Its behaviour was read; no code was ported.
+
+- **A load adds rows; only a read from the first row rebuilds.** A table's or a view's data tab reads one load
+  (Settings' size, now "Rows fetched at a time") from the first row, then the next when the scroll comes within
+  20 rows of the last one (the kit's threshold, the same as a query result, and the same switch: Settings ▸
+  Grid ▸ "Fetch the next rows when scrolling reaches the end of a result"), or on **Fetch more** (the footer,
+  Ctrl+Alt+N, the palette). Its rows are pushed into the grid already on screen (`Grid::took_rows`): nothing
+  is rebuilt, so the selection, the scroll, the record view, the find, the columns' layout and the pending
+  changes (kept by row as read; rows added are drawn after the rows read) stay as they were. Row numbers go
+  on. A load is one statement on the tab's session, after what the session is doing (a count, an apply,
+  distinct values); "fetching more…" and Cancel show meanwhile. A load that fails or is cancelled keeps every
+  row and every pending change, says why in the footer ("The next rows could not be read. …", "Cancelled: no
+  more rows were read."), and its button becomes **Try again**; the scroll does not try again by itself (a
+  read that fails would loop). A table dropped since also has the tree read its schema again, as a failed read
+  does.
+- **The order of the loads.** A table with a key was already read in a total order: `ORDER BY` the sorted
+  column, then the key (`browse::select_sql`). Its loads are `LIMIT size OFFSET <rows read>`, the offset being
+  the rows read, not a page number, so the size can change between two loads. A table without a key and a
+  view are read with no `ORDER BY` (an order over every column would have the server sort the whole relation
+  before it sends the first row, on every first load of every view). Two reads of them by offset can repeat
+  rows and skip others: on PostgreSQL an `UPDATE` moves a row to the end of the heap, a synchronized or
+  parallel scan starts elsewhere; on MySQL and MariaDB the plan can change between an index and a table scan.
+  So each load of such a relation reads from the first row as many rows as are on screen plus one load, in one
+  statement, in place of the rows on screen: every screen is one read, no row twice, none skipped. These rows
+  are read-only in Kerno (no key, or a view), so nothing pending can be lost. Costs: the rows sent grow with
+  the square of the loads (100 loads of 1,000 rows send 5 million rows); Fetch all on them is one read
+  without a limit, its count jumping once at the end. Known limits: if the server's order changes between two
+  loads of such a relation, a row on screen can change place (the screen shows what the server says); rows
+  inserted or deleted by someone else before the offset between two loads of a keyed table shift it, as any
+  `OFFSET` read does (a read by key after the last row would fix it, at the price of comparing (sort, key)
+  pairs with their NULLs on each engine: not done).
+- **The footer.** "Rows 1–3,000 of 12,345" ("of about" for the planner's estimate, no total before the
+  count); **Fetch size: 1,000** with a caret, a list of 100, 500, 1,000, 5,000 and 10,000 (the current one
+  ticked) and "Other size…", a small dialog that takes what Settings takes (100 to 10,000, "2,500" with its
+  comma); **Fetch 1,000 more**, outlined while the server has more (K21's lesson), "Fetch 345 more" before
+  the last load of a counted table, "All rows fetched" greyed after it (a load that ends exactly on the count
+  ends the way on too); **Fetch all**: load after load, each as large as what is loaded (from the size up to
+  100,000 rows: few statements, `OFFSET` cost bounded), the count growing; Cancel stops it.
+- **The size lasts for the tab** (owner-disagreeable). DBeaver's box writes the connection's preference
+  (`RESULT_SET_MAX_ROWS`, `ResultSetViewer` status bar). In Kerno a size picked to look through one large
+  table would otherwise make every later opening of that table, or of every table of the connection, read
+  that much; Settings stays the default of a newly opened table and says so. Remembering it per table would be
+  one more field of the J6 `TableLayout`.
+- **Refresh, Apply, auto-refresh: read again as far as loaded.** They read from the first row as many rows as
+  are loaded (at least one load), then put the selection and the first row in view back by position, and the
+  record view (DBeaver's `refreshData` reads up to the segment of the current row; Kerno reads them all, so
+  nothing under the selection goes away). After an Apply the rows are the server's: nothing shown contradicts
+  it. An auto-refresh tick does the same; with many rows loaded each tick reads them all, and a tick still
+  waits while a read runs. A new sort, a new filter and "Reset layout" start again from one load. Refresh, sort
+  and filter still wait for pending changes to be applied or discarded. The value panel's preview of a foreign
+  key's row reads it again after a refresh even though the selection stayed on the same cell.
+- **Rows added.** Drawn after the rows read, as before. The scroll does not load while rows are added: the
+  next load would push the row being filled in down out of view. Fetch more does load: the new rows go above
+  the added ones, a selection on an added row follows it, and a cell being typed in one is kept first.
+- **Keys and words.** Fetch More Rows (Ctrl+Alt+N) and Fetch All Rows (Ctrl++) were keys of the query tab; they
+  are global now and go to the active table or query tab (the find bar's "Fetch all" reaches a table too).
+  "Page 2 of 13", Previous and Next and their code are gone; "Go to row" past the rows read says "That row is
+  not read yet: Fetch more reads the next rows." The export of a table still reads the server (one statement,
+  the tab's filter and order), as do "Rows of … referencing this one".
+- **Measured** on `analytics.big_table` (1,000,000 rows, read only), fetch size 10,000, release build,
+  offscreen (`HeadlessAppContext` with Metal's headless renderer, 1200 × 800; no window may be opened for this
+  item), the machine busy (1-minute load 9 to 50): each of the nine loads after the first took 50 to 68 ms
+  from the call to the rows on screen (offsets 10,000 to 90,000: the offset's cost does not show at this size);
+  the process grew from 76 MiB with 10,000 rows to 106 MiB with 100,000 (+29 MiB, about 15 bytes a cell: the
+  columnar store, nothing per cell); 1,332 frames drawn while scrolling the 100,000 rows down and up, 150 rows a
+  frame: 7.72 ms on average, median 7.32, 99th percentile 13.75, longest 36.05. These are the time to lay out,
+  paint and render one frame offscreen, not the app's interval between frames on a display.

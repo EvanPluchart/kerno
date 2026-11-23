@@ -48,10 +48,12 @@ impl TableDoubleClick {
 pub struct Settings {
     /// Light, dark, or follow the system.
     pub appearance: Appearance,
-    /// Rows fetched per page of a result.
+    /// Rows fetched at a time by a result, and by a newly opened table's
+    /// data (K36).
     pub page_size: u32,
-    /// A result fetches its next page when scrolling reaches its last
-    /// fetched rows (DBeaver's `resultset.autofetch.next.segment`, K21).
+    /// A result or a table's data fetches its next rows when scrolling
+    /// reaches its last fetched rows (DBeaver's
+    /// `resultset.autofetch.next.segment`, K21, K36).
     pub fetch_on_scroll: bool,
     /// Ask before running a destructive statement typed in the editor.
     pub confirm_destructive: bool,
@@ -188,8 +190,19 @@ pub const RECENT_SCRIPTS: usize = 10;
 /// The sizes the settings allow, in points.
 pub const UI_FONT_SIZES: std::ops::RangeInclusive<f32> = 12.0..=18.0;
 pub const CODE_FONT_SIZES: std::ops::RangeInclusive<f32> = 11.0..=20.0;
-/// The sizes a page of rows may have.
+/// The sizes a page of rows may have: what a result fetches at a time,
+/// and a table's data until its footer changes it (K36).
 pub const PAGE_SIZES: std::ops::RangeInclusive<u32> = 100..=10_000;
+
+/// A page size as typed ("2,500"), when the settings take it.
+pub fn page_size(typed: &str) -> Option<u32> {
+    typed
+        .trim()
+        .replace([',', '_', ' '], "")
+        .parse::<u32>()
+        .ok()
+        .filter(|size| PAGE_SIZES.contains(size))
+}
 /// The widths the value panel may have, in points.
 pub const VALUE_PANEL_WIDTHS: std::ops::RangeInclusive<f32> = 240.0..=900.0;
 

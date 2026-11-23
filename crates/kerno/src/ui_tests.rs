@@ -75,6 +75,7 @@ mod shortcuts;
 mod sidebar_tree;
 mod split;
 mod sqlite;
+mod table_loads;
 mod tabs_v11;
 mod tasks;
 mod tool_passwords;
@@ -4494,7 +4495,7 @@ fn scratch_schema(engine: Engine, name: &str) -> (String, String) {
 const ENGINES: [Engine; 3] = [Engine::Postgres, Engine::MySql, Engine::MariaDb];
 
 #[gpui_kit::test]
-fn a_table_is_read_in_pages_sorted_and_filtered_by_the_server(cx: &mut TestAppContext) {
+fn a_table_is_read_in_loads_sorted_and_filtered_by_the_server(cx: &mut TestAppContext) {
     for engine in ENGINES {
         if !testing::available(engine) {
             return;
@@ -4540,22 +4541,24 @@ fn a_table_is_read_in_pages_sorted_and_filtered_by_the_server(cx: &mut TestAppCo
         app.open_table(cx, "kerno_ui_pages", "items", RelationKind::Table);
         assert_eq!(app.titles(cx), ["items"]);
 
-        // Pages.
-        app.click(cx, "data-next");
-        app.wait_for_rows(cx, "Rows 101–200 of 250");
-        assert_eq!(app.data_rows(cx)[0][0], "101");
-        // K21: the way on says what the last page holds.
-        assert_eq!(app.label_of(cx, "data-next"), "Next 50 rows");
-        app.click(cx, "data-next");
-        app.wait_for_rows(cx, "Rows 201–250 of 250");
-        // There is no page after the last.
-        app.on_data(cx, |tab, window, cx| tab.turn_page(1, window, cx));
+        // Loads, added under the rows there (K36).
+        app.click(cx, "data-fetch-more");
+        app.wait_for_rows(cx, "Rows 1–200 of 250");
+        assert_eq!(app.data_rows(cx)[100][..2], ["101", "item 101"]);
+        assert_eq!(app.data_rows(cx)[0][0], "1");
+        // K21: the way on says what the last load reads.
+        assert_eq!(app.label_of(cx, "data-fetch-more"), "Fetch 50 more");
+        app.click(cx, "data-fetch-more");
+        app.wait_for_rows(cx, "Rows 1–250 of 250");
+        // The last load of a counted table ends the way on.
+        assert_eq!(app.label_of(cx, "data-fetch-more"), "All rows fetched");
+        assert!(!app.has(cx, "data-fetch-all"));
+        app.on_data(cx, |tab, window, cx| tab.fetch_more(false, window, cx));
         cx.run_until_parked();
-        assert_eq!(app.data_state(cx), "Rows 201–250 of 250");
-        app.click(cx, "data-previous");
-        app.wait_for_rows(cx, "Rows 101–200 of 250");
+        assert_eq!(app.data_state(cx), "Rows 1–250 of 250");
+        assert_eq!(app.data_rows(cx).len(), 250);
 
-        // A click on a header sorts on the server, from the first page.
+        // A click on a header sorts on the server, from the first load.
         let grid = app.data_grid(cx);
         app.step(cx, |window, cx| {
             grid.update(cx, |table, cx| {
@@ -9524,7 +9527,7 @@ fn a_data_tab_whose_table_is_gone_shows_no_rows_and_the_tree_forgets_it(cx: &mut
     // No row can be added to a table that is not there.
     app.click(cx, "data-add-row");
     assert_eq!(app.pending(cx), 0);
-    assert!(!app.has(cx, "data-next"), "no page to turn");
+    assert!(!app.has(cx, "data-fetch-more"), "no rows to fetch");
     // The tree reads the schema's tables again.
     app.wait_until(cx, "the tree to forget the table", |app, cx| {
         !app.shows(cx, &path)

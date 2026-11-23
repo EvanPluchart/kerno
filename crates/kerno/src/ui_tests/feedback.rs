@@ -346,24 +346,24 @@ fn the_setting_off_or_rows_sorted_here_fetch_nothing_by_themselves(cx: &mut Test
     assert_eq!(app.outcomes(cx), ["100 rows, more"]);
 }
 
-/// K21: a table's data keeps its pages, and the way on says what it shows.
+/// K21, K36: a table's footer says what is fetched, its fetch size, and
+/// what the way on reads; a load adds its rows under those there.
 #[gpui_kit::test]
-fn a_tables_pager_says_where_it_is_and_what_next_shows(cx: &mut TestAppContext) {
+fn a_tables_footer_says_what_is_fetched_and_what_comes_next(cx: &mut TestAppContext) {
     if !testing::available(Engine::Postgres) {
         return;
     }
     let app = connected(cx, Engine::Postgres);
     cx.update(|cx| AppState::update_settings(cx, |settings| settings.page_size = 100));
     app.open_table(cx, "shop", "orders", RelationKind::Table);
-    app.wait_until(cx, "the first page", |app, cx| {
-        app.data_state(cx).starts_with("Rows 1–100 of")
+    app.wait_until(cx, "the first load", |app, cx| {
+        app.data_state(cx) == "Rows 1–100 of 5,000"
     });
-    assert!(paints(&app, cx, "Page 1 of "), "the page and how many");
-    assert_eq!(app.label_of(cx, "data-next"), "Next 100 rows");
-    assert_eq!(app.label_of(cx, "data-previous"), "Previous 100 rows");
-    app.click(cx, "data-next");
-    app.wait_until(cx, "the second page", |app, cx| {
-        app.data_state(cx).starts_with("Rows 101–200 of")
+    assert_eq!(app.label_of(cx, "data-fetch-size"), "Fetch size: 100");
+    assert_eq!(app.label_of(cx, "data-fetch-more"), "Fetch 100 more");
+    assert_eq!(app.label_of(cx, "data-fetch-all"), "Fetch all");
+    app.click(cx, "data-fetch-more");
+    app.wait_until(cx, "the second load", |app, cx| {
+        app.data_state(cx) == "Rows 1–200 of 5,000"
     });
-    assert!(paints(&app, cx, "Page 2 of "));
 }

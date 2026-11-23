@@ -1,4 +1,5 @@
-//! A table's data: one page of its rows, filtered and sorted by the server.
+//! A table's data: its rows, filtered and sorted by the server, read a load
+//! at a time as the scroll reaches the end (K36).
 //! Cells are edited in place; the changes wait, are reviewed as SQL, and
 //! are applied in one transaction or discarded.
 
@@ -7,12 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::table::{TableEvent, TableState};
+use gpui_kit::component::table::{TableEvent, TableSelection, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
@@ -21,17 +21,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Task, TestSupportExt as _, Window, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    TestSupportExt as _, Window, div, px,
 };
 use kerno_core::browse::{
-    Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql,
+    Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql, select_sql,
 };
 use kerno_core::exec::CollectedResult;
 use kerno_core::pending::Pending;
 use kerno_core::schema::{ForeignKeyInfo, RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits_until};
 use kerno_core::storage::TableLayout;
-use kerno_core::{Engine, Error, ResultStore, Session, TxState, describe, exec};
+use kerno_core::{Dialect, Engine, Error, ResultStore, Session, TxState, describe, exec};
 
 use crate::actions::CloseTab;
 use crate::bridge;
@@ -40,10 +41,11 @@ use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::query::distinct;
 use crate::query::edit;
-use crate::query::grid::{CopyFormat, EditTarget, Grid, GridAction, Owner, SortOnServer};
+use crate::query::grid::{CopyFormat, EditTarget, Grid, GridAction, LoadRows, Owner, SortOnServer};
 use crate::query::plan_view::number;
 use crate::query::tab::{TabStatus, duration_text};
 use crate::query::value_panel::{self, ValuePanel};
+use crate::settings::{PAGE_SIZES, page_size};
 use crate::sql_confirm::{self, Confirmation, Statement};
 use crate::state::AppState;
 use crate::tabs::{TabSnapshot, Target};
@@ -102,12 +104,12 @@ enum State {
 pub enum Total {
     Exact(u64),
     /// The planner's estimate of an unfiltered table too large to count
-    /// after each page; "Count exactly" counts it.
+    /// after each read from the first row; "Count exactly" counts it.
     About(u64),
 }
 
 /// An unfiltered table whose estimate is above this is not counted after
-/// each page: the estimate is shown instead (M6 Part 2).
+/// each read: the estimate is shown instead (M6 Part 2).
 const COUNT_ESTIMATE_ABOVE: u64 = 1_000_000;
 
 /// The intervals auto-refresh offers, in seconds (DBeaver's
@@ -225,11 +227,64 @@ fn sentence(message: &str) -> String {
     }
 }
 
-/// What a load brought back.
+/// What a read from the first row brought back.
 struct Loaded {
     session: Arc<dyn Session>,
     structure: Arc<TableStructure>,
     result: CollectedResult,
+    /// The rows it asked for: fewer came when the table has no more.
+    asked: u64,
+}
+
+/// What a read from the first row keeps of the rows it replaces (K36):
+/// the selection, the first row in view, the record view.
+struct Place {
+    selection: TableSelection,
+    top: usize,
+    record: bool,
+}
+
+/// The sizes of a load the footer offers (K36); another is typed.
+pub const LOAD_SIZES: [u64; 5] = [100, 500, 1_000, 5_000, 10_000];
+
+/// The most rows one read of Fetch all asks for (K36): the count grows
+/// as they come, and few reads are needed.
+const FETCH_ALL_AT_MOST: u64 = 100_000;
+
+/// What a further load stopped by Cancel says (K36).
+const LOAD_CANCELLED: &str = "Cancelled: no more rows were read.";
+
+/// The statement that reads `limit` rows of `table` (every one, with
+/// `None`) after the first `offset`, in the order the tab shows them. A
+/// remembered order on a column gone since is dropped.
+fn rows_sql(
+    dialect: &dyn Dialect,
+    structure: &TableStructure,
+    table: &TableRef,
+    filter: &Filter,
+    sort: Option<&(String, bool)>,
+    limit: Option<u64>,
+    offset: u64,
+) -> kerno_core::Result<String> {
+    let identity = structure.row_identity().unwrap_or_default();
+    let sort = sort
+        .filter(|(name, _)| structure.columns.iter().any(|column| column.name == *name))
+        .map(|(column, down)| (column.as_str(), *down));
+    match limit {
+        Some(limit) => page_sql(
+            dialect,
+            &structure.columns,
+            Page {
+                table,
+                filter,
+                sort,
+                identity: &identity,
+                limit,
+                offset,
+            },
+        ),
+        None => select_sql(dialect, &structure.columns, table, filter, sort, &identity),
+    }
 }
 
 /// The rows of one table or view.
@@ -249,9 +304,18 @@ pub struct DataTab {
     applied: Filter,
     /// The column sorted on and whether descending.
     sort: Option<(String, bool)>,
-    /// Index of the page on screen.
-    page: u64,
-    page_size: u64,
+    /// Rows one load reads: Settings' size when the tab opens, changed in
+    /// the footer for this tab (K36).
+    load_size: u64,
+    /// The next rows are being read (K36).
+    appending: bool,
+    /// Loads go on until every row is here (Fetch all).
+    load_all: bool,
+    /// Why the last load of more rows read none, until the next one.
+    load_error: Option<String>,
+    /// What the read from the first row on its way keeps of the rows on
+    /// screen.
+    place: Option<Place>,
     grid: Option<Entity<TableState<Grid>>>,
     /// Rows the filter keeps in the whole table, once counted or estimated.
     total: Option<Total>,
@@ -356,8 +420,11 @@ impl DataTab {
             raw_filter,
             applied: filter.clone(),
             sort: None,
-            page: 0,
-            page_size: u64::from(AppState::get(cx).settings.page_size.max(1)),
+            load_size: u64::from(AppState::get(cx).settings.page_size.max(1)),
+            appending: false,
+            load_all: false,
+            load_error: None,
+            place: None,
             grid: None,
             total: None,
             counting: false,
@@ -502,8 +569,7 @@ impl DataTab {
         self.layout = Some(TableLayout::default());
         self.sort = None;
         self.write_layout(TableLayout::default(), cx);
-        self.page = 0;
-        self.reload(window, cx);
+        self.restart(window, cx);
     }
 
     /// What the filter history of this table is stored under.
@@ -649,7 +715,7 @@ impl DataTab {
                     .and_then(|meta| meta.database())
             }),
             transaction: TxState::Idle,
-            running: self.state == State::Loading || self.applying,
+            running: self.state == State::Loading || self.appending || self.applying,
             // A failed read says nothing about rows: the error says it all.
             rows: self
                 .grid
@@ -716,7 +782,7 @@ impl DataTab {
     pub fn close_session(&mut self, cx: &mut Context<Self>) {
         // A statement still waiting (behind a lock, say) is stopped first,
         // so nothing of a closed tab keeps running on the server (C3).
-        let busy = self.state == State::Loading || self.counting || self.applying;
+        let busy = self.state == State::Loading || self.appending || self.counting || self.applying;
         if let Some(session) = self.session.take() {
             bridge::spawn(cx, async move {
                 if busy && let Err(error) = session.cancel().await {
@@ -732,6 +798,7 @@ impl DataTab {
     pub fn defer_until_shown(&mut self, cx: &mut Context<Self>) {
         self.hidden = true;
         self.generation += 1;
+        (self.appending, self.load_all) = (false, false);
         self.load = None;
         self.close_session(cx);
         self.state = State::Waiting;
@@ -750,10 +817,45 @@ impl DataTab {
         }
     }
 
-    /// Reads the page again, with the filter and sort as they are.
+    /// Reads the rows again from the first, as many as are loaded, with
+    /// the filter and sort as they are: the selection, the scroll and the
+    /// record view stay where they were (K36, DBeaver's `refreshData`).
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let place = self
+            .grid
+            .as_ref()
+            .filter(|_| self.state == State::Ready)
+            .map(|table| {
+                let table = table.read(cx);
+                Place {
+                    selection: table.selection(),
+                    top: table.visible_range().rows().start,
+                    record: table.delegate().record,
+                }
+            });
+        let rows = self.fetched(cx).max(self.load_size);
+        self.read(rows, place, window, cx);
+    }
+
+    /// Reads one load of rows from the first: another order or filter.
+    fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.read(self.load_size, None, window, cx);
+    }
+
+    /// Reads `rows` rows from the first in place of those on screen, then
+    /// counts them all; `place` is what of the rows on screen is kept.
+    fn read(
+        &mut self,
+        rows: u64,
+        place: Option<Place>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.generation += 1;
         let generation = self.generation;
+        // A further load on its way is of rows read again now.
+        (self.appending, self.load_all, self.load_error) = (false, false, None);
+        self.place = place;
         if self.hidden || !self.connected(cx) {
             self.close_session(cx);
             self.state = State::Waiting;
@@ -775,7 +877,6 @@ impl DataTab {
         let known = self.structure.clone();
         let filter = self.applied.clone();
         let sort = self.sort.clone();
-        let (limit, offset) = (self.page_size, self.page * self.page_size);
         self.load = Some(cx.spawn_in(window, async move |this, cx| {
             // One statement at a time on the session, in the order asked.
             if let Some(previous) = previous {
@@ -816,7 +917,7 @@ impl DataTab {
                         };
                         // The planner's estimate of an unfiltered table: above
                         // the threshold it stands for the count, read with
-                        // the page instead of a count after it.
+                        // the rows instead of a count after it.
                         let about = if filter.is_empty() {
                             let estimate = session.dialect().estimated_rows_sql(&table);
                             first_count(exec::collect(session.clone(), estimate).await)
@@ -824,22 +925,14 @@ impl DataTab {
                         } else {
                             None
                         };
-                        let identity = structure.row_identity().unwrap_or_default();
-                        // A remembered order on a column gone since is dropped.
-                        let sort = sort.filter(|(name, _)| {
-                            structure.columns.iter().any(|column| column.name == *name)
-                        });
-                        let sql = page_sql(
+                        let sql = rows_sql(
                             session.dialect(),
-                            &structure.columns,
-                            Page {
-                                table: &table,
-                                filter: &filter,
-                                sort: sort.as_ref().map(|(column, down)| (column.as_str(), *down)),
-                                identity: &identity,
-                                limit,
-                                offset,
-                            },
+                            &structure,
+                            &table,
+                            &filter,
+                            sort.as_ref(),
+                            Some(rows),
+                            0,
                         )?;
                         let result = exec::collect(session.clone(), sql)
                             .await?
@@ -867,6 +960,7 @@ impl DataTab {
                 session: session.clone(),
                 structure,
                 result,
+                asked: rows,
             };
             let shown = this.update_in(cx, |this, window, cx| {
                 this.generation == generation && {
@@ -881,7 +975,7 @@ impl DataTab {
             if !matches!(shown, Ok(true)) || about.is_some() {
                 return;
             }
-            // The page shows at once; how many rows there are in all follows.
+            // The rows show at once; how many there are in all follows.
             let Ok(counted) = cx.update(|_, cx| {
                 bridge::spawn(cx, async move {
                     first_count(exec::collect(session, counting).await).map(Total::Exact)
@@ -894,6 +988,7 @@ impl DataTab {
                 if this.generation == generation {
                     this.total = total;
                     this.counting = false;
+                    this.settle_end(cx);
                     cx.notify();
                 }
             });
@@ -931,7 +1026,7 @@ impl DataTab {
         cx.notify();
     }
 
-    /// Puts a fetched page on screen.
+    /// Puts rows read from the first on screen.
     fn show(
         &mut self,
         loaded: Loaded,
@@ -943,7 +1038,9 @@ impl DataTab {
             session,
             structure,
             result,
+            asked,
         } = loaded;
+        let complete = (result.row_count() as u64) < asked;
         self.session = Some(session.clone());
         self.structure = Some(structure.clone());
         self.elapsed = Some(elapsed);
@@ -988,6 +1085,12 @@ impl DataTab {
                 let _ = view.update(cx, |this, cx| this.sort_by(sort, window, cx));
             }
         });
+        let load_rows: Rc<LoadRows> = Rc::new({
+            let view = view.clone();
+            move |window, cx| {
+                let _ = view.update(cx, |this, cx| this.fetch_more(false, window, cx));
+            }
+        });
         let keyless = structure.row_identity().is_none();
         let described = structure.clone();
         let owner = Owner {
@@ -1005,13 +1108,14 @@ impl DataTab {
             keyless,
             structure: Some(described),
         };
-        let mut grid = Grid::page(
+        let mut grid = Grid::table_rows(
             store,
             session,
             self.table.clone(),
             sort,
             target,
-            sort_on_server,
+            (sort_on_server, load_rows),
+            complete,
         )
         .with_owner(owner);
         // The columns as they were last left (J6).
@@ -1034,7 +1138,7 @@ impl DataTab {
                     .collect(),
             );
         }
-        // The find bar stays open, with its text, over the new page.
+        // The find bar stays open, with its text, over the rows read again.
         let find = self
             .grid
             .as_ref()
@@ -1096,6 +1200,25 @@ impl DataTab {
         if let Some(find) = find {
             crate::query::find::restore(&table, find, window, cx);
         }
+        // Rows read again keep the user's place (K36): the selection, then
+        // the first row that was in view, by position.
+        if let Some(place) = self.place.take() {
+            table.update(cx, |table, cx| {
+                let Some(last) = table.delegate().total_rows().checked_sub(1) else {
+                    return;
+                };
+                table.delegate_mut().record = place.record;
+                match place.selection {
+                    TableSelection::Cell(row, column) => {
+                        table.set_selected_cell(row.min(last), column, cx)
+                    }
+                    TableSelection::Row(row) => table.set_selected_row(row.min(last), cx),
+                    TableSelection::Column(column) => table.set_selected_col(column, cx),
+                    TableSelection::None => {}
+                }
+                table.scroll_to_row(place.top.min(last), cx);
+            });
+        }
         if std::mem::take(&mut self.refocus_grid) {
             // Only while the keyboard is still on this tab, not after the
             // user moved on during the reload.
@@ -1139,8 +1262,7 @@ impl DataTab {
         self.sort = sort
             .and_then(|(column, descending)| Some((columns.get(column)?.name.clone(), descending)));
         self.remember_layout(cx);
-        self.page = 0;
-        self.reload(window, cx);
+        self.restart(window, cx);
     }
 
     /// What the layout of the table is stored under; for tests.
@@ -1157,34 +1279,207 @@ impl DataTab {
             .map(|(column, descending)| (column.as_str(), *descending))
     }
 
-    /// Shows another page: the next (`1`) or the previous (`-1`) one.
-    pub fn turn_page(&mut self, by: i64, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.free_to_move(window, cx) {
-            return;
-        }
-        let Some(page) = self.page.checked_add_signed(by) else {
-            return;
-        };
-        if by > 0 && !self.has_next(cx) {
-            return;
-        }
-        self.page = page;
-        self.reload(window, cx);
-    }
-
+    /// Rows read from the server and held (rows added here aside).
     fn fetched(&self, cx: &App) -> u64 {
         self.grid.as_ref().map_or(0, |grid| {
             grid.read(cx).delegate().store().row_count() as u64
         })
     }
 
-    fn has_next(&self, cx: &App) -> bool {
-        let shown = self.page * self.page_size + self.fetched(cx);
-        match self.total {
-            Some(Total::Exact(total)) => shown < total,
-            // Not counted: a full page may have a next one.
-            Some(Total::About(_)) | None => self.fetched(cx) == self.page_size,
+    /// Whether the server has, or may have, rows not read yet.
+    fn has_more(&self, cx: &App) -> bool {
+        self.grid
+            .as_ref()
+            .is_some_and(|grid| !grid.read(cx).delegate().is_complete())
+    }
+
+    /// A counted table whose rows are all here has none left to read.
+    fn settle_end(&mut self, cx: &mut Context<Self>) {
+        let fetched = self.fetched(cx);
+        if let (Some(Total::Exact(total)), Some(table)) = (self.total, &self.grid)
+            && fetched >= total
+        {
+            table.update(cx, |table, _| table.delegate_mut().finish(true));
         }
+    }
+
+    /// Changes how many rows the next loads of this tab read (K36): what is
+    /// here stays.
+    pub fn set_load_size(&mut self, size: u64, cx: &mut Context<Self>) {
+        self.load_size = size.max(1);
+        cx.notify();
+    }
+
+    /// How many rows one load reads; for tests.
+    #[cfg(test)]
+    pub fn load_size(&self) -> u64 {
+        self.load_size
+    }
+
+    /// Reads the next rows and adds them under those on screen (K36),
+    /// after what the session is doing; with `all`, every row left, a load
+    /// after another, the count growing. The rows on screen, the selection,
+    /// the scroll, the record view and the pending changes stay. A table
+    /// without a key, or a view, has no order the server keeps from one
+    /// statement to the next: its rows are read again from the first, one
+    /// load more (all of them in one read for `all`), in place of those on
+    /// screen (D-109).
+    pub fn fetch_more(&mut self, all: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(session), Some(structure), Some(table)) = (
+            self.session.clone(),
+            self.structure.clone(),
+            self.grid.clone(),
+        ) else {
+            return;
+        };
+        if self.state != State::Ready || self.appending || !self.has_more(cx) {
+            return;
+        }
+        table.update(cx, |table, _| table.delegate_mut().asked());
+        let loaded = self.fetched(cx);
+        let keyed = structure.row_identity().is_some();
+        let size = if all {
+            loaded.clamp(self.load_size, FETCH_ALL_AT_MOST.max(self.load_size))
+        } else {
+            self.load_size
+        };
+        // The rows the read asks for, and after how many.
+        let (limit, offset) = match (keyed, all) {
+            (true, _) => (Some(size), loaded),
+            (false, true) => (None, 0),
+            (false, false) => (Some(loaded + size), 0),
+        };
+        self.appending = true;
+        self.load_all = all;
+        self.load_error = None;
+        self.cancel_requested = false;
+        let generation = self.generation;
+        let previous = self.load.take();
+        let (name, filter, sort) = (self.table.clone(), self.applied.clone(), self.sort.clone());
+        self.load = Some(cx.spawn_in(window, async move |this, cx| {
+            // One statement at a time on the session, in the order asked.
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let Ok(reading) = cx.update(|_, cx| {
+                bridge::spawn(cx, async move {
+                    let sql = rows_sql(
+                        session.dialect(),
+                        &structure,
+                        &name,
+                        &filter,
+                        sort.as_ref(),
+                        limit,
+                        offset,
+                    )?;
+                    exec::collect(session, sql).await
+                })
+            }) else {
+                return;
+            };
+            let read = reading.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.landed(generation, read, limit, !keyed, window, cx)
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Puts the rows of a further load on screen, or says why none came.
+    fn landed(
+        &mut self,
+        generation: u64,
+        read: kerno_core::Result<exec::Collected>,
+        asked: Option<u64>,
+        from_start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        self.appending = false;
+        let cancelled = std::mem::take(&mut self.cancel_requested);
+        let Some(table) = self.grid.clone() else {
+            return;
+        };
+        let result = match read {
+            Ok(mut collected) => collected.results.pop().unwrap_or_default(),
+            Err(error) => {
+                self.load_all = false;
+                if error.is_disconnect() {
+                    self.close_session(cx);
+                }
+                self.load_error = Some(if cancelled || matches!(error, Error::Cancelled) {
+                    LOAD_CANCELLED.into()
+                } else {
+                    format!("The next rows could not be read. {}", describe(&error))
+                });
+                if table_gone(&error) {
+                    cx.emit(DataTabEvent::TableGone {
+                        table: self.table.clone(),
+                    });
+                }
+                cx.notify();
+                return;
+            }
+        };
+        // Rows of another shape (the table was altered since) cannot go
+        // under these.
+        let same = {
+            let held = table.read(cx).delegate().store().columns().clone();
+            held.len() == result.columns.len()
+                && held
+                    .iter()
+                    .zip(result.columns.iter())
+                    .all(|(held, read)| held.name == read.name)
+        };
+        if !same {
+            self.load_all = false;
+            self.load_error = Some(
+                "The table's columns changed since its rows were read: Refresh reads them again."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let complete = asked.is_none_or(|asked| (result.row_count() as u64) < asked);
+        table.update(cx, |table, cx| {
+            // A row added here is drawn after the rows read: a selection on
+            // it follows it down.
+            let first_added = |table: &TableState<Grid>| {
+                let grid = table.delegate();
+                grid.total_rows() - grid.pending().map_or(0, Pending::inserted)
+            };
+            let (before, selection) = (first_added(table), table.selection());
+            table
+                .delegate_mut()
+                .took_rows(result.batches, from_start, complete, cx);
+            let shift = first_added(table).saturating_sub(before);
+            let adding = table
+                .delegate()
+                .pending()
+                .is_some_and(|pending| pending.inserted() > 0);
+            if shift > 0 && adding {
+                match selection {
+                    TableSelection::Cell(row, column) if row >= before => {
+                        table.set_selected_cell(row + shift, column, cx)
+                    }
+                    TableSelection::Row(row) if row >= before => {
+                        table.set_selected_row(row + shift, cx)
+                    }
+                    _ => {}
+                }
+            }
+            cx.notify();
+        });
+        self.settle_end(cx);
+        if self.load_all && self.has_more(cx) {
+            self.fetch_more(true, window, cx);
+        } else {
+            self.load_all = false;
+        }
+        cx.notify();
     }
 
     /// How many rows the filter keeps, as counted or estimated; for tests.
@@ -1237,6 +1532,7 @@ impl DataTab {
                     // A cancelled count leaves the estimate.
                     if let Some(total) = total {
                         this.total = Some(Total::Exact(total));
+                        this.settle_end(cx);
                     }
                     cx.notify();
                 }
@@ -1354,7 +1650,7 @@ impl DataTab {
 
     // Auto-refresh ----------------------------------------------------------
 
-    /// Reads the page again every `every`, or stops (`None`).
+    /// Reads the rows again every `every`, or stops (`None`).
     pub fn set_auto_refresh(
         &mut self,
         every: Option<Duration>,
@@ -1391,7 +1687,7 @@ impl DataTab {
             return false;
         }
         // Never two reads at once: the next tick tries again.
-        if !(self.state == State::Loading || self.counting || self.applying) {
+        if !(self.state == State::Loading || self.appending || self.counting || self.applying) {
             self.reload(window, cx);
         }
         true
@@ -1405,9 +1701,11 @@ impl DataTab {
 
     /// Stops the statement the tab is waiting for.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
-        if !(self.state == State::Loading || self.counting || self.applying) {
+        if !(self.state == State::Loading || self.appending || self.counting || self.applying) {
             return;
         }
+        // Fetch all stops at the load in flight.
+        self.load_all = false;
         // Seen by a read whose session is still opening (C3).
         self.cancel_requested = true;
         if self.applying {
@@ -1482,14 +1780,13 @@ impl DataTab {
         }
     }
 
-    /// Reads the rows the filter bar asks for, from the first page.
+    /// Reads the rows the filter bar asks for, one load from the first.
     pub fn apply_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.free_to_move(window, cx) {
             return;
         }
         self.applied = self.typed_filter(cx);
-        self.page = 0;
-        self.reload(window, cx);
+        self.restart(window, cx);
     }
 
     /// Replaces the filter and reads the rows it keeps.
@@ -2018,30 +2315,14 @@ impl DataTab {
 
     // Rendering ---------------------------------------------------------------
 
-    /// "Page 2 of 13", "Page 2 of about 13", or "Page 2" when the rows
-    /// were not counted.
-    fn page_text(&self) -> String {
-        let page = format!("Page {}", number((self.page + 1) as f64));
-        let pages = |total: u64| number(total.div_ceil(self.page_size.max(1)).max(1) as f64);
-        match self.total {
-            Some(Total::Exact(total)) => format!("{page} of {}", pages(total)),
-            Some(Total::About(total)) => format!("{page} of about {}", pages(total)),
-            None => page,
-        }
-    }
-
-    /// "Rows 1–1,000 of 12,345".
+    /// "Rows 1–3,000 of 12,345", "of about 12,000", or without a total
+    /// before it is counted.
     fn range_text(&self, cx: &App) -> String {
         let fetched = self.fetched(cx);
-        let offset = self.page * self.page_size;
         let range = if fetched == 0 {
             "No rows".to_string()
         } else {
-            format!(
-                "Rows {}–{}",
-                number((offset + 1) as f64),
-                number((offset + fetched) as f64)
-            )
+            format!("Rows 1–{}", number(fetched as f64))
         };
         match self.total {
             Some(Total::Exact(total)) if fetched > 0 => {
@@ -2051,6 +2332,17 @@ impl DataTab {
                 format!("{range} of about {}", number(total as f64))
             }
             _ => range,
+        }
+    }
+
+    /// How many rows the next load reads: its size, or what is left of a
+    /// counted table.
+    fn next_load(&self, cx: &App) -> u64 {
+        match self.total {
+            Some(Total::Exact(total)) => total
+                .saturating_sub(self.fetched(cx))
+                .clamp(1, self.load_size),
+            _ => self.load_size,
         }
     }
 
@@ -2456,8 +2748,9 @@ impl DataTab {
             }))
             .when(self.counting && !loading, |bar| bar.child("counting…"))
             .when(loading && self.grid.is_some(), |bar| bar.child("loading…"))
+            .when(self.appending, |bar| bar.child("fetching more…"))
             .when(self.applying, |bar| bar.child("applying…"))
-            .when(loading || self.counting || self.applying, |bar| {
+            .when(loading || self.appending || self.counting || self.applying, |bar| {
                 bar.child(
                     Button::new("data-cancel")
                         .ghost()
@@ -2489,56 +2782,67 @@ impl DataTab {
                     .map(|table| crate::query::grid_view::SelectionStats::of(table, cx)),
             )
             .child(div().flex_1())
-            // No pages to turn when the rows could not be read. The way on
-            // says what it shows and stands out while there is one (K21: a
-            // first user missed it at the end of a page).
-            .when(!self.read_failed(), |footer| {
-                let has_next = self.has_next(cx) && !loading;
-                let page = SharedString::from(self.page_text());
-                let size = number(self.page_size as f64);
-                // The last page of a counted table says how many it holds.
-                let next = match self.total {
-                    Some(Total::Exact(total)) => {
-                        let shown = (self.page + 1) * self.page_size;
-                        total.saturating_sub(shown).clamp(1, self.page_size)
-                    }
-                    _ => self.page_size,
+            // No way on before the rows are read, or when they could not be.
+            // While there is one it stands out and says what it reads (K21:
+            // a first user missed it at the end of a page); the size of a
+            // load is changed here, for this tab (K36, DBeaver's fetch size
+            // box).
+            .when(!self.read_failed() && self.grid.is_some(), |footer| {
+                let more = self.has_more(cx);
+                let idle = !(loading || self.appending);
+                let next = self.next_load(cx);
+                let label = match &self.load_error {
+                    Some(_) if more => "Try again".to_string(),
+                    _ if more => format!(
+                        "Fetch {} more",
+                        number(next as f64)
+                    ),
+                    _ => "All rows fetched".to_string(),
                 };
-                let next = format!(
-                    "{} row{}",
-                    number(next as f64),
-                    if next == 1 { "" } else { "s" }
-                );
                 footer
-                    .child(
+                    .children(self.load_error.clone().map(|error| {
+                        let error = SharedString::from(error);
                         div()
-                            .id("data-page")
+                            .id("data-fetch-error")
                             .test_support()
-                            .child(page.clone())
-                            .test_text(page),
-                    )
+                            .aria_label(error.clone())
+                            .text_color(cx.theme().danger)
+                            .child(error)
+                    }))
+                    .child(load_size_button(self.load_size, cx.entity()))
                     .child(
-                        Button::new("data-previous")
-                            .ghost()
+                        Button::new("data-fetch-more")
+                            .map(|button| if more { button.outline() } else { button.ghost() })
                             .xsmall()
-                            .label(SharedString::from(format!("Previous {size} rows")))
-                            .tooltip("The previous page of rows")
-                            .disabled(self.page == 0 || loading)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.turn_page(-1, window, cx)),
-                            ),
+                            .label(SharedString::from(label))
+                            .tooltip_with_action(
+                                "Read the next rows and add them under these; scrolling to \
+                                 the last rows does it too",
+                                &crate::actions::FetchMoreRows,
+                                None,
+                            )
+                            .disabled(!(more && idle))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.fetch_more(false, window, cx)
+                            })),
                     )
-                    .child(
-                        Button::new("data-next")
-                            .map(|button| if has_next { button.outline() } else { button.ghost() })
-                            .xsmall()
-                            .label(SharedString::from(format!("Next {next}")))
-                            .tooltip("The next page of rows (this table's data is read by pages)")
-                            .disabled(!has_next)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.turn_page(1, window, cx)),
-                            ),
-                    )
+                    .when(more, |footer| {
+                        footer.child(
+                            Button::new("data-fetch-all")
+                                .ghost()
+                                .xsmall()
+                                .label("Fetch all")
+                                .tooltip_with_action(
+                                    "Read every row left; Cancel stops it",
+                                    &crate::actions::FetchAllRows,
+                                    None,
+                                )
+                                .disabled(!idle)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.fetch_more(true, window, cx)
+                                })),
+                        )
+                    })
             })
     }
 
@@ -2827,6 +3131,109 @@ pub fn auto_refresh_button<T: 'static>(
                     move |_, window, cx| view.update(cx, |this, cx| set(this, None, window, cx)),
                 ))
         })
+}
+
+/// How many rows a load of a table's data reads, as a dropdown (K36,
+/// DBeaver's fetch size box in the result's status bar): a few sizes, the
+/// current one ticked, and another typed.
+fn load_size_button(size: u64, view: Entity<DataTab>) -> impl IntoElement {
+    Button::new("data-fetch-size")
+        .ghost()
+        .xsmall()
+        .label(SharedString::from(format!(
+            "Fetch size: {}",
+            number(size as f64)
+        )))
+        .tooltip("How many rows each fetch reads in this tab")
+        .dropdown_caret(true)
+        .dropdown_menu(move |mut menu, _, _| {
+            for each in LOAD_SIZES {
+                let view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(SharedString::from(number(each as f64)))
+                        .checked(each == size)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.set_load_size(each, cx))
+                        }),
+                );
+            }
+            let view = view.clone();
+            menu.separator().item(
+                PopupMenuItem::new("Other size…")
+                    .checked(!LOAD_SIZES.contains(&size))
+                    .on_click(move |_, window, cx| ask_load_size(size, view.clone(), window, cx)),
+            )
+        })
+}
+
+/// Asks for the size of a load, within the bounds of Settings' page size.
+fn ask_load_size(size: u64, view: Entity<DataTab>, window: &mut Window, cx: &mut App) {
+    let (low, high) = (
+        number(f64::from(*PAGE_SIZES.start())),
+        number(f64::from(*PAGE_SIZES.end())),
+    );
+    let input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(format!("{low} to {high}"))
+            .default_value(size.to_string())
+    });
+    // Takes a size the settings would take; another keeps the dialog open.
+    let take = Rc::new({
+        let input = input.clone();
+        move |_: &mut Window, cx: &mut App| -> bool {
+            let Some(size) = page_size(&input.read(cx).value()) else {
+                return false;
+            };
+            view.update(cx, |this, cx| this.set_load_size(u64::from(size), cx));
+            true
+        }
+    });
+    let field = input.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (field, take) = (field.clone(), take.clone());
+        let on_enter = take.clone();
+        let (low, high) = (low.clone(), high.clone());
+        dialog
+            .title("Fetch size")
+            .w(px(360.))
+            .on_ok(move |_, window, cx| on_enter(window, cx))
+            .content(move |content, _, _| {
+                let take = take.clone();
+                content.child(
+                    v_flex()
+                        .gap_3()
+                        .pt_1()
+                        .child(div().text_sm().child(SharedString::from(format!(
+                            "Rows each fetch reads in this tab, {low} to {high}."
+                        ))))
+                        .child(Input::new(&field).id("data-fetch-size-input").small())
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("data-fetch-size-cancel")
+                                        .ghost()
+                                        .label("Cancel")
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("data-fetch-size-set")
+                                        .primary()
+                                        .label("Set")
+                                        .on_click(move |_, window, cx| {
+                                            if take(window, cx) {
+                                                window.close_dialog(cx);
+                                            }
+                                        }),
+                                ),
+                        ),
+                )
+            })
+    });
+    window.defer(cx, move |window, cx| {
+        input.update(cx, |input, cx| input.focus(window, cx))
+    });
 }
 
 /// The narrowest a WHERE field gets: below it, the buttons after it go to

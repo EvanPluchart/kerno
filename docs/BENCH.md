@@ -159,6 +159,20 @@ machine (1-minute load 1.9 to 3.95), 2026-11-14.
   attempts of at most 10 s, again after 0.5 s, 1 s and every 2 s. The statuses each run went through are
   printed with the numbers (Connected, Connecting, Connected).
 
+## A table's data with 100,000 rows loaded (K36, offscreen)
+
+A table's data tab now reads its rows a load at a time (D-109). Measured on 2026-11-23 on `analytics.big_table`
+(PostgreSQL), fetch size 10,000, with a release build of a temporary test (not committed) that drives the app
+offscreen (`HeadlessAppContext`, Metal's headless renderer, 1200 × 800): no window could be opened for this
+item, so these figures are the time to lay out, paint and render one frame, not the interval between frames on
+a display as above. The machine was busy (1-minute load 9 to 50, another build beside it).
+
+| Measure | Result |
+|---|---|
+| A load of 10,000 rows, offsets 10,000 to 90,000, from the call to the rows on screen | 50 to 68 ms each |
+| Process memory, 10,000 then 100,000 rows of 20 columns | 76 MiB, then 106 MiB (+29 MiB) |
+| Scrolling the 100,000 rows down and up, 150 rows a frame, 1,332 frames | 7.72 ms on average, median 7.32, 99th percentile 13.75, longest 36.05 |
+
 ## Reproducing
 
 ```sh

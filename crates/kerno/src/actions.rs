@@ -375,9 +375,9 @@ gpui_kit::actions!(
         NextResultTab,
         /// Shows the previous result tab of the active query tab.
         PreviousResultTab,
-        /// Fetches the next page of the result on screen.
+        /// Fetches the next rows of the result or the table on screen.
         FetchMoreRows,
-        /// Fetches every remaining row of the result on screen.
+        /// Fetches every remaining row of the result or the table on screen.
         FetchAllRows,
         /// Copies the selected cells as CSV.
         CopyAsCsv,
@@ -1033,24 +1033,22 @@ pub const COMMANDS: &[Command] = &[
         PreviousResultTab
     ),
     // DBeaver's fetch keys (Ctrl+Alt+N, Ctrl+Shift+=, which keyboards
-    // report as `+`).
+    // report as `+`): a query result's next rows, or a table's (K36).
     command!(
         "fetch_more_rows",
         "Fetch More Rows",
         "Query",
         ["ctrl-alt-n"],
-        ["next page", "load more", "results"],
-        FetchMoreRows,
-        "QueryTab"
+        ["next rows", "load more", "results", "table data"],
+        FetchMoreRows
     ),
     command!(
         "fetch_all_rows",
         "Fetch All Rows",
         "Query",
         ["ctrl-+"],
-        ["every row", "load all", "results"],
-        FetchAllRows,
-        "QueryTab"
+        ["every row", "load all", "results", "table data"],
+        FetchAllRows
     ),
     // Completion while the list is closed: DBeaver's Ctrl+Space, which
     // macOS may keep for the input sources, and Cmd+I as other Mac editors.

@@ -601,6 +601,15 @@ pub fn rows_shown(grid: &Grid) -> Option<String> {
     ))
 }
 
+impl Find {
+    /// The rows were read again from the first (K36): what was counted is
+    /// counted again.
+    pub(super) fn recount(&mut self) {
+        self.of = None;
+        self.job = None;
+    }
+}
+
 /// The bar above a grid, when its find is open.
 pub fn bar(table: &Table, cx: &App) -> Option<AnyElement> {
     let state = table.read(cx);
