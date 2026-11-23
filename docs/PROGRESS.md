@@ -1438,3 +1438,26 @@ Still open (for the owner):
 - Tests: `ai::tests::inserted_sql_runs_as_statements_of_its_own`, `ui_tests::ai_chat::`
   `{the_keyboard_comes_back_whatever_takes_the_panel_away, enter_in_the_rows_field_sends_and_escape_leaves_it,
   the_panel_always_fits_in_the_window}`, the Insert tests.
+
+## 2026-11-23, night — 2026.11.2 prepared, not published: K48 to K53, a pass in the real app
+
+- The owner left for the night with full autonomy and one rule: prepare the release, publish nothing until
+  his word. K48 (a faster backup), K49 (foreign keys seen and followed), K50 to K53 (the AI assistant: a
+  richer context, a conversation in a side panel, asking in the editor with a diff and a one-click fix, the
+  right-click entries), each by an agent in its own worktree, merged one by one with the full check green
+  each time.
+- Before anything: the fixture database of `kerno-postgres` was recreated from its seed scripts (its `public`
+  schema had been dropped during the day, which had made six UI tests fail at the release of 2026.11.1); the
+  code published as 2026.11.1 then passed the full check. Two tests that depended on timing were made not to.
+- A user's report: the DBeaver import read an SSH tunnel's port 2222 as 22 (DBeaver writes it `2222.0`). Fixed.
+- Two findings of the automated security review of the commits, both fixed before any merge or with a test:
+  an index on an expression could carry a value to the model (now `(expression)`); a table tab's statement
+  went with its filter's literals (now `?`).
+- A pass in the real app by an agent, on a copy of the bundle, with a stand-in endpoint on this computer in
+  place of a model (canned answers, every request kept for reading): everything worked, nothing crashed. It
+  found, and these are fixed: the keyboard lost after the panel closed while the assistant was off; Insert
+  glued to a statement with no `;`; Enter in "Rows to generate" doing nothing; the panel wider than the
+  window; the Ask Here card's hint overflowing; a tab per question, all named alike. Found and left, older
+  than tonight: the palette's search wants the words in order; the tab strip clips its leftmost tab when
+  there are many; a long data directory leaves the single-instance socket unopened.
+- The full check on the tree prepared: see the release commit's message for the count.
