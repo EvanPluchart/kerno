@@ -66,6 +66,7 @@ mod password_sources;
 mod portability;
 mod reconnect;
 mod reorder;
+mod restore_roles;
 mod schema_export;
 mod script_progress;
 mod secret_store;

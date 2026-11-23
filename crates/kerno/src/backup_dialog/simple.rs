@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input as TextInput, InputState};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
@@ -42,7 +43,7 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 /// "a, b and c".
-fn listed(parts: &[String]) -> String {
+pub(super) fn listed(parts: &[String]) -> String {
     match parts {
         [] => String::new(),
         [one] => one.clone(),
@@ -206,12 +207,16 @@ impl BackupDialog {
                 );
             }
             Mode::Restore => {
-                let defaults = RestoreOptions::new(
+                let mut defaults = RestoreOptions::new(
                     self.engine,
                     self.restore.database.clone(),
                     self.restore.input.clone(),
                     self.restore.format,
                 );
+                // The simple view's checkbox sets both (K35).
+                if self.restore.no_owner && self.restore.no_privileges {
+                    (defaults.no_owner, defaults.no_privileges) = (true, true);
+                }
                 note(self.restore != defaults, "the restore options");
                 note(typed(&self.jobs), "the jobs");
                 note(self.allow_commands, "the file's client commands allowed");
@@ -244,12 +249,15 @@ impl BackupDialog {
                 clear(&self.encoding, window, cx);
             }
             Mode::Restore => {
+                let without_owners = self.without_owners();
                 self.restore = RestoreOptions::new(
                     self.engine,
                     self.restore.database.clone(),
                     self.restore.input.clone(),
                     self.restore.format,
                 );
+                (self.restore.no_owner, self.restore.no_privileges) =
+                    (without_owners, without_owners);
                 self.allow_commands = false;
             }
             Mode::GlobalBackup | Mode::ExecuteScript => {}
@@ -331,6 +339,13 @@ impl BackupDialog {
                     )
                 })
         });
+    }
+
+    /// The simple restore's "Leave out the backup's owners and privileges"
+    /// (K35): pg_restore's `--no-owner` and `--no-privileges`, the wizard's
+    /// two checkboxes, both set.
+    pub(super) fn without_owners(&self) -> bool {
+        self.restore.no_owner && self.restore.no_privileges
     }
 
     /// Enter in the dialog: starts a simple backup that can run. A restore
@@ -625,6 +640,46 @@ impl BackupDialog {
                     .into_any_element()
             }),
         };
+        // A PostgreSQL archive can be restored without its owners and
+        // privileges; a plain script sets them in its own text.
+        let archive = self.family == ClientFamily::Postgres
+            && matches!(&self.input, Some(Ok(input)) if input.format != BackupFormat::Sql);
+        let roles = archive.then(|| {
+            let user = self
+                .params
+                .as_ref()
+                .map(|params| params.user.clone())
+                .unwrap_or_default();
+            let hint = format!(
+                "For a backup from another server whose roles this one does not have: what is \
+                 restored then belongs to “{user}”, without the backup's grants."
+            );
+            row(
+                "Roles",
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Checkbox::new("simple-no-owner")
+                            .label("Leave out the backup's owners and privileges")
+                            .checked(self.without_owners())
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.restore.no_owner = *checked;
+                                this.restore.no_privileges = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("simple-no-owner-hint")
+                            .test_support()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(hint.clone()))
+                            .test_text(hint),
+                    ),
+                cx,
+            )
+        });
         vec![
             row(
                 "File",
@@ -675,8 +730,11 @@ impl BackupDialog {
                     ),
                 cx,
             ),
-            row("Client", self.simple_client(cx), cx),
         ]
+        .into_iter()
+        .chain(roles)
+        .chain([row("Client", self.simple_client(cx), cx)])
+        .collect()
     }
 
     /// The simple view's page: the panel, a file's client commands when it

@@ -3212,3 +3212,61 @@ edit it). What stays absolute: never in plain text on disk, never in logs, never
 - **Not done:** no master password (it would bring the prompt back); no use of the macOS Data Protection
   keychain or of a Developer ID (none exists); the old keychain items are not deleted; non-UTF-8 secrets cannot
   exist (`Secret` wraps a `String`); the plaintext is not zeroised in memory, as no `Secret` is today.
+
+## D-108 — A restore whose backup names a role the server does not have (K35; 2026-11-23)
+
+The first outside user restored a production dump (custom format) into a local PostgreSQL with the simple
+restore view: pg_restore stopped at `ALTER SCHEMA archive OWNER TO app_owner` ("role "app_owner" does not
+exist"), in one transaction, and Kerno showed the raw output and no way on. The most common restore there is: a
+production backup into a local server that has none of production's roles.
+
+- **Read the SQL, not the words.** pg_restore and psql speak the user's language (the report: pg_restore 18 in
+  French) and the server its own (`lc_messages`). A fixed message locale cannot cover both: `lc_messages` may
+  be set by a superuser only, so `PGOPTIONS=-c lc_messages=C` would make a non-superuser's connect fail, and
+  `LC_ALL=C` on the tool would fix only the tool's half while turning the user's log to English. The SQL is
+  never translated: pg_restore prints the failed command after a translated label (`Command was:`, `La
+  commande était :`), an ACL entry's whole block at once; psql, which Kerno runs without `--echo-errors` (not
+  added: the command stays as it was), prints `psql:<stdin>:N:`, and line N of the script is read back.
+  `tools::refused_roles` finds a tail after a colon starting `ALTER `, `GRANT `, `REVOKE ` or `SET SESSION
+  AUTHORIZATION ` (pg_dump's spelling), with the block's following lines; lexes each with the PostgreSQL rules;
+  takes the roles of `ALTER … OWNER TO`, `GRANT … TO`, `REVOKE … FROM`, `GRANTED BY`, `ALTER DEFAULT PRIVILEGES
+  FOR ROLE|USER` and `SET SESSION AUTHORIZATION`, unquoted (`PUBLIC`, `CURRENT_USER`, `SESSION_USER`,
+  `CURRENT_ROLE` left out). An ACL block names several roles and only one failed: a role counts only when the
+  server's message just above (back to the tool's own `pg_restore:` / `psql:` line) names it as a whole name,
+  which holds in any language, the name not being translated. The user's block, verbatim, and its English form
+  are test inputs, with a French server's message.
+- **"This server has no such role" is asked of the server.** The same failure naming a role that exists comes
+  from a restore by a user who may not act as it (PostgreSQL 16's "must be able to SET ROLE"), and no
+  language-independent text tells the two apart. Once roles are found, `pg_catalog.pg_roles` is asked on the
+  connection's metadata session (the names as literals through the dialect, off the UI thread): only the roles
+  it lacks are said to be missing. Otherwise (they exist, or the server could not be asked) the text says the
+  server would not let the user use them, and the next step is to restore as a user allowed to.
+- **What the failure view says**, above the status line, the command and the log, which stay as they were: "The
+  backup names the role “app_owner” as the owner of its objects, and this server has no such role. Restore again
+  without the backup's owners and privileges: what it restores then belongs to “postgres”, and the backup's
+  grants are left out. Or create the role on this server, then restore again." ("in the rights it grants" for
+  privileges). An archive gets **Restore without owners and privileges…**, the primary button: it sets `no_owner`
+  and `no_privileges` and goes through Start, so the command is shown and asked as for any restore (twice on
+  production; a read-only connection has no restore at all), `--single-transaction` kept. Only after a run in one
+  transaction (Kerno's default): without it (unticked in the wizard, or jobs) pg_restore goes on past the refused
+  statements and restores the rest, so a second run would meet what is there; the text then says so ("pg_restore
+  went on past it: the rest is restored, and what the backup gives to it belongs to “postgres”") and offers
+  nothing. A plain SQL script gets no button: "A plain SQL script sets its owners and rights in its own text, so
+  psql cannot leave them out. Create the role on this server, then restore again; or back up again as a
+  compressed archive, which a restore can run without them."
+- **The two flags stay set** after the retry, and after its confirmation is cancelled: the wizard's two
+  checkboxes and the simple view's checkbox show them, and a saved task keeps them only if saved again (a
+  task's run records its status and log, not its settings). The
+  button follows what the failed run had, so a cancelled confirmation leaves it offered.
+- **The simple restore's checkbox**, for PostgreSQL archives only (DBeaver's two options as one): "Leave out the
+  backup's owners and privileges", with one line on when to use it and who then owns what. It sets both flags
+  and is checked when both are set. **Off by default**, pg_restore's own default: a restore between servers
+  that share their roles (a backup of this server, a staging copy) keeps its owners and grants, and changing
+  them silently would be worse than the failure, which now says what to do. Going back from the wizard does not
+  count the pair as a hidden change (one of the two alone still does). A SQL file chosen in the simple view
+  after it clears the pair: a script runs as it is, and pg_restore's options on it are refused.
+- **MySQL and MariaDB**, looked at only (a view and a procedure with `DEFINER` naming a missing user, run by
+  `mysql` 26.10): a user with `SET_ANY_DEFINER` or `SUPER` (MySQL 8.4) or `SET USER` (MariaDB 11) restores
+  without an error, the objects created with the orphan definer, failing later when used (ERROR 1449). A user
+  without it gets ERROR 1227 at that statement, and the restore stops there, what ran before kept. Nothing
+  built.

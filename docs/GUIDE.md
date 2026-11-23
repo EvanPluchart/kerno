@@ -422,6 +422,15 @@ and says which tool restores it), the database it goes into, what a restore does
 no restore. Enter never starts a restore. A SQL file that holds client commands (`\!`, `\connect`, `system`…)
 is refused; it can be allowed in the advanced settings, for a file you trust.
 
+A backup made on another server gives its objects to that server's roles. Restored into a server without them
+(a production backup into your own PostgreSQL), pg_restore stops at the first one; Kerno then says which role
+the backup names and that this server has none, above the tool's output. **Restore without owners and
+privileges…** runs the same restore again with pg_restore's `--no-owner --no-privileges`: everything restored
+belongs to the user you connect as, without the backup's grants. It asks first, as any restore. You can tick
+**Leave out the backup's owners and privileges** before the first run too (PostgreSQL archives only; it is off
+by default, which keeps the owners). A plain SQL script sets its owners in its own text, so psql cannot leave
+them out: create the role on the server, or back up again as a compressed archive.
+
 **Advanced settings…** opens the full wizard on what the screen holds (the file, the format, the client): the
 objects to back up (schemas and tables), every option of the tool, the file name pattern with its variables,
 extra arguments, another user, **Save as task…**. **Simple view** goes back; when an option the simple screen

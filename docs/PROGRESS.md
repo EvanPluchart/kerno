@@ -1179,3 +1179,23 @@ Still open (for the owner):
   single-instance socket unopened (a warning in the log).
 - Version 0.3.0 in `Cargo.toml` and the four READMEs (SQLite named, schema compare off the roadmap line),
   notes in `docs/release-notes/v0.3.0.md` with what the keychain asks once after the update.
+
+## 2026-11-23 — K35: a restore whose backup names a role the server does not have
+
+- The first outside user restored a production dump into a local PostgreSQL: pg_restore stopped at `ALTER SCHEMA
+  archive OWNER TO app_owner` (the role exists only in production), and Kerno left the raw output. The failure
+  view now says first, in plain words, which role the backup names and that the server has none (the server asked
+  through `pg_roles`), then what to do; the output stays below. A PostgreSQL archive gets "Restore without owners
+  and privileges…", the same restore with `--no-owner --no-privileges`, shown and asked as any restore (after a
+  run in one transaction, the default; one that went on past it says so instead). A plain SQL script gets no
+  button, only what can be done: create the role, or back up again as an archive. D-108.
+- The detection reads the SQL the tool printed (pg_restore's failed command, psql's script line), never the
+  words around it: pg_restore and the server each speak their own language. The user's French output and its
+  English form are test inputs.
+- The simple restore has a checkbox for PostgreSQL archives, "Leave out the backup's owners and privileges",
+  off by default (pg_restore's own default); the wizard's two checkboxes stay and follow it.
+- MySQL and MariaDB looked at only: a `DEFINER` naming a missing user passes for a user with `SET_ANY_DEFINER`
+  (`SET USER` on MariaDB), the object failing later when used, and stops the restore for a user without it.
+- Tests: five core unit tests of the detection, one of the words per case, three UI tests (a stand-in pg_restore
+  and psql, and the real tools on `kerno-postgres` with a scratch role whose name needs quotes); each seen
+  failing under a mutation. Captures of the failure view and the simple restore, light and dark.

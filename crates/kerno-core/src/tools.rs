@@ -96,6 +96,10 @@ use crate::error::{Error, Result};
 use crate::schema::TableRef;
 use crate::ssh::Tunnel;
 
+mod roles;
+
+pub use roles::{RefusedRole, refused_roles};
+
 /// A client tool Kerno runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Tool {

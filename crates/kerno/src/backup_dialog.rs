@@ -61,9 +61,10 @@ use kerno_core::storage::{HistoryStatus, SavedTask};
 use kerno_core::tools::{
     self, BackupContent, BackupFormat, BackupOptions, ClientFamily, ClientInstall, ClientRoots,
     ClientWanted, Compatibility, DumpMethod, EngineBackup, Finding, GlobalBackupOptions, NameVars,
-    RestoreOptions, ScriptLogLevel, ScriptOptions, Stamp, TaskSettings, Tool, ToolCommand,
+    RefusedRole, RestoreOptions, ScriptLogLevel, ScriptOptions, Stamp, TaskSettings, Tool,
+    ToolCommand,
 };
-use kerno_core::{Error, Session};
+use kerno_core::{Error, Session, exec};
 
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
@@ -193,6 +194,43 @@ enum Step {
     },
 }
 
+/// A failed PostgreSQL restore whose statements name roles the server
+/// refused (K35, D-108): what the failure view says first, and whether it
+/// offers the restore again without the backup's owners and privileges.
+#[derive(Debug, Clone)]
+struct RoleFailure {
+    refused: Vec<RefusedRole>,
+    /// The refused roles the server does not have, as it answered; `None`
+    /// when it could not be asked.
+    missing: Option<Vec<String>>,
+    /// The file was a plain SQL script, which sets its owners in its text.
+    script: bool,
+    /// The failed run was all or nothing: nothing of it was kept.
+    single_transaction: bool,
+    /// The same restore can run again without the backup's owners and
+    /// privileges: an archive, restored in one transaction (else pg_restore
+    /// went on and the objects are there), which kept them.
+    retry: bool,
+    /// The user the restore connected as.
+    user: String,
+}
+
+impl RoleFailure {
+    /// A failure of a restore with `options`, its roles still to be read.
+    fn new(script: bool, options: &RestoreOptions, user: String) -> Self {
+        Self {
+            refused: Vec::new(),
+            missing: None,
+            script,
+            single_transaction: options.single_transaction,
+            retry: !script
+                && options.single_transaction
+                && !(options.no_owner && options.no_privileges),
+            user,
+        }
+    }
+}
+
 /// The tables and views of one schema (the database on MySQL).
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaEntry {
@@ -282,6 +320,8 @@ pub struct BackupDialog {
     /// The explicit opt-in to a file's client commands; reset per file.
     allow_commands: bool,
     step: Step,
+    /// The roles a failed restore names, once read from its output.
+    roles: Option<RoleFailure>,
     /// The command that runs or ran, as shown.
     shown_command: Option<String>,
     /// The file or folder the backup writes.
@@ -582,6 +622,7 @@ impl BackupDialog {
             input: None,
             allow_commands: false,
             step: Step::Preparing,
+            roles: None,
             agreed_replace: None,
             shown_command: None,
             output: None,
@@ -780,6 +821,15 @@ impl BackupDialog {
                     this.tool_state = examined.tool;
                     this.detected = examined.detected;
                     this.input = examined.input;
+                    // The simple view's "Leave out the backup's owners and
+                    // privileges" is for archives: a script chosen after it
+                    // runs as it is (K35).
+                    if this.view == View::Simple
+                        && this.without_owners()
+                        && matches!(&this.input, Some(Ok(input)) if input.format == BackupFormat::Sql)
+                    {
+                        (this.restore.no_owner, this.restore.no_privileges) = (false, false);
+                    }
                     cx.notify();
                 }
             });
@@ -1804,6 +1854,7 @@ impl BackupDialog {
         self.shown_command = Some(command.display());
         self.output = output.as_ref().map(|(path, _)| path.clone());
         self.log.clear();
+        self.roles = None;
         self.step = Step::Running;
         self.showing_clients = false;
         self.started = Some(Instant::now());
@@ -2081,10 +2132,95 @@ impl BackupDialog {
             let text = text.clone();
             self.record_run(run, &text, cx);
         }
+        if run == HistoryStatus::Error
+            && self.mode == Mode::Restore
+            && self.engine == Engine::Postgres
+        {
+            self.check_roles(cx);
+        }
         if self.close_when_stopped {
             window.close_dialog(cx);
         }
         cx.notify();
+    }
+
+    /// Reads the roles the failed restore names from its output (and, for
+    /// psql, from the script's line it points at), then asks the server
+    /// which of them it does not have: only those are said to be missing.
+    fn check_roles(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(input)) = &self.input else {
+            return;
+        };
+        let script = input.format == BackupFormat::Sql;
+        let path = input.path.clone();
+        let log: Vec<String> = self.log.iter().map(|line| line.to_string()).collect();
+        let started = self.started;
+        let user = self
+            .auth_user_value(cx)
+            .or_else(|| self.params.as_ref().map(|params| params.user.clone()))
+            .unwrap_or_default();
+        let failure = RoleFailure::new(script, &self.restore, user);
+        let meta = self.connections.read(cx).meta_session(&self.connection);
+        let reading = bridge::spawn_blocking(cx, move || {
+            tools::refused_roles(&log, |number| {
+                script.then(|| script_line(&path, number)).flatten()
+            })
+        });
+        self.tasks.push(cx.spawn(async move |this, cx| {
+            let refused = reading.await;
+            if refused.is_empty() {
+                return;
+            }
+            let missing = match meta {
+                None => None,
+                Some(meta) => {
+                    let names: Vec<String> = refused
+                        .iter()
+                        .map(|role| meta.dialect().quote_string(&role.name))
+                        .collect();
+                    let sql = format!(
+                        "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname IN ({})",
+                        names.join(", ")
+                    );
+                    let asking = cx.update(|cx| bridge::spawn(cx, exec::collect(meta, sql)));
+                    asking.await.ok().map(|collected| {
+                        let present: Vec<String> = collected
+                            .results
+                            .first()
+                            .map(|result| result.rows())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|row| row.into_iter().next().flatten())
+                            .collect();
+                        refused
+                            .iter()
+                            .map(|role| role.name.clone())
+                            .filter(|name| !present.contains(name))
+                            .collect()
+                    })
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                // A run started since has its own output.
+                if this.started == started {
+                    this.roles = Some(RoleFailure {
+                        refused,
+                        missing,
+                        ..failure
+                    });
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The failure view's "Restore without owners and privileges…": the
+    /// same restore with pg_restore's `--no-owner --no-privileges`, which
+    /// the wizard's two checkboxes show; asked first like any restore.
+    pub fn restore_without_owners(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore.no_owner = true;
+        self.restore.no_privileges = true;
+        self.start(window, cx);
     }
 
     /// Stops the tool.
@@ -2494,6 +2630,117 @@ fn archive_database(pg_restore: &Path, archive: &Path) -> Option<String> {
                 .strip_prefix("dbname:")
                 .map(|name| name.trim().to_string())
         })
+}
+
+/// Line `number` (from 1) of the script at `path`, as psql counted it.
+/// Blocking.
+fn script_line(path: &Path, number: u64) -> Option<String> {
+    use std::io::BufRead as _;
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let line = file
+        .split(b'\n')
+        .nth(usize::try_from(number).ok()?.checked_sub(1)?)?
+        .ok()?;
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// What the failure view says first about refused roles (K35): what
+/// happened, in plain words, then what to do; the tool's output below.
+fn roles_text(failure: &RoleFailure) -> String {
+    let missing: Vec<&RefusedRole> = failure
+        .refused
+        .iter()
+        .filter(|role| {
+            failure
+                .missing
+                .as_ref()
+                .is_some_and(|missing| missing.contains(&role.name))
+        })
+        .collect();
+    let confirmed = !missing.is_empty();
+    let shown = if confirmed {
+        missing
+    } else {
+        failure.refused.iter().collect()
+    };
+    let one = shown.len() == 1;
+    let names: Vec<String> = shown
+        .iter()
+        .map(|role| format!("“{}”", role.name))
+        .collect();
+    let names = format!(
+        "{} {}",
+        if one { "the role" } else { "the roles" },
+        simple::listed(&names)
+    );
+    let owner = shown.iter().any(|role| role.owner);
+    let how = match (owner, shown.iter().any(|role| !role.owner)) {
+        (true, false) => "as the owner of its objects",
+        (false, _) => "in the rights it grants",
+        (true, true) => "as an owner and in the rights it grants",
+    };
+    let (it, role) = if one {
+        ("it", "role")
+    } else {
+        ("them", "roles")
+    };
+    let user = &failure.user;
+    let mut text = if confirmed {
+        format!("The backup names {names} {how}, and this server has no such {role}.")
+    } else {
+        format!(
+            "The backup names {names} {how}, and the server would not let “{user}”, the user the \
+             restore connects as, use {it}."
+        )
+    };
+    let other_way = if confirmed {
+        format!("create the {role} on this server")
+    } else {
+        format!("restore as a user allowed to use {it}")
+    };
+    if failure.script {
+        text.push_str(&format!(
+            " A plain SQL script sets its owners and rights in its own text, so psql cannot \
+             leave them out. {}, then restore again; or back up again as a compressed archive, \
+             which a restore can run without them.",
+            capitalized(&other_way)
+        ));
+    } else if failure.retry {
+        text.push_str(&format!(
+            " Restore again without the backup's owners and privileges: what it restores then \
+             belongs to “{user}”, and the backup's grants are left out. Or {other_way}, then \
+             restore again."
+        ));
+    } else if !failure.single_transaction {
+        // pg_restore went on: the objects are there, a second run would
+        // find them.
+        text.push_str(&if owner {
+            format!(
+                " pg_restore went on past {it}: the rest is restored, and what the backup gives \
+                 to {it} belongs to “{user}”."
+            )
+        } else {
+            format!(
+                " pg_restore went on past {it}: the rest is restored, without the rights the \
+                 backup grants {it}."
+            )
+        });
+    } else {
+        text.push_str(&format!(
+            " {}, then restore again.",
+            capitalized(&other_way)
+        ));
+    }
+    text
+}
+
+/// `text` with its first letter in capitals.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// What the confirmation of a restore or a script is about.
@@ -4160,6 +4407,22 @@ impl BackupDialog {
                         theme.muted_foreground,
                     ),
                 };
+                if let Some(failure) = &self.roles {
+                    let text = roles_text(failure);
+                    body.push(
+                        div()
+                            .id("restore-roles")
+                            .test_support()
+                            .p_2()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.danger)
+                            .text_sm()
+                            .child(SharedString::from(text.clone()))
+                            .test_text(text)
+                            .into_any_element(),
+                    );
+                }
                 body.push(
                     message(id, status.clone())
                         .text_color(color)
@@ -4221,6 +4484,7 @@ impl BackupDialog {
                 let reveal = (*success && !self.mode.writes())
                     .then(|| self.output.clone())
                     .flatten();
+                let retry = self.roles.as_ref().is_some_and(|failure| failure.retry);
                 return footer
                     .justify_end()
                     .child(copy)
@@ -4242,7 +4506,20 @@ impl BackupDialog {
                             .label("Back")
                             .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
                     )
-                    .child(close("Close").primary())
+                    .map(|this| {
+                        if retry {
+                            this.child(close("Close")).child(
+                                Button::new("restore-without-owners")
+                                    .primary()
+                                    .label("Restore without owners and privileges…")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.restore_without_owners(window, cx)
+                                    })),
+                            )
+                        } else {
+                            this.child(close("Close").primary())
+                        }
+                    })
                     .into_any_element();
             }
             Step::Options => {}
@@ -4421,6 +4698,63 @@ impl Render for BackupDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K35: what the failure view says, per case; the retry offered only
+    /// where a second run can work.
+    #[test]
+    fn a_refused_role_is_said_with_what_to_do() {
+        let options = |single_transaction: bool, without: bool| {
+            let mut options =
+                RestoreOptions::new(Engine::Postgres, "kerno", "/tmp/x", BackupFormat::Custom);
+            options.single_transaction = single_transaction;
+            (options.no_owner, options.no_privileges) = (without, without);
+            options
+        };
+        let failure = |script: bool, options: &RestoreOptions, roles: &[(&str, bool)]| {
+            let mut failure = RoleFailure::new(script, options, "kerno".into());
+            failure.refused = roles
+                .iter()
+                .map(|(name, owner)| RefusedRole {
+                    name: name.to_string(),
+                    owner: *owner,
+                })
+                .collect();
+            failure
+        };
+        let archive = options(true, false);
+        // Missing, as the server said.
+        let mut missing = failure(false, &archive, &[("app_owner", true)]);
+        missing.missing = Some(vec!["app_owner".into()]);
+        assert!(missing.retry);
+        assert!(roles_text(&missing).starts_with(
+            "The backup names the role “app_owner” as the owner of its objects, and this server \
+             has no such role. Restore again without"
+        ));
+        // The role exists, or the server could not be asked.
+        let mut refused = failure(false, &archive, &[("app_owner", true), ("reader", false)]);
+        refused.missing = Some(Vec::new());
+        assert_eq!(
+            roles_text(&refused),
+            "The backup names the roles “app_owner” and “reader” as an owner and in the rights it \
+             grants, and the server would not let “kerno”, the user the restore connects as, use \
+             them. Restore again without the backup's owners and privileges: what it restores \
+             then belongs to “kerno”, and the backup's grants are left out. Or restore as a user \
+             allowed to use them, then restore again."
+        );
+        // pg_restore went on: no retry into what is now there.
+        let went_on = failure(false, &options(false, false), &[("reader", false)]);
+        assert!(!went_on.retry);
+        assert_eq!(
+            roles_text(&went_on),
+            "The backup names the role “reader” in the rights it grants, and the server would not \
+             let “kerno”, the user the restore connects as, use it. pg_restore went on past it: \
+             the rest is restored, without the rights the backup grants it."
+        );
+        // Already without them; a script.
+        assert!(!failure(false, &options(true, true), &[("a", true)]).retry);
+        let script = failure(true, &options(true, false), &[("a", true)]);
+        assert!(!script.retry && roles_text(&script).contains("psql cannot leave them out"));
+    }
 
     #[test]
     fn mysql_through_a_tunnel_with_verify_full_is_refused() {
