@@ -595,4 +595,84 @@ fn the_field_sits_at_its_statement_however_the_editor_draws_it(cx: &mut TestAppC
     app.press(cx, &["escape"]);
     assert!(inline(&app, cx).is_none());
     assert_eq!(cx.update(|cx| tab.read(cx).vim_mode()), mode);
+    cx.update(|cx| AppState::update_settings(cx, |settings| settings.vim_mode = false));
+    cx.run_until_parked();
+
+    // A narrow editor (the assistant's panel shown at its widest): every part of the card, its
+    // hint and its links included, stays inside the card, and the card inside the editor; in the
+    // diff, the answer without SQL, the request on its way and the failed request.
+    cx.update(|cx| {
+        AppState::update_settings(cx, |settings| {
+            settings.ai_panel = true;
+            settings.ai_panel_width = 720.;
+        })
+    });
+    cx.run_until_parked();
+    let inside = |app: &Fixture, cx: &mut TestAppContext, what: &str| {
+        let card = app.step(cx, |window, _| window.find("ai-inline").bounds());
+        let editor = view(cx);
+        assert!(editor.size.width < px(480.), "{what}: narrow, {editor:?}");
+        assert!(
+            card.left() >= editor.left() && card.right() <= editor.right(),
+            "{what}: {card:?} in {editor:?}"
+        );
+        for id in [
+            "ai-inline-diff",
+            "ai-inline-text",
+            "ai-inline-words",
+            "ai-inline-sending",
+            "ai-inline-stop",
+            "ai-inline-note",
+            "ai-inline-field",
+            "ai-inline-accept",
+            "ai-inline-reject",
+            "ai-inline-close",
+            "ai-inline-foot",
+            "ai-inline-hint",
+            "ai-inline-panel",
+            "ai-inline-what",
+        ] {
+            let Some(part) = app.step(cx, |window, _| window.try_find(id).map(|e| e.bounds()))
+            else {
+                continue;
+            };
+            assert!(
+                part.left() >= card.left() - px(0.5)
+                    && part.right() <= card.right() + px(0.5)
+                    && part.top() >= card.top() - px(0.5)
+                    && part.bottom() <= card.bottom() + px(0.5),
+                "{what}: {id} {part:?} outside the card {card:?}"
+            );
+        }
+    };
+    set_text(&app, cx, SCRIPT, 30..30);
+    ask(&app, cx, "only the orders of this year");
+    wait_for_answer(&app, cx, 2);
+    assert!(diff(&app, cx).is_some());
+    assert!(app.has(cx, "ai-inline-panel") && app.has(cx, "ai-inline-accept"));
+    inside(&app, cx, "the diff");
+    app.press(cx, &["escape"]);
+    let prose = FakeAi::start("I cannot tell which year you mean: the table has no date column.");
+    enable(cx, &prose.base(), true);
+    ask(&app, cx, "only the orders of this year");
+    wait_for_answer(&app, cx, 2);
+    assert!(app.has(cx, "ai-inline-text"));
+    inside(&app, cx, "the answer without SQL");
+    app.press(cx, &["escape"]);
+    let slow = FakeAi::start_with(ANSWER, Duration::from_secs(30));
+    enable(cx, &slow.base(), true);
+    ask(&app, cx, "only the orders of this year");
+    app.wait_until(cx, "the request on its way", |app, cx| {
+        app.has(cx, "ai-inline-sending") && slow.requests().len() == 1
+    });
+    inside(&app, cx, "the request on its way");
+    app.press(cx, &["escape"]);
+    // Nothing listens there: the request fails at once, said in the card.
+    enable(cx, "http://127.0.0.1:1/v1", true);
+    ask(&app, cx, "only the orders of this year");
+    app.wait_until(cx, "the failure", |app, cx| {
+        !read(app, cx, |inline, _| inline.sending()) && app.has(cx, "ai-inline-note")
+    });
+    inside(&app, cx, "the failed request");
+    app.press(cx, &["escape"]);
 }

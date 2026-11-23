@@ -897,7 +897,8 @@ impl Render for AiInline {
         let on = AppState::get(cx).settings.ai.enabled;
         let width = (self.editor.read(cx).input_bounds().size.width - px(16.))
             .min(MAX_WIDTH)
-            .max(px(320.));
+            // Never wider than the editor: a narrow one (the panel shown) narrows the card.
+            .max(px(240.));
         let proposal = self.has_proposal();
         let sending = self.sending.as_ref().map(|sending| match &sending.host {
             Some(host) => format!("Asking {host}…"),
@@ -907,11 +908,11 @@ impl Render for AiInline {
         let diff = (shown.and_then(|shown| shown.proposal.as_ref()))
             .map(|proposal| self.render_diff(&proposal.lines, cx));
         let words = shown.and_then(|shown| self.render_words(&shown.answer, !proposal, cx));
+        // The keys only: what Accept does, and that nothing runs, is said in its tooltip.
         let hint = if proposal {
-            let run = key("secondary-enter");
             format!(
-                "{run} accepts (one undo step), Esc rejects, Enter refines. Nothing runs: {run} in \
-                 the editor runs the editor's own text."
+                "{} accept · Esc reject · Enter refine",
+                key("secondary-enter")
             )
         } else if self.turns.is_empty() && self.subject == Subject::Ask {
             let what = if self.original.trim().is_empty() {
@@ -982,6 +983,7 @@ impl Render for AiInline {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .text_xs()
                             .text_color(muted)
                             .child(SharedString::from(sending)),
@@ -1030,7 +1032,7 @@ impl Render for AiInline {
                                 .label("Accept")
                                 .tooltip(format!(
                                     "{} — puts the lines marked + in place of those marked −, as \
-                                     one undo step; runs nothing",
+                                     one undo step. Nothing runs until you run it.",
                                     key("secondary-enter")
                                 ))
                                 .disabled(self.sending.is_some())
@@ -1058,41 +1060,56 @@ impl Render for AiInline {
                         )
                     }),
             )
+            // The hint wraps inside the card; its links go to a line of their own when the
+            // card is too narrow for both.
             .child(
                 h_flex()
-                    .gap_1()
+                    .id("ai-inline-foot")
+                    .test_support()
+                    .flex_wrap()
+                    .gap_x_2()
+                    .gap_y_1()
                     .child(
                         div()
+                            .id("ai-inline-hint")
+                            .test_support()
                             .flex_1()
+                            .min_w(px(160.))
                             .text_xs()
                             .text_color(muted)
                             .child(SharedString::from(hint)),
                     )
-                    .when(!self.turns.is_empty(), |row| {
-                        row.child(
-                            Button::new("ai-inline-panel")
-                                .ghost()
-                                .xsmall()
-                                .label("Open in the panel")
-                                .tooltip("Goes on as a conversation in the tab's AI panel")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_in_panel(window, cx)
-                                })),
-                        )
-                    })
                     .child(
-                        Button::new("ai-inline-what")
-                            .ghost()
-                            .xsmall()
-                            .label(match (self.show_payload, self.last_sent.is_some()) {
-                                (true, _) => "Hide",
-                                (false, false) => "What is sent…",
-                                (false, true) => "What was sent…",
+                        h_flex()
+                            .flex_none()
+                            .ml_auto()
+                            .gap_1()
+                            .when(!self.turns.is_empty(), |row| {
+                                row.child(
+                                    Button::new("ai-inline-panel")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Open in the panel")
+                                        .tooltip("Goes on as a conversation in the tab's AI panel")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_in_panel(window, cx)
+                                        })),
+                                )
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_payload = !this.show_payload;
-                                cx.notify();
-                            })),
+                            .child(
+                                Button::new("ai-inline-what")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(match (self.show_payload, self.last_sent.is_some()) {
+                                        (true, _) => "Hide",
+                                        (false, false) => "What is sent…",
+                                        (false, true) => "What was sent…",
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_payload = !this.show_payload;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .when(self.show_payload, |card| {
