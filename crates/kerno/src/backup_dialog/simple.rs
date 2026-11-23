@@ -37,6 +37,12 @@ fn simple_formats(family: ClientFamily) -> &'static [BackupFormat] {
     }
 }
 
+/// How many connections "Faster" uses, for a backup (K48) as for a restore:
+/// the machine's cores, 8 at most.
+pub(crate) fn faster_jobs() -> u32 {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(8) as u32)
+}
+
 /// `n` things, in words.
 fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -176,10 +182,44 @@ impl BackupDialog {
         }
     }
 
+    /// The jobs field holds the number "Faster" uses.
+    fn faster_jobs_typed(&self, cx: &App) -> bool {
+        Self::text(&self.jobs, cx) == faster_jobs().to_string()
+    }
+
+    /// The simple backup's "Faster" is ticked (K48, D-117): a PostgreSQL
+    /// directory archive, written by pg_dump on [`faster_jobs`] connections.
+    pub(super) fn faster_backup(&self, cx: &App) -> bool {
+        self.family == ClientFamily::Postgres
+            && self.backup.format == BackupFormat::Directory
+            && self.faster_jobs_typed(cx)
+    }
+
+    /// The simple restore's "Faster" is ticked: pg_restore on
+    /// [`faster_jobs`] connections, outside one transaction.
+    pub(super) fn faster_restore(&self, cx: &App) -> bool {
+        !self.restore.single_transaction && self.faster_jobs_typed(cx)
+    }
+
+    /// Ticks or unticks the simple backup's "Faster": the directory format
+    /// and its jobs, or the custom archive again (the Speed row shows only
+    /// beside the archive, so that is what was chosen before).
+    fn set_faster_backup(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (format, jobs) = if on {
+            (BackupFormat::Directory, faster_jobs().to_string())
+        } else {
+            (BackupFormat::Custom, String::new())
+        };
+        self.backup.format = format;
+        self.jobs
+            .update(cx, |input, cx| input.set_value(jobs, window, cx));
+        cx.notify();
+    }
+
     /// The wizard's settings the simple view neither shows nor sets that
     /// differ from its defaults, in words: what going back to it resets.
-    /// The folder, the file name and a format the simple view offers are
-    /// shown there, so they are kept.
+    /// The folder, the file name, a format the simple view offers and its
+    /// "Faster" (format and jobs) are shown there, so they are kept.
     pub(super) fn advanced_changes(&self, cx: &App) -> Vec<&'static str> {
         let typed = |input: &Entity<InputState>| !Self::text(input, cx).is_empty();
         let mut changes = Vec::new();
@@ -191,9 +231,10 @@ impl BackupDialog {
         match self.mode {
             Mode::Backup => {
                 let defaults = BackupOptions::new(self.engine, self.database.clone());
+                let faster = self.faster_backup(cx);
                 note(!self.selection.complete, "the objects ticked");
                 note(
-                    !simple_formats(self.family).contains(&self.backup.format),
+                    !simple_formats(self.family).contains(&self.backup.format) && !faster,
                     "the format",
                 );
                 note(self.backup.content != defaults.content, "the content");
@@ -201,24 +242,32 @@ impl BackupDialog {
                     self.backup.engine != defaults.engine,
                     "the dump tool's options",
                 );
+                // The jobs count only with the directory format, the only
+                // one pg_dump runs them for.
+                let jobs =
+                    self.backup.format == BackupFormat::Directory && typed(&self.jobs) && !faster;
                 note(
-                    typed(&self.compression) || typed(&self.encoding) || typed(&self.jobs),
+                    typed(&self.compression) || typed(&self.encoding) || jobs,
                     "the compression, encoding or jobs",
                 );
             }
             Mode::Restore => {
+                let faster = self.faster_restore(cx);
                 let mut defaults = RestoreOptions::new(
                     self.engine,
                     self.restore.database.clone(),
                     self.restore.input.clone(),
                     self.restore.format,
                 );
-                // The simple view's checkbox sets both (K35).
+                // The simple view's checkboxes set these (K35, "Faster").
                 if self.restore.no_owner && self.restore.no_privileges {
                     (defaults.no_owner, defaults.no_privileges) = (true, true);
                 }
+                if faster {
+                    defaults.single_transaction = false;
+                }
                 note(self.restore != defaults, "the restore options");
-                note(typed(&self.jobs), "the jobs");
+                note(typed(&self.jobs) && !faster, "the jobs");
                 note(self.allow_commands, "the file's client commands allowed");
             }
             Mode::GlobalBackup | Mode::ExecuteScript => {}
@@ -230,15 +279,21 @@ impl BackupDialog {
 
     /// Puts every setting [`Self::advanced_changes`] lists back to the
     /// simple view's defaults; the folder, the file name, the file to
-    /// restore, a format the simple view offers and the client stay.
+    /// restore, a format the simple view offers, "Faster" and the client
+    /// stay.
     fn reset_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let clear = |input: &Entity<InputState>, window: &mut Window, cx: &mut App| {
             input.update(cx, |input, cx| input.set_value("", window, cx))
         };
+        let faster = match self.mode {
+            Mode::Backup => self.faster_backup(cx),
+            Mode::Restore => self.faster_restore(cx),
+            Mode::GlobalBackup | Mode::ExecuteScript => false,
+        };
         match self.mode {
             Mode::Backup => {
                 let mut defaults = BackupOptions::new(self.engine, self.database.clone());
-                if simple_formats(self.family).contains(&self.backup.format) {
+                if simple_formats(self.family).contains(&self.backup.format) || faster {
                     defaults.format = self.backup.format;
                 }
                 self.backup = defaults;
@@ -258,16 +313,15 @@ impl BackupDialog {
                 );
                 (self.restore.no_owner, self.restore.no_privileges) =
                     (without_owners, without_owners);
+                self.restore.single_transaction &= !faster;
                 self.allow_commands = false;
             }
             Mode::GlobalBackup | Mode::ExecuteScript => {}
         }
-        for input in [
-            &self.jobs,
-            &self.extra,
-            &self.auth_user,
-            &self.auth_password,
-        ] {
+        if !faster {
+            clear(&self.jobs, window, cx);
+        }
+        for input in [&self.extra, &self.auth_user, &self.auth_password] {
             clear(input, window, cx);
         }
         self.auth = false;
@@ -397,7 +451,8 @@ impl BackupDialog {
     /// Takes `path` as the backup's file: its folder, and its name as the
     /// file name pattern. A name ending in the extension of a format the
     /// simple view offers chooses that format, the extension left to it
-    /// (so another format later does not write `name.dump.sql`).
+    /// (so another format later does not write `name.dump.sql`). With
+    /// "Faster" ticked the backup is a folder, named as typed.
     fn set_file(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
             return;
@@ -408,7 +463,7 @@ impl BackupDialog {
                 .filter(|stem| !stem.is_empty())
                 .map(|stem| (*format, stem.to_string()))
         });
-        if let Some((format, stem)) = chosen {
+        if let Some((format, stem)) = chosen.filter(|_| !self.faster_backup(cx)) {
             self.backup.format = format;
             name = stem;
         }
@@ -455,6 +510,11 @@ impl BackupDialog {
             EngineBackup::Postgres(_) if self.backup.format == BackupFormat::Sql => {
                 "A text file of SQL statements, run back by psql: readable and editable, \
                  larger, restored whole."
+                    .into()
+            }
+            EngineBackup::Postgres(_) if self.backup.format == BackupFormat::Directory => {
+                "pg_dump's directory archive: a folder of compressed files, one per table, \
+                 restored by pg_restore whole or only some of its tables."
                     .into()
             }
             EngineBackup::Postgres(_) => {
@@ -526,9 +586,11 @@ impl BackupDialog {
     fn simple_backup_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         let what = self.what_text();
+        let faster = self.faster_backup(cx);
         let file = match self.output_path(cx) {
             Ok(path) => {
-                let shown = path.display().to_string();
+                // A folder's path ends with a slash.
+                let shown = format!("{}{}", path.display(), if faster { "/" } else { "" });
                 div()
                     .id("simple-file")
                     .test_support()
@@ -548,13 +610,20 @@ impl BackupDialog {
         let formats = simple_formats(self.family);
         let format = if formats.len() > 1 {
             let entity = cx.entity();
-            let selected = formats
-                .iter()
-                .position(|format| *format == self.backup.format);
+            // "Faster" writes the archive as a folder: still the archive.
+            let shown = if faster {
+                BackupFormat::Custom
+            } else {
+                self.backup.format
+            };
+            let selected = formats.iter().position(|format| *format == shown);
             v_flex()
                 .gap_1()
                 .child(
                     OptionCards::new("simple-format", selected, move |index, _, cx| {
+                        // The archive's card is the chosen one while "Faster"
+                        // is ticked (a chosen card is not chosen again); the
+                        // script unticks it, its jobs then unused.
                         entity.update(cx, |this, cx| {
                             this.backup.format = formats[index];
                             cx.notify();
@@ -568,6 +637,43 @@ impl BackupDialog {
             div().into_any_element()
         };
         let hint = self.format_hint();
+        // pg_dump dumps several tables at once (`--jobs`) only into a
+        // directory archive: offered beside PostgreSQL's archive (K48).
+        let speed = (self.family == ClientFamily::Postgres
+            && matches!(
+                self.backup.format,
+                BackupFormat::Custom | BackupFormat::Directory
+            ))
+        .then(|| {
+            let hint = "The backup is then a folder, one file per table, which Kerno restores like \
+                        any backup. A single large table is still read by one connection.";
+            row(
+                "Speed",
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Checkbox::new("simple-faster")
+                            .label(SharedString::from(format!(
+                                "Faster: back up on {} connections at once",
+                                faster_jobs()
+                            )))
+                            .checked(faster)
+                            .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                                this.set_faster_backup(*checked, window, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("simple-faster-hint")
+                            .test_support()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(hint)
+                            .test_text(hint),
+                    ),
+                cx,
+            )
+        });
         vec![
             row(
                 "What",
@@ -610,8 +716,11 @@ impl BackupDialog {
                 ),
                 cx,
             ),
-            row("Client", self.simple_client(cx), cx),
         ]
+        .into_iter()
+        .chain(speed)
+        .chain([row("Client", self.simple_client(cx), cx)])
+        .collect()
     }
 
     fn simple_restore_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
@@ -691,9 +800,8 @@ impl BackupDialog {
                     if matches!(input.format, BackupFormat::Custom | BackupFormat::Directory)
             );
         let speed = parallel.then(|| {
-            let jobs = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-            let on =
-                !self.restore.single_transaction && !self.jobs.read(cx).value().trim().is_empty();
+            let jobs = faster_jobs();
+            let on = self.faster_restore(cx);
             let hint = "Not all or nothing: if a step fails, pg_restore goes on and what it \
                         restored stays.";
             row(

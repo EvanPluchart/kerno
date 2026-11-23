@@ -1362,3 +1362,14 @@ Still open (for the owner):
   still running right after a click). To make robust.
 - Asked and left for the next release: a faster backup (pg_dump on several connections writes a directory, not
   one file).
+
+## 2026-11-23 — K48: a faster backup, pg_dump on several connections
+
+- The simple PostgreSQL backup has "Faster: back up on N connections at once" (off by default): pg_dump's
+  directory archive with `--jobs=N`, a folder the simple restore reads back, on several connections too. The
+  simple restore's "Faster" is no longer called a hidden change on the way back from the wizard.
+- Measured (BENCH.md): almost no gain on the fixture database (one table holds nearly all of it), about 3.3
+  times faster on eight tables of similar size. No zstd: the default client here is built without it (D-117).
+- Tests: `tools::tests::parallel_jobs_go_with_the_directory_format_only`; `ui_tests::backup_simple::`
+  `faster_backs_up_into_a_folder_and_the_wizard_shows_it`, `the_simple_restores_faster_is_not_a_hidden_change`,
+  `a_faster_backup_removes_only_the_folder_it_made`, `a_faster_backup_is_a_folder_the_simple_restore_reads_back`.

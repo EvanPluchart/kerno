@@ -3543,3 +3543,43 @@ finding each missing piece by running the restore again is what had to end.
   is newer than every 0.x and is offered to them; the artifact names carry the version as written. It is one
   way: a 0.x published after it would never be offered.
 - No pre-release suffix: the update check reads three numbers only.
+
+## D-117 — A faster backup: pg_dump on several connections (K48; 2026-11-23)
+
+After the simple restore's "Faster" (commit `80c50c4`), the owner asked for the same on the backup, then left it
+to be done in autonomy for the next release.
+
+- **What it is.** pg_dump reads several tables at once only into its directory archive (`--format=directory
+  --jobs=N`): the simple backup's "Faster: back up on N connections at once" is exactly that, N the restore's
+  (the machine's cores, 8 at most; `faster_jobs`, now shared by both). Off by default; shown for PostgreSQL
+  beside the compressed archive only, the script being one file by one connection. Unticking gives the custom
+  archive back, which is what was chosen before since the row shows only beside it; choosing the script unticks.
+- **One state, no flag.** "Faster" is the format and the jobs field themselves: the directory format with the
+  jobs field at N. The wizard therefore shows it in its own Format and Jobs fields and a task keeps it; the way
+  back to the simple view does not call it a hidden change, and its reset keeps it. The directory format with
+  other jobs, or none, is a hidden change, named and reset to the archive. The jobs field counts as a change only
+  with the directory format, the only one pg_dump runs them for. The simple restore's "Faster" was called a
+  hidden change by the same way back (its one-transaction default and its jobs), and its reset unticked it:
+  fixed the same way (a bug of `80c50c4`, found here).
+- **A folder.** The "To" row ends with a slash; the save panel's name is the folder's, as typed (an extension
+  does not choose a format while ticked); the end says the folder's size (the sum of its files: pg_dump's
+  directory archive is flat); Show in Finder selects it. A folder already there is refused before the run, as
+  the wizard did (pg_dump's documentation says the folder must not exist); the run checks again just before
+  pg_dump starts, and a folder found then is not the run's: nothing runs, nothing is removed. A failed or
+  cancelled run removes only the folder it made. Left: the microseconds between that second check and pg_dump's
+  own `mkdir`.
+- **No cheaper compression.** zstd made the custom archive 2.5 times faster for the same size with
+  pg_dump 17 (BENCH.md), but the client Kerno picks here, libpq 19.0's pg_dump, is built without zstd and lz4,
+  and an archive compressed with them is readable only by a pg_restore built with them: a backup the default
+  restore client of the same machine could refuse is not sure. The directory archive keeps pg_dump's default
+  (gzip), which every pg_restore reads. Not built.
+- **Measured.** BENCH.md: on the fixture database, whose one table holds 301 of 317 MB, "Faster" gains almost
+  nothing (5.3 to 5.7 s against 5.7 to 5.9 s); on eight tables of similar size, 1.0 to 1.4 s against 3.5 to
+  3.6 s. The hint says so in the view: one large table is still read by one connection.
+- **MySQL and MariaDB: nothing.** mysqldump 8.4 (and the installed client) has no parallel mode; mysqlpump is
+  gone from MySQL 8.4 (only the installed 5.7 client has it); `mariadb-dump --parallel` (11.8, in
+  `kerno-mariadb`) works only with `--tab`, which has the server write one file per table on its own disk, not
+  a script Kerno restores.
+- **Not verified.** A hot standby that pg_dump cannot dump in parallel, a server with too few free connections:
+  pg_dump's own message is in the output and the run ends as any failed backup (the failure path is tested
+  with a stand-in pg_dump). No pass in the real app; captures were rendered offscreen (not committed).

@@ -470,6 +470,13 @@ and triggers. **Show command** shows the exact command (the password never: it g
 environment). **Back up** (or Enter) runs it; the progress shows the tool's output, the time, Cancel, and Show
 in Finder at the end.
 
+Beside PostgreSQL's compressed archive, **Faster: back up on N connections at once** (N is your computer's cores,
+8 at most; off by default) has pg_dump read several tables at the same time (`--format=directory --jobs=N`). The
+backup is then a folder, one file per table, chosen and shown like a file: **Restore…** takes that folder (pick
+it in the open panel or type its path) and can restore it on several connections too. It helps a database of
+many tables; one large table is still read by one connection. A failed or cancelled backup removes the folder
+it made, never a folder that was already there: a folder of that name stops the backup before it starts.
+
 **Restore…** opens the same kind of screen: the file (Choose… or a typed path; its format is read from the file
 and says which tool restores it), the database it goes into, what a restore does to it, the client.
 **Restore…** shows the command and asks first, twice on a production connection; a read-only connection has

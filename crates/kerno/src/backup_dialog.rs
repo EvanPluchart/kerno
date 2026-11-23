@@ -76,6 +76,9 @@ use crate::theme;
 
 mod simple;
 
+#[cfg(test)]
+pub(crate) use simple::faster_jobs;
+
 /// Which wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -1946,7 +1949,22 @@ impl BackupDialog {
                     write_new(path, &tools::list_without(list, left_out))
                 }
             };
+            // A directory archive goes into a folder pg_dump makes. One there
+            // now (made since Start was checked) is not this run's: it is
+            // never removed, and nothing runs (K48).
+            let taken = output
+                .as_ref()
+                .filter(|_| directory)
+                .map(|(path, _)| path)
+                .filter(|path| std::fs::symlink_metadata(path).is_ok());
             let outcome = match written {
+                Ok(()) if taken.is_some() => Err(Error::Config(format!(
+                    "{} already exists: pg_dump writes a directory archive into a new folder. \
+                     Nothing was run.",
+                    taken
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ))),
                 Ok(()) => {
                     tools::run(
                         command,
@@ -1972,12 +1990,7 @@ impl BackupDialog {
             };
             if let Some((path, existed)) = &output {
                 match &ended.outcome {
-                    Ok(status) if status.success() => {
-                        ended.size = std::fs::metadata(path)
-                            .ok()
-                            .filter(|meta| meta.is_file())
-                            .map(|meta| meta.len());
-                    }
+                    Ok(status) if status.success() => ended.size = backup_size(path),
                     // The tool stopped short: what it wrote is incomplete.
                     // What it never opened (it failed to connect) may be an
                     // earlier backup: kept.
@@ -2124,7 +2137,9 @@ impl BackupDialog {
         self.elapsed = self.started.map(|started| started.elapsed());
         self.ticking = None;
         let writes_file = !self.mode.writes();
+        let folder = self.mode == Mode::Backup && self.backup.format == BackupFormat::Directory;
         let kept = match (writes_file, self.engine) {
+            (true, _) if ended.removed && folder => " The incomplete folder was removed.",
             (true, _) if ended.removed => " The incomplete file was removed.",
             (true, _) => "",
             (false, Engine::Postgres)
@@ -2624,6 +2639,25 @@ impl BackupDialog {
         self.output.clone()
     }
 
+    /// Runs the backup past the check Start makes for an output already
+    /// there, as when one appears between that check and the run; for
+    /// tests.
+    #[cfg(test)]
+    pub fn run_unchecked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self.command(cx).expect("a command");
+        let output = self.output_path(cx).expect("an output");
+        self.run(command, Some((output, false)), window, cx);
+    }
+
+    /// The settings a saved task would keep; for tests.
+    #[cfg(test)]
+    pub fn task_backup(&self, cx: &App) -> Option<BackupOptions> {
+        match self.task_settings(cx) {
+            Ok(TaskSettings::Backup(options)) => Some(options),
+            _ => None,
+        }
+    }
+
     /// The schemas listed on the objects page; for tests.
     #[cfg(test)]
     pub fn schema_names(&self) -> Vec<String> {
@@ -2935,6 +2969,24 @@ fn ignored_commands<S: AsRef<str>>(log: &[S]) -> Vec<String> {
                 .then(|| sql.to_string())
         })
         .collect()
+}
+
+/// The size of a backup written: a file's, or the sum of a directory
+/// archive's files (pg_dump writes them side by side, no subfolder).
+/// Blocking.
+fn backup_size(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return meta.is_file().then_some(meta.len());
+    }
+    Some(
+        std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|entry| entry.ok()?.metadata().ok())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum(),
+    )
 }
 
 /// Writes `text` to `path` as a new file of this user's only: a file left

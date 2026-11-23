@@ -4036,6 +4036,31 @@ mod tests {
         }
     }
 
+    /// K48: the simple backup's "Faster" is `--format=d --jobs=N`; jobs with
+    /// any other format are refused, never passed.
+    #[test]
+    fn parallel_jobs_go_with_the_directory_format_only() {
+        let args = own_args(
+            &pg_with(|o, p| {
+                o.format = BackupFormat::Directory;
+                p.jobs = Some(8)
+            })
+            .unwrap(),
+        );
+        let at = args.iter().position(|arg| arg == "--format=d").unwrap();
+        assert_eq!(args[at + 1], "--jobs=8", "{args:?}");
+        for format in [BackupFormat::Sql, BackupFormat::Custom, BackupFormat::Tar] {
+            let refused = pg_with(|o, p| {
+                o.format = format;
+                p.jobs = Some(8)
+            });
+            assert!(
+                matches!(&refused, Err(Error::Unsupported(text)) if text.contains("directory format")),
+                "{format:?}: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn pg_dump_refuses_what_it_cannot_do() {
         type Change = fn(&mut BackupOptions, &mut PgBackup);

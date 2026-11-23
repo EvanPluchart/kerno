@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use gpui_kit::Pixels;
-use kerno_core::tools::{BackupFormat, ClientFamily};
+use kerno_core::tools::{BackupFormat, ClientFamily, EngineBackup};
 
 use super::tool_wizards::{fake_client, paints};
 use super::*;
@@ -636,4 +636,449 @@ fn the_backup_dialogs_fit_a_small_window(cx: &mut TestAppContext) {
         "simple restore",
     );
     app.press(cx, &["escape"]);
+}
+
+/// The arguments of the dialog's command, joined.
+fn joined(cx: &mut TestAppContext, dialog: &Entity<BackupDialog>) -> String {
+    command_args(cx, dialog).join(" ")
+}
+
+/// K48: the simple backup's "Faster" makes a directory archive on several
+/// connections, a folder; the wizard shows the same state and the way back
+/// does not call it a hidden change; other jobs are one; unticking, or the
+/// script, gives the single file back.
+#[gpui_kit::test]
+fn faster_backs_up_into_a_folder_and_the_wizard_shows_it(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let app = connected(cx, Engine::Postgres);
+    let client = fake_client(
+        &root,
+        "pg",
+        ClientFamily::Postgres,
+        "pg_dump (PostgreSQL) 99.0",
+        "exit 0",
+    );
+    app.use_client(cx, ClientFamily::Postgres, &client);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", false)
+        .expect("the backup");
+    app.wait_backup(cx, &dialog, &["ready"]);
+    let jobs = crate::backup_dialog::faster_jobs();
+    let file = |cx: &mut TestAppContext| cx.update(|cx| dialog.read(cx).file_preview(cx));
+
+    // Off by default: the archive, one file.
+    assert!(app.has(cx, "simple-faster"));
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains("--format=c") && !args.contains("--jobs"),
+        "{args}"
+    );
+    app.save_as(cx, "simple-choose-file", &root.join("mine.dump"));
+    assert_eq!(file(cx), Ok(root.join("mine.dump")));
+
+    // Ticked: a directory archive on that many connections, into a folder.
+    app.tap(cx, "simple-faster");
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains(&format!("--format=d --jobs={jobs}")),
+        "{args}"
+    );
+    assert_eq!(file(cx), Ok(root.join("mine")));
+    assert!(paints(
+        &app,
+        cx,
+        &format!("{}/", root.join("mine").display())
+    ));
+    assert!(paints(&app, cx, "pg_dump's directory archive: a folder"));
+    assert!(paints(
+        &app,
+        cx,
+        "The backup is then a folder, one file per table, which Kerno restores like any backup."
+    ));
+    assert!(
+        app.has(cx, crate::settings_ui::check_id("simple-format", 0)),
+        "still the archive"
+    );
+    // The save panel names the folder, as typed: an extension does not
+    // choose the format.
+    app.save_as(cx, "simple-choose-file", &root.join("nightly.dump"));
+    assert_eq!(file(cx), Ok(root.join("nightly.dump")));
+    assert!(joined(cx, &dialog).contains("--format=d"));
+    // The archive's card again: still faster.
+    app.step(cx, |window, cx| {
+        window.within("simple-format").click(0usize, cx)
+    });
+    assert!(joined(cx, &dialog).contains(&format!("--format=d --jobs={jobs}")));
+
+    // The wizard shows the same: the directory format and its jobs; a task
+    // keeps them.
+    app.tap(cx, "backup-advanced");
+    app.to_settings(cx, &dialog);
+    assert!(app.has(cx, "backup-jobs"));
+    let settings = cx.update(|cx| dialog.read(cx).settings(cx)).unwrap();
+    assert_eq!(settings.format, BackupFormat::Directory);
+    assert!(
+        matches!(&settings.engine, EngineBackup::Postgres(pg) if pg.jobs == Some(jobs)),
+        "{settings:?}"
+    );
+    let task = cx
+        .update(|cx| dialog.read(cx).task_backup(cx))
+        .expect("a task");
+    assert_eq!(task.format, BackupFormat::Directory);
+    assert!(matches!(&task.engine, EngineBackup::Postgres(pg) if pg.jobs == Some(jobs)));
+    // Nothing the simple view hides: back at once, still faster.
+    app.tap(cx, "wizard-simple");
+    assert_eq!(view(cx, &dialog), "simple");
+    assert!(!app.has(cx, "simple-reset"));
+    assert!(joined(cx, &dialog).contains(&format!("--format=d --jobs={jobs}")));
+    // A hidden option is named alone, and its reset keeps "Faster".
+    app.tap(cx, "backup-advanced");
+    app.to_settings(cx, &dialog);
+    app.tap(cx, "backup-no-owner");
+    app.tap(cx, "wizard-simple");
+    assert!(paints(
+        &app,
+        cx,
+        "The simple view does not show the dump tool's options."
+    ));
+    app.tap(cx, "simple-reset");
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains(&format!("--format=d --jobs={jobs}")) && !args.contains("--no-owner"),
+        "{args}"
+    );
+
+    // Other jobs typed in the wizard are a hidden change: named, and reset
+    // to the archive in one file.
+    app.tap(cx, "backup-advanced");
+    app.to_settings(cx, &dialog);
+    app.replace_text(cx, "backup-jobs", "3");
+    app.tap(cx, "wizard-simple");
+    assert!(paints(
+        &app,
+        cx,
+        "The simple view does not show the format and the compression, encoding or jobs."
+    ));
+    app.tap(cx, "simple-reset");
+    assert_eq!(view(cx, &dialog), "simple");
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains("--format=c") && !args.contains("--jobs"),
+        "{args}"
+    );
+    assert_eq!(file(cx), Ok(root.join("nightly.dump")));
+
+    // Unticked: the archive in one file again.
+    app.tap(cx, "simple-faster");
+    assert!(joined(cx, &dialog).contains("--format=d"));
+    app.tap(cx, "simple-faster");
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains("--format=c") && !args.contains("--jobs"),
+        "{args}"
+    );
+
+    // The script, chosen while ticked: one file by one connection, and no
+    // Speed row; the archive again is the single file.
+    app.tap(cx, "simple-faster");
+    app.step(cx, |window, cx| {
+        window.within("simple-format").click(1usize, cx)
+    });
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains("--format=p") && !args.contains("--jobs"),
+        "{args}"
+    );
+    assert!(!app.has(cx, "simple-faster"));
+    app.step(cx, |window, cx| {
+        window.within("simple-format").click(0usize, cx)
+    });
+    let args = joined(cx, &dialog);
+    assert!(
+        args.contains("--format=c") && !args.contains("--jobs"),
+        "{args}"
+    );
+    assert!(app.has(cx, "simple-faster"));
+}
+
+/// The simple restore's "Faster" is the simple view's own state too: the
+/// wizard and back keep it, without asking.
+#[gpui_kit::test]
+fn the_simple_restores_faster_is_not_a_hidden_change(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = fake_client(
+        &root,
+        "pg",
+        ClientFamily::Postgres,
+        "pg_restore (PostgreSQL) 99.0",
+        "exit 0",
+    );
+    let archive = root.join("archive.dump");
+    std::fs::write(&archive, "PGDMP a stand-in archive").unwrap();
+    let app = connected(cx, Engine::Postgres);
+    app.use_client(cx, ClientFamily::Postgres, &client);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", true)
+        .expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &archive);
+    app.wait_backup(cx, &dialog, &["ready"]);
+    app.tap(cx, "simple-parallel");
+    let jobs = format!("--jobs={}", crate::backup_dialog::faster_jobs());
+    let state = app.wizard_state(cx, &dialog);
+    assert!(
+        state.contains(&jobs) && !state.contains("--single-transaction"),
+        "{state}"
+    );
+    app.tap(cx, "backup-advanced");
+    assert_eq!(view(cx, &dialog), "advanced");
+    app.tap(cx, "wizard-simple");
+    assert_eq!(view(cx, &dialog), "simple");
+    assert!(!app.has(cx, "simple-reset"));
+    assert!(app.wizard_state(cx, &dialog).contains(&jobs));
+    // A hidden option's reset keeps it too.
+    app.tap(cx, "backup-advanced");
+    app.tap(cx, "restore-clean");
+    app.tap(cx, "wizard-simple");
+    assert!(paints(
+        &app,
+        cx,
+        "The simple view does not show the restore options."
+    ));
+    app.tap(cx, "simple-reset");
+    let state = app.wizard_state(cx, &dialog);
+    assert!(
+        state.contains(&jobs) && !state.contains("--clean") && !state.contains("--single"),
+        "{state}"
+    );
+}
+
+/// A faster backup that fails or is cancelled removes the folder it made;
+/// a folder already there is never written into nor removed, also when it
+/// appears between Start's check and the run.
+#[gpui_kit::test]
+fn a_faster_backup_removes_only_the_folder_it_made(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // The stand-in makes the folder and writes into it, then fails or waits.
+    let made = r#"for arg in "$@"; do case $arg in --file=*) mkdir -p "${arg#--file=}"; echo partial > "${arg#--file=}/toc.dat";; esac; done"#;
+    let failing = fake_client(
+        &root,
+        "failing",
+        ClientFamily::Postgres,
+        "pg_dump (PostgreSQL) 99.0",
+        &format!("{made}\necho 'pg_dump: error: a stand-in failure' >&2\nexit 1"),
+    );
+    let slow = fake_client(
+        &root,
+        "slow",
+        ClientFamily::Postgres,
+        "pg_dump (PostgreSQL) 99.0",
+        &format!("{made}\necho 'pg_dump: started'\nexec sleep 60"),
+    );
+    let app = connected(cx, Engine::Postgres);
+    app.use_client(cx, ClientFamily::Postgres, &failing);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", false)
+        .expect("the backup");
+    app.wait_backup(cx, &dialog, &["ready"]);
+    app.tap(cx, "simple-faster");
+
+    // A failure: the folder it made is removed, and said so.
+    let failed = root.join("failed");
+    app.save_as(cx, "simple-choose-file", &failed);
+    app.tap(cx, "backup-start");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert_eq!(
+        state,
+        "failed: pg_dump failed (exit status 1). The incomplete folder was removed."
+    );
+    assert!(!failed.exists());
+    assert!(
+        cx.update(|cx| dialog.read(cx).log())
+            .contains(&"pg_dump: error: a stand-in failure".to_string())
+    );
+
+    // A folder already there: Back up says so and runs nothing.
+    app.tap(cx, "backup-back");
+    let earlier = root.join("earlier");
+    std::fs::create_dir(&earlier).unwrap();
+    std::fs::write(earlier.join("keep"), "an earlier backup\n").unwrap();
+    app.save_as(cx, "simple-choose-file", &earlier);
+    let before = notification_count(&app, cx);
+    app.tap(cx, "backup-start");
+    app.wait_until(cx, "the refusal", |app, cx| {
+        notification_count(app, cx) == before + 1
+    });
+    assert!(app.wizard_state(cx, &dialog).starts_with("ready: "));
+    // One that appears after that check is not the run's either: nothing
+    // runs, nothing is removed.
+    app.step(cx, |window, cx| {
+        dialog.update(cx, |dialog, cx| dialog.run_unchecked(window, cx))
+    });
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.starts_with(&format!("failed: {} already exists", earlier.display()))
+            && state.ends_with("Nothing was run."),
+        "{state}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(earlier.join("keep")).unwrap(),
+        "an earlier backup\n"
+    );
+    assert!(!earlier.join("toc.dat").exists());
+    app.tap(cx, "backup-close");
+
+    // Cancelled: the folder it made is removed.
+    app.use_client(cx, ClientFamily::Postgres, &slow);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", false)
+        .expect("the backup");
+    app.wait_backup(cx, &dialog, &["ready"]);
+    app.tap(cx, "simple-faster");
+    let cut = root.join("cut");
+    app.save_as(cx, "simple-choose-file", &cut);
+    app.tap(cx, "backup-start");
+    app.wait_until(cx, "the first line", |_, cx| {
+        cx.update(|cx| dialog.read(cx).log()) == ["pg_dump: started"]
+    });
+    assert!(cut.join("toc.dat").exists());
+    app.tap(cx, "backup-cancel");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert_eq!(
+        state,
+        "failed: Cancelled: pg_dump was stopped. The incomplete folder was removed."
+    );
+    assert!(!cut.exists());
+}
+
+/// The round trip from the simple views alone, with the real tools: a
+/// faster backup of a scratch database writes a folder, said with its size;
+/// the simple restore takes that folder from the open panel (which lets a
+/// folder be chosen) or typed, reads it as a directory archive, and
+/// restores it on several connections.
+#[gpui_kit::test]
+fn a_faster_backup_is_a_folder_the_simple_restore_reads_back(cx: &mut TestAppContext) {
+    let engine = Engine::Postgres;
+    if !testing::available(engine) {
+        return;
+    }
+    let (source, target) = ("kerno_test_k48_src", "kerno_test_k48_dst");
+    let drop = |name: &str| format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop(source), &drop(target)],
+        &[
+            &format!("CREATE DATABASE {source}"),
+            &format!("CREATE DATABASE {target}"),
+        ],
+    );
+    on_database(
+        engine,
+        Some(source),
+        "CREATE TABLE one (id int); CREATE TABLE two (id int); CREATE TABLE three (id int); \
+         INSERT INTO one SELECT generate_series(1, 1000); \
+         INSERT INTO two SELECT generate_series(1, 200); INSERT INTO three VALUES (7)",
+    );
+    let app = connected(cx, engine);
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let jobs = format!("--jobs={}", crate::backup_dialog::faster_jobs());
+
+    let dialog = app.simple_dialog(cx, source, false).expect("the backup");
+    let state = app.wait_backup(cx, &dialog, &["ready", "no tool", "old client"]);
+    if !state.starts_with("ready") {
+        eprintln!("SKIPPED: no usable client tool: {state}");
+        return;
+    }
+    app.tap(cx, "simple-faster");
+    let folder = root.join("k48");
+    app.save_as(cx, "simple-choose-file", &folder);
+    assert!(app.wizard_state(cx, &dialog).contains(&jobs));
+    app.tap(cx, "backup-start");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: pg_dump finished"), "{state}");
+    assert_eq!(
+        cx.update(|cx| dialog.read(cx).written()),
+        Some(folder.clone())
+    );
+    assert!(folder.join("toc.dat").is_file());
+    let size: u64 = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        state.ends_with(&format!(
+            "to {} ({}).",
+            folder.display(),
+            kerno_core::format::byte_size(size)
+        )),
+        "{state}"
+    );
+    assert!(app.has(cx, "backup-reveal"));
+    app.tap(cx, "backup-close");
+
+    // Restored from the open panel, which offers folders.
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    let chosen = folder.clone();
+    cx.simulate_path_prompt_response(move |options| {
+        assert!(options.directories && options.files, "{options:?}");
+        Some(vec![chosen])
+    });
+    cx.run_until_parked();
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    assert!(paints(
+        &app,
+        cx,
+        "Directory archive, restored by pg_restore"
+    ));
+    app.tap(cx, "simple-parallel");
+    let state = app.wizard_state(cx, &dialog);
+    assert!(
+        state.contains(&jobs) && !state.contains("--single-transaction"),
+        "{state}"
+    );
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: pg_restore finished"), "{state}");
+    assert_eq!(
+        on_database(
+            engine,
+            Some(target),
+            "SELECT (SELECT count(*) FROM one) || '/' || (SELECT count(*) FROM two) || '/' || \
+             (SELECT id FROM three)"
+        ),
+        "1000/200/7"
+    );
+    app.tap(cx, "backup-close");
+
+    // Typed: read the same way.
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.replace_text(cx, "restore-file", &folder.display().to_string());
+    app.press(cx, &["enter"]);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    assert!(paints(
+        &app,
+        cx,
+        "Directory archive, restored by pg_restore"
+    ));
 }

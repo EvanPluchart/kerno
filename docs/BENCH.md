@@ -173,6 +173,26 @@ a display as above. The machine was busy (1-minute load 9 to 50, another build b
 | Process memory, 10,000 then 100,000 rows of 20 columns | 76 MiB, then 106 MiB (+29 MiB) |
 | Scrolling the 100,000 rows down and up, 150 rows a frame, 1,332 frames | 7.72 ms on average, median 7.32, 99th percentile 13.75, longest 36.05 |
 
+## A faster backup: pg_dump on several connections (K48)
+
+Measured on 2026-11-23 through the simple backup view itself, driven by a temporary UI test (not committed): the
+time from Back up to the end of the run, the size of what was written, three runs each, with the client Kerno
+picks for the PostgreSQL 17 test server (Homebrew libpq 19.0's pg_dump), 11 cores, so "Faster" is `--jobs=8`.
+The machine was shared with another build (1-minute load 5 to 7). Sizes in MB of 10⁶ bytes: the app's own end
+message counts in units of 2²⁰ (92.8 MB here is its "88 MB").
+
+| Database | Without "Faster" (custom archive) | With "Faster" (directory, 8 jobs) |
+|---|---|---|
+| `kerno` (317 MB; `analytics.big_table` alone is 301 MB) | 5.78, 5.66, 5.92 s; 92.8 MB | 5.70, 5.63, 5.33 s; 92.8 MB |
+| `kerno_test_k48_bench` (299 MB in 8 tables of 125,000 rows, made and dropped by the test) | 3.46, 3.51, 3.59 s; 61.2 MB | 1.01, 1.38, 0.95 s; 61.2 MB |
+
+On the fixture database "Faster" gains almost nothing: pg_dump gives each table to one connection, and one table
+holds nearly all the data. On eight tables of similar size it is about 3.3 times faster, for the same size.
+
+Compression (one run each, pg_dump by hand on `kerno`, custom format): pg_dump 17.12's default (gzip) 7.3 s and
+92.9 MB, `--compress=zstd` 2.9 s and 90.1 MB. libpq 19.0's pg_dump, the one Kerno picks here, refuses `zstd` and
+`lz4` ("this build does not support compression with ZSTD"): Kerno does not use them (D-117).
+
 ## Reproducing
 
 ```sh
