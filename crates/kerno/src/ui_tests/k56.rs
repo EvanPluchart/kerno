@@ -246,3 +246,58 @@ fn the_other_tall_dialogs_keep_their_buttons_in_a_short_window(cx: &mut TestAppC
         app.press(cx, &["escape"]);
     }
 }
+
+/// 2. A path typed in the restore's File field is taken once typing
+/// pauses, without Enter and with the focus still in the field: a path
+/// that names nothing says so, a real one makes the restore ready.
+#[gpui_kit::test]
+fn a_restore_takes_a_typed_path_without_enter(cx: &mut TestAppContext) {
+    use kerno_core::tools::ClientFamily;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = super::tool_wizards::fake_client(
+        &root,
+        "pg",
+        ClientFamily::Postgres,
+        "pg_dump (PostgreSQL) 99.0",
+        "exit 0",
+    );
+    let script = root.join("script.sql");
+    std::fs::write(&script, "SELECT 1;\n").unwrap();
+    let app = connected(cx, Engine::Postgres);
+    app.use_client(cx, ClientFamily::Postgres, &client);
+    let dialog = app.simple_dialog(cx, "kerno", true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    let pause = |app: &Fixture, cx: &mut TestAppContext| {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        app.step(cx, |_, _| ());
+    };
+
+    app.click(cx, "restore-file");
+    app.type_text(cx, &root.join("missing.sql").display().to_string());
+    pause(&app, cx);
+    let state = app.wait_backup(cx, &dialog, &["file:"]);
+    assert!(state.contains("No such file: "), "{state}");
+    assert!(app.has(cx, "restore-problem"));
+    let disabled = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |window, _| window.find("restore-start").disabled()) == Some(true)
+    };
+    assert!(disabled(&app, cx));
+
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, &script.display().to_string());
+    pause(&app, cx);
+    let state = app.wait_backup(cx, &dialog, &["ready", "file", "no tool", "refused"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    assert!(!disabled(&app, cx));
+    // The field kept the keyboard and its text, as typed.
+    let field = cx.update(|cx| dialog.read(cx).file().map(Path::to_path_buf));
+    assert_eq!(field.as_deref(), Some(script.as_path()));
+    app.type_text(cx, "x");
+    pause(&app, cx);
+    let state = app.wait_backup(cx, &dialog, &["file:"]);
+    assert!(state.contains("script.sqlx"), "{state}");
+}

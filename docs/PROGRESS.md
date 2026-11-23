@@ -1494,3 +1494,5 @@ Still open (for the owner):
 - In a window less than about 750 px high, a failed "Test connection" pushed the connection dialog's buttons
   out of the window. The fields now scroll above the result and the buttons, which stay in view down to 560 px;
   the other tall dialogs were checked at that height and pass.
+- A path typed in the restore's File field was taken only on Enter or when the field lost the focus. It is
+  now taken once the typing pauses, and a path that names nothing says "No such file".

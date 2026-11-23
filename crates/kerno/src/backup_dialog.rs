@@ -67,6 +67,7 @@ use kerno_core::tools::{
 use kerno_core::{Error, Session, exec};
 
 use crate::bridge;
+use crate::connections::form::expand_home;
 use crate::connections::manager::{Connections, Status};
 use crate::query::tab::duration_text;
 use crate::sql_confirm::{self, Confirmation, Statement};
@@ -390,11 +391,16 @@ pub struct BackupDialog {
     /// read (a schema's backup, a saved task).
     pending_schemas: Vec<String>,
     probing: Option<Task<()>>,
+    /// Waits for a pause in the typing of the file field.
+    typing: Option<Task<()>>,
     running: Option<Task<()>>,
     ticking: Option<Task<()>>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How long the typing of a path pauses before the path is read.
+const TYPING_PAUSE: Duration = Duration::from_millis(400);
 
 /// Opens the wizard of `mode` on the database of `target` (its
 /// connection's default database when it names none), or says why it
@@ -580,21 +586,22 @@ impl BackupDialog {
                 .masked(true)
                 .placeholder("password, for this run only")
         });
-        // A typed path is read once it is complete: Enter, or leaving the
-        // field (reading it on every key would look for the clients each time).
-        let mut subscriptions: Vec<Subscription> = vec![cx.subscribe_in(
-            &file_field,
-            window,
-            |this, field, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                    let typed = field.read(cx).value().trim().to_string();
-                    let path = PathBuf::from(&typed);
-                    if !typed.is_empty() && this.file.as_ref() != Some(&path) {
-                        this.load_input(path, window, cx);
+        // A typed path is taken once typing pauses (reading it on every key
+        // would look for the clients each time), or at once on Enter or when
+        // the field loses the focus.
+        let mut subscriptions: Vec<Subscription> =
+            vec![
+                cx.subscribe(&file_field, |this, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        this.typing = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(TYPING_PAUSE).await;
+                            let _ = this.update(cx, |this, cx| this.take_typed(cx));
+                        }));
                     }
-                }
-            },
-        )];
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => this.take_typed(cx),
+                    _ => {}
+                }),
+            ];
         subscriptions.extend(
             [
                 &folder,
@@ -687,6 +694,7 @@ impl BackupDialog {
             on_tasks_changed: None,
             pending_schemas: Vec::new(),
             probing: None,
+            typing: None,
             running: None,
             ticking: None,
             tasks: Vec::new(),
@@ -985,7 +993,21 @@ impl BackupDialog {
         self.file.as_deref()
     }
 
+    /// Takes the path typed in the file field (`~/` is the home folder)
+    /// when it names another file than the one in use; the field is left as
+    /// typed. An emptied field forgets the file.
+    fn take_typed(&mut self, cx: &mut Context<Self>) {
+        self.typing = None;
+        let typed = self.file_field.read(cx).value().trim().to_string();
+        let path = (!typed.is_empty()).then(|| expand_home(&typed));
+        if self.file != path {
+            self.file = path;
+            self.probe(cx);
+        }
+    }
+
     pub fn load_input(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.typing = None;
         let shown = path.display().to_string();
         if self.file_field.read(cx).value() != shown {
             self.file_field
@@ -2803,6 +2825,17 @@ struct Examined {
 /// computer.
 fn examine(job: Job) -> Examined {
     let detected = tools::detect_clients(&ClientRoots::system(job.added));
+    // A path typed in the field may name nothing yet (K56).
+    if let Some(file) = job.file.as_ref().filter(|file| !file.exists()) {
+        return Examined {
+            tool: ToolState::Probing,
+            detected,
+            input: Some(Err(format!(
+                "No such file: {}. Check the path, or choose the file.",
+                file.display()
+            ))),
+        };
+    }
     let format = match &job.file {
         Some(file) if job.mode == Mode::Restore => match tools::guess_format(file, job.engine) {
             Ok(format) => Some(format),
