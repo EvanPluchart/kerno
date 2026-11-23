@@ -12,7 +12,7 @@ use super::tool_wizards::paints;
 use super::*;
 
 /// The fixture schema of the driver's tests, in a new file of `dir`.
-fn fixture_file(dir: &Path) -> PathBuf {
+pub(super) fn fixture_file(dir: &Path) -> PathBuf {
     let file = dir.join("shop.db");
     assert!(kerno_sqlite::new_database_file(&file).unwrap());
     let script = std::fs::read_to_string(testing::fixtures().join("sqlite/schema.sql")).unwrap();
@@ -44,7 +44,7 @@ fn fixture_file(dir: &Path) -> PathBuf {
     file
 }
 
-fn file_config(file: &Path) -> ConnectionConfig {
+pub(super) fn file_config(file: &Path) -> ConnectionConfig {
     ConnectionConfig {
         name: "Shop file".into(),
         file: Some(file.to_path_buf()),

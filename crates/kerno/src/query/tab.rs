@@ -75,7 +75,9 @@ use crate::actions::{
 };
 use crate::bridge;
 use crate::connections::manager::{Connections, ConnectionsEvent, Status};
-use crate::data::tab::{AutoRefresh, FILTER_MIN_WIDTH, auto_refresh_button, history_button};
+use crate::data::tab::{
+    AutoRefresh, FILTER_MIN_WIDTH, auto_refresh_button, history_button, related,
+};
 use crate::engine_logo::engine_logo;
 use crate::export_dialog::{self, ExportDialog, Source};
 use crate::multi_run::{ScriptRun, Stage};
@@ -657,6 +659,9 @@ pub enum QueryTabEvent {
     /// The tab's session moved to another database or schema (`USE`, `SET
     /// search_path`), and the tab's target with it: the tab is stored again.
     Moved,
+    /// Show the rows of a table that `filter` keeps, on this tab's
+    /// connection: the other end of a foreign key of a result (K49).
+    OpenData { table: TableRef, filter: Filter },
 }
 
 impl EventEmitter<QueryTabEvent> for QueryTab {}
@@ -3988,6 +3993,7 @@ impl QueryTab {
                         GridAction::Export => {
                             this.export_statement(sql.clone(), window, cx);
                         }
+                        GridAction::Follow(index, _) => this.follow(id, index, row, cx),
                         GridAction::Paste
                         | GridAction::EditCell
                         | GridAction::SetNull
@@ -4004,7 +4010,16 @@ impl QueryTab {
                     }
                 });
             }),
-            related: None,
+            // Where a row's foreign keys lead, once the result is known
+            // to be one table's rows (K49).
+            related: Some(Rc::new(|grid: &Grid, row| {
+                grid.structure().map_or_else(Vec::new, |structure| {
+                    related(structure, grid, row)
+                        .into_iter()
+                        .map(|related| related.label)
+                        .collect()
+                })
+            })),
             export: class.writes.then_some("the statement writes"),
             filtered: requery
                 .as_ref()
@@ -4107,6 +4122,22 @@ impl QueryTab {
             None => {}
         }
         id
+    }
+
+    /// Opens the other end of the `index`-th foreign key of a row of the
+    /// result in pane `id`, in a table's tab, as the menu of a table's cell
+    /// does (K49).
+    fn follow(&mut self, id: u64, index: usize, row: usize, cx: &mut Context<Self>) {
+        let found = self.pane_grid(id).and_then(|grid| {
+            let grid = grid.read(cx).delegate();
+            related(grid.structure()?, grid, row).into_iter().nth(index)
+        });
+        if let Some(related) = found {
+            cx.emit(QueryTabEvent::OpenData {
+                table: related.table,
+                filter: related.filter,
+            });
+        }
     }
 
     // Editing a result (RES-51) ---------------------------------------------

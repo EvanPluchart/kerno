@@ -672,6 +672,12 @@ impl DataTab {
         &self.target
     }
 
+    /// The filter the rows were read with; for tests.
+    #[cfg(test)]
+    pub fn applied_filter(&self) -> &Filter {
+        &self.applied
+    }
+
     pub fn snapshot(&self) -> TabSnapshot {
         TabSnapshot::Data {
             target: self.target.clone(),
@@ -3086,19 +3092,50 @@ pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Relat
 }
 
 /// The row a foreign key of a row points to, when none of its columns is
-/// NULL: the jump of the cell menu, and the value panel's preview (K18).
+/// NULL: the jump of the cell menu, of a cell's arrow (K49), and the value
+/// panel's preview (K18). Labelled as the arrow's tooltip says it: "Open
+/// shop.customers where id = 42".
 pub fn reference(key: &ForeignKeyInfo, grid: &Grid, row: usize) -> Option<Related> {
     let values = values_of(grid, row, &key.columns)?;
+    let filter = equal_to(&key.referenced_columns, values);
+    let conditions: Vec<String> = filter
+        .conditions
+        .iter()
+        .map(|condition| format!("{} = {}", condition.column, condition.value))
+        .collect();
     Some(Related {
         label: format!(
-            "Go to {} ({} = {})",
+            "Open {}.{} where {}",
+            key.referenced_table.schema,
             key.referenced_table.name,
-            key.columns.join(", "),
-            values.join(", ")
+            conditions.join(" and ")
         ),
         table: key.referenced_table.clone(),
-        filter: equal_to(&key.referenced_columns, values),
+        filter,
     })
+}
+
+/// The jump of the foreign key that holds the table column `name`, from
+/// `row` (K49): its number among the row's jumps ([`related`], as
+/// [`GridAction::Follow`] numbers them) and where it leads. None when the
+/// column is in no foreign key or a column of the key is NULL. A column in
+/// several keys follows the first, as the value panel's preview does.
+pub fn follow_at(
+    structure: &TableStructure,
+    grid: &Grid,
+    row: usize,
+    name: &str,
+) -> Option<(usize, Related)> {
+    let keys = &structure.foreign_keys;
+    let index = keys
+        .iter()
+        .position(|key| key.columns.iter().any(|column| column == name))?;
+    let related = reference(&keys[index], grid, row)?;
+    let before = keys[..index]
+        .iter()
+        .filter(|earlier| reference(earlier, grid, row).is_some())
+        .count();
+    Some((before, related))
 }
 
 /// The values of the table columns `columns` in a row, when none is NULL.

@@ -62,6 +62,7 @@ mod grid_v11;
 mod k40;
 mod k44;
 mod k45;
+mod k49;
 mod legacy;
 mod menus;
 mod multi_run;
@@ -4920,7 +4921,7 @@ fn foreign_keys_lead_to_the_referenced_row_and_back(cx: &mut TestAppContext) {
                 .iter()
                 .map(|related| related.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Go to authors (author_id = 1)"]
+            ["Open kerno_ui_fk.authors where id = 1"]
         );
         assert_eq!(related(&app, cx, 3), []);
         app.on_data(cx, |tab, _, cx| tab.follow(&to_author[0], cx));

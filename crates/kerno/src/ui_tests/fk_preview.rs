@@ -223,8 +223,13 @@ fn an_editable_result_previews_its_foreign_keys(cx: &mut TestAppContext) {
             field("email", &first_customer(Engine::Postgres, "email")),
         ]
     );
-    // No jump from a result: the cell menu has none either.
-    assert!(!app.has(cx, "fk-preview-open"));
+    // A result of one table jumps as a table's data does (K49).
+    assert!(app.has(cx, "fk-preview-open"));
+    app.click(cx, "fk-preview-open");
+    app.wait_until(cx, "the customer", |app, cx| {
+        cx.update(|cx| app.workspace.read(cx).active_data_tab().is_some())
+            && app.data_state(cx).starts_with("Rows 1–1 ")
+    });
 
     app.run_in_new_tab(cx, "select 1 as customer_id", "secondary-enter");
     app.wait_until(cx, "the row", |app, cx| app.outcomes(cx) == ["1 rows"]);

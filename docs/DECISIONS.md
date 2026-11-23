@@ -3583,3 +3583,45 @@ to be done in autonomy for the next release.
 - **Not verified.** A hot standby that pg_dump cannot dump in parallel, a server with too few free connections:
   pg_dump's own message is in the output and the run ends as any failed backup (the failure path is tested
   with a stand-in pg_dump). No pass in the real app; captures were rendered offscreen (not committed).
+
+## D-118 — A foreign key seen in the grid, followed in one gesture (K49; 2026-11-23)
+
+The owner's request: a foreign key's column does not say it leads elsewhere, and the way there was the cell's
+menu only. DBeaver's grid (`SpreadsheetPresentation.navigateLink`, `GridCellRenderer`'s link image) was read for
+the behaviour; Kerno's code is its own, the jump itself is E3's, unchanged.
+
+- **The mark is the header's.** A column of a foreign key carries the schema tree's foreign-key glyph (Link2) in
+  the link colour after its name, its tooltip "→ shop.customers (id)"; a key of several columns marks each and
+  names them, "(pa, pb) → s.pairs (a, b)"; a column in two keys has two lines. Worked out once each time the
+  grid learns its table (`with_owner`, `set_edit_target`), never per frame. A key referenced by other tables
+  gets no mark and no tooltip: the task allowed one, a second sign in every primary key's header was not
+  calm, and the cell menu's "Rows of … referencing this one" stays.
+- **The arrow is per cell, and only one or two at a time.** On the cell under the pointer and on the selected
+  cell (never a selected row or column, which would put one on every row), when the key's values are all
+  there. The cell is laid out as before without it; with it, the text is cut with an ellipsis before it and a
+  number stands just left of it. Only a foreign key's cells follow the pointer (`on_hover`); the others pay
+  nothing. NULL, a binary key (as the menu), a pending default or expression show none.
+- **One way there.** The arrow, ⌘-click (Ctrl-click elsewhere) on the value, the key and the record view's
+  arrow all run the cell menu's `GridAction::Follow` with the same number and label (`data::tab::follow_at`,
+  also the value panel's): the same tab, filter and environment rules. The menu's entry now reads as the
+  tooltip, "Open shop.customers where id = 42"; the tooltip adds "· ⌘-click or ⌘↓".
+- **A pending value is followed**, as the menu already did: the cell shows it, the jump goes to it. Applying
+  first is not asked; the referenced row may not exist yet, which the opened tab shows.
+- **The arrow is its own target.** It stops the mouse down, so neither the cell nor the table starts a click:
+  no selection, no row escalation, no edit; a double click opens one tab. A double click on the value still
+  edits; shift and click still stretches a range; ⌘-click on a cell without a key does what it did.
+- **The key: ⌘↓ (Ctrl+Down elsewhere) only.** The task proposed F4 "as DBeaver's"; DBeaver's own key for
+  `core.resultset.navigateLink` is Alt+Space (`ui.editors.data` plugin.xml). Not taken: bound in the grid, it
+  would also fire while a cell is being edited, where ⌥Space types a character on a Mac (and GNOME keeps
+  Alt+Space for its window menu); a user can add it in the keymap file. ⌘↓ opens the selection in the Finder;
+  in a cell being edited the input keeps it (a Mac) or the cell editor stops the command (Ctrl+Down on Linux).
+  F4 is the editor's "Open Rows of the Table at the Cursor" in a query tab, which the conflict rule counts as
+  overlapping a grid.
+- **Query results**: marks and arrows where Kerno already knows the rows are one table's (the edit check of
+  RES-51: PostgreSQL by the result's table OIDs, MySQL and MariaDB by the names the server sends), and the jump
+  opens a table's tab (`QueryTabEvent::OpenData`); the value panel's "Open the row" works there too, which
+  D-091's last sentence ruled out. A result that is not one table's (a join, a view, a key
+  missing), and every result on a read-only connection (the check stops there), stays as before; SQLite
+  results name no table and stay as before too. A SQLite table's data has both.
+- WCAG: the link colour reaches 3:1 on every surface the marks are drawn on, the lowest 3.87:1 (light, an
+  edited cell of a hovered row); `theme::tests::foreign_key_marks_meet_wcag`.

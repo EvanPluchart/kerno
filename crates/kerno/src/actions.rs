@@ -435,6 +435,8 @@ gpui_kit::actions!(
         NextRow,
         /// Selects the last row fetched.
         LastRow,
+        /// Opens the rows the foreign key of the selected cell points to.
+        FollowForeignKey,
         /// Asks for a row number and selects that row.
         GoToRow,
         /// Lists the columns of the grid to select one.
@@ -1379,6 +1381,18 @@ pub const COMMANDS: &[Command] = &[
         ["ctrl-alt-shift-right"],
         ["navigate", "bottom"],
         LastRow,
+        "DataTable"
+    ),
+    // What a foreign key's arrow and ⌘-click do (K49, D-118): ⌘↓ (Ctrl+Down
+    // elsewhere) opens what is selected, as in the Finder. Not DBeaver's
+    // Alt+Space: ⌥Space types a character in a cell being edited.
+    command!(
+        "follow_foreign_key",
+        "Open the Rows a Foreign Key Points To",
+        "Data",
+        ["secondary-down"],
+        ["navigate link", "reference", "jump", "foreign key", "go to"],
+        FollowForeignKey,
         "DataTable"
     ),
     command!(

@@ -11,25 +11,27 @@ use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableSelection, TableState};
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
-    SharedString, Stateful, Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity,
-    Window, div, font, px,
+    App, AppContext as _, ClipboardItem, Context, DismissEvent, Div, ElementId, Entity,
+    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window, div, font, px,
 };
 use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
 use kerno_core::format::{CellStyle, display};
 use kerno_core::pending::Pending;
-use kerno_core::schema::{ColumnGeneration, ColumnInfo, TableRef, TableStructure};
+use kerno_core::schema::{ColumnGeneration, ColumnInfo, ForeignKeyInfo, TableRef, TableStructure};
 use kerno_core::sort::sorted_rows;
 use kerno_core::sql::{CellValue, RowChange, RowSql, edit_statements, rows_sql};
 use kerno_core::{Dialect, ResultStore, RowBatch, RowDemand, Session, TypeKind};
@@ -968,6 +970,14 @@ pub struct Grid {
     layout_version: u64,
     /// The value panel following this grid, while one does (K17).
     pub(super) value_panel: Option<WeakEntity<super::value_panel::ValuePanel>>,
+    /// Per column of the result, where the foreign keys holding the table
+    /// column it shows lead ("→ shop.customers (id)"), worked out once per
+    /// structure (K49): the mark of its header, and the columns whose cells
+    /// can show an arrow.
+    links: Vec<Option<SharedString>>,
+    /// The cell of a foreign-key column under the pointer (display row,
+    /// column of the grid): its arrow shows.
+    hovered: Option<(usize, usize)>,
 }
 
 impl Grid {
@@ -1011,12 +1021,15 @@ impl Grid {
             generation: 0,
             widths: HashMap::new(),
             value_panel: None,
+            links: Vec::new(),
+            hovered: None,
         }
     }
 
     /// Lets the grid's owner run the entries of its menus that are its own.
     pub fn with_owner(mut self, owner: Owner) -> Self {
         self.owner = Some(owner);
+        self.find_links();
         self
     }
 
@@ -1094,6 +1107,8 @@ impl Grid {
             generation: 0,
             widths: HashMap::new(),
             value_panel: None,
+            links: Vec::new(),
+            hovered: None,
             store,
         }
     }
@@ -1123,7 +1138,74 @@ impl Grid {
                 self.edits = None;
             }
         }
+        self.find_links();
         self.generation += 1;
+    }
+
+    /// Works out [`Self::links`] from the table the rows are from: once
+    /// per structure, never per frame (K49).
+    fn find_links(&mut self) {
+        self.links = (0..self.store.columns().len())
+            .map(|source| {
+                let structure = self.structure()?;
+                let name = self.table_column_name(source)?;
+                let lines: Vec<String> = structure
+                    .foreign_keys
+                    .iter()
+                    .filter(|key| key.columns.iter().any(|column| column == name))
+                    .map(link_text)
+                    .collect();
+                (!lines.is_empty()).then(|| SharedString::from(lines.join("\n")))
+            })
+            .collect();
+    }
+
+    /// Where the foreign keys holding the column of the result `source`
+    /// lead: the tooltip of its header's mark; `None` for a column in none.
+    pub fn link(&self, source: usize) -> Option<&SharedString> {
+        self.links.get(source)?.as_ref()
+    }
+
+    /// The jump of a foreign-key cell (K49): its number among the row's
+    /// jumps and where it leads, when the owner follows keys, the column of
+    /// the result `source` is in one and none of the key's values is NULL.
+    /// A pending value is followed, as the cell menu does.
+    pub fn jump(&self, row: usize, source: usize) -> Option<(usize, crate::data::tab::Related)> {
+        self.link(source)?;
+        if !self.follows() {
+            return None;
+        }
+        let name = self.table_column_name(source)?;
+        crate::data::tab::follow_at(self.structure()?, self, row, name)
+    }
+
+    /// Opens the rows the foreign key of a cell points to, as its menu's
+    /// "Open … where …" does: the arrow, ⌘-click and the key (K49). Whether
+    /// the cell had one to follow.
+    pub fn follow(
+        table: &Entity<TableState<Self>>,
+        row: usize,
+        column: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let jump = {
+            let grid = table.read(cx).delegate();
+            grid.source_column(column)
+                .and_then(|source| grid.jump(row, source))
+        };
+        let Some((index, related)) = jump else {
+            return false;
+        };
+        let pick = Self::pick(table, Some(row), column, cx);
+        pick(GridAction::Follow(index, related.label), window, cx);
+        true
+    }
+
+    /// Whether the arrow of a cell shows: it is under the pointer or it is
+    /// the selected cell, never a whole row or column (K49).
+    fn shows_arrow(&self, row: usize, column: usize) -> bool {
+        self.hovered == Some((row, column)) || self.anchor == TableSelection::Cell(row, column)
     }
 
     /// The rows as rows of the table they are written to: the result's
@@ -2649,6 +2731,56 @@ impl Grid {
     }
 }
 
+/// The arrow of a foreign key's cell, in the grid and in the record view
+/// (K49): a click opens the rows the key points to; `label` says where. Its
+/// own target: the cell under it neither selects nor edits.
+pub(super) fn arrow_element(
+    table: &Entity<TableState<Grid>>,
+    id: impl Into<ElementId>,
+    row: usize,
+    column: usize,
+    label: &str,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let theme = cx.theme();
+    let key = follow_key(cx);
+    let tip = SharedString::from(arrow_tip(
+        label,
+        cx.platform_info().is_mac(),
+        key.as_deref(),
+    ));
+    let size = text_size(cx);
+    let table = table.clone();
+    div()
+        .id(id)
+        .test_support()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(size + px(6.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(|arrow| arrow.bg(theme.secondary_hover))
+        .aria_description(tip.clone())
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        // Stopped here, the cell's own press and the table's click (a
+        // selection, a row, an edit on a double click) never start.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |event, window, cx| {
+            // The second click of a double click lands here too: one tab.
+            if event.click_count() <= 1 {
+                Grid::follow(&table, row, column, window, cx);
+            }
+        })
+        .child(
+            Icon::new(IconName::ArrowUpRight)
+                .size(size)
+                .text_color(theme.link),
+        )
+        .into_any_element()
+}
+
 /// What a cell being edited draws, in the grid and in the record view: the
 /// text input, right-aligned for numbers, or the list of the column's
 /// values open under the value (`shown`).
@@ -2691,6 +2823,8 @@ pub(super) fn editor_element(
             // Tab while typing stays in the cell: it does not switch to the
             // record view.
             .on_action(|_: &crate::actions::ToggleRecordView, _, cx| cx.stop_propagation())
+            // Nor does Ctrl+Down (Linux) leave it for another table (K49).
+            .on_action(|_: &crate::actions::FollowForeignKey, _, cx| cx.stop_propagation())
             // \u{2318}E while typing switches the cell between a value and
             // an expression; it explains no statement here.
             .on_action(move |_: &crate::actions::ExplainStatement, _, cx| {
@@ -2770,7 +2904,13 @@ impl Grid {
         let header = measure(&described.name, &theme.font_family, size)
             + measure(&described.type_name, &theme.font_family, size * 0.85)
             + px(8.)
-            + px(16.);
+            + px(16.)
+            // A foreign key's mark and its gap (K49).
+            + if self.link(source).is_some() {
+                size + px(8.)
+            } else {
+                px(0.)
+            };
         // ponytail: the cells of the first rows only, and the longest by
         // characters (the font is monospaced); a longer value further down
         // stays cut. Sample the rows on screen if that matters.
@@ -2820,6 +2960,50 @@ impl Grid {
             })
             .collect()
     }
+}
+
+/// Where a foreign key leads, as its columns' header mark says (K49): "→
+/// shop.customers (id)"; a key of several columns names its own columns
+/// first, "(a, b) → shop.pairs (x, y)".
+pub fn link_text(key: &ForeignKeyInfo) -> String {
+    let to = format!(
+        "→ {}.{} ({})",
+        key.referenced_table.schema,
+        key.referenced_table.name,
+        key.referenced_columns.join(", ")
+    );
+    match key.columns.as_slice() {
+        [_] => to,
+        columns => format!("({}) {to}", columns.join(", ")),
+    }
+}
+
+/// The tooltip of a cell's arrow (K49): where it goes, then the other ways
+/// there, the click and `key` (the shortcut as the kit writes it, when the
+/// command has one).
+pub fn arrow_tip(label: &str, mac: bool, key: Option<&str>) -> String {
+    let click = if mac { "⌘-click" } else { "Ctrl-click" };
+    match key {
+        Some(key) => format!("{label} · {click} or {key}"),
+        None => format!("{label} · {click}"),
+    }
+}
+
+/// The first key of "Open the Rows a Foreign Key Points To" in the keymap
+/// (the user's file applied), as the kit's tooltips write it.
+pub fn follow_key(cx: &App) -> Option<String> {
+    use gpui_kit::AsKeystroke as _;
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap
+        .bindings_for_action(&crate::actions::FollowForeignKey)
+        .next()?;
+    let strokes: Vec<String> = binding
+        .keystrokes()
+        .iter()
+        .map(|stroke| gpui_kit::component::kbd::Kbd::format(stroke.as_keystroke()))
+        .collect();
+    (!strokes.is_empty()).then(|| strokes.join(" "))
 }
 
 /// Width of the row-number column for a result of `rows` rows.
@@ -3026,6 +3210,19 @@ impl TableDelegate for Grid {
                     .truncate()
                     .child(SharedString::from(described.name.clone())),
             )
+            // A foreign key's column: the link mark of the schema tree's
+            // foreign keys, where it leads in its tooltip (K49).
+            .when_some(self.link(source).cloned(), |header, link| {
+                header.child(
+                    div()
+                        .id(("column-link", column))
+                        .test_support()
+                        .flex_none()
+                        .aria_description(link.clone())
+                        .tooltip(move |window, cx| Tooltip::new(link.clone()).build(window, cx))
+                        .child(Icon::new(IconName::Link2).size(size).text_color(theme.link)),
+                )
+            })
             .child(
                 div()
                     .id(("column-type", column))
@@ -3222,11 +3419,44 @@ impl TableDelegate for Grid {
                     (row, column),
                 )
             });
+        // A foreign key's cell under the pointer or selected, holding a
+        // value: an arrow at its right edge opens the rows it points to
+        // (K49). Its text is cut before it; without it the cell is as it
+        // was, a number aligned to the right edge.
+        let link = self.link(source).is_some();
+        let arrow = (link && self.shows_arrow(row, column))
+            .then(|| self.jump(row, source))
+            .flatten()
+            .map(|(_, related)| {
+                let id = ("fk-arrow", (row << 12) | column);
+                arrow_element(&table, id, row, column, &related.label, cx)
+            });
+        let text = match arrow {
+            Some(_) => text.flex_1().min_w_0(),
+            None => text,
+        };
         // The text's style stays on the text: the menu, drawn inside the
         // element that opens it, would inherit it.
         div()
             .id(("cell", (row << 12) | column))
             .w_full()
+            .when(arrow.is_some(), |cell| cell.flex().items_center().gap_1())
+            // Only a foreign key's cells follow the pointer: the others pay
+            // nothing for the arrows.
+            .when(link, |cell| {
+                cell.on_hover(cx.listener(move |table, hovered: &bool, _, cx| {
+                    let grid = table.delegate_mut();
+                    let was = grid.hovered;
+                    if *hovered {
+                        grid.hovered = Some((row, column));
+                    } else if grid.hovered == Some((row, column)) {
+                        grid.hovered = None;
+                    }
+                    if grid.hovered != was {
+                        cx.notify();
+                    }
+                }))
+            })
             // What is not on the server yet shows (a new or deleted row is
             // tinted as a whole, by `render_tr`).
             .when(mark == Mark::Edited, |cell| {
@@ -3267,9 +3497,20 @@ impl TableDelegate for Grid {
             // click is the table's.
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |table, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |table, event: &MouseDownEvent, window, cx| {
                     if event.modifiers.shift {
                         table.delegate_mut().extend_to(row, column);
+                        cx.stop_propagation();
+                    } else if event.modifiers.secondary(cx)
+                        && table.delegate().jump(row, source).is_some()
+                    {
+                        // ⌘-click (Ctrl-click elsewhere) on a foreign key's
+                        // value follows it, as its arrow does (K49), once
+                        // the table is free.
+                        let table = cx.entity();
+                        window.defer(cx, move |window, cx| {
+                            Grid::follow(&table, row, column, window, cx);
+                        });
                         cx.stop_propagation();
                     } else {
                         let grid = table.delegate_mut();
@@ -3291,6 +3532,7 @@ impl TableDelegate for Grid {
                 }),
             )
             .child(text)
+            .children(arrow)
             // The table keeps a right click on a cell to itself: each cell
             // opens its own menu, built when it opens.
             .context_menu(move |menu, window, cx| {

@@ -27,8 +27,8 @@ use kerno_core::schema::{TableRef, TableStructure};
 use kerno_core::{Column, ResultStore};
 
 use super::grid::{
-    Grid, GridAction, Mark, Panel, RowMove, Selected, current, editor_element, table_size,
-    text_size,
+    Grid, GridAction, Mark, Panel, RowMove, Selected, arrow_element, current, editor_element,
+    table_size, text_size,
 };
 use super::viewer::give_back;
 
@@ -177,11 +177,26 @@ fn record_view(table: &Entity<TableState<Grid>>, cx: &App) -> AnyElement {
                         .child(SharedString::from(described.type_name.clone())),
                 )
                 .child(
-                    div()
+                    h_flex()
                         .flex_1()
                         .min_w_0()
+                        .gap_1()
                         .font_family(theme.mono_font_family.clone())
-                        .child(value),
+                        // The editor takes the whole field; a value its width.
+                        .child(
+                            div()
+                                .min_w_0()
+                                .when(grid.editor_at(row, source).is_some(), |held| held.flex_1())
+                                .child(value),
+                        )
+                        // A foreign key's field has its arrow just after the
+                        // value, as its cell (K49): one row shows, so always.
+                        .when(grid.editor_at(row, source).is_none(), |field| {
+                            field.children(grid.jump(row, source).map(|(_, related)| {
+                                let id = ("record-fk-arrow", index);
+                                arrow_element(table, id, row, column, &related.label, cx)
+                            }))
+                        }),
                 )
         })
     });

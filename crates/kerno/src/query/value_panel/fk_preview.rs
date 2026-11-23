@@ -30,7 +30,7 @@ use kerno_core::{Session, TxState, describe};
 use super::*;
 use crate::bridge;
 use crate::connections::manager::Connections;
-use crate::data::tab::{Related, reference, table_key};
+use crate::data::tab::{Related, follow_at, table_key};
 use crate::query::grid::{GridAction, Mark};
 use crate::tabs::Target;
 
@@ -219,11 +219,10 @@ pub(super) enum Wanted {
 pub(super) fn wanted_at(grid: &Grid, row: usize, source: usize) -> Option<Wanted> {
     let structure = grid.structure()?;
     let name = grid.table_column_name(source)?;
-    let (index, key) = structure
+    let key = structure
         .foreign_keys
         .iter()
-        .enumerate()
-        .find(|(_, key)| key.columns.iter().any(|column| column == name))?;
+        .find(|key| key.columns.iter().any(|column| column == name))?;
     let sources: Vec<usize> = key
         .columns
         .iter()
@@ -243,13 +242,8 @@ pub(super) fn wanted_at(grid: &Grid, row: usize, source: usize) -> Option<Wanted
             key.columns.join(", ")
         )));
     }
-    let related = reference(key, grid, row)?;
-    let follow = grid.follows().then(|| {
-        structure.foreign_keys[..index]
-            .iter()
-            .filter(|earlier| reference(earlier, grid, row).is_some())
-            .count()
-    });
+    let (index, related) = follow_at(structure, grid, row, name)?;
+    let follow = grid.follows().then_some(index);
     let key_columns = key
         .columns
         .iter()

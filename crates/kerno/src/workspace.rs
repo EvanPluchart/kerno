@@ -1905,6 +1905,13 @@ impl Workspace {
                         let target = tab.read(cx).target().cloned();
                         this.open_query(title.clone(), sql, target, window, cx);
                     }
+                    // K49: the other end of a foreign key of a result.
+                    QueryTabEvent::OpenData { table, filter } => {
+                        if let Some(target) = tab.read(cx).target().cloned() {
+                            let (table, filter) = (table.clone(), filter.clone());
+                            this.open_data(target, table, RelationKind::Table, filter, window, cx);
+                        }
+                    }
                     QueryTabEvent::SourceApplied => {
                         let tab = tab.read(cx);
                         if let (Some(target), Some(schema)) = (tab.target().cloned(), tab.source())
@@ -6565,6 +6572,21 @@ impl Workspace {
         )
         .on_action(
             cx.listener(|this, _: &actions::LastRow, _, cx| this.move_row(RowMove::Last, cx)),
+        )
+        // K49: the selected cell's foreign key, as its arrow.
+        .on_action(
+            cx.listener(|this, _: &actions::FollowForeignKey, window, cx| {
+                let Some(grid) = this.active_grid(cx) else {
+                    return;
+                };
+                let (row, column) = crate::query::grid::current(grid.read(cx).selection());
+                if !Grid::follow(&grid, row, column, window, cx) {
+                    window.push_notification(
+                        Notification::info("The selected cell holds no foreign key value."),
+                        cx,
+                    );
+                }
+            }),
         )
         .on_action(cx.listener(|this, _: &actions::GoToRow, window, cx| {
             if let Some(grid) = this.active_grid(cx) {

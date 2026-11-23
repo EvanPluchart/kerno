@@ -810,6 +810,54 @@ mod tests {
         assert!(failures.is_empty(), "below 3:1:\n{}", failures.join("\n"));
     }
 
+    /// K49: a foreign key's marks, drawn in the link colour (the mark of its
+    /// header, the arrow of its cell), stand 3:1 (WCAG's floor for what is
+    /// not text) from everything they are drawn on: the header, a plain, a
+    /// striped and a hovered row, each selected (the kit's tint over the
+    /// arrow), edited, new or deleted (the grid's tints), and the arrow's own
+    /// hover.
+    #[test]
+    fn foreign_key_marks_meet_wcag() {
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let link = hex(&theme.colors["link"]);
+            let mut surfaces: Vec<(String, u32)> = [
+                "table.head.background",
+                "table.background",
+                "table.even.background",
+                "table.hover.background",
+                "secondary.hover.background",
+            ]
+            .iter()
+            .map(|key| (key.to_string(), hex(&theme.colors[*key])))
+            .collect();
+            for row in [
+                "table.background",
+                "table.even.background",
+                "table.hover.background",
+            ] {
+                surfaces.push((format!("selected on {row}"), selected_on(&theme, row)));
+                // `render_tr` and `render_td`'s tints.
+                for (tint, amount, what) in [
+                    ("warning.background", 0.22, "edited"),
+                    ("success.background", 0.22, "new"),
+                    ("danger.background", 0.18, "deleted"),
+                ] {
+                    let painted =
+                        super::mix(hex(&theme.colors[row]), hex(&theme.colors[tint]), amount);
+                    surfaces.push((format!("{what} on {row}"), painted));
+                }
+            }
+            for (surface, painted) in surfaces {
+                let ratio = super::contrast(link, painted);
+                if ratio < 3.0 {
+                    failures.push(format!("{}: link on {surface} is {ratio:.2}:1", theme.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "below 3:1:\n{}", failures.join("\n"));
+    }
+
     /// How far a selection, as painted, stands from the surface under it, at
     /// least (K34, D-107): above every step of the theme meant to stay
     /// quiet (a stripe 1.08:1, the grid's header 1.14, a hovered row 1.16),

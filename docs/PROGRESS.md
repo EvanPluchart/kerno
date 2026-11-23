@@ -1373,3 +1373,14 @@ Still open (for the owner):
 - Tests: `tools::tests::parallel_jobs_go_with_the_directory_format_only`; `ui_tests::backup_simple::`
   `faster_backs_up_into_a_folder_and_the_wizard_shows_it`, `the_simple_restores_faster_is_not_a_hidden_change`,
   `a_faster_backup_removes_only_the_folder_it_made`, `a_faster_backup_is_a_folder_the_simple_restore_reads_back`.
+
+## 2026-11-23 — K49: a foreign key seen in the grid, followed in one gesture
+
+- A foreign key's column has a link mark in its header, its tooltip where it leads; the hovered or selected cell
+  of a key that holds a value shows an arrow; the arrow, ⌘-click on the value and ⌘↓ open the
+  referenced table filtered on the value, as the cell menu's entry, now worded "Open shop.customers where id =
+  42". Table data on the four engines, the record view, and one-table query results (PostgreSQL, MySQL,
+  MariaDB) (D-118).
+- Tests: `ui_tests::k49` (three, PostgreSQL, MySQL, MariaDB, SQLite), `theme::tests::foreign_key_marks_meet_wcag`;
+  each seen failing under a mutation (`docs/plans/M12.md`, K49). Frame times with and without keys alike
+  (`docs/BENCH.md`, offscreen).

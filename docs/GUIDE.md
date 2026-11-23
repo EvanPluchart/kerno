@@ -19,6 +19,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Settings, environments and what wins](#settings-environments-and-what-wins)
 - [Where a running script stands](#where-a-running-script-stands)
 - [Rows as you scroll](#rows-as-you-scroll)
+- [Foreign keys in the grids](#foreign-keys-in-the-grids)
 - [The value panel](#the-value-panel)
 - [Split views](#split-views)
 - [A connection's SQL scripts](#a-connections-sql-scripts)
@@ -394,6 +395,21 @@ were. The WHERE field proposes the table's columns as you type, with their type,
 of (AND, OR, IN, IS NULL, LIKE, ILIKE on PostgreSQL, BETWEEN…): Tab or Enter takes one, quoted when the name
 needs it, Escape closes the list; with the list closed, Enter applies the filter. The order, widths, hidden and
 pinned columns and the sort of a table are kept for the next time it is opened, after a restart too.
+
+## Foreign keys in the grids
+
+A column that belongs to a foreign key has a small link mark after its name in the header; its tooltip says
+where it leads ("→ shop.customers (id)"; for a key of several columns, "(a, b) → shop.pairs (x, y)"). The cell
+under the pointer, and the selected cell, show an arrow at their right edge when they hold a value: a click on it
+opens the referenced table in a tab of its own, filtered on that value, exactly as the cell's menu entry "Open
+shop.customers where id = 42" does. ⌘-click on the value (Ctrl-click on Linux) and ⌘↓ (Ctrl+Down on Linux) on
+the selected cell do the same. NULL has no arrow. A value you changed and have not
+applied is the one followed. A double click on the value still edits it. The record view (Tab) has the same
+arrow beside the field of a foreign key.
+
+A query's result has the marks and the arrows when its rows are one table's and can be edited (PostgreSQL,
+MySQL, MariaDB): a join, a view, or a result on a read-only connection has none. SQLite results never name
+their table and have none; a SQLite table opened from the tree has them.
 
 ## The value panel
 
@@ -776,6 +792,7 @@ reachable from the command palette.
 | Tab | Toggle record view (grids) |
 | Ctrl+Alt+Left / Right | Previous / next row (Add Shift for the first / last row) |
 | Ctrl+G / Ctrl+Shift+G | Go to row / go to column |
+| Cmd+Down | Open the rows the selected cell's foreign key points to (grid) |
 | Ctrl+F11 | Filter by distinct values of the column |
 | Cmd+= / Cmd+- / Cmd+0 (or Alt+0 / Alt+9) | Grid text larger / smaller / usual |
 | Cmd+Shift+D | Switch between the light and the dark theme (the theme shown; Settings ▸ Appearance ▸ Follow system goes back to the system's) |

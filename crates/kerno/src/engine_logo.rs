@@ -24,10 +24,12 @@ const MARIADB: &str = "engines/mariadb.svg";
 const SQLITE: &str = "engines/sqlite.svg";
 
 // The glyphs of the schema tree, the query toolbar, the main toolbar and the
-// side list of Settings, from the same Lucide set as the UI kit's.
+// side list of Settings, from the same Lucide set as the UI kit's; and the
+// arrow of a foreign key's cell in the grids (K49).
 gpui_kit::assets::icon_assets!(
     TreeGlyphs,
     [
+        ArrowUpRight,
         Bookmark,
         Boxes,
         Briefcase,

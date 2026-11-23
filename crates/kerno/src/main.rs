@@ -636,6 +636,7 @@ fn menus() -> Vec<Menu> {
                 command("last_row"),
                 command("go_to_row"),
                 command("go_to_column"),
+                command("follow_foreign_key"),
                 separator(),
                 command("find_in_results"),
                 command("find_next_in_results"),

@@ -193,6 +193,19 @@ Compression (one run each, pg_dump by hand on `kerno`, custom format): pg_dump 1
 92.9 MB, `--compress=zstd` 2.9 s and 90.1 MB. libpq 19.0's pg_dump, the one Kerno picks here, refuses `zstd` and
 `lz4` ("this build does not support compression with ZSTD"): Kerno does not use them (D-117).
 
+## Foreign keys in the grid (K49, offscreen)
+
+The header marks of foreign keys and the arrow of a hovered or selected cell (D-118), measured on 2026-11-23 the
+same way as K36 (release, `HeadlessAppContext`, 1200 × 800, a temporary test not committed) on scratch PostgreSQL
+tables: each table with foreign keys against the same table without them, one cell selected and one under the
+pointer in a key column, two runs (the machine busy, 1-minute load 6 to 15). Average frame, then 99th percentile.
+
+| Measure | With foreign keys | Without |
+|---|---|---|
+| 100,000 rows of 20 columns (5 keys), down and up, 150 rows a frame, 1,332 frames | 7.47 / 8.82 ms; 10.34 / 19.19 | 9.01 / 8.41 ms; 20.67 / 17.47 |
+| 300 columns (30 keys), 1,000 rows, across and back, one column a frame, 600 frames | 8.02 / 7.01 ms; 11.08 / 11.12 | 8.27 / 7.43 ms; 19.56 / 10.47 |
+| The same, down and up, 17 rows a frame, 116 frames | 8.47 / 8.02 ms; 9.35 / 15.99 | 8.28 / 7.90 ms; 9.47 / 12.45 |
+
 ## Reproducing
 
 ```sh
