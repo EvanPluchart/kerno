@@ -2776,9 +2776,12 @@ impl Workspace {
                     let query = palette.read(cx).query(cx);
                     let recent = AppState::get(cx).settings.recent_commands.clone();
                     let confirmed = palette.clone();
+                    // Filtered here (`palette_groups`), not again by the kit,
+                    // whose filter wants the words typed in a row (K55).
                     let mut command = Command::new(&palette)
                         .bordered(false)
                         .rounded(cx.theme().radius_lg)
+                        .filterable(false)
                         .placeholder("Type a command")
                         .max_h(px(420.))
                         .on_confirm(move |index, window, cx| {
@@ -2808,7 +2811,16 @@ impl Workspace {
                             }),
                         ));
                     }
-                    content.child(command)
+                    // Escape closes the palette at once, with text typed or
+                    // not; the kit's would clear the text first (K55).
+                    content.child(
+                        v_flex()
+                            .capture_action(|_: &gpui_kit::base::actions::Cancel, window, cx| {
+                                cx.stop_propagation();
+                                window.close_dialog(cx);
+                            })
+                            .child(command),
+                    )
                 })
         });
     }
@@ -7083,10 +7095,72 @@ fn connection_target(id: &str) -> Target {
     }
 }
 
+/// `text` as the palette compares it: lower case, accents aside, words
+/// separated by one space.
+fn palette_folded(text: &str) -> String {
+    // ponytail: the accented Latin letters only; another script is kept as
+    // typed, and a decomposed accent (a letter then U+0301) is not folded.
+    let mut folded = String::with_capacity(text.len());
+    for c in text.to_lowercase().chars() {
+        let plain = match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' => "a",
+            'æ' => "ae",
+            'ç' => "c",
+            'è' | 'é' | 'ê' | 'ë' | 'ē' => "e",
+            'ì' | 'í' | 'î' | 'ï' => "i",
+            'ñ' => "n",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => "o",
+            'œ' => "oe",
+            'ß' => "ss",
+            'ù' | 'ú' | 'û' | 'ü' => "u",
+            'ý' | 'ÿ' => "y",
+            _ => {
+                folded.push(c);
+                continue;
+            }
+        };
+        folded.push_str(plain);
+    }
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How well `command` matches the words typed (`query`, folded), the
+/// lowest best: its title itself, a title that starts with what is typed,
+/// the words in the order typed in its title (or what is typed in a
+/// keyword), then every word somewhere in its title, section or keywords
+/// (K55); among those last, more words in the title, then a shorter title.
+fn palette_rank(command: &actions::Command, query: &str) -> Option<(u8, usize, usize)> {
+    let title = palette_folded(command.label.trim_end_matches('…'));
+    let keywords: Vec<String> = command.keywords.iter().map(|k| palette_folded(k)).collect();
+    if title == query {
+        return Some((0, 0, 0));
+    }
+    if title.starts_with(query) {
+        return Some((1, 0, 0));
+    }
+    let words: Vec<&str> = query.split(' ').collect();
+    let mut rest = title.as_str();
+    let in_order = words.iter().all(|word| match rest.find(word) {
+        Some(at) => {
+            rest = &rest[at + word.len()..];
+            true
+        }
+        None => false,
+    });
+    if in_order || keywords.iter().any(|keyword| keyword.contains(query)) {
+        return Some((2, 0, 0));
+    }
+    let group = palette_folded(command.group);
+    let found = |word: &&str| {
+        title.contains(word) || group.contains(word) || keywords.iter().any(|k| k.contains(word))
+    };
+    let missing = words.iter().filter(|word| !title.contains(**word)).count();
+    words.iter().all(found).then_some((3, missing, title.len()))
+}
+
 /// The commands shown in the palette for `query`: grouped, in display
-/// order, when nothing is typed; otherwise one list of the matches, the
-/// title itself first, then titles that start with it, then the others
-/// (other words of a title, keywords) in display order.
+/// order, when nothing is typed; otherwise one list of the matches, best
+/// first (`palette_rank`), in display order within a rank.
 pub(crate) fn palette_groups(
     query: &str,
     recent: &[String],
@@ -7099,6 +7173,7 @@ pub(crate) fn palette_groups(
         .iter()
         .filter_map(|id| actions::COMMANDS.iter().find(|command| command.id == id))
         .collect();
+    let query = palette_folded(query);
     if query.is_empty() && !recent.is_empty() {
         groups.push(("Recently used", recent));
     }
@@ -7108,30 +7183,13 @@ pub(crate) fn palette_groups(
             None => groups.push((command.group, vec![command])),
         }
     }
-    // As the kit filters: case aside, the query as typed.
-    let query = query.to_lowercase();
     if query.is_empty() {
         return groups;
     }
-    let rank = |command: &actions::Command| {
-        let title = command.label.to_lowercase();
-        let title = title.trim_end_matches('…');
-        if title == query {
-            Some(0)
-        } else if title.starts_with(&query) {
-            Some(1)
-        } else if title.contains(&query)
-            || (command.keywords.iter()).any(|word| word.to_lowercase().contains(&query))
-        {
-            Some(2)
-        } else {
-            None
-        }
-    };
-    let mut ranked: Vec<(u8, &'static actions::Command)> = groups
+    let mut ranked: Vec<((u8, usize, usize), &'static actions::Command)> = groups
         .into_iter()
         .flat_map(|(_, commands)| commands)
-        .filter_map(|command| Some((rank(command)?, command)))
+        .filter_map(|command| Some((palette_rank(command, &query)?, command)))
         .collect();
     ranked.sort_by_key(|(rank, _)| *rank);
     let matches = ranked.into_iter().map(|(_, command)| command).collect();

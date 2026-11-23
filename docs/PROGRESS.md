@@ -1496,3 +1496,9 @@ Still open (for the owner):
   the other tall dialogs were checked at that height and pass.
 - A path typed in the restore's File field was taken only on Enter or when the field lost the focus. It is
   now taken once the typing pauses, and a path that names nothing says "No such file".
+
+## 2026-11-23 — K55: four small defects of the window's chrome
+
+- The command palette finds the words typed in any order, in a command's name, its section or its keywords,
+  accents aside ("theme light", "sql new"); Escape closes it at once, with text typed or not (it cleared the
+  text first). Tests: `ui_tests::k55` (3), each seen failing under a mutation.

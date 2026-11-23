@@ -1,0 +1,86 @@
+//! K55 (the passes in the real app, 2026-11-23): the window's chrome. The
+//! palette finds the words typed in any order, and Escape closes it.
+
+use super::*;
+
+/// The titles the palette lists for `query`, in its order.
+fn listed(query: &str) -> Vec<&'static str> {
+    crate::workspace::palette_groups(query, &[])
+        .into_iter()
+        .flat_map(|(_, commands)| commands)
+        .map(|command| command.label)
+        .collect()
+}
+
+/// Every word typed is found in a command's name, its section or its
+/// keywords, in any order, case and accents aside; the name itself first,
+/// then the names that start with what is typed, then the words in the
+/// order typed, then the others.
+#[test]
+fn the_palette_finds_the_words_typed_in_any_order() {
+    for query in ["theme light", "light theme", "Light  THEME", "thème light"] {
+        assert_eq!(listed(query).first(), Some(&"Theme: Light"), "{query}");
+    }
+    // A word of the name and a keyword ("sql"), in any order: among the
+    // words apart, more of them in the name first, then a shorter name.
+    for query in ["sql new", "new sql", "query new", "tab query new"] {
+        let found = listed(query);
+        assert_eq!(found.first(), Some(&"New Query Tab"), "{query}: {found:?}");
+    }
+    assert_eq!(listed("dark theme")[0], "Theme: Dark");
+    // A word of its section: "Tabs" holds Close Tab and Duplicate Tab.
+    let tabs = listed("duplicate tabs");
+    assert_eq!(tabs.first(), Some(&"Duplicate Tab"), "{tabs:?}");
+    // The name itself, then a name that starts with it, as before.
+    assert_eq!(listed("theme: dark")[0], "Theme: Dark");
+    assert_eq!(listed("settings")[0], "Settings");
+    let close = listed("close tab");
+    assert_eq!(close[0], "Close Tab");
+    // The words in the order typed come before the same words apart.
+    let theme = listed("theme switch");
+    assert_eq!(theme[0], "Theme: Switch Light and Dark", "{theme:?}");
+    // Every word must be found.
+    assert!(listed("theme zzz").is_empty());
+    // Nothing typed (or only spaces): the sections, as before.
+    assert_eq!(
+        crate::workspace::palette_groups("  ", &[]).len(),
+        crate::workspace::palette_groups("", &[]).len()
+    );
+}
+
+/// The palette itself (not only its list) finds a command by its words in
+/// another order, and Enter runs it.
+#[gpui_kit::test]
+fn the_palette_runs_a_command_typed_in_another_order(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-k"]);
+    app.type_text(cx, "dark theme");
+    app.press(cx, &["enter"]);
+    cx.update(|cx| assert!(cx.theme().is_dark()));
+    app.press(cx, &["secondary-k"]);
+    app.type_text(cx, "sql new");
+    app.press(cx, &["enter"]);
+    assert_eq!(app.titles(cx), ["Query 1"]);
+}
+
+/// One Escape closes the palette, with a command typed, with a text that
+/// finds nothing, or with nothing typed; the next keys go to the editor.
+#[gpui_kit::test]
+fn escape_always_closes_the_palette(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    app.press(cx, &["secondary-t"]);
+    for typed in ["close tab", "zzz", ""] {
+        app.press(cx, &["secondary-k"]);
+        assert!(app.dialog_open(cx), "{typed:?}");
+        app.type_text(cx, typed);
+        app.press(cx, &["escape"]);
+        assert!(!app.dialog_open(cx), "{typed:?}: one Escape closes it");
+    }
+    assert_eq!(app.titles(cx), ["Query 1"], "nothing ran");
+    app.type_text(cx, "select 1");
+    let sql = cx.update(|cx| {
+        let workspace = app.workspace.read(cx);
+        workspace.active_query_tab().map(|tab| tab.read(cx).sql(cx))
+    });
+    assert_eq!(sql.as_deref(), Some("select 1"));
+}

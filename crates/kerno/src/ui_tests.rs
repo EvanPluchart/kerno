@@ -67,6 +67,7 @@ mod k44;
 mod k45;
 mod k49;
 mod k54;
+mod k55;
 mod k56;
 mod legacy;
 mod menus;
@@ -702,8 +703,8 @@ fn command_palette_finds_and_runs_commands(cx: &mut TestAppContext) {
     // Escape closes the palette without running anything.
     app.press(cx, &["secondary-k"]);
     app.type_text(cx, "close tab");
-    // (The first Escape clears the search, the second closes the palette.)
-    app.press(cx, &["escape", "escape"]);
+    // (One Escape closes it, with text typed or not: K55.)
+    app.press(cx, &["escape"]);
     assert_eq!(app.titles(cx), ["Query 2"]);
     // And the keyboard is back in the workspace.
     app.press(cx, &["secondary-t"]);
