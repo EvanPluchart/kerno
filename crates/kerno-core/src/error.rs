@@ -656,6 +656,16 @@ fn openssh_words(
     };
     let words = |kind, headline: String, next: &str| (kind, headline, next.to_string());
     for line in stderr.lines().map(str::trim) {
+        // Windows' ssh.exe could not start Kerno's helper (K69, D-138).
+        if cfg!(windows) && line.starts_with(crate::openssh::ASKPASS_UNREACHABLE) {
+            return words(
+                FailureKind::SshAuthentication,
+                line.to_string(),
+                "Load the key in the SSH agent (ssh-add) and connect once with ssh in a terminal \
+                 to record the server's key, choose the built-in client on the SSH tab, or \
+                 install Kerno in a folder whose path has only plain letters (A to Z).",
+            );
+        }
         // Windows' ssh.exe before 8.4 (K69, D-138).
         if cfg!(windows) && line.starts_with("This OpenSSH is too old to ask Kerno") {
             return words(
@@ -1283,6 +1293,33 @@ mod tests {
                 false => "OpenSSH was not found on this computer.",
             }
         );
+        // K69: Windows' ssh.exe cannot start the helper from a folder with
+        // "É" (Windows only): said first, ssh's words below.
+        let explained = explain(
+            &format!(
+                "SSH tunnel: OpenSSH: {} from a folder whose name has the letter “É”.\n\
+                 CreateProcessW failed error:2\nssh_askpass: posix_spawnp: No such file or \
+                 directory\nkerno@bastion: Permission denied (publickey).",
+                crate::openssh::ASKPASS_UNREACHABLE
+            ),
+            &config,
+        );
+        assert_eq!(
+            explained
+                .headline
+                .starts_with("Windows' OpenSSH cannot start Kerno's helper"),
+            cfg!(windows),
+            "{}",
+            explained.headline
+        );
+        if cfg!(windows) {
+            assert!(explained.headline.contains("“É”"), "{}", explained.headline);
+            assert!(
+                explained.next_step.contains("ssh-add"),
+                "{}",
+                explained.next_step
+            );
+        }
         // K69: Windows' ssh.exe before 8.4 cannot ask Kerno (Windows only).
         let explained = explain(
             &format!(

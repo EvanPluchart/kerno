@@ -422,6 +422,41 @@ async fn a_chain_of_jump_hosts_runs_the_chosen_ssh_exe_from_a_folder_with_a_spac
     );
 }
 
+/// A chain of three jump hosts: four `ssh.exe` per stream, each started by
+/// the one before, all gone once the stream and the tunnel are dropped, and
+/// all gone after `stop_all` (the whole tree listed before anything stops).
+#[tokio::test]
+async fn a_chain_of_three_jump_hosts_leaves_nothing() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = k69::openssh(dir.path(), askpass(), true);
+    let jump = format!("{},{},{}", k69::JUMP, k69::HOP2, k69::HOP3);
+    let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump.clone())));
+    for stop_all in [false, true] {
+        let tunnel = open(&fixture.env, &config, None, None)
+            .await
+            .expect("a tunnel through three jump hosts");
+        probe(&tunnel, &config).await;
+        let held = tunnel.open_stream(&config.host, config.port).await.unwrap();
+        let marker = marker(&tunnel);
+        let running = runs_only(&marker, &fixture.env.ssh);
+        assert!(running >= 4, "the stream's and its three hops': {running}");
+        if stop_all {
+            kerno_core::openssh::stop_all();
+            let left = k69::ssh_executables(&marker);
+            assert!(left.is_empty(), "left after stop_all: {left:#?}");
+        }
+        drop(held);
+        drop(tunnel);
+        wait_until_gone(&marker).await;
+        eprintln!(
+            "K69 PROVED: through {jump}, {running} ssh.exe, none left (stop_all: {stop_all})"
+        );
+    }
+}
+
 /// A PEM key (Kerno cannot try its passphrase) used by the jump host and by
 /// the target: each hop's `ssh.exe` asks for it under the stream's number
 /// and is answered once; a wrong one is still said as wrong (S5). The jump
@@ -476,6 +511,49 @@ async fn a_key_written_with_slashes_under_home() {
         .expect("the key written ~/.ssh/kerno_k69_enc");
     probe(&tunnel, &config).await;
     eprintln!("K69 PROVED: ~/.ssh/kerno_k69_enc asked for and answered: {error}");
+}
+
+/// Kerno's helper in a folder named with "É" while the tunnels' folder is
+/// elsewhere: no ASCII spelling reaches it, `ssh.exe` cannot start it, and
+/// the failure says so first, with the next step (S8).
+#[tokio::test]
+async fn a_helper_out_of_reach_is_said_before_the_login_fails() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let accented = dir.path().join("Élodie");
+    std::fs::create_dir_all(&accented).unwrap();
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let mut fixture = k69::openssh(&plain, askpass(), true);
+    fixture.env.tunnels = Some(plain.join("ssh"));
+    let program = accented.join(askpass().file_name().unwrap());
+    std::fs::copy(askpass(), &program).unwrap();
+    fixture.env.askpass = program.clone();
+    let config = k69::config(k69::ssh(key("kerno_k69_enc"), None));
+    let error = open(&fixture.env, &config, Some(PASSPHRASE), None)
+        .await
+        .unwrap_err();
+    let text = Error::from(error).to_string();
+    assert!(
+        text.contains(
+            "Windows' OpenSSH cannot start Kerno's helper from a folder whose name has \
+                       the letter “É”."
+        ),
+        "{text}"
+    );
+    let explained = explain(&text, &config);
+    assert!(
+        explained
+            .headline
+            .starts_with("Windows' OpenSSH cannot start Kerno's helper"),
+        "{explained:?}"
+    );
+    eprintln!(
+        "K69 PROVED: said first: {} {}",
+        explained.headline, explained.next_step
+    );
 }
 
 /// A profile whose name has an accent ("Élodie"): the tunnel's folder, its

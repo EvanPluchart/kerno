@@ -62,9 +62,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::{
-    ASKPASS_VAR, Answers, Messages, Observed, OpenSshRequest, START_TIMEOUT, TOO_OLD, Via, decide,
-    failure, guard_config, is_login_line, lock, passphrase_opens, private_dir_in, resolve_ssh,
-    safe_ssh_word, ssh_version, too_old, tunnel_args,
+    ASKPASS_UNREACHABLE, ASKPASS_VAR, Answers, Messages, Observed, OpenSshRequest, START_TIMEOUT,
+    TOO_OLD, Via, askpass_spelling, decide, failure, guard_config, is_login_line, lock,
+    passphrase_opens, private_dir_in, process_rows, resolve_ssh, safe_ssh_word, ssh_version,
+    too_old, tree, tunnel_args,
 };
 use crate::config::SshAuth;
 use crate::instance::windows::{self as named, Bytes};
@@ -107,22 +108,65 @@ static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// given to another process before its `taskkill` ran.
 pub fn stop_all() {
     let mut live = lock(&LIVE);
-    for pid in live.drain(..) {
-        let _ = taskkill(pid).status();
+    if live.is_empty() {
+        return;
     }
+    let listed = listing().and_then(|mut listing| listing.output().ok());
+    let pids = whole_tree(listed.as_ref().map(|output| &output.stdout[..]), &live);
+    let _ = taskkill(&pids).status();
+    live.clear();
 }
 
-/// System32's `taskkill /T /F /PID <pid>`: the process and every process it
-/// started.
-fn taskkill(pid: u32) -> std::process::Command {
+/// The `ssh.exe` processes running now, as `<pid> <parent pid> <start>`
+/// lines (System32's PowerShell): the trees are read whole before anything
+/// is stopped, since `taskkill /T` walks them as it kills, and an `ssh.exe`
+/// started by a middle hop that died first is no longer under anything
+/// (seen on the runner with a chain of two jump hosts: the innermost
+/// `ssh.exe` stayed, holding its connection to the first jump host). `None`
+/// when System32's PowerShell is not where Windows puts it.
+fn listing() -> Option<std::process::Command> {
+    use std::os::windows::process::CommandExt as _;
+    let program = crate::tools::windows_program(r"WindowsPowerShell\v1.0\powershell.exe")?;
+    let mut command = std::process::Command::new(program);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | ForEach-Object { \
+             if ($_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, \
+             $_.CreationDate.ToFileTimeUtc() } }",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    Some(command)
+}
+
+/// `roots` and every `ssh.exe` under them in `listed` ([`listing`]'s
+/// output), deepest last; `roots` alone without a listing.
+fn whole_tree(listed: Option<&[u8]>, roots: &[u32]) -> Vec<u32> {
+    let rows = listed
+        .map(|bytes| process_rows(&String::from_utf8_lossy(bytes)))
+        .unwrap_or_default();
+    tree(&rows, roots)
+}
+
+/// System32's `taskkill /T /F` on each of `pids`: those processes, and any
+/// process one of them started since they were listed.
+fn taskkill(pids: &[u32]) -> std::process::Command {
     use std::os::windows::process::CommandExt as _;
     // System32's, by its full path (no `ssh.exe` is found on a Windows
     // installed elsewhere than `C:\Windows` either).
     let program = crate::tools::windows_program("taskkill.exe")
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\taskkill.exe"));
     let mut command = std::process::Command::new(program);
+    command.args(["/T", "/F"]);
+    for pid in pids {
+        command.args(["/PID", &pid.to_string()]);
+    }
     command
-        .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -131,11 +175,10 @@ fn taskkill(pid: u32) -> std::process::Command {
 }
 
 /// A stream to the database: the standard input and output of its own
-/// `ssh -W`, which is stopped when the stream is dropped.
+/// `ssh -W` (held by its [`Tree`]), which is stopped when the stream is
+/// dropped.
 pub(crate) struct LocalStream {
     child: Tree,
-    output: ChildStdout,
-    input: ChildStdin,
     seen: Arc<Seen>,
 }
 
@@ -161,23 +204,41 @@ struct Seen {
 /// goes (`kill_on_drop`). The pid is taken at the start (`Child::id` says
 /// nothing once the exit was seen) and listed in [`LIVE`] until the child's
 /// handle goes.
-struct Tree(Option<Child>, Option<u32>);
+struct Tree {
+    child: Option<Child>,
+    pid: Option<u32>,
+    /// The `ssh.exe`'s standard output and input, the stream itself, closed
+    /// only once the tree is stopped: an `ssh.exe` whose input ends leaves at
+    /// once and stops only its own jump host's `ssh.exe` (`TerminateProcess`),
+    /// whose own `ssh.exe` then outlives everything, out of any tree (seen on
+    /// the runner with two and three hops).
+    io: Option<(ChildStdout, ChildStdin)>,
+}
 
 impl Tree {
-    fn new(child: Child) -> Self {
+    fn new(child: Child, io: Option<(ChildStdout, ChildStdin)>) -> Self {
         let pid = child.id();
         if let Some(pid) = pid {
             lock(&LIVE).push(pid);
         }
-        Self(Some(child), pid)
+        Self {
+            child: Some(child),
+            pid,
+            io,
+        }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        match &mut self.0 {
+        match &mut self.child {
             Some(child) => child.try_wait(),
             None => Ok(None),
         }
     }
+}
+
+/// The end of a stream whose pipes are gone (never, while it lives).
+fn closed() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::BrokenPipe)
 }
 
 /// Takes `pid` off [`LIVE`] and drops `child`, its handle, under the list's
@@ -191,21 +252,31 @@ fn release(child: Child, pid: u32) {
 
 impl Drop for Tree {
     fn drop(&mut self) {
-        let (Some(child), Some(pid)) = (self.0.take(), self.1) else {
+        let io = self.io.take();
+        let (Some(child), Some(pid)) = (self.child.take(), self.pid) else {
             return;
         };
-        // The tree is walked from the living parent: it goes last.
+        // The whole tree is listed while every `ssh.exe` of it lives (its
+        // pipes still open), then stopped; the pipes close last.
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                let mut taskkill = Command::from(taskkill(pid));
                 runtime.spawn(async move {
-                    let _ = taskkill.status().await;
+                    let listed = match listing() {
+                        Some(listing) => Command::from(listing).output().await.ok(),
+                        None => None,
+                    };
+                    let pids = whole_tree(listed.as_ref().map(|out| &out.stdout[..]), &[pid]);
+                    let _ = Command::from(taskkill(&pids)).status().await;
                     release(child, pid);
+                    drop(io);
                 });
             }
             Err(_) => {
-                let _ = taskkill(pid).status();
+                let listed = listing().and_then(|mut listing| listing.output().ok());
+                let pids = whole_tree(listed.as_ref().map(|out| &out.stdout[..]), &[pid]);
+                let _ = taskkill(&pids).status();
                 release(child, pid);
+                drop(io);
             }
         }
     }
@@ -218,9 +289,13 @@ impl AsyncRead for LocalStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
-        let polled = Pin::new(&mut self.output).poll_read(cx, buf);
+        let this = &mut *self;
+        let Some((output, _)) = this.child.io.as_mut() else {
+            return Poll::Ready(Err(closed()));
+        };
+        let polled = Pin::new(output).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
-            let seen = &self.seen;
+            let seen = &this.seen;
             if buf.filled().len() > before {
                 seen.received.store(true, Ordering::SeqCst);
             } else if buf.remaining() > 0 && !seen.received.swap(true, Ordering::SeqCst) {
@@ -242,15 +317,24 @@ impl AsyncWrite for LocalStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.input).poll_write(cx, buf)
+        match self.child.io.as_mut() {
+            Some((_, input)) => Pin::new(input).poll_write(cx, buf),
+            None => Poll::Ready(Err(closed())),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.input).poll_flush(cx)
+        match self.child.io.as_mut() {
+            Some((_, input)) => Pin::new(input).poll_flush(cx),
+            None => Poll::Ready(Err(closed())),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.input).poll_shutdown(cx)
+        match self.child.io.as_mut() {
+            Some((_, input)) => Pin::new(input).poll_shutdown(cx),
+            None => Poll::Ready(Err(closed())),
+        }
     }
 }
 
@@ -308,7 +392,12 @@ pub struct Forward {
     args: Vec<OsString>,
     /// Where `ssh.exe` runs: the folder's parent (`-F` is relative to it).
     base: PathBuf,
-    askpass: PathBuf,
+    /// `SSH_ASKPASS`: the helper's path as `ssh.exe` can start it
+    /// ([`askpass_spelling`]: ASCII, maybe relative to `base`).
+    askpass: OsString,
+    /// The letter no spelling of the helper's path could avoid: `ssh.exe`
+    /// cannot start it, and a failure says so first.
+    askpass_letter: Option<char>,
     ask_file: PathBuf,
     dir: PathBuf,
     target: (String, u16),
@@ -420,12 +509,19 @@ impl Forward {
             },
             spawns.clone(),
         ));
+        // A path `ssh.exe` can start: else it still runs (an agent and a
+        // known host ask nothing), and a failure names the letter first.
+        let (askpass, askpass_letter) = match askpass_spelling(&request.env.askpass, &base) {
+            Ok(spelling) => (spelling, None),
+            Err(letter) => (request.env.askpass.clone().into_os_string(), Some(letter)),
+        };
         // From here on dropping `forward` cleans everything up.
         let mut forward = Self {
             ssh: request.env.ssh.clone(),
             args,
             base,
-            askpass: request.env.askpass.clone(),
+            askpass,
+            askpass_letter,
             ask_file: dir.join("ask"),
             dir,
             target: (request.db_host.to_string(), request.db_port),
@@ -468,16 +564,14 @@ impl Forward {
             .map_err(|error| {
                 SshError::Other(format!("could not start {}: {error}", self.ssh.display()))
             })?;
-        let streams = (
-            spawned.stdout.take(),
-            spawned.stdin.take(),
-            spawned.stderr.take(),
-        );
-        // From here on every return stops `ssh` and its jump hosts' `ssh`.
-        let mut child = Tree::new(spawned);
-        let (Some(output), Some(input), stderr) = streams else {
+        let io = spawned.stdout.take().zip(spawned.stdin.take());
+        let stderr = spawned.stderr.take();
+        // From here on every return stops `ssh` and its jump hosts' `ssh`,
+        // its pipes closed after them.
+        let mut child = Tree::new(spawned, io);
+        if child.io.is_none() {
             return Err(SshError::Other("ssh's standard streams are missing".into()));
-        };
+        }
 
         // Read continuously: a pipe nobody reads fills up and stops `ssh`.
         let own = Arc::new(Mutex::new(Messages::default()));
@@ -540,8 +634,6 @@ impl Forward {
         }
         Ok(LocalStream {
             child,
-            output,
-            input,
             seen: Arc::new(Seen {
                 received: AtomicBool::new(false),
                 messages: self.messages.clone(),
@@ -554,13 +646,24 @@ impl Forward {
     fn failure(&self, asking: Asking, stderr: &str) -> SshError {
         let error = failure(&asking.observed, self.key.as_deref(), stderr);
         // An `ssh` that cannot ask Kerno asks nobody, and fails.
-        match error {
-            SshError::OpenSsh { stderr } if self.too_old && asking.questions == 0 => {
+        match (error, self.askpass_letter) {
+            // `ssh.exe` says only that it could not start "ssh_askpass".
+            (SshError::OpenSsh { stderr }, Some(letter))
+                if stderr.contains("ssh_askpass: posix_spawnp") =>
+            {
+                SshError::OpenSsh {
+                    stderr: format!(
+                        "{ASKPASS_UNREACHABLE} from a folder whose name has the letter \
+                         “{letter}”.\n{stderr}"
+                    ),
+                }
+            }
+            (SshError::OpenSsh { stderr }, _) if self.too_old && asking.questions == 0 => {
                 SshError::OpenSsh {
                     stderr: format!("{TOO_OLD}\n{stderr}"),
                 }
             }
-            other => other,
+            (other, _) => other,
         }
     }
 

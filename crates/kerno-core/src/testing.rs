@@ -546,6 +546,10 @@ pub mod k69 {
     /// loop, with the plain key.
     pub const HOP2: &str = "k69-hop2";
 
+    /// A third hop (`k69-jump,k69-hop2,k69-hop3`): the jump host's port
+    /// under another name.
+    pub const HOP3: &str = "k69-hop3";
+
     /// The jump host [`JUMP`]'s port with the PEM key (its passphrase is
     /// [`PASSPHRASE`]), written with `/` where `-i` has `\`.
     pub const JUMP_PEM: &str = "k69-jump-pem";
@@ -562,6 +566,7 @@ pub mod k69 {
         let text = format!(
             "Host {JUMP}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{plain}\"\n\
              Host {HOP2}\n  HostName 127.0.0.1\n  Port {SSH_PORT}\n  IdentityFile \"{plain}\"\n\
+             Host {HOP3}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{plain}\"\n\
              Host {JUMP_PEM}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{}\"\n\
              Host *\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
              UserKnownHostsFile \"{}\"\n  UpdateHostKeys no\n  ConnectTimeout 10\n",

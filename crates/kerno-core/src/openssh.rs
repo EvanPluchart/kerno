@@ -62,6 +62,11 @@ pub const NOT_FOUND: &str = "Windows' OpenSSH client is not installed: add it in
 pub const TOO_OLD: &str = "This OpenSSH is too old to ask Kerno for a passphrase: load the key \
      in the agent, or use the built-in client";
 
+/// How the failure of a tunnel begins when Windows' `ssh.exe` could not
+/// start Kerno's helper ([`askpass_spelling`] found no ASCII spelling of its
+/// path); the line goes on with the letter that stopped it.
+pub const ASKPASS_UNREACHABLE: &str = "Windows' OpenSSH cannot start Kerno's helper";
+
 /// Where the system's OpenSSH is and how Kerno runs it. The app builds it
 /// once; tests pass their own configuration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -819,6 +824,119 @@ fn wildcard(pattern: &[u8], text: &[u8]) -> bool {
     }
 }
 
+// Windows: the processes of a tunnel, and its helper's spelling ---------------
+
+/// One process of a listing: its id, its parent's id, when it started.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessRow {
+    pid: u32,
+    parent: u32,
+    started: u64,
+}
+
+/// The rows of a listing of `<pid> <parent pid> <start time>` lines; other
+/// lines are skipped.
+#[cfg(any(windows, test))]
+fn process_rows(text: &str) -> Vec<ProcessRow> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace().map(str::parse::<u64>);
+            let (Some(Ok(pid)), Some(Ok(parent)), Some(Ok(started)), None) =
+                (words.next(), words.next(), words.next(), words.next())
+            else {
+                return None;
+            };
+            Some(ProcessRow {
+                pid: u32::try_from(pid).ok()?,
+                parent: u32::try_from(parent).ok()?,
+                started,
+            })
+        })
+        .collect()
+}
+
+/// `roots` and every process under them in `rows`, the deepest last: a
+/// child is one whose parent id is the process's and that started after it
+/// (Windows keeps a dead parent's id, which a later process may get). Taken
+/// all at once, before anything is stopped: once a middle `ssh.exe` of a
+/// chain of jump hosts is gone, the `ssh.exe` it started has no parent left
+/// to be found by (seen on the runner with two hops, K69).
+#[cfg(any(windows, test))]
+fn tree(rows: &[ProcessRow], roots: &[u32]) -> Vec<u32> {
+    let mut found: Vec<ProcessRow> = rows
+        .iter()
+        .filter(|row| roots.contains(&row.pid))
+        .copied()
+        .collect();
+    let mut at = 0;
+    while let Some(&parent) = found.get(at) {
+        for row in rows {
+            let child = row.parent == parent.pid
+                && row.started >= parent.started
+                && row.pid != parent.pid
+                && !found.iter().any(|seen| seen.pid == row.pid);
+            if child {
+                found.push(*row);
+            }
+        }
+        at += 1;
+    }
+    // A root no listing showed is still stopped by its own id.
+    let unlisted: Vec<u32> = roots
+        .iter()
+        .copied()
+        .filter(|root| !found.iter().any(|row| row.pid == *root))
+        .collect();
+    found.iter().map(|row| row.pid).chain(unlisted).collect()
+}
+
+/// How `ssh.exe` is told where Kerno's helper is (`SSH_ASKPASS`): Windows'
+/// OpenSSH reads that variable in the system's ANSI code page and starts it
+/// as UTF-8, so a path with a letter beyond ASCII ("Élodie") names no file
+/// (`CreateProcessW failed error:2`). The path as it is when it is ASCII;
+/// else relative to `base`, where `ssh.exe` runs (its jump hosts' too),
+/// which climbs out of a profile folder with `..` and is ASCII whenever the
+/// helper's own folders below the common one are (an install under
+/// `%LOCALAPPDATA%\Programs` beside the tunnels' `%LOCALAPPDATA%\Kerno`);
+/// `Err` with the first other letter when no ASCII spelling exists.
+#[cfg(any(windows, test))]
+fn askpass_spelling(askpass: &Path, base: &Path) -> Result<OsString, char> {
+    let first_other = |path: &Path| path.to_string_lossy().chars().find(|c| !c.is_ascii());
+    let Some(letter) = first_other(askpass) else {
+        return Ok(askpass.as_os_str().to_owned());
+    };
+    let same = |a: &std::path::Component<'_>, b: &std::path::Component<'_>| {
+        let (a, b) = (
+            a.as_os_str().to_string_lossy(),
+            b.as_os_str().to_string_lossy(),
+        );
+        if cfg!(windows) {
+            a.to_lowercase() == b.to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let (to, from): (Vec<_>, Vec<_>) =
+        (askpass.components().collect(), base.components().collect());
+    let common = to.iter().zip(&from).take_while(|(a, b)| same(a, b)).count();
+    // Another drive, or nothing in common: no relative path.
+    if common == 0 || !askpass.is_absolute() || !base.is_absolute() {
+        return Err(letter);
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for part in &to[common..] {
+        relative.push(part.as_os_str());
+    }
+    match first_other(&relative) {
+        None => Ok(relative.into_os_string()),
+        Some(letter) => Err(letter),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1434,54 @@ mod tests {
         );
         assert!(!guard_config(Some(Path::new("/a\"b")), "/s").contains("/a"));
         assert!(guard_config(None, "/s").starts_with("KbdInteractiveAuthentication no\n"));
+    }
+
+    /// A chain of three jump hosts: every `ssh.exe` under the stream's is
+    /// found from one listing, a process that only reuses a dead parent's id
+    /// is not, and a root missing from the listing is still named. Mutation
+    /// seen: children taken only one level down.
+    #[test]
+    fn a_tree_is_listed_whole_before_anything_stops() {
+        let rows = process_rows(
+            "10 1 100\n11 10 110\n12 11 120\n13 12 130\n14 13 140\n\
+             20 12 90\n21 99 150\nnoise line\n30 10 105 extra\n",
+        );
+        assert_eq!(rows.len(), 7);
+        // 20 claims 12 as its parent but started before it: another's child.
+        assert_eq!(tree(&rows, &[10]), [10, 11, 12, 13, 14]);
+        assert_eq!(tree(&rows, &[13, 77]), [13, 14, 77]);
+        assert!(tree(&[], &[5]) == [5]);
+    }
+
+    /// The helper's path as `ssh.exe` can start it: ASCII as it is; else
+    /// relative to where `ssh.exe` runs, when that is ASCII; else the letter
+    /// that stops it (S8).
+    #[test]
+    fn the_helper_is_named_in_ascii_or_its_letter_is_said() {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        let profile = Path::new(root).join("Users").join("Élodie");
+        let local = profile.join("AppData").join("Local");
+        let base = local.join("Kerno").join("data").join("ssh");
+        let installed = local.join("Programs").join("Kerno").join("kerno.exe");
+        let plain = Path::new(root)
+            .join("Program Files")
+            .join("Kerno")
+            .join("kerno.exe");
+        assert_eq!(
+            askpass_spelling(&plain, &base),
+            Ok(plain.clone().into_os_string())
+        );
+        let up = PathBuf::from("..")
+            .join("..")
+            .join("..")
+            .join("Programs")
+            .join("Kerno")
+            .join("kerno.exe");
+        assert_eq!(askpass_spelling(&installed, &base), Ok(up.into_os_string()));
+        let elsewhere = Path::new(root).join("tunnels");
+        assert_eq!(askpass_spelling(&installed, &elsewhere), Err('É'));
+        let greek = Path::new(root).join("Ωmega").join("kerno.exe");
+        assert_eq!(askpass_spelling(&greek, &base), Err('Ω'));
     }
 
     /// Windows: the key named with `/` or `\`, in any ASCII case, is the
