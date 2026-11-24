@@ -7,8 +7,8 @@
 #   test-linux   the workspace tests with the kerno-* containers, the legacy MySQL ones included
 #   windows      step 1 of the Windows port (K64, D-131): cargo check and clippy of every crate and
 #                target, and kerno-core's tests; no container and no UI test there yet
-#   windows-exe  a release kerno.exe, kept 7 days with the run: not a package yet (no icon, no
-#                installer, no update), and nobody has seen it on a Windows screen
+#   windows-package  the release's Windows zip, built by scripts/bundle-windows.sh and kept 7
+#                days with the run: a preview, nobody has seen it on a Windows screen
 name: CI
 
 on:
@@ -111,8 +111,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p kerno-core -- --test-threads=3
 
-  windows-exe:
-    name: release kerno.exe (Windows)
+  windows-package:
+    name: release zip (Windows)
     runs-on: windows-2025
     timeout-minutes: 90
     defaults:
@@ -127,17 +127,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
-      - run: cargo build --release -p kerno
-      - name: kerno.exe --version prints the workspace version
-        run: |
-          expected="kerno $(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
-          printed="$(./target/release/kerno.exe --version)"
-          echo "expected: $expected"
-          echo "printed:  $printed"
-          test "$printed" = "$expected"
+      - name: Build, check the version and zip
+        run: scripts/bundle-windows.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kerno-windows-x86_64
-          path: target/release/kerno.exe
+          path: dist/*.zip
           if-no-files-found: error
           retention-days: 7

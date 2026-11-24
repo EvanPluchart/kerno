@@ -38,6 +38,11 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 
+# The icon of kerno.exe, compiled in by build.rs on Windows (K66); already in
+# the lock through GPUI, which compiles its manifest in the same way.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
 kerno-core = { workspace = true, features = ["test-support"] }

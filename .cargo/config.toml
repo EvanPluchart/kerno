@@ -1,2 +1,7 @@
 [build]
 jobs = 3
+
+# Windows: the C runtime is linked into kerno.exe, so the zip runs on a machine
+# that has no Visual C++ redistributable installed (K66).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

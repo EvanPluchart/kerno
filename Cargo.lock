@@ -4405,6 +4405,7 @@ name = "kerno"
 version = "2026.11.2"
 dependencies = [
  "anyhow",
+ "embed-resource",
  "gpui-kit",
  "image",
  "kerno-core",

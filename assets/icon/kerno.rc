@@ -1,0 +1,3 @@
+// The executable's icon on Windows, compiled in by crates/kerno/build.rs. GPUI loads the icon
+// resource numbered 1 for its windows; Explorer and the taskbar show the same one.
+1 ICON "kerno.ico"
