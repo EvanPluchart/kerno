@@ -1773,3 +1773,18 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   as written, an empty parent refused, a refused row keeping nothing) and six UI tests, each seen failing
   under a mutation; captures light and dark.
 - Not done: values read from a file or another table, CHECK rules kept, settings saved as a task (D-141).
+
+## 2026-11-24 — K71: the tests that failed now and then
+
+- The owner's pick C1: the CI must not go red by chance. Seven tests were looped on this Mac (one copy at a
+  time, beside the other agents' work) and on GitHub through the probe workflow on `linux-tests` (a CPU hog
+  per core; Linux with the containers, and `macos-15` for the DBeaver import) until each failed, then fixed
+  where the wrong thing happens (D-140).
+- Four defects of the app: a PostgreSQL close let a statement whose describe was cancelled be sent and wait
+  for a lock unseen (the FK preview's stopped read); a table locked elsewhere held every PostgreSQL schema
+  listing (Copy tables, the tree, the backup dialog), and an object dropped while it was listed failed it; a
+  second DBeaver import at once could copy a connection; a run on several connections said "Starting…" while
+  it asked. Three tests read a state before
+  it was there (the update relaunch, the fold marks, MySQL's own transaction after a sizes read).
+- Proved by the loops (numbers in M12, K71), three new tests seen failing without their fix, and the probe's
+  whole workspace on the Linux runner. Left: J15's import plans from the list in memory too (not reproduced).

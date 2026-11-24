@@ -4588,3 +4588,33 @@ was ported, `THIRD_PARTY_NOTICES.md` is unchanged, and the word lists were writt
   values for types Kerno has no kind for (geometry, ranges, `inet`, …: NULL where allowed, else refused in
   words); MySQL `TIMESTAMP` values are written as wall times in the session's zone.
 
+
+## D-140 — The tests that failed now and then: fixed where the wrong thing happens (K71; 2026-11-24)
+
+Seven tests failed now and then on GitHub's runners or on this Mac under load (K71). The rule taken: loop each
+until it fails, read the code path, and fix the place that does the wrong thing; a test changes only when the
+app was right and the test read a state before it was there. No longer timeout, no retry, no `#[ignore]`.
+
+- **Four were the app.** A PostgreSQL `close` now counts as a cancel, so a statement whose describe step
+  (where the server waits for the table's lock as it parses) was cancelled is not sent afterwards, to wait on
+  the server unseen; every owner that stops work by closing its session gets it (`bridge::Stop`, the FK
+  preview, the dialogs). A schema's listing on PostgreSQL leaves out the size of a table another session holds
+  or asks an ACCESS EXCLUSIVE lock on, instead of waiting for it: the tree, the backup dialog and Copy tables
+  no longer hang behind someone's long ALTER; the size is the only thing lost, and only while the lock lasts
+  (a lock taken between the check and the size still waits: rare, marked in the code). A catalog read that
+  fails because an object it listed was dropped meanwhile ("could not open relation with OID", "cache lookup
+  failed") is read again, twice at most, outside a transaction block: the next snapshot no longer lists it.
+  Reading a sequence's last value still waits for an `ALTER SEQUENCE` in progress: the tree keeps its Cancel
+  and its 30 s bound for that, and its tests now hold such a sequence. The DBeaver import's
+  preview judges what is already here from the store, which the previous import has written, not from the
+  list in memory that reads it back a moment later. A run on several connections shows "Waiting for your
+  confirmation" as soon as a target asks.
+- **Three were the tests**, and wait now for the state they read: the update test for the new Kerno to have
+  read the store; the folding test for the fold marks (the clock moved on for the kit's parse off the UI
+  thread) and one click per fold, where it retried; the session owners test counts the transactions MySQL's
+  SQL has open (`performance_schema`), not InnoDB's own object, which MySQL 8.4 keeps on an idle session after
+  a read of `information_schema.TABLES`' sizes until that session's next statement. That one is the server's,
+  not a transaction of Kerno's: in the app the connection's keep-alive (5 s) ends it; left as it is.
+- **The proof is a loop, on both kinds of machine.** The probe workflow (`linux-tests-probe.yml`, on the
+  branch `linux-tests` only, not merged) runs each test 30 to 100 times with a CPU hog per core on
+  `ubuntu-24.04` with the containers, and the DBeaver import 100 times on `macos-15`; numbers in M12, K71.
