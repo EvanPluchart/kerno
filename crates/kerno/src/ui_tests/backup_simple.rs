@@ -485,6 +485,9 @@ fn a_simple_backup_is_restored_by_the_simple_restore(cx: &mut TestAppContext) {
 /// up; a file's client commands are refused, the way to allow them named.
 #[gpui_kit::test]
 fn the_simple_views_keep_every_guard(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -867,6 +870,9 @@ fn the_simple_restores_faster_is_not_a_hidden_change(cx: &mut TestAppContext) {
 /// appears between Start's check and the run.
 #[gpui_kit::test]
 fn a_faster_backup_removes_only_the_folder_it_made(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }

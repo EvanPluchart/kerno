@@ -29,7 +29,7 @@ fn tables(schema: &str) -> Vec<String> {
     vec![
         format!("CREATE SCHEMA {schema}"),
         format!(
-            "CREATE TABLE {schema}.items (code text COLLATE \"en_US\" PRIMARY KEY, n integer, \
+            "CREATE TABLE {schema}.items (code text COLLATE \"en-US-x-icu\" PRIMARY KEY, n integer, \
              price numeric(12,2), at timestamptz, doc jsonb, raw bytea, tags text[], note text, \
              total numeric GENERATED ALWAYS AS (price * 2) STORED)"
         ),

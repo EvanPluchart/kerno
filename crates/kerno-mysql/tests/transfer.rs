@@ -431,18 +431,9 @@ fn line_count(path: &Path) -> usize {
 }
 
 /// Peak resident memory of this process while `body` runs, sampled with
-/// `ps` every 200 ms, minus what it was before.
+/// `ps` (`tasklist` on Windows) every 200 ms, minus what it was before.
 async fn peak_growth_kb<T>(body: impl Future<Output = T>) -> (T, u64) {
-    fn rss_kb() -> u64 {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .unwrap()
-    }
+    use kerno_core::testing::resident_kb as rss_kb;
     let before = rss_kb();
     let peak = Arc::new(AtomicU64::new(before));
     let done = Arc::new(AtomicBool::new(false));

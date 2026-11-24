@@ -210,15 +210,27 @@ fn urls_handed_over_through_the_socket_open_in_the_same_window(cx: &mut TestAppC
     // A live instance's socket is never taken over.
     assert!(instance::listen(&socket).unwrap().is_none());
 
-    instance::send(&socket, "not a url").unwrap();
+    // On Windows the URL crosses the pipe without its password and a line that is not a URL
+    // is refused before anything is sent (D-131): the instance opens the connection and asks
+    // for the password, which this test does not type (K68).
+    let sent = instance::send(&socket, "not a url");
+    if cfg!(windows) {
+        assert_eq!(sent.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    } else {
+        sent.unwrap();
+    }
     instance::send(&socket, &url(Engine::Postgres, true)).unwrap();
     app.wait_until(cx, "the first URL", |app, cx| app.listed(cx).len() == 1);
-    app.wait_connected(cx, 0);
+    if !cfg!(windows) {
+        app.wait_connected(cx, 0);
+    }
 
     instance::send(&socket, &url(Engine::Postgres, true)).unwrap();
     instance::send(&socket, &url(Engine::MySql, true)).unwrap();
     app.wait_until(cx, "the second URL", |app, cx| app.listed(cx).len() == 2);
-    app.wait_connected(cx, 1);
+    if !cfg!(windows) {
+        app.wait_connected(cx, 1);
+    }
     let engines = cx.update(|cx| {
         let connections = app.connections.read(cx);
         connections

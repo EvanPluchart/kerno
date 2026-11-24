@@ -13,7 +13,9 @@ use kerno_core::schema::{Change, Dependent, ObjectRef, RelationKind, RoutineKind
 use kerno_core::{Error, Session};
 
 const A: &str = "kerno_test_k14";
-const B: &str = "kerno_test_k14b";
+/// After A's objects in every collation: glibc's skips the dot of
+/// `kerno_test_k14.v1`, Windows' and ICU's do not (K68).
+const B: &str = "kerno_test_k14z";
 
 fn table(schema: &str, name: &str) -> TableRef {
     TableRef::new(schema, name)
@@ -177,8 +179,8 @@ async fn a_cascade_lists_what_the_server_drops() {
             format!("function {A}.f({A}.t)"),
             format!("function {A}.g()"),
             format!("materialized view {A}.mv"),
-            format!("view {B}.v2"),
             format!("view {A}.v1"),
+            format!("view {B}.v2"),
         ]
     );
     assert!(found.iter().all(|d| d.tie == Tie::Dropped));

@@ -505,16 +505,17 @@ fn binary(dir: &Path, name: &str) -> PathBuf {
 /// `canonicalize` puts before a drive letter: the folder is shown to the user, and compared with
 /// folders typed or saved without it.
 pub fn real_path(path: &Path) -> PathBuf {
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    #[cfg(windows)]
-    if let Some(plain) = real
-        .to_str()
+    plain_path(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// `path` without the `\\?\` before a drive letter (Windows; itself elsewhere). A tool given
+/// `\\?\C:\out\k48` for a folder writes `\\?\C:\out\k48/toc.dat`, which Windows refuses:
+/// that form takes no `/` (pg_dump's directory format, K68).
+pub fn plain_path(path: &Path) -> PathBuf {
+    path.to_str()
         .and_then(|text| text.strip_prefix(r"\\?\"))
-        .filter(|rest| !rest.starts_with(r"UNC\"))
-    {
-        return PathBuf::from(plain);
-    }
-    real
+        .filter(|rest| cfg!(windows) && !rest.starts_with(r"UNC\"))
+        .map_or_else(|| path.to_path_buf(), PathBuf::from)
 }
 
 /// Probes one folder chosen by the user: the install it holds for
@@ -835,13 +836,20 @@ pub fn version(path: &Path) -> Option<ToolVersion> {
 /// Reads `psql (PostgreSQL) 18.6`, `mysql  Ver 8.0.36 for Linux …`,
 /// `mysql  Ver 15.1 Distrib 10.6.18-MariaDB, …` (where 15.1 is the client
 /// protocol, not the version) and `mariadb from 11.8.9-MariaDB, client 15.2 …`.
+/// MySQL's tools start with their own path, which on Windows holds spaces and
+/// a version of its own (`C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe
+/// Ver 8.4.13 …`): the word after `Ver` is the version.
 fn parse_version(output: &str) -> Option<ToolVersion> {
     let text = output.lines().next()?.trim();
     let words: Vec<&str> = text.split_whitespace().collect();
-    let word = words
-        .iter()
-        .position(|word| *word == "Distrib" || *word == "from")
-        .and_then(|at| words.get(at + 1))
+    let after = |markers: &[&str]| {
+        words
+            .iter()
+            .position(|word| markers.contains(word))
+            .and_then(|at| words.get(at + 1))
+    };
+    let word = after(&["Distrib", "from"])
+        .or_else(|| after(&["Ver"]))
         .or_else(|| {
             words
                 .iter()
@@ -1875,7 +1883,7 @@ pub fn backup_command(
             )?;
             args.push("--verbose".into());
             args.push(format!("--dbname={}", pg_dbname(&options.database)));
-            args.push(format!("--file={}", output.display()));
+            args.push(format!("--file={}", plain_path(output).display()));
             args.push(format!("--format={}", options.format.letter()));
             if let Some(level) = pg.compression {
                 args.push(format!("--compress={level}"));
@@ -2040,7 +2048,7 @@ pub fn global_backup_command(
             args.push(flag.into());
         }
     }
-    args.push(format!("--file={}", output.display()));
+    args.push(format!("--file={}", plain_path(output).display()));
     for database in &options.exclude_databases {
         args.push(format!("--exclude-database={}", pg_pattern(database)));
     }
@@ -2152,7 +2160,7 @@ pub fn restore_command(
                 }
             }
             args.extend(extra);
-            args.push(options.input.display().to_string());
+            args.push(plain_path(&options.input).display().to_string());
             Ok(command)
         }
         (Engine::MySql | Engine::MariaDb, BackupFormat::Sql) => {
@@ -3482,6 +3490,49 @@ mod tests {
     }
 
     #[test]
+    fn a_verbatim_drive_path_reaches_the_tools_plain() {
+        let verbatim = Path::new(r"\\?\C:\out\k48");
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\out\k48")
+        } else {
+            verbatim.to_path_buf()
+        };
+        assert_eq!(plain_path(verbatim), expected);
+        let unc = Path::new(r"\\?\UNC\host\share\k48");
+        assert_eq!(plain_path(unc), unc);
+        assert_eq!(plain_path(Path::new("/tmp/out")), Path::new("/tmp/out"));
+        // What pg_dump is given for a folder.
+        let command = backup_command(
+            Path::new("pg_dump"),
+            &crate::testing::params(Engine::Postgres),
+            &BackupOptions {
+                format: BackupFormat::Directory,
+                ..BackupOptions::new(Engine::Postgres, "shop")
+            },
+            verbatim,
+        )
+        .unwrap();
+        let file = format!("--file={}", expected.display());
+        assert!(command.args.contains(&file), "{:?}", command.args);
+        // And what pg_restore reads it back from.
+        let command = restore_command(
+            Path::new("pg_restore"),
+            &crate::testing::params(Engine::Postgres),
+            &RestoreOptions::new(
+                Engine::Postgres,
+                "shop",
+                verbatim.to_path_buf(),
+                BackupFormat::Directory,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            command.args.last().map(String::as_str),
+            Some(expected.to_str().unwrap())
+        );
+    }
+
+    #[test]
     fn versions_are_read_from_each_tool() {
         let cases = [
             ("psql (PostgreSQL) 18.6\n", (18, 6, 0), false),
@@ -3495,6 +3546,12 @@ mod tests {
                 "/opt/homebrew/opt/mysql-client/bin/mysql  Ver 26.10.0 for macos27.0 on arm64 \
                  (Homebrew)",
                 (26, 10, 0),
+                false,
+            ),
+            (
+                "C:\\Program Files\\MySQL\\MySQL Server 8.4\\bin\\mysql.exe  Ver 8.4.13 for Win64 on \
+                 x86_64 (MySQL Community Server - GPL)",
+                (8, 4, 13),
                 false,
             ),
             (

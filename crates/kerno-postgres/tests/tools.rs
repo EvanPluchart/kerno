@@ -60,14 +60,24 @@ async fn server_major(session: &Arc<dyn Session>) -> u32 {
         / 10_000
 }
 
-/// The directory of the first `pg_dump` (in `$PATH`, then the usual
-/// install directories) able to dump a server of major `server`, or `None`
-/// after a `SKIPPED` line naming what was found.
-fn tool_dir(server: u32) -> Option<PathBuf> {
+/// Where the tests look for PostgreSQL's tools: `$PATH`, the usual install
+/// directories, then the installs Kerno detects, as the app finds them
+/// (EDB's installer on Windows puts nothing on `PATH`, K68).
+fn search_dirs() -> Vec<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let dirs = std::env::split_paths(&path).chain(FALLBACK_DIRS.iter().map(PathBuf::from));
+    let detected = tools::detect_clients(&tools::ClientRoots::system(Vec::new()));
+    std::env::split_paths(&path)
+        .chain(FALLBACK_DIRS.iter().map(PathBuf::from))
+        .chain(detected.into_iter().map(|install| install.dir))
+        .collect()
+}
+
+/// The directory of the first `pg_dump` (in [`search_dirs`]) able to dump a
+/// server of major `server`, or `None` after a `SKIPPED` line naming what was
+/// found.
+fn tool_dir(server: u32) -> Option<PathBuf> {
     let mut found = Vec::new();
-    for dir in dirs {
+    for dir in search_dirs() {
         let Some(pg_dump) = tools::find_in(Tool::PgDump, None, std::slice::from_ref(&dir)) else {
             continue;
         };
@@ -466,7 +476,7 @@ async fn genuine_round_trip(session: Arc<dyn Session>, dir: PathBuf) {
 /// command is built without the check (and not run here).
 #[tokio::test]
 async fn a_plain_file_with_client_commands_runs_nothing() {
-    let Some(psql) = tools::find(Tool::Psql) else {
+    let Some(psql) = tools::find_in(Tool::Psql, None, &search_dirs()) else {
         eprintln!("SKIPPED: no psql installed");
         return;
     };

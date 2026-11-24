@@ -661,6 +661,12 @@ const SECRET_STORE_DESCRIPTION: &str = if cfg!(target_os = "macos") {
      ~/.pgpass. macOS Keychain: guarded by your login, but macOS asks for your password again \
      after every update of Kerno, which is not signed by Apple. A password saved in the other \
      place moves here the first time it is used."
+} else if cfg!(windows) {
+    "Kerno's file: one encrypted file in Kerno's data folder, its key in a second file beside \
+     it. No prompt; a copy of the file, a file search or another user of this computer sees \
+     nothing, but a program running under your account could read both files, as with DBeaver \
+     or pgpass.conf. Windows Credential Manager: guarded by your Windows login. A password \
+     saved in the other place moves here the first time it is used."
 } else {
     "Kerno's file: one encrypted file in Kerno's data folder, its key in a second file beside \
      it. No prompt; a copy of the file, a file search or another user of this computer sees \

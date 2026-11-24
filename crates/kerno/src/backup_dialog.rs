@@ -3587,7 +3587,7 @@ fn archive_list(pg_restore: &Path, archive: &Path) -> Option<String> {
     let mut command = std::process::Command::new(pg_restore);
     command
         .arg("--list")
-        .arg(archive)
+        .arg(tools::plain_path(archive))
         .stdin(std::process::Stdio::null());
     tools::no_console(&mut command);
     let output = command.output().ok()?;
@@ -3995,12 +3995,18 @@ fn left_out_closed(names: &[String], max: usize) -> Option<String> {
     })
 }
 
+/// The tool as the dialog names it: `pg_dump`, also on Windows where its
+/// file is `pg_dump.exe` (K68).
 fn program_name(command: &ToolCommand) -> String {
-    command
+    let name = command
         .program
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    match name.strip_suffix(std::env::consts::EXE_SUFFIX) {
+        Some(stem) if !stem.is_empty() => stem.to_string(),
+        _ => name,
+    }
 }
 
 /// An error as the dialog says it. A refused script and other settings

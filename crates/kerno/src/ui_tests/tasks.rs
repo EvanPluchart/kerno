@@ -88,6 +88,9 @@ echo "pw=$PGPASSWORD""#,
 
 #[gpui_kit::test]
 fn a_backup_task_is_saved_listed_run_again_edited_duplicated_and_deleted(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -265,6 +268,9 @@ fn a_task_whose_connection_was_deleted_says_so_and_cannot_run(cx: &mut TestAppCo
 
 #[gpui_kit::test]
 fn a_task_keeps_no_password_and_asks_the_override_s_at_each_run(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }

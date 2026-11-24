@@ -154,11 +154,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for UntilClosed<S> {
             std::task::ready!(Pin::new(&mut self.stream).poll_shutdown(cx))?;
             self.shut = true;
         }
-        // The server sends nothing back: read until it closes.
+        // The server sends nothing back: read until it closes. A server on
+        // Windows closes with our end's FIN unread, which Windows turns into
+        // a reset: closed all the same (libpq ignores the read's errors).
         let mut scratch = [0u8; 64];
         loop {
             let mut buf = ReadBuf::new(&mut scratch);
-            std::task::ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buf))?;
+            match std::task::ready!(Pin::new(&mut self.stream).poll_read(cx, &mut buf)) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return Poll::Ready(Ok(()));
+                }
+                result => result?,
+            }
             if buf.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
@@ -577,6 +584,82 @@ impl ServerCertVerifier for AnyCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a cancel connection: what writing does, then what each
+    /// read after the write side is shut answers.
+    struct CancelEnd {
+        write: Option<std::io::ErrorKind>,
+        read: Option<std::io::ErrorKind>,
+        written: usize,
+    }
+
+    impl AsyncRead for CancelEnd {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(self.read.map_or(Ok(()), |kind| Err(kind.into())))
+        }
+    }
+
+    impl AsyncWrite for CancelEnd {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if let Some(kind) = self.write {
+                return Poll::Ready(Err(kind.into()));
+            }
+            self.written += buf.len();
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// K68: a PostgreSQL server on Windows ends the cancel connection with a
+    /// reset once it has the request: that is its close. A request that
+    /// could not be written, or another error of the read, is still one.
+    #[tokio::test]
+    async fn a_reset_after_the_cancel_request_is_the_server_closing() {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionReset, TimedOut};
+        use tokio::io::AsyncWriteExt as _;
+        let end = |write, read| {
+            UntilClosed::new(CancelEnd {
+                write,
+                read,
+                written: 0,
+            })
+        };
+        let request = [0u8; 16];
+
+        let mut closed = end(None, None);
+        closed.write_all(&request).await.unwrap();
+        closed.shutdown().await.unwrap();
+
+        let mut reset = end(None, Some(ConnectionReset));
+        reset.write_all(&request).await.unwrap();
+        reset.shutdown().await.unwrap();
+        assert_eq!(reset.stream.written, request.len());
+
+        let mut unsent = end(Some(ConnectionReset), None);
+        let error = unsent.write_all(&request).await.unwrap_err();
+        assert_eq!(error.kind(), ConnectionReset);
+        let mut broken = end(Some(BrokenPipe), None);
+        assert!(broken.write_all(&request).await.is_err());
+
+        let mut silent = end(None, Some(TimedOut));
+        silent.write_all(&request).await.unwrap();
+        assert_eq!(silent.shutdown().await.unwrap_err().kind(), TimedOut);
+    }
 
     #[test]
     fn startup_option_values_protect_spaces_and_backslashes() {

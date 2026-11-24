@@ -53,6 +53,9 @@ fn open_file(app: &Fixture, cx: &mut TestAppContext, dialog: &Entity<BackupDialo
 /// simple view and the wizard show what it set.
 #[gpui_kit::test]
 fn a_missing_owner_is_said_and_the_restore_runs_again_without_owners(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -173,6 +176,9 @@ fn a_missing_owner_is_said_and_the_restore_runs_again_without_owners(cx: &mut Te
 /// since psql cannot leave out what the script's text holds.
 #[gpui_kit::test]
 fn a_plain_script_says_what_to_do_without_a_retry(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }

@@ -2556,6 +2556,8 @@ fn start_fresh_is_not_offered_while_another_kerno_has_the_data(cx: &mut TestAppC
     let other = kerno_core::instance::listen(&socket)
         .unwrap()
         .expect("the socket is free");
+    // Served, as a running Kerno serves it: on Windows a pipe proves itself only then (D-131).
+    std::thread::spawn(move || kerno_core::instance::serve(other, |_| true));
     k8_in(cx, window, |window, cx| {
         window.click("start-failure-fresh", cx)
     });
@@ -2580,7 +2582,6 @@ fn start_fresh_is_not_offered_while_another_kerno_has_the_data(cx: &mut TestAppC
         ["start-failure-folder", "start-failure-quit"]
     );
     assert!(in_use(cx, window));
-    drop(other);
 }
 
 /// C16: a settings save that fails shows one notification, however many saves fail after it

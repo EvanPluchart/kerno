@@ -11149,7 +11149,11 @@ fn a_key_puts_the_keyboard_in_the_tree_filter(cx: &mut TestAppContext) {
     assert!(in_filter(&app, cx));
     // What is typed filters the tree.
     app.type_text(cx, "shop");
-    assert!(app.tree(cx).iter().any(|row| row.trim() == "shop"));
+    assert!(
+        app.tree(cx).iter().any(|row| row.trim() == "shop"),
+        "{:#?}",
+        app.tree(cx)
+    );
 }
 
 #[gpui_kit::test]
@@ -13230,9 +13234,11 @@ fn the_editor_adds_a_cursor_above_and_below(cx: &mut TestAppContext) {
     app.press(cx, &["secondary-t"]);
     app.type_text(cx, "a\nb\nc");
     // The editor's keys: Cmd+Alt+Up / Down on macOS, Shift+Alt+Up / Down and
-    // Ctrl+Home on Linux (K65).
+    // Ctrl+Home on Linux (K65), Ctrl+Alt+Up / Down and Ctrl+Home on Windows (K68).
     let (above, below, start) = if cfg!(target_os = "macos") {
         ("cmd-alt-up", "cmd-alt-down", "cmd-up")
+    } else if cfg!(windows) {
+        ("ctrl-alt-up", "ctrl-alt-down", "ctrl-home")
     } else {
         ("shift-alt-up", "shift-alt-down", "ctrl-home")
     };

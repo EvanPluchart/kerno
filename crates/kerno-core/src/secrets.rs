@@ -1,7 +1,8 @@
 //! Where passwords and passphrases live (K33, D-106): Kerno's own encrypted
 //! file ([`FileSecretStore`], the default on macOS) or the operating
 //! system's store ([`OsSecretStore`]: macOS Keychain, Linux Secret Service,
-//! the default on Linux), as Settings ▸ Passwords says. Never in plain text.
+//! Windows Credential Manager; the default on Linux and Windows), as
+//! Settings ▸ Passwords says. Never in plain text.
 //!
 //! Kerno's file keeps the passwords out of plain sight (a backup or a copy
 //! of the file, a file search, a shared screen, another user of the
@@ -248,6 +249,8 @@ impl<S: SecretStore> SecretStore for CachedSecretStore<S> {
 /// The name of the system store, as Settings shows it.
 pub const SYSTEM_STORE_NAME: &str = if cfg!(target_os = "macos") {
     "macOS Keychain"
+} else if cfg!(windows) {
+    "Windows Credential Manager"
 } else {
     "Secret Service"
 };

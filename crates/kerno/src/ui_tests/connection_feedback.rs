@@ -67,8 +67,14 @@ fn a_refused_connection_says_so_in_plain_words(cx: &mut TestAppContext) {
         ),
     );
     app.click(cx, "conn-test");
+    // The system's own words, shown below Kerno's: Windows says them its way (K68).
+    let (refused, lookup) = if cfg!(windows) {
+        ("actively refused", "No such host is known")
+    } else {
+        ("Connection refused", "lookup")
+    };
     app.wait_until(cx, "the failed test", |app, cx| {
-        app.has(cx, "conn-test-failed") && paints(app, cx, "Connection refused")
+        app.has(cx, "conn-test-failed") && paints(app, cx, refused)
     });
     // The plain words first, the raw message of the driver below.
     assert!(paints(
@@ -104,8 +110,8 @@ fn a_refused_connection_says_so_in_plain_words(cx: &mut TestAppContext) {
         cx,
         "Check the host name; for a server on this computer, use localhost."
     ));
-    assert!(paints(&app, cx, "lookup"), "{:?}", painted(&app, cx));
-    assert!(!paints(&app, cx, "Connection refused"));
+    assert!(paints(&app, cx, lookup), "{:?}", painted(&app, cx));
+    assert!(!paints(&app, cx, refused));
 }
 
 #[gpui_kit::test]

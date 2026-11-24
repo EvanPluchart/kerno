@@ -259,29 +259,43 @@ pub struct Explained {
 }
 
 /// Texts the operating system gives for a host name that does not resolve
-/// (macOS, then Linux).
-const HOST_NOT_FOUND: [&str; 5] = [
+/// (macOS, then Linux, then Windows' WSAHOST_NOT_FOUND, WSATRY_AGAIN and
+/// WSANO_DATA, which Windows words in the user's language).
+const HOST_NOT_FOUND: [&str; 8] = [
     "failed to lookup address information",
     "nodename nor servname",
     "Name or service not known",
     "Temporary failure in name resolution",
     "No address associated with hostname",
+    "os error 11001",
+    "os error 11002",
+    "os error 11004",
 ];
 
-const REFUSED: [&str; 3] = ["Connection refused", "os error 61", "os error 111"];
+/// macOS, Linux, then Windows' WSAECONNREFUSED.
+const REFUSED: [&str; 4] = [
+    "Connection refused",
+    "os error 61",
+    "os error 111",
+    "os error 10061",
+];
 
 /// Kerno's own "no answer from" (both drivers' connect timeout and the SSH
 /// tunnel's), tokio-postgres' "connection timed out", mysql_async's wait,
-/// and the OS's timeouts and unreachable routes (macOS 60, Linux 110).
-const TIMED_OUT: [&str; 8] = [
+/// and the OS's timeouts and unreachable routes (macOS 60, Linux 110,
+/// Windows 10060; Windows' unreachable network and host, 10051 and 10065).
+const TIMED_OUT: [&str; 11] = [
     "no answer from",
     "no answer after",
     "connection timed out",
     "timeout waiting for server",
     "os error 60",
     "os error 110",
+    "os error 10060",
     "No route to host",
     "Network is unreachable",
+    "os error 10051",
+    "os error 10065",
 ];
 
 /// Part of the driver's message when a server's TLS is older than what
@@ -946,6 +960,27 @@ mod tests {
                 "could not connect: Connection refused (os error 111)",
                 Refused,
                 "Nothing answers on studio:5432.",
+            ),
+            // Windows' own words (a runner, K68).
+            (
+                "could not connect: error connecting to server: No connection could be made \
+                 because the target machine actively refused it. (os error 10061)",
+                Refused,
+                "Nothing answers on studio:5432.",
+            ),
+            (
+                "could not connect: error connecting to server: No such host is known. (os error \
+                 11001)",
+                HostNotFound,
+                "Host “studio” was not found.",
+            ),
+            (
+                "could not connect: error connecting to server: A connection attempt failed \
+                 because the connected party did not properly respond after a period of time, or \
+                 established connection failed because connected host has failed to respond. (os \
+                 error 10060)",
+                TimedOut,
+                "studio:5432 did not answer in time.",
             ),
             // Timed out.
             (

@@ -29,6 +29,20 @@ fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Whether the stand-in tools of [`fake_tool`] run here: they are `/bin/sh`
+/// scripts, and Windows runs a client tool only as an `.exe` (K68). A test
+/// built on running them prints why and stops on Windows; Windows' real
+/// tools are run by the tests that use the installed client.
+pub(super) fn fake_tools_run() -> bool {
+    if cfg!(windows) {
+        eprintln!(
+            "SKIPPED: the stand-in client tools are /bin/sh scripts, and Windows runs a client \
+             tool only as an .exe"
+        );
+    }
+    !cfg!(windows)
+}
+
 /// A stand-in client: the folder `root/name` holding every tool of
 /// `family`, each one `fake_tool(…, version, body)`. Its real path.
 pub(super) fn fake_client(
@@ -102,7 +116,13 @@ impl Fixture {
             let state = cx.update(|cx| dialog.read(cx).state(cx));
             ends.iter().any(|end| state.starts_with(end))
         });
-        cx.update(|cx| dialog.read(cx).state(cx))
+        let state = cx.update(|cx| dialog.read(cx).state(cx));
+        // What the tool said, for the message of a test that did not expect a failure.
+        if state.starts_with("failed") {
+            let log = cx.update(|cx| dialog.read(cx).log());
+            eprintln!("the tool's log:\n{}", log.join("\n"));
+        }
+        state
     }
 
     pub(super) fn wizard_state(
@@ -241,6 +261,9 @@ fn written(cx: &mut TestAppContext, dialog: &Entity<BackupDialog>) -> PathBuf {
 
 #[gpui_kit::test]
 fn a_backup_tool_is_found_or_chosen_and_its_output_streams(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -600,6 +623,9 @@ fn a_file_with_client_commands_is_refused_until_explicitly_allowed(cx: &mut Test
 
 #[gpui_kit::test]
 fn a_restore_asks_twice_on_production_and_is_refused_on_read_only(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -663,6 +689,9 @@ fn a_restore_asks_twice_on_production_and_is_refused_on_read_only(cx: &mut TestA
 
 #[gpui_kit::test]
 fn a_running_backup_is_cancelled_from_the_progress_page(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::MySql) {
         return;
     }
@@ -1147,6 +1176,9 @@ fn a_restore_asks_with_its_command_and_restores(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn an_older_client_warns_before_running(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -1225,6 +1257,9 @@ impl Fixture {
 
 #[gpui_kit::test]
 fn a_connection_overrides_the_local_client(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -1308,6 +1343,9 @@ fn a_connection_overrides_the_local_client(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn settings_lists_local_clients_and_sets_the_default(cx: &mut TestAppContext) {
+    if !fake_tools_run() {
+        return;
+    }
     let app = open(cx, memory_storage());
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();

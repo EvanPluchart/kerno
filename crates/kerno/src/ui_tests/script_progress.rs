@@ -12,6 +12,9 @@ use crate::backup_dialog::Mode;
 
 #[gpui_kit::test]
 fn a_script_shows_how_much_was_sent_and_cancels_at_once(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::MySql) {
         return;
     }

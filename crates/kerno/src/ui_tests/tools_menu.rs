@@ -328,12 +328,14 @@ fn foreign_data_wrappers_create_a_server_a_mapping_and_import_a_schema(cx: &mut 
         listing(cx).is_some_and(|read| read.wrappers.contains(&"postgres_fdw".to_string()))
     });
 
-    // The form, its password typed for this run.
+    // The form, its password typed for this run. The server reaches itself on the port it
+    // listens on: 5432 in the container, the tests' port on a Windows runner (K68).
     let user = testing::config(Engine::Postgres).user;
+    let port = on_database(Engine::Postgres, None, "SHOW port");
     for (id, text) in [
         ("fdw-server", "kerno_ui_tools_loop"),
         ("fdw-host", "localhost"),
-        ("fdw-port", "5432"),
+        ("fdw-port", port.as_str()),
         ("fdw-dbname", database),
         ("fdw-user", user.as_str()),
         ("fdw-password", testing::DB_PASSWORD),

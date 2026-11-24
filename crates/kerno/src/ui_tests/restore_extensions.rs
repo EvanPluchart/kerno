@@ -105,6 +105,9 @@ fn client(root: &Path) -> PathBuf {
 /// nothing. The list file is removed after the run.
 #[gpui_kit::test]
 fn what_the_server_lacks_is_said_and_left_out_before_the_run(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -215,6 +218,9 @@ fn what_the_server_lacks_is_said_and_left_out_before_the_run(cx: &mut TestAppCon
 /// and one retry leaves out both, through the same confirmation.
 #[gpui_kit::test]
 fn a_failed_extension_and_owner_are_said_and_one_retry_leaves_out_both(cx: &mut TestAppContext) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }

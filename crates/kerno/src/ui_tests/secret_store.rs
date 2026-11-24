@@ -79,6 +79,10 @@ fn the_passwords_setting_shows_changes_and_is_stored(cx: &mut TestAppContext) {
             "macOS Keychain: guarded by your login",
             "asks for your password again after every update",
         ]);
+    } else if cfg!(windows) {
+        parts.push("Windows Credential Manager: guarded by your Windows login");
+    } else {
+        parts.push("Secret Service: GNOME Keyring or KWallet");
     }
     for part in parts {
         assert!(said.contains(part), "{part}: {said}");

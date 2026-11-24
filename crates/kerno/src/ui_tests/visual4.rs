@@ -191,6 +191,9 @@ fn a_failed_connection_shows_its_whole_message_in_details(cx: &mut TestAppContex
 fn the_local_client_panel_says_what_the_server_asks_and_disables_older_clients(
     cx: &mut TestAppContext,
 ) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
@@ -266,6 +269,9 @@ fn the_local_client_panel_says_what_the_server_asks_and_disables_older_clients(
 fn restore_and_script_find_their_client_before_the_file_and_take_a_typed_path(
     cx: &mut TestAppContext,
 ) {
+    if !super::tool_wizards::fake_tools_run() {
+        return;
+    }
     if !testing::available(Engine::Postgres) {
         return;
     }
