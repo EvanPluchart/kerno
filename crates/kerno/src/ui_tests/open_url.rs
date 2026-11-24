@@ -201,7 +201,7 @@ fn urls_handed_over_through_the_socket_open_in_the_same_window(cx: &mut TestAppC
         return;
     }
     let app = open(cx, memory_storage());
-    let socket = instance::socket_path(app._data_dir.path());
+    let socket = instance::socket_path(app._data_dir.path()).unwrap();
     let listener = instance::listen(&socket).unwrap().expect("nobody listens");
     let (workspace, connections) = (app.workspace.clone(), app.connections.clone());
     app.step(cx, |window, cx| {

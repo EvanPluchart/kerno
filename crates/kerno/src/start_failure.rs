@@ -184,9 +184,7 @@ pub fn open(error: &anyhow::Error, paths: Option<AppPaths>, url: Option<Secret>,
     if let Err(error) = theme::init(Appearance::System, cx) {
         tracing::warn!(%error, "the theme did not load for the start-failure window");
     }
-    let in_use = paths
-        .as_ref()
-        .is_some_and(|paths| UnixStream::connect(instance::socket_path(&paths.data_dir)).is_ok());
+    let in_use = paths.as_ref().is_some_and(|paths| in_use(&paths.data_dir));
     let view = FailureWindow {
         failure: start_failure(error),
         paths,
@@ -217,6 +215,11 @@ pub fn open(error: &anyhow::Error, paths: Option<AppPaths>, url: Option<Secret>,
     }
 }
 
+/// Whether a running Kerno holds the instance socket of `data_dir`.
+fn in_use(data_dir: &std::path::Path) -> bool {
+    instance::socket_path(data_dir).is_ok_and(|socket| UnixStream::connect(socket).is_ok())
+}
+
 impl FailureWindow {
     /// "Start fresh" is shown.
     fn offers_start_fresh(&self) -> bool {
@@ -242,7 +245,7 @@ impl FailureWindow {
             return;
         }
         // Another Kerno may have opened this data since the window did.
-        self.in_use = UnixStream::connect(instance::socket_path(&paths.data_dir)).is_ok();
+        self.in_use = in_use(&paths.data_dir);
         if self.in_use {
             cx.notify();
             return;

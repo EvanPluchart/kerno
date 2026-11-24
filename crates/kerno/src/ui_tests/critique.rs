@@ -2522,7 +2522,7 @@ fn a_start_failure_opens_a_window_that_says_what_happened(cx: &mut TestAppContex
 fn start_fresh_is_not_offered_while_another_kerno_has_the_data(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (data, paths, error) = k8_newer_store();
-    let socket = kerno_core::instance::socket_path(&paths.data_dir);
+    let socket = kerno_core::instance::socket_path(&paths.data_dir).unwrap();
     let in_use = |cx: &mut TestAppContext, window| {
         k8_in(cx, window, |window, _| {
             use gpui_kit::test::TestQueryExt as _;

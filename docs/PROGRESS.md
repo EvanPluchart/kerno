@@ -1542,3 +1542,9 @@ Still open (for the owner):
 - Each save panel (an export, a backup, a schema document, a diagram, the connections' export, a saved script, a
   new database file) opened in the home folder. Each kind now opens in the folder it last saved in, the home
   folder when that folder is gone.
+- With a long data directory, the single-instance socket could not be opened ("path must be shorter than
+  SUN_LEN" at each start) and `kerno <url>` no longer reached the running Kerno. Such a directory now gets a
+  short socket in a private folder of the user's runtime or temporary directory, found the same way by both.
+- Tests: `ui_tests::k56` (8; PostgreSQL where a server is needed, fixtures read only) and the core test
+  `instance::tests::a_long_data_directory_gets_a_short_socket_of_its_own`, each seen failing under a mutation
+  (`docs/plans/M12.md`, K56).

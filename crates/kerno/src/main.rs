@@ -173,7 +173,8 @@ fn main() {
     // One running instance: it opens the URL and comes to the front.
     if let Some(url) = &url
         && let Ok(paths) = &paths
-        && instance::send(&instance::socket_path(&paths.data_dir), url.expose()).is_ok()
+        && let Ok(socket) = instance::socket_path(&paths.data_dir)
+        && instance::send(&socket, url.expose()).is_ok()
     {
         return;
     }
@@ -241,8 +242,8 @@ type Loaded = (Startup, Listener);
 /// UI thread.
 fn load(paths: &AppPaths) -> anyhow::Result<Loaded> {
     Startup::load(paths).map(|startup| {
-        let socket = instance::socket_path(&startup.paths.data_dir);
-        let listener = instance::listen(&socket);
+        let listener = instance::socket_path(&startup.paths.data_dir)
+            .and_then(|socket| instance::listen(&socket));
         // What a run that crashed left of its unsaved connections (J4);
         // only by the instance that holds the socket: a second one
         // beside it must not touch the first one's.
