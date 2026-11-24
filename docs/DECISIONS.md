@@ -3899,7 +3899,9 @@ foreign key was marked only in a table's data and in a result that could be edit
 - **One query, then the catalog.** On PostgreSQL every table of a result is named in one query
   (`Dialect::origin_names_sql`, `pg_class`/`pg_attribute` for the numbers seen), on the connection's own session
   in the result's database or one opened for it, never the tab's (the session RES-51 uses, now `side_session`),
-  off the UI thread, once per result. The keys come from the completion catalog the tab already holds (each
+  off the UI thread. The names are kept in the tab (cleared whenever its catalog is read again, so never across
+  databases): a result read again (a filter, a sort, each auto-refresh) or another result over the same tables
+  asks nothing. The keys come from the completion catalog the tab already holds (each
   relation's foreign keys): no table structure is read. The marks come after the grid's first layout: a column
   that gains one is drawn again wide enough for it (seen in a capture: the type beside it cut to a dot), the
   others keep the width they have. A result that comes before the catalog is marked when it
@@ -3924,8 +3926,13 @@ foreign key was marked only in a table's data and in a result that could be edit
   value panel's preview of the row still leaves a binary key out (it reads the row through text literals).
 - **A table read twice** (a self-join) cannot be told apart by origins: a key's column is taken from the first
   column of the result that shows it.
+- **SQLite's results stay read-only, with their own reason.** Now that their columns name a table, the RES-51
+  check goes on to look the table up, which SQLite has no query for: the reason said was "no column comes from
+  a table" under columns showing marks. It now says "on this engine a query's rows are not edited here; open the
+  table from the tree to edit them" (`ReadOnly::NotOnThisEngine`).
 - **Measured.** 300 columns over 20 tables (PostgreSQL, debug build): naming them 1.57 ms, with the keys 1.68 ms
-  (BENCH.md). The frame times of K49 were not measured again: per frame the grid still looks up one key list per
+  (BENCH.md); in the app under a UI test, from the result's columns arriving to the marks set, 39 to 74 ms (the
+  test's executor turning between frames of a 300-column grid in a debug build). The frame times of K49 were not measured again: per frame the grid still looks up one key list per
   header and works out jumps only for the hovered or selected cell.
 
 ## D-124 — A DBeaver tunnel's jump servers, and what an import leaves out said with what to do (K58; 2026-11-23)

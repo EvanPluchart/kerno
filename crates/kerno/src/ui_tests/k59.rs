@@ -415,6 +415,33 @@ fn a_join_and_an_alias_are_marked_and_followed(cx: &mut TestAppContext) {
         assert_eq!(filter.conditions.len(), 1, "{engine:?}");
         assert_eq!(app.data_rows(cx).len(), 1, "{engine:?}");
 
+        // Read again filtered, the result keeps its marks and asks no names
+        // again (PostgreSQL asked once; MySQL names its tables itself).
+        app.step(cx, |window, cx| {
+            window.dispatch_action(Box::new(actions::CloseTab), cx)
+        });
+        let tab = app.tab(cx);
+        let asked = cx.update(|cx| tab.read(cx).names_asked());
+        assert_eq!(asked, usize::from(engine == Engine::Postgres), "{engine:?}");
+        app.step(cx, |window, cx| {
+            tab.update(cx, |tab, cx| tab.filter_result("id > 0", window, cx))
+        });
+        app.wait_until(cx, "the filtered rows", |app, cx| {
+            let filtered = cx.update(|cx| {
+                tab.read(cx)
+                    .result_requery()
+                    .0
+                    .is_some_and(|requery| requery.filter == "id > 0")
+            });
+            filtered && !app.running(cx)
+        });
+        wait_mark(&app, cx, 2, &customers);
+        assert_eq!(
+            cx.update(|cx| tab.read(cx).names_asked()),
+            asked,
+            "{engine:?}"
+        );
+
         // An alias keeps the mark: the column is the table's.
         app.run_in_new_tab(
             cx,
@@ -568,6 +595,13 @@ fn a_sqlite_join_is_marked_and_followed(cx: &mut TestAppContext) {
     opened(&app, cx, 2);
     assert_eq!(shown(&app, cx).0, TableRef::new("main", "customers"));
     assert_eq!(app.data_rows(cx).len(), 1);
+    // A result of one table, marked, says why its rows are not edited
+    // there: not "no column comes from a table" under its marks.
+    app.run_in_new_tab(cx, "select id, customer_id from orders", "secondary-enter");
+    rows(&app, cx);
+    wait_mark(&app, cx, 2, "→ main.customers (id)");
+    let why = app.result_verdict(cx).expect("read-only");
+    assert!(why.contains("open the table from the tree"), "{why}");
 }
 
 /// A result of 300 columns over 20 tables (PostgreSQL): its 19 keys are

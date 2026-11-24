@@ -579,6 +579,17 @@ pub struct QueryTab {
     catalog: SharedCatalog,
     /// The catalog being loaded. Replacing it drops the older load.
     catalog_load: Option<Task<()>>,
+    /// PostgreSQL's table and column numbers met in results, named (K59):
+    /// a result read again (a filter, a sort, auto-refresh) asks nothing.
+    /// Cleared whenever the catalog is read again (another database, a
+    /// changed schema).
+    origin_names: kerno_core::links::Names,
+    /// Counts the clearings of `origin_names`: names asked before the last
+    /// one are not kept.
+    origin_epoch: u64,
+    /// How many times tables were named on the server; for tests.
+    #[cfg(test)]
+    names_asked: usize,
     /// Source mode: the text replaces an object of this schema (MySQL
     /// database), and "Apply source" runs all of it.
     source: Option<String>,
@@ -829,6 +840,10 @@ impl QueryTab {
             placed: 0,
             catalog: SharedCatalog::default(),
             catalog_load: None,
+            origin_names: Default::default(),
+            origin_epoch: 0,
+            #[cfg(test)]
+            names_asked: 0,
             source: None,
             editor_options,
             next_requery: None,
@@ -1535,6 +1550,8 @@ impl QueryTab {
     /// Loads (again) what completion offers: from the connection's own
     /// session when the tab is in its database, else from the tab's.
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        self.origin_names.clear();
+        self.origin_epoch += 1;
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -4214,11 +4231,14 @@ impl QueryTab {
         if columns.iter().all(|column| column.origin.is_none()) {
             return;
         }
-        let numbered = columns
-            .iter()
-            .any(|column| matches!(column.origin, Some(kerno_core::ColumnOrigin::Oid { .. })));
-        if !numbered {
-            let named = kerno_core::links::named(&columns, &Default::default());
+        // The tables not named yet: none on MySQL, MariaDB and SQLite, none
+        // for a result read again.
+        let missing: Vec<u32> = kerno_core::links::numbered_tables(&columns)
+            .into_iter()
+            .filter(|table| !self.origin_names.keys().any(|(known, _)| known == table))
+            .collect();
+        if missing.is_empty() {
+            let named = kerno_core::links::named(&columns, &self.origin_names);
             if let Some(pane) = self.pane_mut(id) {
                 pane.origins = Some(named);
             }
@@ -4228,19 +4248,30 @@ impl QueryTab {
         let Some(session) = self.side_session(id, cx) else {
             return;
         };
+        let epoch = self.origin_epoch;
+        #[cfg(test)]
+        {
+            self.names_asked += 1;
+        }
         let naming = bridge::spawn(cx, async move {
             let (session, close) = session.await?;
-            let named = kerno_core::links::named_origins(&session, &columns)
+            let names = kerno_core::links::name_tables(&session, &missing)
                 .await
                 .map_err(|error| error.to_string());
             if close {
                 session.close().await;
             }
-            named
+            names
         });
         let task = cx.spawn_in(window, async move |this, cx| match naming.await {
-            Ok(named) => {
+            Ok(names) => {
                 let _ = this.update(cx, |this, cx| {
+                    let named = if this.origin_epoch == epoch {
+                        this.origin_names.extend(names);
+                        kerno_core::links::named(&columns, &this.origin_names)
+                    } else {
+                        kerno_core::links::named(&columns, &names)
+                    };
                     if let Some(pane) = this.pane_mut(id) {
                         pane.origins = Some(named);
                     }
@@ -5947,6 +5978,12 @@ impl QueryTab {
     #[cfg(test)]
     pub fn typed_result_filter(&self, cx: &App) -> String {
         self.result_filter.read(cx).value().to_string()
+    }
+
+    /// How many times tables were named on the server (K59); for tests.
+    #[cfg(test)]
+    pub fn names_asked(&self) -> usize {
+        self.names_asked
     }
 
     /// The filter field above the result; for tests.

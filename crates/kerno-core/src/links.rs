@@ -11,6 +11,9 @@ use crate::result::{Column, ColumnOrigin, ResultStore};
 use crate::schema::{ForeignKeyInfo, TableRef};
 use crate::sql::Catalog;
 
+/// PostgreSQL's table and column numbers, named: the table and the column.
+pub type Names = HashMap<(u32, i16), (TableRef, String)>;
+
 /// The table and the table column each column of a result shows, from what
 /// the server sent with it ([`Column::origin`]): MySQL, MariaDB and SQLite
 /// name them; PostgreSQL numbers them, named here on `session` (in the
@@ -23,6 +26,13 @@ pub async fn named_origins(
     session: &Arc<dyn Session>,
     columns: &[Column],
 ) -> crate::Result<Vec<Option<(TableRef, String)>>> {
+    let names = name_tables(session, &numbered_tables(columns)).await?;
+    Ok(named(columns, &names))
+}
+
+/// The tables a result's columns come from that the server gave by number
+/// (PostgreSQL), each once.
+pub fn numbered_tables(columns: &[Column]) -> Vec<u32> {
     let mut tables: Vec<u32> = Vec::new();
     for column in columns {
         if let Some(ColumnOrigin::Oid { table, .. }) = column.origin
@@ -31,41 +41,47 @@ pub async fn named_origins(
             tables.push(table);
         }
     }
-    let mut names: HashMap<(u32, i16), (TableRef, String)> = HashMap::new();
-    if let Some(sql) = session.dialect().origin_names_sql(&tables) {
-        let mut answer = exec::collect(session.clone(), sql)
-            .await?
-            .results
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let mut rows = ResultStore::new(answer.columns.clone());
-        for batch in answer.batches.drain(..) {
-            rows.push(batch);
-        }
-        let text = |row: usize, column: usize| rows.text(row, column).unwrap_or_default();
-        for row in 0..rows.row_count() {
-            let (Ok(table), Ok(number)) = (text(row, 0).parse(), text(row, 3).parse()) else {
-                continue;
-            };
-            names.insert(
-                (table, number),
-                (
-                    TableRef::new(text(row, 1), text(row, 2)),
-                    text(row, 4).into(),
-                ),
-            );
-        }
+    tables
+}
+
+/// The columns of the tables numbered `tables`, named on `session` in one
+/// query; nothing on engines that name their tables themselves.
+///
+/// Must be called from within the Tokio runtime.
+pub async fn name_tables(session: &Arc<dyn Session>, tables: &[u32]) -> crate::Result<Names> {
+    let mut names = Names::new();
+    let Some(sql) = session.dialect().origin_names_sql(tables) else {
+        return Ok(names);
+    };
+    let mut answer = exec::collect(session.clone(), sql)
+        .await?
+        .results
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let mut rows = ResultStore::new(answer.columns.clone());
+    for batch in answer.batches.drain(..) {
+        rows.push(batch);
     }
-    Ok(named(columns, &names))
+    let text = |row: usize, column: usize| rows.text(row, column).unwrap_or_default();
+    for row in 0..rows.row_count() {
+        let (Ok(table), Ok(number)) = (text(row, 0).parse(), text(row, 3).parse()) else {
+            continue;
+        };
+        names.insert(
+            (table, number),
+            (
+                TableRef::new(text(row, 1), text(row, 2)),
+                text(row, 4).into(),
+            ),
+        );
+    }
+    Ok(names)
 }
 
 /// The table and the table column each column of a result shows: those
 /// the server named, and those PostgreSQL numbered as `names` names them.
-pub fn named(
-    columns: &[Column],
-    names: &HashMap<(u32, i16), (TableRef, String)>,
-) -> Vec<Option<(TableRef, String)>> {
+pub fn named(columns: &[Column], names: &Names) -> Vec<Option<(TableRef, String)>> {
     columns
         .iter()
         .map(|column| match column.origin.as_ref()? {

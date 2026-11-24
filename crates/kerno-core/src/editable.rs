@@ -31,6 +31,9 @@ pub enum ReadOnly {
     Shape(&'static str),
     /// Every column is an expression or a literal.
     NoTableColumn,
+    /// The engine names the table, but Kerno edits its rows from the
+    /// table's own tab only (SQLite, K59).
+    NotOnThisEngine,
     /// Columns of several tables.
     SeveralTables,
     /// The table of the columns was not found (dropped since).
@@ -54,6 +57,7 @@ impl ReadOnly {
             Self::NotSelect => "not a single SELECT",
             Self::Shape(what) => what,
             Self::NoTableColumn => "no column of a table",
+            Self::NotOnThisEngine => "edited from the table's tab",
             Self::SeveralTables => "columns of several tables",
             Self::Gone => "table not found",
             Self::View(..) => "view",
@@ -77,6 +81,10 @@ impl fmt::Display for ReadOnly {
             Self::NotSelect => write!(f, "the statement {NOT_A_SELECT}."),
             Self::Shape(what) => write!(f, "the statement {what}."),
             Self::NoTableColumn => f.write_str("no column comes from a table."),
+            Self::NotOnThisEngine => f.write_str(
+                "on this engine a query's rows are not edited here; open the table from the tree \
+                 to edit them.",
+            ),
             Self::SeveralTables => f.write_str("its columns come from several tables."),
             Self::Gone => f.write_str("the table of its columns was not found."),
             Self::View(table, RelationKind::MaterializedView) => write!(
@@ -263,7 +271,7 @@ pub async fn lookup(
     let sql = session
         .dialect()
         .origin_sql(source)
-        .ok_or(ReadOnly::NoTableColumn)?;
+        .ok_or(ReadOnly::NotOnThisEngine)?;
     let mut answer = exec::collect(session.clone(), sql)
         .await
         .map_err(unread)?

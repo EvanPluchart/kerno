@@ -236,8 +236,10 @@ Between a result's rows on screen and its marks lie, on PostgreSQL, one query na
 (its tables' numbers in the row description) and the match of their keys against the completion catalog the tab
 already holds; MySQL, MariaDB and SQLite name their columns themselves and skip the query. Measured on
 2026-11-24 (debug build, the machine busy) by `kerno-postgres` `edits::three_hundred_columns_over_twenty_tables_are_named_in_one_query`,
-300 columns over 20 joined scratch tables, 19 keys: names 1.57 ms, names and keys 1.68 ms. The marks show on the
-frame after. The grid's frame cost is that of K49 (a key looked up per header and per hovered or selected cell,
+300 columns over 20 joined scratch tables, 19 keys: names 1.57 ms, names and keys 1.68 ms. In the app, a
+temporary probe in a UI test (debug, `ui_tests::k59`, not committed) gave 39 to 74 ms from the result's columns
+arriving to the marks set, three results: that includes the test executor's turns between frames of the grid.
+The marks show on the frame after. The names are kept in the tab: a result read again asks nothing. The grid's frame cost is that of K49 (a key looked up per header and per hovered or selected cell,
 the keys worked out once per result); the frame times above were not measured again.
 
 ## Reproducing
