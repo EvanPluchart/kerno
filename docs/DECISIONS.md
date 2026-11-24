@@ -4784,3 +4784,52 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
   ONLY`), not `FLUSH TABLES WITH READ LOCK`, which writes nothing; not tested. The catalog and the lock are on
   Kerno's own session, as the connection's user, also when the tools run as another user. No pass in the real
   app; captures rendered offscreen.
+
+## D-137 — Windows, step 3b: the test suites against real servers, and the app at work (K68; 2026-11-24)
+
+The owner's pick "A3": the Windows preview had been launched once, never tested. This replaces "nobody has used
+it" with what a runner can show; a person's use is still to come.
+
+- **What is proved, and what is not.** GitHub's `windows-2025` runner runs `cargo test --workspace` against a
+  PostgreSQL 17 and a MySQL 8.4 seeded as the `kerno-*` containers, and the packaged `kerno.exe` is driven
+  there by keys for five pictures (`docs/screenshots/final/m12-windows-*.png`). Not on the runner: MariaDB, the
+  SSH servers, the legacy MySQL servers (their tests skip as when a container is down), and a person.
+- **The servers are the image's own**, initialised by `scripts/windows-test-servers.sh` with the containers'
+  ports, role, password, options, certificates and seed: throwaway servers made for the tests, nothing
+  downloaded. Two choices differ from a plain Windows install, to be the container's server: MySQL keeps
+  names' case (`lower_case_table_names=2`; Windows' default 1 lowers them), and PostgreSQL's cluster is
+  `en-US` (Windows' collation, which does not skip punctuation as glibc's does: the tests that relied on
+  glibc's order now use names or an ICU collation that sort the same everywhere). MySQL runs as a Windows
+  service: the runner stops what a step started when the step ends.
+- **A finer switch than `KERNO_REQUIRE_CONTAINERS`.** `KERNO_REQUIRE_SERVERS=kerno-postgres,kerno-mysql`
+  fails a test whose named server is down and lets the others skip: a server that failed to start fails the
+  run instead of skipping 800 tests.
+- **Windows defects fixed** (macOS and Linux unchanged): connection errors in Windows' own words (WSA codes
+  10061, 11001, 11002, 11004, 10060, 10051, 10065) are told in plain words with their next step; MySQL's
+  client version is the word after `Ver`, not a number of `mysql.exe`'s folder (`MySQL Server 8.4` gave 8.4.0
+  for 8.4.13, and the client's own switch for client commands was left out); `--file=` and pg_restore's input
+  drop `\\?\` before a drive letter (pg_dump's folder format writes `<folder>/toc.dat`, and pg_restore reads it,
+  which that form refuses); the dialogs name
+  `pg_dump`, not `pg_dump.exe`; Settings ▸ Passwords names Windows Credential Manager, the store `keyring`
+  uses there, instead of the Secret Service.
+- **A defect everywhere that Windows showed**: against a PostgreSQL server that runs on Windows, a cancel was
+  reported as failed ("could not send the cancel request") although the statement stopped: that server ends
+  the cancel connection with a reset, our end's FIN unread. Kerno waits for the server to close that connection
+  (so that the cancel cannot hit the next statement); a reset on that read, after the request's bytes were
+  written, now counts as the close, as libpq ignores that read's errors. An error before or while writing the
+  request is still said. The client's system does not matter: a Kerno on macOS or Linux talking to a server on
+  Windows had the same error. Worth a line in the release notes.
+- **Tests made true on Windows, none weakened**: `tasklist` for a process's memory, the editor's Ctrl+Alt+Up /
+  Down (the kit's Windows keys), Windows' words for a refused connection, the pipe of "another Kerno" served
+  as a running one serves it, a URL handed over without its password (D-131), the port a server says for its
+  own loopback, the PostgreSQL tools found where Kerno finds them. 17 tests whose stand-in client tools are
+  `/bin/sh` scripts stop on Windows with a `SKIPPED` line saying so: Windows runs a client tool only as an
+  `.exe`, and writing stand-ins as executables would take a compiled helper. K67's runner tests and the tests
+  that use the installed client run Windows' real `pg_dump.exe`, `pg_restore.exe`, `psql.exe`,
+  `mysqldump.exe` and `mysql.exe`.
+- **Windows' defaults** are the Linux ones where the reason is the same: Ctrl for ⌘, Query History on
+  Ctrl+Alt+E (Ctrl+Y is the text fields' Redo there too), Ctrl+Home; the kit adds cursors with Ctrl+Alt+Up /
+  Down on Windows (Shift+Alt on Linux). `actions::HOST_OS` stays `Linux` on Windows: it only parses keys, the
+  same for both, and the kit draws the Windows key "Win" on both.
+- **Left as found**: no menu bar on Windows, as on Linux (GPUI draws none outside macOS; the toolbar and the
+  palette hold every command); `actions::RECORD_RULE` calls the Windows key "Super", the Linux word.

@@ -114,8 +114,8 @@ and AI keys you save are kept:
   or another user of the computer shows nothing. It does not keep them from a program running under your
   account, which can read both files: the level of DBeaver's saved passwords, `~/.pgpass` or an SSH key
   without a passphrase.
-- **macOS Keychain** or **Secret Service** (the default on Linux: GNOME Keyring, KWallet): the system's store,
-  guarded by your login. On macOS, Kerno's builds are not signed with an Apple Developer ID, so the Keychain asks
+- **macOS Keychain**, **Secret Service** (the default on Linux: GNOME Keyring, KWallet) or **Windows Credential
+  Manager** (the default on Windows): the system's store, guarded by your login. On macOS, Kerno's builds are not signed with an Apple Developer ID, so the Keychain asks
   for your login password again, once per saved password, after every update. On Linux without a Secret
   Service running, passwords are kept until Kerno quits (the status bar says so).
 
@@ -987,7 +987,8 @@ Oracle's archived binaries, checked against Oracle's MD5. `scripts/check.sh` sta
 
 ## Keyboard shortcuts
 
-`Cmd` on macOS is `Ctrl` on Linux; `Ctrl` written alone is the Control key on both systems. Every action is also
+`Cmd` on macOS is `Ctrl` on Linux and Windows, which share every key this guide gives "on Linux" (Ctrl+Y is the
+text fields' Redo on both); `Ctrl` written alone is the Control key everywhere. Every action is also
 reachable from the command palette: type words of a command's name, its section or its keywords, in any order and
 without accents ("theme light", "sql new"); Escape closes it.
 

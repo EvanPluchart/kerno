@@ -67,11 +67,14 @@ once by the CI on every push; a picture of that launch is the only look at the W
 used it. Step 3a is done (K67, D-136): the home folder (`%USERPROFILE%`: `~\.ssh`, libpq's
 `%APPDATA%\postgresql\pgpass.conf`, no MySQL option file), the update check (`curl.exe` of `System32`) and the
 local clients (`pg_dump.exe`, `mysqldump.exe`, … in the installers' folders of Program Files and on `PATH`; a
-backup, a restore and a cancel proved on a runner). A preview until the list below is done. Next, in order:
+backup, a restore and a cancel proved on a runner). Step 3b is done (K68, D-137): the whole test suite runs on
+the runner against a PostgreSQL 17 and a MySQL 8.4 seeded as the containers (`ci.yml`'s `windows` job), what it
+showed is fixed, and the packaged app is driven there by keys for pictures (a connection, a query, a table, the
+connection dialog, Settings). A preview until the list below is done. Next, in order:
 
-1. A pass in the real app on Windows, by a person: the menus, fonts, the secret store (Credential Manager
-   through `keyring`), the instance's pipe, the built-in SSH client and its agent pipe, the backup wizards and
-   Settings ▸ Local clients.
+1. A pass in the real app on Windows, by a person: the secret store (Credential Manager through `keyring`),
+   the instance's pipe, the built-in SSH client and its agent pipe, the backup wizards and Settings ▸ Local
+   clients; whether a menu bar is wanted there (GPUI draws none outside macOS).
 2. A line for Windows in the READMEs' install tables, once a person has used the zip.
 3. The password command's presets (`aws.exe`, `op.exe`), a MariaDB client whose `mysqldump.exe` is not a link
    (D-136), and the start-failure page's advice (it says "Set HOME").
