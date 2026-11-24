@@ -182,8 +182,13 @@ fn a_folded_region_still_runs_and_saves_in_full(cx: &mut TestAppContext) {
         })
     };
     // The statement (line 0), its subquery (line 2) and the `BEGIN … END`
-    // of the `do` body (line 9) fold.
-    assert_eq!(candidates(cx), [0, 2, 9]);
+    // of the `do` body (line 9) fold. The kit parses for 2 ms as the text
+    // is set and, when that is not enough (a loaded machine), again 150 ms
+    // later off the UI thread: the test clock is moved on until it has.
+    app.wait_until(cx, "the fold marks", |_, cx| {
+        cx.executor().advance_clock(Duration::from_millis(200));
+        candidates(cx) == [0, 2, 9]
+    });
     let folded = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let editor = tab.read(cx).editor().read(cx);
@@ -196,10 +201,16 @@ fn a_folded_region_still_runs_and_saves_in_full(cx: &mut TestAppContext) {
         })
     };
     // A click on the gutter's fold mark of `line` (the cursor's line, where
-    // the mark is drawn), left of its text.
-    let fold = |cx: &mut TestAppContext, line: usize| {
+    // the mark is drawn), left of its text. The text stays: setting it again
+    // would parse it again.
+    let fold_at = |cx: &mut TestAppContext, line: usize| {
         let start: usize = script.lines().take(line).map(|text| text.len() + 1).sum();
-        set_text(&app, cx, script, start..start);
+        app.step(cx, |_, cx| {
+            tab.update(cx, |tab, cx| {
+                tab.editor()
+                    .update(cx, |editor, cx| editor.set_selected_range(start..start, cx))
+            })
+        });
         let text_start = cx
             .update(|cx| {
                 tab.read(cx)
@@ -210,14 +221,7 @@ fn a_folded_region_still_runs_and_saves_in_full(cx: &mut TestAppContext) {
             .expect("the line is drawn");
         let mark = gpui_kit::point(text_start.left() - px(13.), text_start.center().y);
         app.step(cx, |window, cx| window.drag(mark, mark, cx));
-    };
-    // The fold marks follow the parse, which under load ends a moment after
-    // the text is set: the click is tried until its mark is there.
-    let fold_at = |cx: &mut TestAppContext, line: usize| {
-        app.wait_until(cx, "the fold", |_, cx| {
-            fold(cx, line);
-            folded(cx) == [line]
-        });
+        assert_eq!(folded(cx), [line], "one click folds");
     };
     fold_at(cx, 0);
     // Running the script runs every statement, the folded lines included.

@@ -359,11 +359,16 @@ fn update_installs_the_checked_release_and_starts_it(cx: &mut TestAppContext) {
     set_phase(&app, cx, Phase::Available(v("0.2.0")));
     // No tab holds a transaction or a pending change: no question, the install follows.
     app.click(cx, "status-update-button");
+    // The new Kerno has started once it read the store: the fake runner
+    // lists the `open` call before it runs it, on another thread.
     app.wait_until(cx, "the relaunch", |_, _| {
+        stored_at_start.lock().unwrap().is_some()
+    });
+    assert!(
         fake.calls()
             .iter()
             .any(|(program, _)| program.ends_with("open"))
-    });
+    );
     assert_eq!(phase(cx), Phase::Installing(v("0.2.0")));
     assert_eq!(bundle_says(&bundle), "new");
     let stored = stored_at_start.lock().unwrap().clone();
