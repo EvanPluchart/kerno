@@ -4361,10 +4361,9 @@ The owner asked for the Windows package in the release itself, not only a build 
 - **A preview, said as one** in the release notes until a person has used it: no update check (it runs
   `/usr/bin/curl`), no home folder (`~/.ssh`, `.pgpass`), no detection of the local clients, no OpenSSH
   tunnel, private files that rely on the profile's access list (D-131).
-- **The dry run's draft from a branch is refused.** "Run workflow" with "draft" from a branch other than
-  `main` built the nine files, then GitHub answered HTTP 403 to the creation of the release with the job's
-  token, which had `contents: write`. My reading, not proved: a release whose target is a commit that changes
-  workflow files needs a permission the job's token cannot have. A dry run without "draft" keeps the packages
-  as artifacts, which is how these were checked. The path of a real release (a tag on `main`) creates no tag
-  and names no target: to verify at the next release.
+- **A dry run's draft only from `main`.** "Run workflow" with "draft" from another branch built the nine
+  files, then GitHub answered HTTP 403 to the creation of the release with the job's token, which had
+  `contents: write`; the same run from `main` opened its draft with the nine files (checked, then deleted).
+  My reading: a release whose target is a commit that changes workflow files needs a permission the job's
+  token cannot have. From a branch, a dry run without "draft" keeps the packages as artifacts.
 

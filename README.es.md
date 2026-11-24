@@ -73,7 +73,13 @@ Los paquetes funcionan en cualquier distribución con **glibc 2.31 o posterior**
 posteriores). Las bibliotecas que necesitan y las opciones del AppImage están en la
 [guía](docs/GUIDE.md#linux) (en inglés).
 
-No hay compilación para Windows.
+### Windows (x86_64, vista previa)
+
+`kerno-<version>-windows-x86_64.zip`: descomprímelo y ejecuta `kerno.exe`; no hay nada más que instalar. Es una
+vista previa: la aplicación arranca y dibuja su ventana, pero nadie la ha usado todavía en Windows. Allí no
+comprueba las actualizaciones, y el túnel por el OpenSSH del sistema, las herramientas locales de copia de
+seguridad y `~/.pgpass` aún no están disponibles; lo que viene después está en la
+[hoja de ruta](docs/ROADMAP.md).
 
 ## Primeros pasos
 
@@ -287,7 +293,7 @@ empaquetado, las comprobaciones locales y las bases de datos de prueba se descri
 
 ## Estado
 
-Versión 2026.11.2. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon) y Linux
+Versión 2026.11.3. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon) y Linux
 (x86_64 y arm64). Otros motores, la comparación de datos y más están en la [hoja de ruta](docs/ROADMAP.md).
 
 ## Licencia

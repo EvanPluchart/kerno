@@ -70,7 +70,12 @@ Apple M3 Pro에서 측정했습니다. 측정 방법과 모든 수치는 [docs/B
 이 패키지는 **glibc 2.31 이상**을 갖춘 모든 배포판(Ubuntu 20.04, Debian 11 이후)에서 실행됩니다. 필요한
 라이브러리와 AppImage의 옵션은 [가이드](docs/GUIDE.md#linux)(영문)에 있습니다.
 
-Windows 빌드는 없습니다.
+### Windows (x86_64, 미리 보기)
+
+`kerno-<version>-windows-x86_64.zip`: 압축을 풀고 `kerno.exe`를 실행하면 됩니다. 따로 설치할 것은 없습니다.
+미리 보기 버전입니다. 앱이 시작되고 창이 그려지지만, 아직 Windows에서 실제로 사용해 본 사람은 없습니다.
+Windows에서는 업데이트를 확인하지 않으며, 시스템 OpenSSH를 통한 터널, 로컬 백업 도구, `~/.pgpass`는 아직
+지원하지 않습니다. 다음 단계는 [로드맵](docs/ROADMAP.md)에 있습니다.
 
 ## 시작하기
 
@@ -273,7 +278,7 @@ Debian이나 Ubuntu에서는 먼저 `sudo scripts/install-linux-deps.sh`로 시�
 
 ## 현황
 
-버전 2026.11.2입니다. macOS(Apple Silicon)와 Linux(x86_64, arm64)에서 PostgreSQL, MySQL, MariaDB, SQLite를
+버전 2026.11.3입니다. macOS(Apple Silicon)와 Linux(x86_64, arm64)에서 PostgreSQL, MySQL, MariaDB, SQLite를
 지원합니다. 다른 엔진, 데이터 비교 등은 [로드맵](docs/ROADMAP.md)에 있습니다.
 
 ## 라이선스

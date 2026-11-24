@@ -1717,3 +1717,12 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   a release dry run's nine files downloaded, their checksums verified, the zip and the executable inspected.
 - Not proved: the dry run's draft from a branch (HTTP 403, D-133); the app in a person's hands on Windows.
 
+## 2026-11-24 — 2026.11.3 prepared: the first release built by GitHub Actions
+
+- At the owner's word ("go pour la release"): version 2026.11.3 and its notes
+  (`docs/release-notes/v2026.11.3.md`): K62 (the databases a PostgreSQL connection shows, a closed database
+  said before any click), K65 (the Linux fixes, Query History on Ctrl+Alt+E there), K64 and K66 (Windows, a
+  preview: one zip). The READMEs say what the Windows preview is and is not.
+- The tag `v2026.11.3` makes `release.yml` build the nine files and open a draft: the first real use of the
+  tag's path (the dry runs took the other one). Publishing waits for the owner, who tries the draft first.
+

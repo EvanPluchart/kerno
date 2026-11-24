@@ -70,7 +70,12 @@ checksum of each file.
 The packages run on any distribution with **glibc 2.31 or newer** (Ubuntu 20.04, Debian 11 and later). The
 libraries they need and the AppImage's options are in the [guide](docs/GUIDE.md#linux).
 
-There is no Windows build.
+### Windows (x86_64, preview)
+
+`kerno-<version>-windows-x86_64.zip`: unpack it and run `kerno.exe`; there is nothing else to install. It is a
+preview: the app starts and draws its window, but nobody has used it on Windows yet. It does not check for
+updates there, and the tunnel through the system's OpenSSH, the local backup tools and `~/.pgpass` are not
+available yet; what comes next is on the [roadmap](docs/ROADMAP.md).
 
 ## First steps
 
@@ -272,7 +277,7 @@ the local checks and the test databases are described in the [guide](docs/GUIDE.
 
 ## Status
 
-Version 2026.11.2. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon) and Linux
+Version 2026.11.3. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon) and Linux
 (x86_64 and arm64); MySQL from 5.1 on, with what each old release lacks said in the
 [guide](docs/GUIDE.md#supported-servers). Other engines, data compare and more are on the
 [roadmap](docs/ROADMAP.md).
