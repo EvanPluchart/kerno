@@ -110,18 +110,22 @@ pub fn open(
         let queries = storage
             .saved_queries()
             .map_err(|error| format!("Kerno's saved queries cannot be read: {error}."))?;
-        Ok::<_, String>((bytes, export, queries))
+        let stored = storage
+            .connections()
+            .map_err(|error| format!("Kerno's saved connections cannot be read: {error}."))?;
+        Ok::<_, String>((bytes, export, queries, stored))
     });
     window.spawn(cx, async move |cx| {
         let outcome = reading.await;
         cx.update(|window, cx| match outcome {
-            Ok((bytes, export, queries)) => {
+            Ok((bytes, export, queries, stored)) => {
                 tracing::info!(
                     connections = export.connections.len(),
                     scripts = export.scripts.len(),
                     "DBeaver export read"
                 );
-                let view = cx.new(|cx| DbeaverImport::new(connections, bytes, export, queries, cx));
+                let view = cx
+                    .new(|cx| DbeaverImport::new(connections, bytes, export, queries, stored, cx));
                 let shown = view.clone();
                 window.open_dialog(cx, move |dialog, _, _| {
                     let view = shown.clone();
@@ -183,9 +187,21 @@ impl DbeaverImport {
         bytes: Vec<u8>,
         export: Export,
         queries: Vec<SavedQuery>,
+        stored: Vec<SavedConnection>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fates = fates(&export, connections.read(cx).saved());
+        // What is here is read from the store, which an import made a
+        // moment before has written: the list in memory reads it back a
+        // little later (an import twice in a row made a second copy). The
+        // connections opened from a URL are in memory only.
+        let mut here = stored;
+        let list = connections.read(cx);
+        here.extend(
+            (list.saved().iter())
+                .filter(|saved| list.is_unsaved(&saved.id))
+                .cloned(),
+        );
+        let fates = fates(&export, &here);
         Self {
             connections,
             bytes,

@@ -168,6 +168,35 @@ fn a_dbeaver_project_is_previewed_then_imported_once(cx: &mut TestAppContext) {
     assert!(!secrets::has_secrets(store.as_ref(), &blog_id).unwrap());
 }
 
+/// K71: a connection written to the store a moment before (an import just
+/// done), which the list in memory has not read back yet, is already here:
+/// a second import does not make a copy of it.
+#[gpui_kit::test]
+fn a_connection_just_written_is_already_here(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let environments = cx.update(|cx| AppState::get(cx).settings.environments.clone());
+    let export = dbeaver::read(
+        &dbeaver::sample_project(),
+        false,
+        &environments,
+        &crate::theme::TAG_COLORS,
+    )
+    .unwrap();
+    let shop = (export.connections.iter())
+        .find(|connection| connection.name == "Shop")
+        .and_then(|connection| connection.config.clone().ok())
+        .unwrap();
+    // Behind the list's back, as the import's own write.
+    let shop_id = app.storage.save_connection(None, &shop).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let view = app.dbeaver_preview(cx, project_file(&dir));
+    let summary = cx.update(|cx| view.read(cx).summary());
+    assert!(
+        summary.contains(&format!("Shop Exists(\"{shop_id}\")")),
+        "{summary}"
+    );
+}
+
 #[gpui_kit::test]
 fn without_the_box_no_password_is_kept(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
