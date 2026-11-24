@@ -1660,3 +1660,26 @@ into the morning's release, which stays unpublished until his go.
   emulation; x86_64 packages are now started on an x86_64 runner (`scripts/check-linux-packages.sh [arch]`).
 - Found: 13 tests of the app fail on Linux, where the tests had never run (K65). A probe on a Windows
   runner: every dependency compiles, 27 errors in `kerno-core` (K64).
+
+## 2026-11-24 — K64: Windows, step 1 (the workspace builds and `kerno-core`'s tests pass there)
+
+- The owner's word: releases for macOS, Linux and Windows from CI; step 1 first. This Mac cannot compile for
+  Windows (ring and SQLite need a Windows C toolchain); a GitHub runner did, through the probe workflow
+  `.github/workflows/windows.yml` on the `windows` branch (not for `main`; two jobs on `windows-2025`).
+  Every crate and target compiles for `x86_64-pc-windows-msvc`, clippy is clean there, `kerno-core`'s tests
+  pass there, and a release `kerno.exe` prints `kerno 2026.11.2`. Nobody has seen Kerno on a Windows screen
+  (D-131).
+- One home per Unix concern, with a Windows side: private files and folders (`kerno_core::private`), the
+  running instance's channel (a named pipe, both ends proving they can read a token of the data directory,
+  the URL sent without its password), the SSH agent (a named pipe of this machine only), the system OpenSSH
+  tunnel (Unix only: Windows says it is not available yet). The Unix sides are today's code, moved.
+- Reviews during the work, all folded in before the report: the URL's password never crosses the pipe; a pipe
+  that cannot prove it is this user's Kerno gets nothing and the second Kerno opens the URL itself; an agent's
+  pipe from an imported connection or `SSH_AUTH_SOCK` must be a pipe of this machine (a host's pipe would send
+  the user's credentials to it over SMB). A first run that looked green was not: `continue-on-error` reported
+  every step a success while clippy had failed (two `mut` only Unix uses) and one test had (a `/bin/sh`
+  script); none is left in the workflow.
+- macOS: fmt, clippy (`-D warnings`) and `cargo deny` clean; `kerno-core` 701 unit tests and its integration
+  tests, `kerno` 945, `kerno-postgres` 148, `kerno-mysql` 198, `kerno-sqlite` 30, all passing. Not done on
+  Windows yet, in order: a CI job and a zip, a pass in the real app, the home folder and the update check, the
+  local clients and the password presets, an installer and the update's install, the system OpenSSH tunnel.

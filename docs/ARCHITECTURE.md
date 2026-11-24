@@ -180,6 +180,19 @@ what keeps the macOS keychain from asking for the login password at every connec
 `KERNO_SECRET_STORE=memory` forces the memory store (tests and checks of the real app). Secrets never reach
 the SQLite file, the logs or the connection export; history text is redacted before it is stored.
 
+## Private files and the running instance
+
+`kerno-core/src/private.rs` is the one place that makes a file or a folder only the user may read: mode 0600
+or 0700 from its creation on Unix; on Windows nothing is set, and what is made under the user's profile
+inherits its access list (D-131). The password file, the store, the logs and the temporary folders go
+through it.
+
+`kerno-core/src/instance.rs` is `kerno <url>`'s hand-off to the running Kerno (J4): one line, a URL. On Unix
+the channel is a 0600 socket in the data directory, or in a private folder when the path is too long (D-128,
+`instance/unix.rs`); on Windows a named pipe whose random name and token `instance.pipe` holds: both ends
+prove they can read the token before the line crosses, and the URL goes without its password (D-131,
+`instance/windows.rs`, `instance/proof.rs`).
+
 ## Storage and migrations
 
 `kerno-core/src/storage.rs`. One SQLite file, `kerno.db`, in the platform data directory (`directories`

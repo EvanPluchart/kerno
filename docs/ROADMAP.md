@@ -53,6 +53,23 @@ SQLite's interrupt, `admin_query` `None` for every view, and the capabilities it
 defaults (`Dialect::begin_sql`, `transactional_ddl`, `has_routines`, `ExecSink::stop_signal`). Its FEATURES row
 is K29.
 
+## Windows (the owner's word, 2026-11-24: releases for macOS, Linux and Windows from CI)
+
+Step 1 is done (K64, D-131): the workspace compiles for `x86_64-pc-windows-msvc`, clippy is clean there,
+`kerno-core`'s tests pass there and a GitHub runner builds a release `kerno.exe`. Nobody has seen it on a Windows
+screen yet. Next, in order:
+
+1. A Windows job in the real CI (the probe workflow of the `windows` branch folded in) and a zip of `kerno.exe`
+   in `scripts/release.sh`'s `SHA256SUMS`; the executable's icon (a resource from a build script).
+2. A pass in the real app on Windows: the window, the menus, fonts, the secret store (Credential Manager through
+   `keyring`), the instance's pipe, the built-in SSH client and its agent pipe.
+3. The home folder (`%USERPROFILE%` where `HOME` is read: `~/.ssh`, `.pgpass`, `.my.cnf`; libpq's
+   `%APPDATA%\postgresql\pgpass.conf`) and the update check (`curl.exe` of `System32`).
+4. The local clients (`pg_dump.exe`, `mysqldump.exe`, …, in `Program Files` and on `PATH`) and the password
+   command's presets (`aws.exe`, `op.exe`).
+5. An installer and the in-app update's install, as Recto and Vigie do on Windows.
+6. The system OpenSSH tunnel (a loopback TCP forward and the askpass questions on a named pipe), Pageant.
+
 ## The AI assistant, next (agreed with the owner, 2026-11-23)
 
 Today (J17) the assistant answers one question at a time: write SQL from a sentence, explain a query, a plan

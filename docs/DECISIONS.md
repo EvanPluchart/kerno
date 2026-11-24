@@ -4190,3 +4190,97 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
 - **Not in this decision.** A Windows build (K64 is its first step); a stable signing identity or
   notarization (they need secrets and an Apple account); Dependabot for the pinned actions (update them by
   hand, with their hash); the site.
+
+## D-131 — Windows, step 1: the workspace builds there, one home per Unix concern (K64; 2026-11-24)
+
+- **What is proved, and what is not.** Nobody has seen Kerno on a Windows screen. What a GitHub runner
+  (`windows-2025`, `.github/workflows/windows.yml` on the `windows` branch) proves: every crate and target
+  compiles for `x86_64-pc-windows-msvc`, clippy is clean there with `-D warnings`, `kerno-core`'s tests pass
+  there, and a release `kerno.exe` prints `kerno <version>` for `--version`. No window was opened, no UI test
+  ran, no database was reached (the runners have no Linux containers). This Mac cannot compile for Windows
+  (ring and SQLite need a Windows C toolchain): the runner is the only compiler.
+- **One home per concern, a Unix side and a Windows side**, instead of `#[cfg]` at each call site. The Unix
+  sides are today's code moved, byte for byte where it was Unix-only (`instance/unix.rs`,
+  `openssh/unix.rs`).
+- **Private files and folders** (`kerno_core::private`): `file_options()` (0600 from the creation),
+  `create_dir()` (0700), `restrict()`, `mode()`. Used by the password file, the store and its copies, the
+  logs, the backup wizard's object list, the update's folder, the OpenSSH tunnel's folder. On Windows nothing
+  is set or read: no access list without a new `unsafe` or a new dependency. A file or folder made under the
+  user's profile (`%APPDATA%`, `%LOCALAPPDATA%`, `%TEMP%`: Kerno's data directory and temporary folders)
+  inherits the profile's list, which grants the user, SYSTEM and the administrators only. One made elsewhere
+  (a `KERNO_DATA_DIR` outside the profile) gets what that folder grants, which may be more: Unix's explicit
+  mode had no such dependence. `mode()` answers `None` on Windows: nothing claims to know.
+- **Checks that cannot be made on Windows.** `.pgpass` other users can read and a `.my.cnf` anyone can change
+  are refused on Unix (libpq's and MySQL's rules); on Windows Kerno cannot tell, and reads the file (libpq's
+  check is compiled for Unix only, as recalled, not re-read for K64; MySQL's rule is about Unix modes). In
+  practice no password file is read on Windows yet: `HOME` is not set there, and libpq's file is
+  `%APPDATA%\postgresql\pgpass.conf`. A program is "executable" on Windows when it is a file (no execute bit;
+  the extension decides), for the password command and the client tools.
+- **The running instance (J4) on Windows: a named pipe, and a proof.** Pipe names are one namespace for the
+  machine, and the other end of a pipe cannot be checked to be this user's without a system call
+  (`GetNamedPipeServerProcessId` and the process's token) that the no-new-`unsafe` rule leaves out. The model,
+  in three lines:
+  - **What proves the peer**: reading the user's data directory. The listening Kerno writes `instance.pipe`
+    there (a private file): its pipe's random name (`\\.\pipe\kerno-` and 32 hex digits) and a random 32-byte
+    token, both from `getrandom`. The client sends a fresh nonce; the instance answers its own nonce and
+    SHA-256(token ‖ client nonce ‖ "server"); the client checks it, sends SHA-256(token ‖ instance nonce ‖
+    "client"), and only then its line, which the instance reads only once that proof checks. The token never
+    crosses; fixed sizes, a timeout on every read (5 s for the client, 2 s for the whole exchange on the
+    instance's side), the line capped at 64 KiB as on Unix. Digests are compared with `==`, not in constant
+    time: no helper for it in the crate's reach, and a local peer timing a 32-byte comparison learns too
+    little. `sha2` 0.10 (already locked, the app's update checksums use it) is added to `kerno-core` for
+    Windows and its tests: no new package in the lock.
+  - **What a hostile process of another account can do**: take a pipe name before Kerno makes it (then
+    nothing it can prove: the second Kerno sends it nothing and opens the URL itself; the first one makes a
+    pipe under a new random name), and keep the pipe busy. **What it cannot do**: receive a URL (it cannot
+    prove it holds the token), make Kerno open one (it cannot prove it either), or reach the pipe from another
+    machine. This holds while it cannot read `instance.pipe`: true under the profile; a `KERNO_DATA_DIR` outside
+    it gives the token to whoever can read that folder, so the URL crosses without its password all the same
+    (`instance::without_password`: the password of `user:password@` and every option the URL parser takes for a
+    secret; the running Kerno asks for it when it connects).
+  - **A process of the same account** is not defended against, on Windows as on Unix: it can read the data
+    directory, as it can read the password file's key.
+  Any failure (no file, a file not in Kerno's form, a missing or wrong proof, a timeout, a short read) means
+  "no Kerno of mine is there": nothing more is written, the second Kerno opens the URL itself and logs why
+  (`main.rs`, never with the URL). The file is removed when the listener goes and when Kerno quits
+  (`instance::forget`); one left by a crash is replaced at the next start. One difference with Unix: a
+  socket answers a connection before anyone accepts it, a pipe proves itself only once the window serves it;
+  a second Kerno started in the moment between the first one's load and its window waits up to 5 s, then
+  makes a pipe of its own (the first one's later URLs go to the second's).
+- **The system OpenSSH tunnel (J2): Unix only for now.** It forwards a Unix socket and asks its questions on a
+  second one; neither std nor tokio has Unix sockets on Windows, and Windows' OpenSSH forwards none.
+  `OpenSshEnv::detect` returns `None` on Windows, so new connections take the built-in client, and a
+  connection saved with "system OpenSSH" says "Tunnels through the system's OpenSSH are not available on Windows
+  yet; use the built-in client" (the dialog and the connection error). `Forward` is an empty enum there.
+- **The SSH agent on Windows**: russh's named-pipe client, no new dependency or feature: the connection's own
+  pipe, else `SSH_AUTH_SOCK`, else `\\.\pipe\openssh-ssh-agent` (Windows' OpenSSH agent, which 1Password's
+  replaces when it is on), as Windows' `ssh` looks for it. A saved name may come from an imported file, and a
+  pipe of another machine (`\\host\pipe\x`) would make Windows log in to that host over SMB with the user's
+  credentials: one rule (`ssh::is_local_pipe`), for the saved name and `SSH_AUTH_SOCK` alike, accepts only
+  `\\.\pipe\` (any case) followed by a name with no further `\` or `/` and not `.` or `..`; anything else (a
+  host, `\\?\UNC\…`, a drive path, a Unix socket's path from a macOS export, the forward-slash spelling) is
+  refused before any open, saying what was found and what a valid name looks like. So an imported connection
+  can make Kerno open a pipe of this machine only. On Unix the same field is a Unix socket's path (the built-in
+  client and OpenSSH's `IdentityAgent`): a local socket, no network; unchanged. Compiled and its rule tested
+  on every system; never run against an agent on Windows.
+- **No console window.** A release build is a GUI program (`windows_subsystem = "windows"`, as Recto's): no
+  console opens with it. `--version` and `--help` print when their output goes to a pipe or a file (the
+  workflow checks `--version` that way); typed in a console they print nothing, since attaching to the parent's
+  console (`AttachConsole`) takes `unsafe`. Debug builds keep the console.
+- **Smaller.** PostgreSQL's cancel request over a Unix-socket host is Unix only (tokio-postgres has no such
+  host elsewhere). Tests that run `/bin/sh` scripts, set modes, make symbolic links or need the OpenSSH tunnel
+  are gated to Unix; each gated test says why; Windows twins where cheap (the name file's form, a URL through a
+  real pipe, a pipe without the token, OpenSSH not offered), and the logic tested on every system (the proof,
+  the password's removal, the agent's rule, the private files' answers).
+- **Not on Windows yet, in the order they should come**: an installer or a zip and the in-app update's install
+  (`update::artifact` names nothing on Windows: an update opens the release page) and the update check itself
+  (it runs `curl` from `/usr/bin`; Windows has `curl.exe` in `System32`); the home folder (`HOME` is not set:
+  `~/.ssh/known_hosts`, `~/.ssh/config`, `.pgpass`, `.my.cnf` are not found; `%USERPROFILE%` and libpq's
+  `%APPDATA%` places); detection of `pg_dump.exe`, `mysqldump.exe` and the other local clients (their names
+  have no `.exe`, their places are Unix ones); the password-command presets (`aws`, `op` are looked for without
+  `.exe`); the system OpenSSH tunnel (a TCP loopback forward and an askpass channel on a named pipe); Pageant
+  for the agent; the executable's icon (a resource compiled in by a build script: a build dependency such as
+  `winresource`, or `rc.exe` from a `build.rs`); the start-failure window's "is another Kerno using this
+  data" check, which runs on the UI thread and on Windows may wait up to about 7 s for a pipe that exists and
+  does not answer (CLAUDE.md §1: the UI thread never waits on I/O); UI tests and the container tests on
+  Windows; a pass in the real app.
