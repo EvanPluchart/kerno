@@ -4618,3 +4618,97 @@ app was right and the test read a state before it was there. No longer timeout, 
 - **The proof is a loop, on both kinds of machine.** The probe workflow (`linux-tests-probe.yml`, on the
   branch `linux-tests` only, not merged) runs each test 30 to 100 times with a CPU hog per core on
   `ubuntu-24.04` with the containers, and the DBeaver import 100 times on `macos-15`; numbers in M12, K71.
+
+## D-135 — A faster backup and restore for MySQL and MariaDB, and an old server's client said (K63; 2026-11-24)
+
+A user's request relayed by the owner: PostgreSQL's backup got "Faster" in 2026.11.2 (K48, D-117), MySQL had
+nothing, and the user's MySQL 5.1 database holds one table of several gigabytes. mysqldump reads with one
+connection and has no parallel mode that writes a script (mysqlpump is gone from MySQL 8.4; `mariadb-dump
+--parallel` needs `--tab`, files the server writes on its own disk): the parallelism is Kerno's own, with the
+stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
+
+- **The folder.** One SQL file per table, `NNNN-<name>.sql` (the number keeps two names that clean to the
+  same one apart, and `A` from `a` on a case-insensitive disk; the name keeps ASCII letters, digits, `_` and
+  `-`), each written by its own `mysqldump` of that one table with `--skip-triggers`; a table cut into ranges
+  is `NNNN-<name>.partNN.sql`, each `--where=…` and `--skip-add-locks`, the first with the table's
+  definition, the others `--no-create-info`. Then `routines.sql` (`--no-create-info --no-data` with the routines, the
+  triggers and, as asked, the events) and `views.sql` (the views, by one mysqldump, which orders views over
+  views itself), in mysqldump's own order: a view may call a function. Last, `kerno-backup.json`: the
+  manifest's format (1), the engine, the database, the server's and the client's versions, the content, the
+  options, each table with its engine and files (and each range's condition), the files after the tables in
+  their order. It is written only when every file is: a folder without it is an incomplete backup, which the
+  restore refuses ("not a backup Kerno made"), as it refuses a manifest naming a file outside its folder.
+  The triggers come with the routines, after every row is in, so none fires during the load.
+- **One state, no flag**, as K48: "Faster" is `BackupFormat::Directory` with `MySqlBackup::jobs` at N (the
+  machine's cores, 8 at most, shared with PostgreSQL); the wizard shows the Format ("Plain SQL" / "Folder, one
+  file per table") and Jobs; a task keeps them; the way back to the simple view is not a hidden change.
+  "Block writes" is the existing "Lock all tables" (`DumpMethod::LockAllTables`) of the folder backup: a global
+  read lock for the whole dump, as mysqldump's own option means, held by Kerno for all the processes.
+- **The ranges.** A table of at least `RANGE_THRESHOLD` (32 MiB of `DATA_LENGTH`, measured: see BENCH.md)
+  whose primary key is one integer column is cut into N ranges of equal key span between `MIN` and `MAX`, the
+  first open below and the last open above: together they hold every integer once (tested as a property),
+  so a row inserted during the backup below the minimum or above the maximum is in one of them. A sparse or
+  skewed key gives ranges of unequal size: still correct, less gain. An empty table, a composite or
+  non-integer key, or no key: one file by one process; a single very large table without such a key gains
+  nothing, and the hint says so. The sizes are read with `information_schema_stats_expiry = 0` on MySQL 8.0.3
+  and later, whose cached sizes would otherwise be up to a day old; InnoDB's own size estimate still lags a bulk
+  load by a few seconds.
+- **Consistency, in plain words in the wizard.** Off by default, each mysqldump reads at its own moment: an
+  InnoDB table (or range) with `--single-transaction`, any other table under `--lock-tables` (that one table,
+  while it is read). Two tables are not read at the same instant, and a row whose key is updated during the
+  backup can move from a range not yet read to one already read (missed) or the other way (written twice,
+  and the restore then stops on a duplicate key): the hint says it. Ticked, Kerno's own session holds `FLUSH
+  TABLES WITH READ LOCK` from before the first mysqldump until the last has ended, each mysqldump then with
+  `--skip-lock-tables`. It needs RELOAD (read from `information_schema.USER_PRIVILEGES` for `CURRENT_USER()`;
+  a privilege only an active MySQL 8 role gives is not seen, and the choice stays off): without it the choice
+  says so and cannot be ticked, and a lock chosen in the wizard or a task refuses Start. Start shows the
+  statement and asks first (a write in `sql_confirm`'s sense: twice on production), since every write of the
+  whole server waits. The statement itself waits behind running writes and long transactions, and blocks
+  every other write while it waits; Cancel stops it there too. Any end releases it (`UNLOCK TABLES`, else the
+  session is closed): a test cancels mid-run and then writes, on 8.4 and 5.1.
+- **What else each file carries.** `--set-gtid-purged=OFF` for a MySQL mysqldump from 5.6 (MariaDB's has no
+  such option): on a server with GTIDs each file would set `GTID_PURGED` and the second could not; not tested
+  against such a server (none in the compose file). The user's own `--where` is refused for a table cut into
+  ranges (mysqldump keeps the last one, every range would hold the same rows).
+- **Cancel and failure** stop every mysqldump (`tools::run`'s kill, every child awaited before anything is
+  removed), release the lock, and remove only the folder this run made (`create_dir`: a folder already there
+  is refused and never touched). "it has no fields" in a mysqldump's output is a failure even when it exits 0
+  (the old client below, with `--skip-triggers`, exits 0 and writes no table).
+- **The restore.** The folder is offered by the restore as one backup (the open panel takes folders for
+  MySQL too). "Faster: restore on N connections at once", off by default as PostgreSQL's: N `mysql` clients,
+  one file each; a table's first file alone, then its ranges side by side when its engine at the backup
+  (from the manifest) is InnoDB, one after the other otherwise (MyISAM, MEMORY: table locks); then the
+  routines and the views, in order, by one client. Every file is checked for client commands before any
+  client starts (the opt-in of a plain SQL file covers the folder; the refusal names the file). The faster
+  loading is what mysqldump's header already sets (`UNIQUE_CHECKS=0`, `FOREIGN_KEY_CHECKS=0`, `DISABLE KEYS`
+  for MyISAM): nothing that changes durability or needs SUPER (`sql_log_bin`, `innodb_flush_log_at_trx_commit`)
+  was added. Measured to help: `--skip-add-locks` on the ranges (their restore 6.7 to 9.3 s against 16.3 to 29.6
+  s with mysqldump's `LOCK TABLES … WRITE`, which makes the ranges of one table wait for each other).
+- **A failed restore** stops (kills) the other clients, mid-file, says which table and the server's error with its line
+  ("mysql failed on big 2/4: ERROR 1064 (42000) at line 38: …"), then what is loaded, partly loaded and not
+  loaded, and that the routines and views did not run; what was loaded stays, as with a plain SQL file. A
+  cancel says the same in the log.
+- **An old server needs an old client** (the owner's "B2"). Reproduced on the legacy servers with every client
+  at hand (Homebrew's 26.10 and 5.7.44; 8.4.13, MariaDB 11.8.9, 5.5 to 5.7 inside the `kerno-*` containers):
+  MySQL's mysqldump 8.4 and 26.10 read no column of a 5.1 table (each table "has no fields", the file holds
+  no table; exit 2 with the triggers, 0 without); MariaDB's mariadb-dump 11.8 does the same on 5.1 and fails
+  on 5.5 and 5.6 (`GENERATION_EXPRESSION`) after writing a definition without its rows. These pairs, and
+  only those (8.0 and MariaDB before 11.8 were not tried), are said before the run, Start refused, for the
+  plain and the faster backup, with the way out: "Choose a MySQL 5.7 client (5.7.11 or later) with “Local
+  client…”", naming one found that works. 5.7.11 and not "5.x": Kerno passes `--ssl-mode`, which 5.6's client
+  takes only as `REQUIRED` and 5.5's does not have.
+- **TLS on 5.1 and 5.5.** Those servers offer TLS 1.0 only, which the clients built with OpenSSL 3 refuse
+  ("unsupported protocol"; 26.10 on 5.1 and 5.5, 5.7.44 on 5.1): a connection with "prefer" now runs every tool
+  of the wizards (backup, restore, script) with `--ssl-mode=DISABLED` there, as the connection itself goes without TLS (K22). "require" and the
+  "verify" modes are left as they are and fail with the tool's own message.
+- **Measured** (BENCH.md, MySQL 8.4, 8 processes): the fixture's `kerno_analytics` (one table of 238 MB, cut)
+  backed up in 0.81 to 0.83 s against 1.79 to 1.88 s and restored in 6.5 to 8.4 s against 14.3 to 17.1 s; eight
+  tables of 30 MB (not cut) 0.98 to 1.23 s against 1.80 to 2.85 s, restored in 6.5 to 7.5 s against 14.8 to 17.2
+  s; on 5.1, one run, 0.68 against 1.18 s and 3.69 against 7.20 s. The UI says no number: "Faster" and that one
+  large table without a usable key is still read by one connection.
+- **Not verified.** A server with GTIDs; MySQL's 8.0 clients and MariaDB's before 11.8 on the old servers; a
+  connection through an SSH tunnel (each mysqldump gets its own forward, as a plain backup's tool does). A
+  read-only connection may hold the read lock: its session refuses data writes (`SET SESSION TRANSACTION READ
+  ONLY`), not `FLUSH TABLES WITH READ LOCK`, which writes nothing; not tested. The catalog and the lock are on
+  Kerno's own session, as the connection's user, also when the tools run as another user. No pass in the real
+  app; captures rendered offscreen.

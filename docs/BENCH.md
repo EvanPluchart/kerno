@@ -242,6 +242,46 @@ arriving to the marks set, three results: that includes the test executor's turn
 The marks show on the frame after. The names are kept in the tab: a result read again asks nothing. The grid's frame cost is that of K49 (a key looked up per header and per hovered or selected cell,
 the keys worked out once per result); the frame times above were not measured again.
 
+## A faster backup and restore for MySQL and MariaDB (K63)
+
+Measured on 2026-11-24 with a temporary driver test (not committed) that calls what the simple backup and
+restore call: the plain backup is one `mysqldump` of the database into one file (`tools::backup_command`) and
+its restore one `mysql` client (`tools::restore_command`); "Faster" is `mysql_folder::back_up` and
+`mysql_folder::restore` with 8 processes (the machine's 11 cores, 8 at most). Clients: Homebrew's
+`mysql-client` 26.10 on MySQL 8.4 (`kerno-mysql`), Homebrew's `mysql@5.7` 5.7.44 for MySQL 5.1
+(`kerno-mysql51`); restores into a scratch database `kerno_test_k63_bench`, never a fixture database. Each run
+waits for a 1-minute load below 8 before it starts. Sizes in MB of 10⁶ bytes.
+
+| Database | Plain backup | Plain restore | Faster backup | Faster restore |
+|---|---|---|---|---|
+| `kerno_analytics` (8.4; `big_table`, 1M rows, 238 MB of data, cut in 8 ranges, and `events`; 307.1 MB written, 10 files) | 1.88, 1.81, 1.79 s | 16.49, 14.26, 17.12 s | 0.81, 0.81, 0.83 s | 8.36, 6.49, 7.24 s |
+| `kerno_test_k63_eight` (8.4; eight tables of 125,000 rows of `big_table`, 30 MB of data each, not cut; 303.1 MB, 9 files) | 1.94, 1.80, 2.85 s | 15.52, 14.80, 17.22 s | 1.23, 0.98, 1.14 s | 6.49, 7.48, 6.81 s |
+| `kerno_test_k63_eight` on MySQL 5.1.73 (eight tables of 125,000 rows, 16 MB each, not cut; 129.8 MB, 9 files), one run | 1.18 s | 7.20 s | 0.68 s | 3.69 s |
+
+The 1-minute load at the start of each run was between 7.0 and 7.9 (the test servers are shared with other
+agents' runs). "Faster" backs up about 2.2 times faster and restores about 2.2 times faster on 8.4, on one large
+table cut into ranges as on eight tables; about 1.7 and 2 times on 5.1. The files are the same size.
+
+**The threshold** (`RANGE_THRESHOLD`, 32 MiB): one table of `big_table`'s rows, backed up and restored whole by
+one process, then cut into 8 ranges, three runs each (load 3 to 6):
+
+| Data (`DATA_LENGTH`) | Whole: backup, restore | Cut in 8: backup, restore |
+|---|---|---|
+| 238 MB (1M rows) | 1.70–1.77 s, 14.2–14.7 s | 0.70–0.74 s, 6.0–8.5 s |
+| 59 MB | 0.46–0.53 s, 3.2–3.6 s | 0.19–0.27 s, 1.4–1.9 s |
+| 30 MB | 0.29–0.32 s, 1.9–2.0 s | 0.15–0.19 s, 0.8–1.2 s |
+| 14 MB | 0.14–0.15 s, 1.0–1.1 s | 0.08–0.09 s, 0.4–0.5 s |
+| 8 MB | 0.08–0.11 s, 0.5 s | 0.07 s, 0.3–0.5 s |
+
+One mysqldump of an empty table takes 18 to 21 ms (ten runs). A cut helps at every size alone, but below about
+32 MB it saves under a second, and in a database of many tables the other tables keep the processes busy:
+smaller tables are left whole.
+
+**`--skip-add-locks` on the ranges**: the 1M-row table cut in 8, restored on 8 clients, 6.65 to 9.30 s; the same
+ranges written with mysqldump's `LOCK TABLES … WRITE` around their rows, 16.28 to 29.63 s (the ranges then wait
+for each other). Taken at a load of 9 to 10, above the bar of the other numbers: the gap is far larger than the
+noise.
+
 ## Reproducing
 
 ```sh

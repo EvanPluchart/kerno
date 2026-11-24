@@ -1789,3 +1789,23 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Proved by the loops (numbers in M12, K71), four new tests seen failing without their fix, and the probe's
   last run on the final code (45468100079): every loop 0 failures, the whole workspace on the Linux runner
   2,120 passed, none failed. Left: J15's import plans from the list in memory too (not reproduced).
+
+## 2026-11-24 — K63: a faster backup and restore for MySQL and MariaDB, an old server's client said
+
+- A user's request relayed by the owner ("B1 B2"): MySQL and MariaDB get PostgreSQL's "Faster". Kerno runs N
+  `mysqldump` at once into a folder, one SQL file per table, a large table with a single-column integer key cut
+  into key ranges, the routines, triggers, events and views after, `kerno-backup.json` last; the restore loads
+  the folder on N `mysql` clients. "Block writes during the backup" holds Kerno's own `FLUSH TABLES WITH READ
+  LOCK` (RELOAD; asked first); off, the wizard says in plain words how each table is read. From MySQL 5.1 on
+  (D-135).
+- An old server needs an old client (the owner's "B2"): mysqldump 8.4 and later (and MariaDB's 11.8) read no
+  column of a MySQL 5.1 table, reproduced on the legacy servers; the backup says so before it runs, refuses to
+  start, and names a MySQL 5.7 client found. "prefer" goes without TLS for the tools on 5.1 and 5.5.
+- Proved against the servers: a scratch database backed up and restored identical (rows, checksums, view,
+  routines, trigger, event) on 8.4, MariaDB 11 and 5.1 to 5.7; a cancel leaves no mysqldump, no folder, no lock
+  (8.4 and 5.1); a broken file stops the restore and says what is in; a refused client command loads nothing.
+  Every new test seen failing under a mutation (docs/plans/M12.md).
+- Measured (BENCH.md, MySQL 8.4, 8 processes): the fixture's analytics database (one 238 MB table) backed up
+  in 0.8 s against 1.8 s, restored in 6.5 to 8.4 s against 14.3 to 17.1 s; eight tables of 30 MB about as much;
+  on 5.1 about 1.7 and 2 times faster (one run).
+- Not verified: a GTID server, MySQL 8.0's clients on 5.1, an SSH tunnel, a pass in the real app.

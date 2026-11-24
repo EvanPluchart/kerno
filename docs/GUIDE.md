@@ -58,7 +58,7 @@ something Kerno offers, Kerno says so in words that name the release it needs, i
 | Generated columns (5.7.6), `JSON` (5.7.8), check constraints (8.0.16) | no | no | no | yes, yes, no | Not listed; imported JSON goes into `longtext` |
 | Views over views in what a drop breaks (`VIEW_TABLE_USAGE`, 8.0.13) | no | no | no | no | The views are found by a search of the view definitions for the name, as on MariaDB |
 | Transactions on MyISAM tables (the default engine before 5.5.5) | — | — | — | — | Edits are applied in a transaction as everywhere; a MyISAM table has none, so when one statement fails the ones before it stay: the failure says so |
-| Backups with a `mysqldump` 8.x | no | yes | yes | yes | `mysqldump` 8.4 finds no columns in a 5.1 table: choose a 5.x `mysqldump` as the local client (Settings ▸ Local clients) |
+| Backups with a `mysqldump` 8.4 or later | no | yes | yes | yes | `mysqldump` 8.4 and later read no column of a 5.1 table (and MariaDB's `mariadb-dump` 11.8 none of 5.1 to 5.6): the backup says so before it runs and does not start; choose a MySQL 5.7 client, 5.7.11 or later, with “Local client…” (it names one found). With SSL mode “prefer”, the tools go without TLS on 5.1 and 5.5, as the connection does |
 
 MariaDB releases before 11 share some of these gaps (database comments 10.5, `RENAME COLUMN` 10.5.2, check
 constraints with their table 10.3.10, JSON columns 10.4.3, `information_schema.SYSTEM_VARIABLES` 10.1.1): Kerno
@@ -621,6 +621,26 @@ backup is then a folder, one file per table, chosen and shown like a file: **Res
 it in the open panel or type its path) and can restore it on several connections too. It helps a database of
 many tables; one large table is still read by one connection. A failed or cancelled backup removes the folder
 it made, never a folder that was already there: a folder of that name stops the backup before it starts.
+
+MySQL and MariaDB get the same **Faster: back up on N connections at once** beside their SQL script: Kerno runs
+N `mysqldump` at once, one per table, into a folder of SQL files, and cuts a large table whose key is one
+whole-number column into parts read side by side (a large table without such a key is still read by one
+connection). The procedures, functions, triggers, events and views come last, in their own files, and a small
+`kerno-backup.json` names every file: **Restore…** takes that folder as one backup, and its **Faster: restore
+on N connections at once** loads several tables at a time (the parts of a large InnoDB table side by side). A
+failed restore stops the others and says which table, the server's error, what is loaded and what is not.
+
+With "Faster", **Block writes during the backup, so that every table is read at the same moment** (off by
+default) says how the backup is consistent. Off, each table is read at its own moment: an InnoDB table, or each
+part of a large one, in one snapshot, any other table locked while it is read; two tables are not read at the
+same instant. On, Kerno holds `FLUSH TABLES WITH READ LOCK` on the server from before the first table until the
+last: every write on that server waits until the backup ends, so Kerno shows the statement and asks first
+(twice on production). It needs the RELOAD privilege; an account without it is told so and cannot tick it.
+
+An old server needs an old client. MySQL's `mysqldump` 8.4 and later, and MariaDB's `mariadb-dump` 11.8, read
+no column of a MySQL 5.1 table (the backup would hold no table), and `mariadb-dump` cannot read MySQL 5.5 and
+5.6 either: for those pairs the backup says so before it runs, names a MySQL 5.7 client found on the computer
+(5.7.11 or later), and does not start until you choose one with **Local client…**.
 
 **Restore…** opens the same kind of screen: the file (Choose… or a typed path; its format is read from the file
 and says which tool restores it), the database it goes into, what a restore does to it, the client.

@@ -119,7 +119,8 @@ unless sample rows are ticked, "What is sent", nothing run by itself):
   DBeaver's `MySQLPlanNodePlain` does); before MySQL 8.0.3 / MariaDB 10.5.2 a column renamed alone in the
   structure editor is refused (`CHANGE COLUMN` needs the column's definition, which
   `TableChange::RenameColumn` would have to carry); `mysqldump` 8.4 finds no columns in a 5.1 table, so a 5.1
-  backup needs a 5.x client chosen in Settings ▸ Local clients, and the wizard does not say so yet. MariaDB
+  backup needs a MySQL 5.7 client (5.7.11 or later) chosen in Settings ▸ Local clients, which the backup now
+  says before it runs and names (K63, D-135); MySQL 8.0's clients were not tried there. MariaDB
   before 11 uses the same version facts but is not tested.
 
 ## From the competitors' issues (triage of 2026-11-14): not now
