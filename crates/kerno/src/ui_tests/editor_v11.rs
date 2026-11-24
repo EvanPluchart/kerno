@@ -211,8 +211,15 @@ fn a_folded_region_still_runs_and_saves_in_full(cx: &mut TestAppContext) {
         let mark = gpui_kit::point(text_start.left() - px(13.), text_start.center().y);
         app.step(cx, |window, cx| window.drag(mark, mark, cx));
     };
-    fold(cx, 0);
-    assert_eq!(folded(cx), [0]);
+    // The fold marks follow the parse, which under load ends a moment after
+    // the text is set: the click is tried until its mark is there.
+    let fold_at = |cx: &mut TestAppContext, line: usize| {
+        app.wait_until(cx, "the fold", |_, cx| {
+            fold(cx, line);
+            folded(cx) == [line]
+        });
+    };
+    fold_at(cx, 0);
     // Running the script runs every statement, the folded lines included.
     app.press(cx, &["secondary-shift-enter"]);
     app.wait_until(cx, "the script", |app, cx| app.outcomes(cx).len() == 2);
@@ -246,8 +253,7 @@ fn a_folded_region_still_runs_and_saves_in_full(cx: &mut TestAppContext) {
     // The subquery, then the `BEGIN … END`: folded, the text that runs and
     // saves is all there.
     for line in [2, 9] {
-        fold(cx, line);
-        assert_eq!(folded(cx), [line]);
+        fold_at(cx, line);
         assert_eq!(cx.update(|cx| tab.read(cx).sql(cx)), script);
         app.dispatch(cx, actions::UnfoldAll);
         assert_eq!(folded(cx), Vec::<usize>::new());

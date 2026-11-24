@@ -3940,3 +3940,22 @@ info colour over 1.2 s, so two redraws differed by a few per cent of a 17 px dis
   alone, was cut flat by the editor's left edge, which a wider halo made plain.
 - **Less motion.** When the system asks for less motion (GPUI's `reduce_motion`), the halo is held at its fullest:
   the mark still says "running" by its shape and its halo, without moving.
+
+## D-128 — Where the instance socket goes when the data directory is too deep (K56; 2026-11-24)
+
+- **The case.** A Unix socket's path holds 104 bytes on macOS (108 on Linux), its end byte included. A data
+  directory deeper than that left Kerno without its single-instance socket: "path must be shorter than SUN_LEN"
+  at each start, and `kerno <url>` opening a second window instead of reaching the first (J4).
+- **Where.** The socket stays `instance.sock` in the data directory whenever its path fits (103 bytes, the
+  smaller of the two systems). Otherwise it is `<hash>.sock` in a folder `kerno-<uid>` of `XDG_RUNTIME_DIR` when
+  it is set (Linux: per user, 0700), else of the temporary directory (per user on macOS; `/tmp` elsewhere).
+  `<uid>` is the data directory's owner (read from its metadata: no `unsafe`, no new crate).
+- **Private or nothing.** The folder is made at 0700; one found there that is a link, belongs to another user or
+  is open to the group or to others is refused, and then no socket is used at all: the window opens as it does
+  without one, and a URL is never sent to a socket another user could hold. The socket itself is 0600, as
+  before.
+- **One per data directory, the same in every build.** The hash is FNV-1a (64 bits) of the data directory's path
+  bytes, written in a few lines: `DefaultHasher` may change between Rust releases, which would part a running
+  instance from a newer `kerno <url>`. Not a security measure: the folder is.
+- Both ends (the listener, the hand-off of `kerno <url>`, the start-failure window's check) call the same
+  `instance::socket_path`.

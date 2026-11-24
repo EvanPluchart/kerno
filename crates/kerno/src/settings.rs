@@ -82,8 +82,8 @@ pub struct Settings {
     /// The client each engine family uses unless a connection names its
     /// own; the newest found when absent.
     pub default_clients: BTreeMap<ClientFamily, PathBuf>,
-    /// The folder the last backup of a database was written to: the next
-    /// one is proposed there (K26).
+    /// The folder the last backup of a database was written to, or chosen
+    /// for it in the save panel (K56): the next one is proposed there (K26).
     pub backup_folder: Option<PathBuf>,
     /// The folder each kind of save panel last saved in (K56,
     /// [`crate::save_panel`]), by kind; the backup's is `backup_folder`.
