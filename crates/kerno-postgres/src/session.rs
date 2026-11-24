@@ -107,7 +107,20 @@ impl PgSession {
     pub(crate) async fn query(&self, sql: &str) -> Result<Vec<SimpleQueryRow>> {
         let link = self.link.lock().await;
         let client = link.client.as_ref().ok_or_else(closed)?;
-        simple_rows(client, sql).await
+        // A catalog read lists what its snapshot holds, then reads each
+        // object's size, last value or definition from the latest catalog:
+        // one another session dropped meanwhile fails the whole statement.
+        // Read again (a new snapshot no longer lists it), twice at most, and
+        // never inside a transaction block, which the error ended (K71).
+        let mut again = 2;
+        loop {
+            match simple_rows(client, sql).await {
+                Err(error) if again > 0 && vanished(&error) && self.tx_state() == TxState::Idle => {
+                    again -= 1;
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     fn set_tx_state(&self, state: TxState) {
@@ -259,6 +272,17 @@ async fn simple_rows(client: &Client, sql: &str) -> Result<Vec<SimpleQueryRow>> 
             _ => None,
         })
         .collect())
+}
+
+/// Whether a catalog read failed because an object it listed was dropped
+/// while it was read: the server's internal error for a relation, or a
+/// definition, gone between the read's snapshot and the catalog's present.
+fn vanished(error: &Error) -> bool {
+    error.db().is_some_and(|db| {
+        db.code.as_deref() == Some("XX000")
+            && (db.message.starts_with("could not open relation with OID")
+                || db.message.starts_with("cache lookup failed for"))
+    })
 }
 
 /// The first words of a statement, upper-cased, skipping comments.

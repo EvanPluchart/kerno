@@ -203,6 +203,60 @@ async fn a_locked_table_is_listed_at_once_without_its_size() {
     assert_eq!(sizes, [("free", true), ("locked", false)]);
 }
 
+/// K71: an object another session drops while the schema is read (the
+/// listing saw it, then the server read its last value once it was gone:
+/// "could not open relation with OID") leaves the listing whole, without it,
+/// instead of failing it.
+#[tokio::test]
+async fn an_object_dropped_while_it_is_listed_is_left_out() {
+    let (Some(session), Some(holder), Some(watcher)) = (
+        common::session().await,
+        common::session().await,
+        common::session().await,
+    ) else {
+        return;
+    };
+    let schema = common::scratch_schema("dropped_while_listed");
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(&session, &format!("CREATE TABLE {schema}.kept (n int)")).await;
+    exec_ok(&session, &format!("CREATE SEQUENCE {schema}.going")).await;
+    // The listing waits for the sequence while the holder alters it, then
+    // reads it once the holder has dropped it.
+    exec_ok(&holder, "BEGIN").await;
+    exec_ok(
+        &holder,
+        &format!("ALTER SEQUENCE {schema}.going INCREMENT BY 1"),
+    )
+    .await;
+    let listing = {
+        let (session, schema) = (session.clone(), schema.clone());
+        tokio::spawn(async move { session.objects(&schema).await })
+    };
+    let waiting = format!(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+         AND query LIKE '%pg_sequences%{schema}%'"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while scalar(&watcher, &waiting).await == "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the listing never waited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    exec_ok(&holder, &format!("DROP SEQUENCE {schema}.going")).await;
+    exec_ok(&holder, "COMMIT").await;
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(10), listing)
+        .await
+        .expect("the listing ended")
+        .unwrap();
+    exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    let listed = listed.unwrap();
+    assert_eq!(names(&listed.relations, |r| &r.name), ["kept"]);
+    assert_eq!(names(&listed.sequences, |s| &s.name), Vec::<&str>::new());
+}
+
 #[tokio::test]
 async fn objects_of_a_schema() {
     let Some(session) = common::session().await else {
