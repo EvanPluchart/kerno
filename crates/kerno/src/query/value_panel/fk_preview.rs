@@ -30,7 +30,7 @@ use kerno_core::{Session, TxState, describe};
 use super::*;
 use crate::bridge;
 use crate::connections::manager::Connections;
-use crate::data::tab::{Related, follow_at, table_key};
+use crate::data::tab::{Related, table_key};
 use crate::query::grid::{GridAction, Mark};
 use crate::tabs::Target;
 
@@ -215,7 +215,7 @@ pub(super) enum Wanted {
 
 /// What the cell at `row` and the result's column `source` points to: none
 /// when its column is in no foreign key of the table the rows are from, or
-/// a column of the key is NULL (or binary, as the cell menu's jump).
+/// a column of the key is NULL or binary.
 pub(super) fn wanted_at(grid: &Grid, row: usize, source: usize) -> Option<Wanted> {
     let structure = grid.structure()?;
     let name = grid.table_column_name(source)?;
@@ -228,6 +228,14 @@ pub(super) fn wanted_at(grid: &Grid, row: usize, source: usize) -> Option<Wanted
         .iter()
         .map(|column| grid.source_of(column))
         .collect::<Option<_>>()?;
+    // A binary key is followed (K59) but not previewed: the preview reads
+    // its row through literals of text.
+    if sources
+        .iter()
+        .any(|&source| grid.store().columns()[source].kind == TypeKind::Binary)
+    {
+        return None;
+    }
     let computed = sources.iter().any(|&source| {
         matches!(
             grid.pending()
@@ -242,7 +250,12 @@ pub(super) fn wanted_at(grid: &Grid, row: usize, source: usize) -> Option<Wanted
             key.columns.join(", ")
         )));
     }
-    let (index, related) = follow_at(structure, grid, row, name)?;
+    let (index, related) = grid
+        .references(row)
+        .into_iter()
+        .enumerate()
+        .find(|(_, (key, _))| grid.keys()[*key].holds(source))
+        .map(|(number, (_, related))| (number, related))?;
     let follow = grid.follows().then_some(index);
     let key_columns = key
         .columns

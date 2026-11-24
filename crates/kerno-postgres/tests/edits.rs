@@ -1095,3 +1095,114 @@ async fn sql_expressions_are_run_by_the_server() {
     })
     .await;
 }
+
+/// K59: the columns of a join, of a subset and under aliases are named by
+/// their table and table column, in one query for every table; an
+/// expression has none; a view's columns are the view's (it has no foreign
+/// key: nothing is marked there). Fixture read only.
+#[tokio::test]
+async fn a_join_names_the_table_column_of_each_column() {
+    use kerno_core::links::named_origins;
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let named = |sql: &'static str| {
+        let session = session.clone();
+        async move {
+            let columns = run(&session, sql).await.unwrap().results[0].columns.clone();
+            named_origins(&session, &columns).await.unwrap()
+        }
+    };
+    let at = |table: &str, column: &str| Some((TableRef::new("shop", table), column.to_string()));
+    assert_eq!(
+        named(
+            "select o.id, o.customer_id as who, c.full_name, o.id + 1 as next \
+             from shop.orders o join shop.customers c on c.id = o.customer_id limit 1"
+        )
+        .await,
+        [
+            at("orders", "id"),
+            at("orders", "customer_id"),
+            at("customers", "full_name"),
+            None
+        ]
+    );
+    assert_eq!(
+        named("select * from shop.order_totals limit 1").await[0],
+        at("order_totals", "order_id")
+    );
+    // The query of the names alone: one row per column of every table.
+    let sql = session
+        .dialect()
+        .origin_names_sql(&[1, 2])
+        .expect("PostgreSQL names its tables' numbers");
+    assert!(sql.contains("IN (1, 2)"), "{sql}");
+    assert!(session.dialect().origin_names_sql(&[]).is_none());
+}
+
+/// K59: what lies between a result's rows on screen and its foreign keys'
+/// marks, for 300 columns over 20 tables: one query names every column, then
+/// the keys are matched against the completion catalog the tab holds. The
+/// times are printed (docs/BENCH.md). The scratch schema is dropped, also
+/// when the test fails.
+#[tokio::test]
+async fn three_hundred_columns_over_twenty_tables_are_named_in_one_query() {
+    use kerno_core::links::{key_links, named_origins};
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let schema = common::scratch_schema("k59_names");
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    let body = {
+        let (session, schema) = (session.clone(), schema.clone());
+        tokio::spawn(async move {
+            exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+            let mut columns = Vec::new();
+            let mut from = format!("{schema}.t1 t1");
+            for table in 1..=20 {
+                let values: Vec<String> = (1..=13).map(|n| format!("c{n} INT")).collect();
+                let parent = match table {
+                    1 => String::new(),
+                    _ => format!(", parent INT REFERENCES {schema}.t{} (id)", table - 1),
+                };
+                exec_ok(
+                    &session,
+                    &format!(
+                        "CREATE TABLE {schema}.t{table} (id INT PRIMARY KEY, {}{parent})",
+                        values.join(", ")
+                    ),
+                )
+                .await;
+                columns.push(format!("t{table}.id"));
+                columns.extend((1..=13).map(|n| format!("t{table}.c{n}")));
+                columns.push(match table {
+                    1 => "t1.id AS again".to_string(),
+                    _ => format!("t{table}.parent"),
+                });
+                if table > 1 {
+                    from.push_str(&format!(
+                        " JOIN {schema}.t{table} t{table} ON t{table}.parent = t{}.id",
+                        table - 1
+                    ));
+                }
+            }
+            assert_eq!(columns.len(), 300);
+            let sql = format!("SELECT {} FROM {from}", columns.join(", "));
+            let result = run(&session, &sql).await.unwrap().results.remove(0);
+            let catalog = session.completion_catalog().await.unwrap();
+            let started = std::time::Instant::now();
+            let named = named_origins(&session, &result.columns).await.unwrap();
+            let names = started.elapsed();
+            let keys = key_links(&named, |table| catalog.foreign_keys(table));
+            let total = started.elapsed();
+            assert_eq!(named.iter().flatten().count(), 300);
+            assert_eq!(keys.len(), 19);
+            eprintln!("K59: 300 columns over 20 tables: names {names:?}, names and keys {total:?}");
+        })
+    };
+    let outcome = body.await;
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}

@@ -192,10 +192,11 @@ fn record_view(table: &Entity<TableState<Grid>>, cx: &App) -> AnyElement {
                         // A foreign key's field has its arrow just after the
                         // value, as its cell (K49): one row shows, so always.
                         .when(grid.editor_at(row, source).is_none(), |field| {
-                            field.children(grid.jump(row, source).map(|(_, related)| {
+                            let jumps = grid.jumps(row, source);
+                            field.when(!jumps.is_empty(), |field| {
                                 let id = ("record-fk-arrow", index);
-                                arrow_element(table, id, row, column, &related.label, cx)
-                            }))
+                                field.child(arrow_element(table, id, row, column, jumps, cx))
+                            })
                         }),
                 )
         })

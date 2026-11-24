@@ -390,12 +390,15 @@ fn a_result_of_one_table_and_sqlite_follow_their_foreign_keys(cx: &mut TestAppCo
     opened(&app, cx, 2);
     assert_eq!(shown(&app, cx).0, TableRef::new("main", "customers"));
     assert_eq!(app.data_rows(cx).len(), 1);
-    // A SQLite result: no table named, no mark.
+    // A SQLite result.
     app.run_in_new_tab(cx, "SELECT * FROM orders", "secondary-enter");
     app.wait_until(cx, "the rows", |app, cx| {
         app.outcomes(cx)
             .iter()
             .any(|outcome| outcome.ends_with("rows"))
     });
-    assert_eq!(mark(&app, cx, column), None);
+    // It names its tables now (K59): the same mark.
+    app.wait_until(cx, "the mark", |app, cx| {
+        mark(app, cx, column).as_deref() == Some("→ main.customers (id)")
+    });
 }

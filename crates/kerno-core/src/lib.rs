@@ -22,6 +22,7 @@ pub mod find;
 pub mod format;
 pub mod import;
 pub mod instance;
+pub mod links;
 pub mod maintenance;
 pub mod openssh;
 pub mod password;

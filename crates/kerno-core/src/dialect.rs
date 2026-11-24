@@ -252,6 +252,14 @@ pub trait Dialect: Send + Sync {
         None
     }
 
+    /// The query that names the columns of the tables numbered `tables`
+    /// (K59): one row per column, with the table's number, its schema, its
+    /// name, the column's number and the column's name. `None` on engines
+    /// whose results name their tables themselves.
+    fn origin_names_sql(&self, _tables: &[u32]) -> Option<String> {
+        None
+    }
+
     /// The script that replaces `object` by the definition in `ddl`: what
     /// [`crate::Session::ddl`] printed for it, edited by the user. The
     /// script is run one statement at a time, as the editor splits it.

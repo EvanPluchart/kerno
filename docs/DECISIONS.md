@@ -4043,3 +4043,42 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   differences from the tab (the script is the way); saving a comparison; more than 10,000 differences in one
   script (compare again after running it); keys whose text differs only by Unicode normalization (`é` composed
   and decomposed are two keys).
+- **Where a column comes from.** PostgreSQL's row description gives each column's table number and column
+  number; MySQL and MariaDB give the database, table and column under their own names; SQLite gives them through
+  its column metadata, compiled into the bundled build (`SQLITE_ENABLE_COLUMN_METADATA`): rusqlite's
+  `column_metadata` feature is turned on in `kerno-sqlite`, no new crate, `Cargo.lock` unchanged. The drivers
+  already kept the first two (`Column::origin`, RES-51); SQLite's now goes in the same field. An expression or a
+  literal has none, so no mark. A view's columns are the view's on PostgreSQL, MySQL and MariaDB: a view has no
+  foreign key, so no mark. SQLite looks through a view and names the table it reads: such a column is marked as
+  that table's.
+- **One query, then the catalog.** On PostgreSQL every table of a result is named in one query
+  (`Dialect::origin_names_sql`, `pg_class`/`pg_attribute` for the numbers seen), on the connection's own session
+  in the result's database or one opened for it, never the tab's (the session RES-51 uses, now `side_session`),
+  off the UI thread, once per result. The keys come from the completion catalog the tab already holds (each
+  relation's foreign keys): no table structure is read. The marks come after the grid's first layout: a column
+  that gains one is drawn again wide enough for it (seen in a capture: the type beside it cut to a dot), the
+  others keep the width they have. A result that comes before the catalog is marked when it
+  arrives. Left: a key made elsewhere after the catalog was read is not marked until the catalog is read again
+  (a statement of the tab that changes the schema, "Refresh Completion Metadata", a new tab, another database),
+  as completion does not know it either.
+- **One model for every grid.** `kerno_core::links`: per key, the column of the result that shows each of its
+  columns (`KeyLink`), worked out once (`key_links`). A table's data and an editable result build it from their
+  structure, so their numbering of jumps stays the cell menu's; any other result from the names above. The
+  header's tooltip, the arrow, ⌘-click, ⌘↓, the cell menu's "Open … where …", the record view and the value
+  panel's preview all read it. Following needs no editable result: a read-only connection and a join follow.
+  The menu's "Rows of … referencing this one" stays for one table's rows only (it needs that table's key).
+- **A key of several columns** is followed only with all its columns in the result; else each of its columns
+  keeps the mark, its tooltip ending "· not followed: pb is not in the result", and no arrow.
+- **A column in two keys** has both lines in its header's tooltip; its arrow is a button whose click opens a
+  small menu naming the two jumps ("Open s.parents where id = 2", "Open s.others where id = 2"), each running the
+  cell menu's entry; the arrow stays while its menu is open. ⌘-click and ⌘↓ follow the first, as before (the
+  owner's to change: a key has no place to open a menu at).
+- **A binary key** (`bytea`, `BINARY(16)`, a `uuid` kept as bytes) is followed: the condition is written with
+  the engine's binary literal (`Dialect::quote_bytes`, `'\x…'::bytea` on PostgreSQL, `X'…'` elsewhere) in the
+  opened tab's WHERE field, the label shortening it to its first twelve and last six characters around "…". The
+  value panel's preview of the row still leaves a binary key out (it reads the row through text literals).
+- **A table read twice** (a self-join) cannot be told apart by origins: a key's column is taken from the first
+  column of the result that shows it.
+- **Measured.** 300 columns over 20 tables (PostgreSQL, debug build): naming them 1.57 ms, with the keys 1.68 ms
+  (BENCH.md). The frame times of K49 were not measured again: per frame the grid still looks up one key list per
+  header and works out jumps only for the hovered or selected cell.

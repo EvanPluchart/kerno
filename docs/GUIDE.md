@@ -495,9 +495,14 @@ the selected cell do the same. NULL has no arrow. A value you changed and have n
 applied is the one followed. A double click on the value still edits it. The record view (Tab) has the same
 arrow beside the field of a foreign key.
 
-A query's result has the marks and the arrows when its rows are one table's and can be edited (PostgreSQL,
-MySQL, MariaDB): a join, a view, or a result on a read-only connection has none. SQLite results never name
-their table and have none; a SQLite table opened from the tree has them.
+A query's result has the marks and the arrows on every column that shows a table's column, whatever the
+statement: a join, a few columns, an alias, a result that cannot be edited, a read-only connection (following
+only reads), on every engine. A key of several columns is followed only when all its columns are in the result;
+otherwise its columns keep the mark, whose tooltip names the column missing, and have no arrow. A column in two
+keys names both in its tooltip, and its arrow opens a small menu of the two (⌘-click and ⌘↓ open the first). A
+binary key (`bytea`, `BINARY(16)`) is followed with the engine's binary literal, shortened in the tooltip. An
+expression has no mark; neither has a view's column on PostgreSQL, MySQL and MariaDB (a view has no foreign
+key), while SQLite names the table a view reads.
 
 ## The value panel
 

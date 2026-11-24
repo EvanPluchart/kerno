@@ -503,6 +503,23 @@ ORDER BY a.attnum"
         ))
     }
 
+    /// Every table of the result at once: a result over twenty tables is
+    /// one round trip.
+    fn origin_names_sql(&self, tables: &[u32]) -> Option<String> {
+        let oids: Vec<String> = tables.iter().map(u32::to_string).collect();
+        (!oids.is_empty()).then(|| {
+            format!(
+                "\
+SELECT c.oid::int8, n.nspname, c.relname, a.attnum, a.attname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE c.oid IN ({})",
+                oids.join(", ")
+            )
+        })
+    }
+
     /// From `pg_namespace`, with what the schema holds.
     fn schema_properties_sql(&self, schema: &str) -> Option<String> {
         Some(format!(

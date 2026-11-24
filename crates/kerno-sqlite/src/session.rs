@@ -19,7 +19,9 @@ use kerno_core::schema::{
     TableStructure,
 };
 use kerno_core::sql::Catalog;
-use kerno_core::{AdminView, Column, DbError, Engine, Error, Result, Session, TxState, TypeKind};
+use kerno_core::{
+    AdminView, Column, ColumnOrigin, DbError, Engine, Error, Result, Session, TxState, TypeKind,
+};
 use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::ValueRef;
 use rusqlite::{Batch, Connection, Row, Statement};
@@ -198,6 +200,18 @@ fn run_statement(
             )
         })
         .collect();
+    // The table column each column shows, as the bundled SQLite says (its
+    // column metadata, K59); an expression names none.
+    let origins: Vec<Option<ColumnOrigin>> = statement
+        .columns_with_metadata()
+        .map(|column| {
+            Some(ColumnOrigin::Named {
+                schema: column.database_name()?.to_string(),
+                table: column.table_name()?.to_string(),
+                column: column.origin_name()?.to_string(),
+            })
+        })
+        .collect();
     let describe = |first: Option<&Row<'_>>| -> Vec<Column> {
         described
             .iter()
@@ -209,6 +223,7 @@ fn run_statement(
                     column_type_name(declared.as_deref(), value),
                     column_kind(declared.as_deref(), value),
                 )
+                .with_origin(origins[index].clone())
             })
             .collect()
     };

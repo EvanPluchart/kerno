@@ -1318,3 +1318,40 @@ async fn sql_expressions_are_run_by_the_server() {
         cleaned(&session, &database, body).await;
     }
 }
+
+/// K59: MySQL and MariaDB name each column's table and table column
+/// themselves, through a join and under an alias; an expression has none.
+/// No query is asked for the names. Fixture read only.
+#[tokio::test]
+async fn a_join_names_the_table_column_of_each_column() {
+    use kerno_core::links::named_origins;
+    for engine in engines() {
+        let session = common::session(engine).await;
+        let columns = run(
+            &session,
+            "select o.id, o.customer_id as who, c.full_name, o.id + 1 as next \
+             from orders o join customers c on c.id = o.customer_id limit 1",
+        )
+        .await
+        .unwrap()
+        .results[0]
+            .columns
+            .clone();
+        let at =
+            |table: &str, column: &str| Some((TableRef::new("kerno", table), column.to_string()));
+        assert_eq!(
+            named_origins(&session, &columns).await.unwrap(),
+            [
+                at("orders", "id"),
+                at("orders", "customer_id"),
+                at("customers", "full_name"),
+                None
+            ],
+            "{engine:?}"
+        );
+        assert!(
+            session.dialect().origin_names_sql(&[1]).is_none(),
+            "{engine:?}"
+        );
+    }
+}

@@ -15,7 +15,7 @@ async-trait.workspace = true
 tracing.workspace = true
 # The declared type of each result column (D-102); no new crate, the
 # bundled SQLite is kerno-core's.
-rusqlite = { workspace = true, features = ["column_decltype"] }
+rusqlite = { workspace = true, features = ["column_decltype", "column_metadata"] }
 
 [dev-dependencies]
 kerno-core = { workspace = true, features = ["test-support"] }

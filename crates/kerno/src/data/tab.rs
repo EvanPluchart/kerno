@@ -30,11 +30,12 @@ use kerno_core::browse::{
     Condition, Filter, Operator, Page, count_sql, distinct_sql, one_of_sql, page_sql, select_sql,
 };
 use kerno_core::exec::CollectedResult;
+use kerno_core::links::KeyLink;
 use kerno_core::pending::Pending;
-use kerno_core::schema::{ForeignKeyInfo, RelationKind, TableRef, TableStructure};
+use kerno_core::schema::{RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{ApplyFailure, CellValue, RowChange, RowSql, apply_edits_until};
 use kerno_core::storage::TableLayout;
-use kerno_core::{Dialect, Engine, Error, ResultStore, Session, TxState, describe, exec};
+use kerno_core::{Dialect, Engine, Error, ResultStore, Session, TxState, TypeKind, describe, exec};
 
 use crate::actions::CloseTab;
 use crate::ai_view::ask::{self as ai_ask, Entry as AiEntry};
@@ -1143,7 +1144,7 @@ impl DataTab {
                 let _ = view.update(cx, |this, cx| this.perform(action, row, column, window, cx));
             }),
             related: Some(Rc::new(move |grid, row| {
-                related(&structure, grid, row)
+                related(grid, row)
                     .into_iter()
                     .map(|related| related.label)
                     .collect()
@@ -2102,11 +2103,9 @@ impl DataTab {
             GridAction::ClearFilters => self.set_filter(Filter::default(), window, cx),
             GridAction::DistinctValues => self.distinct_values(column, window, cx),
             GridAction::Follow(index, _) => {
-                let related = match (&self.grid, &self.structure) {
-                    (Some(table), Some(structure)) => {
-                        related(structure, table.read(cx).delegate(), row)
-                    }
-                    _ => Vec::new(),
+                let related = match &self.grid {
+                    Some(table) => related(table.read(cx).delegate(), row),
+                    None => Vec::new(),
                 };
                 if let Some(related) = related.get(index) {
                     self.follow(related, cx);
@@ -2210,9 +2209,9 @@ impl DataTab {
     /// Where the foreign keys of a row lead; for tests.
     #[cfg(test)]
     pub fn related(&self, row: usize, cx: &App) -> Vec<Related> {
-        match (&self.grid, &self.structure) {
-            (Some(table), Some(structure)) => related(structure, table.read(cx).delegate(), row),
-            _ => Vec::new(),
+        match &self.grid {
+            Some(table) => related(table.read(cx).delegate(), row),
+            None => Vec::new(),
         }
     }
 
@@ -3208,73 +3207,81 @@ pub struct Related {
     pub filter: Filter,
 }
 
-/// Where the foreign keys of a row lead: to the row it references, and to
-/// the rows that reference it. A key with a NULL column leads nowhere.
-pub fn related(structure: &TableStructure, grid: &Grid, row: usize) -> Vec<Related> {
-    let references = structure
-        .foreign_keys
-        .iter()
-        .filter_map(|key| reference(key, grid, row));
-    let referenced_by = structure.referenced_by.iter().filter_map(|key| {
-        let values = values_of(grid, row, &key.referenced_columns)?;
-        Some(Related {
-            label: format!(
-                "Rows of {} referencing this one ({})",
-                key.table.name,
-                key.columns.join(", ")
-            ),
-            table: key.table.clone(),
-            filter: equal_to(&key.columns, values),
-        })
-    });
+/// Where the foreign keys of a row lead: to the rows its keys reference
+/// (the grid's keys, K59), then, for one table's rows, to the rows that
+/// reference it. A key with a NULL column, or one the result lacks, leads
+/// nowhere.
+pub fn related(grid: &Grid, row: usize) -> Vec<Related> {
+    let references = grid.references(row).into_iter().map(|(_, related)| related);
+    let referenced_by = grid
+        .structure()
+        .into_iter()
+        .flat_map(|structure| &structure.referenced_by)
+        .filter_map(|key| {
+            let values = values_of(grid, row, &key.referenced_columns)?;
+            Some(Related {
+                label: format!(
+                    "Rows of {} referencing this one ({})",
+                    key.table.name,
+                    key.columns.join(", ")
+                ),
+                table: key.table.clone(),
+                filter: equal_to(&key.columns, values),
+            })
+        });
     references.chain(referenced_by).collect()
 }
 
-/// The row a foreign key of a row points to, when none of its columns is
-/// NULL: the jump of the cell menu, of a cell's arrow (K49), and the value
-/// panel's preview (K18). Labelled as the arrow's tooltip says it: "Open
-/// shop.customers where id = 42".
-pub fn reference(key: &ForeignKeyInfo, grid: &Grid, row: usize) -> Option<Related> {
-    let values = values_of(grid, row, &key.columns)?;
-    let filter = equal_to(&key.referenced_columns, values);
-    let conditions: Vec<String> = filter
-        .conditions
-        .iter()
-        .map(|condition| format!("{} = {}", condition.column, condition.value))
-        .collect();
+/// The row a foreign key of a row points to, when every column of the key
+/// is in the result and none is NULL: the jump of the cell menu, of a
+/// cell's arrow (K49), and the value panel's preview (K18). Labelled as the
+/// arrow's tooltip says it: "Open shop.customers where id = 42". A binary
+/// column is compared with the engine's binary literal, shortened in the
+/// label (K59).
+pub fn reference(link: &KeyLink, grid: &Grid, row: usize) -> Option<Related> {
+    let key = &link.key;
+    let dialect = grid.session().dialect();
+    let mut filter = Filter::default();
+    let (mut said, mut raw) = (Vec::new(), Vec::new());
+    for (source, there) in link.sources.iter().zip(&key.referenced_columns) {
+        let source = (*source)?;
+        let value = grid.cell(row, source)?;
+        if grid.store().columns().get(source)?.kind == TypeKind::Binary {
+            let literal = dialect.quote_bytes(value);
+            said.push(format!("{there} = {}", shortened(&literal)));
+            raw.push(format!("{} = {literal}", dialect.quote_ident(there)));
+        } else {
+            let text = String::from_utf8_lossy(value).into_owned();
+            said.push(format!("{there} = {text}"));
+            filter
+                .conditions
+                .push(Condition::equals(there.clone(), text));
+        }
+    }
+    filter.raw = raw.join(" AND ");
     Some(Related {
         label: format!(
             "Open {}.{} where {}",
             key.referenced_table.schema,
             key.referenced_table.name,
-            conditions.join(" and ")
+            said.join(" and ")
         ),
         table: key.referenced_table.clone(),
         filter,
     })
 }
 
-/// The jump of the foreign key that holds the table column `name`, from
-/// `row` (K49): its number among the row's jumps ([`related`], as
-/// [`GridAction::Follow`] numbers them) and where it leads. None when the
-/// column is in no foreign key or a column of the key is NULL. A column in
-/// several keys follows the first, as the value panel's preview does.
-pub fn follow_at(
-    structure: &TableStructure,
-    grid: &Grid,
-    row: usize,
-    name: &str,
-) -> Option<(usize, Related)> {
-    let keys = &structure.foreign_keys;
-    let index = keys
-        .iter()
-        .position(|key| key.columns.iter().any(|column| column == name))?;
-    let related = reference(&keys[index], grid, row)?;
-    let before = keys[..index]
-        .iter()
-        .filter(|earlier| reference(earlier, grid, row).is_some())
-        .count();
-    Some((before, related))
+/// A binary literal as a label shows it: its start and its end around an
+/// ellipsis once it is long (K59).
+fn shortened(literal: &str) -> String {
+    const KEPT: usize = 12;
+    let chars: Vec<char> = literal.chars().collect();
+    if chars.len() <= 2 * KEPT + 1 {
+        return literal.to_string();
+    }
+    let head: String = chars[..KEPT].iter().collect();
+    let tail: String = chars[chars.len() - KEPT / 2..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// The values of the table columns `columns` in a row, when none is NULL.

@@ -1064,3 +1064,38 @@ async fn the_ai_context_says_nulls_keys_and_indexes() {
         assert!(!system.contains(never), "{never}:\n{system}");
     }
 }
+
+/// K59: the bundled SQLite says where each column of a result comes from
+/// (its column metadata), through a join and under an alias, as MySQL does;
+/// an expression has none. A view's columns are named by the table they read
+/// (SQLite looks through the view).
+#[tokio::test]
+async fn a_join_names_the_table_column_of_each_column() {
+    use kerno_core::links::named_origins;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, session) = fixture(dir.path()).await;
+    let columns = |sql: &'static str| {
+        let session = session.clone();
+        async move { run(&session, sql).await.unwrap().results[0].columns.clone() }
+    };
+    let at = |table: &str, column: &str| Some((TableRef::new("main", table), column.to_string()));
+    let joined = columns(
+        "select o.id, o.customer_id as who, c.name, o.id + 1 as next \
+         from orders o join customers c on c.id = o.customer_id",
+    )
+    .await;
+    assert_eq!(
+        named_origins(&session, &joined).await.unwrap(),
+        [
+            at("orders", "id"),
+            at("orders", "customer_id"),
+            at("customers", "name"),
+            None
+        ]
+    );
+    let view = columns("select customer_id, email, orders from customer_orders").await;
+    assert_eq!(
+        named_origins(&session, &view).await.unwrap(),
+        [at("customers", "id"), at("customers", "email"), None]
+    );
+}

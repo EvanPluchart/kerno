@@ -15,7 +15,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableSelection, TableState};
 use gpui_kit::component::tooltip::Tooltip;
@@ -31,6 +31,7 @@ use gpui_kit::{
 use kerno_core::browse::Operator;
 use kerno_core::export::{DelimitedOptions, ExportFormat, export_to_string};
 use kerno_core::format::{CellStyle, display};
+use kerno_core::links::{KeyLink, key_links};
 use kerno_core::pending::Pending;
 use kerno_core::schema::{ColumnGeneration, ColumnInfo, ForeignKeyInfo, TableRef, TableStructure};
 use kerno_core::sort::sorted_rows;
@@ -985,6 +986,15 @@ pub struct Grid {
     /// structure (K49): the mark of its header, and the columns whose cells
     /// can show an arrow.
     links: Vec<Option<SharedString>>,
+    /// The foreign keys the result's columns are in (K59): the table's,
+    /// once the rows are known as one table's, else `found_keys`.
+    keys: Vec<KeyLink>,
+    /// The keys the owner found from where the server says each column
+    /// comes from: any result, a join, a read-only one (K59).
+    found_keys: Vec<KeyLink>,
+    /// The cell whose arrow's menu is open (a column in two keys): its arrow
+    /// stays while the pointer is in the menu (K59).
+    arrow_menu: Option<(usize, usize)>,
     /// The cell of a foreign-key column under the pointer (display row,
     /// column of the grid): its arrow shows.
     hovered: Option<(usize, usize)>,
@@ -1035,6 +1045,9 @@ impl Grid {
             widths: HashMap::new(),
             value_panel: None,
             links: Vec::new(),
+            keys: Vec::new(),
+            found_keys: Vec::new(),
+            arrow_menu: None,
             hovered: None,
             exited_at: None,
         }
@@ -1122,6 +1135,9 @@ impl Grid {
             widths: HashMap::new(),
             value_panel: None,
             links: Vec::new(),
+            keys: Vec::new(),
+            found_keys: Vec::new(),
+            arrow_menu: None,
             hovered: None,
             exited_at: None,
             store,
@@ -1157,22 +1173,112 @@ impl Grid {
         self.generation += 1;
     }
 
-    /// Works out [`Self::links`] from the table the rows are from: once
-    /// per structure, never per frame (K49).
+    /// Gives the grid the foreign keys its owner found for the result's
+    /// columns, from where the server says each comes from (K59): used while
+    /// the rows are not known as one table's. A column that gains a mark is
+    /// drawn again at a width that holds it (the marks come after the first
+    /// layout); the others keep the width they have.
+    pub fn set_found_keys(
+        table: &mut TableState<Self>,
+        keys: Vec<KeyLink>,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let marked = |grid: &Self| -> Vec<bool> {
+            (0..grid.store.columns().len())
+                .map(|source| grid.link(source).is_some())
+                .collect()
+        };
+        let before = marked(table.delegate());
+        table.delegate_mut().found_keys = keys;
+        table.delegate_mut().find_links();
+        let after = marked(table.delegate());
+        let gained: Vec<usize> = (0..after.len())
+            .filter(|&source| after[source] && !before[source])
+            .collect();
+        if !gained.is_empty() {
+            let grid = table.delegate();
+            let kept: Vec<(String, Pixels)> = (1..=grid.layout.len())
+                .filter_map(|column| {
+                    let source = grid.source_column(column)?;
+                    let name = grid.store.columns()[source].name.clone();
+                    (!gained.contains(&source)).then_some((name, table.col_width(column)?))
+                })
+                .collect();
+            let grid = table.delegate_mut();
+            grid.widths.extend(kept);
+            for source in gained {
+                let name = grid.store.columns()[source].name.clone();
+                grid.widths.remove(&name);
+            }
+            table.refresh(cx);
+        }
+        cx.notify();
+    }
+
+    /// Works out [`Self::keys`] and [`Self::links`]: from the table the rows
+    /// are from, else from what the owner found; once per structure or per
+    /// result, never per frame (K49, K59).
     fn find_links(&mut self) {
-        self.links = (0..self.store.columns().len())
+        let columns = self.store.columns().len();
+        self.keys = match self.structure() {
+            Some(structure) => {
+                let table = TableRef::new("", "");
+                let origins: Vec<Option<(TableRef, String)>> = (0..columns)
+                    .map(|source| Some((table.clone(), self.table_column_name(source)?.into())))
+                    .collect();
+                key_links(&origins, |_| structure.foreign_keys.clone())
+            }
+            None => self.found_keys.clone(),
+        };
+        self.links = (0..columns)
             .map(|source| {
-                let structure = self.structure()?;
-                let name = self.table_column_name(source)?;
-                let lines: Vec<String> = structure
-                    .foreign_keys
+                let lines: Vec<String> = self
+                    .keys
                     .iter()
-                    .filter(|key| key.columns.iter().any(|column| column == name))
-                    .map(link_text)
+                    .filter(|link| link.holds(source))
+                    .map(|link| match link.missing() {
+                        Some(column) => format!(
+                            "{} · not followed: {column} is not in the result",
+                            link_text(&link.key)
+                        ),
+                        None => link_text(&link.key),
+                    })
                     .collect();
                 (!lines.is_empty()).then(|| SharedString::from(lines.join("\n")))
             })
             .collect();
+    }
+
+    /// The foreign keys the result's columns are in (K59).
+    pub fn keys(&self) -> &[KeyLink] {
+        &self.keys
+    }
+
+    /// Where the foreign keys of a row lead, in the order of [`Self::keys`]
+    /// (a key with a column missing or NULL leads nowhere): the first
+    /// entries [`GridAction::Follow`] numbers, the key of each with it.
+    pub fn references(&self, row: usize) -> Vec<(usize, crate::data::tab::Related)> {
+        self.keys
+            .iter()
+            .enumerate()
+            .filter_map(|(key, link)| Some((key, crate::data::tab::reference(link, self, row)?)))
+            .collect()
+    }
+
+    /// The jumps of a foreign-key cell (K49, K59): per key holding the
+    /// column of the result `source`, its number among the row's jumps and
+    /// where it leads, when the owner follows keys. Two for a column in two
+    /// keys. A pending value is followed, as the cell menu does.
+    pub fn jumps(&self, row: usize, source: usize) -> Vec<(usize, crate::data::tab::Related)> {
+        if self.link(source).is_none() || !self.follows() {
+            return Vec::new();
+        }
+        self.references(row)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (key, _))| self.keys[*key].holds(source))
+            .map(|(number, (_, related))| (number, related))
+            .collect()
     }
 
     /// Where the foreign keys holding the column of the result `source`
@@ -1186,12 +1292,7 @@ impl Grid {
     /// the result `source` is in one and none of the key's values is NULL.
     /// A pending value is followed, as the cell menu does.
     pub fn jump(&self, row: usize, source: usize) -> Option<(usize, crate::data::tab::Related)> {
-        self.link(source)?;
-        if !self.follows() {
-            return None;
-        }
-        let name = self.table_column_name(source)?;
-        crate::data::tab::follow_at(self.structure()?, self, row, name)
+        self.jumps(row, source).into_iter().next()
     }
 
     /// Opens the rows the foreign key of a cell points to, as its menu's
@@ -1220,7 +1321,9 @@ impl Grid {
     /// Whether the arrow of a cell shows: it is under the pointer or it is
     /// the selected cell, never a whole row or column (K49).
     fn shows_arrow(&self, row: usize, column: usize) -> bool {
-        self.hovered == Some((row, column)) || self.anchor == TableSelection::Cell(row, column)
+        self.hovered == Some((row, column))
+            || self.anchor == TableSelection::Cell(row, column)
+            || self.arrow_menu == Some((row, column))
     }
 
     /// The rows as rows of the table they are written to: the result's
@@ -1350,7 +1453,7 @@ impl Grid {
     /// What a cell holds as it shows: the pending value when there is one,
     /// else what was fetched. `None` for NULL (and for a default not known
     /// yet).
-    pub(super) fn cell(&self, row: usize, source: usize) -> Option<&[u8]> {
+    pub(crate) fn cell(&self, row: usize, source: usize) -> Option<&[u8]> {
         let fetched = self.store.row_count();
         match self
             .pending()
@@ -1937,7 +2040,7 @@ impl Grid {
     }
 
     /// The table the rows are from, when they are one table's.
-    pub(super) fn structure(&self) -> Option<&Arc<TableStructure>> {
+    pub(crate) fn structure(&self) -> Option<&Arc<TableStructure>> {
         if let Some(edits) = &self.edits {
             return Some(&edits.structure);
         }
@@ -1964,7 +2067,7 @@ impl Grid {
     }
 
     /// The session the rows came from.
-    pub(super) fn session(&self) -> &Arc<dyn Session> {
+    pub(crate) fn session(&self) -> &Arc<dyn Session> {
         &self.session
     }
 
@@ -2756,51 +2859,95 @@ impl Grid {
 }
 
 /// The arrow of a foreign key's cell, in the grid and in the record view
-/// (K49): a click opens the rows the key points to; `label` says where. Its
-/// own target: the cell under it neither selects nor edits.
+/// (K49): a click opens the rows the key points to; the jumps' labels say
+/// where. Its own target: the cell under it neither selects nor edits. A
+/// column in two keys (K59) has one arrow whose click opens a small menu
+/// naming where each leads.
 pub(super) fn arrow_element(
     table: &Entity<TableState<Grid>>,
     id: impl Into<ElementId>,
     row: usize,
     column: usize,
-    label: &str,
+    jumps: Vec<(usize, crate::data::tab::Related)>,
     cx: &App,
 ) -> gpui_kit::AnyElement {
     let theme = cx.theme();
-    let key = follow_key(cx);
-    let tip = SharedString::from(arrow_tip(
-        label,
-        cx.platform_info().is_mac(),
-        key.as_deref(),
-    ));
     let size = text_size(cx);
+    let icon = Icon::new(IconName::ArrowUpRight)
+        .size(size)
+        .text_color(theme.link);
     let table = table.clone();
+    if let [(_, related)] = jumps.as_slice() {
+        let key = follow_key(cx);
+        let tip = SharedString::from(arrow_tip(
+            &related.label,
+            cx.platform_info().is_mac(),
+            key.as_deref(),
+        ));
+        return div()
+            .id(id)
+            .test_support()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(size + px(6.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|arrow| arrow.bg(theme.secondary_hover))
+            .aria_description(tip.clone())
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            // Stopped here, the cell's own press and the table's click (a
+            // selection, a row, an edit on a double click) never start.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |event, window, cx| {
+                // The second click of a double click lands here too: one tab.
+                if event.click_count() <= 1 {
+                    Grid::follow(&table, row, column, window, cx);
+                }
+            })
+            .child(icon)
+            .into_any_element();
+    }
+    let labels: Vec<String> = jumps
+        .iter()
+        .map(|(_, related)| related.label.clone())
+        .collect();
+    let tip = SharedString::from(labels.join("\n"));
+    let (open, menu_table) = (table.clone(), table);
     div()
         .id(id)
         .test_support()
         .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(size + px(6.))
-        .rounded(px(4.))
-        .cursor_pointer()
-        .hover(|arrow| arrow.bg(theme.secondary_hover))
         .aria_description(tip.clone())
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        // Stopped here, the cell's own press and the table's click (a
-        // selection, a row, an edit on a double click) never start.
+        // As the single arrow: the cell neither selects nor edits.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(move |event, window, cx| {
-            // The second click of a double click lands here too: one tab.
-            if event.click_count() <= 1 {
-                Grid::follow(&table, row, column, window, cx);
-            }
-        })
         .child(
-            Icon::new(IconName::ArrowUpRight)
-                .size(size)
-                .text_color(theme.link),
+            Button::new("fk-arrow-menu")
+                .ghost()
+                .xsmall()
+                .child(icon)
+                .tooltip(tip)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (number, related) in &jumps {
+                        let (table, number, label) =
+                            (menu_table.clone(), *number, related.label.clone());
+                        menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
+                            move |_, window, cx| {
+                                let pick = Grid::pick(&table, Some(row), column, cx);
+                                pick(GridAction::Follow(number, label.clone()), window, cx);
+                            },
+                        ));
+                    }
+                    menu
+                })
+                // The arrow stays while its menu is open, the pointer in it.
+                .on_open_change(move |opened, _, cx| {
+                    open.update(cx, |table, cx| {
+                        table.delegate_mut().arrow_menu = opened.then_some((row, column));
+                        cx.notify();
+                    })
+                }),
         )
         .into_any_element()
 }
@@ -3499,11 +3646,11 @@ impl TableDelegate for Grid {
         let link = self.link(source).is_some();
         let watched = link && self.hovered == Some((row, column));
         let arrow = (link && self.shows_arrow(row, column))
-            .then(|| self.jump(row, source))
-            .flatten()
-            .map(|(_, related)| {
+            .then(|| self.jumps(row, source))
+            .filter(|jumps| !jumps.is_empty())
+            .map(|jumps| {
                 let id = ("fk-arrow", (row << 12) | column);
-                arrow_element(&table, id, row, column, &related.label, cx)
+                arrow_element(&table, id, row, column, jumps, cx)
             });
         let text = match arrow {
             Some(_) => text.flex_1().min_w_0(),

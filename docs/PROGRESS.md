@@ -1568,3 +1568,14 @@ Still open (for the owner):
   the script on the target, compare again, nothing left), `ui_tests::data_compare` (7), each seen failing under
   a mutation (`docs/plans/M12.md`, K60). Scratch schemas and databases `kerno_test_dc_*` only, dropped also on a
   failure; the fixtures are only read.
+
+## 2026-11-24 — K59, part 2: foreign keys marked in more results
+
+- K49's marks and arrows now come on every result whose columns the engine says come from a table: a join, a
+  few columns, an alias, a result that cannot be edited, a read-only connection, SQLite (its column metadata,
+  a feature of the crate already there). A key with a column missing says which; a column in two keys offers both
+  from its arrow; a binary key is followed with the engine's binary literal. PostgreSQL names a result's tables
+  in one query; the keys come from the tab's completion catalog (`docs/plans/M12.md`, K59; D-125).
+- Measured: 300 columns over 20 tables named and matched in 1.7 ms (debug build).
+- Tests: `ui_tests::k59` (7 in all), `links::tests` (4), three driver tests; each new one seen failing under a
+  mutation.

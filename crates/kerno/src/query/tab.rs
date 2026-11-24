@@ -366,7 +366,16 @@ pub struct ResultPane {
     _grid_events: Option<Subscription>,
     /// Finds out whether its rows take changes; dropped with the pane.
     _lookup: Option<Task<()>>,
+    /// The table and table column each column of the result shows, once
+    /// named (K59): what its foreign keys are found from.
+    origins: Option<Vec<Option<(TableRef, String)>>>,
+    /// Names the origins of the result's columns off the UI thread.
+    _naming: Option<Task<()>>,
 }
+
+/// A session for side work on a result's rows, and whether the work closes it
+/// ([`QueryTab::side_session`]).
+type SideSession = (Arc<dyn Session>, bool);
 
 /// What the result of a SELECT is read again with: its own statement,
 /// filtered and ordered by the server, as DBeaver's filter panel over an
@@ -1553,6 +1562,11 @@ impl QueryTab {
                     let _ = this.update(cx, |this, cx| {
                         *this.catalog.borrow_mut() = Arc::new(catalog);
                         this.tell_ai_catalog(cx);
+                        // Results read before it get their foreign keys (K59).
+                        let ids: Vec<u64> = this.results.iter().map(|pane| pane.id).collect();
+                        for id in ids {
+                            this.mark_keys(id, cx);
+                        }
                     });
                 }
                 Err(error) => {
@@ -2695,6 +2709,8 @@ impl QueryTab {
             source: None,
             _grid_events: None,
             _lookup: None,
+            origins: None,
+            _naming: None,
         });
         id
     }
@@ -4065,15 +4081,13 @@ impl QueryTab {
                     }
                 });
             }),
-            // Where a row's foreign keys lead, once the result is known
-            // to be one table's rows (K49).
+            // Where a row's foreign keys lead: those the grid knows, from
+            // its table or from where its columns come from (K49, K59).
             related: Some(Rc::new(|grid: &Grid, row| {
-                grid.structure().map_or_else(Vec::new, |structure| {
-                    related(structure, grid, row)
-                        .into_iter()
-                        .map(|related| related.label)
-                        .collect()
-                })
+                related(grid, row)
+                    .into_iter()
+                    .map(|related| related.label)
+                    .collect()
             })),
             export: class.writes.then_some("the statement writes"),
             filtered: requery
@@ -4176,7 +4190,84 @@ impl QueryTab {
             Some(Err(why)) => self.decided(id, Err(why), cx),
             None => {}
         }
+        // Foreign keys, whatever the statement and the connection (K59).
+        if self.explain_mode.is_none() {
+            let requery = self
+                .pane_index(id)
+                .and_then(|index| self.results[index].requery.clone());
+            let columns = self.origin_columns(requery.as_ref(), &table, cx);
+            self.name_origins(id, columns, window, cx);
+        }
         id
+    }
+
+    /// Names the table column each column of pane `id` shows (K59): at once
+    /// when the server named them (MySQL, MariaDB, SQLite), else with one
+    /// query on a side session (PostgreSQL's numbers), then marks the keys.
+    fn name_origins(
+        &mut self,
+        id: u64,
+        columns: Arc<[kerno_core::Column]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if columns.iter().all(|column| column.origin.is_none()) {
+            return;
+        }
+        let numbered = columns
+            .iter()
+            .any(|column| matches!(column.origin, Some(kerno_core::ColumnOrigin::Oid { .. })));
+        if !numbered {
+            let named = kerno_core::links::named(&columns, &Default::default());
+            if let Some(pane) = self.pane_mut(id) {
+                pane.origins = Some(named);
+            }
+            self.mark_keys(id, cx);
+            return;
+        }
+        let Some(session) = self.side_session(id, cx) else {
+            return;
+        };
+        let naming = bridge::spawn(cx, async move {
+            let (session, close) = session.await?;
+            let named = kerno_core::links::named_origins(&session, &columns)
+                .await
+                .map_err(|error| error.to_string());
+            if close {
+                session.close().await;
+            }
+            named
+        });
+        let task = cx.spawn_in(window, async move |this, cx| match naming.await {
+            Ok(named) => {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(pane) = this.pane_mut(id) {
+                        pane.origins = Some(named);
+                    }
+                    this.mark_keys(id, cx);
+                });
+            }
+            Err(error) => tracing::warn!(%error, "the columns of a result were not named"),
+        });
+        if let Some(pane) = self.pane_mut(id) {
+            pane._naming = Some(task);
+        }
+    }
+
+    /// Gives the grid of pane `id` the foreign keys its columns are in, from
+    /// the tables of the tab's catalog (K59). Nothing while the catalog is
+    /// not read; again when it arrives.
+    fn mark_keys(&mut self, id: u64, cx: &mut Context<Self>) {
+        let (Some(grid), Some(origins)) = (
+            self.pane_grid(id),
+            self.pane_index(id)
+                .and_then(|index| self.results[index].origins.clone()),
+        ) else {
+            return;
+        };
+        let catalog = self.catalog.borrow().clone();
+        let keys = kerno_core::links::key_links(&origins, |table| catalog.foreign_keys(table));
+        grid.update(cx, |table, cx| Grid::set_found_keys(table, keys, cx));
     }
 
     /// Opens the other end of the `index`-th foreign key of a row of the
@@ -4185,7 +4276,7 @@ impl QueryTab {
     fn follow(&mut self, id: u64, index: usize, row: usize, cx: &mut Context<Self>) {
         let found = self.pane_grid(id).and_then(|grid| {
             let grid = grid.read(cx).delegate();
-            related(grid.structure()?, grid, row).into_iter().nth(index)
+            related(grid, row).into_iter().nth(index)
         });
         if let Some(related) = found {
             cx.emit(QueryTabEvent::OpenData {
@@ -4216,20 +4307,63 @@ impl QueryTab {
         if let Some(saved) = saved.filter(|saved| saved.config.read_only) {
             return Err(ReadOnly::Connection(saved.config.name.clone()));
         }
-        let mut columns = table.read(cx).delegate().store().columns().clone();
-        if let Some(origins) = requery
-            .and_then(|requery| requery.origins.as_ref())
-            .filter(|origins| origins.len() == columns.len())
-        {
-            columns = columns
-                .iter()
-                .zip(origins.iter())
-                .map(|(column, origin)| column.clone().with_origin(origin.clone()))
-                .collect();
-        }
+        let columns = self.origin_columns(requery, table, cx);
         let statement = requery.map_or(statement, |requery| requery.statement.as_str());
         let source = editable::check(statement, self.lex_rules(cx), &columns)?;
         Ok((columns, source))
+    }
+
+    /// The columns of a result with the origins of its statement's own run
+    /// when it is read again: inside a derived table, MariaDB names the
+    /// derived table instead.
+    fn origin_columns(
+        &self,
+        requery: Option<&Requery>,
+        table: &Entity<TableState<Grid>>,
+        cx: &App,
+    ) -> Arc<[kerno_core::Column]> {
+        let columns = table.read(cx).delegate().store().columns().clone();
+        match requery
+            .and_then(|requery| requery.origins.as_ref())
+            .filter(|origins| origins.len() == columns.len())
+        {
+            Some(origins) => columns
+                .iter()
+                .zip(origins.iter())
+                .map(|(column, origin)| column.clone().with_origin(origin.clone()))
+                .collect(),
+            None => columns,
+        }
+    }
+
+    /// The session the side work on pane `id`'s rows runs on (RES-51, K59):
+    /// the connection's own when it is in the rows' database, else one
+    /// opened for it, which the work closes (`true`). Never the tab's: a
+    /// result being paged holds it, and its transaction is the user's.
+    fn side_session(
+        &self,
+        id: u64,
+        cx: &App,
+    ) -> Option<impl Future<Output = Result<SideSession, String>> + Send + use<>> {
+        let (target, grid) = (self.target.as_ref()?, self.pane_grid(id)?);
+        let database = grid.read(cx).delegate().session().database();
+        let connections = self.connections.read(cx);
+        let meta = connections
+            .meta_session(&target.connection)
+            .filter(|meta| !meta.dialect().has_schemas() || meta.database() == database);
+        let opening = meta
+            .is_none()
+            .then(|| connections.open_session(&target.connection, database, cx));
+        Some(async move {
+            match (meta, opening) {
+                (Some(meta), _) => Ok((meta, false)),
+                (None, Some(opening)) => opening
+                    .await
+                    .map(|session| (session, true))
+                    .map_err(|error| error.to_string()),
+                (None, None) => Err("no session".to_string()),
+            }
+        })
     }
 
     /// Finds out from the table whether the rows of pane `id` take
@@ -4246,29 +4380,13 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(target), Some(grid)) = (self.target.clone(), self.pane_grid(id)) else {
+        let Some(session) = self.side_session(id, cx) else {
             return;
-        };
-        let database = grid.read(cx).delegate().session().database();
-        let connections = self.connections.read(cx);
-        let meta = connections
-            .meta_session(&target.connection)
-            .filter(|meta| !meta.dialect().has_schemas() || meta.database() == database);
-        let opening = match &meta {
-            Some(_) => None,
-            None => Some(connections.open_session(&target.connection, database, cx)),
         };
         // One piece of work on the runtime, which goes on when the pane is
         // gone: a session opened for the lookup is always closed by it.
         let looking = bridge::spawn(cx, async move {
-            let (session, close) = match (meta, opening) {
-                (Some(meta), _) => (meta, false),
-                (None, Some(opening)) => match opening.await {
-                    Ok(session) => (session, true),
-                    Err(error) => return Err(ReadOnly::Unread(error.to_string())),
-                },
-                (None, None) => return Err(ReadOnly::Unread("no session".into())),
-            };
+            let (session, close) = session.await.map_err(ReadOnly::Unread)?;
             let decided = editable::lookup(&session, &columns, &source).await;
             if close {
                 session.close().await;
