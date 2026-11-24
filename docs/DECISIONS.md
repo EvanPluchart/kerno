@@ -4186,7 +4186,7 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
   Linux 22 min (about 9 min per architecture), the whole run under 30 min.
 - **What the first runs found.** The workspace tests had never run on Linux: 13 of the app's fail there
   (shortcuts that collide with the kit's on Linux, backup tools, folder pictures, one font metric). They are
-  K65's; until it lands the Linux test job is red.
+  K65's (D-132), which made that job green.
 - **Not in this decision.** A Windows build (K64 is its first step); a stable signing identity or
   notarization (they need secrets and an Apple account); Dependabot for the pinned actions (update them by
   hand, with their hash); the site.
