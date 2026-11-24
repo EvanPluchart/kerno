@@ -392,7 +392,12 @@ fn start(
             kerno_core::home::dir().as_deref(),
             std::env::var_os("KERNO_SSH_CONFIG").map(std::path::PathBuf::from),
             std::env::current_exe().unwrap_or_else(|_| "kerno".into()),
-        );
+        )
+        // Windows: the tunnels' private folders, in the profile (K69, D-138).
+        .map(|env| kerno_core::openssh::OpenSshEnv {
+            tunnels: kerno_core::storage::AppPaths::local_data_dir().map(|dir| dir.join("ssh")),
+            ..env
+        });
         let connections = cx.new(|_| {
             let mut connections = Connections::new(connections, drivers, user_known_hosts);
             connections.set_openssh(openssh);
@@ -416,6 +421,14 @@ fn start(
             )
         });
         workspace::handle_quit(window.window_handle(), workspace.downgrade(), cx);
+        // Windows: every ssh.exe of the OpenSSH tunnels, a jump host's
+        // included, stops with Kerno, waited for (K69, D-138).
+        #[cfg(windows)]
+        cx.on_app_quit(|_| {
+            kerno_core::openssh::stop_all();
+            async {}
+        })
+        .detach();
         bench::begin(&workspace, &connections, window, cx);
         if let Some(listener) = listener {
             open_url::listen(listener, &workspace, &connections, window, cx);

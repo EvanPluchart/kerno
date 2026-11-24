@@ -104,11 +104,10 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
     // Confirmed here; never in the file.
     command.password_command_unconfirmed = false;
     let command_id = storage.save_connection(None, &command).unwrap();
-    let mut task = SavedTask::new(
-        "kerno_ui nightly",
-        &linked_id,
-        TaskSettings::Backup(BackupOptions::new(Engine::Postgres, "kerno")),
-    );
+    // A folder the preview shows before the task is saved (K69).
+    let mut backup = BackupOptions::new(Engine::Postgres, "kerno");
+    backup.output_folder = PathBuf::from("/tmp/kerno_ui dumps");
+    let mut task = SavedTask::new("kerno_ui nightly", &linked_id, TaskSettings::Backup(backup));
     task.description = "kerno_ui backup".into();
     storage.save_task(&task).unwrap();
     let app = open(cx, storage);
@@ -192,6 +191,15 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
          kerno_ui command Add Ask | environments [Replace, Add] | tasks [Add]"
     );
     assert!(other.has(fresh, ("import-connection", 2usize)));
+    // K69: what the task writes is shown before it is saved. Mutation seen:
+    // the preview's line left out.
+    assert!(other.has(fresh, ("import-task-files", 0usize)));
+    assert_eq!(
+        fresh.update(|cx| preview.read(cx).task_notes()),
+        [Some(
+            "Writes its backups to /tmp/kerno_ui dumps.".to_string()
+        )]
+    );
     other.click(fresh, "import-next");
     // The command needs no password: two rows. The entry found under the
     // first one's id is offered, naming where it would go, but not chosen:

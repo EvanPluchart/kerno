@@ -1794,6 +1794,24 @@ impl ConnectionDialog {
                         cx,
                     ),
                 )
+                // Windows: which ssh.exe runs, never one from PATH (K69).
+                .when_some(
+                    self.connections
+                        .read(cx)
+                        .openssh()
+                        .filter(|_| openssh && cfg!(windows))
+                        .map(|env| format!("Runs {}", env.ssh.display())),
+                    |this, runs| {
+                        this.child(
+                            div()
+                                .id("conn-ssh-openssh-path")
+                                .test_support()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(runs),
+                        )
+                    },
+                )
                 .when(openssh && !found, |this| {
                     this.child(
                         div()

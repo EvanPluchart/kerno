@@ -40,8 +40,10 @@ pub const PIPE_FILE: &str = "instance.pipe";
 /// Every pipe name of Kerno's: this, then 32 hex digits.
 const PREFIX: &str = r"\\.\pipe\kerno-";
 
-/// How long a client waits for the instance's proof: the instance may be
-/// busy with another peer first ([`READ_TIMEOUT`]).
+/// How many peers the instance serves at once (K69, R4).
+const PEERS: usize = 8;
+
+/// How long a client waits for the instance's proof.
 const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Windows' `ERROR_PIPE_BUSY`: every instance of the pipe is taken for the
@@ -284,22 +286,39 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
         file,
     } = listener;
     runtime.block_on(async {
+        // Each peer in a task of its own (K69, R4): one that connects and
+        // says nothing delays nobody; at most `PEERS` at once.
+        let peers = std::sync::Arc::new(tokio::sync::Semaphore::new(PEERS));
+        let (sent, mut lines) = tokio::sync::mpsc::channel::<String>(PEERS);
         loop {
-            // An error here is a peer that wrote and closed before this
-            // call (`ERROR_NO_DATA`): what it wrote is still read below.
-            let _ = pipe.connect().await;
-            // The next instance before this one is read: a second peer
-            // finds one free instead of a busy name.
-            let Ok(next) = next_instance(&name) else {
-                return;
-            };
-            let mut peer = std::mem::replace(&mut pipe, next);
-            let exchange = exchange(&mut peer, &token);
-            let Ok(Some(line)) = tokio::time::timeout(READ_TIMEOUT, exchange).await else {
-                continue;
-            };
-            if !on_line(line) {
-                return;
+            tokio::select! {
+                // An error here is a peer that wrote and closed before this
+                // call (`ERROR_NO_DATA`): what it wrote is still read below.
+                // Cancel safe: a peer is never lost between two turns.
+                _ = pipe.connect() => {
+                    // The next instance before this one is read: a second
+                    // peer finds one free instead of a busy name.
+                    let Ok(next) = next_instance(&name) else {
+                        return;
+                    };
+                    let mut peer = std::mem::replace(&mut pipe, next);
+                    let Ok(permit) = peers.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let sent = sent.clone();
+                    tokio::spawn(async move {
+                        let exchange = exchange(&mut peer, &token);
+                        if let Ok(Some(line)) = tokio::time::timeout(READ_TIMEOUT, exchange).await {
+                            let _ = sent.send(line).await;
+                        }
+                        drop(permit);
+                    });
+                }
+                Some(line) = lines.recv() => {
+                    if !on_line(line) {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -422,6 +441,40 @@ mod tests {
         assert_ne!(std::fs::read_to_string(&path).unwrap(), written);
         drop(listener);
         assert!(!path.exists(), "the file goes with the listener");
+    }
+
+    /// A peer that connects and says nothing delays nobody (K69, R4): a
+    /// URL sent meanwhile arrives at once. Mutation seen: peers served one
+    /// after the other (the URL waits for the silent peer's 2 s).
+    #[test]
+    fn a_silent_peer_delays_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path()).unwrap();
+        let listener = listen(&path).unwrap().expect("nobody listens yet");
+        let (sent, received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve(listener, |line| {
+                sent.send(line).unwrap();
+                false
+            })
+        });
+        let (name, _) = read_name_file(&path).unwrap();
+        let runtime = runtime().unwrap();
+        let silent = {
+            let _entered = runtime.enter();
+            ClientOptions::new().open(&name).unwrap()
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        send(&path, "postgres://h").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        server.join().unwrap();
+        drop(silent);
+        assert_eq!(received.try_iter().collect::<Vec<_>>(), ["postgres://h"]);
     }
 
     /// Something else listens under the name the file holds (a program of

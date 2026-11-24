@@ -944,6 +944,10 @@ pub struct ToolCommand {
     /// A script the child will read, which [`run`] checks with
     /// [`check_script`] before starting it.
     pub script_check: Option<ScriptCheck>,
+    /// A task's files the child reads or writes (its output, its input):
+    /// on Windows [`run`] refuses one that is not a file of this computer
+    /// before anything opens it (K69, D-138).
+    pub files: Vec<PathBuf>,
 }
 
 /// A part of what [`run`] feeds a tool.
@@ -1635,6 +1639,9 @@ pub fn output_path(
     format: BackupFormat,
     vars: &NameVars,
 ) -> Result<PathBuf> {
+    // Windows: `~\` expanded; the caller checks the file before it looks
+    // at it, `run` before the tool writes it (K69, D-138).
+    let folder = &crate::local_path::expand(folder);
     let name = file_name(pattern, vars)?;
     let extension = format.extension();
     let name = if extension.is_empty() || name.ends_with(&format!(".{extension}")) {
@@ -1901,8 +1908,11 @@ pub fn backup_command(
     options: &BackupOptions,
     output: &Path,
 ) -> Result<ToolCommand> {
+    // Windows: `~\` expanded; `run` checks the file (K69, D-138).
+    let output = &crate::local_path::expand(output);
     let extra = extra_args(&options.extra_args, ClientFamily::required(params.engine)?)?;
     let mut command = connection_command(tool_path, &with_user(params, &options.auth_user))?;
+    command.files.push(output.to_path_buf());
     let args = &mut command.args;
     match (params.engine, &options.engine) {
         (Engine::Postgres, EngineBackup::Postgres(pg)) => {
@@ -2060,6 +2070,8 @@ pub fn global_backup_command(
     options: &GlobalBackupOptions,
     output: &Path,
 ) -> Result<ToolCommand> {
+    // Windows: `~\` expanded; `run` checks the file (K69, D-138).
+    let output = &crate::local_path::expand(output);
     refuse(
         params.engine != Engine::Postgres,
         "the global backup is PostgreSQL's pg_dumpall",
@@ -2079,6 +2091,7 @@ pub fn global_backup_command(
     )?;
     let extra = extra_args(&options.extra_args, ClientFamily::Postgres)?;
     let mut command = connection_command(tool_path, &with_user(params, &options.auth_user))?;
+    command.files.push(output.to_path_buf());
     let args = &mut command.args;
     args.push("--verbose".into());
     if let Some(encoding) = options.encoding.as_deref().filter(|e| !e.is_empty()) {
@@ -2113,6 +2126,21 @@ pub fn global_backup_command(
 /// module documentation says: by the tool's option, or by a check that
 /// [`run`] makes before starting the tool.
 pub fn restore_command(
+    tool_path: &Path,
+    params: &ConnectParams,
+    options: &RestoreOptions,
+) -> Result<ToolCommand> {
+    // Windows: `~\` expanded; `run` checks the file (K69, D-138).
+    let options = &RestoreOptions {
+        input: crate::local_path::expand(&options.input),
+        ..options.clone()
+    };
+    let mut command = restore_command_for(tool_path, params, options)?;
+    command.files.push(options.input.clone());
+    Ok(command)
+}
+
+fn restore_command_for(
     tool_path: &Path,
     params: &ConnectParams,
     options: &RestoreOptions,
@@ -2310,6 +2338,21 @@ pub fn script_command(
     params: &ConnectParams,
     options: &ScriptOptions,
 ) -> Result<ToolCommand> {
+    // Windows: `~\` expanded; `run` checks the file (K69, D-138).
+    let options = &ScriptOptions {
+        input: crate::local_path::expand(&options.input),
+        ..options.clone()
+    };
+    let mut command = script_command_for(tool_path, params, options)?;
+    command.files.push(options.input.clone());
+    Ok(command)
+}
+
+fn script_command_for(
+    tool_path: &Path,
+    params: &ConnectParams,
+    options: &ScriptOptions,
+) -> Result<ToolCommand> {
     if params.read_only {
         return Err(Error::ReadOnly("a script can write to the database".into()));
     }
@@ -2474,8 +2517,9 @@ pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFo
 /// The program with the arguments and environment that say which server to
 /// reach, as whom, and over which TLS.
 fn connection_command(tool_path: &Path, params: &ConnectParams) -> Result<ToolCommand> {
-    // The TLS files go to the tool: none of another machine (K69, D-138).
-    crate::local_path::check_tls(&params.tls)?;
+    // The TLS files go to the tool: `~\` expanded, none of another machine
+    // (K69, D-138).
+    let params = &crate::local_path::resolve_params(params)?;
     let mut args = Vec::new();
     let mut env = Vec::new();
     let tunnelled = params.tunnel.is_some();
@@ -2536,6 +2580,7 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> Result<ToolCo
             port_arg,
         }),
         script_check: None,
+        files: Vec::new(),
     })
 }
 
@@ -2682,6 +2727,11 @@ pub async fn run(
     on_line: impl Fn(String) + Send + 'static,
     cancel: Arc<AtomicBool>,
 ) -> Result<ExitStatus> {
+    // Windows: a task's file of another computer is never opened, by Kerno
+    // or by the tool (K69, D-138).
+    for file in &command.files {
+        crate::local_path::check(file, "task's file")?;
+    }
     if let Some(check) = command.script_check.clone() {
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || check_script(&check, &cancel))
@@ -3395,6 +3445,44 @@ impl TaskSettings {
         matches!(self, Self::Restore(_) | Self::ExecuteScript(_))
     }
 
+    /// The files the task reads or writes, each with what it is, the empty
+    /// ones left out: shown before an imported task is saved, checked where
+    /// they are used (K69, D-138).
+    pub fn files(&self) -> Vec<(&'static str, &Path)> {
+        let file = match self {
+            Self::Backup(options) => ("output folder", options.output_folder.as_path()),
+            Self::GlobalBackup(options) => ("output folder", options.output_folder.as_path()),
+            Self::Restore(options) => ("backup file", options.input.as_path()),
+            Self::ExecuteScript(options) => ("script", options.input.as_path()),
+        };
+        [file]
+            .into_iter()
+            .filter(|(_, path)| !path.as_os_str().is_empty())
+            .collect()
+    }
+
+    /// What the task does with its files, in words, for an import's
+    /// preview: an imported task that restores a file of the sender's
+    /// choosing into a database shows that file before it is saved. On
+    /// Windows a file Kerno will not open is said too. `None` without files.
+    pub fn files_note(&self) -> Option<String> {
+        let (_, path) = *self.files().first()?;
+        let database = self.database().unwrap_or_default();
+        let mut note = match self {
+            Self::Backup(_) | Self::GlobalBackup(_) => {
+                format!("Writes its backups to {}", path.display())
+            }
+            Self::Restore(_) => format!("Restores {} into “{database}”", path.display()),
+            Self::ExecuteScript(_) => format!("Runs {} in “{database}”", path.display()),
+        };
+        for (what, path) in self.files() {
+            if let Some(refused) = crate::local_path::note(path, what) {
+                note.push_str(&format!(". Note: {refused}"));
+            }
+        }
+        Some(format!("{note}."))
+    }
+
     /// Refuses what a task must not keep: extra arguments the tool refuses,
     /// a password among them ([`extra_args`]).
     pub fn check(&self, engine: Engine) -> Result<()> {
@@ -3411,6 +3499,61 @@ impl TaskSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K69: a task's file of another computer stops the run before the tool
+    /// starts or anything opens it. Mutation seen: the loop over `files` in
+    /// `run` removed (whoami.exe runs).
+    #[cfg(windows)]
+    #[test]
+    fn a_task_file_of_another_computer_stops_the_run() {
+        let command = ToolCommand {
+            program: r"C:\Windows\System32\whoami.exe".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            password: None,
+            stdin: None,
+            sent: Arc::default(),
+            tunnel: None,
+            script_check: None,
+            files: vec![r"\\k69-nowhere\share\shop.sql".into()],
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(run(command, |_| {}, Arc::default()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a file of this computer"),
+            "{error}"
+        );
+    }
+
+    /// K69: a System32 program only under exactly `C:\Windows`.
+    #[test]
+    fn a_system_program_is_taken_from_c_windows_only() {
+        let ssh = Some(PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe"));
+        for root in [r"C:\Windows", r"c:\WINDOWS\", "C:\\Windows/"] {
+            assert_eq!(
+                system_program(Some(root), r"OpenSSH\ssh.exe"),
+                ssh,
+                "{root}"
+            );
+        }
+        for root in [
+            r"D:\Windows",
+            "Windows",
+            r"\\host\share\Windows",
+            "",
+            r"C:\Windows\..\Users\ada",
+            r"C:\WinNT",
+        ] {
+            assert_eq!(
+                system_program(Some(root), r"OpenSSH\ssh.exe"),
+                None,
+                "{root}"
+            );
+        }
+        assert_eq!(system_program(None, "curl.exe"), None);
+    }
     use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -5788,6 +5931,7 @@ mod tests {
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
+            files: Vec::new(),
         }
     }
 

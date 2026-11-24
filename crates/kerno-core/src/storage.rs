@@ -1541,7 +1541,7 @@ impl AppPaths {
 
     /// The platform's local (not roaming) data directory for Kerno, never `KERNO_DATA_DIR`'s: on
     /// Windows `%LOCALAPPDATA%\Kerno\data`, inside the user's profile. The update's downloads go
-    /// there on Windows (K70, D-139).
+    /// there on Windows (K70, D-139), and the tunnels' private folders (K69, D-138).
     pub fn local_data_dir() -> Option<PathBuf> {
         directories::ProjectDirs::from("", "", "Kerno")
             .map(|dirs| dirs.data_local_dir().to_path_buf())

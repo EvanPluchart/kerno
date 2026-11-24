@@ -1809,7 +1809,12 @@ impl BackupDialog {
         if !folder.is_absolute() {
             return Err("Choose the folder the backup is written to.".into());
         }
-        tools::output_path(&folder, &pattern, format, &vars).map_err(|error| error_text(&error))
+        let path = tools::output_path(&folder, &pattern, format, &vars)
+            .map_err(|error| error_text(&error))?;
+        // Windows: a file of another computer is never looked at, nor
+        // written (K69, D-138).
+        kerno_core::local_path::check(&path, "backup file").map_err(|error| error_text(&error))?;
+        Ok(path)
     }
 
     /// The connection's route for this run: another user's password when
@@ -3455,6 +3460,23 @@ struct Examined {
 /// checks a SQL file for client commands the tool would run on this
 /// computer.
 fn examine(job: Job) -> Examined {
+    // Windows: a file of another computer (an imported task's) is never
+    // looked at: Windows would log in there (K69, D-138).
+    let file = match job
+        .file
+        .as_deref()
+        .map(|file| kerno_core::local_path::resolve(file, "file"))
+    {
+        Some(Err(error)) => {
+            return Examined {
+                tool: ToolState::Probing,
+                detected: tools::detect_clients(&ClientRoots::system(job.added)),
+                input: Some(Err(error_text(&error))),
+            };
+        }
+        resolved => resolved.and_then(Result::ok),
+    };
+    let job = Job { file, ..job };
     let detected = tools::detect_clients(&ClientRoots::system(job.added));
     // A path typed in the field may name nothing yet (K56).
     if let Some(file) = job.file.as_ref().filter(|file| !file.exists()) {

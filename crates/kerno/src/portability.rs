@@ -846,6 +846,16 @@ impl ImportSetup {
         cx.notify();
     }
 
+    /// What the preview says under each task about its files; for tests.
+    #[cfg(test)]
+    pub fn task_notes(&self) -> Vec<Option<String>> {
+        self.file
+            .tasks
+            .iter()
+            .map(|task| task.settings.files_note())
+            .collect()
+    }
+
     /// The preview and the choices, in words; for tests.
     #[cfg(test)]
     pub fn summary(&self) -> String {
@@ -987,6 +997,19 @@ impl ImportSetup {
                     *action,
                     None,
                 ));
+                // The files it would read or write, before it is saved: an
+                // imported restore of the sender's file is worth a look (K69).
+                if let Some(note) = task.settings.files_note() {
+                    items.push(
+                        div()
+                            .id(("import-task-files", index))
+                            .test_support()
+                            .text_xs()
+                            .text_color(warning)
+                            .child(SharedString::from(note))
+                            .into_any_element(),
+                    );
+                }
             }
         }
         if !self.file.folders.is_empty() {

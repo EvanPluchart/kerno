@@ -20,6 +20,7 @@ fn use_openssh(app: &Fixture, cx: &mut TestAppContext, config: &Path) {
         config: Some(config.to_path_buf()),
         aliases_from: Some(config.to_path_buf()),
         askpass: "/usr/bin/false".into(),
+        tunnels: None,
     };
     cx.update(|cx| {
         app.connections

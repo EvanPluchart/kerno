@@ -359,9 +359,9 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
                     "Choose the built-in client on the SSH tab, or install OpenSSH.",
                 ),
                 false => (
-                    "OpenSSH was not found on this computer.",
-                    "Choose the built-in client on the SSH tab, or add Windows' OpenSSH Client \
-                     (Settings, System, Optional features).",
+                    "Windows' OpenSSH client is not installed.",
+                    "Add “OpenSSH Client” in Settings ▸ System ▸ Optional features, or choose the \
+                     built-in client on the SSH tab.",
                 ),
             };
             (
@@ -657,7 +657,7 @@ fn openssh_words(
     let words = |kind, headline: String, next: &str| (kind, headline, next.to_string());
     for line in stderr.lines().map(str::trim) {
         // Windows' ssh.exe before 8.4 (K69, D-138).
-        if line.starts_with("This OpenSSH is too old to ask Kerno") {
+        if cfg!(windows) && line.starts_with("This OpenSSH is too old to ask Kerno") {
             return words(
                 FailureKind::SshAuthentication,
                 "This OpenSSH is too old to ask Kerno for a passphrase or a host key.".to_string(),
@@ -1278,9 +1278,12 @@ mod tests {
         );
         assert_eq!(
             explained.headline,
-            "OpenSSH was not found on this computer."
+            match cfg!(windows) {
+                true => "Windows' OpenSSH client is not installed.",
+                false => "OpenSSH was not found on this computer.",
+            }
         );
-        // K69: Windows' ssh.exe before 8.4 cannot ask Kerno.
+        // K69: Windows' ssh.exe before 8.4 cannot ask Kerno (Windows only).
         let explained = explain(
             &format!(
                 "SSH tunnel: OpenSSH: {}\nkerno@bastion: Permission denied (publickey).",
@@ -1289,8 +1292,9 @@ mod tests {
             &config,
         );
         assert_eq!(explained.kind, SshAuthentication);
-        assert!(
+        assert_eq!(
             explained.headline.starts_with("This OpenSSH is too old"),
+            cfg!(windows),
             "{}",
             explained.headline
         );

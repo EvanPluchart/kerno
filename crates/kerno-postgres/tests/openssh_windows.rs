@@ -111,13 +111,10 @@ async fn a_query_and_a_cancel_through_ssh_exe() {
     eprintln!("K69 PROVED: a refused forward: {error}");
 }
 
-/// Every `ssh.exe` of the tests names a tunnel folder under the temporary
-/// directory: what the waits look for.
+/// Every `ssh.exe` of the tests names its tunnel's folder, `kerno-ssh-…`
+/// (`-F kerno-ssh-…/config`): what the waits look for.
 fn connector_marker() -> String {
-    std::env::temp_dir()
-        .join("kerno-ssh-")
-        .display()
-        .to_string()
+    "kerno-ssh-".into()
 }
 
 /// A TLS file of another computer named by a connection built by hand (as

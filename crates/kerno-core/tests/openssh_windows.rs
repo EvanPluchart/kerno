@@ -22,6 +22,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// The askpass program: what the app's `main` does first, alone.
 const ASKPASS: &str = env!("CARGO_BIN_EXE_kerno-askpass");
 
+/// The askpass program of the run: `KERNO_K69_ASKPASS` (the workflow names
+/// the release's windowed `kerno.exe` for a second pass of the question
+/// tests), else [`ASKPASS`].
+fn askpass() -> PathBuf {
+    std::env::var_os("KERNO_K69_ASKPASS").map_or_else(|| ASKPASS.into(), PathBuf::from)
+}
+
+/// The passphrase of the keys made with one.
+const PASSPHRASE: &str = k69::PASSPHRASE;
+
 /// PostgreSQL's SSLRequest packet: the runner's server has no TLS and
 /// answers `N`.
 const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
@@ -71,13 +81,15 @@ async fn probe(tunnel: &Tunnel, config: &ConnectionConfig) {
         .expect("no answer through the tunnel");
 }
 
-/// The tunnel's private folder, which every `ssh.exe` of it names.
+/// The name of the tunnel's private folder, which every `ssh.exe` of it
+/// names (`-F <name>/config`).
 fn marker(tunnel: &Tunnel) -> String {
     tunnel
         .openssh_dir()
+        .and_then(|dir| dir.file_name())
         .expect("an OpenSSH tunnel")
-        .display()
-        .to_string()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[tokio::test]
@@ -86,9 +98,14 @@ async fn windows_ssh_exe_reaches_postgres() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
-    // Windows' own, even with Git's ssh.exe earlier on PATH (bash steps).
+    let fixture = k69::openssh(dir.path(), askpass(), true);
+    // Windows' own, even with Git's ssh.exe earlier on PATH (bash steps),
+    // and never PATH's when there is none (R3).
     assert_eq!(fixture.env.ssh, k69::system32("ssh.exe"));
+    assert_eq!(
+        find_ssh(std::env::var_os("PATH").as_deref()),
+        Some(k69::system32("ssh.exe"))
+    );
     eprintln!("PATH's first ssh: {:?}", which_ssh());
     let config = k69::config(k69::ssh(key("kerno_k69"), None));
     let tunnel = open(&fixture.env, &config, None, None)
@@ -134,7 +151,7 @@ async fn a_host_alias_of_the_profile_config() {
         std::env::var_os("PATH").as_deref(),
         Some(&home),
         None,
-        ASKPASS.into(),
+        askpass(),
     )
     .expect("ssh.exe found");
     let file = env.aliases_from.clone().unwrap();
@@ -162,7 +179,7 @@ async fn a_passphrase_is_answered_through_the_askpass_pipe() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
+    let fixture = k69::openssh(dir.path(), askpass(), true);
     let config = k69::config(k69::ssh(key("kerno_k69_enc"), None));
 
     // No passphrase stored: ssh asked Kerno, Kerno can ask the user.
@@ -194,12 +211,31 @@ async fn a_passphrase_is_answered_through_the_askpass_pipe() {
     assert!(text.contains("the passphrase is wrong"), "{text}");
 
     // The right one crosses the pipe to ssh.exe.
-    let tunnel = open(&fixture.env, &config, Some(k69::PASSPHRASE), None)
+    let tunnel = open(&fixture.env, &config, Some(PASSPHRASE), None)
         .await
         .expect("tunnel with the passphrase");
     probe(&tunnel, &config).await;
     // A second stream: a new ssh.exe asks again, and is answered again.
     probe(&tunnel, &config).await;
+    // Two at once: each ssh.exe is answered on its own (R9).
+    let (first, second) = tokio::join!(
+        tunnel.open_stream(&config.host, config.port),
+        tunnel.open_stream(&config.host, config.port)
+    );
+    let (first, second) = (first.expect("first"), second.expect("second"));
+    // No ssh.exe's command line holds the passphrase (its environment is
+    // `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `KERNO_ASKPASS` and
+    // `KERNO_ASKPASS_SPAWN`, by construction).
+    let lines = ssh_processes();
+    assert!(lines.len() >= 2, "{lines:#?}");
+    assert!(
+        lines.iter().all(|line| !line.contains(PASSPHRASE)),
+        "{lines:#?}"
+    );
+    drop((first, second));
+    eprintln!(
+        "K69 PROVED: two ssh.exe at once each answered; no command line holds the passphrase"
+    );
     eprintln!("K69 PROVED: the passphrase answered through the askpass pipe, twice");
     drop(tunnel);
 
@@ -213,7 +249,7 @@ async fn a_passphrase_is_answered_through_the_askpass_pipe() {
         askpass: program.clone(),
         ..fixture.env.clone()
     };
-    let tunnel = open(&env, &config, Some(k69::PASSPHRASE), None)
+    let tunnel = open(&env, &config, Some(PASSPHRASE), None)
         .await
         .expect("tunnel with the askpass in a folder with a space");
     probe(&tunnel, &config).await;
@@ -229,7 +265,7 @@ async fn an_unknown_host_key_is_shown_then_trusted_then_remembered() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), false);
+    let fixture = k69::openssh(dir.path(), askpass(), false);
     let config = k69::config(k69::ssh(key("kerno_k69"), None));
     let known = || std::fs::read_to_string(&fixture.known_hosts).unwrap_or_default();
 
@@ -288,7 +324,7 @@ async fn the_jump_host_field_goes_through_the_jump_host() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
+    let fixture = k69::openssh(dir.path(), askpass(), true);
     let jump = format!("{}@{}", k69::user(), k69::JUMP);
     let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump.clone())));
     let tunnel = open(&fixture.env, &config, None, None)
@@ -307,7 +343,7 @@ async fn nothing_is_left_after_the_tunnel_is_dropped() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
+    let fixture = k69::openssh(dir.path(), askpass(), true);
     let jump = format!("{}@{}", k69::user(), k69::JUMP);
     let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump)));
     let tunnel = open(&fixture.env, &config, None, None)
@@ -363,7 +399,7 @@ async fn nothing_is_left_after_a_cancelled_start() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
+    let fixture = k69::openssh(dir.path(), askpass(), true);
     // Takes the connection and says nothing: ssh.exe waits for its banner.
     let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = silent.local_addr().unwrap().port();
@@ -374,8 +410,9 @@ async fn nothing_is_left_after_a_cancelled_start() {
         }
     });
     let folders = || -> Vec<PathBuf> {
-        std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
+        std::fs::read_dir(k69::tunnels())
+            .into_iter()
+            .flatten()
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
@@ -434,7 +471,7 @@ async fn a_key_on_a_share_is_refused_before_ssh_starts() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let fixture = k69::openssh(dir.path(), ASKPASS.into(), true);
+    let fixture = k69::openssh(dir.path(), askpass(), true);
     let config = k69::config(k69::ssh(
         SshAuth::KeyFile {
             path: r"\\k69-nowhere\share\id".into(),
@@ -446,4 +483,135 @@ async fn a_key_on_a_share_is_refused_before_ssh_starts() {
     assert!(matches!(error, SshError::Key { .. }), "{error:?}");
     assert_eq!(ssh_processes().len(), before);
     assert_eq!(find_ssh(None), Some(k69::system32("ssh.exe")));
+}
+
+/// A key Kerno cannot try itself (PEM): its passphrase is given once per
+/// ssh.exe, and a wrong one is said as wrong, not as a refused login (R8).
+#[tokio::test]
+async fn a_pem_key_s_wrong_passphrase_is_said() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = k69::openssh(dir.path(), askpass(), true);
+    let config = k69::config(k69::ssh(key("kerno_k69_pem"), None));
+    let error = open(&fixture.env, &config, Some("not the passphrase"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, SshError::Passphrase { reason, .. } if *reason == "the passphrase is wrong"),
+        "{error:?}"
+    );
+    eprintln!("K69 PROVED: a PEM key's wrong passphrase: {error}");
+    let tunnel = open(&fixture.env, &config, Some(PASSPHRASE), None)
+        .await
+        .expect("the PEM key with its passphrase");
+    probe(&tunnel, &config).await;
+    eprintln!("K69 PROVED: a PEM key opened through the askpass pipe");
+}
+
+/// A key named `~\…` is the profile's: what is checked, tried and given to
+/// ssh.exe is the expanded path (R7).
+#[tokio::test]
+async fn a_home_key_path_is_expanded() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = k69::openssh(dir.path(), askpass(), true);
+    let config = k69::config(k69::ssh(
+        SshAuth::KeyFile {
+            path: r"~\.ssh\kerno_k69_enc".into(),
+        },
+        None,
+    ));
+    let error = open(&fixture.env, &config, Some("not the passphrase"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, SshError::Passphrase { reason, .. } if *reason == "the passphrase is wrong"),
+        "{error:?}"
+    );
+    let tunnel = open(&fixture.env, &config, Some(PASSPHRASE), None)
+        .await
+        .expect("the key under ~");
+    probe(&tunnel, &config).await;
+    let expanded = k69::key("kerno_k69_enc").display().to_string();
+    eprintln!("K69 PROVED: ~\\.ssh\\kerno_k69_enc opened as {expanded}");
+}
+
+/// A profile whose name holds a space ("C:\Users\Jean Dupont"): the
+/// tunnels' folder and the SSH files under such a folder, behind a jump
+/// host, whose command line OpenSSH writes with `-F` unquoted (R11).
+#[tokio::test]
+async fn a_folder_with_a_space_behind_a_jump_host() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spaced = dir.path().join("Jean Dupont");
+    std::fs::create_dir_all(&spaced).unwrap();
+    let mut fixture = k69::openssh(&spaced, askpass(), true);
+    fixture.env.tunnels = Some(spaced.join("AppData Local").join("ssh"));
+    let jump = format!("{}@{}", k69::user(), k69::JUMP);
+    let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump)));
+    let tunnel = open(&fixture.env, &config, None, None)
+        .await
+        .expect("a tunnel from a folder with a space, behind a jump host");
+    probe(&tunnel, &config).await;
+    let stream = tunnel.open_stream(&config.host, config.port).await.unwrap();
+    let marker = marker(&tunnel);
+    let lines: Vec<String> = ssh_processes()
+        .into_iter()
+        .filter(|line| line.contains(&marker))
+        .collect();
+    eprintln!("ssh.exe from a folder with a space: {lines:#?}");
+    assert!(
+        lines.len() >= 2,
+        "the target's and the jump host's: {lines:#?}"
+    );
+    assert!(tunnel.openssh_dir().unwrap().starts_with(&spaced));
+    drop(stream);
+    drop(tunnel);
+    wait_until_gone(&marker).await;
+    eprintln!(
+        "K69 PROVED: a tunnel folder under {} behind a jump host",
+        spaced.display()
+    );
+}
+
+/// What the app does when it quits: every ssh.exe of every tunnel, a jump
+/// host's included, stopped and waited for (R10).
+#[tokio::test]
+async fn stop_all_leaves_no_ssh_exe() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = k69::openssh(dir.path(), askpass(), true);
+    let jump = format!("{}@{}", k69::user(), k69::JUMP);
+    let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump)));
+    let tunnel = open(&fixture.env, &config, None, None)
+        .await
+        .expect("tunnel");
+    let streams = (
+        tunnel.open_stream(&config.host, config.port).await.unwrap(),
+        tunnel.open_stream(&config.host, config.port).await.unwrap(),
+    );
+    let marker = marker(&tunnel);
+    let running = ssh_processes()
+        .into_iter()
+        .filter(|line| line.contains(&marker))
+        .count();
+    assert!(running >= 4, "two streams behind a jump host: {running}");
+    kerno_core::openssh::stop_all();
+    // Waited for: nothing of it is left at once.
+    let left: Vec<String> = ssh_processes()
+        .into_iter()
+        .filter(|line| line.contains(&marker))
+        .collect();
+    assert!(left.is_empty(), "left after stop_all: {left:#?}");
+    drop(streams);
+    drop(tunnel);
+    eprintln!("K69 PROVED: stop_all stopped {running} ssh.exe at once");
 }

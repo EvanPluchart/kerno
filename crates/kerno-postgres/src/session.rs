@@ -65,8 +65,9 @@ const IN_FAILED_TRANSACTION: &str = "25P02";
 impl PgSession {
     /// Connects and reads the server's identity.
     pub(crate) async fn connect(params: &ConnectParams) -> Result<Self> {
-        // No file of another machine is opened (K69, D-138).
-        kerno_core::local_path::check_params(params)?;
+        // Windows: `~\` expanded, and no file of another machine opened
+        // (K69, D-138): what is checked is what is opened.
+        let params = &kerno_core::local_path::resolve_params(params)?;
         let (client, events, cancel, gone) = connect::open(params).await?;
         let rows = simple_rows(
             &client,

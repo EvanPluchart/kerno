@@ -660,7 +660,19 @@ impl ConnectionForm {
                 SshAuthKind::Agent => {
                     let socket = self.ssh_agent_socket.trim();
                     let socket = (!socket.is_empty()).then(|| expand_home(socket));
+                    // Windows: the agent is a pipe, judged by its name and
+                    // never stat'ed: a name of another machine would make
+                    // Windows log in there (K69, D-138).
                     if let Some(path) = &socket
+                        && cfg!(windows)
+                        && !kerno_core::ssh::is_local_pipe(&path.to_string_lossy())
+                    {
+                        errors.push(error(
+                            Field::SshAgentSocket,
+                            r"The agent's address must be a pipe of this computer, such as \\.\pipe\openssh-ssh-agent",
+                        ));
+                    } else if let Some(path) = &socket
+                        && !cfg!(windows)
                         && !path.exists()
                     {
                         errors.push(error(

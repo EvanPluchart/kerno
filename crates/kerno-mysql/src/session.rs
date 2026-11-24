@@ -131,8 +131,9 @@ impl MysqlSession {
     /// Connects, reads the server's identity and applies the session
     /// settings of `params`.
     pub(crate) async fn connect(params: &ConnectParams) -> Result<Self> {
-        // No file of another machine is opened (K69, D-138).
-        kerno_core::local_path::check_params(params)?;
+        // Windows: `~\` expanded, and no file of another machine opened
+        // (K69, D-138): what is checked is what is opened.
+        let params = &kerno_core::local_path::resolve_params(params)?;
         let settings = connect::settings(params)?;
         let mut conn = connect::open(params, settings.timeout, params.database.as_deref()).await?;
 

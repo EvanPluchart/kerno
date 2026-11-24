@@ -198,6 +198,7 @@ pub fn openssh(dir: &std::path::Path, askpass: PathBuf, known: bool) -> OpenSshF
         config: Some(config.clone()),
         aliases_from: Some(config.clone()),
         askpass,
+        tunnels: None,
     };
     OpenSshFixture {
         config,
@@ -528,6 +529,14 @@ pub mod k69 {
         config
     }
 
+    /// Where the tunnels' private folders are made when the settings name
+    /// none: the app's local data folder's `ssh` (K69, R5).
+    pub fn tunnels() -> PathBuf {
+        crate::storage::AppPaths::local_data_dir()
+            .expect("the local data folder")
+            .join("ssh")
+    }
+
     /// The jump host's alias in [`openssh`]'s file: the server's second
     /// port, with the plain key.
     pub const JUMP: &str = "k69-jump";
@@ -566,6 +575,7 @@ pub mod k69 {
             config: Some(config.clone()),
             aliases_from: Some(config.clone()),
             askpass,
+            tunnels: None,
         };
         super::OpenSshFixture {
             config,

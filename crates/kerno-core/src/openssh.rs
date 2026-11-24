@@ -42,14 +42,20 @@ pub use unix::{Forward, answer_askpass};
 #[cfg(windows)]
 pub(crate) use windows::LocalStream;
 #[cfg(windows)]
-pub use windows::{Forward, answer_askpass};
+pub use windows::{Forward, answer_askpass, stop_all};
 
 /// Variable that tells a child `ssh`'s askpass program (Kerno) which socket
 /// to ask.
 pub const ASKPASS_VAR: &str = "KERNO_ASKPASS";
 
 /// Said when no `ssh` program can be used.
+#[cfg(not(windows))]
 pub const NOT_FOUND: &str = "OpenSSH was not found on this computer; use the built-in client";
+/// Said when no `ssh.exe` can be used: Windows' own is an optional feature
+/// (K69, D-138), and no other is ever looked for on `PATH`.
+#[cfg(windows)]
+pub const NOT_FOUND: &str = "Windows' OpenSSH client is not installed: add it in Settings ▸ System ▸ \
+     Optional features, or use the built-in client";
 
 /// Said when Windows' `ssh.exe` cannot ask Kerno its questions: before
 /// OpenSSH 8.4 it ignores `SSH_ASKPASS_REQUIRE` (D-138).
@@ -72,6 +78,11 @@ pub struct OpenSshEnv {
     /// The program `ssh` runs to ask a question: Kerno itself, which
     /// answers through [`answer_askpass`].
     pub askpass: PathBuf,
+    /// Windows: the folder the tunnels' private folders are made in (the
+    /// app gives `AppPaths::local_data_dir()`'s `ssh`, in the profile);
+    /// `None` takes that same folder. Unix keeps the temporary folder (a
+    /// Unix socket's path must stay short), whatever this says.
+    pub tunnels: Option<PathBuf>,
 }
 
 impl OpenSshEnv {
@@ -91,6 +102,7 @@ impl OpenSshEnv {
             config,
             aliases_from,
             askpass,
+            tunnels: None,
         })
     }
 }
@@ -107,20 +119,54 @@ pub fn find_ssh(path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The `ssh.exe` Windows ships (`%SystemRoot%\System32\OpenSSH`), which
-/// only administrators can change, then the first on `path` (an OpenSSH
-/// installed elsewhere). A `ssh.exe` another program put earlier on `PATH`
-/// (Git's, a user's folder) is not taken over Windows' own.
+/// The first `ssh.exe` of [`windows_ssh_candidates`] that exists; `path`
+/// (`PATH`) is never searched.
 #[cfg(windows)]
 pub fn find_ssh(path: Option<&OsStr>) -> Option<PathBuf> {
-    let root =
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let system = root.join("System32").join("OpenSSH");
-    let listed = path.map(std::env::split_paths).into_iter().flatten();
-    std::iter::once(system)
-        .chain(listed)
-        .map(|dir| dir.join("ssh.exe"))
-        .find(|candidate| candidate.is_file())
+    let var = |name| std::env::var(name).ok();
+    windows_ssh_candidates(
+        var("SystemRoot").as_deref(),
+        var("ProgramFiles").as_deref(),
+        path,
+    )
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+/// Where Kerno takes `ssh.exe` on Windows, in order (K69, D-138): the one
+/// Windows ships, `C:\Windows\System32\OpenSSH\ssh.exe` (the optional
+/// feature "OpenSSH Client"), then the one Win32-OpenSSH's installer puts in
+/// `C:\Program Files\OpenSSH\ssh.exe`: folders only administrators can
+/// change. Each only when `SystemRoot`, `ProgramFiles` is exactly that folder
+/// (any case, a trailing separator ignored): a process of the user's could
+/// set either before the user starts Kerno as administrator, and plant an
+/// `ssh.exe` there. A Windows installed elsewhere than `C:\Windows` gets no
+/// system OpenSSH. Never `PATH` (taken and ignored here, so that a test
+/// proves it): an `ssh.exe` a program or a user put on it (Git's, a download
+/// folder's) is never run.
+#[cfg(any(windows, test))]
+fn windows_ssh_candidates(
+    system_root: Option<&str>,
+    program_files: Option<&str>,
+    _path: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let system = crate::tools::system_program(system_root, r"OpenSSH\ssh.exe");
+    system
+        .into_iter()
+        .chain(installed_ssh(program_files))
+        .collect()
+}
+
+/// Win32-OpenSSH's installer's `ssh.exe`, `C:\Program Files\OpenSSH\ssh.exe`,
+/// only when `program_files` is exactly `C:\Program Files` (ASCII case
+/// ignored, a trailing `\` or `/` trimmed): the rule of
+/// [`crate::tools::system_program`].
+#[cfg(any(windows, test))]
+fn installed_ssh(program_files: Option<&str>) -> Option<PathBuf> {
+    let folder = program_files?.trim_end_matches(['\\', '/']);
+    folder
+        .eq_ignore_ascii_case(r"C:\Program Files")
+        .then(|| PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"))
 }
 
 /// The version `ssh -V` printed (`OpenSSH_for_Windows_9.5p1, …`,
@@ -140,40 +186,43 @@ fn too_old(version: (u32, u32)) -> bool {
     version < (8, 4)
 }
 
-/// Refuses, before anything opens it or `ssh.exe` is given it, what would
-/// make Windows reach another machine on its own: a key file that is not a
-/// file of this computer ([`crate::local_path::is_local_file`]: a share is opened
-/// over SMB with the user's credentials) and an agent that is not a pipe of
+/// The SSH settings `ssh.exe` is given, on Windows (K69, D-138): the key
+/// file with `~\` put under `home` and refused when it is not a file of this
+/// computer ([`crate::local_path::resolve_with`]: a share is opened over SMB
+/// with the user's credentials), the agent refused when it is not a pipe of
 /// this machine ([`crate::ssh::is_local_pipe`]). These are the only paths a
 /// saved connection (maybe from an imported file) puts on `ssh.exe`'s
 /// command line (`-i`, `-o IdentityAgent=`); `-F` is the tunnel's own file.
+/// Checked before anything opens the key or `ssh.exe` starts.
 #[cfg(any(windows, test))]
-fn refused_path(auth: &SshAuth) -> Option<SshError> {
-    match auth {
+fn resolve_ssh(ssh: &SshConfig, home: Option<&Path>) -> Result<SshConfig, SshError> {
+    let mut resolved = ssh.clone();
+    match &mut resolved.auth {
         SshAuth::KeyFile { path } => {
-            let text = path.to_string_lossy();
-            (!crate::local_path::is_local_file(&text)).then(|| SshError::Key {
-                path: text.into_owned(),
-                reason: format!(
-                    "Kerno opens no file of another computer: use {}",
-                    crate::local_path::LOCAL_FILE
-                ),
-            })
+            *path =
+                crate::local_path::resolve_with(path, "key", home).map_err(|_| SshError::Key {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "Kerno opens no file of another computer: use {}",
+                        crate::local_path::LOCAL_FILE
+                    ),
+                })?;
         }
         SshAuth::Agent {
             socket: Some(socket),
         } => {
             let text = socket.to_string_lossy();
-            (!crate::ssh::is_local_pipe(&text)).then(|| {
-                SshError::Agent(format!(
+            if !crate::ssh::is_local_pipe(&text) {
+                return Err(SshError::Agent(format!(
                     "The SSH agent's address “{text}” is not a local pipe: on Windows it looks \
                      like \\\\.\\pipe\\openssh-ssh-agent. Clear it in the connection's SSH tab \
                      to use the system's agent."
-                ))
-            })
+                )));
+            }
         }
-        SshAuth::Agent { socket: None } | SshAuth::Password => None,
+        SshAuth::Agent { socket: None } | SshAuth::Password => {}
     }
+    Ok(resolved)
 }
 
 /// Whether `passphrase` opens the key file at `path`: `Some(false)` only for
@@ -379,11 +428,52 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// A new directory only this user can enter, with a short path: a Unix
 /// socket path is limited to about 100 bytes.
+#[cfg(unix)]
 fn private_dir() -> std::io::Result<PathBuf> {
+    private_dir_in(&std::env::temp_dir())
+}
+
+/// A new private directory in `base`, named `kerno-ssh-` and 12 hex digits:
+/// no space, whatever `base` holds.
+fn private_dir_in(base: &Path) -> std::io::Result<PathBuf> {
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("kerno-ssh-{}", &id[..12]));
+    let dir = base.join(format!("kerno-ssh-{}", &id[..12]));
     crate::private::create_dir(&dir)?;
     Ok(dir)
+}
+
+/// Whether `line` is the one `ssh -o LogLevel=VERBOSE` prints once it has
+/// logged in, in OpenSSH's exact shape (`sshconnect2.c`):
+/// `Authenticated to <host> ([<address>]:<port>) using "<method>".`, or
+/// `(via proxy)` in place of the address behind a jump host. A server's
+/// banner can still print that very text: see D-138 for what it can do then.
+#[cfg(any(windows, test))]
+fn is_login_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Authenticated to ") else {
+        return false;
+    };
+    let Some((host, rest)) = rest.split_once(" (") else {
+        return false;
+    };
+    let Some((place, rest)) = rest.split_once(") using \"") else {
+        return false;
+    };
+    let Some(method) = rest.strip_suffix("\".") else {
+        return false;
+    };
+    let word = |text: &str| !text.is_empty() && !text.contains(char::is_whitespace);
+    let address = place
+        .strip_prefix('[')
+        .and_then(|place| place.rsplit_once("]:"))
+        .is_some_and(|(address, port)| {
+            word(address) && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+        });
+    word(host)
+        && (place == "via proxy" || address)
+        && !method.is_empty()
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-@.".contains(&b))
 }
 
 /// The configuration every tunnel's `ssh` reads (`-F`), jump hosts
@@ -456,12 +546,7 @@ fn decide(prompt: &str, asker: u32, answers: &Answers, observed: &mut Observed) 
             .and_then(|rest| rest.strip_suffix("': "))
             .unwrap_or_default();
         let ours = answers.key.as_deref().is_some_and(|key| {
-            // Windows' ssh.exe names `C:\k\id` as `C:/k/id` (K69, D-138).
-            let (named, key) = match cfg!(windows) {
-                true => (named.replace('\\', "/"), key.replace('\\', "/")),
-                false => (named.to_string(), key.to_string()),
-            };
-            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(&named)))
+            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(named)))
         });
         if !ours {
             // A question in other words names no key worth reporting.
@@ -862,28 +947,87 @@ mod tests {
         assert!(!safe_ssh_word("ops@-D8080", false));
     }
 
-    /// K69: Windows' own `ssh.exe` comes before any on `PATH` (Git's, one
-    /// a program put in a user's folder), and the dialog reads the profile's
-    /// `.ssh\config`. Mutation seen: `PATH` searched first.
+    /// K69 (R6): only OpenSSH's own login line says a stream is up: its
+    /// exact shapes, nothing around them. Mutation seen: a prefix match.
+    #[test]
+    fn only_the_login_line_says_up() {
+        for line in [
+            r#"Authenticated to 127.0.0.1 ([127.0.0.1]:52290) using "publickey"."#,
+            r#"Authenticated to db.example.com ([2001:db8::1]:22) using "keyboard-interactive"."#,
+            r#"Authenticated to k69-alias (via proxy) using "publickey"."#,
+        ] {
+            assert!(is_login_line(line), "{line}");
+        }
+        for line in [
+            "Authenticated to ",
+            "Authenticated to the bastion, welcome",
+            r#"Authenticated to 127.0.0.1 ([127.0.0.1]:52290) using "publickey". more"#,
+            r#"Authenticated to 127.0.0.1 (127.0.0.1:52290) using "publickey"."#,
+            r#"Authenticated to a b ([1.2.3.4]:22) using "publickey"."#,
+            r#"Authenticated to h ([1.2.3.4]:x) using "publickey"."#,
+            r#"Authenticated to h (via proxy) using "Public Key"."#,
+            r#"banner: Authenticated to h (via proxy) using "publickey"."#,
+        ] {
+            assert!(!is_login_line(line), "{line}");
+        }
+    }
+
+    /// K69 (R3): on Windows `ssh.exe` is taken from System32's OpenSSH, then
+    /// `%ProgramFiles%\OpenSSH`, never from `PATH`, whatever `PATH` holds;
+    /// a `SystemRoot` or `ProgramFiles` that is not a drive's path is not
+    /// taken. Strings in, paths out: run on every system. Mutation seen: a
+    /// `PATH` entry chained after the two folders.
+    #[test]
+    fn windows_ssh_exe_is_never_taken_from_path() {
+        let path = std::env::join_paths([Path::new("dl"), Path::new("git")]).unwrap();
+        let system = PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe");
+        let installed = PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe");
+        assert_eq!(
+            windows_ssh_candidates(Some(r"C:\Windows"), Some(r"C:\Program Files"), Some(&path)),
+            [system.clone(), installed.clone()]
+        );
+        assert_eq!(
+            windows_ssh_candidates(Some(r"c:\windows\"), Some(r"C:\PROGRAM FILES\"), None),
+            [system.clone(), installed]
+        );
+        for root in [
+            None,
+            Some(r"D:\Windows"),
+            Some("Windows"),
+            Some(r"\\host\share\Windows"),
+            Some(""),
+            Some(r"C:\Windows\..\Users\ada"),
+        ] {
+            for files in [
+                None,
+                Some(r"D:\Program Files"),
+                Some("Program Files"),
+                Some(""),
+            ] {
+                assert_eq!(
+                    windows_ssh_candidates(root, files, Some(&path)),
+                    Vec::<PathBuf>::new(),
+                    "{root:?} {files:?}"
+                );
+            }
+        }
+        assert_eq!(
+            windows_ssh_candidates(Some(r"C:\Windows"), Some(r"\\host\apps"), None),
+            [system]
+        );
+    }
+
+    /// K69: the dialog reads the profile's `.ssh\config` on Windows.
     #[cfg(windows)]
     #[test]
-    fn windows_own_ssh_exe_comes_first() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ssh.exe"), "").unwrap();
-        let path = std::env::join_paths([dir.path()]).unwrap();
-        let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
-        let system = root.join(r"System32\OpenSSH\ssh.exe");
-        let expected = match system.is_file() {
-            true => system,
-            false => dir.path().join("ssh.exe"),
-        };
-        assert_eq!(find_ssh(Some(&path)), Some(expected));
+    fn the_profile_ssh_config_is_listed_on_windows() {
         let home = Path::new(r"C:\Users\ada");
-        let env = OpenSshEnv::detect(Some(&path), Some(home), None, "k".into()).unwrap();
-        assert_eq!(
-            env.aliases_from,
-            Some(PathBuf::from(r"C:\Users\ada\.ssh\config"))
-        );
+        if let Some(env) = OpenSshEnv::detect(None, Some(home), None, "k".into()) {
+            assert_eq!(
+                env.aliases_from,
+                Some(PathBuf::from(r"C:\Users\ada\.ssh\config"))
+            );
+        }
     }
 
     /// K69: an `Include` of the user's file that names another machine is
@@ -961,6 +1105,13 @@ mod tests {
     /// check dropped.
     #[test]
     fn a_key_or_agent_on_another_machine_is_refused() {
+        let home = Path::new(r"C:\Users\Jean Dupont");
+        let with = |auth: SshAuth| {
+            let mut config = ssh(auth);
+            config.client = SshClient::OpenSsh;
+            resolve_ssh(&config, Some(home)).map(|config| config.auth)
+        };
+        let key = |path: &str| SshAuth::KeyFile { path: path.into() };
         for remote in [
             r"\\host\share\id",
             r"\\?\UNC\host\s\id",
@@ -968,29 +1119,33 @@ mod tests {
             "//host/share/id",
             r"\/host\share\id",
             "id_ed25519",
+            r"C:\keys\nul",
         ] {
-            let auth = SshAuth::KeyFile {
-                path: remote.into(),
-            };
             assert!(
-                matches!(refused_path(&auth), Some(SshError::Key { .. })),
+                matches!(with(key(remote)), Err(SshError::Key { .. })),
                 "{remote}"
             );
         }
-        for local in [r"C:\Users\ada\.ssh\id", r"~\.ssh\id", "D:/keys/id"] {
-            let auth = SshAuth::KeyFile { path: local.into() };
-            assert!(refused_path(&auth).is_none(), "{local}");
+        for local in [r"C:\Users\ada\.ssh\id", "D:/keys/id"] {
+            assert_eq!(with(key(local)).unwrap(), key(local), "{local}");
         }
+        // `~/` (`~\` on Windows too) is put under the home: the path given
+        // to ssh.exe and asked about is the expanded one.
+        assert_eq!(
+            with(key("~/.ssh/id")).unwrap(),
+            SshAuth::KeyFile {
+                path: home.join(".ssh/id")
+            }
+        );
         let agent = |socket: &str| SshAuth::Agent {
             socket: Some(socket.into()),
         };
-        assert!(refused_path(&agent(r"\\.\pipe\openssh-ssh-agent")).is_none());
+        assert!(with(agent(r"\\.\pipe\openssh-ssh-agent")).is_ok());
         assert!(matches!(
-            refused_path(&agent(r"\\evil\pipe\x")),
-            Some(SshError::Agent(message)) if message.contains("not a local pipe")
+            with(agent(r"\\evil\pipe\x")),
+            Err(SshError::Agent(message)) if message.contains("not a local pipe")
         ));
-        assert!(refused_path(&SshAuth::Agent { socket: None }).is_none());
-        assert!(refused_path(&SshAuth::Password).is_none());
+        assert!(with(SshAuth::Agent { socket: None }).is_ok());
     }
 
     /// K69: a wrong passphrase is told before `ssh.exe` runs, from the key

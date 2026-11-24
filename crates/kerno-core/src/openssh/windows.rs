@@ -2,25 +2,38 @@
 //!
 //! Windows' OpenSSH forwards no Unix socket that tokio can open, and a
 //! loopback TCP port would be open to every local account while the tunnel
-//! is up. So each stream to the database is its own `ssh -W host:port`,
-//! the stream being that `ssh`'s standard input and output: nothing listens
-//! on this computer, the same promise as the Unix socket. The price is one
-//! SSH login per stream (each session, each cancel request), and the
-//! questions channel and the key's passphrase live as long as the tunnel.
+//! is up. So each stream to the database is its own `ssh -W host:port`, the
+//! stream being that `ssh`'s standard input and output: a driver that takes
+//! a stream (PostgreSQL) gets one that listens nowhere. The price is one SSH
+//! login per stream (each session, each cancel request), and the questions
+//! channel and the key's passphrase live as long as the tunnel.
 //!
-//! `ssh -o LogLevel=VERBOSE` says `Authenticated to …` once it has logged
-//! in: that line is how Kerno knows a stream is up, as the socket appearing
-//! is on Unix. Jump hosts read `LogLevel INFO` first in the tunnel's own
-//! configuration file, so only the target's login is ever reported.
+//! `ssh -o LogLevel=VERBOSE` prints its login line once it has logged in
+//! ([`super::is_login_line`]): that line is how Kerno knows a stream is up,
+//! as the socket appearing is on Unix. Jump hosts read `LogLevel INFO` first
+//! in the tunnel's own configuration file, so only the target's login is
+//! ever reported.
+//!
+//! The tunnel's private folder is under the app's local data folder, in the
+//! profile ([`crate::storage::AppPaths::local_data_dir`]), whatever `TEMP`
+//! says, and `ssh.exe` runs in its parent with `-F <folder>/config`: no path
+//! with a space ever reaches the command line OpenSSH writes for a jump host
+//! (it does not quote `-F`'s), whatever the profile's name. Kerno keeps the
+//! folder's two files open, others may read them but neither write nor
+//! delete them, while the tunnel lives.
 //!
 //! The questions `ssh` asks come back to Kerno over a named pipe whose two
-//! ends prove they can read a token in the tunnel's private folder (the
-//! running instance's handshake, `instance/windows.rs`); the environment
-//! carries the path of that file, never the token. The helper names no
-//! parent process (Windows' std has no parent id): each question is its
-//! own, and a wrong passphrase is found before `ssh` starts, by trying it on
-//! the key file ([`super::passphrase_opens`]).
+//! ends prove they can read a token in that folder (the running instance's
+//! handshake, `instance/windows.rs`); the environment carries the path of
+//! that file and the number of the `ssh` that asks, never the token. Each
+//! peer is served by a task of its own (a silent one delays nobody), at most
+//! [`PEERS`] at once. A stream's questions are answered only until it is up.
+//! A passphrase Kerno could try on the key file itself
+//! ([`super::passphrase_opens`]) is known right before `ssh` starts, and given
+//! to every question for that key; one it could not try (a PEM key) is given
+//! once per `ssh`, a second question meaning it was wrong.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -36,23 +49,28 @@ use tokio::io::{
 };
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::{
     ASKPASS_VAR, Answers, Messages, Observed, OpenSshRequest, START_TIMEOUT, TOO_OLD, Via, decide,
-    failure, guard_config, lock, passphrase_opens, private_dir, refused_path, safe_ssh_word,
-    ssh_version, too_old, tunnel_args,
+    failure, guard_config, is_login_line, lock, passphrase_opens, private_dir_in, resolve_ssh,
+    safe_ssh_word, ssh_version, too_old, tunnel_args,
 };
 use crate::config::SshAuth;
 use crate::instance::windows::{self as named, Bytes};
 use crate::ssh::SshError;
 
+/// Variable that tells the askpass helper which `ssh` of the tunnel asks.
+const SPAWN_VAR: &str = "KERNO_ASKPASS_SPAWN";
+
 /// `CREATE_NO_WINDOW`: `ssh.exe` is a console program, and Kerno has no
 /// console: without it each `ssh` would open a console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// What `ssh -o LogLevel=VERBOSE` prints once it has logged in.
-const AUTHENTICATED: &str = "Authenticated to ";
+/// `FILE_SHARE_READ`: others may read the tunnel's files, not write or
+/// delete them.
+const FILE_SHARE_READ: u32 = 1;
 
 /// How long the stream the start opened is kept for the first connection.
 const SPARE_LIFE: Duration = Duration::from_secs(5);
@@ -60,8 +78,44 @@ const SPARE_LIFE: Duration = Duration::from_secs(5);
 /// The longest question or answer that crosses the askpass pipe.
 const MAX_MESSAGE: usize = 8192;
 
-/// How long one question may take on the pipe, proofs included.
+/// How long one peer may take on the pipe, proofs included.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many peers of the askpass pipe are served at once; more wait outside.
+const PEERS: usize = 8;
+
+/// The process ids of every `ssh.exe` tree Kerno started and has not stopped
+/// yet, for [`stop_all`]. A pid is listed only while Kerno holds its
+/// process's handle, so Windows cannot give it to another process meanwhile.
+static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Stops every `ssh.exe` Kerno started and its jump hosts' `ssh.exe`, now,
+/// waiting for `taskkill`: what the app does when it quits, when the runtime
+/// that would stop them one by one is going away.
+pub fn stop_all() {
+    let pids = std::mem::take(&mut *lock(&LIVE));
+    for pid in pids {
+        let _ = taskkill(pid).status();
+    }
+}
+
+/// System32's `taskkill /T /F /PID <pid>`: the process and every process it
+/// started.
+fn taskkill(pid: u32) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+    // System32's, by its full path (no `ssh.exe` is found on a Windows
+    // installed elsewhere than `C:\Windows` either).
+    let program = crate::tools::windows_program("taskkill.exe")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\taskkill.exe"));
+    let mut command = std::process::Command::new(program);
+    command
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+}
 
 /// A stream to the database: the standard input and output of its own
 /// `ssh -W`, which is stopped when the stream is dropped.
@@ -91,14 +145,17 @@ struct Seen {
 /// dropped, all of them are stopped. Windows does not stop a process's
 /// children with it, and a jump host's `ssh.exe` was seen to outlive its
 /// parent; `taskkill /T` (System32's) stops the tree, then the child itself
-/// goes (`kill_on_drop`).
-/// The pid is taken at the start: `Child::id` says nothing once the exit
-/// was seen.
+/// goes (`kill_on_drop`). The pid is taken at the start (`Child::id` says
+/// nothing once the exit was seen) and listed in [`LIVE`] until the child's
+/// handle goes.
 struct Tree(Option<Child>, Option<u32>);
 
 impl Tree {
     fn new(child: Child) -> Self {
         let pid = child.id();
+        if let Some(pid) = pid {
+            lock(&LIVE).push(pid);
+        }
         Self(Some(child), pid)
     }
 
@@ -110,33 +167,29 @@ impl Tree {
     }
 }
 
+/// Drops `child` and takes its pid off [`LIVE`]: its handle goes now.
+fn release(child: Child, pid: u32) {
+    lock(&LIVE).retain(|live| *live != pid);
+    drop(child);
+}
+
 impl Drop for Tree {
     fn drop(&mut self) {
         let (Some(child), Some(pid)) = (self.0.take(), self.1) else {
             return;
         };
-        use std::os::windows::process::CommandExt as _;
-        let root = std::env::var_os("SystemRoot")
-            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-        let mut taskkill = std::process::Command::new(root.join("System32").join("taskkill.exe"));
-        taskkill
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW);
         // The tree is walked from the living parent: it goes last.
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                let mut taskkill = Command::from(taskkill);
+                let mut taskkill = Command::from(taskkill(pid));
                 runtime.spawn(async move {
                     let _ = taskkill.status().await;
-                    drop(child);
+                    release(child, pid);
                 });
             }
             Err(_) => {
-                let _ = taskkill.status();
-                drop(child);
+                let _ = taskkill(pid).status();
+                release(child, pid);
             }
         }
     }
@@ -185,12 +238,60 @@ impl AsyncWrite for LocalStream {
     }
 }
 
+/// What the tunnel knows of each `ssh` still logging in, by its number.
+#[derive(Debug, Default)]
+struct Spawns {
+    next: AtomicU64,
+    asking: Mutex<HashMap<u64, Asking>>,
+}
+
+/// One `ssh` still logging in: what its questions told, how many reached
+/// Kerno. Gone once it is up (its later questions are refused) or ended.
+#[derive(Debug, Default)]
+struct Asking {
+    observed: Observed,
+    questions: u64,
+}
+
+/// Takes a spawn off [`Spawns`] when dropped: once it is up, ended, or its
+/// start was cancelled.
+struct Listed {
+    spawns: Arc<Spawns>,
+    id: u64,
+}
+
+impl Listed {
+    fn new(spawns: &Arc<Spawns>) -> Self {
+        let id = spawns.next.fetch_add(1, Ordering::SeqCst) + 1;
+        lock(&spawns.asking).insert(id, Asking::default());
+        Self {
+            spawns: spawns.clone(),
+            id,
+        }
+    }
+
+    /// What its questions told, taken off the list.
+    fn take(&self) -> Asking {
+        lock(&self.spawns.asking)
+            .remove(&self.id)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        lock(&self.spawns.asking).remove(&self.id);
+    }
+}
+
 /// The tunnel: how to start an `ssh -W`, its private folder and its askpass
 /// pipe. Dropping it stops the pipe, the `ssh` of the stream not taken yet,
 /// and removes the folder; each stream stops its own `ssh`.
 pub struct Forward {
     ssh: PathBuf,
     args: Vec<OsString>,
+    /// Where `ssh.exe` runs: the folder's parent (`-F` is relative to it).
+    base: PathBuf,
     askpass: PathBuf,
     ask_file: PathBuf,
     dir: PathBuf,
@@ -200,13 +301,13 @@ pub struct Forward {
     too_old: bool,
     /// Lines `ssh` printed once logged in: refused forwards.
     messages: Arc<Mutex<Messages>>,
-    observed: Arc<Mutex<Observed>>,
-    /// Questions that reached Kerno.
-    questions: Arc<AtomicU64>,
-    /// The stream [`Forward::start`] opened, for the first connection, when,
-    /// and the forward failures counted then.
-    spare: Mutex<Option<(LocalStream, tokio::time::Instant, u64)>>,
-    responder: JoinHandle<()>,
+    spawns: Arc<Spawns>,
+    /// The stream [`Forward::start`] opened, for the first connection, and
+    /// the forward failures counted then; retired after [`SPARE_LIFE`].
+    spare: Arc<Mutex<Option<(LocalStream, u64)>>>,
+    /// The folder's `config` and `ask`, open for as long as the tunnel.
+    held: Vec<std::fs::File>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Forward {
@@ -223,11 +324,15 @@ impl Forward {
     pub async fn start(request: OpenSshRequest<'_>) -> Result<Self, SshError> {
         // Checked where `ssh` starts too: a store edited by hand does not
         // go through `ConnectionConfig::validate` (ProxyJump uses a shell).
-        let ssh = request.ssh;
-        let jump = ssh.jump.as_deref().map(str::trim).unwrap_or_default();
+        let jump = request
+            .ssh
+            .jump
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
         let words = [
-            (ssh.host.trim(), false),
-            (ssh.user.trim(), false),
+            (request.ssh.host.trim(), false),
+            (request.ssh.user.trim(), false),
             (jump, true),
         ];
         if let Some((word, _)) = words
@@ -238,29 +343,44 @@ impl Forward {
                 "“{word}” has characters OpenSSH cannot take as a host, user or jump host"
             )));
         }
-        if let Some(refusal) = refused_path(&ssh.auth) {
-            return Err(refusal);
-        }
-        // A wrong passphrase is told before `ssh` runs (see the module).
-        if let (SshAuth::KeyFile { path }, Some(passphrase)) =
-            (&ssh.auth, request.key_passphrase.filter(|p| !p.is_empty()))
-        {
+        // `~\` expanded, nothing of another machine (`-i`, the agent).
+        let ssh = resolve_ssh(request.ssh, crate::home::dir().as_deref())?;
+        let passphrase = request.key_passphrase.filter(|p| !p.is_empty()).cloned();
+        // A passphrase tried on the key file: wrong, it is told before
+        // `ssh` runs; right, it answers every question for that key.
+        let mut verified = false;
+        if let (SshAuth::KeyFile { path }, Some(passphrase)) = (&ssh.auth, &passphrase) {
             let (path, passphrase) = (path.clone(), passphrase.clone());
             let opens =
                 tokio::task::spawn_blocking(move || passphrase_opens(&path, &passphrase)).await;
-            if let Ok(Some(false)) = opens {
-                return Err(SshError::Passphrase {
-                    path: ssh_key_text(&ssh.auth).unwrap_or_default(),
-                    reason: "the passphrase is wrong",
-                });
+            match opens {
+                Ok(Some(false)) => {
+                    return Err(SshError::Passphrase {
+                        path: ssh_key_text(&ssh.auth).unwrap_or_default(),
+                        reason: "the passphrase is wrong",
+                    });
+                }
+                Ok(Some(true)) => verified = true,
+                _ => {}
             }
         }
         let too_old = version(&request.env.ssh).await.is_some_and(too_old);
 
-        let dir = private_dir().map_err(|error| {
-            SshError::Other(format!("could not create the tunnel's directory: {error}"))
-        })?;
-        let (args, made) = match prepare(&dir, &request) {
+        let base = match &request.env.tunnels {
+            Some(base) => base.clone(),
+            None => crate::storage::AppPaths::local_data_dir()
+                .map(|dir| dir.join("ssh"))
+                .ok_or_else(|| {
+                    SshError::Other("could not find the local data folder for the tunnel".into())
+                })?,
+        };
+        let dir = std::fs::create_dir_all(&base)
+            .and_then(|()| private_dir_in(&base))
+            .map_err(|error| {
+                SshError::Other(format!("could not create the tunnel's directory: {error}"))
+            })?;
+        let prepared = prepare(&dir, &ssh, &request);
+        let (args, made, held) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -269,23 +389,23 @@ impl Forward {
         };
         let answers = Answers {
             key: ssh_key_text(&ssh.auth),
-            passphrase: request.key_passphrase.filter(|p| !p.is_empty()).cloned(),
+            passphrase,
             trusted: request.trusted_fingerprint.map(str::to_string),
         };
-        let observed = Arc::new(Mutex::new(Observed::default()));
-        let questions = Arc::new(AtomicU64::new(0));
+        let spawns = Arc::new(Spawns::default());
         let responder = tokio::spawn(respond(
             made.pipe,
             made.name,
             made.token,
-            answers.clone(),
-            observed.clone(),
-            questions.clone(),
+            Arc::new(answers.clone()),
+            verified,
+            spawns.clone(),
         ));
         // From here on dropping `forward` cleans everything up.
-        let forward = Self {
+        let mut forward = Self {
             ssh: request.env.ssh.clone(),
             args,
+            base,
             askpass: request.env.askpass.clone(),
             ask_file: dir.join("ask"),
             dir,
@@ -293,26 +413,33 @@ impl Forward {
             key: answers.key,
             too_old,
             messages: Arc::new(Mutex::new(Messages::default())),
-            observed,
-            questions,
-            spare: Mutex::new(None),
-            responder,
+            spawns,
+            spare: Arc::new(Mutex::new(None)),
+            held,
+            tasks: vec![responder],
         };
         let first = forward.spawn().await?;
         let mark = forward.forward_mark();
-        *lock(&forward.spare) = Some((first, tokio::time::Instant::now(), mark));
+        *lock(&forward.spare) = Some((first, mark));
+        // A spare nobody took stops logged in no longer than its life.
+        let spare = forward.spare.clone();
+        forward.tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(SPARE_LIFE).await;
+            drop(lock(&spare).take());
+        }));
         Ok(forward)
     }
 
     /// Starts one `ssh -W` and waits until it has logged in.
     async fn spawn(&self) -> Result<LocalStream, SshError> {
-        *lock(&self.observed) = Observed::default();
-        let asked_before = self.questions.load(Ordering::SeqCst);
+        let listed = Listed::new(&self.spawns);
         let mut spawned = Command::new(&self.ssh)
             .args(&self.args)
+            .current_dir(&self.base)
             .env("SSH_ASKPASS", &self.askpass)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env(ASKPASS_VAR, &self.ask_file)
+            .env(SPAWN_VAR, listed.id.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -346,7 +473,7 @@ impl Forward {
                 {
                     let text = String::from_utf8_lossy(&line);
                     let text = text.trim_end();
-                    if text.starts_with(AUTHENTICATED) {
+                    if !up.load(Ordering::SeqCst) && is_login_line(text) {
                         up.store(true, Ordering::SeqCst);
                     } else if up.load(Ordering::SeqCst) {
                         // Once logged in, only the target's forward can fail
@@ -363,6 +490,8 @@ impl Forward {
         let started = tokio::time::Instant::now();
         loop {
             if up.load(Ordering::SeqCst) {
+                // Its questions are over: later ones are refused.
+                listed.take();
                 break;
             }
             match child.try_wait() {
@@ -372,8 +501,7 @@ impl Forward {
                         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
                     }
                     let text = lock(&own).text();
-                    let asked = self.questions.load(Ordering::SeqCst) > asked_before;
-                    return Err(self.failure(&text, asked));
+                    return Err(self.failure(listed.take(), &text));
                 }
                 Ok(None) => {}
                 Err(error) => return Err(SshError::Other(error.to_string())),
@@ -403,15 +531,16 @@ impl Forward {
         })
     }
 
-    /// Why an `ssh` exited before it logged in. `asked`: a question of its
-    /// reached Kerno.
-    fn failure(&self, stderr: &str, asked: bool) -> SshError {
-        let error = failure(&lock(&self.observed), self.key.as_deref(), stderr);
+    /// Why an `ssh` exited before it logged in, from its own questions.
+    fn failure(&self, asking: Asking, stderr: &str) -> SshError {
+        let error = failure(&asking.observed, self.key.as_deref(), stderr);
         // An `ssh` that cannot ask Kerno asks nobody, and fails.
         match error {
-            SshError::OpenSsh { stderr } if self.too_old && !asked => SshError::OpenSsh {
-                stderr: format!("{TOO_OLD}\n{stderr}"),
-            },
+            SshError::OpenSsh { stderr } if self.too_old && asking.questions == 0 => {
+                SshError::OpenSsh {
+                    stderr: format!("{TOO_OLD}\n{stderr}"),
+                }
+            }
             other => other,
         }
     }
@@ -430,8 +559,7 @@ impl Forward {
         let spare = lock(&self.spare).take();
         // A spare whose forward the server refused meanwhile is not handed
         // out: its failure would come before the caller's mark.
-        if let Some((mut stream, at, mark)) = spare
-            && at.elapsed() < SPARE_LIFE
+        if let Some((mut stream, mark)) = spare
             && self.forward_mark() == mark
             && matches!(stream.child.try_wait(), Ok(None))
         {
@@ -474,20 +602,25 @@ impl Forward {
 
 impl Drop for Forward {
     fn drop(&mut self) {
-        // The pipe goes with the task; the spare stream stops its `ssh`.
-        self.responder.abort();
+        // The pipe goes with its task; the spare stream stops its `ssh`;
+        // the files are let go before the folder is removed.
+        for task in &self.tasks {
+            task.abort();
+        }
         drop(lock(&self.spare).take());
+        self.held.clear();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 /// Writes the tunnel's `ssh` config into `dir` and makes its askpass pipe
-/// (named by the file `ask` there): the arguments of every `ssh -W`, and
-/// the pipe.
+/// (named by the file `ask` there): the arguments of every `ssh -W`, the
+/// pipe, and the two files held open (others may only read them).
 fn prepare(
     dir: &Path,
+    ssh: &crate::config::SshConfig,
     request: &OpenSshRequest<'_>,
-) -> Result<(Vec<OsString>, named::NewPipe), SshError> {
+) -> Result<(Vec<OsString>, named::NewPipe, Vec<std::fs::File>), SshError> {
     // Kerno's own configuration file, so its rules reach the `ssh` of every
     // jump host too (`-J` hands `-F` on, not the `-o` options); `LogLevel
     // INFO` first keeps a jump host's `ssh` from saying it logged in.
@@ -504,16 +637,33 @@ fn prepare(
     std::fs::write(&guard, text).map_err(|error| {
         SshError::Other(format!("could not write the tunnel's ssh config: {error}"))
     })?;
+    let made = named::new_pipe(&dir.join("ask"))
+        .map_err(|error| SshError::Other(format!("could not open the askpass pipe: {error}")))?;
+    let hold = |path: &Path| {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+            .map_err(|error| SshError::Other(format!("could not hold the tunnel's files: {error}")))
+    };
+    let held = vec![hold(&guard)?, hold(&dir.join("ask"))?];
+    // Relative to the folder's parent, where `ssh.exe` runs: OpenSSH puts
+    // `-F` unquoted in a jump host's command, and the folder's own name has
+    // no space.
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let relative = PathBuf::from(format!("{name}/config"));
     let args = tunnel_args(
-        request.ssh,
-        Some(&guard),
+        ssh,
+        Some(&relative),
         Via::Pipes,
         request.db_host,
         request.db_port,
     );
-    let made = named::new_pipe(&dir.join("ask"))
-        .map_err(|error| SshError::Other(format!("could not open the askpass pipe: {error}")))?;
-    Ok((args, made))
+    Ok((args, made, held))
 }
 
 /// The key file as `ssh` names it in its question.
@@ -551,16 +701,20 @@ async fn version(ssh: &Path) -> Option<(u32, u32)> {
 
 // Questions from ssh ----------------------------------------------------------
 
-/// Answers the questions of the tunnel's `ssh` processes, one peer after the
-/// other, each once it proved it holds the token.
+/// Answers the questions of the tunnel's `ssh` processes: each peer in a
+/// task of its own, at most [`PEERS`] at once (more are let go at once),
+/// each once it proved it holds the token.
 async fn respond(
     mut pipe: NamedPipeServer,
     name: String,
     token: Bytes,
-    answers: Answers,
-    observed: Arc<Mutex<Observed>>,
-    questions: Arc<AtomicU64>,
+    answers: Arc<Answers>,
+    verified: bool,
+    spawns: Arc<Spawns>,
 ) {
+    let peers = Arc::new(Semaphore::new(PEERS));
+    // A distinct asker for each answer of a passphrase Kerno verified.
+    let fresh = Arc::new(AtomicU64::new(1 << 31));
     loop {
         // An error here is a peer that wrote and closed before this call:
         // what it wrote is still read below.
@@ -569,28 +723,50 @@ async fn respond(
             return;
         };
         let mut peer = std::mem::replace(&mut pipe, next);
-        let exchange = answer(&mut peer, &token, &answers, &observed, &questions);
-        let _ = tokio::time::timeout(ASK_TIMEOUT, exchange).await;
+        let Ok(permit) = peers.clone().try_acquire_owned() else {
+            continue;
+        };
+        let (answers, spawns, fresh) = (answers.clone(), spawns.clone(), fresh.clone());
+        tokio::spawn(async move {
+            let exchange = answer(&mut peer, &token, &answers, verified, &spawns, &fresh);
+            let _ = tokio::time::timeout(ASK_TIMEOUT, exchange).await;
+            drop(permit);
+        });
     }
 }
 
-/// One question: the peer's proof, then "<id>\n<question>", length first;
-/// the answer, length first (0: refused). Waits for the peer to close, so
+/// One question: the peer's proof, then "<spawn>\n<question>", length
+/// first; the answer, length first (0: refused). A question of an `ssh`
+/// that is up, ended or unknown is refused. Waits for the peer to close, so
 /// that the answer is read before this end goes.
 async fn answer(
     peer: &mut NamedPipeServer,
     token: &Bytes,
     answers: &Answers,
-    observed: &Mutex<Observed>,
-    questions: &AtomicU64,
+    verified: bool,
+    spawns: &Spawns,
+    fresh: &AtomicU64,
 ) -> Option<()> {
     named::prove_peer(peer, token).await?;
     let question = read_message(peer).await?;
-    questions.fetch_add(1, Ordering::SeqCst);
     let text = String::from_utf8_lossy(&question);
-    let (asker, prompt) = text.split_once('\n').unwrap_or(("0", &text));
-    let asker = asker.trim().parse().unwrap_or(0);
-    let reply = decide(prompt, asker, answers, &mut lock(observed));
+    let (spawn, prompt) = text.split_once('\n').unwrap_or(("0", &text));
+    let spawn: u64 = spawn.trim().parse().unwrap_or(0);
+    let reply = {
+        let mut asking = lock(&spawns.asking);
+        asking.get_mut(&spawn).and_then(|asking| {
+            asking.questions += 1;
+            // A verified passphrase answers every question for its key (a
+            // jump host's `ssh` asks for it too); one Kerno could not try,
+            // once per `ssh`.
+            let asker = match verified {
+                true => fresh.fetch_add(1, Ordering::SeqCst),
+                false => spawn,
+            };
+            let asker = u32::try_from(asker).unwrap_or(u32::MAX);
+            decide(prompt, asker, answers, &mut asking.observed)
+        })
+    };
     let reply = reply.as_ref().map(|reply| reply.expose().as_bytes());
     write_message(peer, reply.unwrap_or_default()).await?;
     let mut rest = [0; 1];
@@ -620,14 +796,15 @@ async fn write_message(stream: &mut (impl AsyncWrite + Unpin), message: &[u8]) -
 // Askpass -----------------------------------------------------------------------
 
 /// Kerno run by `ssh` as its askpass program: passes the question (the first
-/// argument) to the tunnel whose file [`ASKPASS_VAR`] names, once the tunnel
-/// proved itself, and prints the answer. Returns the exit code when this
-/// process is such a run, `None` otherwise; `main` calls it first thing.
+/// argument) and the number of the `ssh` that asks to the tunnel whose file
+/// [`ASKPASS_VAR`] names, once the tunnel proved itself, and prints the
+/// answer. Returns the exit code when this process is such a run, `None`
+/// otherwise; `main` calls it first thing.
 pub fn answer_askpass() -> Option<i32> {
     let file = std::env::var_os(ASKPASS_VAR)?;
     let prompt = std::env::args_os().nth(1).unwrap_or_default();
-    // No parent id on Windows: each question is its own (see the module).
-    let mut question = format!("{}\n", std::process::id()).into_bytes();
+    let spawn = std::env::var(SPAWN_VAR).unwrap_or_default();
+    let mut question = format!("{}\n", spawn.trim()).into_bytes();
     question.extend_from_slice(prompt.to_string_lossy().as_bytes());
     let answer = ask(Path::new(&file), &question);
     Some(match answer {
@@ -670,14 +847,14 @@ mod tests {
         assert_eq!(ask(&dir.path().join("ask"), b"1\nPassword: "), None);
     }
 
-    /// The whole question through a real pipe: answered once both ends
-    /// proved themselves; a peer without the token gets nothing.
-    #[test]
-    fn a_question_crosses_the_proved_pipe() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ask");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let key = r"C:\Users\ada\.ssh\id_ed25519";
+    /// A pipe served by [`respond`] in `dir`, with a passphrase for `key`.
+    fn serve(
+        runtime: &tokio::runtime::Runtime,
+        dir: &Path,
+        key: &str,
+        verified: bool,
+    ) -> (PathBuf, Arc<Spawns>, JoinHandle<()>) {
+        let file = dir.join("ask");
         let made = {
             let _entered = runtime.enter();
             named::new_pipe(&file).unwrap()
@@ -687,33 +864,137 @@ mod tests {
             passphrase: Some(crate::config::Secret::new("s3cret")),
             trusted: None,
         };
-        let questions = Arc::new(AtomicU64::new(0));
-        let observed = Arc::new(Mutex::new(Observed::default()));
+        let spawns = Arc::new(Spawns::default());
         let responder = runtime.spawn(respond(
             made.pipe,
             made.name,
             made.token,
-            answers,
-            observed.clone(),
-            questions.clone(),
+            Arc::new(answers),
+            verified,
+            spawns.clone(),
         ));
-        let prompt = format!("12\nEnter passphrase for key '{key}': ");
+        (file, spawns, responder)
+    }
+
+    /// The whole question through a real pipe: answered once both ends
+    /// proved themselves, for an `ssh` still logging in only; a passphrase
+    /// Kerno could not try is given once per `ssh` (R8, R12). Mutations
+    /// seen: the spawn's entry not required (a finished `ssh` answered);
+    /// the asker made unique for an unverified passphrase (asked twice,
+    /// answered twice).
+    #[test]
+    fn a_question_crosses_the_proved_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\Users\ada\.ssh\id_pem";
+        let (file, spawns, responder) = serve(&runtime, dir.path(), key, false);
+        let listed = Listed::new(&spawns);
+        let prompt = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
         assert_eq!(
             ask(&file, prompt.as_bytes()).as_deref(),
             Some(&b"s3cret"[..])
         );
-        // Another key's question: refused (an empty answer).
-        let other = b"13\nEnter passphrase for key 'C:\\other': ";
-        assert_eq!(ask(&file, other).as_deref(), Some(&b""[..]));
-        assert_eq!(questions.load(Ordering::SeqCst), 2);
+        // Asked again by the same `ssh`: the passphrase was wrong.
+        assert_eq!(ask(&file, prompt.as_bytes()).as_deref(), Some(&b""[..]));
+        let asking = listed.take();
+        assert_eq!(asking.questions, 2);
+        assert_eq!(asking.observed.passphrase, Some("the passphrase is wrong"));
+        // That `ssh` is up or gone: its questions are refused.
+        assert_eq!(ask(&file, prompt.as_bytes()).as_deref(), Some(&b""[..]));
+        // Another key's question: refused.
+        let other = Listed::new(&spawns);
+        let question = format!("{}\nEnter passphrase for key 'C:\\other': ", other.id);
+        assert_eq!(ask(&file, question.as_bytes()).as_deref(), Some(&b""[..]));
         // A file with another token: the tunnel does not prove itself to
         // it, and it gets no answer.
         let text = std::fs::read_to_string(&file).unwrap();
         let id = text.lines().next().unwrap();
         let forged = dir.path().join("forged");
         std::fs::write(&forged, format!("{id}\n{}\n", "ab".repeat(32))).unwrap();
-        assert_eq!(ask(&forged, prompt.as_bytes()), None);
-        assert_eq!(questions.load(Ordering::SeqCst), 2);
+        let question = format!("{}\nEnter passphrase for key '{key}': ", other.id);
+        assert_eq!(ask(&forged, question.as_bytes()), None);
+        assert_eq!(other.take().questions, 1);
+        responder.abort();
+    }
+
+    /// A verified passphrase is given to every question for its key, a jump
+    /// host's `ssh` asking for it on its own.
+    #[test]
+    fn a_verified_passphrase_answers_each_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\Users\ada\.ssh\id_ed25519";
+        let (file, spawns, responder) = serve(&runtime, dir.path(), key, true);
+        let listed = Listed::new(&spawns);
+        let prompt = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
+        for _ in 0..2 {
+            assert_eq!(
+                ask(&file, prompt.as_bytes()).as_deref(),
+                Some(&b"s3cret"[..])
+            );
+        }
+        responder.abort();
+    }
+
+    /// The server side never answers a peer that did not prove itself: a
+    /// wrong proof, then a question, gets nothing. Mutation seen: the
+    /// proof's result ignored in `answer`.
+    #[test]
+    fn a_peer_without_the_proof_gets_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\k";
+        let (file, spawns, responder) = serve(&runtime, dir.path(), key, true);
+        let listed = Listed::new(&spawns);
+        let (name, _) = named::read_name_file(&file).unwrap();
+        let answer = runtime.block_on(async {
+            let mut pipe = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&name)
+                .unwrap();
+            pipe.write_all(&[7; 32]).await.unwrap();
+            let mut server = [0; 64];
+            pipe.read_exact(&mut server).await.unwrap();
+            // A proof made with no token at all.
+            pipe.write_all(&[0; 32]).await.unwrap();
+            let question = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
+            let _ = write_message(&mut pipe, question.as_bytes()).await;
+            tokio::time::timeout(Duration::from_secs(3), read_message(&mut pipe)).await
+        });
+        assert!(matches!(answer, Ok(None) | Err(_)), "{answer:?}");
+        assert_eq!(listed.take().questions, 0);
+        responder.abort();
+    }
+
+    /// A peer that connects and says nothing delays nobody (R4): a proved
+    /// question is answered while it holds its instance. Mutation seen:
+    /// peers served one after the other.
+    #[test]
+    fn a_silent_peer_delays_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\k";
+        let (file, spawns, responder) = serve(&runtime, dir.path(), key, true);
+        let (name, _) = named::read_name_file(&file).unwrap();
+        let silent = {
+            let _entered = runtime.enter();
+            tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&name)
+                .unwrap()
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let listed = Listed::new(&spawns);
+        let prompt = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            ask(&file, prompt.as_bytes()).as_deref(),
+            Some(&b"s3cret"[..])
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(silent);
         responder.abort();
     }
 }

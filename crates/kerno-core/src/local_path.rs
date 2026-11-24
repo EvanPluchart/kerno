@@ -1,38 +1,47 @@
-//! The files a saved connection names, on Windows (K69, D-138).
+//! The files a saved connection or a saved task names, on Windows (K69, D-138).
 //!
 //! A saved connection may come from an imported file (Kerno's connections
-//! file, DBeaver's), from a task, or from the store edited by hand. On
-//! Windows a path that names another machine (`\\host\share\…`, in any
-//! spelling) is opened over SMB with the user's Windows credentials: merely
-//! reading, stating or handing it to another program logs in there. So every
-//! place that opens a connection's file, or hands it to another program,
-//! asks [`check`] first: the drivers' connect (TLS files, the SQLite
-//! database), the client tools (TLS files), both SSH clients (the key file),
-//! the password command (its program). On macOS and Linux nothing is
-//! refused: the rule itself ([`is_local_file`]) is strings in, a verdict
-//! out, tested on every system.
+//! file, DBeaver's), a task too, or from the store edited by hand. On Windows
+//! a path that names another machine (`\\host\share\…`, in any spelling) is
+//! opened over SMB with the user's Windows credentials: merely reading,
+//! stating or handing it to another program logs in there. So every place
+//! that opens such a file, or hands it to another program, takes it through
+//! [`resolve`] first, which expands `~\` with the home and then checks it, so
+//! that what is checked is what is opened: the drivers' connect (TLS files,
+//! the SQLite database: [`resolve_params`]), the client tools (TLS files and
+//! a task's files), both SSH clients (the key file), the password command (its
+//! program). On macOS and Linux nothing is expanded or refused: the rule
+//! itself ([`is_local_file`]) is strings in, a verdict out, tested on every
+//! system.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{ConnectParams, ConnectionConfig, Engine, SshAuth, TlsConfig};
 use crate::error::{Error, Result};
 
-/// What a connection's file must look like on Windows, for the messages
-/// that refuse another.
+/// What a file of a connection or a task must look like on Windows, for the
+/// messages that refuse another.
 pub const LOCAL_FILE: &str = r"a full path on this computer, such as C:\Users\you\file or ~\file";
+
+/// Windows' device names: a path component named so (any case, with or
+/// without an extension) opens the device, not a file.
+const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
 /// Whether `path` is a file of this computer the way Windows reads it.
 ///
 /// An allow-list, `/` read as `\` as Windows does: a drive's absolute path
 /// (`X:\…`, a mapped network drive included: Windows logged in to it when the
 /// user mapped it) or a path under the home (`~\…`), with no further `:` (no
-/// alternate data stream, no second drive) and no NUL. Everything else is
+/// alternate data stream, no second drive), no NUL and no component that is a
+/// device name (`CON`, `NUL`, `COM1`, `LPT1.txt`…). Everything else is
 /// refused: two leading separators in any spelling (`\\host`, `//host`,
 /// `\/host`, `/\host`), `\\?\`, `\\.\`, `\??\`, a rooted path without a
-/// drive (`\Users\…`), a drive-relative `X:file`, a path relative to the
-/// folder Kerno happens to run in. Named pipes are
-/// [`crate::ssh::is_local_pipe`]'s. On Windows the drive is confirmed by
-/// `Path::components` too.
+/// drive (`\Users\…`: when Kerno's working folder is a share, it names that
+/// share), a drive-relative `X:file`, a path relative to the folder Kerno
+/// happens to run in. Named pipes are [`crate::ssh::is_local_pipe`]'s. A
+/// link on the local disk that leads to a share is the machine owner's own
+/// doing, not a saved connection's, and is followed. On Windows the drive is
+/// confirmed by `Path::components` too.
 pub fn is_local_file(path: &str) -> bool {
     let path = path.replace('/', "\\");
     let rest = match path.as_bytes() {
@@ -40,7 +49,7 @@ pub fn is_local_file(path: &str) -> bool {
         [b'~', b'\\', ..] => &path[2..],
         _ => return false,
     };
-    if rest.contains([':', '\0']) {
+    if rest.contains([':', '\0']) || rest.split('\\').any(is_device) {
         return false;
     }
     #[cfg(windows)]
@@ -57,8 +66,30 @@ pub fn is_local_file(path: &str) -> bool {
     true
 }
 
-/// On Windows, why the connection's `what` at `path` is not opened, in plain
-/// words; `None` when it is a file of this computer, and always on Unix.
+/// Whether a path component names a device: its name before the first `.`,
+/// trailing spaces and dots left out, is one of [`DEVICES`] or `COM`/`LPT`
+/// followed by a digit (`1`–`9`, or the superscripts `¹²³`, which Windows
+/// takes too).
+fn is_device(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    let stem = stem.trim_end_matches([' ', '.']).to_uppercase();
+    if DEVICES.contains(&stem.as_str()) {
+        return true;
+    }
+    let numbered = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    numbered.is_some_and(|digit| {
+        let mut chars = digit.chars();
+        matches!(
+            (chars.next(), chars.next()),
+            (Some('1'..='9' | '¹' | '²' | '³'), None)
+        )
+    })
+}
+
+/// On Windows, why the `what` at `path` is not opened, in plain words; `None`
+/// when it is a file of this computer, and always on Unix.
 pub fn refusal(path: &Path, what: &str) -> Option<String> {
     (cfg!(windows) && !is_local_file(&path.to_string_lossy())).then(|| {
         format!(
@@ -74,37 +105,71 @@ pub fn check(path: &Path, what: &str) -> Result<()> {
     refusal(path, what).map_or(Ok(()), |refusal| Err(Error::Config(refusal)))
 }
 
-/// Checks the TLS files of a connection.
-pub fn check_tls(tls: &TlsConfig) -> Result<()> {
-    let files = [
-        (&tls.ca_file, "CA certificate"),
-        (&tls.cert_file, "client certificate"),
-        (&tls.key_file, "client key"),
-    ];
-    for (file, what) in files {
-        if let Some(file) = file {
-            check(file, what)?;
-        }
+/// `path` with `~\` (or `~/`) put under the home, on Windows only; the
+/// check is [`check`]'s, where the file is used.
+pub fn expand(path: &Path) -> PathBuf {
+    if !cfg!(windows) {
+        return path.to_path_buf();
     }
-    Ok(())
+    crate::home::expand(&path.to_string_lossy(), crate::home::dir().as_deref())
 }
 
-/// Checks every file a driver's connect opens: the TLS files, and SQLite's
-/// database, which may well be on a share: a mapped drive letter is taken.
-pub fn check_params(params: &ConnectParams) -> Result<()> {
-    if params.engine == Engine::Sqlite
-        && let Some(file) = &params.file
-        && refusal(file, "database file").is_some()
-    {
+/// The path to open for `path`, a file of a connection or a task: on Windows
+/// `~\` (or `~/`) put under the home ([`crate::home::expand`]), then checked
+/// ([`check`]); refused when `~` cannot be expanded. On Unix `path` as it is.
+pub fn resolve(path: &Path, what: &str) -> Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(path.to_path_buf());
+    }
+    resolve_with(path, what, crate::home::dir().as_deref())
+}
+
+/// [`resolve`] with the home given: the rule itself, on every system.
+pub(crate) fn resolve_with(path: &Path, what: &str, home: Option<&Path>) -> Result<PathBuf> {
+    let expanded = crate::home::expand(&path.to_string_lossy(), home);
+    if expanded.to_string_lossy().starts_with('~') || !is_local_file(&expanded.to_string_lossy()) {
         return Err(Error::Config(format!(
-            "the database file “{}” is not a file of this computer: Kerno opens no file of \
-             another computer by its network name (Windows would log in there with your \
-             account). Map the share to a drive letter (File Explorer, Map network drive) \
-             and open the file there, or use {LOCAL_FILE}.",
-            file.display()
+            "the {what} “{}” is not a file of this computer, and Kerno opens no file of \
+             another computer (Windows would log in there with your account): use {LOCAL_FILE}.",
+            path.display()
         )));
     }
-    check_tls(&params.tls)
+    Ok(expanded)
+}
+
+/// The TLS files of a connection, resolved ([`resolve`]).
+pub fn resolve_tls(tls: &TlsConfig) -> Result<TlsConfig> {
+    let file =
+        |file: &Option<PathBuf>, what| file.as_deref().map(|file| resolve(file, what)).transpose();
+    Ok(TlsConfig {
+        ca_file: file(&tls.ca_file, "CA certificate")?,
+        cert_file: file(&tls.cert_file, "client certificate")?,
+        key_file: file(&tls.key_file, "client key")?,
+        ..tls.clone()
+    })
+}
+
+/// The settings a driver's connect opens files from, resolved: the TLS files,
+/// and SQLite's database, which may well be on a share: a mapped drive letter
+/// is taken, the network name is not, and the message says how.
+pub fn resolve_params(params: &ConnectParams) -> Result<ConnectParams> {
+    let mut resolved = params.clone();
+    if params.engine == Engine::Sqlite
+        && let Some(file) = &params.file
+        && !file.as_os_str().is_empty()
+    {
+        resolved.file = Some(resolve(file, "database file").map_err(|_| {
+            Error::Config(format!(
+                "the database file “{}” is not a file of this computer: Kerno opens no file of \
+                 another computer by its network name (Windows would log in there with your \
+                 account). Map the share to a drive letter (File Explorer, Map network drive) \
+                 and open the file there, or use {LOCAL_FILE}.",
+                file.display()
+            ))
+        })?);
+    }
+    resolved.tls = resolve_tls(&params.tls)?;
+    Ok(resolved)
 }
 
 /// What an import says under a connection whose files Kerno will not open
@@ -123,16 +188,18 @@ pub fn notes(config: &ConnectionConfig) -> Vec<String> {
     ];
     files
         .into_iter()
-        .filter_map(|(path, what)| {
-            let path = path?;
-            refusal(path, what)?;
-            Some(format!(
-                "the {what} {} is not a file of this computer: it will not be opened; choose \
-                 {LOCAL_FILE}",
-                path.display()
-            ))
-        })
+        .filter_map(|(path, what)| note(path?, what))
         .collect()
+}
+
+/// The import's line for one file Kerno will not open, `None` when it will.
+pub fn note(path: &Path, what: &str) -> Option<String> {
+    refusal(path, what)?;
+    Some(format!(
+        "the {what} {} is not a file of this computer: it will not be opened; choose \
+         {LOCAL_FILE}",
+        path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -141,8 +208,9 @@ mod tests {
 
     /// A connection's file is a file of this computer, Windows' way: only a
     /// drive's absolute path or one under `~\`, whatever the separators and
-    /// the case. Mutation seen: the `/` to `\` turn dropped (the `//host`,
-    /// `\/host` and `C:/` cases go wrong).
+    /// the case, and no device. Mutations seen: the `/` to `\` turn dropped
+    /// (the `//host`, `\/host` and `C:/` cases go wrong); the device check
+    /// dropped (`NUL`, `com1.txt` pass).
     #[test]
     fn a_connection_file_is_a_file_of_this_computer() {
         for local in [
@@ -154,6 +222,7 @@ mod tests {
             r"~\.ssh\id_ed25519",
             "~/.ssh/id_ed25519",
             r"C:\\double\\separators\inside",
+            r"C:\console\conx.d\com10\lpt0\nul-file",
         ] {
             assert!(is_local_file(local), "{local}");
         }
@@ -188,9 +257,40 @@ mod tests {
             r"..\id",
             "",
             "C:\\id\0",
+            r"C:\NUL",
+            r"c:\dir\con",
+            r"C:\keys\com1.txt",
+            r"C:\keys\LPT9",
+            r"C:\keys\nul.tar.gz",
+            r"C:\keys\aux \x",
+            r"C:\keys\CON..",
+            r"C:\keys\conin$",
+            r"C:\keys\COM¹",
+            r"~\nul",
         ] {
             assert!(!is_local_file(other), "{other}");
         }
+    }
+
+    /// `~\` is expanded with the home before it is checked: what is checked
+    /// is what is opened; no home, no expansion, refused. Mutation seen: the
+    /// expansion dropped (`~\k` comes back as it is).
+    #[test]
+    fn a_home_path_is_expanded_then_checked() {
+        let home = Path::new(r"C:\Users\Jean Dupont");
+        // `~/`: a separator on every system (`~\` is one on Windows only).
+        assert_eq!(
+            resolve_with(Path::new("~/.ssh/id"), "key", Some(home)).unwrap(),
+            home.join(".ssh/id")
+        );
+        assert_eq!(
+            resolve_with(Path::new(r"D:\k"), "key", Some(home)).unwrap(),
+            PathBuf::from(r"D:\k")
+        );
+        assert!(resolve_with(Path::new("~/.ssh/id"), "key", None).is_err());
+        let share = Path::new(r"\\host\share");
+        assert!(resolve_with(Path::new("~/x"), "key", Some(share)).is_err());
+        assert!(resolve_with(Path::new(r"\\host\x"), "key", Some(home)).is_err());
     }
 
     /// The refusals are Windows' only, and say what a valid path looks like.
@@ -208,19 +308,19 @@ mod tests {
         config.tls = tls.clone();
         assert_eq!(notes(&config).len(), usize::from(cfg!(windows)));
         if cfg!(windows) {
-            let message = check_tls(&tls).unwrap_err().to_string();
+            let message = resolve_tls(&tls).unwrap_err().to_string();
             assert!(message.contains("CA certificate"), "{message}");
             assert!(message.contains(LOCAL_FILE), "{message}");
-            let message = check_params(&params).unwrap_err().to_string();
+            let message = resolve_params(&params).unwrap_err().to_string();
             assert!(
                 message.contains("Map the share to a drive letter"),
                 "{message}"
             );
             params.file = Some(r"Z:\shop.db".into());
-            assert!(check_params(&params).is_ok());
+            assert!(resolve_params(&params).is_ok());
         } else {
-            assert!(check_tls(&tls).is_ok());
-            assert!(check_params(&params).is_ok());
+            assert_eq!(resolve_tls(&tls).unwrap(), tls);
+            assert_eq!(resolve_params(&params).unwrap().file, params.file);
         }
     }
 }
