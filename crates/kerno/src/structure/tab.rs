@@ -1165,6 +1165,15 @@ impl Render for StructureTab {
                     cx.stop_propagation();
                 }
             }))
+            // Edit ▸ Copy does what Cmd+C does; the window's own Copy
+            // otherwise (K61).
+            .on_action(
+                cx.listener(|this, _: &gpui_kit::base::input::Copy, window, cx| {
+                    if !this.copy_selection(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .child(self.render_toolbar(cx))
             .child(self.render_sections(cx))
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))

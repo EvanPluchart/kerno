@@ -872,8 +872,9 @@ reachable from the command palette: type words of a command's name, its section 
 without accents ("theme light", "sql new"); Escape closes it.
 
 On macOS the Edit menu starts with Undo, Redo, Cut, Copy, Paste and Select All, with their usual keys. They act on
-whatever has the keyboard: the SQL editor and every text field, and a grid for Copy, Paste and Select All; an
-entry is greyed where nothing focused takes it.
+whatever has the keyboard: the SQL editor and every text field, a grid for Copy, Paste and Select All, and for
+Copy what Cmd+C copies elsewhere (the name of the object selected in the schema tree, the cell selected in a
+structure or administration list); an entry is greyed where nothing focused takes it.
 
 | Shortcut | Action |
 | -------- | ------ |

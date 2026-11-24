@@ -420,3 +420,71 @@ fn the_edit_menu_has_the_systems_editing_entries(cx: &mut TestAppContext) {
     }
     assert!(enabled(cx, "Copy"));
 }
+
+/// K61 (the pass in the real app, 2026-11-24): Edit ▸ Copy does what Cmd+C
+/// does on every surface whose Cmd+C copies something of its own: the
+/// schema tree (the selected object's name), a structure tab's list and an
+/// administration tab's list (the selected cell). The grids of a table and
+/// of a result are the test above's.
+#[gpui_kit::test]
+fn edit_copy_does_what_the_key_does_on_every_surface(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let app = connected(cx, Engine::Postgres);
+    app.step(cx, |window, _| window.activate_window());
+    // What the key copies, then what the menu copies: the same, never a
+    // value left on the clipboard before.
+    let copied = |app: &Fixture, cx: &mut TestAppContext, what: &str| {
+        let blank = gpui_kit::ClipboardItem::new_string("-".into());
+        cx.write_to_clipboard(blank.clone());
+        app.press(cx, &["secondary-c"]);
+        let by_key = app.clipboard(cx);
+        cx.write_to_clipboard(blank);
+        from_menu(app, cx, "Copy");
+        assert_eq!(
+            app.clipboard(cx),
+            by_key,
+            "{what}: the menu copies what the key does"
+        );
+        by_key.unwrap_or_default()
+    };
+
+    // The schema tree, a table selected.
+    let orders = ["kerno", "shop", "Tables", "orders"];
+    app.open_path(cx, &orders);
+    app.click_row(cx, &orders, false);
+    assert_eq!(copied(&app, cx, "the tree"), "orders");
+
+    // A structure tab: a cell of its columns.
+    app.open_structure(cx, "shop", "orders", RelationKind::Table);
+    app.wait_for_structure(cx);
+    let columns = app.structure_rows(cx, List::Columns);
+    let tab = app.structure(cx);
+    let grid = cx.update(|cx| tab.read(cx).grid(List::Columns)).unwrap();
+    app.on_structure(cx, |tab, _, cx| tab.select(1, cx));
+    app.step(cx, |window, cx| {
+        grid.update(cx, |table, cx| table.set_selected_cell(1, 2, cx));
+        grid.read(cx).focus_handle(cx).focus(window, cx);
+    });
+    assert_eq!(copied(&app, cx, "a structure tab"), columns[1][2]);
+
+    // An administration tab: a cell of its settings.
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    app.sidebar_does(
+        cx,
+        Subject::Connection(id),
+        SidebarAction::Tool(crate::navigator::actions::ToolEntry::Dashboard),
+    );
+    app.wait_admin(cx, Pane::Sessions);
+    app.on_admin(cx, |tab, window, cx| tab.select(SETTINGS, window, cx));
+    app.wait_admin(cx, Pane::Settings);
+    app.admin_filter(cx, "max_connections");
+    let (_, settings) = app.admin_shown(cx, Pane::Settings);
+    let row = settings
+        .iter()
+        .position(|row| row[0] == "max_connections")
+        .unwrap();
+    app.click(cx, ("admin-settings-cell", (row << 12) | 1));
+    assert_eq!(copied(&app, cx, "an administration tab"), settings[row][1]);
+}

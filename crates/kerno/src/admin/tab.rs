@@ -1376,6 +1376,15 @@ impl Render for AdminTab {
                     cx.stop_propagation();
                 }
             }))
+            // Edit ▸ Copy does what Cmd+C does; the window's own Copy
+            // otherwise (K61).
+            .on_action(
+                cx.listener(|this, _: &gpui_kit::base::input::Copy, window, cx| {
+                    if !this.copy_selection(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .child(self.render_toolbar(cx))
             .child(self.render_sections(cx))
             .children(self.render_section_bar(cx))

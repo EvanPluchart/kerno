@@ -4294,6 +4294,11 @@ impl Render for Navigator {
                     }))
                     // Cmd+. on a row being read stops the read (C3); else
                     // it goes on to the active tab.
+                    // Edit ▸ Copy does what Cmd+C does here: the selected
+                    // object's name (K61).
+                    .on_action(|_: &gpui_kit::base::input::Copy, window, cx| {
+                        window.dispatch_action(Box::new(crate::actions::CopyObjectName), cx)
+                    })
                     .capture_action(cx.listener(|this, _: &crate::actions::CancelQuery, _, cx| {
                         if this.cancel_selected_load(cx) {
                             cx.stop_propagation();

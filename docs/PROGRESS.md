@@ -1586,3 +1586,8 @@ Still open (for the owner):
   (K55): the kit's reveal of a click does not move on its first frame, which counted as "stopped". That frame no
   longer counts; the K55 test now moves the test clock between its frames, which it did not (the reveal never
   moved there), and failed without the fix. Seen in the release build before the fix and gone after it.
+- Edit ▸ Copy copied nothing where ⌘C copies on its own (K54): in the schema tree, a structure tab's and an
+  administration tab's lists the menu's Copy reached only the window's copy of selected label text. Each now
+  routes it to what its ⌘C does (the selected object's name, the selected cell). The other surfaces have no ⌘C,
+  Paste or Select All of their own. Test: `ui_tests::k54::edit_copy_does_what_the_key_does_on_every_surface`,
+  each of the three seen failing without its handler.
