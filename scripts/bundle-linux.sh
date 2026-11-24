@@ -6,8 +6,11 @@
 #   kerno_<version>_<arm64|amd64>.deb               files under /usr, Depends from dpkg-shlibdeps
 #   Kerno-<version>-<aarch64|x86_64>.AppImage       AppDir + squashfs + the AppImage type-2 runtime
 #
-#   scripts/bundle-linux.sh          build the image if needed, then both architectures
-#   scripts/bundle-linux.sh --clean  remove the image kerno-linux-build and the volume kerno-linux-cache
+#   scripts/bundle-linux.sh [aarch64] [x86_64]   build the image if needed, then the architectures
+#                                                named (both when none is: the release workflow
+#                                                names one per runner, to build them side by side)
+#   scripts/bundle-linux.sh --clean              remove the image kerno-linux-build and the volume
+#                                                kerno-linux-cache
 #
 # It runs itself in the image of packaging/linux/Dockerfile (Ubuntu 20.04 arm64, so the packages need
 # glibc 2.31 or newer; docs/DECISIONS.md D-066): the source is mounted read-only, dist/ writable, and
@@ -36,8 +39,14 @@ if [ -z "${KERNO_LINUX_BUILD_IMAGE:-}" ]; then
     -v "$PWD:/src:ro" -v "$PWD/dist:/src/dist" -v kerno-linux-cache:/cache \
     -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target \
     -e KERNO_JOBS="$jobs" -e KERNO_NICE="$niceness" \
-    kerno-linux-build scripts/bundle-linux.sh
+    kerno-linux-build scripts/bundle-linux.sh "$@"
 fi
+
+archs=("$@")
+[ ${#archs[@]} -gt 0 ] || archs=(aarch64 x86_64)
+for arch in "${archs[@]}"; do
+  case $arch in aarch64 | x86_64) ;; *) echo "usage: scripts/bundle-linux.sh [aarch64] [x86_64] | --clean" >&2; exit 2 ;; esac
+done
 
 target_dir=${CARGO_TARGET_DIR:-target}
 stage=$(mktemp -d)
@@ -70,8 +79,8 @@ cp assets/icon/kerno.svg "$prefix/share/icons/hicolor/scalable/apps/kerno.svg"
 cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md README.md "$prefix/share/doc/kerno/"
 
 mkdir -p dist
-for target in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
-  arch=${target%%-*}
+for arch in "${archs[@]}"; do
+  target=$arch-unknown-linux-gnu
   case $arch in aarch64) deb_arch=arm64 ;; x86_64) deb_arch=amd64 ;; esac
   started=$(date +%s)
   nice -n "$niceness" cargo build --release --locked -p kerno --target "$target" -j "$jobs"
@@ -122,4 +131,7 @@ APPRUN
   chmod 755 "dist/$image"
 done
 
-ls -la dist/kerno-"$version"-linux-*.tar.gz dist/kerno_"$version"_*.deb dist/Kerno-"$version"-*.AppImage
+for arch in "${archs[@]}"; do
+  case $arch in aarch64) deb_arch=arm64 ;; x86_64) deb_arch=amd64 ;; esac
+  ls -la "dist/kerno-$version-linux-$arch.tar.gz" "dist/kerno_${version}_$deb_arch.deb" "dist/Kerno-$version-$arch.AppImage"
+done

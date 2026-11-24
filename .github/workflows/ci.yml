@@ -9,6 +9,9 @@
 #                target, and kerno-core's tests; no container and no UI test there yet
 #   windows-package  the release's Windows zip, built by scripts/bundle-windows.sh and kept 7
 #                days with the run: a preview, nobody has seen it on a Windows screen
+#   macos-package    the release's .dmg, built by scripts/bundle-macos.sh and kept 7 days
+# The two package jobs also leave their compiled dependencies in a cache that release.yml reads
+# (shared keys): a release then compiles Kerno's own crates only on macOS and Windows.
 name: CI
 
 on:
@@ -126,8 +129,9 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          shared-key: release-windows
           cache-on-failure: true
-      - name: Build, check the version and zip
+      - name: Build, check the version, launch once and zip
         run: scripts/bundle-windows.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -136,5 +140,26 @@ jobs:
           path: |
             dist/*.zip
             dist/kerno-windows-launch.png
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-package:
+    name: release dmg (macOS)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-macos
+          cache-on-failure: true
+      - name: Build, sign, launch once and pack
+        run: scripts/bundle-macos.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kerno-macos-arm64
+          path: dist/*.dmg
           if-no-files-found: error
           retention-days: 7

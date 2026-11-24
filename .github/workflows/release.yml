@@ -8,13 +8,17 @@
 # artifacts, and no release is made unless "draft" is ticked (then a draft named "dry run", to
 # delete afterwards).
 #   macos    scripts/bundle-macos.sh on Apple Silicon: the .dmg, signed ad hoc, launched once
-#   linux    scripts/bundle-linux.sh on arm64: aarch64 built natively and x86_64 cross-compiled in
-#            the image of packaging/linux, then the aarch64 packages started in clean containers
+#   linux    scripts/bundle-linux.sh on arm64, one runner per architecture, side by side: aarch64
+#            built natively and x86_64 cross-compiled in the image of packaging/linux; the aarch64
+#            packages are then started in clean containers
 #   linux-x86_64  the x86_64 packages started in clean containers on an x86_64 runner: nothing is
 #            emulated here, not even for the check
 #   windows  scripts/bundle-windows.sh on x86_64: kerno.exe (its icon and the C runtime inside)
 #            in a zip; a preview: no installer, and nobody tries it on a screen here
 #   publish  SHA256SUMS over the eight packages, then the draft
+# The macOS and Windows jobs start from the dependencies compiled by the same builds of ci.yml on
+# main (a tag's run reads main's caches and saves none of its own): only Kerno's own crates are
+# compiled again. The Linux builds are whole: their target directory is inside a container.
 name: Release
 
 on:
@@ -65,6 +69,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-macos
+          save-if: false
       - name: Build, sign, launch once and pack
         run: scripts/bundle-macos.sh
       - name: Name the disk image as the updater looks for it
@@ -79,19 +87,24 @@ jobs:
           retention-days: 7
 
   linux:
-    name: Linux (aarch64, x86_64)
+    name: Linux (${{ matrix.arch }})
     needs: version
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build both architectures
-        run: KERNO_JOBS=$(nproc) scripts/bundle-linux.sh
+      - name: Build ${{ matrix.arch }}
+        run: KERNO_JOBS=$(nproc) scripts/bundle-linux.sh ${{ matrix.arch }}
       - name: Start every aarch64 package in clean containers
+        if: matrix.arch == 'aarch64'
         run: scripts/check-linux-packages.sh aarch64
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           path: |
             dist/*.tar.gz
             dist/*.deb
@@ -108,7 +121,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: linux
+          name: linux-x86_64
           path: dist
       # An artifact does not keep the executable bit.
       - run: chmod 755 dist/*.AppImage
@@ -130,7 +143,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Build, check the version and zip
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-windows
+          save-if: false
+      - name: Build, check the version, launch once and zip
         run: scripts/bundle-windows.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
