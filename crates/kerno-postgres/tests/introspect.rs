@@ -171,6 +171,38 @@ async fn closed_databases(session: std::sync::Arc<dyn kerno_core::Session>) {
     );
 }
 
+/// K71: a table another session holds locked (a long `ALTER`, a migration)
+/// is listed without its size, at once: the size would wait for the lock,
+/// and the tree, the backup and the copy dialogs with it.
+#[tokio::test]
+async fn a_locked_table_is_listed_at_once_without_its_size() {
+    let (Some(session), Some(holder)) = (common::session().await, common::session().await) else {
+        return;
+    };
+    let schema = common::scratch_schema("locked_listing");
+    exec_ok(&session, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&session, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(&session, &format!("CREATE TABLE {schema}.free (n int)")).await;
+    exec_ok(&session, &format!("CREATE TABLE {schema}.locked (n int)")).await;
+    exec_ok(&holder, "BEGIN").await;
+    exec_ok(
+        &holder,
+        &format!("LOCK TABLE {schema}.locked IN ACCESS EXCLUSIVE MODE"),
+    )
+    .await;
+    let listed =
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.objects(&schema)).await;
+    exec_ok(&holder, "ROLLBACK").await;
+    exec_ok(&session, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    let listed = listed
+        .expect("listed without waiting for the lock")
+        .unwrap();
+    let sizes: Vec<_> = (listed.relations.iter())
+        .map(|relation| (relation.name.as_str(), relation.size_bytes.is_some()))
+        .collect();
+    assert_eq!(sizes, [("free", true), ("locked", false)]);
+}
+
 #[tokio::test]
 async fn objects_of_a_schema() {
     let Some(session) = common::session().await else {

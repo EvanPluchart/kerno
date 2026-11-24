@@ -135,10 +135,24 @@ pub(crate) async fn objects(session: &PgSession, schema: &str) -> Result<SchemaO
 }
 
 async fn relations(session: &PgSession, schema: &str) -> Result<Vec<RelationInfo>> {
+    // The size opens the table and its indexes, which waits behind an
+    // ACCESS EXCLUSIVE lock held or asked for by another session (a long
+    // ALTER, a migration): such a table is listed without its size (K71).
+    // ponytail: a lock taken between this check and the size still waits;
+    // a lock_timeout on the listing if that is ever seen.
     let sql = format!(
-        "SELECT c.relname, c.relkind, c.relispartition, \
+        "WITH locked AS ( \
+             SELECT coalesce(i.indrelid, l.relation) AS oid \
+             FROM pg_catalog.pg_locks l \
+             LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = l.relation \
+             WHERE l.locktype = 'relation' AND l.mode = 'AccessExclusiveLock' \
+               AND l.relation IS NOT NULL \
+               AND l.database = (SELECT oid FROM pg_catalog.pg_database \
+                                 WHERE datname = current_database())) \
+         SELECT c.relname, c.relkind, c.relispartition, \
                 CASE WHEN c.relkind IN ('r', 'p', 'm', 'f') AND c.reltuples >= 0 THEN c.reltuples::bigint END, \
-                CASE WHEN c.relkind IN ('r', 'm') THEN pg_catalog.pg_total_relation_size(c.oid) END, \
+                CASE WHEN c.relkind IN ('r', 'm') AND c.oid NOT IN (SELECT oid FROM locked) \
+                     THEN pg_catalog.pg_total_relation_size(c.oid) END, \
                 pg_catalog.obj_description(c.oid, 'pg_class') \
          FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
