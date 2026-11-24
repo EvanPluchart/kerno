@@ -4240,9 +4240,14 @@ fn history_and_saved_queries_are_searched_and_reopened(cx: &mut TestAppContext) 
         ("The other one", "samples", "select 2 as other")
     );
 
-    // Cmd+Y: the history, newest first; the search narrows it; a click
-    // opens the statement in a tab on the connection it ran on.
-    app.press(cx, &["secondary-y"]);
+    // Its key (Cmd+Y, Ctrl+Alt+E on Linux): the history, newest first; the
+    // search narrows it; a click opens the statement in a tab on the
+    // connection it ran on.
+    let history = actions::COMMANDS
+        .iter()
+        .find(|command| command.id == "show_history")
+        .unwrap();
+    app.press(cx, &[history.keys[0]]);
     app.wait_until(cx, "the history list", |app, cx| {
         app.has(cx, ("history", 1usize))
     });
@@ -4318,7 +4323,7 @@ fn the_editor_searches_and_replaces(cx: &mut TestAppContext) {
     };
     assert_eq!(searching(cx), None);
     // The editor's own shortcut, then the commands of the palette and menu.
-    app.press(cx, &["cmd-f"]);
+    app.press(cx, &["secondary-f"]);
     assert_eq!(searching(cx), Some(false));
     app.press(cx, &["escape"]);
     assert_eq!(searching(cx), None);
@@ -13189,12 +13194,19 @@ fn the_editor_adds_a_cursor_above_and_below(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
     app.press(cx, &["secondary-t"]);
     app.type_text(cx, "a\nb\nc");
+    // The editor's keys: Cmd+Alt+Up / Down on macOS, Shift+Alt+Up / Down and
+    // Ctrl+Home on Linux (K65).
+    let (above, below, start) = if cfg!(target_os = "macos") {
+        ("cmd-alt-up", "cmd-alt-down", "cmd-up")
+    } else {
+        ("shift-alt-up", "shift-alt-down", "ctrl-home")
+    };
     // From the last line, two cursors above: one letter typed on each line.
-    app.press(cx, &["cmd-alt-up", "cmd-alt-up"]);
+    app.press(cx, &[above, above]);
     app.type_text(cx, "x");
     assert_eq!(app.active_query(cx).1, "ax\nbx\ncx");
     // From the first line, one cursor below.
-    app.press(cx, &["escape", "secondary-up", "cmd-alt-down"]);
+    app.press(cx, &["escape", start, below]);
     app.type_text(cx, "-");
     assert_eq!(app.active_query(cx).1, "-ax\n-bx\ncx");
 }

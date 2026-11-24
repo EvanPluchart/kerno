@@ -444,13 +444,16 @@ fn the_global_defaults_over_a_key_of_the_kit_are_known(cx: &mut TestAppContext) 
             Some(format!("{id} {key} {action}"))
         })
         .collect();
-    assert_eq!(
-        found,
-        [
-            "run_statement secondary-enter Confirm",
-            "cancel_query secondary-. ToggleCodeActions"
-        ]
-    );
+    let mut known = vec![
+        "run_statement secondary-enter Confirm",
+        "cancel_query secondary-. ToggleCodeActions",
+    ];
+    // K65: elsewhere the kit binds its inspector, a developer's tool, to
+    // Ctrl+Shift+I; Format SQL keeps the key it has on macOS.
+    if !cfg!(target_os = "macos") {
+        known.push("format_sql secondary-shift-i ToggleInspector");
+    }
+    assert_eq!(found, known);
 }
 
 /// K20: each new default wins where the keyboard is all day: in the SQL

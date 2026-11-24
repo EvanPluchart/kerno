@@ -31,12 +31,18 @@ fn cmd_left_collapses_the_tree_only_from_the_tree(cx: &mut TestAppContext) {
     app.press(cx, &["secondary-a", "backspace"]);
     app.wait_until(cx, "the tree unfiltered", expanded);
 
-    // A query editor.
+    // A query editor: the key stays the editor's (on Linux Ctrl+Left goes
+    // back one word, K65).
     app.press(cx, &["secondary-t"]);
     app.type_text(cx, "select 1");
     app.press(cx, &["secondary-left"]);
     app.type_text(cx, "x");
-    assert_eq!(app.active_query(cx).1, "xselect 1");
+    let moved = if cfg!(target_os = "macos") {
+        "xselect 1"
+    } else {
+        "select x1"
+    };
+    assert_eq!(app.active_query(cx).1, moved);
     assert!(expanded(&app, cx), "{:#?}", app.tree(cx));
 
     // The tree itself.
@@ -66,8 +72,17 @@ fn a_key_of_the_text_fields_is_taken_for_a_command_of_the_tree(cx: &mut TestAppC
     app.click(cx, "shortcut-about-add");
     app.press(cx, &["secondary-right"]);
     let refused = text_of(&app, cx, "shortcut-recording");
+    // The text fields' action for it: the end of the line on macOS, the
+    // next word on Linux (K65).
+    let kept = if cfg!(target_os = "macos") {
+        "MoveEnd"
+    } else {
+        "MoveToNextWord"
+    };
     assert!(
-        refused.contains("text fields' MoveEnd: a command that works everywhere would take it"),
+        refused.contains(&format!(
+            "text fields' {kept}: a command that works everywhere would take it"
+        )),
         "{refused}"
     );
     app.press(cx, &["f6"]);

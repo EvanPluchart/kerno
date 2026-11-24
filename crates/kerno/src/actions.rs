@@ -908,11 +908,17 @@ pub const COMMANDS: &[Command] = &[
         ["write", "sql", "file"],
         SaveFileAs
     ),
+    // Ctrl+Y is the text fields' only Redo on Linux (the kit's): there,
+    // DataGrip's Browse Console History (Ctrl+Alt+E); DBeaver has none (K65).
     command!(
         "show_history",
         "Query History",
         "Query",
-        ["secondary-y"],
+        if cfg!(target_os = "macos") {
+            ["secondary-y"]
+        } else {
+            ["ctrl-alt-e"]
+        },
         ["past", "recent", "ran"],
         ShowHistory
     ),
@@ -3869,6 +3875,14 @@ mod tests {
             ("upper_case", &["secondary-shift-x"]),
             ("lower_case", &["secondary-shift-y"]),
             ("link_with_editor", &["secondary-shift-,"]),
+            (
+                "show_history",
+                if cfg!(target_os = "macos") {
+                    &["secondary-y"]
+                } else {
+                    &["ctrl-alt-e"]
+                },
+            ),
         ] {
             assert_eq!(keys_of(&bindings, id), keys, "{id}");
         }
