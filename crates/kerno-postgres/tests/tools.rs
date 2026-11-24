@@ -541,3 +541,128 @@ async fn a_plain_file_with_client_commands_runs_nothing() {
         assert_eq!(command.stdin.as_deref(), Some(input.as_path()));
     }
 }
+
+/// K67 (D-136), on the Windows runner of the probe workflow only, whose
+/// PostgreSQL 17 listens where the container does and holds
+/// `kerno_test_k67`: Kerno's own chain (the clients detected in Program
+/// Files, the one `client_for` picks, `backup_command`, `restore_command`,
+/// `run`) backs the database up with `pg_dump.exe`, restores it with
+/// `pg_restore.exe` into a scratch database, and a cancelled backup leaves no
+/// `pg_dump.exe` running.
+#[tokio::test]
+async fn windows_k67_backup_restore_and_cancel() {
+    if !testing::k67_runner() {
+        return;
+    }
+    let mut params = testing::params(Engine::Postgres);
+    params.database = Some("kerno_test_k67".into());
+    let session = common::connect(&params).await.expect("connect");
+    let cleanup = ["DROP DATABASE IF EXISTS kerno_test_k67_restore WITH (FORCE)".to_string()];
+    cleaning_up(&session, &cleanup, windows_k67(params)).await;
+}
+
+async fn windows_k67(params: ConnectParams) {
+    let detected = tools::detect_clients(&tools::ClientRoots::system(Vec::new()));
+    let wanted = tools::ClientWanted {
+        engine: Engine::Postgres,
+        connection_dir: None,
+        default_dir: None,
+    };
+    let install = tools::client_for(&detected, &wanted)
+        .expect("a PostgreSQL client")
+        .install;
+    eprintln!(
+        "K67 client: {} in {}",
+        install.label(),
+        install.dir.display()
+    );
+    let pg_dump = install.path(Tool::PgDump).expect("pg_dump.exe");
+    let backup = |path: &Path| {
+        tools::backup_command(
+            pg_dump,
+            &params,
+            &BackupOptions::new(Engine::Postgres, "kerno_test_k67"),
+            path,
+        )
+        .unwrap()
+    };
+    let files = tempfile::tempdir().unwrap();
+
+    let dump = files.path().join("k67.dump");
+    let log = run_ok(backup(&dump)).await;
+    assert!(
+        log.iter().any(|line| line.contains("k67_items")),
+        "{log:#?}"
+    );
+    let size = std::fs::metadata(&dump).unwrap().len();
+    assert!(size > 0);
+    eprintln!(
+        "K67 backup: pg_dump.exe wrote {size} bytes to {}",
+        dump.display()
+    );
+
+    let session = common::connect(&params).await.expect("connect");
+    exec_ok(&session, "CREATE DATABASE kerno_test_k67_restore").await;
+    let restore = tools::restore_command(
+        install.path(Tool::PgRestore).expect("pg_restore.exe"),
+        &params,
+        &RestoreOptions::new(
+            Engine::Postgres,
+            "kerno_test_k67_restore",
+            dump,
+            BackupFormat::Custom,
+        ),
+    )
+    .unwrap();
+    run_ok(restore).await;
+    let copy = common::connect(&ConnectParams {
+        database: Some("kerno_test_k67_restore".into()),
+        ..params.clone()
+    })
+    .await
+    .expect("connect to the copy");
+    let back = rows(&copy, "SELECT id::text, label FROM k67_items ORDER BY id").await;
+    copy.close().await;
+    let expected: Vec<Vec<Option<String>>> = [("1", "one"), ("2", "two"), ("3", "three")]
+        .map(|(id, label)| vec![Some(id.into()), Some(label.into())])
+        .into();
+    assert_eq!(back, expected);
+    eprintln!(
+        "K67 restore: pg_restore.exe gave back {} rows of k67_items in kerno_test_k67_restore: \
+         {back:?}",
+        back.len()
+    );
+
+    // A lock held here makes pg_dump wait, so the cancel stops a live process.
+    exec_ok(&session, "BEGIN").await;
+    exec_ok(&session, "LOCK TABLE k67_items IN ACCESS EXCLUSIVE MODE").await;
+    assert_eq!(testing::processes_named("pg_dump.exe"), 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let running = tokio::spawn(tools::run(
+        backup(&files.path().join("cancelled.dump")),
+        |line| eprintln!("  | {line}"),
+        cancel.clone(),
+    ));
+    let mut before = 0;
+    for _ in 0..120 {
+        before = testing::processes_named("pg_dump.exe");
+        if before > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(before, 1, "pg_dump.exe never showed in tasklist");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!running.is_finished(), "pg_dump should wait on the lock");
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = running.await.unwrap();
+    assert!(
+        matches!(outcome, Err(kerno_core::Error::Cancelled)),
+        "{outcome:?}"
+    );
+    let after = testing::processes_named("pg_dump.exe");
+    eprintln!("K67 cancel: tasklist listed {before} pg_dump.exe before the cancel, {after} after");
+    assert_eq!(after, 0);
+    exec_ok(&session, "ROLLBACK").await;
+    session.close().await;
+}

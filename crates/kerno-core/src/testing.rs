@@ -401,6 +401,34 @@ pub fn password_file(dir: &std::path::Path, name: &str, text: &str, mode: u32) {
         .expect("set the password file's permissions");
 }
 
+/// Whether this is the Windows runner of the K67 probe workflow
+/// (`.github/workflows/windows-probe.yml` on the branch `windows`), which
+/// sets `KERNO_K67_RUNNER` after starting its own PostgreSQL and MySQL on the
+/// test containers' ports. Elsewhere, prints why and answers `false`: the
+/// tests that need it never run on a developer's Windows by accident.
+pub fn k67_runner() -> bool {
+    let runner = cfg!(windows) && std::env::var_os("KERNO_K67_RUNNER").is_some();
+    if !runner {
+        eprintln!("SKIPPED: runs only on the Windows runner of the K67 probe (KERNO_K67_RUNNER)");
+    }
+    runner
+}
+
+/// Windows: how many processes run the program `image` (`pg_dump.exe`),
+/// as `tasklist` lists them.
+pub fn processes_named(image: &str) -> usize {
+    let filter = format!("IMAGENAME eq {image}");
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", filter.as_str(), "/NH", "/FO", "CSV"])
+        .output()
+        .expect("run tasklist");
+    let quoted = format!("\"{}\"", image.to_ascii_lowercase());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with(&quoted))
+        .count()
+}
+
 /// What a [`Proxy`] does with the traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {

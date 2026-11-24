@@ -20,6 +20,7 @@ pub mod export;
 pub mod export_file;
 pub mod find;
 pub mod format;
+pub mod home;
 pub mod import;
 pub mod instance;
 pub mod links;

@@ -353,8 +353,7 @@ fn start(
         // The built-in client reads the user's own known_hosts, never writes
         // it (OpenSSH connections use OpenSSH's, see D-056): keys Kerno
         // learns go to its own file.
-        let user_known_hosts = std::env::var_os("HOME")
-            .map(|home| std::path::PathBuf::from(home).join(".ssh/known_hosts"));
+        let user_known_hosts = kerno_core::home::known_hosts();
         let drivers = Drivers::default()
             .with(kerno_postgres::PostgresDriver)
             .with(kerno_mysql::MysqlDriver)
@@ -362,9 +361,7 @@ fn start(
         // The system's OpenSSH (J2); `KERNO_SSH_CONFIG` names another file.
         let openssh = kerno_core::openssh::OpenSshEnv::detect(
             std::env::var_os("PATH").as_deref(),
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .as_deref(),
+            kerno_core::home::dir().as_deref(),
             std::env::var_os("KERNO_SSH_CONFIG").map(std::path::PathBuf::from),
             std::env::current_exe().unwrap_or_else(|_| "kerno".into()),
         );
@@ -372,10 +369,10 @@ fn start(
             let mut connections = Connections::new(connections, drivers, user_known_hosts);
             connections.set_openssh(openssh);
             // Password files and commands (J3): the user's PATH (plus
-            // Homebrew's), HOME and PGPASSFILE, read once here.
+            // Homebrew's), the home and PGPASSFILE, read once here.
             connections.set_password_env(Some(kerno_core::password::PasswordEnv::detect(
                 std::env::var_os("PATH").as_deref(),
-                std::env::var_os("HOME").map(std::path::PathBuf::from),
+                kerno_core::home::dir(),
                 std::env::var_os("PGPASSFILE").map(std::path::PathBuf::from),
             )));
             connections

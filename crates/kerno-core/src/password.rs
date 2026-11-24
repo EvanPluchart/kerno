@@ -22,16 +22,19 @@ use crate::config::{ConnectionConfig, Engine, PasswordSource, Secret};
 use crate::error::{Error, Result};
 
 /// What the password readers and commands see of the user's environment,
-/// built once by the app (tests pass a temporary directory: `HOME`, `PATH`
-/// and `PGPASSFILE` are never read here).
+/// built once by the app (tests pass a temporary directory: the home,
+/// `PATH` and `PGPASSFILE` are never read here).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PasswordEnv {
     /// Directories a command's program is looked for in, in order; also the
     /// command's `PATH`.
     pub path: Vec<PathBuf>,
-    /// The home directory: `~/.pgpass`, `~/.my.cnf`, a program's `~/`.
+    /// The home directory ([`crate::home`]): `~/.pgpass` and `~/.my.cnf` on
+    /// Unix, a program's `~/`.
     pub home: Option<PathBuf>,
-    /// `PGPASSFILE`, which replaces `~/.pgpass`.
+    /// The PostgreSQL password file when it is not `~/.pgpass`: `PGPASSFILE`,
+    /// or on Windows libpq's `%APPDATA%\postgresql\pgpass.conf`
+    /// ([`crate::home::pgpassfile`]).
     pub pgpassfile: Option<PathBuf>,
 }
 
@@ -57,7 +60,8 @@ pub(crate) const IGNORED: &str = " was ignored: ";
 
 impl PasswordEnv {
     /// The environment of the running app: `path` is the `PATH` variable,
-    /// to which the usual directories are added.
+    /// to which the usual directories are added; `pgpassfile` is
+    /// `PGPASSFILE`, or libpq's file on Windows when it is not set.
     pub fn detect(
         path: Option<&OsStr>,
         home: Option<PathBuf>,
@@ -77,31 +81,20 @@ impl PasswordEnv {
         Self {
             path: dirs,
             home,
-            pgpassfile,
+            pgpassfile: crate::home::pgpassfile(pgpassfile),
         }
     }
 
     /// `path` as the user writes it: `~/…` under the home directory.
     pub fn display(&self, path: &Path) -> String {
-        match self
-            .home
-            .as_deref()
-            .and_then(|home| path.strip_prefix(home).ok())
-        {
-            Some(rest) => format!("~/{}", rest.display()),
-            None => path.display().to_string(),
-        }
+        crate::home::display(path, self.home.as_deref())
     }
 
     /// The program a command names: a path (`~/` expanded), or the first
     /// executable file of that name in [`PasswordEnv::path`].
     fn find(&self, program: &str) -> Option<PathBuf> {
-        if program.contains('/') {
-            let path = match (program.strip_prefix("~/"), &self.home) {
-                (Some(rest), Some(home)) => home.join(rest),
-                _ => PathBuf::from(program),
-            };
-            return Some(path);
+        if program.contains(std::path::is_separator) {
+            return Some(crate::home::expand(program, self.home.as_deref()));
         }
         self.path
             .iter()
@@ -514,16 +507,25 @@ pub async fn resolve(
             warning: None,
         });
     }
-    let (Some(env), Some(home)) = (env, env.and_then(|env| env.home.as_ref())) else {
+    let Some(env) = env else {
         return Ok(Resolved::default());
     };
+    // `~/.pgpass` and `~/.my.cnf` are Unix files. On Windows libpq reads
+    // `pgpassfile` (`%APPDATA%`), and MySQL has no per-user option file but
+    // the encrypted `.mylogin.cnf`, which Kerno does not read (D-136).
+    let in_home = |name: &str| {
+        env.home
+            .as_deref()
+            .filter(|_| cfg!(unix))
+            .map(|home| home.join(name))
+    };
     let file = match config.engine {
-        Engine::Postgres => env
-            .pgpassfile
-            .clone()
-            .unwrap_or_else(|| home.join(".pgpass")),
-        Engine::MySql | Engine::MariaDb => home.join(".my.cnf"),
-        Engine::Sqlite => return Ok(Resolved::default()),
+        Engine::Postgres => env.pgpassfile.clone().or_else(|| in_home(".pgpass")),
+        Engine::MySql | Engine::MariaDb => in_home(".my.cnf"),
+        Engine::Sqlite => None,
+    };
+    let Some(file) = file else {
+        return Ok(Resolved::default());
     };
     let text = match read_file(&file, env, config.engine).await {
         Ok(Some(text)) => text,
@@ -975,5 +977,50 @@ mod tests {
         );
         assert_eq!(env.display(Path::new("/home/ada/.pgpass")), "~/.pgpass");
         assert_eq!(env.display(Path::new("/etc/x")), "/etc/x");
+    }
+
+    /// K67, D-136: `~/.pgpass` and `~/.my.cnf` are read on Unix only; the
+    /// password file libpq names (`PGPASSFILE`, `%APPDATA%` on Windows) on
+    /// every system, also without a home.
+    #[tokio::test]
+    async fn the_home_files_are_unix_ones_and_pgpassfile_is_read_everywhere() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            crate::private::file_options()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(text.as_bytes()))
+                .unwrap();
+            path
+        };
+        write(".pgpass", "*:*:*:*:from-home\n");
+        write(".my.cnf", "[client]\npassword=from-home\n");
+        let pgpass = write("pgpass.conf", "*:*:*:*:from-pgpassfile\n");
+        let home = PasswordEnv {
+            path: Vec::new(),
+            home: Some(dir.path().to_path_buf()),
+            pgpassfile: None,
+        };
+        for engine in [Engine::Postgres, Engine::MySql] {
+            let config = ConnectionConfig::new(engine);
+            let resolved = resolve(&config, None, None, Some(&home)).await.unwrap();
+            assert_eq!(
+                resolved.password.map(|p| p.expose().to_string()),
+                cfg!(unix).then(|| "from-home".to_string()),
+                "{engine:?}"
+            );
+            assert!(resolved.warning.is_none(), "{:?}", resolved.warning);
+        }
+        let named = PasswordEnv {
+            home: None,
+            pgpassfile: Some(pgpass),
+            ..home
+        };
+        let config = ConnectionConfig::new(Engine::Postgres);
+        let resolved = resolve(&config, None, None, Some(&named)).await.unwrap();
+        assert_eq!(resolved.password.unwrap().expose(), "from-pgpassfile");
     }
 }

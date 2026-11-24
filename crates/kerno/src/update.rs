@@ -44,9 +44,10 @@ pub struct System;
 
 impl Runner for System {
     fn output(&self, program: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {
-        let output = std::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
+        let mut command = std::process::Command::new(program);
+        command.args(args).stdin(std::process::Stdio::null());
+        kerno_core::tools::no_console(&mut command);
+        let output = command
             .output()
             .map_err(|error| format!("{} could not run: {error}", program.display()))?;
         if output.status.success() {
@@ -81,8 +82,36 @@ fn program(places: &[&str]) -> PathBuf {
     PathBuf::from(found.or(places.first()).copied().unwrap_or_default())
 }
 
+#[cfg(not(windows))]
 fn curl() -> PathBuf {
     program(&["/usr/bin/curl", "/bin/curl"])
+}
+
+/// Windows 10 1803 and later ship `curl.exe` in `System32`: that one, found through `SystemRoot`
+/// and never through `PATH`, the current folder or the application's, where a `curl.exe` put
+/// earlier would be run instead (K67, D-136). Missing (an older Windows), running it fails and
+/// the check says nothing, as offline; as on Unix, never a bare name.
+#[cfg(windows)]
+fn curl() -> PathBuf {
+    windows_curl(std::env::var("SystemRoot").ok().as_deref())
+}
+
+/// `<system_root>\System32\curl.exe`, `system_root` taken only when it is a drive's absolute path
+/// (`C:\Windows`), else `C:\Windows`: always an absolute path.
+#[cfg(any(windows, test))]
+fn windows_curl(system_root: Option<&str>) -> PathBuf {
+    let absolute = |root: &&str| {
+        let bytes = root.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+    };
+    let root = system_root.filter(absolute).unwrap_or(r"C:\Windows");
+    PathBuf::from(format!(
+        r"{}\System32\curl.exe",
+        root.trim_end_matches(['\\', '/'])
+    ))
 }
 
 fn tar() -> PathBuf {
@@ -711,7 +740,7 @@ pub mod tests {
         assert_eq!(calls.len(), 3);
         let (program, args) = &calls[0];
         assert!(
-            program.is_absolute() && program.ends_with("curl"),
+            program.is_absolute() && program.file_stem() == Some(std::ffi::OsStr::new("curl")),
             "{program:?}"
         );
         let expected: Vec<String> = releases::check_args("0.1.0")
@@ -1081,6 +1110,24 @@ pub mod tests {
         assert!(pass(&mut updates, TICK, TICK));
     }
 
+    /// K67: on Windows the check runs `System32\curl.exe` by its absolute path, whatever
+    /// `SystemRoot` says: never a bare name, which Windows would look for in the current folder
+    /// and on `PATH`.
+    #[test]
+    fn windows_curl_is_always_system32_s_by_an_absolute_path() {
+        for (root, expected) in [
+            (Some(r"C:\Windows"), r"C:\Windows\System32\curl.exe"),
+            (Some(r"D:\WINNT\"), r"D:\WINNT\System32\curl.exe"),
+            (Some(""), r"C:\Windows\System32\curl.exe"),
+            (Some(r"Windows"), r"C:\Windows\System32\curl.exe"),
+            (Some(r"..\x"), r"C:\Windows\System32\curl.exe"),
+            (Some(r"\\host\share"), r"C:\Windows\System32\curl.exe"),
+            (None, r"C:\Windows\System32\curl.exe"),
+        ] {
+            assert_eq!(windows_curl(root), PathBuf::from(expected), "{root:?}");
+        }
+    }
+
     #[test]
     fn the_environment_switches_and_a_test_build_make_no_updater() {
         assert!(!switched_off(|_| false));
@@ -1089,5 +1136,25 @@ pub mod tests {
         assert!(!switched_off(|name| name == "KERNO_NO_UPDATE"));
         // Whatever the environment says, a test build never makes the real one.
         assert!(for_this_run(|_| false, None).is_none());
+    }
+
+    /// K67 (D-136), on the Windows runner of the probe workflow only: the check, as the app runs
+    /// it, through Windows' own `curl.exe`, finds a release at least as new as 2026.11.3, the
+    /// first with a Windows zip. The one request this test makes is the app's own.
+    #[test]
+    fn windows_k67_the_check_finds_the_latest_release_with_system32_curl() {
+        if !kerno_core::testing::k67_runner() {
+            return;
+        }
+        let system32 = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("curl.exe");
+        assert_eq!(curl(), system32);
+        assert_eq!(curl(), windows_curl(Some(r"C:\Windows")));
+        let latest = check(&System, "0.0.1")
+            .expect("GitHub answered")
+            .expect("a release");
+        assert!(latest >= v("2026.11.3"), "{latest}");
+        eprintln!("K67 update check: {} found {latest}", curl().display());
     }
 }

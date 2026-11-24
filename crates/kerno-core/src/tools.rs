@@ -200,6 +200,14 @@ impl ClientFamily {
     /// was found.
     pub fn install_hint(self) -> &'static str {
         match self {
+            Self::Postgres if cfg!(windows) => {
+                "with PostgreSQL's installer for Windows (EDB's), which puts them in Program \
+                 Files"
+            }
+            Self::MySql if cfg!(windows) => {
+                "with the MySQL Server or MariaDB installer for Windows, which puts them in \
+                 Program Files"
+            }
             Self::Postgres => {
                 "with “brew install libpq” on macOS, or the postgresql-client package of the \
                  Linux distribution"
@@ -225,6 +233,8 @@ pub enum ClientSource {
     Edb,
     /// A distribution package (`/usr/lib/postgresql/<n>/bin`).
     Linux,
+    /// Windows: the MySQL or MariaDB installer's folder in `%ProgramFiles%`.
+    ProgramFiles,
     /// A folder of `$PATH` or of [`FALLBACK_DIRS`].
     Path,
 }
@@ -237,6 +247,7 @@ impl ClientSource {
             Self::PostgresApp => "Postgres.app",
             Self::Edb => "EDB installer",
             Self::Linux => "system package",
+            Self::ProgramFiles => "Program Files",
             Self::Path => "PATH",
         }
     }
@@ -296,6 +307,9 @@ pub struct ClientRoots {
     pub edb: Vec<PathBuf>,
     /// `/usr/lib/postgresql`.
     pub linux: Vec<PathBuf>,
+    /// Windows' `%ProgramFiles%`: the MySQL installer's `MySQL\<product>\bin` and MariaDB's
+    /// `MariaDB <X.Y>\bin` (PostgreSQL's installer, EDB's, is in [`ClientRoots::edb`]).
+    pub program_files: Vec<PathBuf>,
     /// Folders looked at after `$PATH` ([`FALLBACK_DIRS`]).
     pub fallbacks: Vec<PathBuf>,
     /// Folders the user added or chose, looked at first.
@@ -304,6 +318,7 @@ pub struct ClientRoots {
 
 impl ClientRoots {
     /// The usual places on this computer, plus `added`.
+    #[cfg(not(windows))]
     pub fn system(added: Vec<PathBuf>) -> Self {
         let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect();
         Self {
@@ -312,8 +327,30 @@ impl ClientRoots {
             postgres_app: paths(&["/Applications/Postgres.app/Contents/Versions"]),
             edb: paths(&["/Library/PostgreSQL"]),
             linux: paths(&["/usr/lib/postgresql"]),
-            fallbacks: paths(&FALLBACK_DIRS),
+            program_files: Vec::new(),
+            fallbacks: paths(FALLBACK_DIRS),
             added,
+        }
+    }
+
+    /// The usual places on this computer, plus `added`: on Windows the installers' folders in
+    /// `%ProgramFiles%` (`PostgreSQL\<n>\bin`, `MySQL\<product>\bin`, `MariaDB <X.Y>\bin`) and
+    /// `PATH`, versions read from the folders, never assumed.
+    #[cfg(windows)]
+    pub fn system(added: Vec<PathBuf>) -> Self {
+        let program_files: Vec<PathBuf> = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .into_iter()
+            .collect();
+        Self {
+            path_var: std::env::var_os("PATH"),
+            edb: program_files
+                .iter()
+                .map(|dir| dir.join("PostgreSQL"))
+                .collect(),
+            program_files,
+            added,
+            ..Self::default()
         }
     }
 }
@@ -369,13 +406,28 @@ pub fn detect_clients(roots: &ClientRoots) -> Vec<ClientInstall> {
             );
         }
     }
+    for root in &roots.program_files {
+        let mariadb = subdirs(root).into_iter().filter(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("MariaDB"))
+        });
+        push_all(
+            subdirs(&root.join("MySQL"))
+                .into_iter()
+                .chain(mariadb)
+                .map(|dir| dir.join("bin"))
+                .collect(),
+            ClientSource::ProgramFiles,
+        );
+    }
     let path = roots
         .path_var
         .as_deref()
         .into_iter()
         .flat_map(std::env::split_paths)
         .chain(roots.fallbacks.iter().cloned())
-        .filter(|dir| !dir.as_os_str().is_empty())
+        // A relative entry (`.`) would run a tool of the current folder.
+        .filter(|dir| dir.is_absolute())
         .collect();
     push_all(path, ClientSource::Path);
 
@@ -388,7 +440,7 @@ pub fn detect_clients(roots: &ClientRoots) -> Vec<ClientInstall> {
             };
             // The real folder of the first tool: `/opt/homebrew/bin/pg_dump`
             // is a link into `Cellar/postgresql@14/…/bin`.
-            let real = std::fs::canonicalize(&key).unwrap_or(key);
+            let real = real_path(&key);
             let Some(real_dir) = real.parent().map(Path::to_path_buf) else {
                 continue;
             };
@@ -439,8 +491,29 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
 fn tool_in(dir: &Path, tool: Tool) -> Option<PathBuf> {
     tool.names()
         .iter()
-        .map(|name| dir.join(name))
+        .map(|name| binary(dir, name))
         .find(|path| is_executable(path))
+}
+
+/// The file of the program `name` in `dir`: `pg_dump`, `pg_dump.exe` on Windows.
+fn binary(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// `path` with its links resolved, itself when that fails. On Windows without the `\\?\` that
+/// `canonicalize` puts before a drive letter: the folder is shown to the user, and compared with
+/// folders typed or saved without it.
+pub fn real_path(path: &Path) -> PathBuf {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    if let Some(plain) = real
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| !rest.starts_with(r"UNC\"))
+    {
+        return PathBuf::from(plain);
+    }
+    real
 }
 
 /// Probes one folder chosen by the user: the install it holds for
@@ -472,6 +545,16 @@ impl ClientMissing {
         let Some(family) = self.family else {
             return format!("{NO_CLIENT_TOOLS}.");
         };
+        if cfg!(windows) {
+            return format!(
+                "No {} client was found: Kerno looked in Program Files (the PostgreSQL, MySQL \
+                 and MariaDB installers' folders), PATH and the folders added in Settings ▸ \
+                 Local clients. It is usually installed {}. Then add its folder in Settings ▸ \
+                 Local clients.",
+                family.label(),
+                family.install_hint()
+            );
+        }
         format!(
             "No {} client was found: Kerno looked in Homebrew, Postgres.app, the EDB and Linux \
              package folders, $PATH, {} and the folders added in Settings ▸ Local clients. It is \
@@ -530,7 +613,7 @@ pub fn client_for<'a>(
         .into_iter()
         .flatten()
     {
-        let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let real = real_path(dir);
         match in_family().find(|install| install.dir == real || install.dir == dir) {
             Some(install) => return Ok(ClientPick { install, ignored }),
             None => {
@@ -648,8 +731,10 @@ pub fn compatibility(
 }
 
 /// Where the tools usually are when `$PATH` does not have them (a GUI app on
-/// macOS gets a short `$PATH`).
-pub const FALLBACK_DIRS: [&str; 7] = [
+/// macOS gets a short `$PATH`). None on Windows, whose installers' folders are
+/// [`ClientRoots::system`]'s.
+#[cfg(not(windows))]
+pub const FALLBACK_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/opt/homebrew/opt/libpq/bin",
@@ -658,6 +743,12 @@ pub const FALLBACK_DIRS: [&str; 7] = [
     "/Applications/Postgres.app/Contents/Versions/latest/bin",
     "/usr/bin",
 ];
+
+/// Where the tools usually are when `$PATH` does not have them (a GUI app on
+/// macOS gets a short `$PATH`). None on Windows, whose installers' folders are
+/// [`ClientRoots::system`]'s.
+#[cfg(windows)]
+pub const FALLBACK_DIRS: &[&str] = &[];
 
 /// The installed binary of `tool`: the first match in `$PATH`, then in the
 /// usual install directories.
@@ -690,8 +781,9 @@ pub fn find_all_in(tool: Tool, path_var: Option<&OsStr>, fallbacks: &[PathBuf]) 
     let mut seen = std::collections::HashSet::new();
     from_path
         .chain(fallbacks.iter().cloned())
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .flat_map(|dir| tool.names().iter().map(move |name| dir.join(name)))
+        // A relative entry (`.`) would run a tool of the current folder.
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| tool.names().iter().map(move |name| binary(&dir, name)))
         .filter(|candidate| is_executable(candidate))
         .filter(|candidate| {
             seen.insert(std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone()))
@@ -732,11 +824,10 @@ pub struct ToolVersion {
 /// (blocking: call it off the UI thread). `None` when it does not run or
 /// prints no version.
 pub fn version(path: &Path) -> Option<ToolVersion> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(path);
+    command.arg("--version").stdin(Stdio::null());
+    no_console(&mut command);
+    let output = command.output().ok()?;
     parse_version(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -2371,10 +2462,27 @@ fn positional(name: &str) -> Result<String> {
 /// Whether an environment variable is read by libpq or the MySQL / MariaDB
 /// clients.
 fn is_database_variable(name: &OsStr) -> bool {
-    let name = name.to_string_lossy();
+    let mut name = name.to_string_lossy().into_owned();
+    // Windows' names have no case: `PgHost` is read as `PGHOST`.
+    if cfg!(windows) {
+        name.make_ascii_uppercase();
+    }
     ["PG", "MYSQL", "MARIADB"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
+}
+
+/// Windows: the child gets no console window. A release Kerno is a windowed program with no
+/// console to share, so Windows would open one for each console program it starts
+/// (`CREATE_NO_WINDOW`). Nothing on other systems.
+pub fn no_console(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// How often [`run`] looks at its cancel flag.
@@ -2403,6 +2511,7 @@ pub async fn run(
     }
     let mut child = tokio::process::Command::new(&command.program);
     child.args(&args).kill_on_drop(true);
+    no_console(child.as_std_mut());
     // Inherited libpq / MySQL variables (PGHOST, PGSERVICE, MYSQL_HOST...)
     // could send the tool to another server.
     for (name, _) in std::env::vars_os().filter(|(name, _)| is_database_variable(name)) {
@@ -4864,6 +4973,7 @@ mod tests {
             postgres_app: vec![app],
             edb: vec![edb],
             linux: vec![root.join("usr/lib/postgresql")],
+            program_files: Vec::new(),
             fallbacks: vec![pg18.clone()],
             added: vec![added.clone()],
         };
@@ -5015,6 +5125,106 @@ mod tests {
             }
             .text()
             .contains("brew install mysql-client")
+        );
+    }
+
+    /// K67: a relative folder of `PATH` (`.`, `bin`) names a folder of the
+    /// current directory: a tool there is never found, by `find` or by
+    /// detection, so none planted where Kerno starts can run.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let bin = root.join("bin");
+        fake_install(&bin, ClientFamily::Postgres, "pg_dump (PostgreSQL) 17.12");
+        // The same folder, relative to the current directory.
+        let up = std::env::current_dir().unwrap().components().count() - 1;
+        let relative: PathBuf = std::iter::repeat_n(Path::new(".."), up)
+            .collect::<PathBuf>()
+            .join(bin.strip_prefix("/").unwrap());
+        assert!(relative.join("pg_dump").is_file());
+        let path_var = std::env::join_paths([&relative]).unwrap();
+        assert_eq!(
+            find_all_in(Tool::PgDump, Some(&path_var), &[]),
+            Vec::<PathBuf>::new()
+        );
+        let roots = ClientRoots {
+            path_var: Some(path_var),
+            ..ClientRoots::default()
+        };
+        assert_eq!(detect_clients(&roots), Vec::new());
+        // The absolute one is.
+        assert_eq!(
+            find_all_in(Tool::PgDump, None, std::slice::from_ref(&bin)),
+            [bin.join("pg_dump")]
+        );
+    }
+
+    /// K67: Windows' installers put MySQL in `MySQL\<product>\bin` and
+    /// MariaDB in `MariaDB <X.Y>\bin` under `%ProgramFiles%`; PostgreSQL's
+    /// (EDB's) is [`ClientRoots::edb`]. The same folder reached through
+    /// `PATH` (by another name: Windows' short names) is kept once, as an
+    /// installer's.
+    #[cfg(unix)]
+    #[test]
+    fn the_windows_installers_folders_are_read_not_assumed() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let program_files = root.join("Program Files");
+        let mysql = program_files.join("MySQL/MySQL Server 8.4/bin");
+        fake_install(
+            &mysql,
+            ClientFamily::MySql,
+            "mysqldump  Ver 8.4.13 for Win64 on x86_64 (MySQL Community Server - GPL)",
+        );
+        let mariadb = program_files.join("MariaDB 11.4/bin");
+        versioned_tool(
+            &mariadb,
+            "mariadb-dump",
+            "mariadb-dump from 11.4.5-MariaDB, client 10.19 for Win64 (AMD64)",
+        );
+        let postgres = program_files.join("PostgreSQL/17/bin");
+        fake_install(
+            &postgres,
+            ClientFamily::Postgres,
+            "pg_dump (PostgreSQL) 17.12",
+        );
+        // Another program's folder: never looked at.
+        versioned_tool(
+            &program_files.join("Other/bin"),
+            "mysqldump",
+            "mysqldump  Ver 99.0",
+        );
+        let short = root.join("PROGRA~1");
+        std::os::unix::fs::symlink(&program_files, &short).unwrap();
+        let roots = ClientRoots {
+            path_var: Some(
+                std::env::join_paths([short.join("MySQL/MySQL Server 8.4/bin")]).unwrap(),
+            ),
+            edb: vec![program_files.join("PostgreSQL")],
+            program_files: vec![program_files.clone()],
+            ..ClientRoots::default()
+        };
+        type Row = (PathBuf, ClientSource, Option<(u32, u32, u32)>);
+        let found: Vec<Row> = detect_clients(&roots)
+            .into_iter()
+            .map(|install| {
+                (
+                    install.dir,
+                    install.source,
+                    install.version.map(|v| v.number),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (postgres, ClientSource::Edb, Some((17, 12, 0))),
+                // Newest first.
+                (mariadb, ClientSource::ProgramFiles, Some((11, 4, 5))),
+                (mysql, ClientSource::ProgramFiles, Some((8, 4, 13))),
+            ]
         );
     }
 

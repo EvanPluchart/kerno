@@ -449,3 +449,135 @@ async fn a_file_with_client_commands_runs_nothing() {
             .unwrap();
     }
 }
+
+/// K67 (D-136), on the Windows runner of the probe workflow only, whose
+/// MySQL 8.4 listens where the container does and holds `kerno_test_k67`:
+/// Kerno's own chain (the client detected in Program Files, the one
+/// `client_for` picks, `backup_command`, `restore_command`, `run`) backs the
+/// database up with `mysqldump.exe`, restores it with `mysql.exe` into a
+/// scratch database, and a cancelled backup leaves no `mysqldump.exe`
+/// running. Over TLS (the server's own certificate), so that
+/// `caching_sha2_password` needs no password cached by an earlier login.
+#[tokio::test]
+async fn windows_k67_backup_restore_and_cancel() {
+    if !testing::k67_runner() {
+        return;
+    }
+    let mut params = testing::params(Engine::MySql);
+    params.database = Some("kerno_test_k67".into());
+    params.tls.mode = kerno_core::TlsMode::Require;
+    let session = common::connect(&params).await.expect("connect");
+    let drop = "DROP DATABASE IF EXISTS kerno_test_k67_restore";
+    exec_ok(&session, drop).await;
+    let outcome = tokio::spawn(windows_k67(params)).await;
+    let cleanup = run(&session, drop).await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    cleanup.unwrap_or_else(|error| panic!("{drop}: {error}"));
+}
+
+async fn windows_k67(params: kerno_core::ConnectParams) {
+    let detected = tools::detect_clients(&tools::ClientRoots::system(Vec::new()));
+    let wanted = tools::ClientWanted {
+        engine: Engine::MySql,
+        connection_dir: None,
+        default_dir: None,
+    };
+    let install = tools::client_for(&detected, &wanted)
+        .expect("a MySQL client")
+        .install;
+    eprintln!(
+        "K67 client: {} in {}",
+        install.label(),
+        install.dir.display()
+    );
+    let mysqldump = install.path(Tool::MysqlDump).expect("mysqldump.exe");
+    let backup = |path: &Path| {
+        tools::backup_command(
+            mysqldump,
+            &params,
+            &BackupOptions::new(Engine::MySql, "kerno_test_k67"),
+            path,
+        )
+        .unwrap()
+    };
+    let files = tempfile::tempdir().unwrap();
+
+    let dump = files.path().join("k67.sql");
+    run_ok(backup(&dump)).await;
+    let size = std::fs::metadata(&dump).unwrap().len();
+    let text = std::fs::read_to_string(&dump).unwrap();
+    assert!(text.contains("CREATE TABLE `k67_items`"), "{text}");
+    eprintln!(
+        "K67 backup: mysqldump.exe wrote {size} bytes to {}",
+        dump.display()
+    );
+
+    let session = common::connect(&params).await.expect("connect");
+    exec_ok(&session, "CREATE DATABASE kerno_test_k67_restore").await;
+    let restore = tools::restore_command(
+        install.path(Tool::Mysql).expect("mysql.exe"),
+        &params,
+        &RestoreOptions {
+            allow_client_commands: false,
+            tool_version: install.version.clone(),
+            ..RestoreOptions::new(
+                Engine::MySql,
+                "kerno_test_k67_restore",
+                dump,
+                BackupFormat::Sql,
+            )
+        },
+    )
+    .unwrap();
+    run_ok(restore).await;
+    let back = rows(
+        &session,
+        "SELECT id, label FROM kerno_test_k67_restore.k67_items ORDER BY id",
+    )
+    .await;
+    let expected: Vec<Vec<Option<String>>> = [("1", "one"), ("2", "two"), ("3", "three")]
+        .map(|(id, label)| vec![Some(id.into()), Some(label.into())])
+        .into();
+    assert_eq!(back, expected);
+    eprintln!(
+        "K67 restore: mysql.exe gave back {} rows of k67_items in kerno_test_k67_restore: \
+         {back:?}",
+        back.len()
+    );
+
+    // A lock held here makes mysqldump wait, so the cancel stops a live process.
+    exec_ok(&session, "LOCK TABLES k67_items WRITE").await;
+    assert_eq!(testing::processes_named("mysqldump.exe"), 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let running = tokio::spawn(tools::run(
+        backup(&files.path().join("cancelled.sql")),
+        |line| eprintln!("  | {line}"),
+        cancel.clone(),
+    ));
+    let mut before = 0;
+    for _ in 0..120 {
+        before = testing::processes_named("mysqldump.exe");
+        if before > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(before, 1, "mysqldump.exe never showed in tasklist");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!running.is_finished(), "mysqldump should wait on the lock");
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = running.await.unwrap();
+    assert!(
+        matches!(outcome, Err(kerno_core::Error::Cancelled)),
+        "{outcome:?}"
+    );
+    let after = testing::processes_named("mysqldump.exe");
+    eprintln!(
+        "K67 cancel: tasklist listed {before} mysqldump.exe before the cancel, {after} after"
+    );
+    assert_eq!(after, 0);
+    exec_ok(&session, "UNLOCK TABLES").await;
+    session.close().await;
+}

@@ -102,10 +102,9 @@ impl LocalClientsView {
 
     fn remove_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         AppState::update_settings(cx, |settings| {
-            settings.client_folders.retain(|added| {
-                std::fs::canonicalize(added).unwrap_or_else(|_| added.clone()) != dir
-                    && *added != dir
-            });
+            settings
+                .client_folders
+                .retain(|added| tools::real_path(added) != dir && *added != dir);
             settings
                 .default_clients
                 .retain(|_, default| *default != dir);
@@ -298,11 +297,14 @@ impl Render for LocalClientsView {
             .id("local-clients")
             .test_support()
             .gap_3()
-            .child(div().text_xs().text_color(muted).child(
+            .child(div().text_xs().text_color(muted).child(if cfg!(windows) {
+                "The client tools backup, restore and Execute script run. Found in Program \
+                     Files (the PostgreSQL, MySQL and MariaDB installers' folders) and PATH."
+            } else {
                 "The client tools backup, restore and Execute script run. Found in Homebrew \
                      (every installed version), Postgres.app, the EDB and Linux package folders \
-                     and $PATH.",
-            ))
+                     and $PATH."
+            }))
             .child(
                 div()
                     .id("override-local-clients")

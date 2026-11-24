@@ -807,12 +807,9 @@ impl ConnectionForm {
     }
 }
 
-/// Expands a leading `~/` to the home directory.
+/// Expands a leading `~/` (`~\` too on Windows) to the home directory.
 pub(crate) fn expand_home(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(path),
-    }
+    kerno_core::home::expand(path, kerno_core::home::dir().as_deref())
 }
 
 #[cfg(test)]

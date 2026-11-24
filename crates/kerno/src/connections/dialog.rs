@@ -471,7 +471,7 @@ impl ConnectionDialog {
             ssh_aliases: Vec::new(),
             loading_aliases: openssh.and_then(|env| {
                 let file = env.aliases_from?;
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let home = kerno_core::home::dir();
                 let reading = crate::bridge::spawn_blocking(cx, move || {
                     kerno_core::openssh::host_aliases(&file, home.as_deref())
                 });
@@ -1464,19 +1464,26 @@ impl ConnectionDialog {
                 .child(text.clone())
                 .test_text(text)
         };
+        // Windows: libpq's file is in %APPDATA%, and MySQL has no per-user
+        // option file there that Kerno reads (D-136).
         let file = match self.form.engine {
-            Engine::Postgres => "~/.pgpass",
-            Engine::MySql | Engine::MariaDb => "~/.my.cnf",
+            Engine::Postgres if cfg!(windows) => Some(r"%APPDATA%\postgresql\pgpass.conf"),
+            Engine::Postgres => Some("~/.pgpass"),
+            Engine::MySql | Engine::MariaDb if cfg!(windows) => None,
+            Engine::MySql | Engine::MariaDb => Some("~/.my.cnf"),
             // Not drawn for a database file, which has no password.
-            Engine::Sqlite => "",
+            Engine::Sqlite => None,
         };
         let fields = match choice {
             PasswordChoice::Keychain => note(
                 "conn-password-hint",
-                format!(
-                    "Left empty, Kerno reads {file}, as the {} tools do.",
-                    self.form.engine.label()
-                ),
+                match file {
+                    Some(file) => format!(
+                        "Left empty, Kerno reads {file}, as the {} tools do.",
+                        self.form.engine.label()
+                    ),
+                    None => "Left empty, Kerno connects without a password.".into(),
+                },
                 muted,
             )
             .into_any_element(),

@@ -556,9 +556,7 @@ impl BackupDialog {
             meta,
             family,
         } = opening;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let home = kerno_core::home::dir().unwrap_or_default();
         let global = GlobalBackupOptions::default();
         let pattern_default = match mode {
             Mode::GlobalBackup => global.file_pattern.clone(),
@@ -726,8 +724,7 @@ impl BackupDialog {
         // The host key was trusted when the connection was opened: in the
         // user's own known_hosts (read, never written by the built-in client;
         // OpenSSH checks its own) or in Kerno's.
-        let known_hosts: Vec<PathBuf> = std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".ssh/known_hosts"))
+        let known_hosts: Vec<PathBuf> = kerno_core::home::known_hosts()
             .into_iter()
             .chain([AppState::get(cx).paths.known_hosts()])
             .collect();
@@ -2993,12 +2990,13 @@ fn examine(job: Job) -> Examined {
 /// A PostgreSQL archive's list, as `pg_restore --list` prints it with the
 /// archive's own pg_restore; `None` when it could not be read. Blocking.
 fn archive_list(pg_restore: &Path, archive: &Path) -> Option<String> {
-    let output = std::process::Command::new(pg_restore)
+    let mut command = std::process::Command::new(pg_restore);
+    command
         .arg("--list")
         .arg(archive)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .stdin(std::process::Stdio::null());
+    tools::no_console(&mut command);
+    let output = command.output().ok()?;
     output
         .status
         .success()

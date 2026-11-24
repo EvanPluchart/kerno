@@ -93,6 +93,6 @@ fn start_folder(folders: [Option<PathBuf>; 2]) -> PathBuf {
         .into_iter()
         .flatten()
         .find(|folder| folder.is_absolute() && folder.is_dir())
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(kerno_core::home::dir)
         .unwrap_or_default()
 }

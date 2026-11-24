@@ -587,9 +587,7 @@ fn a_tested_password_says_where_it_really_came_from(cx: &mut TestAppContext) {
 /// again once that folder is gone; another kind keeps to its own.
 #[gpui_kit::test]
 fn each_save_panel_opens_where_its_kind_last_saved(cx: &mut TestAppContext) {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
+    let home = kerno_core::home::dir().unwrap_or_default();
     let dir = tempfile::tempdir().unwrap();
     let folder = std::fs::canonicalize(dir.path()).unwrap().join("exports");
     std::fs::create_dir(&folder).unwrap();

@@ -55,10 +55,10 @@ pub struct AiSources {
 impl Global for AiSources {}
 
 impl AiSources {
-    /// This computer's: `HOME`, the process's environment, the usual local ports.
+    /// This computer's: the home folder, the process's environment, the usual local ports.
     pub fn of_this_computer() -> Self {
         Self {
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: kerno_core::home::dir(),
             env: None,
             ports: endpoints::LOCAL_SERVERS
                 .iter()
