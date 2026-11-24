@@ -80,7 +80,8 @@ connection dialog, Settings). A preview until the list below is done. Next, in o
    (D-136), and the start-failure page's advice (it says "Set HOME").
 4. Done (K70, D-139): an installer for the user's account (Inno Setup) and the update installed from the app,
    proved on GitHub's runner; a standard user's update on a real Windows is still to be tried by a person.
-5. The system OpenSSH tunnel (a loopback TCP forward and the askpass questions on a named pipe), Pageant.
+5. Pageant for the agent. (The system OpenSSH tunnel is done, K69, D-138: one `ssh.exe -W` per stream, the
+   askpass questions on a proved named pipe, no file of another computer opened.)
 
 ## The AI assistant, next (agreed with the owner, 2026-11-23)
 

@@ -5232,3 +5232,88 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
     "Release page", as the notice says (on every system: before, it went back to "Update" and offered the
     same failure again); a check asked for offers it again and closes the notice. A download folder older
     than 7 days goes whatever `tasklist` says, unless it is this process's.
+
+## D-138 — Windows: the tunnel through the system's OpenSSH (K69; 2026-11-24)
+
+The owner's pick "A5": on Windows a connection tunnels through `ssh.exe` as it does through `ssh` on macOS and
+Linux since J2 (D-056). An independent review of the first version found twelve points (K69's R1 to R12 in
+`docs/plans/M12.md`); this is the decision as it stands after them.
+
+**The security model, in one table.**
+
+| What | How it is decided | Who can reach it / what proves it |
+|---|---|---|
+| The `ssh.exe` run | `C:\Windows\System32\OpenSSH\ssh.exe` when `SystemRoot` is exactly `C:\Windows`, then `C:\Program Files\OpenSSH\ssh.exe` when `ProgramFiles` is exactly `C:\Program Files` (`tools::system_program`, `openssh::installed_ssh`); never `PATH` | Folders only administrators change; a value a process of the user's set (before Kerno is started as administrator) is not followed. A Windows installed elsewhere than `C:\Windows` gets no system OpenSSH ("Windows' OpenSSH client is not installed…", the built-in client) |
+| The stream to PostgreSQL | One `ssh.exe -W host:port` per stream, its standard input and output | Nothing listens on the computer |
+| The stream to MySQL/MariaDB, and the client tools (`pg_dump.exe`, `mysqldump.exe`, …) | `Tunnel::forward_once`: a loopback port that admits one connection, then the stream above | Any local account can connect to that port in the moment between Kerno opening it and the driver connecting (`ssh.rs`, unchanged since v1); the database's own login is still needed. `mysql_async` dials an address and takes no stream, and a tool is a separate program: neither can take the pipes |
+| The tunnel's private folder | `AppPaths::local_data_dir()\ssh\kerno-ssh-<12 hex>` (`%LOCALAPPDATA%\Kerno\data\ssh`, in the profile), whatever `TEMP` and `KERNO_DATA_DIR` say; removed at the tunnel's end | The profile's access list: the user, SYSTEM, the administrators. Kerno holds its two files open with `FILE_SHARE_READ` while the tunnel lives: others may read them, not write or delete them |
+| Its `config` (`-F`) | Kerno's own: `LogLevel INFO`, no password, no keyboard-interactive, `BatchMode no`, then `Include` of the user's file and the system's | `ssh.exe` runs in the folder's parent with `-F kerno-ssh-…/config`: OpenSSH writes `-F` unquoted in a jump host's command, and that relative path has no space whatever the profile's name |
+| The questions (`SSH_ASKPASS`) | Kerno itself (`kerno.exe`, a windowed program), `SSH_ASKPASS_REQUIRE=force` | Over a named pipe (random name, local peers only, first instance) whose two ends prove they read the token in the folder's `ask` file (the running instance's handshake, D-131) before a byte crosses. The environment carries the file's path and the asking `ssh`'s number, never the token or the passphrase |
+| Another account and the pipe | Each peer in a task of its own, at most 8 at once, 10 s each | It can open the pipe for reading (a pipe's default access list) and take some of the 8 places: a denial of service, as D-131 accepted. It can neither receive the passphrase nor answer the helper (no proof) |
+| The passphrase | From the secret store; tried on the key file first (`passphrase_opens`, ssh-key's `decrypt`) | Never in an argument, the environment or a log. Answered only while the asking `ssh` is still logging in: once its login line is seen, its later questions are refused. Kept in memory for the tunnel's life (each `ssh.exe` asks again) |
+| A file named by a connection or a task | `local_path::resolve`: `~\` put under the home, then an allow-list: a drive's absolute path or `~\…`, no further `:`, no device name (`CON`, `NUL`, `COM1`…), no NUL | Checked where it is used: the three drivers' connect (TLS files, the SQLite database), the tools' TLS options and a task's output folder, backup file and script, both SSH clients' key, `ssh.exe`'s `-i` and `IdentityAgent` (a pipe of this computer), the password command's program, the `Include`s Kerno reads to list aliases; the dialog, the backup wizard and the imports say it early |
+
+**The forward.** A loopback `-L` would keep the shape of `openssh/unix.rs` (one login for every session) but
+open a port every local account can reach while the tunnel is up, that a squatter can take between Kerno
+picking it and `ssh` binding it, and whose readiness could only be checked by connecting to it. So each stream
+is its own `ssh -W`. The price, said in the guide: one SSH login per session and per cancelled query (a jump
+host doubles it), and each stream holds one `ssh.exe` and two blocking threads of the runtime (tokio 1.54
+reads a child's pipes through its blocking pool, `process/windows.rs`). `Tunnel` and the drivers are
+unchanged: `Forward::connect` returns a stream or an `SshError` on both systems.
+
+**Knowing a stream is up.** `-o LogLevel=VERBOSE` on the outer `ssh.exe` only, which then prints OpenSSH's
+login line, matched in its exact shapes (`Authenticated to <host> ([<address>]:<port>) using "<method>".`, or
+`(via proxy)` behind a jump host; `openssh::is_login_line`). A server's banner can still print that very text:
+the stream is then taken as up before the login ends; with the questions stopped once up, the server can only
+make its own login fail, which it could anyway, and no secret moves. Until then a stream is not handed out,
+and an `ssh.exe` that exits is explained from its messages and its own questions as on Unix
+(`openssh::failure`). After it, a forward the server cannot open says nothing on Windows: Windows' OpenSSH
+server takes it, then closes it, and `ssh -W` ends without a word (seen on the runner). A stream whose reader
+sees its end before the database sent a byte (a database always speaks first or answers a login) counts as a
+refused forward ("the SSH server closed the way to host:port before the database said anything"), which
+`Connector::session` turns into `SshError::Forward`. `Forward::start` logs in once and keeps that stream 5 s
+for the first connection (a timer retires it; a server closes a connection that says nothing: MySQL after
+10 s), unless a forward failed since. `is_closed` is always false: no `ssh.exe` stands for the tunnel.
+
+**The passphrase, per `ssh`.** Windows' std has no parent id, so the helper names the `ssh` that asks by the
+number Kerno gave it (`KERNO_ASKPASS_SPAWN`); questions and what they told are kept per `ssh`
+(`Observed`, R9). A passphrase Kerno verified on the key file answers every question for that key (a jump
+host's `ssh` asks on its own); one it could not try (a PEM or PKCS#8 key) is given once per `ssh`, and a
+second question from the same `ssh` says "the passphrase is wrong" (R8). Edge: a PEM key that a jump host and
+its target both use is then said wrong (the jump host's question and the target's share a number). The
+passphrase question is matched exactly as on Unix: `ssh.exe` names the key as it was given.
+
+**Too old.** An `ssh.exe` before 8.4 ignores `SSH_ASKPASS_REQUIRE` (8.4's release notes, as recalled): when
+it fails and none of its questions reached Kerno, the failure says "This OpenSSH is too old to ask Kerno for a
+passphrase: load the key in the agent, or use the built-in client" (`error::explain` tells it on Windows
+only). Not proved end to end: the runner has 9.5, and an older `ssh.exe` could not be had without an unpinned
+download. Windows 10 shipped 7.7 and later 8.1, as recalled.
+
+**Every `ssh.exe` goes.** A jump host's `ssh.exe` outlived its parent on the runner (Windows stops no child
+with its parent). A stream's tree is stopped with System32's `taskkill /T /F /PID` before the process itself,
+at a stream's drop, a failed start and a cancelled one; the pids of the trees not stopped yet are listed (only
+while Kerno holds their handles, so no pid is reused meanwhile), and the app's quit stops them all and waits
+(`openssh::stop_all`). A crash stops nothing: without a job object (it needs `unsafe`) the `ssh.exe` of the
+open sessions stay until their server closes them or the user logs out, visible in Task Manager, harmless.
+
+**Files of another computer.** On Windows a path such as `\\host\share\x` (any spelling: `//host`, `\/host`,
+`\\?\UNC\…`, `\??\…`, a device path) is opened over SMB with the user's Windows credentials, by Kerno or by a
+program it hands the path to. The allow-list above refuses too a rooted path without a drive (`\Users\…`, or a
+macOS path from an export): when Kerno's working folder is a share, `\foo` names that share. A link on the
+local disk that leads to a share is the machine owner's own doing and is followed. **A limit a user may hit**:
+a SQLite database on a share is refused by its network name; mapping the share to a drive letter (which logs
+in once, by the user's hand) makes it a drive path that passes. An imported task's files are shown in the
+import's preview on every system ("Restores … into “shop”"): a task that restores a file of the sender's
+choosing deserves a look before it is saved.
+
+**What an imported connection can make `ssh.exe` do**: its host, user and jump hosts are `safe_ssh_word`s (K58,
+unchanged); its key file (`-i`) and agent (`-o IdentityAgent=`) pass the checks above; `-F` is the tunnel's own
+file; `UserKnownHostsFile`, `ProxyCommand` and the user's config are the user's, never a connection's.
+
+**Not on Windows**: Pageant (PuTTY's agent; Windows' OpenSSH agent and 1Password's take its place);
+ControlMaster (nothing relies on it). Not verified: whether a jump host's `ssh.exe` (started by `ssh.exe`, not
+by Kerno, which sets `CREATE_NO_WINDOW` on its own) shows a console window on a person's screen.
+
+**macOS and Linux.** Unchanged in behaviour: `openssh/unix.rs`'s shared parts moved to `openssh.rs`,
+`tunnel_args` gives the same arguments (`Via::Socket`), the checks above are Windows-only at their call sites
+or inside the functions; the too-old line is told on Windows only. The home is K67's `home::dir()`.

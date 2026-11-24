@@ -1950,3 +1950,21 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   said above the buttons, in the simple view and on the wizard's last page, so a saved task with an argument
   refused now says it where it starts (N4). D-143, M12's K74 tables.
 - Left: the read of the database after a stop cannot be cancelled; `NO_BACKSLASH_ESCAPES` reasoned, not run.
+
+## 2026-11-24 — K69: the tunnel through Windows' OpenSSH
+
+- The owner's pick "A5": on Windows a connection tunnels through System32's `ssh.exe` (never one on `PATH`),
+  with the user's `.ssh\config` aliases, jump hosts, agents and known_hosts, the questions `ssh.exe` asks
+  answered by Kerno over a named pipe whose two ends prove themselves (the running instance's handshake). One
+  `ssh.exe -W` per stream: a PostgreSQL connection listens nowhere; each session logs in again (D-138).
+- The coordinator's review: no file of another computer named by a connection or a saved task is opened or
+  handed to a program on Windows (`kerno_core::local_path`, `~\` expanded first); an imported task shows its
+  files in the import's preview on every system.
+- An independent review found twelve points (R1 to R12 in `docs/plans/M12.md`), all addressed: the agent's
+  address never stat'ed, `ssh.exe` only from `C:\Windows` or `C:\Program Files`, a peer per task on both
+  pipes, the tunnel's folder in the profile and held, the exact login line, answers per `ssh` and only until
+  it is up, `stop_all` at quit, a profile with a space behind a jump host, the release `kerno.exe` as the
+  askpass program.
+- Proved on a throwaway Windows runner (the probe workflow of the branch `windows-ssh`, not merged) against
+  Windows' own OpenSSH server, a PostgreSQL 17 and a MySQL 8.4 the workflow starts; macOS unchanged, the J2
+  tests green against `kerno-ssh` and `kerno-ssh-jump`.

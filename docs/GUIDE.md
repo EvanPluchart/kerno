@@ -104,6 +104,25 @@ command line; a server key you choose to trust is added to your known_hosts. `KE
 Kerno pass another configuration file to `ssh` (`-F`). The **built-in** client needs no `ssh` and is the one for
 a password login; it takes Ed25519 and ECDSA key files and the keys of an SSH agent, not RSA key files.
 
+On Windows, OpenSSH is the `ssh.exe` Windows ships, `C:\Windows\System32\OpenSSH\ssh.exe` (the optional
+feature "OpenSSH Client"), or the one Win32-OpenSSH's installer puts in `C:\Program Files\OpenSSH`; never one
+found on `PATH` (the SSH tab says which runs), and your file is `%USERPROFILE%\.ssh\config`. What differs:
+Windows' OpenSSH forwards no private socket, so each connection to the database is its own `ssh.exe` (its
+standard input and output are the connection), and each session, and each cancelled query, logs in to the SSH
+server again. PostgreSQL connections listen nowhere on your computer; MySQL and MariaDB connections and the
+client tools (`pg_dump.exe`, `mysqldump.exe`, …) dial an address, so Kerno opens a one-use loopback port for
+each, which another account of this computer could take in the moment before the connection does (the
+database's own login is still needed). A key's passphrase and a host key you trust are answered by Kerno over
+a named pipe whose two ends prove they can read a token in the tunnel's private folder (in
+`%LOCALAPPDATA%\Kerno\data\ssh`, removed when the connection closes), and only while that `ssh.exe` logs in;
+the passphrase is kept in memory while the connection is open. A wrong passphrase is said as wrong. An
+`ssh.exe` older than 8.4 cannot ask Kerno anything: load the key in the agent (`ssh-add`), connect once with
+`ssh` in a terminal to record the server's key, or use the built-in client. ControlMaster and Pageant are not
+used. Kerno opens no file of another computer named in a connection or a saved task (a key, a certificate, a
+SQLite database, a backup's folder at `\\server\share\…`): Windows would log in there with your account. Use a
+path such as `C:\Users\you\…` or `~\…`; for a database on a share, map the share to a drive letter first. When
+you import connections, each saved task shows the files it would read or write before you save it.
+
 ## Where passwords are kept
 
 **Settings ▸ Passwords ▸ Keep saved passwords in** chooses where the passwords, SSH passwords, key passphrases
