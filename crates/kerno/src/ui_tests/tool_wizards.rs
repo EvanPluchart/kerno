@@ -1044,8 +1044,10 @@ fn the_options_page_changes_the_command(cx: &mut TestAppContext) {
     app.tap(cx, "backup-extended-inserts");
     let now = state(cx);
     assert!(
-        now.contains("--lock-all-tables --events --skip-extended-insert")
-            && !now.contains("--routines")
+        // utf8mb4 when the server and the client have it (K63, F3).
+        now.contains(
+            "--lock-all-tables --default-character-set=utf8mb4 --events --skip-extended-insert"
+        ) && !now.contains("--routines")
             && !now.contains("--hex-blob"),
         "{now}"
     );

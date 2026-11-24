@@ -580,9 +580,60 @@ impl BackupDialog {
         };
         format!(
             "A restore writes into “{}” on top of what it holds and cannot be undone. Kerno \
-             shows the command and asks before it runs.{tail}",
-            self.database
+             shows the command and asks before it runs.{tail}{}",
+            self.database,
+            self.overlap_words()
         )
+    }
+
+    /// A folder backup restored into a database that already holds some of
+    /// its tables: what happens to them (K63).
+    fn overlap_words(&self) -> String {
+        let (
+            Some(Ok(Input {
+                manifest: Some(manifest),
+                ..
+            })),
+            Some(held),
+        ) = (&self.input, &self.target_tables)
+        else {
+            return String::new();
+        };
+        let fold = |name: &str| name.to_lowercase();
+        let both: Vec<String> = manifest
+            .tables
+            .iter()
+            .map(|table| table.table.as_str())
+            .chain(
+                manifest
+                    .after
+                    .iter()
+                    .flat_map(|after| after.objects.iter().map(String::as_str)),
+            )
+            .filter(|name| held.iter().any(|have| fold(have) == fold(name)))
+            .map(|name| format!("“{name}”"))
+            .collect();
+        if both.is_empty() {
+            return String::new();
+        }
+        let shown = if both.len() > 6 {
+            format!("{} and {} more", both[..6].join(", "), both.len() - 6)
+        } else {
+            listed(&both)
+        };
+        if manifest.options.add_drop_table {
+            format!(
+                " “{}” already holds {shown}, which the backup has too: each is dropped and \
+                 created again from the backup; the database's other tables stay.",
+                self.database
+            )
+        } else {
+            format!(
+                " “{}” already holds {shown}, which the backup has too, and the backup was made \
+                 without DROP TABLE statements: the restore stops at the first of them.",
+                self.database
+            )
+        }
     }
 
     /// The client in use, small, with the way to another one.
@@ -680,9 +731,9 @@ impl BackupDialog {
                 }
                 ClientFamily::MySql => {
                     "The backup is then a folder, one file per table, which Kerno restores on \
-                     several connections too. A large table with a single-column whole-number \
-                     key is read in several parts at once; one without such a key is still read \
-                     by one connection."
+                     several connections too. A large InnoDB table with a single-column \
+                     whole-number key is read in several parts at once; any other is still read by \
+                     one connection."
                 }
             };
             row(
@@ -721,13 +772,12 @@ impl BackupDialog {
             } else if on {
                 "Kerno holds a read lock on the whole server (FLUSH TABLES WITH READ LOCK) from \
                  before the first table until the last: every table is read at the same moment, \
-                 and every write on the server waits until the backup ends. Kerno asks before it \
-                 starts."
+                 and every write on the server waits until the backup ends. Kerno asks first, and \
+                 the backup stops if a long statement keeps the lock from coming within 10 s."
             } else {
-                "Each table is read at its own moment: an InnoDB table, or each part of a large \
-                 one, in one consistent snapshot; any other table locked while it is read. Two \
-                 tables are not read at the same instant, and a row whose key changes during the \
-                 backup can be missed or written twice."
+                "Each table is read at one moment, all its parts included; two tables are not read \
+                 at the same instant (an InnoDB table in one snapshot, any other locked while it \
+                 is read)."
             };
             row(
                 "Writes",

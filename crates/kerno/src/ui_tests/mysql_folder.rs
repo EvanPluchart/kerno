@@ -38,6 +38,9 @@ fn a_faster_mysql_backup_is_a_folder_the_restore_loads_on_several_clients(cx: &m
         &[
             &format!("CREATE DATABASE {source}"),
             &format!("CREATE DATABASE {target}"),
+            // A database that is not empty: `one` is the backup's too.
+            &format!("CREATE TABLE {target}.one (x INT)"),
+            &format!("CREATE TABLE {target}.extra (id INT)"),
             &format!("CREATE TABLE {source}.one (id INT PRIMARY KEY, label VARCHAR(20))"),
             &format!("CREATE TABLE {source}.two (label VARCHAR(20)) ENGINE=MyISAM"),
             &format!("CREATE VIEW {source}.one_view AS SELECT id FROM {source}.one"),
@@ -65,7 +68,11 @@ fn a_faster_mysql_backup_is_a_folder_the_restore_loads_on_several_clients(cx: &m
     );
     assert!(paints(&app, cx, "A folder of SQL scripts, one per table"));
     assert!(app.has(cx, "simple-block-writes"));
-    assert!(paints(&app, cx, "Each table is read at its own moment"));
+    assert!(paints(
+        &app,
+        cx,
+        "Each table is read at one moment, all its parts included"
+    ));
     let folder = root.join("k63");
     app.save_as(cx, "simple-choose-file", &folder);
     assert!(paints(&app, cx, &format!("{}/", folder.display())));
@@ -106,6 +113,14 @@ fn a_faster_mysql_backup_is_a_folder_the_restore_loads_on_several_clients(cx: &m
         "Kerno's folder backup, one SQL file per table, run by the mysql client (made from the \
          database “kerno_test_k63_ui_src”)"
     ));
+    app.wait_until(cx, "the database's tables", |app, cx| {
+        paints(
+            app,
+            cx,
+            "“kerno_test_k63_ui_dst” already holds “one”, which the backup has too: each is \
+             dropped and created again from the backup; the database's other tables stay.",
+        )
+    });
     app.tap(cx, "simple-parallel");
     assert!(
         cx.update(|cx| dialog.read(cx).task_restore(cx))
@@ -121,10 +136,11 @@ fn a_faster_mysql_backup_is_a_folder_the_restore_loads_on_several_clients(cx: &m
             engine,
             &format!(
                 "SELECT CONCAT((SELECT COUNT(*) FROM {target}.one), '/', \
-                 (SELECT COUNT(*) FROM {target}.two), '/', (SELECT COUNT(*) FROM {target}.one_view))"
+                 (SELECT COUNT(*) FROM {target}.two), '/', (SELECT COUNT(*) FROM {target}.one_view), \
+                 '/', (SELECT COUNT(*) FROM {target}.extra))"
             )
         ),
-        "3/2/3"
+        "3/2/3/0"
     );
     app.tap(cx, "backup-close");
 
@@ -277,4 +293,40 @@ fn an_old_server_needs_an_old_client(cx: &mut TestAppContext) {
         state.starts_with("ready: ") && state.contains(" --ssl-mode=DISABLED "),
         "{state}"
     );
+}
+
+/// A plain backup whose mysqldump reads no column of a table ("it has no
+/// fields") still exits 0: a failure, its file removed (K63, F6).
+#[gpui_kit::test]
+fn a_plain_backup_that_read_no_column_fails_and_removes_its_file(cx: &mut TestAppContext) {
+    if !testing::available(Engine::MySql) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = fake_client(
+        &root,
+        "nofields",
+        ClientFamily::MySql,
+        "mysqldump  Ver 8.4.6 for macos15 on arm64",
+        r#"for arg in "$@"; do case $arg in --result-file=*) echo '-- MySQL dump' > "${arg#--result-file=}";; esac; done
+echo "-- Skipping dump data for table 't', it has no fields" >&2
+exit 0"#,
+    );
+    let app = connected(cx, Engine::MySql);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", false)
+        .expect("the backup");
+    app.wait_backup(cx, &dialog, &["ready"]);
+    let file = root.join("empty.sql");
+    app.save_as(cx, "simple-choose-file", &file);
+    app.tap(cx, "backup-start");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.starts_with("failed: mysqldump found no columns in a table")
+            && state.ends_with("The incomplete file was removed."),
+        "{state}"
+    );
+    assert!(!file.exists());
 }
