@@ -59,17 +59,19 @@ Step 1 is done (K64, D-131): the workspace compiles for `x86_64-pc-windows-msvc`
 `kerno-core`'s tests pass there. Step 2 is done (K66, D-133): the release carries
 `kerno-<version>-windows-x86_64.zip` (`kerno.exe` with its icon and the C runtime inside), built and launched
 once by the CI on every push; a picture of that launch is the only look at the Windows app so far: nobody has
-used it. A preview until the list below is done. Next, in order:
+used it. Step 3a is done (K67, D-136): the home folder (`%USERPROFILE%`: `~\.ssh`, libpq's
+`%APPDATA%\postgresql\pgpass.conf`, no MySQL option file), the update check (`curl.exe` of `System32`) and the
+local clients (`pg_dump.exe`, `mysqldump.exe`, … in the installers' folders of Program Files and on `PATH`; a
+backup, a restore and a cancel proved on a runner). A preview until the list below is done. Next, in order:
 
 1. A pass in the real app on Windows, by a person: the menus, fonts, the secret store (Credential Manager
-   through `keyring`), the instance's pipe, the built-in SSH client and its agent pipe.
+   through `keyring`), the instance's pipe, the built-in SSH client and its agent pipe, the backup wizards and
+   Settings ▸ Local clients.
 2. A line for Windows in the READMEs' install tables, once a person has used the zip.
-3. The home folder (`%USERPROFILE%` where `HOME` is read: `~/.ssh`, `.pgpass`, `.my.cnf`; libpq's
-   `%APPDATA%\postgresql\pgpass.conf`) and the update check (`curl.exe` of `System32`).
-4. The local clients (`pg_dump.exe`, `mysqldump.exe`, …, in `Program Files` and on `PATH`) and the password
-   command's presets (`aws.exe`, `op.exe`).
-5. An installer and the in-app update's install, as Recto and Vigie do on Windows.
-6. The system OpenSSH tunnel (a loopback TCP forward and the askpass questions on a named pipe), Pageant.
+3. The password command's presets (`aws.exe`, `op.exe`), a MariaDB client whose `mysqldump.exe` is not a link
+   (D-136), and the start-failure page's advice (it says "Set HOME").
+4. An installer and the in-app update's install, as Recto and Vigie do on Windows.
+5. The system OpenSSH tunnel (a loopback TCP forward and the askpass questions on a named pipe), Pageant.
 
 ## The AI assistant, next (agreed with the owner, 2026-11-23)
 

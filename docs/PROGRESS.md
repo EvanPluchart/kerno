@@ -1735,3 +1735,16 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   is new). Measured on a dry run from a branch: Windows 7.5 min, Linux 11 and 10 min, macOS's build 4.5 min;
   that run's macOS job then failed in `hdiutil create`, which is now retried.
 
+## 2026-11-24 — K67: Windows finds the home folder, its updates and the backup tools
+
+- The owner's pick for the next release ("A1 A2"). One owner of the home folder (`kerno_core::home`:
+  `%USERPROFILE%` on Windows, `HOME` on Unix); libpq's `%APPDATA%\postgresql\pgpass.conf` read there, no MySQL
+  option file; the update check through `System32\curl.exe`; `pg_dump.exe`, `mysqldump.exe` and the others
+  found in the installers' folders of Program Files and on `PATH`, started without a console window (D-136).
+- Proved on GitHub's `windows-2025` runner by a probe workflow on the branch `windows` (not merged), against a
+  PostgreSQL 17 and a MySQL 8.4 it starts itself: the clients found with their versions, a backup and a restore
+  through Kerno's own code for both engines, a cancelled backup that leaves no tool in `tasklist`, a version
+  found through the system's curl, the home and libpq's file read; check, clippy and `kerno-core`'s tests green
+  there. A deliberate red run showed each of those tests failing under its mutation.
+- macOS: fmt, clippy and `cargo deny` clean; `kerno-core` and `kerno` green. Not seen: the Windows screens (the
+  dialog's hint, Settings ▸ Local clients, no console window), MariaDB on Windows, the password command's presets.

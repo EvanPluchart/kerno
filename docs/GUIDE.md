@@ -136,7 +136,9 @@ named after where saved passwords are kept (**Kerno's file** or **macOS Keychain
 there; left empty, Kerno reads `~/.pgpass` (or `PGPASSFILE`) for
 PostgreSQL and the `password` of the `[client]` group of `~/.my.cnf` for MySQL and MariaDB, as their own tools
 do (`!include` lines of `.my.cnf` are not followed). A `.pgpass` that other users can read, or a `.my.cnf`
-anyone can change, is ignored, and the error says so. **Ask each time** asks at every connect. **Command**
+anyone can change, is ignored, and the error says so. On Windows the file is libpq's
+`%APPDATA%\postgresql\pgpass.conf` (or `PGPASSFILE`), and no MySQL option file is read: MySQL has no per-user
+one there but the encrypted `.mylogin.cnf`. **Ask each time** asks at every connect. **Command**
 runs a program of yours and uses what it prints (one trailing newline removed): no shell, one argument per
 line, `${host}`, `${port}`, `${user}` and `${database}` replaced inside the arguments, at most 120 s.
 **AWS RDS IAM** runs `aws rds generate-db-auth-token` with the connection's host, port and user, your region
@@ -414,7 +416,8 @@ so `ciw` followed by typed text is undone in two steps (the deletion, then the t
 
 Kerno asks GitHub on its own: at launch, then whenever 6 hours have passed by the clock (a computer that slept
 checks within two minutes of waking, so a Kerno left open learns of a new version without a restart), it sends a
-`HEAD` request to `https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`, with
+`HEAD` request to `https://github.com/EvanPluchart/kerno/releases/latest` through the system's `curl`
+(`/usr/bin/curl`; on Windows the `curl.exe` of `System32`, never one found on `PATH`), with
 the redirect not followed, a `Kerno/<version>` user agent, no cookie, no identifier and nothing else, and
 reads the version in the redirect. It offers only a strictly newer `X.Y.Z` and says nothing when offline. When
 a newer version is found (and checks are on), it also reads that release's notes file from GitHub to show what
@@ -598,7 +601,9 @@ connections never carry the paths of these files.
 
 Kerno backs up and restores with the engine's own tools, run on this computer: `pg_dump`, `pg_restore` and
 `psql` for PostgreSQL, `mysqldump` and `mysql` for MySQL and MariaDB. The client used is the newest one found
-that is not older than the server (Settings ▸ Local clients lists them; a connection can name its own).
+that is not older than the server (Settings ▸ Local clients lists them; a connection can name its own). On
+Windows they are looked for in the installers' folders of Program Files (`PostgreSQL\<n>\bin`,
+`MySQL\<product>\bin`, `MariaDB <X.Y>\bin`) and on `PATH`.
 
 **Back up…** on a database (the tree, Tools ▸, the main toolbar, the palette) opens one screen: what is backed
 up (the whole database, with its schemas and tables counted), the file it writes, the format and the client.

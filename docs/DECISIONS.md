@@ -4395,3 +4395,64 @@ Linux was the longest (21 min: the image, then two architectures one after the o
   and launch check, with no message (`-quiet`): a known "Resource busy" of busy machines.
   `scripts/bundle-macos.sh` now tries five times and shows hdiutil's own words.
 
+## D-136 — Windows, step 3a: the home folder, the update check, the local clients (K67; 2026-11-24)
+
+One of the owner's picks for the next release ("A1 A2"): the Windows preview goes from an app that starts to
+one that finds the user's files, its updates and the backup tools.
+
+- **What is proved, and what is not.** A probe workflow on the branch `windows` (not merged) ran on GitHub's
+  `windows-2025` runner, green: check, clippy and `kerno-core`'s tests, then a PostgreSQL 17 and a MySQL 8.4 that
+  the workflow initialises and starts itself on the test containers' ports, and the K67 tests against them and
+  against the runner's own profile (green: runs 45438156510 and the final commit's; red on purpose,
+  each new runner test failing under its mutation: run 45444618744). Those tests are gated to Windows and to `KERNO_K67_RUNNER`
+  (`testing::k67_runner`), so they never run on a developer's Windows by accident. Nobody opened the app on
+  Windows: the dialog's hint, the Local clients page and the absence of console windows were not seen.
+- **One home folder**, `kerno_core::home`: `HOME` on Unix, read as before; on Windows `USERPROFILE`, else the
+  profile's known folder (`directories`). `USERPROFILE` first because every Windows session sets it to the
+  profile, and a run can change it, as `HOME` on Unix; the known folder is the same folder when it is set.
+  Every reader of the app goes through it: the built-in SSH client's `known_hosts`, the OpenSSH detection, the
+  password files, the AI endpoints' import, the save panels' fallback, the backup folder's default. The readers
+  tests drive still take the home as a value (`PasswordEnv`, `openssh::host_aliases`). A typed `~/x` is under
+  the home on both systems, `~\x` too on Windows (`home::expand`, `std::path::is_separator`).
+- **Password files on Windows.** PostgreSQL: libpq's `%APPDATA%\postgresql\pgpass.conf`, or `PGPASSFILE`,
+  found through the roaming application-data known folder, the one libpq asks Windows for; `~\.pgpass` is not
+  read there. It is read without a permission check: Windows has no modes for Kerno to read (D-131). MySQL and
+  MariaDB: the MySQL 8.4 manual's list of option files for Windows has global files (`%WINDIR%`, `C:\`, the
+  install's folder), `--defaults-extra-file` and `%APPDATA%\MySQL\.mylogin.cnf`, which is encrypted by
+  `mysql_config_editor` and not read by Kerno on Unix either: no per-user file, so Kerno reads none on Windows,
+  and the dialog says "Left empty, Kerno connects without a password". One change on Unix: `PGPASSFILE` is now
+  read when `HOME` is not set (libpq does so); with `HOME` set nothing changes.
+- **The update check on Windows** runs `%SystemRoot%\System32\curl.exe`, shipped since Windows 10 1803, by its
+  absolute path: `SystemRoot` is taken only when it is a drive's absolute path (`X:\…`), else `C:\Windows`
+  (`update::windows_curl`). Never a bare name, which Windows would look for in the application's folder, the
+  current folder and `PATH`, where a `curl.exe` put there would run at every check and decide what is
+  downloaded. Missing (an older Windows), running it fails and the check says nothing, as offline; on Unix
+  `program()` gives the first of its absolute paths in the same case. The same arguments as on Unix
+  (`--disable` first, the redirect not followed). A newer version still opens the release page: the
+  installer is another item.
+- **The local clients on Windows**: names end in `.exe` (`std::env::consts::EXE_SUFFIX`, so Unix is
+  unchanged); the places are the installers' folders under `%ProgramFiles%`, read and never assumed:
+  `PostgreSQL\<n>\bin` (EDB's installer, said "EDB installer"), `MySQL\<product>\bin` and `MariaDB <X.Y>\bin`
+  (said "Program Files"), then `PATH`, split with `std::env::split_paths`; none of the Unix fallback folders. A
+  folder is recognised through links and Windows' short names (the image puts MySQL on `PATH` as
+  `C:\PROGRA~1\…`): one install, the installer's. The `\\?\` that resolving a path puts before a drive letter is
+  removed (`tools::real_path`): the folder is shown to the user and compared with folders saved without it.
+  A relative folder of `PATH` (`.`, `bin`) is never searched, on any system: it names a folder of the current
+  directory, and a tool put there would run. Every tool runs by an absolute path: a detected install's
+  folder (links resolved), or a folder the user added, never a name looked up by Windows.
+- **Running and stopping a tool** is the same code on both systems: the password goes to the child in its
+  environment (`PGPASSWORD`, `MYSQL_PWD`), never on its command line, and the inherited `PG*`, `MYSQL*` and
+  `MARIADB*` variables are removed first; on Windows the names are compared without case, as Windows reads
+  them (the runner itself sets `PGUSER` and `PGPASSWORD` for the whole machine). Nothing in that path was
+  Unix-only (no option file with a mode, no `/dev` path, no `nice`). A cancel kills the child
+  (`Child::kill`: a signal on Unix, `TerminateProcess` on Windows) and waits for it; pg_dump's parallel jobs
+  are threads on Windows, not processes, so nothing is left behind.
+- **No console window.** A release `kerno.exe` is a windowed program (D-131): every console program it starts
+  would open a console of its own. The tools, their `--version`, the restore wizard's `pg_restore --list` and
+  `curl.exe` start with `CREATE_NO_WINDOW`
+  (`tools::no_console`, std's `CommandExt`, no `unsafe`). Not seen: the runner's tests run from a console.
+- **Not on Windows yet**: the password command's presets (`aws`, `op` are looked for without `.exe`); a MariaDB
+  installed on Windows may ship a real `mysqldump.exe` beside `mariadb-dump.exe`, which detection takes first and
+  the command building reads as MySQL's (its name; that code is another item's, and no MariaDB was on the
+  runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
+  OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
