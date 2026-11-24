@@ -1929,6 +1929,12 @@ pub fn backup_command(
                 my.jobs.is_some(),
                 "several mysqldump at once write a folder, one file per table",
             )?;
+            if let Some(word) = extra.iter().find(|word| silences(word)) {
+                return Err(Error::Unsupported(format!(
+                    "“{word}” would hide the lines Kerno reads from mysqldump (its progress, and \
+                     a table it could not read): leave it out"
+                )));
+            }
             refuse(
                 !options.schemas.is_empty(),
                 "a MySQL backup is of one database: name its tables",
@@ -2178,6 +2184,45 @@ pub fn restore_command(
         )),
         (Engine::Sqlite, _) => Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
+}
+
+/// Whether the user's argument `word` turns mysqldump's `--verbose` off
+/// (`--skip-verbose`, `--verbose=0`…) or sends what it writes on its
+/// standard error to a file (`--log-error`): Kerno reads those lines (a
+/// table it could not read, a range's snapshot taken).
+fn silences(word: &str) -> bool {
+    let Some(long) = word.strip_prefix("--") else {
+        return false;
+    };
+    let normal = long.to_ascii_lowercase().replace('_', "-");
+    let (mut name, value) = match normal.split_once('=') {
+        Some((name, value)) => (name.to_string(), Some(value.to_string())),
+        None => (normal.clone(), None),
+    };
+    let mut off = false;
+    loop {
+        if let Some(rest) = name
+            .strip_prefix("skip-")
+            .or_else(|| name.strip_prefix("disable-"))
+        {
+            off = true;
+            name = rest.to_string();
+        } else if let Some(rest) = name
+            .strip_prefix("loose-")
+            .or_else(|| name.strip_prefix("enable-"))
+            .or_else(|| name.strip_prefix("maximum-"))
+        {
+            name = rest.to_string();
+        } else {
+            break;
+        }
+    }
+    let off_value = value
+        .as_deref()
+        .is_some_and(|value| matches!(value, "0" | "false" | "off"));
+    let log_error = name.len() >= 3 && "log-error".starts_with(&name);
+    let verbose = name.len() >= 3 && "verbose".starts_with(&name);
+    log_error || (verbose && (off || off_value))
 }
 
 /// The character set a MySQL / MariaDB tool talks in, when [`utf8mb4`].

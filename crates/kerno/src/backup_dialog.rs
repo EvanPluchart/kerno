@@ -195,6 +195,8 @@ struct Input {
     manifest: Option<Arc<mysql_folder::Manifest>>,
     /// The folder's file that holds [`Input::refusal`].
     refusal_file: Option<String>,
+    /// A MySQL / MariaDB backup that sets `utf8mb4` in its first lines.
+    utf8mb4: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1667,14 +1669,16 @@ impl BackupDialog {
         else {
             return Err("The command appears once the client is found.".into());
         };
-        Ok(mysql_folder::FolderBackup {
+        mysql_folder::FolderBackup {
             tool_path: path.clone(),
             params,
             options: self.backup_options(cx)?,
             folder: self.output_path(cx)?,
             client: install.version.clone(),
             range_threshold: mysql_folder::RANGE_THRESHOLD,
-        })
+        }
+        .settled()
+        .map_err(|error| error.to_string())
     }
 
     /// The restore of a MySQL / MariaDB folder backup as the settings
@@ -2003,14 +2007,17 @@ impl BackupDialog {
             cx,
         );
         let reading = bridge::spawn(cx, async move {
-            let Ok(session) = opening.await else {
-                return Vec::new();
+            let session = match opening.await {
+                Ok(session) => session,
+                Err(error) => return Look::Failed(error_text(&error)),
             };
-            let found = mysql_folder::long_statements(&session, LONG_STATEMENT)
-                .await
-                .unwrap_or_default();
+            let all = mysql_folder::sees_every_statement(&session).await;
+            let found = mysql_folder::long_statements(&session, LONG_STATEMENT).await;
             session.close().await;
-            found
+            match (all, found) {
+                (Ok(all), Ok(long)) => Look::Read { all, long },
+                (Err(error), _) | (_, Err(error)) => Look::Failed(error_text(&error)),
+            }
         });
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let long = reading.await;
@@ -2020,12 +2027,7 @@ impl BackupDialog {
 
     /// Asks before the backup that blocks writes, with the statements that
     /// run long enough to hold the lock up.
-    fn confirm_lock(
-        &mut self,
-        long: Vec<(String, u64, String)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn confirm_lock(&mut self, long: Look, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         sql_confirm::open(
             Confirmation {
@@ -2165,16 +2167,20 @@ impl BackupDialog {
                 } else {
                     format!("Restore {file} into {}", self.database)
                 },
-                explanation: restore_explanation(&Explained {
-                    family: self.family,
-                    database: &self.database,
-                    connection: &self.name,
-                    input: &input,
-                    program: &program_name(&command),
-                    allow_commands: self.allow_commands,
-                    script,
-                    restore: &self.restore,
-                }),
+                explanation: format!(
+                    "{}{}",
+                    restore_explanation(&Explained {
+                        family: self.family,
+                        database: &self.database,
+                        connection: &self.name,
+                        input: &input,
+                        program: &program_name(&command),
+                        allow_commands: self.allow_commands,
+                        script,
+                        restore: &self.restore,
+                    }),
+                    self.overlap_words()
+                ),
                 statement: Statement::Fixed(self.shown(&command)),
                 action: if script { "Run" } else { "Restore" },
                 destructive: true,
@@ -2241,6 +2247,7 @@ impl BackupDialog {
         // holds no table (K63, F6).
         let no_fields = Arc::new(AtomicBool::new(false));
         let heard = no_fields.clone();
+        let mysql_backup = self.mode == Mode::Backup && self.family == ClientFamily::MySql;
         // A MySQL / MariaDB folder backup and its restore run several tools
         // at once (K63).
         let folder_backup = self.folder_backup_mode().then(|| self.folder_backup(cx));
@@ -2301,7 +2308,7 @@ impl BackupDialog {
                         tools::run(
                             command,
                             move |line| {
-                                if line.contains(mysql_folder::NO_FIELDS) {
+                                if mysql_backup && mysql_folder::no_fields_line(&line) {
                                     heard.store(true, Ordering::Relaxed);
                                 }
                                 let _ = sender.send(line);
@@ -3025,6 +3032,20 @@ impl BackupDialog {
         self.current_page().label(self.mode)
     }
 
+    /// Whether the restore's target database's tables are read; for tests.
+    #[cfg(test)]
+    pub fn target_loaded(&self) -> bool {
+        self.target_tables.is_some()
+    }
+
+    /// The server's version as read; set by a test that plays an older
+    /// server.
+    #[cfg(test)]
+    pub fn set_server_version(&mut self, version: (u32, u32, u32), cx: &mut Context<Self>) {
+        self.server_version = version;
+        cx.notify();
+    }
+
     /// Whether the objects are read; for tests.
     #[cfg(test)]
     pub fn objects_loaded(&self) -> bool {
@@ -3147,8 +3168,43 @@ fn spoken(seconds: u64) -> String {
     }
 }
 
+/// What each consistency means for the folder backup (K63, D-135).
+fn folder_consistency(method: DumpMethod) -> &'static str {
+    match method {
+        DumpMethod::SingleTransaction => {
+            "In the folder, each table is read at one moment: a large InnoDB table is read in \
+             parts started together under Kerno's lock of the table (MySQL 5.5.3 on), any other \
+             table whole; two tables are not read at the same instant."
+        }
+        DumpMethod::LockAllTables => {
+            "In the folder, Kerno holds the server's read lock for the whole backup: every table \
+             is read at the same moment, and a large table of any engine is read in parts."
+        }
+        DumpMethod::NoLocks => {
+            "In the folder, with no lock at all, no table is cut: each is read whole by one \
+             process, at its own moment."
+        }
+    }
+}
+
+/// What Kerno could see of the statements running on the server before it
+/// asks for the read lock.
+enum Look {
+    /// `all`: the account sees every account's statements (PROCESS).
+    Read {
+        all: bool,
+        long: Vec<(String, u64, String)>,
+    },
+    /// The list could not be read, and why.
+    Failed(String),
+}
+
 /// What the read lock does, and the long statements that hold it up.
-fn lock_explanation(name: &str, database: &str, long: &[(String, u64, String)]) -> String {
+fn lock_explanation(name: &str, database: &str, look: &Look) -> String {
+    let (all, long) = match look {
+        Look::Read { all, long } => (*all, long.as_slice()),
+        Look::Failed(_) => (true, &[][..]),
+    };
     let mut text = format!(
         "Kerno takes this read lock before the first table is read and releases it after the \
          last: every write on the server of “{name}”, to any database, waits until the backup \
@@ -3171,6 +3227,20 @@ fn lock_explanation(name: &str, database: &str, long: &[(String, u64, String)]) 
             rest.len() + 1,
             spoken(*seconds)
         )),
+    }
+    if let Look::Failed(why) = look {
+        text.push_str(&format!(
+            " Kerno could not read the statements running on the server ({why}): a long one \
+             would make the lock wait {} s, then the backup stops.",
+            mysql_folder::LOCK_WAIT.as_secs()
+        ));
+    } else if !all {
+        text.push_str(&format!(
+            " Kerno cannot see other accounts' running statements with this account (it lacks \
+             the PROCESS privilege): a long one would make the lock wait {} s, then the backup \
+             stops.",
+            mysql_folder::LOCK_WAIT.as_secs()
+        ));
     }
     text
 }
@@ -3410,6 +3480,7 @@ fn examine(job: Job) -> Examined {
         extensions: Vec::new(),
         manifest: None,
         refusal_file: None,
+        utf8mb4: false,
     };
     if let ToolState::Ready { path, install, .. } = &state {
         if format == BackupFormat::Directory && job.engine != Engine::Postgres {
@@ -3456,8 +3527,13 @@ fn examine(job: Job) -> Examined {
                 }
             }
             input.archive_database = Some(manifest.database.clone());
+            input.utf8mb4 = manifest
+                .files()
+                .next()
+                .is_some_and(|first| sets_utf8mb4(&file.join(first)));
             input.manifest = Some(Arc::new(manifest));
         } else if format == BackupFormat::Sql {
+            input.utf8mb4 = job.engine != Engine::Postgres && sets_utf8mb4(&file);
             let mut options =
                 RestoreOptions::new(job.engine, job.database, file.clone(), BackupFormat::Sql);
             options.tool_version = install.version.clone();
@@ -3491,6 +3567,18 @@ fn examine(job: Job) -> Examined {
         detected,
         input: Some(Ok(input)),
     }
+}
+
+/// Whether a SQL file sets `utf8mb4` in its first lines (`SET NAMES
+/// utf8mb4`, as mysqldump writes it for a server that has it). Blocking.
+fn sets_utf8mb4(path: &Path) -> bool {
+    let mut start = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| {
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, 4096), &mut start)
+        })
+        .is_ok()
+        && String::from_utf8_lossy(&start).contains("SET NAMES utf8mb4")
 }
 
 /// A PostgreSQL archive's list, as `pg_restore --list` prints it with the
@@ -4788,13 +4876,27 @@ impl BackupDialog {
                     ),
                     Self::field(
                         "Consistency",
-                        Self::chips(
-                            "backup-method",
-                            &methods,
-                            my.method,
-                            |this, method| my_set(this, |m| m.method = method),
-                            cx,
-                        ),
+                        v_flex()
+                            .gap_1()
+                            .child(Self::chips(
+                                "backup-method",
+                                &methods,
+                                my.method,
+                                |this, method| my_set(this, |m| m.method = method),
+                                cx,
+                            ))
+                            .when(format == BackupFormat::Directory, |this| {
+                                this.child(
+                                    div()
+                                        .id("backup-method-folder")
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(folder_consistency(my.method))
+                                        .test_text(folder_consistency(my.method)),
+                                )
+                            })
+                            .into_any_element(),
                         cx,
                     ),
                     content,
@@ -5942,13 +6044,18 @@ mod tests {
     /// K63, F9: the read lock's confirmation says what the lock waits for.
     #[test]
     fn the_read_lock_s_confirmation_names_the_long_statements() {
-        let none = lock_explanation("Shop", "shop", &[]);
+        let read = |long: Vec<(String, u64, String)>| Look::Read { all: true, long };
+        let none = lock_explanation("Shop", "shop", &read(vec![]));
         assert!(
             none.contains("10 s at most, then the backup stops without running"),
             "{none}"
         );
         assert!(!none.contains("A query has been running"));
-        let one = lock_explanation("Shop", "shop", &[("1234".into(), 252, "SELECT …".into())]);
+        let one = lock_explanation(
+            "Shop",
+            "shop",
+            &read(vec![("1234".into(), 252, "SELECT …".into())]),
+        );
         assert!(
             one.ends_with(
                 "A query has been running for 4 min 12 s (session 1234): the lock will wait for it, \
@@ -5959,16 +6066,39 @@ mod tests {
         let two = lock_explanation(
             "Shop",
             "shop",
-            &[
+            &read(vec![
                 ("7".into(), 38, String::new()),
                 ("8".into(), 6, String::new()),
-            ],
+            ]),
         );
         assert!(
             two.contains(
                 "2 queries have been running for more than 5 s, the longest for 38 s (session 7)"
             ),
             "{two}"
+        );
+        let blind = lock_explanation(
+            "Shop",
+            "shop",
+            &Look::Read {
+                all: false,
+                long: vec![],
+            },
+        );
+        assert!(
+            blind.ends_with(
+                "Kerno cannot see other accounts' running statements with this account (it lacks \
+                 the PROCESS privilege): a long one would make the lock wait 10 s, then the backup \
+                 stops."
+            ),
+            "{blind}"
+        );
+        let failed = lock_explanation("Shop", "shop", &Look::Failed("access denied".into()));
+        assert!(
+            failed.contains(
+                "Kerno could not read the statements running on the server (access denied)"
+            ),
+            "{failed}"
         );
     }
 
@@ -6162,6 +6292,7 @@ mod tests {
             extensions: Vec::new(),
             manifest: None,
             refusal_file: None,
+            utf8mb4: false,
         };
         let pg = RestoreOptions::new(Engine::Postgres, "shop_copy", "/b", BackupFormat::Sql);
         let my = RestoreOptions::new(Engine::MySql, "shop_copy", "/b", BackupFormat::Sql);

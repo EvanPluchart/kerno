@@ -3,7 +3,9 @@
 //! consistency choice, with and without the RELOAD privilege; an old server
 //! that needs an old client (docs/plans/M12.md, D-135).
 
-use kerno_core::tools::{BackupFormat, ClientFamily, DumpMethod, EngineBackup, mysql_folder};
+use kerno_core::tools::{
+    BackupContent, BackupFormat, ClientFamily, DumpMethod, EngineBackup, MySqlBackup, mysql_folder,
+};
 
 use super::tool_wizards::{fake_client, paints};
 use super::*;
@@ -329,4 +331,269 @@ exit 0"#,
         "{state}"
     );
     assert!(!file.exists());
+}
+
+/// How many painted texts hold `part`.
+fn painted(app: &Fixture, cx: &mut TestAppContext, part: &str) -> usize {
+    app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .filter(|text| text.text().contains(part))
+            .count()
+    })
+}
+
+/// A hand-made folder backup of `tables` with `content` and DROP TABLE or
+/// not; its files only say `SELECT 1;`.
+fn folder_of(
+    root: &std::path::Path,
+    name: &str,
+    tables: &[&str],
+    content: BackupContent,
+    add_drop_table: bool,
+) -> std::path::PathBuf {
+    let folder = root.join(name);
+    std::fs::create_dir(&folder).unwrap();
+    let tables: Vec<mysql_folder::TableFiles> = tables
+        .iter()
+        .enumerate()
+        .map(|(at, table)| mysql_folder::TableFiles {
+            table: table.to_string(),
+            engine: Some("InnoDB".into()),
+            files: vec![mysql_folder::Piece {
+                file: format!("{:04}-{table}.sql", at + 1),
+                condition: None,
+            }],
+        })
+        .collect();
+    let manifest = mysql_folder::Manifest {
+        kerno_backup: 1,
+        engine: Engine::MySql,
+        database: "kerno_test_k63_ui_made".into(),
+        server_version: "8.4.6".into(),
+        client: "mysqldump  Ver 8.4.6 for macos15 on arm64".into(),
+        content,
+        options: MySqlBackup {
+            add_drop_table,
+            jobs: Some(2),
+            ..MySqlBackup::default()
+        },
+        tables,
+        after: Vec::new(),
+    };
+    for file in manifest.files() {
+        std::fs::write(folder.join(file), "SELECT 1;\n").unwrap();
+    }
+    std::fs::write(
+        folder.join(mysql_folder::MANIFEST),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    folder
+}
+
+/// The restore of a folder backup into a database that already holds some
+/// of its tables says what happens to them, as the backup was made: rows
+/// added (data only), dropped and created again (with or without their
+/// rows), or a stop at the first one (no DROP TABLE); nothing when none is
+/// there. The confirmation says it too (G3).
+#[gpui_kit::test]
+fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let target = "kerno_test_k63_ui_there";
+    let _scratch = Scratch::new(
+        engine,
+        &[&format!("DROP DATABASE IF EXISTS {target}")],
+        &[
+            &format!("CREATE DATABASE {target}"),
+            &format!("CREATE TABLE {target}.one (id INT PRIMARY KEY)"),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // A stand-in that never runs here: each restore stops at the
+    // confirmation.
+    let client = fake_client(
+        &root,
+        "mysql",
+        ClientFamily::MySql,
+        "mysqldump  Ver 8.4.6 for macos15 on arm64",
+        "exit 0",
+    );
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let held = format!("“{target}” already holds “one”");
+    let cases = [
+        (
+            "data",
+            &["one", "two"][..],
+            BackupContent::DataOnly,
+            true,
+            Some(
+                "which the backup has rows for: the backup holds rows only, so they are added to \
+                 the tables already there; a table that already holds some of them stops the \
+                 restore on a duplicate key, or ends with rows twice when it has no key.",
+            ),
+        ),
+        (
+            "all-drop",
+            &["one", "two"][..],
+            BackupContent::All,
+            true,
+            Some(
+                "which the backup has too: each is dropped and created again from the backup; the \
+                 database's other tables stay.",
+            ),
+        ),
+        (
+            "all-no-drop",
+            &["one", "two"][..],
+            BackupContent::All,
+            false,
+            Some(
+                "which the backup has too, and the backup was made without DROP TABLE \
+                 statements: the restore stops at the first of them.",
+            ),
+        ),
+        (
+            "schema-drop",
+            &["one", "two"][..],
+            BackupContent::SchemaOnly,
+            true,
+            Some(
+                "which the backup has too: the backup holds definitions only, so each is dropped \
+                 and created again empty: the rows it holds now are gone; the database's other \
+                 tables stay.",
+            ),
+        ),
+        ("none", &["two"][..], BackupContent::All, true, None),
+    ];
+    for (name, tables, content, drop, words) in cases {
+        let folder = folder_of(&root, name, tables, content, drop);
+        let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+        app.wait_backup(cx, &dialog, &["choose a file"]);
+        app.tap(cx, "restore-choose-file");
+        app.answer_open_prompt(cx, &folder);
+        let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+        assert!(state.starts_with("ready: "), "{name}: {state}");
+        app.wait_until(cx, "the database's tables", |_, cx| {
+            cx.update(|cx| dialog.read(cx).target_loaded())
+        });
+        let said = words.map(|words| format!("{held}, {words}"));
+        match &said {
+            Some(said) => assert_eq!(painted(&app, cx, said), 1, "{name}"),
+            None => assert_eq!(painted(&app, cx, &held), 0, "{name}"),
+        }
+        app.tap(cx, "restore-start");
+        app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+        // The confirmation says it too: the words twice now.
+        match &said {
+            Some(said) => assert_eq!(painted(&app, cx, said), 2, "{name}"),
+            None => assert_eq!(painted(&app, cx, &held), 0, "{name}"),
+        }
+        app.tap(cx, "sql-cancel");
+        app.tap(cx, "backup-close");
+    }
+}
+
+/// A backup made in utf8mb4 (its first lines set it), restored into a
+/// server older than 5.5.3: said before anything runs (G10).
+#[gpui_kit::test]
+fn a_utf8mb4_backup_for_an_old_server_is_said(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let target = "kerno_test_k63_ui_old";
+    let _scratch = Scratch::new(
+        engine,
+        &[&format!("DROP DATABASE IF EXISTS {target}")],
+        &[&format!("CREATE DATABASE {target}")],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = fake_client(
+        &root,
+        "mysql",
+        ClientFamily::MySql,
+        "mysqldump  Ver 10.13 Distrib 5.7.99, for osx10.19 (x86_64)",
+        "exit 0",
+    );
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let said = "This backup was made in utf8mb4, which MySQL 5.1.73 does not have: the restore \
+                stops at its first statement (ERROR 1115).";
+    for (name, head, warned) in [
+        (
+            "new.sql",
+            "-- MySQL dump 10.13\n/*!40101 SET NAMES utf8mb4 */;\nSELECT 1;\n",
+            true,
+        ),
+        (
+            "old.sql",
+            "-- MySQL dump 10.13\n/*!40101 SET NAMES utf8 */;\nSELECT 1;\n",
+            false,
+        ),
+    ] {
+        let file = root.join(name);
+        std::fs::write(&file, head).unwrap();
+        let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+        // As a 5.1 server would be read.
+        dialog.update(cx, |dialog, cx| dialog.set_server_version((5, 1, 73), cx));
+        app.wait_backup(cx, &dialog, &["choose a file"]);
+        app.tap(cx, "restore-choose-file");
+        app.answer_open_prompt(cx, &file);
+        let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+        assert!(state.starts_with("ready: "), "{name}: {state}");
+        assert_eq!(paints(&app, cx, said), warned, "{name}");
+        app.tap(cx, "backup-close");
+    }
+}
+
+/// mysqldump's "it has no fields" fails a MySQL backup only: a restore
+/// whose client writes the same line ends well (G6).
+#[gpui_kit::test]
+fn only_a_mysql_backup_fails_on_no_fields(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let target = "kerno_test_k63_ui_fields";
+    let _scratch = Scratch::new(
+        engine,
+        &[&format!("DROP DATABASE IF EXISTS {target}")],
+        &[&format!("CREATE DATABASE {target}")],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = fake_client(
+        &root,
+        "fields",
+        ClientFamily::MySql,
+        "mysqldump  Ver 8.4.6 for macos15 on arm64",
+        r#"for arg in "$@"; do case $arg in --result-file=*) echo '-- MySQL dump' > "${arg#--result-file=}";; esac; done
+echo "-- Skipping dump data for table 't', it has no fields" >&2
+echo "Note: the label says it has no fields" >&2
+exit 0"#,
+    );
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    // The restore: the same client prints the same lines.
+    let file = root.join("in.sql");
+    std::fs::write(&file, "SELECT 1;\n").unwrap();
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &file);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: "), "{state}");
+    app.tap(cx, "backup-close");
 }

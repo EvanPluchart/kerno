@@ -7,9 +7,9 @@
 //!
 //! The folder holds one file per table, each written by its own mysqldump
 //! of that one table; a table of at least [`RANGE_THRESHOLD`] bytes with a
-//! single-column integer primary key is cut into ranges of that key
+//! single-column integer primary key may be cut into ranges of that key
 //! ([`ranges`]), one `mysqldump --where` per range, the first carrying the
-//! table's definition. What is not a table's rows comes once, after the
+//! table's definition, where every range reads one moment ([`cut_rule`]). What is not a table's rows comes once, after the
 //! tables, in mysqldump's own order: the routines, triggers and events,
 //! then the views (which may call a routine and read each other). The
 //! manifest ([`MANIFEST`]) names the files and their order; a folder
@@ -18,7 +18,8 @@
 //! Each mysqldump reads at its own moment. With the default "single
 //! transaction" an InnoDB table (or one range of it) is read in one
 //! snapshot and any other table under `LOCK TABLES … READ` while it is
-//! read; two tables, or two ranges, are not read at the same instant. With
+//! read; the ranges of one table start under Kerno's lock of that table, so
+//! that they read one moment; two tables are not read at the same instant. With
 //! "lock all tables", Kerno's own session holds `FLUSH TABLES WITH READ
 //! LOCK` from before the first mysqldump until the last has ended, so that
 //! everything is read at one moment; any end of the run releases it.
@@ -121,6 +122,36 @@ pub struct Catalog {
     /// The server compares table names without case
     /// (`lower_case_table_names` 1 or 2).
     pub fold_names: bool,
+    /// The server's version, which says how a table may be cut ([`cut_rule`]).
+    pub server: (u32, u32, u32),
+}
+
+/// Which tables a folder backup may cut into ranges: only where every
+/// range of a table reads one moment (D-135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// Under the server's read lock ("lock all tables"): nothing changes
+    /// while the ranges are read, so any table, of any engine.
+    AnyEngine,
+    /// An InnoDB table, its ranges started together while Kerno holds the
+    /// table's read lock: each takes its snapshot while no write can
+    /// commit to the table. That needs metadata locks (MySQL 5.5.3 on,
+    /// every MariaDB Kerno supports): before them, a transaction that
+    /// already wrote to the table can commit under `LOCK TABLES … READ`.
+    InnoDbUnderTableLock,
+    /// No table is cut: "no locks" asked for none, and an older server
+    /// without the server's read lock cannot give one moment.
+    Never,
+}
+
+/// The rule of [`Cut`] for `method` on a server of version `server`.
+pub fn cut_rule(method: DumpMethod, server: (u32, u32, u32)) -> Cut {
+    match method {
+        DumpMethod::LockAllTables => Cut::AnyEngine,
+        DumpMethod::NoLocks => Cut::Never,
+        DumpMethod::SingleTransaction if server >= (5, 5, 3) => Cut::InnoDbUnderTableLock,
+        DumpMethod::SingleTransaction => Cut::Never,
+    }
 }
 
 /// `options` with each table and view it names spelled as the catalog
@@ -157,9 +188,9 @@ pub fn resolve_names(
     }
 }
 
-/// Whether a table's engine takes row locks and snapshots: only such a
-/// table is cut into ranges, each read in a snapshot taken while Kerno
-/// holds the table's read lock, so that every range reads one moment.
+/// Whether a table's engine takes row locks and snapshots: outside the
+/// server's read lock, only such a table is cut into ranges, each read in a
+/// snapshot taken while Kerno holds the table's read lock.
 fn transactional(engine: Option<&str>) -> bool {
     engine.is_some_and(|engine| engine.eq_ignore_ascii_case("innodb"))
 }
@@ -289,6 +320,12 @@ pub fn plan(
     };
     let data = options.content != BackupContent::SchemaOnly;
     let definitions = options.content != BackupContent::DataOnly;
+    let rule = cut_rule(my.method, catalog.server);
+    let cuttable = |engine: Option<&str>| match rule {
+        Cut::AnyEngine => true,
+        Cut::InnoDbUnderTableLock => transactional(engine),
+        Cut::Never => false,
+    };
     let tables: Vec<TableFiles> = catalog
         .tables
         .iter()
@@ -299,9 +336,7 @@ pub fn plan(
             let cut = table
                 .key
                 .as_ref()
-                .filter(|_| {
-                    data && table.bytes >= threshold && transactional(table.engine.as_deref())
-                })
+                .filter(|_| data && table.bytes >= threshold && cuttable(table.engine.as_deref()))
                 .map(|key| (key, ranges(key.min, key.max, jobs)))
                 .filter(|(_, pieces)| pieces.len() > 1);
             let files = match cut {
@@ -365,52 +400,125 @@ enum PieceLock {
     None,
 }
 
-/// mysqldump's options that the folder backup sets for each file, by their
-/// long names: one of the user's (or any abbreviation mysqldump would take
-/// for it, or a `skip-` / `loose-` form) would come after and win.
-const FOLDER_OWNS: [&str; 17] = [
-    "where",
-    "tab",
-    "tables",
-    "no-data",
-    "no-create-info",
-    "single-transaction",
-    "lock-all-tables",
-    "lock-tables",
-    "add-locks",
-    "databases",
-    "all-databases",
-    "triggers",
-    "routines",
-    "events",
-    "xml",
-    "opt",
-    "set-gtid-purged",
+/// The user's arguments a folder backup takes although they name an option
+/// it sets: `--set-gtid-purged=OFF` and `--skip-add-locks` are kept (the
+/// first is what it sets, the second only leaves out a lock around the
+/// rows of a whole table at the restore); `--skip-lock-tables` and
+/// `--skip-triggers` are taken over by [`FolderBackup::settled`].
+const FOLDER_KEEPS: [&str; 4] = [
+    "--set-gtid-purged=off",
+    "--skip-add-locks",
+    "--skip-lock-tables",
+    "--skip-triggers",
 ];
 
-/// Their short letters: `-w` (where), `-T` (tab), `-d` (no-data), `-t`
-/// (no-create-info), `-x` (lock-all-tables), `-l` (lock-tables), `-B`
-/// (databases), `-A` (all-databases), `-X` (xml), `-E` (events), `-R`
-/// (routines).
-const FOLDER_OWNS_LETTERS: &str = "wTdtxlBAXER";
+/// mysqldump's options the folder backup sets for each file (or that would
+/// break it), by their long names, with what it does instead: one of the
+/// user's (any abbreviation mysqldump would take for it, a `skip-` or
+/// `loose-` form) would come after and win.
+const FOLDER_OWNS: [(&str, &str); 31] = [
+    ("where", WHERE),
+    (
+        "tab",
+        "the folder backup writes SQL files itself; --tab has the server write text files",
+    ),
+    ("tables", WHICH),
+    ("databases", WHICH),
+    ("all-databases", WHICH),
+    ("ignore-table", WHICH),
+    ("ignore-table-data", WHICH),
+    ("no-data", WHICH),
+    ("no-create-info", WHICH),
+    ("xml", "the folder backup writes SQL files"),
+    ("single-transaction", HOW),
+    ("lock-all-tables", HOW),
+    ("lock-tables", HOW),
+    ("add-locks", HOW),
+    ("opt", OPT),
+    ("compact", OPT),
+    ("set-charset", OPT),
+    ("add-drop-table", OPT),
+    ("triggers", AFTER),
+    ("routines", AFTER),
+    ("events", AFTER),
+    (
+        "set-gtid-purged",
+        "the folder backup sets --set-gtid-purged=OFF itself",
+    ),
+    ("source-data", REPLICA),
+    ("master-data", REPLICA),
+    ("dump-replica", REPLICA),
+    ("dump-slave", REPLICA),
+    ("apply-replica-statements", REPLICA),
+    ("apply-slave-statements", REPLICA),
+    ("include-source-host-port", REPLICA),
+    ("include-master-host-port", REPLICA),
+    ("flush-logs", FLUSH),
+];
 
-/// Whether the user's argument `word` is one the folder backup sets itself.
-fn folder_owns(word: &str) -> bool {
-    if let Some(long) = word.strip_prefix("--") {
-        let mut name = long
-            .split('=')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .replace('_', "-");
+const WHERE: &str = "the folder backup sets its own --where for each range of a large table";
+const WHICH: &str = "the folder backup sets which tables each file holds and what of them (the \
+                     Objects page and the Content choice)";
+const HOW: &str = "the folder backup sets how each file is read (the Consistency choice)";
+const OPT: &str = "it turns off what the folder's files rely on (DROP TABLE before each table, the \
+                   character set, the table locks), which the backup's Settings choose";
+const AFTER: &str = "the folder backup writes them in a file of their own (the checkboxes in \
+                     Settings)";
+const REPLICA: &str = "a replication position is one moment of the whole server, and the folder's \
+                       files are not read at one moment: use the plain backup (one file) to seed a \
+                       replica";
+const FLUSH: &str = "each file would flush the server's logs, and wait behind Kerno's table locks: \
+                     use the plain backup for that";
+
+/// Their short letters.
+const FOLDER_OWNS_LETTERS: [(char, &str); 12] = [
+    ('w', WHERE),
+    (
+        'T',
+        "the folder backup writes SQL files itself; -T has the server write text files",
+    ),
+    ('d', WHICH),
+    ('t', WHICH),
+    ('B', WHICH),
+    ('A', WHICH),
+    ('X', "the folder backup writes SQL files"),
+    ('x', HOW),
+    ('l', HOW),
+    ('E', AFTER),
+    ('R', AFTER),
+    ('F', FLUSH),
+];
+
+/// Why the folder backup refuses the user's argument `word`, or `None`
+/// when it keeps it.
+fn folder_refusal(word: &str) -> Option<String> {
+    let normal = word.to_ascii_lowercase().replace('_', "-");
+    if FOLDER_KEEPS.contains(&normal.as_str()) {
+        return None;
+    }
+    let why = if let Some(long) = normal.strip_prefix("--") {
+        let mut name = long.split('=').next().unwrap_or_default().to_string();
         const PREFIXES: [&str; 5] = ["skip-", "enable-", "disable-", "loose-", "maximum-"];
         while let Some(rest) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) {
             name = rest.to_string();
         }
-        return !name.is_empty() && FOLDER_OWNS.iter().any(|own| own.starts_with(&name));
-    }
-    word.strip_prefix('-')
-        .is_some_and(|cluster| cluster.chars().any(|c| FOLDER_OWNS_LETTERS.contains(c)))
+        if name.is_empty() {
+            return None;
+        }
+        FOLDER_OWNS
+            .iter()
+            .find(|(own, _)| own.starts_with(&name))
+            .map(|(_, why)| *why)
+    } else {
+        let cluster = word.strip_prefix('-')?;
+        FOLDER_OWNS_LETTERS
+            .iter()
+            .find(|(letter, _)| cluster.contains(*letter))
+            .map(|(_, why)| *why)
+    }?;
+    Some(format!(
+        "“{word}”: {why}. Leave it out of the folder backup"
+    ))
 }
 
 /// `--set-gtid-purged=OFF` for a MySQL mysqldump that has it (5.6 on): on a
@@ -438,6 +546,35 @@ pub struct FolderBackup {
 }
 
 impl FolderBackup {
+    /// The backup with the user's arguments that the folder takes over
+    /// ([`FOLDER_KEEPS`]) taken out: `--skip-triggers` turns the triggers
+    /// off (in the plan, the files and the manifest); `--skip-lock-tables`
+    /// is dropped, as the folder sets how each file is locked. [`back_up`]
+    /// runs this.
+    pub fn settled(mut self) -> Result<Self> {
+        let words = super::split_words(&self.options.extra_args)?;
+        let taken = |word: &String, name: &str| word.to_ascii_lowercase().replace('_', "-") == name;
+        let no_triggers = words.iter().any(|word| taken(word, "--skip-triggers"));
+        let kept: Vec<String> = words
+            .into_iter()
+            .filter(|word| !taken(word, "--skip-triggers") && !taken(word, "--skip-lock-tables"))
+            .map(|word| {
+                // Quoted as `split_words` reads it back.
+                let escaped = word
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$")
+                    .replace('`', "\\`");
+                format!("\"{escaped}\"")
+            })
+            .collect();
+        self.options.extra_args = kept.join(" ");
+        if no_triggers && let EngineBackup::MySql(my) = &mut self.options.engine {
+            my.triggers = false;
+        }
+        Ok(self)
+    }
+
     fn my(&self) -> Result<&MySqlBackup> {
         match &self.options.engine {
             EngineBackup::MySql(my) => Ok(my),
@@ -505,14 +642,11 @@ impl FolderBackup {
             .iter()
             .position(|arg| arg.starts_with("--result-file="))
             .map_or(args.len(), |at| at + 1);
-        if let Some(word) = super::split_words(&self.options.extra_args)?
+        if let Some(why) = super::split_words(&self.options.extra_args)?
             .iter()
-            .find(|word| folder_owns(word))
+            .find_map(|word| folder_refusal(word))
         {
-            return Err(Error::Unsupported(format!(
-                "“{word}” would change what the folder backup sets itself for each file (its \
-                 tables, ranges, locks and definitions): leave it out of the folder backup"
-            )));
+            return Err(Error::Unsupported(why));
         }
         args.splice(at..at, more.iter().cloned());
         Ok(command)
@@ -654,7 +788,10 @@ pub async fn read_catalog(
         )
         .await;
     }
-    let mut catalog = Catalog::default();
+    let mut catalog = Catalog {
+        server: session.server().version_number,
+        ..Catalog::default()
+    };
     let fold = rows(session, "SELECT @@lower_case_table_names".into()).await?;
     catalog.fold_names = fold
         .first()
@@ -739,22 +876,35 @@ pub async fn read_catalog(
     Ok(catalog)
 }
 
-/// Whether the account may hold `FLUSH TABLES WITH READ LOCK`: it has the
-/// global RELOAD privilege (a privilege that only an active role of MySQL
-/// 8 gives is not seen, and the choice stays off).
-pub async fn can_lock(session: &Arc<dyn Session>) -> Result<bool> {
+/// Whether the account sees every account's running statements (the
+/// global PROCESS privilege): without it, [`long_statements`] lists only
+/// its own.
+pub async fn sees_every_statement(session: &Arc<dyn Session>) -> Result<bool> {
+    has_privilege(session, "PROCESS").await
+}
+
+/// Whether the account has the global privilege `privilege`.
+async fn has_privilege(session: &Arc<dyn Session>, privilege: &str) -> Result<bool> {
     let found = rows(
         session,
-        "SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE PRIVILEGE_TYPE = 'RELOAD' \
-         AND GRANTEE = CONCAT('''', SUBSTRING_INDEX(CURRENT_USER(), '@', 1), '''@''', \
-         SUBSTRING_INDEX(CURRENT_USER(), '@', -1), '''')"
-            .into(),
+        format!(
+            "SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE PRIVILEGE_TYPE = \
+             '{privilege}' AND GRANTEE = CONCAT('''', SUBSTRING_INDEX(CURRENT_USER(), '@', 1), \
+             '''@''', SUBSTRING_INDEX(CURRENT_USER(), '@', -1), '''')"
+        ),
     )
     .await?;
     Ok(found
         .first()
         .and_then(|row| row.first().cloned().flatten())
         .is_some_and(|count| count != "0"))
+}
+
+/// Whether the account may hold `FLUSH TABLES WITH READ LOCK`: it has the
+/// global RELOAD privilege (a privilege that only an active role of MySQL
+/// 8 gives is not seen, and the choice stays off).
+pub async fn can_lock(session: &Arc<dyn Session>) -> Result<bool> {
+    has_privilege(session, "RELOAD").await
 }
 
 /// One tool run of a pool.
@@ -823,7 +973,14 @@ fn failure_line(line: &str) -> bool {
 /// mysqldump's note when it reads no column of a table: a client that does
 /// not understand this server (8.4 and later on MySQL 5.1); it still exits
 /// 0 when the triggers are left out, with no table in the file.
-pub const NO_FIELDS: &str = "it has no fields";
+const NO_FIELDS: &str = "it has no fields";
+
+/// Whether `line` is mysqldump's own `--verbose` note that it read no
+/// column of a table ("-- Skipping dump data for table 't', it has no
+/// fields"), not a line that only holds the phrase.
+pub fn no_fields_line(line: &str) -> bool {
+    line.starts_with("-- Skipping dump data for table") && line.trim_end().ends_with(NO_FIELDS)
+}
 
 /// The `--verbose` line mysqldump writes once its snapshot is taken (it
 /// starts the transaction first): checked with the clients 5.5 to 26.10
@@ -867,7 +1024,7 @@ fn spawn_job(
             job.command,
             move |line| {
                 if let Ok(mut said) = heard.lock() {
-                    said.1 |= line.contains(NO_FIELDS);
+                    said.1 |= no_fields_line(&line);
                     if failure_line(&line) {
                         said.0 = Some(line.clone());
                     }
@@ -932,6 +1089,17 @@ fn queue_next(
     }
 }
 
+/// The first of `ready` that can start with `running` of `jobs` processes
+/// busy: a single file in any free process, a table's ranges once they all
+/// have one. Files behind a table that waits for its processes fill the
+/// free ones meanwhile.
+fn startable(ready: &VecDeque<Ready>, running: usize, jobs: usize) -> Option<usize> {
+    ready.iter().position(|item| match item {
+        Ready::One(..) => running < jobs,
+        Ready::Together(_, gate) => running == 0 || running + gate.ranges.len() <= jobs,
+    })
+}
+
 /// Runs `groups` with at most `jobs` tools at once. A group is a list of
 /// stages: a stage's files run side by side, the next stage once they all
 /// succeeded. A table's ranges start together on `locker`, Kerno's session
@@ -943,6 +1111,7 @@ async fn run_pool(
     on_line: OnLine,
     cancel: &AtomicBool,
     locker: Option<&Arc<dyn Session>>,
+    backup: bool,
 ) -> PoolEnd {
     let stop = Arc::new(AtomicBool::new(false));
     let mut groups = groups;
@@ -958,17 +1127,10 @@ async fn run_pool(
     let mut tick = tokio::time::interval(CANCEL_POLL);
     loop {
         while !stop.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
-            let free = match ready.front() {
-                None => false,
-                Some(Ready::One(..)) => running.len() < jobs,
-                Some(Ready::Together(_, gate)) => {
-                    running.is_empty() || running.len() + gate.ranges.len() <= jobs
-                }
-            };
-            if !free {
+            let Some(at) = startable(&ready, running.len(), jobs) else {
                 break;
-            }
-            match ready.pop_front() {
+            };
+            match ready.remove(at) {
                 Some(Ready::One(group, job)) => {
                     spawn_job(&mut running, &mut names, group, job, &on_line, &stop, None);
                 }
@@ -1062,7 +1224,7 @@ async fn run_pool(
                 let failed = match ran {
                     // A task that panicked: that file failed (F5).
                     Err(error) => Some(format!("Kerno's task stopped unexpectedly ({error})")),
-                    Ok((Ok(_), _, true)) => Some(
+                    Ok((Ok(_), _, true)) if backup => Some(
                         "the client found no columns in the table: it cannot read this \
                          server's tables (choose another client with “Local client…”)"
                             .to_string(),
@@ -1210,7 +1372,8 @@ pub async fn long_statements(
         session,
         format!(
             "SELECT ID, TIME, LEFT(COALESCE(INFO, ''), 80) FROM information_schema.PROCESSLIST \
-             WHERE COMMAND = 'Query' AND TIME >= {seconds} AND ID <> CONNECTION_ID() \
+             WHERE COMMAND IN ('Query', 'Execute') AND TIME >= {seconds} \
+             AND ID <> CONNECTION_ID() \
              ORDER BY TIME DESC"
         ),
     )
@@ -1243,6 +1406,15 @@ pub async fn back_up(
     cancel: Arc<AtomicBool>,
 ) -> FolderEnd {
     let mut made = false;
+    let job = match job.settled() {
+        Ok(job) => job,
+        Err(error) => {
+            return FolderEnd {
+                outcome: Err(error),
+                removed: false,
+            };
+        }
+    };
     let outcome = back_up_in(&job, &session, &on_line, &cancel, &mut made).await;
     let removed = outcome.is_err() && made && std::fs::remove_dir_all(&job.folder).is_ok();
     FolderEnd { outcome, removed }
@@ -1257,7 +1429,8 @@ async fn back_up_in(
 ) -> Result<()> {
     prepare_locks(session).await;
     if !job.locks() {
-        let (tables, after) = dump_all(job, session, on_line, cancel, made, false).await?;
+        let prepared = prepare(job, session, on_line, made).await?;
+        let (tables, after) = dump_all(job, session, on_line, cancel, prepared).await?;
         return write_manifest(job, session, tables, after);
     }
     // The lock first, then the catalog (as `--lock-all-tables`): a table
@@ -1270,44 +1443,90 @@ async fn back_up_in(
             return Err(error);
         }
     };
-    // Watched while the tools run: a server or a proxy may close an idle
-    // session, and its lock with it.
+    let prepared = match prepare(job, session, on_line, made).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = exec::collect(session.clone(), "UNLOCK TABLES").await;
+            return Err(error);
+        }
+    };
+    // Watched while the tools run, once the catalog is read: Kerno sends
+    // nothing else on the session meanwhile. A server or a proxy may close
+    // an idle session, and its lock with it.
     let lost: Mutex<Option<String>> = Mutex::new(None);
     let (inner, done) = (AtomicBool::new(false), AtomicBool::new(false));
     let dumping = async {
-        let dumped = dump_all(job, session, on_line, &inner, made, true).await;
+        let dumped = dump_all(job, session, on_line, &inner, prepared).await;
         done.store(true, Ordering::Relaxed);
         dumped
     };
     let watching = async {
+        // One check at a time, never dropped half-way (that could break the
+        // session): one that has not answered yet is no evidence, only an
+        // error or another connection's id is.
+        let mut check: Option<tokio::task::JoinHandle<Held>> = None;
         let mut checked = std::time::Instant::now();
         while !done.load(Ordering::Relaxed) {
             if cancel.load(Ordering::Relaxed) {
                 inner.store(true, Ordering::Relaxed);
             }
-            if checked.elapsed() >= WATCH_EVERY {
-                checked = std::time::Instant::now();
-                if connection_id(session).await.as_deref() != Some(id.as_str()) {
-                    if let Ok(mut lost) = lost.lock() {
-                        *lost = Some(clock());
-                    }
-                    inner.store(true, Ordering::Relaxed);
-                    break;
+            if check.as_ref().is_some_and(|running| running.is_finished())
+                && let Some(running) = check.take()
+                && let Ok(Held::Lost) = running.await
+            {
+                if let Ok(mut lost) = lost.lock() {
+                    *lost = Some(clock());
                 }
+                inner.store(true, Ordering::Relaxed);
+                break;
+            }
+            if check.is_none() && checked.elapsed() >= WATCH_EVERY {
+                checked = std::time::Instant::now();
+                check = Some(tokio::spawn(held(session.clone(), id.clone())));
             }
             tokio::time::sleep(CANCEL_POLL).await;
         }
+        check
     };
-    let (dumped, ()) = tokio::join!(dumping, watching);
-    // Still the same session, then released: otherwise the lock was lost
-    // at some point and the backup is not consistent.
+    let (dumped, check) = tokio::join!(dumping, watching);
+    // Still the same session at the end, then released: otherwise the lock
+    // was lost at some point and the backup is not consistent.
     let lost_at = lost.lock().ok().and_then(|lost| lost.clone());
-    let kept = lost_at.is_none() && connection_id(session).await.as_deref() == Some(id.as_str());
+    let at_end = match lost_at {
+        Some(_) => Held::Lost,
+        None => {
+            let (session, id) = (session.clone(), id.clone());
+            let last = tokio::spawn(async move {
+                // The session answers in order: the check under way first.
+                if let Some(check) = check {
+                    let _ = check.await;
+                }
+                held(session, id).await
+            });
+            match tokio::time::timeout(FINAL_CHECK, last).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(_)) => Held::Lost,
+                Err(_) => Held::NoAnswer,
+            }
+        }
+    };
+    if let Held::NoAnswer = at_end {
+        // UNLOCK TABLES would wait behind the statement that does not
+        // answer; the lock goes when the app closes the session.
+        on_line("Kerno: the read lock's session does not answer.".into());
+        return Err(Error::Config(format!(
+            "Kerno could not confirm that its read lock held to the end (its session did not \
+             answer within {} s): the backup may not be consistent, and its folder was removed. \
+             Back up again.",
+            FINAL_CHECK.as_secs()
+        )));
+    }
+    on_line("Kerno: releasing the read lock".into());
     let unlocked = exec::collect(session.clone(), "UNLOCK TABLES")
         .await
         .is_ok();
     on_line("Kerno: UNLOCK TABLES".into());
-    if !(kept && unlocked) {
+    if !(matches!(at_end, Held::Yes) && unlocked) {
         let at = lost_at.unwrap_or_else(clock);
         on_line(format!("Kerno: the read lock was lost at {at}."));
         return Err(Error::Config(lock_lost(&at)));
@@ -1316,20 +1535,56 @@ async fn back_up_in(
     write_manifest(job, session, tables, after)
 }
 
+/// How long the last check of the read lock's session may take.
+const FINAL_CHECK: Duration = Duration::from_secs(60);
+
+/// What a check of the read lock's session found.
+enum Held {
+    /// The same connection answered.
+    Yes,
+    /// It failed, or another connection answered: the lock is gone.
+    Lost,
+    /// No answer within the wait: not evidence either way.
+    NoAnswer,
+}
+
+/// Checks that `session` is still the connection `id` that holds the lock.
+async fn held(session: Arc<dyn Session>, id: String) -> Held {
+    match rows(&session, "SELECT CONNECTION_ID()".into()).await {
+        Err(_) => Held::Lost,
+        Ok(found) => {
+            let answered = found.first().and_then(|row| row.first().cloned().flatten());
+            if answered.as_deref() == Some(id.as_str()) {
+                Held::Yes
+            } else {
+                Held::Lost
+            }
+        }
+    }
+}
+
 /// How often the read lock's session is checked during the run.
 const WATCH_EVERY: Duration = Duration::from_secs(2);
 
-/// Reads the catalog, checks the names picked, makes the folder and runs
-/// every mysqldump; the tables and the files after them, as the manifest
-/// will list them. `global`: the server's read lock is held (no table lock).
-async fn dump_all(
+/// A backup ready to run: its tables and the files after them, as the
+/// manifest will list them, and the jobs.
+struct Prepared {
+    tables: Vec<TableFiles>,
+    after: Vec<AfterFile>,
+    groups: Vec<VecDeque<Stage>>,
+    finishing: VecDeque<Stage>,
+    /// The table locks of [`Cut::InnoDbUnderTableLock`] are taken.
+    gated: bool,
+}
+
+/// Reads the catalog, checks the names picked, builds every command and
+/// makes the folder.
+async fn prepare(
     job: &FolderBackup,
     session: &Arc<dyn Session>,
     on_line: &OnLine,
-    cancel: &AtomicBool,
     made: &mut bool,
-    global: bool,
-) -> Result<(Vec<TableFiles>, Vec<AfterFile>)> {
+) -> Result<Prepared> {
     let database = &job.options.database;
     let catalog = read_catalog(session, database, job.range_threshold).await?;
     let options = resolve_names(&catalog, &job.options).map_err(|missing| {
@@ -1341,11 +1596,14 @@ async fn dump_all(
             names.join(", ")
         ))
     })?;
-    let (mut tables, after) = plan(&catalog, &options, job.jobs(), job.range_threshold);
+    let (tables, after) = plan(&catalog, &options, job.jobs(), job.range_threshold);
+    let gated = job
+        .my()
+        .is_ok_and(|my| cut_rule(my.method, catalog.server) == Cut::InnoDbUnderTableLock);
     // Every command is built before anything runs: a refused option stops
     // the backup before the folder exists.
     let quote = |name: &str| session.dialect().quote_ident(name);
-    let (mut together, mut side) = (Vec::new(), Vec::new());
+    let (mut groups, mut side) = (Vec::new(), Vec::new());
     for (index, table) in tables.iter().enumerate() {
         let n = table.files.len();
         let label = |at: usize| match n {
@@ -1360,7 +1618,7 @@ async fn dump_all(
                 command: job.piece_command(table, piece)?,
             });
         }
-        if n > 1 && !global {
+        if n > 1 && gated {
             let whole = TableFiles {
                 files: vec![Piece {
                     file: table.files[0].file.replace(".part01.sql", ".sql"),
@@ -1368,7 +1626,7 @@ async fn dump_all(
                 }],
                 ..table.clone()
             };
-            together.push(VecDeque::from([Stage::Together(Box::new(Gate {
+            groups.push(VecDeque::from([Stage::Together(Box::new(Gate {
                 label: table.table.clone(),
                 lock: format!(
                     "LOCK TABLES {}.{} READ",
@@ -1390,6 +1648,9 @@ async fn dump_all(
             );
         }
     }
+    // The tables cut into ranges first: each needs several processes at
+    // once, and the single files fill the others meanwhile.
+    groups.extend(side);
     let mut finishing = VecDeque::new();
     for file in &after {
         finishing.push_back(Stage::Side(vec![Job {
@@ -1424,17 +1685,33 @@ async fn dump_all(
             n => format!(", {n} tables cut into ranges of their key"),
         }
     ));
-    // The tables cut into ranges first: each needs every process at once.
-    together.extend(side);
-    let locker = (!global).then_some(session);
-    let end = run_pool(
-        together,
-        job.jobs() as usize,
-        on_line.clone(),
-        cancel,
-        locker,
-    )
-    .await;
+    Ok(Prepared {
+        tables,
+        after,
+        groups,
+        finishing,
+        gated,
+    })
+}
+
+/// Runs every mysqldump of `prepared`.
+async fn dump_all(
+    job: &FolderBackup,
+    session: &Arc<dyn Session>,
+    on_line: &OnLine,
+    cancel: &AtomicBool,
+    prepared: Prepared,
+) -> Result<(Vec<TableFiles>, Vec<AfterFile>)> {
+    let Prepared {
+        mut tables,
+        after,
+        groups,
+        finishing,
+        gated,
+    } = prepared;
+    let locker = gated.then_some(session);
+    let jobs = job.jobs() as usize;
+    let end = run_pool(groups, jobs, on_line.clone(), cancel, locker, true).await;
     for &index in &end.whole {
         let table = &mut tables[index];
         table.files = vec![Piece {
@@ -1443,7 +1720,7 @@ async fn dump_all(
         }];
     }
     settle(end, "mysqldump")?;
-    let end = run_pool(vec![finishing], 1, on_line.clone(), cancel, None).await;
+    let end = run_pool(vec![finishing], 1, on_line.clone(), cancel, None, true).await;
     settle(end, "mysqldump")?;
     Ok((tables, after))
 }
@@ -1655,9 +1932,9 @@ async fn restore_in(
         manifest.files().count(),
         job.jobs()
     ));
-    let tables = run_pool(groups, job.jobs(), on_line.clone(), cancel, None).await;
+    let tables = run_pool(groups, job.jobs(), on_line.clone(), cancel, None, false).await;
     let finished = if tables.failure.is_none() && !tables.cancelled {
-        Some(run_pool(vec![finishing], 1, on_line.clone(), cancel, None).await)
+        Some(run_pool(vec![finishing], 1, on_line.clone(), cancel, None, false).await)
     } else {
         None
     };
@@ -1878,12 +2155,14 @@ mod tests {
             tables: vec![
                 table("big", "InnoDB", 2 * RANGE_THRESHOLD, Some((1, 1000))),
                 table("big no key", "InnoDB", 3 * RANGE_THRESHOLD, None),
-                // Large, with a key, but MyISAM: no snapshot, never cut.
+                // Large, with a key, but MyISAM: no snapshot, cut only
+                // under the server's read lock.
                 table("small", "MyISAM", 2 * RANGE_THRESHOLD, Some((1, 10))),
                 table("tiny/odd", "InnoDB", RANGE_THRESHOLD, Some((7, 7))),
             ],
             views: vec!["v1".into(), "v2".into()],
             fold_names: false,
+            server: (8, 4, 13),
         }
     }
 
@@ -1914,50 +2193,74 @@ mod tests {
 
     #[test]
     fn the_folder_backup_refuses_the_options_it_sets_itself_in_every_spelling() {
-        for word in [
-            "--where=1",
-            "--wher=1",
-            "--w=1",
-            "-w1",
-            "-w",
-            "--WHERE=x",
-            "--loose-where=1",
-            "--tab=/tmp",
-            "-T/tmp",
-            "--ta=/tmp",
-            "--tables",
-            "--no-data",
-            "-d",
-            "--no-create-info",
-            "-t",
-            "--no-c",
-            "--single-transaction",
-            "--single",
-            "--lock-all-tables",
-            "-x",
-            "--lock-tables",
-            "-l",
-            "--skip-lock-tables",
-            "--add-locks",
-            "--skip-add-locks",
-            "--databases",
-            "-B",
-            "--all-databases",
-            "-A",
-            "--skip-triggers",
-            "--routines",
-            "-R",
-            "--events",
-            "-E",
-            "--xml",
-            "-X",
-            "--opt",
-            "--set-gtid-purged=ON",
-            "-vw",
+        for (word, said) in [
+            ("--where=1", "its own --where"),
+            ("--wher=1", "its own --where"),
+            ("--w=1", "its own --where"),
+            ("-w1", "its own --where"),
+            ("--WHERE=x", "its own --where"),
+            ("--loose-where=1", "its own --where"),
+            ("--tab=/tmp", "text files"),
+            ("-T/tmp", "text files"),
+            ("--ta=/tmp", "text files"),
+            ("--tables", "which tables"),
+            ("--no-data", "which tables"),
+            ("-d", "which tables"),
+            ("--no-create-info", "which tables"),
+            ("-t", "which tables"),
+            ("--no-c", "which tables"),
+            ("--ignore-table=db.t", "which tables"),
+            ("--ignore-table-data=db.t", "which tables"),
+            ("--databases", "which tables"),
+            ("-B", "which tables"),
+            ("--all-databases", "which tables"),
+            ("-A", "which tables"),
+            ("--single-transaction", "how each file is read"),
+            ("--single", "how each file is read"),
+            ("--lock-all-tables", "how each file is read"),
+            ("-x", "how each file is read"),
+            ("--lock-tables", "how each file is read"),
+            ("-l", "how each file is read"),
+            ("--add-locks", "how each file is read"),
+            ("--opt", "which the backup's Settings choose"),
+            ("--skip-opt", "which the backup's Settings choose"),
+            ("--compact", "which the backup's Settings choose"),
+            ("--skip-set-charset", "which the backup's Settings choose"),
+            (
+                "--skip-add-drop-table",
+                "which the backup's Settings choose",
+            ),
+            ("--triggers", "a file of their own"),
+            ("--routines", "a file of their own"),
+            ("-R", "a file of their own"),
+            ("--events", "a file of their own"),
+            ("-E", "a file of their own"),
+            ("--xml", "SQL files"),
+            ("-X", "SQL files"),
+            ("--set-gtid-purged=ON", "--set-gtid-purged=OFF itself"),
+            ("--source-data=2", "seed a replica"),
+            ("--master-data", "seed a replica"),
+            ("--dump-replica=1", "seed a replica"),
+            ("--dump-slave", "seed a replica"),
+            ("--apply-replica-statements", "seed a replica"),
+            ("--include-master-host-port", "seed a replica"),
+            ("--flush-logs", "flush the server's logs"),
+            ("-F", "flush the server's logs"),
+            ("-vw", "its own --where"),
         ] {
-            assert!(folder_owns(word), "{word}");
+            let refused = folder_refusal(word).unwrap_or_else(|| panic!("{word} kept"));
+            assert!(
+                refused.starts_with(&format!("“{word}”")) && refused.contains(said),
+                "{refused}"
+            );
         }
+        // Equal to what the folder backup sets, changing nothing it relies
+        // on, or taken over by `settled` (G9).
         for word in [
+            "--set-gtid-purged=OFF",
+            "--skip-lock-tables",
+            "--skip-add-locks",
+            "--skip-triggers",
             "--max-allowed-packet=64M",
             "--net-buffer-length=1M",
             "--quick",
@@ -1969,21 +2272,186 @@ mod tests {
             "-q",
             "-C",
         ] {
-            assert!(!folder_owns(word), "{word}");
+            assert_eq!(folder_refusal(word), None, "{word}");
         }
         let mysql57 = "mysqldump  Ver 10.13 Distrib 5.7.44, for osx10.19 (x86_64)";
         let mut job = folder_backup(mysql57, DumpMethod::SingleTransaction);
         let (tables, _) = plan(&catalog(), &job.options, 4, RANGE_THRESHOLD);
-        for extra in ["-w1=1", "--wher=1", "--tab=/tmp"] {
+        for extra in ["-w1=1", "--wher=1", "--tab=/tmp", "--source-data=2", "-F"] {
             job.options.extra_args = extra.into();
             let refused = job
                 .piece_command(&tables[1], &tables[1].files[0])
                 .unwrap_err();
             assert!(
-                refused.to_string().contains("leave it out"),
+                refused
+                    .to_string()
+                    .contains("Leave it out of the folder backup"),
                 "{extra}: {refused}"
             );
         }
+        // `--skip-lock-tables` is dropped: the MyISAM table keeps the lock
+        // it is read under; `--skip-triggers` turns the triggers off.
+        job.options.extra_args =
+            "--skip-triggers --skip-lock-tables --set-gtid-purged=OFF '--net-buffer-length=1 M'"
+                .into();
+        let job = job.settled().unwrap();
+        assert!(!job.my().unwrap().triggers);
+        let small = tables.iter().find(|table| table.table == "small").unwrap();
+        let kept = job.piece_command(small, &small.files[0]).unwrap();
+        assert!(
+            kept.args.contains(&"--lock-tables".to_string()),
+            "{:?}",
+            kept.args
+        );
+        assert!(
+            !kept.args.contains(&"--skip-lock-tables".to_string()),
+            "{:?}",
+            kept.args
+        );
+        assert!(
+            kept.args.ends_with(&[
+                "--set-gtid-purged=OFF".to_string(),
+                "--net-buffer-length=1 M".to_string(),
+                "db".to_string(),
+                "small".to_string(),
+            ]),
+            "{:?}",
+            kept.args
+        );
+    }
+
+    /// A table is cut only where every range reads one moment (G1, G7):
+    /// under the server's read lock, any engine; with the table's lock, an
+    /// InnoDB table from 5.5.3 on; under "no locks", or before 5.5.3
+    /// without the server's lock, none.
+    #[test]
+    fn a_table_is_cut_only_where_its_ranges_read_one_moment() {
+        let cut = |method: DumpMethod, server: (u32, u32, u32)| {
+            let mut options = BackupOptions::new(Engine::MySql, "db");
+            if let EngineBackup::MySql(my) = &mut options.engine {
+                my.method = method;
+            }
+            let catalog = Catalog {
+                server,
+                ..catalog()
+            };
+            let (tables, _) = plan(&catalog, &options, 4, RANGE_THRESHOLD);
+            tables
+                .iter()
+                .filter(|table| table.files.len() > 1)
+                .map(|table| table.table.clone())
+                .collect::<Vec<_>>()
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(cut(DumpMethod::SingleTransaction, (8, 4, 13)), ["big"]);
+        assert_eq!(cut(DumpMethod::SingleTransaction, (5, 5, 3)), ["big"]);
+        assert_eq!(cut(DumpMethod::SingleTransaction, (5, 5, 2)), none);
+        assert_eq!(cut(DumpMethod::SingleTransaction, (5, 1, 73)), none);
+        // The large MyISAM table too, under the server's lock.
+        assert_eq!(cut(DumpMethod::LockAllTables, (5, 1, 73)), ["big", "small"]);
+        assert_eq!(cut(DumpMethod::LockAllTables, (8, 4, 13)), ["big", "small"]);
+        assert_eq!(cut(DumpMethod::NoLocks, (8, 4, 13)), none);
+        assert_eq!(
+            cut_rule(DumpMethod::SingleTransaction, (11, 8, 9)),
+            Cut::InnoDbUnderTableLock
+        );
+    }
+
+    /// Single files fill the processes a table's ranges wait for (G5).
+    #[test]
+    fn single_files_start_while_a_table_waits_for_its_processes() {
+        let command = ToolCommand {
+            program: PathBuf::from("/x/mysqldump"),
+            args: Vec::new(),
+            env: Vec::new(),
+            password: None,
+            stdin: None,
+            sent: Arc::default(),
+            tunnel: None,
+            script_check: None,
+        };
+        let job = |file: &str| Job {
+            file: file.into(),
+            label: file.into(),
+            command: command.clone(),
+        };
+        let gate = |n: usize| Gate {
+            label: "big".into(),
+            lock: String::new(),
+            table: 0,
+            ranges: (0..n).map(|at| job(&format!("r{at}"))).collect(),
+            whole: job("whole"),
+        };
+        let ready = VecDeque::from([
+            Ready::Together(0, gate(4)),
+            Ready::One(1, job("a")),
+            Ready::One(2, job("b")),
+        ]);
+        // Nothing runs: the table's ranges first.
+        assert_eq!(startable(&ready, 0, 4), Some(0));
+        // Two run: the ranges wait, a single file takes a free process.
+        assert_eq!(startable(&ready, 2, 4), Some(1));
+        // Every process busy: nothing.
+        assert_eq!(startable(&ready, 4, 4), None);
+        // Fewer ranges than processes: they start as soon as they fit.
+        let ready = VecDeque::from([Ready::Together(0, gate(2)), Ready::One(1, job("a"))]);
+        assert_eq!(startable(&ready, 2, 4), Some(0));
+        assert_eq!(startable(&ready, 3, 4), Some(1));
+    }
+
+    #[test]
+    fn only_mysqldump_s_own_line_says_no_fields() {
+        assert!(no_fields_line(
+            "-- Skipping dump data for table 't', it has no fields"
+        ));
+        assert!(!no_fields_line(
+            "INSERT INTO notes VALUES ('it has no fields')"
+        ));
+        assert!(!no_fields_line("ERROR: it has no fields"));
+    }
+
+    #[test]
+    fn a_backup_refuses_what_would_hide_mysqldump_s_lines() {
+        for word in [
+            "--log-error=/tmp/x",
+            "--log-err=/tmp/x",
+            "--LOG_ERROR=/tmp/x",
+            "--loose-log-error=/tmp/x",
+            "--log=/tmp/x",
+            "--skip-verbose",
+            "--disable-verbose",
+            "--loose-skip-verbose",
+            "--skip-verb",
+            "--verbose=0",
+            "--verbose=FALSE",
+            "--verbose=off",
+        ] {
+            assert!(super::super::silences(word), "{word}");
+        }
+        for word in [
+            "--verbose",
+            "-v",
+            "--verbose=1",
+            "--lock-tables",
+            "--log-queries",
+        ] {
+            assert!(!super::super::silences(word), "{word}");
+        }
+        let job = folder_backup(
+            "mysqldump  Ver 26.10.0 for macos27.0 on arm64 (Homebrew)",
+            DumpMethod::SingleTransaction,
+        );
+        let options = BackupOptions {
+            extra_args: "--log-error=/tmp/kerno-k63".into(),
+            ..BackupOptions::new(Engine::MySql, "db")
+        };
+        let refused = backup_command(&job.tool_path, &job.params, &options, Path::new("/b/x.sql"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("would hide the lines Kerno reads"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -2047,7 +2515,7 @@ mod tests {
         let on_line: OnLine = Arc::new(|line: String| {
             assert!(!line.ends_with("] boom"), "a panic in the task");
         });
-        let end = run_pool(groups, 1, on_line, &AtomicBool::new(false), None).await;
+        let end = run_pool(groups, 1, on_line, &AtomicBool::new(false), None, true).await;
         let (label, why) = end.failure.expect("a failure");
         assert_eq!(label, "t boom");
         assert!(why.contains("stopped unexpectedly"), "{why}");

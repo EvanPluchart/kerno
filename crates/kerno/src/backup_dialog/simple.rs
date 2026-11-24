@@ -21,7 +21,8 @@ use gpui_kit::{
 };
 use kerno_core::config::Engine;
 use kerno_core::tools::{
-    BackupFormat, BackupOptions, ClientFamily, DumpMethod, EngineBackup, RestoreOptions,
+    BackupContent, BackupFormat, BackupOptions, ClientFamily, DumpMethod, EngineBackup,
+    RestoreOptions,
 };
 
 use super::{BackupDialog, Input, Loaded, Mode, Purpose, Step, View, is_view};
@@ -578,9 +579,23 @@ impl BackupDialog {
                  already applied."
             }
         };
+        let old = match &self.input {
+            Some(Ok(input))
+                if input.utf8mb4
+                    && self.family == ClientFamily::MySql
+                    && self.server_version < (5, 5, 3) =>
+            {
+                let (a, b, c) = self.server_version;
+                format!(
+                    " This backup was made in utf8mb4, which MySQL {a}.{b}.{c} does not have: the \
+                     restore stops at its first statement (ERROR 1115)."
+                )
+            }
+            _ => String::new(),
+        };
         format!(
             "A restore writes into “{}” on top of what it holds and cannot be undone. Kerno \
-             shows the command and asks before it runs.{tail}{}",
+             shows the command and asks before it runs.{tail}{}{old}",
             self.database,
             self.overlap_words()
         )
@@ -588,7 +603,7 @@ impl BackupDialog {
 
     /// A folder backup restored into a database that already holds some of
     /// its tables: what happens to them (K63).
-    fn overlap_words(&self) -> String {
+    pub(super) fn overlap_words(&self) -> String {
         let (
             Some(Ok(Input {
                 manifest: Some(manifest),
@@ -621,7 +636,22 @@ impl BackupDialog {
         } else {
             listed(&both)
         };
-        if manifest.options.add_drop_table {
+        if manifest.content == BackupContent::DataOnly {
+            format!(
+                " “{}” already holds {shown}, which the backup has rows for: the backup holds \
+                 rows only, so they are added to the tables already there; a table that already \
+                 holds some of them stops the restore on a duplicate key, or ends with rows twice \
+                 when it has no key.",
+                self.database
+            )
+        } else if manifest.options.add_drop_table && manifest.content == BackupContent::SchemaOnly {
+            format!(
+                " “{}” already holds {shown}, which the backup has too: the backup holds \
+                 definitions only, so each is dropped and created again empty: the rows it holds \
+                 now are gone; the database's other tables stay.",
+                self.database
+            )
+        } else if manifest.options.add_drop_table {
             format!(
                 " “{}” already holds {shown}, which the backup has too: each is dropped and \
                  created again from the backup; the database's other tables stay.",
@@ -729,11 +759,18 @@ impl BackupDialog {
                     "The backup is then a folder, one file per table, which Kerno restores like \
                      any backup. A single large table is still read by one connection."
                 }
+                ClientFamily::MySql if self.server_version < (5, 5, 3) => {
+                    "The backup is then a folder, one file per table, which Kerno restores on \
+                     several connections too. On this server, a large table with a single-column \
+                     whole-number key is read in several parts at once only with “Block writes” \
+                     below: only then is every part read at one moment. Otherwise each table is \
+                     read by one connection."
+                }
                 ClientFamily::MySql => {
                     "The backup is then a folder, one file per table, which Kerno restores on \
                      several connections too. A large InnoDB table with a single-column \
-                     whole-number key is read in several parts at once; any other is still read by \
-                     one connection."
+                     whole-number key is read in several parts at once, and a large table of any \
+                     engine with “Block writes” below; any other is still read by one connection."
                 }
             };
             row(

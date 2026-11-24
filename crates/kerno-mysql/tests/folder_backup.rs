@@ -37,6 +37,8 @@ const NAMES: &str = "kerno_test_k63_names";
 const MOVING: &str = "kerno_test_k63_moving";
 const WAIT: &str = "kerno_test_k63_wait";
 const SIZES: &str = "kerno_test_k63_sizes";
+const BUSY: &str = "kerno_test_k63_busy";
+const ARGS: &str = "kerno_test_k63_args";
 
 /// One test of this file at a time: a test that holds the server's read
 /// lock would make the others' writes wait.
@@ -277,9 +279,10 @@ fn folder_options(database: &str, jobs: u32, method: DumpMethod) -> BackupOption
     }
 }
 
-/// Backs the source up into a folder on 4 processes, every table with an
-/// integer key cut into ranges, then restores it on 4 clients.
-async fn round_trip(server: &'static Server, client: PathBuf) {
+/// Backs the source up into a folder on 4 processes with `method`, each
+/// table with an integer key that may be cut cut into ranges, then restores
+/// it on 4 clients.
+async fn round_trip(server: &'static Server, client: PathBuf, method: DumpMethod) {
     let admin = session(&server.params, None).await;
     for db in [SOURCE, TARGET] {
         exec_ok(&admin, &format!("CREATE DATABASE {db}")).await;
@@ -299,7 +302,7 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
     let files = tempfile::tempdir().unwrap();
     let folder = files.path().join("backup");
     let (on_line, lines) = sink();
-    let mut options = folder_options(SOURCE, 4, DumpMethod::SingleTransaction);
+    let mut options = folder_options(SOURCE, 4, method);
     options.utf8mb4 = tools::utf8mb4(server.dump_version.as_ref(), server_version);
     let ended = mysql_folder::back_up(
         FolderBackup {
@@ -327,19 +330,25 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
         .iter()
         .map(|table| (table.table.clone(), table.files.len()))
         .collect();
+    // Under the server's read lock any engine is cut, the MyISAM table
+    // too; otherwise an InnoDB table, from 5.5.3 on (D-135).
+    let (big, plain) = match method {
+        DumpMethod::LockAllTables => (4, 4),
+        _ if server_version >= (5, 5, 3) => (4, 1),
+        _ => (1, 1),
+    };
     assert_eq!(
         pieces,
         [
-            ("big", 4),
+            ("big", big),
             ("chars", 1),
             ("empty_one", 1),
             ("loose", 1),
             ("pairs", 1),
-            // MyISAM: no snapshot, so never cut (D-135).
-            ("plain", 1)
+            ("plain", plain)
         ]
         .map(|(name, n)| (name.to_string(), n)),
-        "{}",
+        "{}: {method:?}",
         server.label
     );
     assert_eq!(manifest.after.len(), 2);
@@ -394,7 +403,33 @@ async fn a_folder_backup_restores_identical_on_every_server() {
         with_scratch(
             &server.params,
             &[SOURCE, TARGET],
-            round_trip(server, client),
+            round_trip(server, client, DumpMethod::SingleTransaction),
+        )
+        .await;
+    }
+}
+
+/// Under the server's read lock every table is read at one moment, so a
+/// large table of any engine is cut, MyISAM included; the restore loads its
+/// ranges one after the other, and gives back the same bytes (G1).
+#[tokio::test]
+async fn under_the_read_lock_a_myisam_table_is_cut_too() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, client)) = servers() else {
+        return;
+    };
+    let wanted = ["MySQL", "kerno-mysql51"];
+    for server in servers
+        .into_iter()
+        .filter(|s| wanted.contains(&s.label.as_str()))
+    {
+        eprintln!("--- {} under the read lock", server.label);
+        let server: &'static Server = Box::leak(Box::new(server));
+        let client = client.clone();
+        with_scratch(
+            &server.params,
+            &[SOURCE, TARGET],
+            round_trip(server, client, DumpMethod::LockAllTables),
         )
         .await;
     }
@@ -768,9 +803,116 @@ async fn cancelled(server: &'static Server) {
     }
 }
 
+/// A session that keeps every statement it was sent, in order: what the
+/// server saw from Kerno's own session. One statement at a time, as a real
+/// session; each is also noted when it is asked for (`asked: …`). It can
+/// make the catalog's read of `information_schema.TABLES`, or the n-th
+/// `SELECT CONNECTION_ID()`, take longer.
+struct Recording {
+    inner: Arc<dyn Session>,
+    sent: Arc<Mutex<Vec<String>>>,
+    one_at_a_time: tokio::sync::Mutex<()>,
+    slow_catalog: Option<Duration>,
+    slow_check: Option<(usize, Duration)>,
+}
+
+impl Recording {
+    fn new(inner: Arc<dyn Session>, sent: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            inner,
+            sent,
+            one_at_a_time: tokio::sync::Mutex::new(()),
+            slow_catalog: None,
+            slow_check: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for Recording {
+    fn engine(&self) -> Engine {
+        self.inner.engine()
+    }
+    fn dialect(&self) -> &dyn kerno_core::Dialect {
+        self.inner.dialect()
+    }
+    fn server(&self) -> &kerno_core::schema::ServerInfo {
+        self.inner.server()
+    }
+    fn database(&self) -> Option<String> {
+        self.inner.database()
+    }
+    fn tx_state(&self) -> kerno_core::TxState {
+        self.inner.tx_state()
+    }
+    async fn execute(&self, sql: &str, sink: &mut kerno_core::ExecSink) -> kerno_core::Result<()> {
+        let checks = {
+            let mut sent = self.sent.lock().unwrap();
+            sent.push(format!("asked: {sql}"));
+            sent.iter()
+                .filter(|line| *line == "asked: SELECT CONNECTION_ID()")
+                .count()
+        };
+        let _one = self.one_at_a_time.lock().await;
+        self.sent.lock().unwrap().push(sql.to_string());
+        let delay = match self.slow_check {
+            Some((n, delay)) if sql == "SELECT CONNECTION_ID()" && checks == n => Some(delay),
+            _ if sql.contains("FROM information_schema.TABLES") => self.slow_catalog,
+            _ => None,
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.inner.execute(sql, sink).await
+    }
+    async fn cancel(&self) -> kerno_core::Result<()> {
+        self.inner.cancel().await
+    }
+    async fn ping(&self) -> kerno_core::Result<()> {
+        self.inner.ping().await
+    }
+    async fn close(&self) {
+        self.inner.close().await
+    }
+    async fn databases(&self) -> kerno_core::Result<Vec<kerno_core::schema::DatabaseInfo>> {
+        self.inner.databases().await
+    }
+    async fn schemas(&self) -> kerno_core::Result<Vec<kerno_core::schema::SchemaInfo>> {
+        self.inner.schemas().await
+    }
+    async fn objects(&self, schema: &str) -> kerno_core::Result<kerno_core::schema::SchemaObjects> {
+        self.inner.objects(schema).await
+    }
+    async fn table_structure(
+        &self,
+        table: &kerno_core::schema::TableRef,
+    ) -> kerno_core::Result<kerno_core::schema::TableStructure> {
+        self.inner.table_structure(table).await
+    }
+    async fn ddl(&self, object: &kerno_core::schema::ObjectRef) -> kerno_core::Result<String> {
+        self.inner.ddl(object).await
+    }
+    async fn extensions(&self) -> kerno_core::Result<Vec<kerno_core::schema::ExtensionInfo>> {
+        self.inner.extensions().await
+    }
+    async fn completion_catalog(&self) -> kerno_core::Result<kerno_core::sql::Catalog> {
+        self.inner.completion_catalog().await
+    }
+    fn admin_query(&self, view: kerno_core::AdminView) -> Option<String> {
+        self.inner.admin_query(view)
+    }
+    async fn cancel_session(&self, id: &str) -> kerno_core::Result<()> {
+        self.inner.cancel_session(id).await
+    }
+    async fn terminate_session(&self, id: &str) -> kerno_core::Result<()> {
+        self.inner.terminate_session(id).await
+    }
+}
+
 /// With "lock all tables", the read lock is held while mysqldump runs: a
-/// write from another session waits, and lands only once Kerno released
-/// the lock at the end.
+/// write from another session waits, and lands only once Kerno started to
+/// release the lock at the end. The lock comes before the catalog is read
+/// (F8), as the server saw Kerno's statements.
 #[tokio::test]
 async fn the_read_lock_holds_writes_until_the_end() {
     let _serial = SERIAL.lock().await;
@@ -793,21 +935,24 @@ async fn held(server: &'static Server) {
     fill_big(&admin, HELD, 400_000).await;
     let files = tempfile::tempdir().unwrap();
     let folder = files.path().join("backup");
-    let (started, unlocked) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
-    let (seen, released) = (started.clone(), unlocked.clone());
-    let said = Arc::new(Mutex::new(Vec::new()));
-    let kept = said.clone();
+    let (started, releasing) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let (seen, released) = (started.clone(), releasing.clone());
     let on_line: OnLine = Arc::new(move |line: String| {
         eprintln!("  | {line}");
-        kept.lock().unwrap().push(line.clone());
         if line.starts_with("[big] -- Retrieving rows") {
             seen.store(true, Ordering::Relaxed);
         }
-        if line == "Kerno: UNLOCK TABLES" {
+        // Said just before UNLOCK TABLES is sent: no write may land
+        // before this instant.
+        if line == "Kerno: releasing the read lock" {
             *released.lock().unwrap() = Some(std::time::Instant::now());
         }
     });
-    let kerno = session(&server.params, None).await;
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let kerno: Arc<dyn Session> = Arc::new(Recording::new(
+        session(&server.params, None).await,
+        sent.clone(),
+    ));
     let running = start_backup(
         server,
         HELD,
@@ -828,23 +973,194 @@ async fn held(server: &'static Server) {
     let ended = running.await.unwrap();
     ended.outcome.unwrap();
     let written = writing.await.unwrap();
-    let released = unlocked.lock().unwrap().expect("the lock released");
+    let released = releasing.lock().unwrap().expect("the lock released");
     assert!(
         written >= released,
-        "the write landed while the lock was said to be held"
+        "the write landed while the lock was held"
     );
-    // The lock first, then the catalog and the plan (F8).
-    let said = said.lock().unwrap().clone();
-    let at = |start: &str| {
-        said.iter()
-            .position(|line| line.starts_with(start))
-            .unwrap()
+    // What the server saw from Kerno's session: the lock, then the
+    // catalog, then the release (F8).
+    let sent: Vec<String> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sql| !sql.starts_with("asked: "))
+        .cloned()
+        .collect();
+    let at = |what: &str| {
+        sent.iter()
+            .position(|sql| sql.contains(what))
+            .unwrap_or_else(|| panic!("{what} not sent: {sent:?}"))
     };
-    assert!(
-        at("Kerno: FLUSH TABLES WITH READ LOCK") < at("Kerno: 2 tables into"),
-        "{said:?}"
+    let lock = at("FLUSH TABLES WITH READ LOCK");
+    assert!(lock < at("information_schema.TABLES"), "{sent:?}");
+    assert!(lock < at("@@lower_case_table_names"), "{sent:?}");
+    assert_eq!(
+        sent.last().map(String::as_str),
+        Some("UNLOCK TABLES"),
+        "{sent:?}"
     );
     kerno.close().await;
+}
+
+/// A slow catalog read, and a check of the read lock's session that does
+/// not answer for longer than the old 10 s, are no evidence that the lock
+/// was lost: the session is checked only once the catalog is read, and a
+/// check that has not answered yet is waited for, not counted as lost
+/// (G4). Each made deterministic by a session that holds them.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_slow_session_is_not_a_lost_lock() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let server: &'static Server = Box::leak(Box::new(server));
+    with_scratch(&server.params, &[BUSY], async move {
+        let admin = session(&server.params, None).await;
+        fill_big(&admin, BUSY, 1_000).await;
+        let files = tempfile::tempdir().unwrap();
+        let folder = files.path().join("backup");
+        // Each mysqldump starts 7 s late: the run lasts past a few checks.
+        let wrapper = files.path().join("mysqldump");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nsleep 7\nexec '{}' \"$@\"\n",
+                server.dump.display()
+            ),
+        )
+        .unwrap();
+        kerno_core::private::restrict(&wrapper, 0o755).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let kerno = Recording {
+            // Past the old watcher's 10 s.
+            slow_catalog: Some(Duration::from_secs(12)),
+            // The first check of the watcher (the second CONNECTION_ID,
+            // the first read the lock's id).
+            slow_check: Some((2, Duration::from_secs(12))),
+            ..Recording::new(session(&server.params, None).await, sent.clone())
+        };
+        let (on_line, _) = sink();
+        let ended = mysql_folder::back_up(
+            FolderBackup {
+                tool_path: wrapper,
+                params: server.params.clone(),
+                options: folder_options(BUSY, 2, DumpMethod::LockAllTables),
+                folder: folder.clone(),
+                client: server.dump_version.clone(),
+                range_threshold: mysql_folder::RANGE_THRESHOLD,
+            },
+            Arc::new(kerno),
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        ended.outcome.unwrap();
+        assert!(mysql_folder::read_manifest(&folder).is_ok());
+        // No check was asked for while the catalog was read.
+        let sent = sent.lock().unwrap().clone();
+        let catalog_end = sent
+            .iter()
+            .rposition(|sql| sql.contains("information_schema"))
+            .unwrap();
+        let checks: Vec<usize> = sent
+            .iter()
+            .enumerate()
+            .filter(|(_, sql)| *sql == "asked: SELECT CONNECTION_ID()")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(checks.len() >= 3, "{sent:?}");
+        assert!(checks[1] > catalog_end, "{sent:?}");
+    })
+    .await;
+}
+
+/// Arguments that would stall the ranges behind Kerno's table lock, or hide
+/// the lines Kerno reads from mysqldump, are refused before anything runs,
+/// in plain words (G2): the reviewer's two runs.
+#[tokio::test]
+async fn arguments_that_stall_or_blind_the_backup_are_refused() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let server: &'static Server = Box::leak(Box::new(server));
+    with_scratch(&server.params, &[ARGS], async move {
+        let admin = session(&server.params, None).await;
+        fill_big(&admin, ARGS, 1_000).await;
+        let files = tempfile::tempdir().unwrap();
+        let log = files.path().join("mysqldump.err");
+        for (extra, said) in [
+            (
+                "--source-data=2",
+                "use the plain backup (one file) to seed a replica",
+            ),
+            ("--flush-logs", "use the plain backup for that"),
+            (
+                &*format!("--log-error={}", log.display()),
+                "would hide the lines Kerno reads",
+            ),
+            ("--skip-verbose", "would hide the lines Kerno reads"),
+        ] {
+            let folder = files.path().join("backup");
+            let mut options = folder_options(ARGS, 2, DumpMethod::SingleTransaction);
+            options.extra_args = extra.into();
+            let (on_line, lines) = sink();
+            let ended = mysql_folder::back_up(
+                FolderBackup {
+                    tool_path: server.dump.clone(),
+                    params: server.params.clone(),
+                    options,
+                    folder: folder.clone(),
+                    client: server.dump_version.clone(),
+                    range_threshold: 1,
+                },
+                session(&server.params, None).await,
+                on_line,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            let refused = ended.outcome.unwrap_err().to_string();
+            assert!(refused.contains(said), "{extra}: {refused}");
+            assert!(!folder.exists(), "{extra}");
+            assert!(
+                lines
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|line| !line.starts_with('[')),
+                "{extra}: a mysqldump ran"
+            );
+            assert!(!log.exists());
+        }
+        // The plain backup refuses what hides mysqldump's lines too.
+        for extra in ["--skip-verbose", "--log-error=/tmp/x"] {
+            let options = BackupOptions {
+                extra_args: extra.into(),
+                ..BackupOptions::new(Engine::MySql, ARGS)
+            };
+            let refused = tools::backup_command(
+                &server.dump,
+                &server.params,
+                &options,
+                &files.path().join("plain.sql"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                refused.contains("would hide the lines Kerno reads"),
+                "{refused}"
+            );
+        }
+    })
+    .await;
 }
 
 /// The read lock lost during the run (Kerno's session closed by the server,
@@ -983,9 +1299,23 @@ fn late_second_range(dir: &std::path::Path, real: &std::path::Path) -> PathBuf {
     path
 }
 
+/// How a row of `moving` is moved from the first range (`id < 501`) into
+/// the second while the backup runs.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Writer {
+    /// An `UPDATE` on its own, sent once the first range has its snapshot.
+    Autocommit,
+    /// The `UPDATE` in a transaction opened before the backup, committed
+    /// once the first range has its snapshot (the reviewer's `opentx`).
+    OpenTransaction,
+}
+
 /// Inside one table every range reads one moment: a row whose key moves
-/// from the first range into the second between their starts is restored
-/// once, never lost nor doubled.
+/// from the first range into the second while the backup runs is restored
+/// once, never lost nor doubled. On 5.1, where `LOCK TABLES … READ` does not
+/// wait for a transaction that already wrote, a table is cut only under the
+/// server's read lock, which holds the COMMIT until the end (G1).
 #[cfg(unix)]
 #[tokio::test]
 async fn every_range_of_a_table_reads_one_moment() {
@@ -993,27 +1323,51 @@ async fn every_range_of_a_table_reads_one_moment() {
     let Some((servers, client)) = servers() else {
         return;
     };
-    let wanted = ["MySQL", "MariaDB", "kerno-mysql51"];
-    for server in servers
+    use DumpMethod::{LockAllTables, SingleTransaction};
+    use Writer::{Autocommit, OpenTransaction};
+    let cases = [
+        ("MySQL", SingleTransaction, Autocommit, 2),
+        // The table lock waits for the open writer, 10 s, then the table
+        // is read whole.
+        ("MySQL", SingleTransaction, OpenTransaction, 1),
+        ("MySQL", LockAllTables, OpenTransaction, 2),
+        ("MariaDB", SingleTransaction, Autocommit, 2),
+        // No metadata locks: not cut, the table in one snapshot.
+        ("kerno-mysql51", SingleTransaction, OpenTransaction, 1),
+        ("kerno-mysql51", SingleTransaction, Autocommit, 1),
+        // The server's read lock: cut, the COMMIT waits until the end.
+        ("kerno-mysql51", LockAllTables, OpenTransaction, 2),
+    ];
+    let servers: Vec<&'static Server> = servers
         .into_iter()
-        .filter(|s| wanted.contains(&s.label.as_str()))
-    {
-        let server: &'static Server = Box::leak(Box::new(server));
+        .map(|server| &*Box::leak(Box::new(server)))
+        .collect();
+    for (label, method, writer, files) in cases {
+        let Some(&server) = servers.iter().find(|server| server.label == label) else {
+            continue;
+        };
         let client = client.clone();
         let target = format!("{MOVING}_dst");
         let target: &'static str = Box::leak(target.into_boxed_str());
         with_scratch(
             &server.params,
             &[MOVING, target],
-            moving(server, client, target),
+            moving(server, client, target, method, writer, files),
         )
         .await;
     }
 }
 
 #[cfg(unix)]
-async fn moving(server: &'static Server, client: PathBuf, target: &'static str) {
-    eprintln!("--- {}", server.label);
+async fn moving(
+    server: &'static Server,
+    client: PathBuf,
+    target: &'static str,
+    method: DumpMethod,
+    writer: Writer,
+    files: usize,
+) {
+    eprintln!("--- {} {method:?} {writer:?}", server.label);
     let admin = session(&server.params, None).await;
     exec_ok(&admin, &format!("CREATE DATABASE {MOVING}")).await;
     exec_ok(&admin, &format!("CREATE DATABASE {target}")).await;
@@ -1028,22 +1382,31 @@ async fn moving(server: &'static Server, client: PathBuf, target: &'static str) 
         &format!("INSERT INTO {MOVING}.moving VALUES {}", values.join(", ")),
     )
     .await;
-    let files = tempfile::tempdir().unwrap();
-    let folder = files.path().join("backup");
-    let wrapper = late_second_range(files.path(), &server.dump);
-    let started = Arc::new(AtomicBool::new(false));
-    let seen = started.clone();
+    let update = format!("UPDATE {MOVING}.moving SET id = 2000 WHERE id = 5");
+    let writing = session(&server.params, None).await;
+    if let Writer::OpenTransaction = writer {
+        exec_ok(&writing, "SET autocommit = 0").await;
+        exec_ok(&writing, &update).await;
+    }
+    let files_dir = tempfile::tempdir().unwrap();
+    let folder = files_dir.path().join("backup");
+    let wrapper = late_second_range(files_dir.path(), &server.dump);
+    let (started, releasing) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let (seen, released) = (started.clone(), releasing.clone());
     let on_line: OnLine = Arc::new(move |line: String| {
         eprintln!("  | {line}");
-        if line.starts_with("[moving 1/2] -- Retrieving table structure") {
+        if line.starts_with("[moving") && line.contains("-- Retrieving table structure") {
             seen.store(true, Ordering::Relaxed);
+        }
+        if line == "Kerno: releasing the read lock" {
+            *released.lock().unwrap() = Some(std::time::Instant::now());
         }
     });
     let backing = tokio::spawn(mysql_folder::back_up(
         FolderBackup {
             tool_path: wrapper,
             params: server.params.clone(),
-            options: folder_options(MOVING, 2, DumpMethod::SingleTransaction),
+            options: folder_options(MOVING, 2, method),
             folder: folder.clone(),
             client: server.dump_version.clone(),
             range_threshold: 1,
@@ -1053,20 +1416,30 @@ async fn moving(server: &'static Server, client: PathBuf, target: &'static str) 
         Arc::new(AtomicBool::new(false)),
     ));
     until(&started, "the first range's snapshot").await;
-    // Row 5 moves from the first range (`id < 501`) into the second.
-    let writer = session(&server.params, None).await;
     let moved = tokio::spawn(async move {
-        run(
-            &writer,
-            &format!("UPDATE {MOVING}.moving SET id = 2000 WHERE id = 5"),
-        )
-        .await
-        .unwrap();
+        match writer {
+            Writer::Autocommit => run(&writing, &update).await.unwrap(),
+            Writer::OpenTransaction => run(&writing, "COMMIT").await.unwrap(),
+        };
+        std::time::Instant::now()
     });
     backing.await.unwrap().outcome.unwrap();
-    moved.await.unwrap();
+    let moved_at = moved.await.unwrap();
+    if method == DumpMethod::LockAllTables {
+        let released = releasing.lock().unwrap().expect("the lock released");
+        assert!(
+            moved_at >= released,
+            "{}: the write committed while the server's read lock was held",
+            server.label
+        );
+    }
     let manifest = mysql_folder::read_manifest(&folder).unwrap();
-    assert_eq!(manifest.tables[0].files.len(), 2, "cut in two ranges");
+    assert_eq!(
+        manifest.tables[0].files.len(),
+        files,
+        "{}: {method:?}",
+        server.label
+    );
     let (on_line, _) = sink();
     mysql_folder::restore(
         FolderRestore {
@@ -1094,7 +1467,7 @@ async fn moving(server: &'static Server, client: PathBuf, target: &'static str) 
     assert_eq!(
         restored[0],
         [Some("1000".to_string()), Some("1".to_string())],
-        "{}: the moved row lost or doubled",
+        "{}: {method:?} {writer:?}: the moved row lost or doubled",
         server.label
     );
 }
