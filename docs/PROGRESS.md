@@ -1579,3 +1579,10 @@ Still open (for the owner):
 - Measured: 300 columns over 20 tables named and matched in 1.7 ms (debug build).
 - Tests: `ui_tests::k59` (7 in all), `links::tests` (4), three driver tests; each new one seen failing under a
   mutation.
+
+## 2026-11-24, night — K61: two defects the pass in the real app found
+
+- After a click on the first tab in view the strip still started with a bare "×", the end of the tab before
+  (K55): the kit's reveal of a click does not move on its first frame, which counted as "stopped". That frame no
+  longer counts; the K55 test now moves the test clock between its frames, which it did not (the reveal never
+  moved there), and failed without the fix. Seen in the release build before the fix and gone after it.

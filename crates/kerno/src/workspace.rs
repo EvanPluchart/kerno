@@ -845,7 +845,13 @@ impl Workspace {
     /// starts on a tab's start (K55).
     fn settle_strip(&self, group: panes::GroupId) {
         let mut settles = self.strip_settles.borrow_mut();
-        settles.entry(group).or_default().pending = true;
+        // The next frame never counts as stopped: the kit's reveal of a
+        // click starts its animation there without moving yet (no time has
+        // passed for it), and moves from the frame after.
+        *settles.entry(group).or_default() = StripSettle {
+            pending: true,
+            last: None,
+        };
     }
 
     /// The menu of the tab at `index`: its place in its group's strip, and

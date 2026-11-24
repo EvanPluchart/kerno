@@ -111,11 +111,12 @@ fn query_tabs(count: usize) -> Arc<Storage> {
 
 /// Draws frames until the strip of tabs stops moving (the kit's reveal of
 /// a clicked tab is animated), then checks that it starts on a tab's start
-/// and shows the active tab whole.
+/// and shows the active tab whole. The frames are 16 ms apart on the test's
+/// clock, which the kit's animation reads: a sleep would leave it still.
 fn strip_settles(app: &Fixture, cx: &mut TestAppContext, what: &str) {
-    for _ in 0..30 {
+    for _ in 0..60 {
+        cx.executor().advance_clock(Duration::from_millis(16));
         app.step(cx, |window, _| window.refresh());
-        std::thread::sleep(Duration::from_millis(10));
     }
     let (cut, (inside, overflows)) = cx.update(|cx| {
         let workspace = app.workspace.read(cx);
