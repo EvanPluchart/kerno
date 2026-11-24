@@ -9,6 +9,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Only for the Windows runner's check of the update (K70, D-139): the build says it is 0.0.0 and
+# takes a newer release without the click on Update. Never in a package: scripts/bundle-windows.sh
+# refuses an executable that has it.
+test-update-without-click = []
+
 [dependencies]
 kerno-core.workspace = true
 kerno-postgres.workspace = true

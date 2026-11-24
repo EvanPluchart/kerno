@@ -4,9 +4,9 @@
 //!
 //! Ported from the owner's Recto (`recto-app/src/update/mod.rs`) and Vigie
 //! (`vigie-app/src/update.rs`), MIT, same owner: the same timing, the same refusals (no
-//! checksum line, a mismatch: deleted, never run), the same "otherwise the release page". They
-//! install on Windows through an installer; Kerno swaps its own bundle on macOS and its own files
-//! on Linux, by rename, with a rollback.
+//! checksum line, a mismatch: deleted, never run), the same "otherwise the release page". Kerno
+//! swaps its own bundle on macOS and its own files on Linux, by rename, with a rollback; on
+//! Windows it runs its installer for this user and quits, as Recto and Vigie do (K70, D-139).
 //!
 //! Every external program is run through [`Runner`] with a fixed argument array and an absolute
 //! path: the real one ([`System`]) is made only in `main.rs`, after the off switches; tests use a
@@ -30,8 +30,9 @@ pub const FIRST: Duration = Duration::from_secs(3);
 pub const EVERY: Duration = Duration::from_secs(6 * 3600);
 pub const TICK: Duration = Duration::from_secs(60);
 
-/// Runs the external programs of an update. One trait for `curl`, `hdiutil`, `ditto`, `tar`
-/// and the relaunch, so a test fake sees (and asserts) every argument array.
+/// Runs the external programs of an update. One trait for `curl`, `hdiutil`, `ditto`, `tar`,
+/// `whoami`, the Windows installer and the relaunch, so a test fake sees (and asserts) every
+/// argument array.
 pub trait Runner: Send + Sync {
     /// Runs `program` with `args` and waits: its standard output, or why it failed.
     fn output(&self, program: &Path, args: &[OsString]) -> Result<Vec<u8>, String>;
@@ -93,13 +94,14 @@ fn curl() -> PathBuf {
 /// the check says nothing, as offline; as on Unix, never a bare name.
 #[cfg(windows)]
 fn curl() -> PathBuf {
-    windows_curl(std::env::var("SystemRoot").ok().as_deref())
+    system32(std::env::var("SystemRoot").ok().as_deref(), "curl.exe")
 }
 
-/// `<system_root>\System32\curl.exe`, `system_root` taken only when it is a drive's absolute path
-/// (`C:\Windows`), else `C:\Windows`: always an absolute path.
-#[cfg(any(windows, test))]
-fn windows_curl(system_root: Option<&str>) -> PathBuf {
+/// `<system_root>\System32\<name>`, a program Windows ships (`curl.exe`, `whoami.exe`),
+/// `system_root` taken only when it is a drive's absolute path (`C:\Windows`), else `C:\Windows`:
+/// always an absolute path (K67's rule, D-136; `whoami.exe` for K70).
+#[cfg(any(windows, test, not(feature = "test-update-without-click")))]
+fn system32(system_root: Option<&str>, name: &str) -> PathBuf {
     let absolute = |root: &&str| {
         let bytes = root.as_bytes();
         bytes.len() >= 3
@@ -109,7 +111,7 @@ fn windows_curl(system_root: Option<&str>) -> PathBuf {
     };
     let root = system_root.filter(absolute).unwrap_or(r"C:\Windows");
     PathBuf::from(format!(
-        r"{}\System32\curl.exe",
+        r"{}\System32\{name}",
         root.trim_end_matches(['\\', '/'])
     ))
 }
@@ -130,8 +132,13 @@ pub enum Install {
     /// Linux: the tarball's install prefix (`<dir>/bin/kerno`, `<dir>/share/…`), writable. It
     /// may be `~/.local`: only the files the tarball carries are replaced, never the folder.
     Prefix(PathBuf),
+    /// Windows: this `kerno.exe`, installed by the installer or unpacked from the zip (its folder
+    /// holds the licences). The installer installs the new version for this user into
+    /// `%LOCALAPPDATA%\Programs\Kerno`, and starts this one again when it could not.
+    Setup(PathBuf),
     /// Anything else (the bare `target/release/kerno`, a read-only place, a package manager's
-    /// install, a translocated app): the release page.
+    /// install, a translocated app, a Kerno running as administrator on Windows): the release
+    /// page.
     Page,
 }
 
@@ -176,8 +183,52 @@ pub fn install_target(exe: &Path, os: &str) -> Install {
                 _ => Install::Page,
             }
         }
+        // The installer writes elsewhere: nothing to probe here. A bare build
+        // (`target\release\kerno.exe`) has no licences beside it.
+        "windows" => {
+            let laid_out = name(Some(exe))
+                .is_some_and(|name| name.eq_ignore_ascii_case("kerno.exe"))
+                && parent.is_some_and(|dir| dir.join("LICENSE-MIT").is_file());
+            if laid_out {
+                Install::Setup(exe.to_path_buf())
+            } else {
+                Install::Page
+            }
+        }
         _ => Install::Page,
     }
+}
+
+/// Windows: whether this process may run a downloaded installer, from `whoami /groups /fo csv
+/// /nh` (asking Windows directly needs `unsafe`). See [`standard_user`].
+#[cfg(any(test, not(feature = "test-update-without-click")))]
+fn elevated(runner: &dyn Runner) -> bool {
+    // Through `System::output`, which starts it without a console window (K67's `no_console`).
+    let whoami = system32(std::env::var("SystemRoot").ok().as_deref(), "whoami.exe");
+    let args = ["/groups", "/fo", "csv", "/nh"].map(OsString::from);
+    let groups = runner.output(&whoami, &args).ok();
+    !standard_user(groups.as_deref())
+}
+
+/// The integrity level of the CSV rows of `whoami /groups /fo csv /nh` (`"name","type","SID",
+/// "attributes"`), read by its SID, the one column Windows never translates: true only when the
+/// one level is Medium (`S-1-16-8192`), the level of a program a user starts. High (12288) and
+/// System (16384) are elevated: an installer run from there would run with those rights, and a
+/// process of the same user without them could swap the checked file before it runs. Low (4096)
+/// is a sandbox the installer could not write from. No level, two levels, an empty answer, no
+/// `whoami` or a failed one (`None`): Kerno cannot tell, and opens the release page rather than run
+/// an installer.
+#[cfg(any(test, not(feature = "test-update-without-click")))]
+fn standard_user(groups: Option<&[u8]>) -> bool {
+    let Some(groups) = groups else {
+        return false;
+    };
+    let groups = String::from_utf8_lossy(groups);
+    let mut levels = groups.lines().filter_map(|row| {
+        let sid = row.trim().split("\",\"").nth(2)?;
+        sid.starts_with("S-1-16-").then_some(sid)
+    });
+    levels.next() == Some("S-1-16-8192") && levels.next().is_none()
 }
 
 /// Whether Kerno may make (and rename) entries in `dir`: tried, not guessed.
@@ -209,8 +260,8 @@ pub fn check(runner: &dyn Runner, current: &str) -> Result<Option<Version>, Stri
 }
 
 /// Downloads this system's file of `version` and its `SHA256SUMS` into a new private folder
-/// under `temp`, and checks the file's SHA-256 against its line. Any failure deletes the folder:
-/// an unchecked file is never kept, run or opened.
+/// under `temp` ([`downloads_dir`]), and checks the file's SHA-256 against its line. Any failure
+/// deletes the folder: an unchecked file is never kept, run or opened.
 pub fn download(
     runner: &dyn Runner,
     current: &str,
@@ -219,6 +270,8 @@ pub fn download(
 ) -> Result<PathBuf, String> {
     let name = releases::artifact(version, std::env::consts::OS, std::env::consts::ARCH)
         .ok_or("no release file for this system")?;
+    fs::create_dir_all(temp)
+        .map_err(|error| format!("could not make {}: {error}", temp.display()))?;
     let dir = private_dir(temp, "kerno-update")?;
     let checked = (|| {
         let sums_path = dir.join("SHA256SUMS");
@@ -240,9 +293,7 @@ pub fn download(
         if fs::metadata(&path).map_or(0, |meta| meta.len()) == 0 {
             return Err("the download is empty".to_string());
         }
-        if sha256_file(&path)? != expected {
-            return Err("the download does not match its checksum".to_string());
-        }
+        open_checked(&path, expected)?;
         Ok(path)
     })();
     if checked.is_err() {
@@ -251,8 +302,30 @@ pub fn download(
     checked
 }
 
-fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+/// Opens `path` held shut and checks its SHA-256 THROUGH that handle: while the returned file
+/// lives, on Windows nobody may write, rename or delete it (share mode: read only), so what was
+/// checked is what a program started from it runs. A file someone else holds open for writing
+/// cannot be opened so: refused. On macOS and Linux the download's folder is 0700 from its creation
+/// (`private::create_dir`): no other account can reach the file at all.
+fn open_checked(path: &Path, expected: [u8; 32]) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_SHARE_READ alone.
+        options.share_mode(1);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("could not hold {} shut: {error}", path.display()))?;
+    if sha256(&mut file)? != expected {
+        return Err("the download does not match its checksum".to_string());
+    }
+    Ok(file)
+}
+
+fn sha256(file: &mut fs::File) -> Result<[u8; 32], String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
     loop {
@@ -266,18 +339,126 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
 }
 
 /// Installs the checked `file` of `version` over `target` and starts the new Kerno; this
-/// process should then quit. On a failure everything is put back as it was.
+/// process should then quit. On a failure everything is put back as it was. On Windows the
+/// installer does the work once this process has quit: `data_dir` keeps the note
+/// [`after_install`] reads at the next start.
 pub fn install(
     runner: &dyn Runner,
     target: &Install,
     file: &Path,
     version: Version,
+    data_dir: Option<&Path>,
 ) -> Result<(), String> {
     match target {
         Install::App(bundle) => install_app(runner, bundle, file),
         Install::Prefix(dir) => install_prefix(runner, dir, file, version),
+        Install::Setup(exe) => install_setup(runner, exe, file, version, data_dir),
         Install::Page => Err("this copy of Kerno opens the release page instead".into()),
     }
+}
+
+/// The note an update on Windows leaves in the data folder before it runs the installer: the
+/// version and the download's folder, one per line.
+pub const PENDING: &str = "update-pending.txt";
+/// The installer's own log of that update, in the data folder.
+pub const SETUP_LOG: &str = "update-setup.log";
+
+/// The installer's switches for an update from the app: no window and no question, never a
+/// restart of Windows, no Kerno closed by it, and the new Kerno started at the end
+/// (`packaging/windows/kerno.iss`).
+const SETUP_ARGS: [&str; 5] = [
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/NOCLOSEAPPLICATIONS",
+    "/relaunch=1",
+];
+
+/// Windows: notes the update in `data_dir`, then starts the checked installer for this user; it
+/// waits for this process (`/pid`) to quit, and starts this `exe` again when it could not install.
+/// The installer is checked again against the `SHA256SUMS` downloaded with it, through a handle
+/// held from that check until the installer's process exists ([`open_checked`]). The download
+/// stays: the installer reads its files from it while it runs.
+fn install_setup(
+    runner: &dyn Runner,
+    exe: &Path,
+    setup: &Path,
+    version: Version,
+    data_dir: Option<&Path>,
+) -> Result<(), String> {
+    let folder = setup.parent().ok_or("the download has no folder")?;
+    let name = setup.file_name().ok_or("the download has no name")?;
+    let sums = fs::read_to_string(folder.join("SHA256SUMS"))
+        .map_err(|_| "the checksums could not be read")?;
+    let expected = releases::checksum_for(&sums, &name.to_string_lossy())
+        .ok_or("the release lists no checksum for the installer")?;
+    let held = open_checked(setup, expected)?;
+    let pending = data_dir.map(|dir| dir.join(PENDING));
+    if let Some(pending) = &pending {
+        fs::write(pending, format!("{version}\n{}\n", folder.display()))
+            .map_err(|error| format!("could not write {}: {error}", pending.display()))?;
+    }
+    let with = |flag: &str, value: &Path| {
+        let mut arg = OsString::from(flag);
+        arg.push(value);
+        arg
+    };
+    let mut args: Vec<OsString> = SETUP_ARGS.map(OsString::from).into();
+    args.push(format!("/pid={}", std::process::id()).into());
+    args.push(with("/kerno=", exe));
+    if let Some(dir) = data_dir {
+        args.push(with("/LOG=", &dir.join(SETUP_LOG)));
+    }
+    let started = runner.start(setup, &args).inspect_err(|_| {
+        if let Some(pending) = &pending {
+            let _ = fs::remove_file(pending);
+        }
+    });
+    // Only now: the installer's process has its file open.
+    drop(held);
+    started
+}
+
+/// Where downloads go: on Windows `Kerno\data\updates` in the profile's local application data
+/// (`%LOCALAPPDATA%`), whatever `KERNO_DATA_DIR` says, since `%TEMP%` may be a folder other
+/// accounts can write and Windows gives a new folder no access list of Kerno's (D-131); `None`
+/// when Windows names no such folder. Elsewhere the system's temporary folder, where the download's
+/// own folder is made 0700.
+pub fn downloads_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        kerno_core::storage::AppPaths::local_data_dir().map(|dir| dir.join("updates"))
+    } else {
+        Some(std::env::temp_dir())
+    }
+}
+
+/// What the last update on Windows left, read at each start (on every system: the note exists
+/// only after one). The note goes, with the download it names. `None` when there was none, or
+/// when this Kerno is that version or newer; else that version and why it was not installed, said
+/// once.
+pub fn after_install(data_dir: &Path, current: &str, temp: &Path) -> Option<(Version, String)> {
+    let pending = data_dir.join(PENDING);
+    let note = fs::read_to_string(&pending).ok()?;
+    let _ = fs::remove_file(&pending);
+    let mut lines = note.lines();
+    let version = lines.next().and_then(Version::parse)?;
+    // Only a download folder of Kerno's own name, in the temporary folder.
+    if let Some(folder) = lines.next().map(PathBuf::from)
+        && folder.parent() == Some(temp)
+        && folder
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("kerno-update-"))
+    {
+        let _ = fs::remove_dir_all(&folder);
+    }
+    releases::newer(current, version)?;
+    let why = format!(
+        "its installer stopped before it finished, and this is still Kerno {current}; what it \
+         did is in {}",
+        data_dir.join(SETUP_LOG).display()
+    );
+    tracing::warn!(%version, "the update was not installed: {why}");
+    Some((version, why))
 }
 
 /// macOS: mounts the disk image read-only without showing it, copies its `Kerno.app` beside
@@ -536,6 +717,8 @@ pub struct Updates {
     pub target: Install,
     /// Where downloads go: the system's temporary folder.
     pub temp: PathBuf,
+    /// Kerno's data folder, where an update on Windows leaves its note ([`after_install`]).
+    pub data_dir: Option<PathBuf>,
     pub phase: Phase,
     /// A check is under way.
     pub checking: bool,
@@ -564,6 +747,7 @@ impl Updates {
             current: current.to_string(),
             target,
             temp,
+            data_dir: None,
             phase: Phase::Idle,
             checking: false,
             offered: None,
@@ -617,21 +801,51 @@ fn switched_off(var: impl Fn(&str) -> bool) -> bool {
     !releases::checks_allowed(var("KERNO_NO_UPDATE_CHECK"), var("KERNO_BENCH"))
 }
 
+/// This Kerno's version. A build with the `test-update-without-click` feature (the Windows
+/// runner's update check only, never a release) says 0.0.0, so that the release it is given is
+/// newer.
+#[cfg(not(feature = "test-update-without-click"))]
+pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "test-update-without-click")]
+pub const CURRENT: &str = "0.0.0";
+
 /// The real updater, or `None` when an off switch is set (`KERNO_NO_UPDATE_CHECK`, a bench run)
-/// or in a test build. `var` tells whether an environment variable is set.
-pub fn for_this_run(var: impl Fn(&str) -> bool, exe: Option<PathBuf>) -> Option<Updates> {
+/// or in a test build. `var` tells whether an environment variable is set. On Windows a Kerno
+/// running as administrator never runs a downloaded installer: it opens the release page.
+pub fn for_this_run(
+    var: impl Fn(&str) -> bool,
+    exe: Option<PathBuf>,
+    data_dir: PathBuf,
+) -> Option<Updates> {
     if cfg!(test) || switched_off(var) {
         return None;
     }
     let target = exe.map_or(Install::Page, |exe| {
         install_target(&exe, std::env::consts::OS)
     });
-    Some(Updates::new(
-        Arc::new(System),
-        env!("CARGO_PKG_VERSION"),
-        target,
-        std::env::temp_dir(),
-    ))
+    // GitHub's Windows runner gives only administrators: the feature's build, there to run the
+    // installer on that runner, leaves this check out (D-139).
+    #[cfg(not(feature = "test-update-without-click"))]
+    let target = if matches!(target, Install::Setup(_)) && elevated(&System) {
+        tracing::info!("Kerno runs as administrator: an update opens the release page");
+        Install::Page
+    } else {
+        target
+    };
+    let Some(downloads) = downloads_dir() else {
+        tracing::warn!("no local application data folder: an update opens the release page");
+        let mut updates = Updates::new(
+            Arc::new(System),
+            CURRENT,
+            Install::Page,
+            std::env::temp_dir(),
+        );
+        updates.data_dir = Some(data_dir);
+        return Some(updates);
+    };
+    let mut updates = Updates::new(Arc::new(System), CURRENT, target, downloads);
+    updates.data_dir = Some(data_dir);
+    Some(updates)
 }
 
 #[cfg(test)]
@@ -694,6 +908,11 @@ pub mod tests {
         .into_bytes()
     }
 
+    /// Whether `program` is `curl`: `/usr/bin/curl`, or `curl.exe` on Windows.
+    pub fn is_curl(program: &Path) -> bool {
+        program.file_stem().is_some_and(|stem| stem == "curl")
+    }
+
     /// The value after `flag` in `args`.
     pub fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let at = args.iter().position(|arg| arg == flag)?;
@@ -739,10 +958,7 @@ pub mod tests {
         let calls = fake.calls();
         assert_eq!(calls.len(), 3);
         let (program, args) = &calls[0];
-        assert!(
-            program.is_absolute() && program.file_stem() == Some(std::ffi::OsStr::new("curl")),
-            "{program:?}"
-        );
+        assert!(program.is_absolute() && is_curl(program), "{program:?}");
         let expected: Vec<String> = releases::check_args("0.1.0")
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
@@ -826,12 +1042,16 @@ pub mod tests {
         fs::write(at.join("Contents/MacOS/kerno"), marker).unwrap();
     }
 
+    // The macOS bundle swap is tested on macOS only: `install_target` makes an `Install::App`
+    // nowhere else, and `hdiutil`, `ditto` and `open` exist only there.
+    #[cfg(target_os = "macos")]
     fn marker(bundle: &Path) -> String {
         fs::read_to_string(bundle.join("Contents/MacOS/kerno")).unwrap()
     }
 
     /// A runner for the macOS install: `hdiutil attach` puts a new `Kerno.app` in the mount
     /// point, `ditto` copies it, `open` fails when `relaunch_fails`.
+    #[cfg(target_os = "macos")]
     fn mac_runner(relaunch_fails: bool) -> Arc<Fake> {
         Fake::new(move |program, args| {
             match program.to_str().unwrap() {
@@ -856,6 +1076,7 @@ pub mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_app_bundle_is_swapped_by_rename_and_put_back_on_a_failure() {
         let apps = tempfile::tempdir().unwrap();
         let bundle = apps.path().join("Kerno.app");
@@ -867,7 +1088,7 @@ pub mod tests {
 
         // The relaunch fails: the old bundle is back, nothing else is left.
         let fake = mac_runner(true);
-        assert!(install(&*fake, &target, &dmg, v("0.2.0")).is_err());
+        assert!(install(&*fake, &target, &dmg, v("0.2.0"), None).is_err());
         assert_eq!(marker(&bundle), "old");
         let names = |dir: &Path| -> Vec<String> {
             let mut names: Vec<String> = fs::read_dir(dir)
@@ -880,7 +1101,7 @@ pub mod tests {
         assert_eq!(names(apps.path()), ["Kerno.app"]);
 
         let fake = mac_runner(false);
-        install(&*fake, &target, &dmg, v("0.2.0")).unwrap();
+        install(&*fake, &target, &dmg, v("0.2.0"), None).unwrap();
         assert_eq!(marker(&bundle), "new");
         let pid = std::process::id();
         assert_eq!(
@@ -987,7 +1208,7 @@ pub mod tests {
         let kinds = "drwx x\ndrwx x\n-rwx x\n-rw- x\n";
 
         let failing = linux_runner(top.clone(), kinds, true);
-        assert!(install(&*failing, &target, &tarball, v("0.2.0")).is_err());
+        assert!(install(&*failing, &target, &tarball, v("0.2.0"), None).is_err());
         assert_eq!(fs::read_to_string(dir.join("bin/kerno")).unwrap(), "old");
         assert!(!dir.join("share/doc/kerno/README.md").exists());
 
@@ -997,11 +1218,11 @@ pub mod tests {
             "drwx x\ndrwx x\nlrwx x -> /etc\n-rw- x\n",
             false,
         );
-        assert!(install(&*linked, &target, &tarball, v("0.2.0")).is_err());
+        assert!(install(&*linked, &target, &tarball, v("0.2.0"), None).is_err());
         assert!(linked.calls().iter().all(|(_, args)| args[0] != "-x"));
 
         let fake = linux_runner(top, kinds, false);
-        install(&*fake, &target, &tarball, v("0.2.0")).unwrap();
+        install(&*fake, &target, &tarball, v("0.2.0"), None).unwrap();
         assert_eq!(fs::read_to_string(dir.join("bin/kerno")).unwrap(), "new");
         assert_eq!(
             fs::read_to_string(dir.join("share/doc/kerno/README.md")).unwrap(),
@@ -1112,7 +1333,7 @@ pub mod tests {
 
     /// K67: on Windows the check runs `System32\curl.exe` by its absolute path, whatever
     /// `SystemRoot` says: never a bare name, which Windows would look for in the current folder
-    /// and on `PATH`.
+    /// and on `PATH`. K70's `whoami.exe` is placed by the same rule.
     #[test]
     fn windows_curl_is_always_system32_s_by_an_absolute_path() {
         for (root, expected) in [
@@ -1124,8 +1345,20 @@ pub mod tests {
             (Some(r"\\host\share"), r"C:\Windows\System32\curl.exe"),
             (None, r"C:\Windows\System32\curl.exe"),
         ] {
-            assert_eq!(windows_curl(root), PathBuf::from(expected), "{root:?}");
+            assert_eq!(
+                system32(root, "curl.exe"),
+                PathBuf::from(expected),
+                "{root:?}"
+            );
         }
+        assert_eq!(
+            system32(Some(r"D:\Windows"), "whoami.exe"),
+            PathBuf::from(r"D:\Windows\System32\whoami.exe")
+        );
+        assert_eq!(
+            system32(Some("C:"), "whoami.exe"),
+            PathBuf::from(r"C:\Windows\System32\whoami.exe")
+        );
     }
 
     #[test]
@@ -1135,7 +1368,239 @@ pub mod tests {
         assert!(switched_off(|name| name == "KERNO_BENCH"));
         assert!(!switched_off(|name| name == "KERNO_NO_UPDATE"));
         // Whatever the environment says, a test build never makes the real one.
-        assert!(for_this_run(|_| false, None).is_none());
+        assert!(for_this_run(|_| false, None, "/".into()).is_none());
+    }
+
+    #[test]
+    fn on_windows_the_zip_and_the_installed_folder_update_through_the_installer() {
+        let folder = tempfile::tempdir().unwrap();
+        let exe = folder.path().join("kerno.exe");
+        fs::write(&exe, "exe").unwrap();
+        // A bare build: no licences beside it.
+        assert_eq!(install_target(&exe, "windows"), Install::Page);
+        fs::write(folder.path().join("LICENSE-MIT"), "MIT").unwrap();
+        assert_eq!(install_target(&exe, "windows"), Install::Setup(exe.clone()));
+        let other = folder.path().join("other.exe");
+        assert_eq!(install_target(&other, "windows"), Install::Page);
+    }
+
+    /// `whoami /groups /fo csv /nh` of GitHub's `windows-2025` runner (an administrator, High),
+    /// captured by the K70 probe.
+    const RUNNER_GROUPS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/windows/whoami-groups-runner.csv"
+    ));
+
+    /// The same groups with another integrity row, as the documented CSV form writes it: built,
+    /// not captured (no Windows at hand runs at Medium); `label` is the row's translated name.
+    fn groups(label: &str, sid: &str) -> Vec<u8> {
+        let mut out: String = RUNNER_GROUPS
+            .lines()
+            .filter(|row| !row.contains("\"S-1-16-"))
+            .map(|row| format!("{row}\r\n"))
+            .collect();
+        out.push_str(&format!("\"{label}\",\"Label\",\"{sid}\",\"\"\r\n"));
+        out.into_bytes()
+    }
+
+    #[test]
+    fn only_a_process_at_medium_integrity_runs_the_installer() {
+        // The runner, as captured: High.
+        assert!(!standard_user(Some(RUNNER_GROUPS.as_bytes())));
+        let medium = groups("Mandatory Label\\Medium Mandatory Level", "S-1-16-8192");
+        assert!(standard_user(Some(&medium)));
+        // Read by the SID: a French Windows translates the names, never the SIDs.
+        let medium_fr = groups(
+            "Étiquette obligatoire\\Niveau obligatoire moyen",
+            "S-1-16-8192",
+        );
+        assert!(standard_user(Some(&medium_fr)));
+        let high_fr = groups(
+            "Étiquette obligatoire\\Niveau obligatoire élevé",
+            "S-1-16-12288",
+        );
+        assert!(!standard_user(Some(&high_fr)));
+        // A name saying Medium with another SID is that SID.
+        let lying = groups("Mandatory Label\\Medium Mandatory Level", "S-1-16-12288");
+        assert!(!standard_user(Some(&lying)));
+        for (sid, what) in [
+            ("S-1-16-12288", "high"),
+            ("S-1-16-16384", "system"),
+            (
+                "S-1-16-4096",
+                "low: a sandbox the installer could not write from",
+            ),
+            ("S-1-16-81920", "not a level Kerno knows"),
+            ("S-1-16-819", "not a level Kerno knows"),
+        ] {
+            assert!(!standard_user(Some(&groups("x", sid))), "{what}");
+        }
+        // Kerno cannot tell: the release page.
+        let none = groups("x", "S-1-5-11");
+        assert!(!standard_user(Some(&none)), "no integrity row");
+        let mut two = medium.clone();
+        two.extend_from_slice(b"\"y\",\"Label\",\"S-1-16-12288\",\"\"\r\n");
+        assert!(!standard_user(Some(&two)), "two integrity rows");
+        assert!(!standard_user(Some(b"")), "an empty answer");
+        assert!(!standard_user(Some(b"S-1-16-8192")), "not the CSV form");
+        assert!(!standard_user(None), "whoami missing or failed");
+
+        // The program and its arguments: Windows' own whoami, by an absolute path.
+        let fake = Fake::new(move |_, _| Ok(medium.clone()));
+        assert!(!elevated(&*fake));
+        let (program, args) = fake.calls()[0].clone();
+        assert!(
+            program.to_string_lossy().ends_with(r"\System32\whoami.exe"),
+            "{program:?}"
+        );
+        assert_eq!(args, ["/groups", "/fo", "csv", "/nh"]);
+        assert!(elevated(&*Fake::new(|_, _| Err("no whoami".into()))));
+    }
+
+    #[test]
+    fn the_installer_is_started_after_a_note_and_the_note_says_what_happened() {
+        let data = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let download = temp.path().join("kerno-update-1-2");
+        fs::create_dir(&download).unwrap();
+        let setup = setup_in(&download);
+        let exe = PathBuf::from(r"C:\Users\x\AppData\Local\Programs\Kerno\kerno.exe");
+        let target = Install::Setup(exe.clone());
+
+        // The installer does not start: no note is left, the download is the caller's.
+        let failing = Fake::new(|_, _| Err("could not start".into()));
+        assert!(install(&*failing, &target, &setup, v("0.2.0"), Some(data.path())).is_err());
+        assert!(!data.path().join(PENDING).exists());
+
+        let fake = Fake::new(|_, _| Ok(Vec::new()));
+        install(&*fake, &target, &setup, v("0.2.0"), Some(data.path())).unwrap();
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        let (program, args) = calls[0].clone();
+        assert_eq!(program, setup);
+        assert_eq!(
+            args,
+            [
+                "/VERYSILENT".to_string(),
+                "/SUPPRESSMSGBOXES".into(),
+                "/NORESTART".into(),
+                "/NOCLOSEAPPLICATIONS".into(),
+                "/relaunch=1".into(),
+                format!("/pid={}", std::process::id()),
+                format!("/kerno={}", exe.display()),
+                format!("/LOG={}", data.path().join(SETUP_LOG).display()),
+            ]
+        );
+        assert!(
+            setup.is_file(),
+            "the installer reads its files from the download"
+        );
+        assert_eq!(
+            fs::read_to_string(data.path().join(PENDING)).unwrap(),
+            format!("0.2.0\n{}\n", download.display())
+        );
+
+        // The next start: still the old version, so it is said, once.
+        let (version, why) = after_install(data.path(), "0.1.0", temp.path()).unwrap();
+        assert_eq!(version, v("0.2.0"));
+        assert!(why.contains("still Kerno 0.1.0"), "{why}");
+        assert!(why.contains(SETUP_LOG), "{why}");
+        assert!(!data.path().join(PENDING).exists());
+        assert!(!download.exists(), "the download goes with the note");
+        assert_eq!(after_install(data.path(), "0.1.0", temp.path()), None);
+
+        // Installed: nothing to say; the download goes all the same.
+        fs::create_dir(&download).unwrap();
+        install(
+            &*fake,
+            &target,
+            &setup_in(&download),
+            v("0.2.0"),
+            Some(data.path()),
+        )
+        .unwrap();
+        assert_eq!(after_install(data.path(), "0.2.0", temp.path()), None);
+        assert!(!download.exists());
+        assert!(!data.path().join(PENDING).exists());
+
+        // A note naming another folder never removes it.
+        let theirs = temp.path().join("not-kerno");
+        fs::create_dir(&theirs).unwrap();
+        fs::write(
+            data.path().join(PENDING),
+            format!("0.2.0\n{}\n", theirs.display()),
+        )
+        .unwrap();
+        assert!(after_install(data.path(), "0.1.0", temp.path()).is_some());
+        assert!(theirs.is_dir());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("kerno-update-9-9");
+        fs::create_dir(&outside).unwrap();
+        fs::write(
+            data.path().join(PENDING),
+            format!("0.2.0\n{}\n", outside.display()),
+        )
+        .unwrap();
+        assert_eq!(after_install(data.path(), "0.3.0", temp.path()), None);
+        assert!(outside.is_dir());
+        // A note that is not Kerno's form: removed, nothing said.
+        fs::write(data.path().join(PENDING), "garbage").unwrap();
+        assert_eq!(after_install(data.path(), "0.1.0", temp.path()), None);
+        assert!(!data.path().join(PENDING).exists());
+    }
+
+    /// A downloaded installer in `folder`, with the `SHA256SUMS` that lists it.
+    fn setup_in(folder: &Path) -> PathBuf {
+        let name = "Kerno-0.2.0-windows-x86_64-setup.exe";
+        let setup = folder.join(name);
+        fs::write(&setup, "installer").unwrap();
+        fs::write(
+            folder.join("SHA256SUMS"),
+            format!("{}  {name}\n", hex(b"installer")),
+        )
+        .unwrap();
+        setup
+    }
+
+    /// K70: the installer is checked again through a handle that stays open until its process is
+    /// started; on Windows nobody may write, rename or delete it in between (tried from the fake's
+    /// start, as another process would). A changed installer or a missing line runs nothing.
+    #[test]
+    fn the_installer_is_held_shut_from_its_check_to_its_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let setup = setup_in(temp.path());
+        let target = Install::Setup(PathBuf::from("kerno.exe"));
+        let tried = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let seen = tried.clone();
+        let fake = Fake::new(move |program, _| {
+            seen.lock().unwrap().extend([
+                fs::OpenOptions::new().write(true).open(program).is_ok(),
+                fs::remove_file(program).is_ok(),
+            ]);
+            Ok(Vec::new())
+        });
+        install(&*fake, &target, &setup, v("0.2.0"), None).unwrap();
+        let tried = tried.lock().unwrap().clone();
+        if cfg!(windows) {
+            assert_eq!(tried, [false, false], "written to or deleted while held");
+            assert!(setup.is_file());
+        } else {
+            // The 0700 folder keeps other accounts out; this one may still write.
+            assert_eq!(tried.len(), 2);
+        }
+
+        // Changed after the download's check, or no longer listed: nothing is started.
+        let fake = Fake::new(|_, _| Ok(Vec::new()));
+        let setup = setup_in(temp.path());
+        fs::write(&setup, "another installer").unwrap();
+        assert_eq!(
+            install(&*fake, &target, &setup, v("0.2.0"), None),
+            Err("the download does not match its checksum".to_string())
+        );
+        let setup = setup_in(temp.path());
+        fs::write(temp.path().join("SHA256SUMS"), "").unwrap();
+        assert!(install(&*fake, &target, &setup, v("0.2.0"), None).is_err());
+        assert!(fake.calls().is_empty());
     }
 
     /// K67 (D-136), on the Windows runner of the probe workflow only: the check, as the app runs
@@ -1146,11 +1611,11 @@ pub mod tests {
         if !kerno_core::testing::k67_runner() {
             return;
         }
-        let system32 = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        let expected = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32")
             .join("curl.exe");
-        assert_eq!(curl(), system32);
-        assert_eq!(curl(), windows_curl(Some(r"C:\Windows")));
+        assert_eq!(curl(), expected);
+        assert_eq!(curl(), system32(Some(r"C:\Windows"), "curl.exe"));
         let latest = check(&System, "0.0.1")
             .expect("GitHub answered")
             .expect("a release");

@@ -308,20 +308,19 @@ fn start(
     let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
     // The one request Kerno makes by itself (CLAUDE.md §1), unless an off
     // switch is set: where this copy lives is looked at off the UI thread.
+    // An update on Windows that did not finish is said whatever the
+    // switches (K70).
     let exe = std::env::current_exe().ok();
+    let data_dir = startup.paths.data_dir.clone();
     let updates = bridge::spawn_blocking(cx, move || {
-        let updates = update::for_this_run(|name| std::env::var_os(name).is_some(), exe);
+        let not_installed = update::downloads_dir()
+            .and_then(|downloads| update::after_install(&data_dir, update::CURRENT, &downloads));
+        let updates = update::for_this_run(|name| std::env::var_os(name).is_some(), exe, data_dir);
         if let Some(updates) = &updates {
             update::remove_leftovers(&updates.target);
         }
-        updates
+        (updates, not_installed)
     });
-    cx.spawn(async move |cx| {
-        if let Some(updates) = updates.await {
-            cx.update(|cx| cx.set_global(updates));
-        }
-    })
-    .detach();
     // Where Settings → AI's Import and Detect look, on click only (K23).
     cx.set_global(ai_settings_view::AiSources::of_this_computer());
     // The menu bar was set by `bind_keys`, which builds it again whenever
@@ -349,7 +348,7 @@ fn start(
         ..
     } = startup;
     let keymap_file = AppState::get(cx).paths.keymap();
-    gpui_kit::open_window(options, cx, move |window, cx| {
+    let (main_window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("Kerno");
         // The built-in client reads the user's own known_hosts, never writes
         // it (OpenSSH connections use OpenSSH's, see D-056): keys Kerno
@@ -434,6 +433,18 @@ fn start(
         }
         workspace
     })?;
+    cx.spawn(async move |cx| {
+        let (updates, not_installed) = updates.await;
+        if let Some(updates) = updates {
+            cx.update(|cx| cx.set_global(updates));
+        }
+        if let Some((version, why)) = not_installed {
+            let _ = cx.update_window(main_window, |_, window, cx| {
+                workspace::updates::not_installed(version, why, window, cx)
+            });
+        }
+    })
+    .detach();
     cx.activate(true);
     Ok(())
 }

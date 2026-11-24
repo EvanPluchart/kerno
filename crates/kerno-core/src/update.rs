@@ -124,7 +124,8 @@ pub(crate) fn parse_hex(hex: &str) -> Option<[u8; 32]> {
 }
 
 /// The release file for this system, as `scripts/release.sh` names it (keep both in step):
-/// `Kerno-X.Y.Z-macos-<arch>.dmg`, `kerno-X.Y.Z-linux-<arch>.tar.gz`; `arch` is
+/// `Kerno-X.Y.Z-macos-<arch>.dmg`, `kerno-X.Y.Z-linux-<arch>.tar.gz`, and on Windows the installer
+/// of `scripts/bundle-windows.sh`, `Kerno-X.Y.Z-windows-<arch>-setup.exe`; `arch` is
 /// `std::env::consts::ARCH`, named as `uname -m` names it. `None` elsewhere.
 /// These names and the ones `scripts/release.sh` writes go together: change both.
 pub fn artifact(version: Version, os: &str, arch: &str) -> Option<String> {
@@ -134,6 +135,7 @@ pub fn artifact(version: Version, os: &str, arch: &str) -> Option<String> {
             Some(format!("Kerno-{version}-macos-{arch}.dmg"))
         }
         "linux" => Some(format!("{}.tar.gz", tarball_folder(version, arch))),
+        "windows" => Some(format!("Kerno-{version}-windows-{arch}-setup.exe")),
         _ => None,
     }
 }
@@ -388,7 +390,11 @@ mod tests {
             artifact(version, "linux", "aarch64").as_deref(),
             Some("kerno-0.2.0-linux-aarch64.tar.gz")
         );
-        assert_eq!(artifact(version, "windows", "x86_64"), None);
+        assert_eq!(
+            artifact(version, "windows", "x86_64").as_deref(),
+            Some("Kerno-0.2.0-windows-x86_64-setup.exe")
+        );
+        assert_eq!(artifact(version, "freebsd", "x86_64"), None);
         assert_eq!(
             version.download_url("SHA256SUMS"),
             "https://github.com/EvanPluchart/kerno/releases/download/v0.2.0/SHA256SUMS"

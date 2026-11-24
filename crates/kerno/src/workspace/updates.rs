@@ -56,9 +56,14 @@ pub fn what_update_does(target: &Install, version: Version) -> String {
             "{checked}, replaces Kerno's files in {} and starts it again. {asks}",
             dir.display()
         ),
+        Install::Setup(_) => format!(
+            "{checked}, then quits and runs its installer for your account (no administrator \
+             rights): Kerno is installed in AppData\\Local\\Programs\\Kerno and started again. A \
+             copy unpacked from the zip stays where it is. {asks}"
+        ),
         Install::Page => "This copy of Kerno cannot replace itself (a package, an AppImage, a \
-             build, or a folder Kerno may not write): Update opens the release page in your \
-             browser, to download it from there."
+             build, a folder Kerno may not write, or Kerno running as administrator): Update \
+             opens the release page in your browser, to download it from there."
             .to_string(),
     }
 }
@@ -278,7 +283,17 @@ impl Workspace {
                 // A skipped version keeps its item too (D-097): only the dialog is left out.
                 found_newer(cx, version);
                 if !manual {
+                    #[cfg(not(feature = "test-update-without-click"))]
                     self.offer_update(version, window, cx);
+                    // The Windows runner's update check (K70): no one to click Update there.
+                    #[cfg(feature = "test-update-without-click")]
+                    {
+                        tracing::warn!(
+                            %version,
+                            "test-update-without-click build: the update is taken without asking"
+                        );
+                        self.update_action(TabAction::Update, window, cx);
+                    }
                 }
                 if manual {
                     window.push_notification(
@@ -554,14 +569,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.push_notification(
-            Notification::error(SharedString::from(format!(
-                "Kerno {version} was not installed: {why}. Nothing was changed; its release \
-                 page has it."
-            ))),
-            cx,
-        );
-        set_phase(cx, Phase::Failed(version, why));
+        not_installed(version, why, window, cx);
         cx.notify();
     }
 
@@ -598,6 +606,7 @@ impl Workspace {
             return;
         }
         let (runner, target) = (updates.runner.clone(), updates.target.clone());
+        let data_dir = updates.data_dir.clone();
         set_phase(cx, Phase::Installing(version));
         cx.notify();
         let (tabs, settings) = (self.save_tabs(cx), AppState::flush_settings(cx));
@@ -606,8 +615,13 @@ impl Workspace {
             settings.await;
             let Ok(install) = this.update(cx, |_, cx| {
                 bridge::spawn_blocking(cx, move || {
-                    let installed = update::install(&*runner, &target, &file, version);
-                    remove_download(&file);
+                    let installed =
+                        update::install(&*runner, &target, &file, version, data_dir.as_deref());
+                    // Windows: the installer started reads its files from the download; the
+                    // next start removes it (`update::after_install`).
+                    if installed.is_err() || !matches!(target, Install::Setup(_)) {
+                        remove_download(&file);
+                    }
                     installed
                 })
             }) else {
@@ -620,6 +634,25 @@ impl Workspace {
             });
         })
         .detach();
+    }
+}
+
+/// Says that `version` was not installed and why, and leaves the status bar item on it (its
+/// click opens the release page). Also at start, when the last update on Windows did not finish
+/// (`update::after_install`).
+pub fn not_installed(version: Version, why: String, window: &mut Window, cx: &mut App) {
+    window.push_notification(
+        Notification::error(SharedString::from(format!(
+            "Kerno {version} was not installed: {why}. Nothing was changed; its release page \
+             has it."
+        )))
+        // It stays until closed: said at a start, it must not go before it is read (K70).
+        .autohide(false),
+        cx,
+    );
+    tracing::warn!(%version, "an update was not installed: {why}");
+    if cx.try_global::<Updates>().is_some() {
+        set_phase(cx, Phase::Failed(version, why));
     }
 }
 

@@ -5,8 +5,8 @@
 use super::tool_wizards::paints;
 use super::*;
 use crate::tabs::TabAction;
-use crate::update::tests::{Fake, redirect_to, value_of};
-use crate::update::{Install, Phase, Updates};
+use crate::update::tests::{Fake, is_curl, redirect_to, value_of};
+use crate::update::{self, Install, Phase, Updates};
 use crate::workspace::updates::{update_label, update_tooltip, what_update_does};
 use kerno_core::update::{self as releases, Version};
 
@@ -83,7 +83,7 @@ fn update_does(app: &Fixture, cx: &mut TestAppContext, action: TabAction) {
 fn curl_args(fake: &Fake) -> Vec<Vec<String>> {
     fake.calls()
         .into_iter()
-        .filter(|(program, args)| program.ends_with("curl") && !is_notes(args))
+        .filter(|(program, args)| is_curl(program) && !is_notes(args))
         .map(|(_, args)| args)
         .collect()
 }
@@ -239,7 +239,7 @@ fn release_runner_then(
             std::fs::write(at.join("Contents/MacOS/kerno"), marker).unwrap();
         };
         match program.to_str().unwrap() {
-            curl if curl.ends_with("/curl") => {
+            _ if is_curl(program) => {
                 // The check (`--head`, no file): 0.2.0 is the latest.
                 let Some(output) = value_of(args, "--output") else {
                     return Ok(redirect_to("v0.2.0"));
@@ -1162,5 +1162,108 @@ fn a_newer_version_found_during_the_quit_question_installs_nothing(cx: &mut Test
             .calls()
             .iter()
             .any(|(program, _)| { program.ends_with("open") || program.ends_with("hdiutil") })
+    );
+}
+
+/// A runner serving `files` to `curl` and recording the installer it is asked to start (Windows,
+/// K70): everything but `curl` is that installer.
+fn setup_runner(files: Vec<(String, Vec<u8>)>) -> Arc<Fake> {
+    Fake::new(move |program, args| {
+        if !is_curl(program) {
+            return Ok(Vec::new());
+        }
+        let Some(output) = value_of(args, "--output") else {
+            return Ok(redirect_to("v0.2.0"));
+        };
+        let name = args.last().unwrap().rsplit('/').next().unwrap();
+        let (_, body) = files
+            .iter()
+            .find(|(file, _)| file == name)
+            .ok_or("curl: (22) The requested URL returned error: 404")?;
+        std::fs::write(output, body).unwrap();
+        Ok(Vec::new())
+    })
+}
+
+/// K70 (D-139), the Windows twin of `update_installs_the_checked_release_and_starts_it`: the
+/// checked installer is started for this user and Kerno quits; the download stays for it, a note
+/// stays for the next start, which says when the installer did not finish.
+#[gpui_kit::test]
+fn on_windows_update_starts_the_checked_installer_and_the_next_start_says_if_it_failed(
+    cx: &mut TestAppContext,
+) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let exe = std::path::PathBuf::from(r"C:\Users\x\AppData\Local\Programs\Kerno\kerno.exe");
+    let target = Install::Setup(exe.clone());
+    let does = what_update_does(&target, v("0.2.0"));
+    assert!(does.contains("installer for your account"), "{does}");
+    let data_dir = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global_mut::<Updates>().data_dir = Some(data.path().to_path_buf()))
+    };
+
+    // A wrong checksum: nothing is started.
+    let refused = setup_runner(release(&sha256_hex(b"another file")));
+    allow_updates(
+        &app,
+        cx,
+        refused.clone(),
+        "0.1.0",
+        target.clone(),
+        temp.path(),
+    );
+    data_dir(cx);
+    set_phase(&app, cx, Phase::Available(v("0.2.0")));
+    app.click(cx, "status-update-button");
+    app.wait_until(cx, "the refusal", |_, cx| {
+        matches!(phase(cx), Phase::Failed(..))
+    });
+    assert!(refused.calls().iter().all(|(program, _)| is_curl(program)));
+    assert!(!data.path().join(update::PENDING).exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+    let fake = setup_runner(release(&sha256_hex(b"the release")));
+    allow_updates(&app, cx, fake.clone(), "0.1.0", target, temp.path());
+    data_dir(cx);
+    set_phase(&app, cx, Phase::Available(v("0.2.0")));
+    app.click(cx, "status-update-button");
+    app.wait_until(cx, "the installer started", |_, _| {
+        fake.calls().iter().any(|(program, _)| !is_curl(program))
+    });
+    assert_eq!(phase(cx), Phase::Installing(v("0.2.0")));
+    let (setup, args) = fake.calls().last().unwrap().clone();
+    assert!(args.contains(&"/relaunch=1".to_string()), "{args:?}");
+    assert!(
+        args.contains(&format!("/kerno={}", exe.display())),
+        "{args:?}"
+    );
+    // The installer reads its files from the download: it stays.
+    cx.run_until_parked();
+    assert!(setup.is_file(), "{setup:?}");
+    assert!(data.path().join(update::PENDING).is_file());
+
+    // The next start, still 0.1.0: it says so, once, and the download goes.
+    let (version, why) = update::after_install(data.path(), "0.1.0", temp.path()).unwrap();
+    assert!(!setup.exists());
+    use gpui_kit::component::WindowExt as _;
+    let before = app.step(cx, |window, cx| window.notifications(cx).len());
+    app.step(cx, |window, cx| {
+        crate::workspace::updates::not_installed(version, why, window, cx)
+    });
+    // It stays until closed, a minute later too.
+    cx.executor().advance_clock(Duration::from_secs(60));
+    cx.run_until_parked();
+    assert_eq!(
+        app.step(cx, |window, cx| window.notifications(cx).len()),
+        before + 1
+    );
+    assert_eq!(
+        label(cx).as_deref(),
+        Some("Kerno 0.2.0 was not installed · Release page")
+    );
+    assert_eq!(
+        update::after_install(data.path(), "0.1.0", temp.path()),
+        None
     );
 }
