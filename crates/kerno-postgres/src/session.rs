@@ -530,8 +530,11 @@ impl Session for PgSession {
     async fn close(&self) {
         // Closed by Kerno, not by the server.
         let _ = self.gone.set(DbError::message("the session was closed"));
-        // Stop whatever is running so the lock is released promptly.
-        let _ = self.cancel.cancel().await;
+        // Stop whatever is running so the lock is released promptly, counted
+        // as any cancel: a statement being described when it comes (one that
+        // waits for a lock as the server parses it) is then not sent after
+        // it, where it would wait for that lock unseen (K71).
+        let _ = Session::cancel(self).await;
         // Dropping the client sends Terminate and ends the connection task.
         self.link.lock().await.client = None;
     }

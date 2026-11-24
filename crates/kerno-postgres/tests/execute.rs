@@ -271,6 +271,61 @@ async fn a_cancel_stops_the_statement_waiting_for_its_turn_too() {
     );
 }
 
+/// K71: a statement that waits for a lock while it is described (the
+/// server parses it before it runs it) is stopped by closing its session,
+/// and is not sent again once its description was cancelled: it would wait
+/// for the lock on the server, unseen, the session closed for Kerno.
+#[tokio::test]
+async fn closing_stops_a_statement_waiting_for_a_lock_as_it_is_described() {
+    let (Some(session), Some(holder), Some(watcher)) = (
+        common::session().await,
+        common::session().await,
+        common::session().await,
+    ) else {
+        return;
+    };
+    let schema = common::scratch_schema("close_while_described");
+    exec_ok(&holder, &format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+    exec_ok(&holder, &format!("CREATE SCHEMA {schema}")).await;
+    exec_ok(&holder, &format!("CREATE TABLE {schema}.t (n int)")).await;
+    exec_ok(&holder, "BEGIN").await;
+    exec_ok(
+        &holder,
+        &format!("LOCK TABLE {schema}.t IN ACCESS EXCLUSIVE MODE"),
+    )
+    .await;
+    let waiting = format!(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+         AND query LIKE 'SELECT n FROM {schema}.t%'"
+    );
+    // Its result is still awaited: nothing but the close stops it.
+    let reading = tokio::spawn(exec::collect(
+        session.clone(),
+        format!("SELECT n FROM {schema}.t"),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while scalar(&watcher, &waiting).await == "0" {
+        assert!(Instant::now() < deadline, "the read never waited");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let closed = tokio::time::timeout(Duration::from_secs(5), session.close()).await;
+    let mut left = scalar(&watcher, &waiting).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while left != "0" && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        left = scalar(&watcher, &waiting).await;
+    }
+    exec_ok(&holder, "ROLLBACK").await;
+    exec_ok(&holder, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    assert!(closed.is_ok(), "the close waited for the statement");
+    assert_eq!(left, "0", "the statement still waits on the server");
+    let read = tokio::time::timeout(Duration::from_secs(5), reading)
+        .await
+        .expect("the read ended")
+        .unwrap();
+    assert!(read.is_err(), "{read:?}");
+}
+
 #[tokio::test]
 async fn every_type_arrives_in_its_text_form() {
     let Some(session) = common::session().await else {
