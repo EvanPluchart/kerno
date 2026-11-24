@@ -504,3 +504,80 @@ fn the_toolbar_opens_an_editor_on_the_connection_selected_in_the_tree(cx: &mut T
     app.wait_until(cx, "a third tab", |app, cx| app.titles(cx).len() == 3);
     assert_eq!(tab_connection(&app, cx).as_deref(), Some(ids[1].as_str()));
 }
+
+/// Runs the dialog's test, which passes; the line it says of the password.
+fn tested_password(app: &Fixture, cx: &mut TestAppContext) -> String {
+    app.click(cx, "conn-test");
+    app.wait_until(cx, "the passed test", |app, cx| {
+        assert!(!app.has(cx, "conn-test-failed"));
+        app.has(cx, "conn-test-passed")
+    });
+    let lines = [
+        crate::connections::manager::TYPED_HERE,
+        "Password from Kerno's file",
+        "Password asked",
+        "Password remembered until Kerno quits",
+    ];
+    lines
+        .into_iter()
+        .find(|line| super::tool_wizards::paints(app, cx, line))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 5. A password typed in the connection dialog is said typed there; one
+/// read from Kerno's file, untouched, is said to come from it; typed over
+/// (even with the same text), it is typed again.
+#[gpui_kit::test]
+fn a_tested_password_says_where_it_really_came_from(cx: &mut TestAppContext) {
+    use kerno_core::secrets::FileSecretStore;
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = open(cx, memory_storage());
+    let store: Arc<dyn kerno_core::secrets::SecretStore> =
+        Arc::new(FileSecretStore::new(dir.path()));
+    cx.update(|cx| cx.global_mut::<AppState>().secrets = store.clone());
+    let port = testing::port(Engine::Postgres);
+
+    // A new connection, its password typed (here through its URL).
+    app.click(cx, "empty-new-connection");
+    app.click(cx, "conn-url");
+    app.type_text(
+        cx,
+        &format!(
+            "postgres://kerno:{}@127.0.0.1:{port}/kerno?sslmode=disable",
+            testing::DB_PASSWORD
+        ),
+    );
+    app.press(cx, &["enter"]);
+    assert_eq!(tested_password(&app, cx), "Password typed here");
+    app.click(cx, "conn-name");
+    app.type_text(cx, "kerno_ui k56");
+    app.click(cx, "conn-save");
+    app.wait_until(cx, "the saved connection", |app, _| {
+        app.storage.connections().unwrap().len() == 1
+    });
+    let id = app.storage.connections().unwrap()[0].id.clone();
+    app.wait_until(cx, "the saved password", |_, _| {
+        kerno_core::secrets::load_secrets(store.as_ref(), &id)
+            .is_ok_and(|secrets| secrets.password.is_some())
+    });
+
+    // Edited: the password read from Kerno's file, untouched.
+    app.wait_until(cx, "the dialog closed", |app, cx| !app.dialog_open(cx));
+    app.sidebar_does(
+        cx,
+        crate::sidebar::Subject::Connection(id.clone()),
+        crate::sidebar::SidebarAction::Edit,
+    );
+    app.wait_until(cx, "the dialog", |app, cx| app.has(cx, "conn-test"));
+    assert_eq!(tested_password(&app, cx), "Password from Kerno's file");
+
+    // Typed over with the same text: typed here.
+    app.click(cx, "conn-password");
+    app.press(cx, &["secondary-a", "backspace"]);
+    app.type_text(cx, testing::DB_PASSWORD);
+    assert_eq!(tested_password(&app, cx), "Password typed here");
+}

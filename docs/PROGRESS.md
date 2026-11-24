@@ -1537,3 +1537,5 @@ Still open (for the owner):
 - The running mark (K37) is seen to breathe: 1.5 s a breath, six of the tab's redraws, from no halo to 50 % of the
   info colour and wider, held still when the system asks for less motion (D-127). Test: `theme::tests`, seen
   failing with K37's breath. Captures light and dark of the strip, the bar and two frames of the mark, offscreen.
+- "Test connection" said a password just typed in the dialog came from Kerno's file (or the keychain). It now
+  says "Password typed here", and still says where a saved one, untouched, really came from.

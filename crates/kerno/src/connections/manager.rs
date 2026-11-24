@@ -1277,12 +1277,14 @@ impl Connections {
 
     /// Tries a connection without saving it, and reports the server version
     /// and latency. `trusted_fingerprint` is an SSH host key the user just
-    /// agreed to trust.
+    /// agreed to trust; `typed`, that the password in `secrets` was typed
+    /// in the dialog, not read from where saved passwords are (K56).
     pub fn test(
         &self,
         config: ConnectionConfig,
         secrets: Secrets,
         trusted_fingerprint: Option<String>,
+        typed: bool,
         cx: &App,
     ) -> Task<kerno_core::Result<TestReport>> {
         let driver = self.drivers.get(config.engine);
@@ -1297,12 +1299,15 @@ impl Connections {
             let latency = started.elapsed();
             let version = session.server().named(session.engine());
             session.close().await;
-            let password = origin_text(
-                connector.password_origin().as_ref(),
-                connector.password_warning().as_deref(),
-                asked,
-                saved_in,
-            );
+            let password = match connector.password_origin() {
+                Some(PasswordOrigin::Given) if typed => Some(TYPED_HERE.to_string()),
+                origin => origin_text(
+                    origin.as_ref(),
+                    connector.password_warning().as_deref(),
+                    asked,
+                    saved_in,
+                ),
+            };
             Ok(TestReport {
                 version,
                 latency,
@@ -1341,6 +1346,9 @@ impl Connections {
         })
     }
 }
+
+/// A test's password, typed in the connection dialog (K56).
+pub const TYPED_HERE: &str = "Password typed here";
 
 /// Where a connection's password came from, in the words of the dialog and
 /// the navigator (J3): `asked` when the user typed it for this run, a

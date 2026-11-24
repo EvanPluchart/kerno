@@ -263,7 +263,7 @@ async fn each_secret_is_read_once_per_run(cx: &mut TestAppContext) {
     cx.update(|cx| {
         app.connections
             .read(cx)
-            .test(config, testing::secrets(), None, cx)
+            .test(config, testing::secrets(), None, false, cx)
     })
     .await
     .unwrap();

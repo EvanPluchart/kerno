@@ -509,7 +509,10 @@ fn test_connection_reports_version_and_latency(cx: &mut TestAppContext) {
             Rc::new(RefCell::new(None));
         let slot = outcome.clone();
         cx.update(|cx| {
-            let test = app.connections.read(cx).test(config, secrets, None, cx);
+            let test = app
+                .connections
+                .read(cx)
+                .test(config, secrets, None, false, cx);
             cx.spawn(async move |_| *slot.borrow_mut() = Some(test.await))
                 .detach();
         });

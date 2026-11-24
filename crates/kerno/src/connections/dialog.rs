@@ -197,6 +197,10 @@ pub struct ConnectionDialog {
     running_command: Option<Task<()>>,
     /// The last URL filled the form; said under the field until it changes.
     url_filled: bool,
+    /// The password read from where saved passwords are, when the dialog
+    /// opened on a saved connection and the field was not typed in since:
+    /// any other one in the field was typed here (K56).
+    stored_password: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -271,6 +275,14 @@ impl ConnectionDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A connection opened from a URL (J4) has no saved password yet.
+        let stored_password = match &existing {
+            Some((saved, secrets)) if !connections.read(cx).is_unsaved(&saved.id) => secrets
+                .password
+                .as_ref()
+                .map(|password| password.expose().to_string()),
+            _ => None,
+        };
         let (editing, mut form) = match &existing {
             Some((saved, secrets)) => (
                 Some(saved.id.clone()),
@@ -394,6 +406,11 @@ impl ConnectionDialog {
         // server's or another login's. It is read again only when asked
         // for: nothing is sent to a server while the user types.
         let mut subscriptions = vec![fill_on_enter, fill_on_paste, refilter];
+        subscriptions.push(cx.subscribe(&password, |this, _, event, _| {
+            if matches!(event, InputEvent::Change) {
+                this.stored_password = None;
+            }
+        }));
         for input in [&host, &port, &user, &password] {
             subscriptions.push(cx.subscribe(input, |this, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -450,6 +467,7 @@ impl ConnectionDialog {
             run: RunState::NotRun,
             running_command: None,
             url_filled: false,
+            stored_password,
             ssh_aliases: Vec::new(),
             loading_aliases: openssh.and_then(|env| {
                 let file = env.aliases_from?;
@@ -685,10 +703,16 @@ impl ConnectionDialog {
         };
         self.test = TestState::Running;
         let tested = config.clone();
-        let testing =
-            self.connections
-                .read(cx)
-                .test(config, secrets, self.trusted_fingerprint.clone(), cx);
+        let password = self.inputs.password.read(cx).value();
+        let typed =
+            !password.is_empty() && self.stored_password.as_deref() != Some(password.as_ref());
+        let testing = self.connections.read(cx).test(
+            config,
+            secrets,
+            self.trusted_fingerprint.clone(),
+            typed,
+            cx,
+        );
         self.running_test = Some(cx.spawn(async move |this, cx| {
             let outcome = testing.await;
             let _ = this.update(cx, |this, cx| {
