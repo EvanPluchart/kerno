@@ -432,13 +432,13 @@ notes](ARCHITECTURE.md#the-update-check) give the details.
 
 When a check at launch (or 6 hours later) finds a new version, a window says so once per version and run (a
 newer one found later in the same run is offered too): the new version, the one you have, and what Update does
-on your copy (an installed `Kerno.app` or archive replaces itself and starts again; any other copy opens the
-release page). **What's new** opens the release page in your browser. **Update** installs as the status bar
-item does; **Later** closes it, and the next launch asks again; **Skip this version** stops the window for
-that version (a newer one asks again). No key acts in it while you type: Enter and Space do nothing, Escape is
-Later, and Tab goes to Later first and to Update last; it waits while another dialog is open. The status bar
-item stays in every case, a skipped version included; Settings ▸ Updates shows the skipped version with
-**Ask again**.
+on your copy (an installed `Kerno.app` or archive replaces itself and starts again; on Windows the installer
+runs for your account; any other copy opens the release page). **What's new** opens the release page in your
+browser. **Update** installs as the status bar item does; **Later** closes it, and the next launch asks again;
+**Skip this version** stops the window for that version (a newer one asks again). No key acts in it while you
+type: Enter and Space do nothing, Escape is Later, and Tab goes to Later first and to Update last; it waits
+while another dialog is open. The status bar item stays in every case, a skipped version included; Settings ▸
+Updates shows the skipped version with **Ask again**.
 
 ## Settings, environments and what wins
 
@@ -864,7 +864,8 @@ never names the server's host, the user or a database file's path.
 
 Everything Kerno remembers (saved connections without their passwords, folders, environments, settings, open
 tabs, where the window was and how large, history, saved queries and tasks) is in one SQLite file, `kerno.db`,
-in its data folder: `~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux. Beside it:
+in its data folder: `~/Library/Application Support/Kerno` on macOS, `~/.local/share/kerno` on Linux,
+`%APPDATA%\Kerno\data` on Windows (and `%APPDATA%\Kerno\config` for `keymap.json`). Beside it:
 `logs/` (a file a day, the last seven), `known_hosts` (the SSH host keys you accepted in Kerno),
 `folder-icons/`, and `backups/`. `keymap.json` is in the same folder on macOS and in `~/.config/kerno` on Linux. Saved passwords
 are in `secrets.kerno` (encrypted, its key in `secrets.key`) or in the system keychain, as Settings ▸ Passwords
@@ -891,8 +892,9 @@ start, never deleted.
 
 The packages are on the [releases page](https://github.com/EvanPluchart/kerno/releases/latest); the README has
 the short version. On macOS, open the `.dmg` and drag Kerno onto the Applications folder beside it, as its window
-shows. To build them yourself, `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
-`scripts/bundle-linux.sh` builds the Linux packages (below).
+shows. To build them yourself, `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`,
+`scripts/bundle-linux.sh` builds the Linux packages (below), and `scripts/bundle-windows.sh` (Git Bash with Inno
+Setup 6, on Windows) the Windows zip and installer.
 
 On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours
 (`KERNO_SIGN_IDENTITY="Apple Development: …" scripts/bundle-macos.sh`). This matters only when Settings ▸
@@ -900,6 +902,34 @@ Passwords keeps passwords in the macOS Keychain (Kerno's own file, the default, 
 each saved password from the keychain once per run, and as an ad-hoc signature changes with every build and
 every update, the keychain asks for your login password again after each one, once per saved password; "Always
 allow" stops it for that build. A stable identity avoids it.
+
+### Windows
+
+Each release carries `Kerno-<version>-windows-x86_64-setup.exe`, the installer, and
+`kerno-<version>-windows-x86_64.zip`, the same files to unpack anywhere. The installer is for your account
+only and never asks for an administrator: it puts Kerno in `%LOCALAPPDATA%\Programs\Kerno`, adds it to the
+Start menu (a desktop shortcut if you tick it), and lists it in Settings ▸ Apps ▸ Installed apps with its
+version, where **Uninstall** removes it. It shows both licences (MIT and Apache 2.0, either at your choice).
+
+The installer is not signed (there is no certificate yet). Windows may say "Windows protected your PC" when you
+open it after a download: click **More info**, check that the file is the one from Kerno's release page (its
+SHA-256 is in the release's `SHA256SUMS`: `Get-FileHash Kerno-<version>-windows-x86_64-setup.exe` in
+PowerShell), then **Run anyway**.
+
+Updates from the app work on both: Kerno downloads the new installer and `SHA256SUMS` from the release (into
+`%LOCALAPPDATA%\Kerno\data\updates`, inside your profile), runs the installer only when its SHA-256 matches,
+quits (after asking about open transactions and pending changes, as quitting does), and the installer replaces
+Kerno and starts it again; your tabs, unsaved text included, come back. A copy unpacked from the zip is updated
+the same way: the new version is installed for your account as above, and the unpacked folder stays where it
+is, yours to delete. A Kerno started as administrator ("Run as administrator") never runs an installer it
+downloaded: Update opens the release page instead. If the installer cannot finish (another Kerno still open
+from the same folder, a folder it cannot write), it changes nothing, starts the Kerno you had again, and that
+Kerno says what happened and where the installer's log is (`%APPDATA%\Kerno\data\update-setup.log`).
+
+Quit Kerno before you install a version over it by hand. Uninstalling removes the program, its shortcuts and its
+entry, never your data: connections, settings, history, saved queries and Kerno's password file stay in
+`%APPDATA%\Kerno` (delete that folder to remove them too), and passwords kept in Windows' Credential Manager
+stay there.
 
 ### Linux
 

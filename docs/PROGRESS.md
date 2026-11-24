@@ -1849,3 +1849,18 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   connection errors") once the folder backup's tests had added to the connections that fail on purpose: a 5.x
   server counts them only for a host whose name it can resolve, which a runner's is and this Mac's is not. The
   four legacy test servers start with `--max_connect_errors=1000000`.
+
+## 2026-11-24 — K70: a Windows installer, and the update installed from the app
+
+- The owner's pick "A4": `Kerno-<version>-windows-x86_64-setup.exe` (Inno Setup, as Recto and Vigie; per user,
+  no administrator, into `%LOCALAPPDATA%\Programs\Kerno`; uninstalling keeps `%APPDATA%\Kerno`), built by
+  `scripts/bundle-windows.sh` after the zip and checked there (silent install, files, shortcut, uninstall entry,
+  a launch, silent uninstall). On Windows Update now downloads the installer, checks its SHA-256 against
+  `SHA256SUMS`, runs it for the user while Kerno quits, and the installer starts the new Kerno; a failure starts
+  the old one, which says why. A Kerno running as administrator keeps to the release page (D-139).
+- Proved on GitHub's runner (the probe of the branch `windows-installer`): the install check, and the update
+  against a fake release served on the runner itself (a wrong checksum refused, another Kerno running stops
+  the installer, 0.0.0 updated to this version). The Kerno that updated there is a test build (no click, says
+  0.0.0, no elevation check: the runner is administrator only).
+- Not proved: a standard user's update on a real Windows, the installer's pages clicked by a person, what
+  Windows' Restart Manager does to a running Kerno, SmartScreen's words on the unsigned installer.

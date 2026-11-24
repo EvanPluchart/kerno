@@ -78,7 +78,8 @@ connection dialog, Settings). A preview until the list below is done. Next, in o
 2. A line for Windows in the READMEs' install tables, once a person has used the zip.
 3. The password command's presets (`aws.exe`, `op.exe`), a MariaDB client whose `mysqldump.exe` is not a link
    (D-136), and the start-failure page's advice (it says "Set HOME").
-4. An installer and the in-app update's install, as Recto and Vigie do on Windows.
+4. Done (K70, D-139): an installer for the user's account (Inno Setup) and the update installed from the app,
+   proved on GitHub's runner; a standard user's update on a real Windows is still to be tried by a person.
 5. The system OpenSSH tunnel (a loopback TCP forward and the askpass questions on a named pipe), Pageant.
 
 ## The AI assistant, next (agreed with the owner, 2026-11-23)
