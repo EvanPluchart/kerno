@@ -11,15 +11,17 @@
 //! with `==`, not in constant time (the tree has no helper for it within
 //! reach; a local peer timing a 32-byte comparison learns too little).
 //!
-//! Pure functions, tested on every system; only Windows' pipe uses them.
+//! Pure functions, tested on every system; only Windows' pipes use them: the
+//! instance's, and the askpass channel of the OpenSSH tunnel (K69, D-138),
+//! through `windows.rs`.
 
 use sha2::{Digest as _, Sha256};
 
 /// The size of the token, of a nonce and of a proof.
-pub(super) const SIZE: usize = 32;
+pub(crate) const SIZE: usize = 32;
 
 /// A token, a nonce or a proof.
-pub(super) type Bytes = [u8; SIZE];
+pub(crate) type Bytes = [u8; SIZE];
 
 fn digest(token: &Bytes, nonce: &Bytes, side: &[u8]) -> Bytes {
     Sha256::new()

@@ -24,6 +24,7 @@ pub mod home;
 pub mod import;
 pub mod instance;
 pub mod links;
+pub mod local_path;
 pub mod maintenance;
 pub mod openssh;
 pub mod password;

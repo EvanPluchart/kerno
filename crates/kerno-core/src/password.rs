@@ -209,6 +209,11 @@ pub fn command_line(config: &ConnectionConfig, database: Option<&str>) -> Option
 pub async fn run(line: &CommandLine, env: &PasswordEnv) -> Result<Secret> {
     let name = line.name().to_string();
     let fail = |what: String| Error::Connect(format!("{COMMAND_MARKER}{name}` {what}"));
+    // A program named by its path is a file of this computer (K69, D-138):
+    // Windows would run one of a share, logging in there first.
+    if line.program.contains(['/', '\\', ':']) {
+        crate::local_path::check(Path::new(&line.program), "password command's program")?;
+    }
     let program = env.find(&line.program).ok_or_else(|| {
         fail(format!(
             "was not found (looked in {})",

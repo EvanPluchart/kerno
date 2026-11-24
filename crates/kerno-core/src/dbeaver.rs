@@ -736,6 +736,8 @@ fn map_connection(
     if let Some(hops) = jumps {
         apply_jumps(&mut config, hops, not_mapped);
     }
+    // Windows: a file on another computer is never opened (K69, D-138).
+    not_mapped.extend(crate::local_path::notes(&config));
     connection.new_environment = new_environment;
     connection.config = match config.validate() {
         Ok(()) => Ok(config),
@@ -1353,14 +1355,21 @@ mod tests {
                 path: "/home/me/.ssh/id_ed25519".into()
             }
         );
-        assert_eq!(
-            shop.not_mapped,
-            [
-                "jump server “jump.example.com”: its key file is not passed to it (DBeaver used \
-                 “/home/me/.ssh/hop”): load that key with ssh-add, or name it for that host in \
-                 ~/.ssh/config"
-            ]
-        );
+        let mut expected = vec![
+            "jump server “jump.example.com”: its key file is not passed to it (DBeaver used \
+             “/home/me/.ssh/hop”): load that key with ssh-add, or name it for that host in \
+             ~/.ssh/config"
+                .to_string(),
+        ];
+        // Windows opens a drive's path only (K69, D-138).
+        if cfg!(windows) {
+            expected.push(format!(
+                "the SSH key /home/me/.ssh/id_ed25519 is not a file of this computer: it will \
+                 not be opened; choose {}",
+                crate::local_path::LOCAL_FILE
+            ));
+        }
+        assert_eq!(shop.not_mapped, expected);
         // The hop's saved passphrase has no place in Kerno: never in the tunnel's.
         assert_eq!(
             shop.secrets.ssh_key_passphrase.as_ref().map(Secret::expose),

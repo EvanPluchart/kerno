@@ -352,15 +352,16 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
         if let Some(stderr) = ssh_text.strip_prefix("OpenSSH: ") {
             openssh_words(stderr, config)
         } else if ssh_text.starts_with(crate::openssh::NOT_FOUND) {
-            // Windows: never offered yet (K64, D-131), installed or not.
+            // Windows ships OpenSSH as an optional feature (K69, D-138).
             let (headline, next_step) = match cfg!(unix) {
                 true => (
                     "OpenSSH was not found on this computer.",
                     "Choose the built-in client on the SSH tab, or install OpenSSH.",
                 ),
                 false => (
-                    "Tunnels through the system's OpenSSH are not available on Windows yet.",
-                    "Choose the built-in client on the SSH tab.",
+                    "OpenSSH was not found on this computer.",
+                    "Choose the built-in client on the SSH tab, or add Windows' OpenSSH Client \
+                     (Settings, System, Optional features).",
                 ),
             };
             (
@@ -655,6 +656,15 @@ fn openssh_words(
     };
     let words = |kind, headline: String, next: &str| (kind, headline, next.to_string());
     for line in stderr.lines().map(str::trim) {
+        // Windows' ssh.exe before 8.4 (K69, D-138).
+        if line.starts_with("This OpenSSH is too old to ask Kerno") {
+            return words(
+                FailureKind::SshAuthentication,
+                "This OpenSSH is too old to ask Kerno for a passphrase or a host key.".to_string(),
+                "Load the key in the SSH agent (ssh-add) and connect once with ssh in a terminal \
+                 to record the server's key, or choose the built-in client on the SSH tab.",
+            );
+        }
         if let Some(rest) = line
             .split_once("Could not resolve hostname ")
             .map(|(_, r)| r)
@@ -1268,10 +1278,21 @@ mod tests {
         );
         assert_eq!(
             explained.headline,
-            match cfg!(unix) {
-                true => "OpenSSH was not found on this computer.",
-                false => "Tunnels through the system's OpenSSH are not available on Windows yet.",
-            }
+            "OpenSSH was not found on this computer."
+        );
+        // K69: Windows' ssh.exe before 8.4 cannot ask Kerno.
+        let explained = explain(
+            &format!(
+                "SSH tunnel: OpenSSH: {}\nkerno@bastion: Permission denied (publickey).",
+                crate::openssh::TOO_OLD
+            ),
+            &config,
+        );
+        assert_eq!(explained.kind, SshAuthentication);
+        assert!(
+            explained.headline.starts_with("This OpenSSH is too old"),
+            "{}",
+            explained.headline
         );
         let explained = explain(
             "SSH tunnel: the SSH server could not connect to studio:5432: channel 2: open \

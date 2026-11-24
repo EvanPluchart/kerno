@@ -460,6 +460,170 @@ pub fn processes_named(image: &str) -> usize {
         .count()
 }
 
+/// The servers a throwaway Windows runner starts for the tunnel through
+/// `ssh.exe` (K69, `.github/workflows/windows-ssh-probe.yml`): Windows' own
+/// OpenSSH server for the runner's user, keys in the profile's `.ssh`, and
+/// a PostgreSQL server of its own.
+#[cfg(windows)]
+pub mod k69 {
+    use std::path::{Path, PathBuf};
+
+    use crate::config::{ConnectionConfig, Engine, SshAuth, SshClient, SshConfig, TlsMode};
+
+    /// The SSH server's port (127.0.0.1).
+    pub const SSH_PORT: u16 = 52290;
+    /// The same server's second port, as a jump host: OpenSSH refuses a
+    /// jump host that is the target itself ("jumphost loop").
+    pub const JUMP_PORT: u16 = 52291;
+    /// The PostgreSQL server's port (127.0.0.1).
+    pub const PG_PORT: u16 = 55433;
+    /// Its database, owned by the role `kerno` ([`super::DB_PASSWORD`]).
+    pub const DATABASE: &str = "kerno_test_k69";
+    /// The passphrase of `kerno_k69_enc`.
+    pub const PASSPHRASE: &str = "k69 passphrase";
+
+    /// Whether this runs on that runner (`KERNO_K69_RUNNER`); otherwise the
+    /// K69 tests print why and pass.
+    pub fn runner() -> bool {
+        let on = std::env::var_os("KERNO_K69_RUNNER").is_some();
+        if !on {
+            eprintln!("SKIPPED: not the K69 Windows runner (KERNO_K69_RUNNER is not set)");
+        }
+        on
+    }
+
+    /// The runner's user, whom the SSH server lets in.
+    pub fn user() -> String {
+        std::env::var("USERNAME").expect("USERNAME")
+    }
+
+    /// A key the workflow made in the profile's `.ssh`.
+    pub fn key(name: &str) -> PathBuf {
+        crate::home::dir()
+            .expect("USERPROFILE")
+            .join(".ssh")
+            .join(name)
+    }
+
+    /// The OpenSSH settings of a test: the SSH server by address, `auth`.
+    pub fn ssh(auth: SshAuth, jump: Option<String>) -> SshConfig {
+        SshConfig {
+            host: "127.0.0.1".into(),
+            port: SSH_PORT,
+            user: user(),
+            auth,
+            keepalive_secs: 30,
+            client: SshClient::OpenSsh,
+            jump,
+        }
+    }
+
+    /// The runner's PostgreSQL as the SSH server sees it, through `ssh`.
+    pub fn config(ssh: SshConfig) -> ConnectionConfig {
+        let mut config = super::config(Engine::Postgres);
+        config.port = PG_PORT;
+        config.database = Some(DATABASE.into());
+        config.tls.mode = TlsMode::Disable;
+        config.ssh = Some(ssh);
+        config
+    }
+
+    /// The jump host's alias in [`openssh`]'s file: the server's second
+    /// port, with the plain key.
+    pub const JUMP: &str = "k69-jump";
+
+    /// A configuration file of the test's own in `dir`, with its own
+    /// known_hosts (filled with the server's keys when `known`): the jump
+    /// host [`JUMP`] takes the plain key, the target only the key a test
+    /// gives (`-i`); no agent.
+    pub fn openssh(dir: &Path, askpass: PathBuf, known: bool) -> super::OpenSshFixture {
+        let slashes = |path: &Path| path.display().to_string().replace('\\', "/");
+        let known_hosts = dir.join("known_hosts");
+        let config = dir.join("ssh_config");
+        let text = format!(
+            "Host {JUMP}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{}\"\n\
+             Host *\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
+             UserKnownHostsFile \"{}\"\n  UpdateHostKeys no\n  ConnectTimeout 10\n",
+            slashes(&key("kerno_k69")),
+            slashes(&known_hosts),
+        );
+        std::fs::write(&config, text).expect("write the test ssh_config");
+        let scan = |port: u16| {
+            let scan = std::process::Command::new(system32("ssh-keyscan.exe"))
+                .args(["-p", &port.to_string(), "127.0.0.1"])
+                .output()
+                .expect("run ssh-keyscan");
+            String::from_utf8_lossy(&scan.stdout).into_owned()
+        };
+        let lines = match known {
+            true => scan(SSH_PORT) + &scan(JUMP_PORT),
+            false => String::new(),
+        };
+        std::fs::write(&known_hosts, lines).expect("write the test known_hosts");
+        let env = crate::openssh::OpenSshEnv {
+            ssh: crate::openssh::find_ssh(std::env::var_os("PATH").as_deref())
+                .expect("Windows' ssh.exe"),
+            config: Some(config.clone()),
+            aliases_from: Some(config.clone()),
+            askpass,
+        };
+        super::OpenSshFixture {
+            config,
+            known_hosts,
+            env,
+        }
+    }
+
+    /// A program of Windows' OpenSSH.
+    pub fn system32(program: &str) -> PathBuf {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        PathBuf::from(root)
+            .join("System32")
+            .join("OpenSSH")
+            .join(program)
+    }
+
+    /// The command lines of the running `ssh.exe` processes.
+    pub fn ssh_processes() -> Vec<String> {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | \
+                 ForEach-Object { $_.CommandLine }",
+            ])
+            .output()
+            .expect("list the processes");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Waits up to 15 s until no `ssh.exe` whose command line holds
+    /// `marker` runs; panics naming the ones left. Async: the tasks that
+    /// stop a stream's `ssh.exe` run on the test's runtime meanwhile.
+    pub async fn wait_until_gone(marker: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let left: Vec<String> = ssh_processes()
+                .into_iter()
+                .filter(|line| line.contains(marker))
+                .collect();
+            if left.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ssh.exe left running: {left:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
 /// What a [`Proxy`] does with the traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {

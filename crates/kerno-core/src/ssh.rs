@@ -178,7 +178,8 @@ pub struct TunnelStream(StreamKind);
 enum StreamKind {
     /// A channel of the built-in client.
     Channel(russh::ChannelStream<client::Msg>),
-    /// The private socket OpenSSH forwards.
+    /// The private socket OpenSSH forwards (Unix), or the pipes of the
+    /// stream's own `ssh -W` (Windows).
     Local(crate::openssh::LocalStream),
 }
 
@@ -260,11 +261,7 @@ impl Route {
                         forward.target().1
                     )));
                 }
-                let stream = forward.connect().await.map_err(|error| SshError::Forward {
-                    host: host.to_string(),
-                    port,
-                    reason: format!("the tunnel's socket did not answer: {error}"),
-                })?;
+                let stream = forward.connect().await?;
                 Ok(TunnelStream(StreamKind::Local(stream)))
             }
         }
@@ -526,6 +523,16 @@ async fn authenticate(
             accept(result).ok_or_else(|| rejected("password"))
         }
         SshAuth::KeyFile { path } => {
+            // Windows: no file of another machine is opened (K69, D-138).
+            if crate::local_path::refusal(path, "key").is_some() {
+                return Err(SshError::Key {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "Kerno opens no file of another computer: use {}",
+                        crate::local_path::LOCAL_FILE
+                    ),
+                });
+            }
             let key = load_key(path, request.key_passphrase).await?;
             // Never RSA (see `load_key`), so there is no hash to negotiate.
             let result = handle
@@ -646,7 +653,7 @@ fn agent_pipe(
 /// something else), not `.` or `..`. A pipe of another host, `\\?\UNC\…`, a
 /// drive path, a Unix socket's path and the forward-slash spelling are not.
 #[cfg(any(windows, test))]
-fn is_local_pipe(name: &str) -> bool {
+pub(crate) fn is_local_pipe(name: &str) -> bool {
     const PREFIX: &str = r"\\.\pipe\";
     match (name.get(..PREFIX.len()), name.get(PREFIX.len()..)) {
         (Some(head), Some(rest)) => {

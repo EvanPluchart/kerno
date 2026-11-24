@@ -2474,6 +2474,8 @@ pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFo
 /// The program with the arguments and environment that say which server to
 /// reach, as whom, and over which TLS.
 fn connection_command(tool_path: &Path, params: &ConnectParams) -> Result<ToolCommand> {
+    // The TLS files go to the tool: none of another machine (K69, D-138).
+    crate::local_path::check_tls(&params.tls)?;
     let mut args = Vec::new();
     let mut env = Vec::new();
     let tunnelled = params.tunnel.is_some();
@@ -3488,12 +3490,14 @@ mod tests {
         );
         assert_no_secret(&command);
 
+        // Windows opens a drive's path only (K69, D-138).
+        let certs = if cfg!(windows) { "C:/certs" } else { "/certs" };
         let mut params = params(Engine::Postgres);
         params.tls = TlsConfig {
             mode: TlsMode::VerifyFull,
-            ca_file: Some("/certs/ca.pem".into()),
-            cert_file: Some("/certs/client.pem".into()),
-            key_file: Some("/certs/client.key".into()),
+            ca_file: Some(format!("{certs}/ca.pem").into()),
+            cert_file: Some(format!("{certs}/client.pem").into()),
+            key_file: Some(format!("{certs}/client.key").into()),
         };
         let options = BackupOptions {
             format: BackupFormat::Custom,
@@ -3512,6 +3516,7 @@ mod tests {
              --host=db.example.com --port=6543 --username=ada --verbose --dbname=shop \
              '--file=/tmp/out dir/shop.sql' --format=c --schema-only --strict-names \
              '--table=\"public\".\"orders\"' '--table=\"Sales\".\"odd\"\"name\"'"
+                .replace("/certs", certs)
         );
 
         let options = BackupOptions {
@@ -3593,9 +3598,11 @@ mod tests {
         assert_no_secret(&command);
 
         let mut params_maria = params(Engine::MariaDb);
+        // Windows opens a drive's path only (K69, D-138).
+        let certs = if cfg!(windows) { "C:/certs" } else { "/certs" };
         params_maria.tls = TlsConfig {
             mode: TlsMode::VerifyCa,
-            ca_file: Some("/certs/ca.pem".into()),
+            ca_file: Some(format!("{certs}/ca.pem").into()),
             ..TlsConfig::default()
         };
         let options = BackupOptions {
@@ -3609,6 +3616,7 @@ mod tests {
              --host=db.example.com --port=6543 --user=ada --ssl --ssl-verify-server-cert \
              --ssl-ca=/certs/ca.pem --verbose --single-transaction --no-create-info \
              --skip-triggers --hex-blob '--result-file=/tmp/out dir/shop.sql' shop"
+                .replace("/certs", certs)
         );
 
         let options = BackupOptions {

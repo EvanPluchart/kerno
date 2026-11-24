@@ -17,14 +17,19 @@
 //! trust, and refuses everything else, passwords included. No secret is ever
 //! in an argument or in the environment of `ssh`.
 //!
-//! The running tunnel is Unix's (`openssh/unix.rs`). Windows has no Unix
-//! sockets in std or tokio: there OpenSSH is never offered yet, and the
-//! built-in client is (`openssh/windows.rs`, K64, D-131).
+//! The running tunnel is Unix's (`openssh/unix.rs`) or Windows'
+//! (`openssh/windows.rs`, K69, D-138). Windows has no Unix sockets in std
+//! or tokio: there each stream to the database is its own `ssh -W`, and the
+//! questions come back over a named pipe whose ends prove themselves.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::config::{Secret, SshAuth, SshConfig};
+use crate::ssh::SshError;
 
 #[cfg(unix)]
 mod unix;
@@ -44,11 +49,12 @@ pub use windows::{Forward, answer_askpass};
 pub const ASKPASS_VAR: &str = "KERNO_ASKPASS";
 
 /// Said when no `ssh` program can be used.
-#[cfg(unix)]
 pub const NOT_FOUND: &str = "OpenSSH was not found on this computer; use the built-in client";
-/// Said when no `ssh` program can be used: on Windows, never (K64, D-131).
-#[cfg(not(unix))]
-pub const NOT_FOUND: &str = "Tunnels through the system's OpenSSH are not available on Windows yet; use the built-in client";
+
+/// Said when Windows' `ssh.exe` cannot ask Kerno its questions: before
+/// OpenSSH 8.4 it ignores `SSH_ASKPASS_REQUIRE` (D-138).
+pub const TOO_OLD: &str = "This OpenSSH is too old to ask Kerno for a passphrase: load the key \
+     in the agent, or use the built-in client";
 
 /// Where the system's OpenSSH is and how Kerno runs it. The app builds it
 /// once; tests pass their own configuration file.
@@ -69,22 +75,17 @@ pub struct OpenSshEnv {
 }
 
 impl OpenSshEnv {
-    /// Finds `ssh` on `path` (the `PATH` variable) and in the usual places
-    /// a GUI app's short `PATH` misses. `None` when there is none, and on
-    /// Windows, where the tunnel cannot run yet (`openssh/windows.rs`).
+    /// Finds `ssh` (see [`find_ssh`]); `None` when there is none.
     pub fn detect(
         path: Option<&OsStr>,
         home: Option<&Path>,
         config: Option<PathBuf>,
         askpass: PathBuf,
     ) -> Option<Self> {
-        if cfg!(windows) {
-            return None;
-        }
         let ssh = find_ssh(path)?;
         let aliases_from = config
             .clone()
-            .or_else(|| home.map(|home| home.join(".ssh/config")));
+            .or_else(|| home.map(|home| home.join(".ssh").join("config")));
         Some(Self {
             ssh,
             config,
@@ -96,6 +97,7 @@ impl OpenSshEnv {
 
 /// The `ssh` program: the first on `path`, then `/usr/bin`,
 /// `/opt/homebrew/bin` and `/usr/local/bin`.
+#[cfg(unix)]
 pub fn find_ssh(path: Option<&OsStr>) -> Option<PathBuf> {
     let listed = path.map(std::env::split_paths).into_iter().flatten();
     let usual = ["/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from);
@@ -105,20 +107,114 @@ pub fn find_ssh(path: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The `ssh.exe` Windows ships (`%SystemRoot%\System32\OpenSSH`), which
+/// only administrators can change, then the first on `path` (an OpenSSH
+/// installed elsewhere). A `ssh.exe` another program put earlier on `PATH`
+/// (Git's, a user's folder) is not taken over Windows' own.
+#[cfg(windows)]
+pub fn find_ssh(path: Option<&OsStr>) -> Option<PathBuf> {
+    let root =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let system = root.join("System32").join("OpenSSH");
+    let listed = path.map(std::env::split_paths).into_iter().flatten();
+    std::iter::once(system)
+        .chain(listed)
+        .map(|dir| dir.join("ssh.exe"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The version `ssh -V` printed (`OpenSSH_for_Windows_9.5p1, …`,
+/// `OpenSSH_9.6p1 …`): major and minor.
+#[cfg(any(windows, test))]
+fn ssh_version(text: &str) -> Option<(u32, u32)> {
+    let (_, rest) = text.split_once("OpenSSH_")?;
+    let rest = rest.strip_prefix("for_Windows_").unwrap_or(rest);
+    let (major, rest) = rest.split_once('.')?;
+    let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Whether an `ssh` of `version` ignores `SSH_ASKPASS_REQUIRE` (8.4).
+#[cfg(any(windows, test))]
+fn too_old(version: (u32, u32)) -> bool {
+    version < (8, 4)
+}
+
+/// Refuses, before anything opens it or `ssh.exe` is given it, what would
+/// make Windows reach another machine on its own: a key file that is not a
+/// file of this computer ([`crate::local_path::is_local_file`]: a share is opened
+/// over SMB with the user's credentials) and an agent that is not a pipe of
+/// this machine ([`crate::ssh::is_local_pipe`]). These are the only paths a
+/// saved connection (maybe from an imported file) puts on `ssh.exe`'s
+/// command line (`-i`, `-o IdentityAgent=`); `-F` is the tunnel's own file.
+#[cfg(any(windows, test))]
+fn refused_path(auth: &SshAuth) -> Option<SshError> {
+    match auth {
+        SshAuth::KeyFile { path } => {
+            let text = path.to_string_lossy();
+            (!crate::local_path::is_local_file(&text)).then(|| SshError::Key {
+                path: text.into_owned(),
+                reason: format!(
+                    "Kerno opens no file of another computer: use {}",
+                    crate::local_path::LOCAL_FILE
+                ),
+            })
+        }
+        SshAuth::Agent {
+            socket: Some(socket),
+        } => {
+            let text = socket.to_string_lossy();
+            (!crate::ssh::is_local_pipe(&text)).then(|| {
+                SshError::Agent(format!(
+                    "The SSH agent's address “{text}” is not a local pipe: on Windows it looks \
+                     like \\\\.\\pipe\\openssh-ssh-agent. Clear it in the connection's SSH tab \
+                     to use the system's agent."
+                ))
+            })
+        }
+        SshAuth::Agent { socket: None } | SshAuth::Password => None,
+    }
+}
+
+/// Whether `passphrase` opens the key file at `path`: `Some(false)` only for
+/// an encrypted key in OpenSSH's format that it does not decrypt; `None`
+/// when that cannot be told here (unreadable, another format, not
+/// encrypted), and `ssh` finds out itself.
+#[cfg(any(windows, test))]
+fn passphrase_opens(path: &Path, passphrase: &Secret) -> Option<bool> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let key = russh::keys::ssh_key::PrivateKey::from_openssh(text.trim()).ok()?;
+    key.is_encrypted()
+        .then(|| key.decrypt(passphrase.expose()).is_ok())
+}
+
 // Arguments --------------------------------------------------------------------
 
-/// The arguments of the `ssh` that forwards `socket` to `db_host:db_port`
-/// as the SSH server sees it. No secret is ever in them.
+/// How the database reaches Kerno through `ssh`.
+#[derive(Debug, Clone, Copy)]
+pub enum Via<'a> {
+    /// `ssh -N -L <socket>:…`: one `ssh` forwards this Unix socket (Unix).
+    Socket(&'a Path),
+    /// `ssh -W …`: one `ssh` per stream, the stream being its standard input
+    /// and output (Windows, D-138). `LogLevel VERBOSE` makes it say when it
+    /// has logged in (`Authenticated to …`), which is how Kerno knows.
+    Pipes,
+}
+
+/// The arguments of the `ssh` that leads to `db_host:db_port` as the SSH
+/// server sees it, the way `via` says. No secret is ever in them.
 pub fn tunnel_args(
     ssh: &SshConfig,
     config: Option<&Path>,
-    socket: &Path,
+    via: Via<'_>,
     db_host: &str,
     db_port: u16,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |arg: &str| args.push(arg.into());
-    push("-N");
+    if let Via::Socket(_) = via {
+        push("-N");
+    }
     for option in [
         "ExitOnForwardFailure=yes",
         // Questions go to Kerno (askpass), which refuses what it cannot
@@ -133,6 +229,10 @@ pub fn tunnel_args(
     ] {
         push("-o");
         push(option);
+    }
+    if let Via::Pipes = via {
+        push("-o");
+        push("LogLevel=VERBOSE");
     }
     if ssh.keepalive_secs > 0 {
         push("-o");
@@ -159,7 +259,6 @@ pub fn tunnel_args(
     } else {
         db_host.to_string()
     };
-    let forward = format!("{}:{bracketed}:{db_port}", socket.display());
     if let Some(config) = config {
         args.push("-F".into());
         args.push(config.into());
@@ -180,7 +279,13 @@ pub fn tunnel_args(
         // refused by `ConnectionConfig::validate`.
         SshAuth::Agent { socket: None } | SshAuth::Password => {}
     }
-    args.extend(["-L".into(), forward.into()]);
+    match via {
+        Via::Socket(socket) => {
+            let forward = format!("{}:{bracketed}:{db_port}", socket.display());
+            args.extend(["-L".into(), forward.into()]);
+        }
+        Via::Pipes => args.extend(["-W".into(), format!("{bracketed}:{db_port}").into()]),
+    }
     // `--`: a host field starting with `-` is a host, never an option.
     args.extend(["--".into(), ssh.host.trim().into()]);
     args
@@ -225,6 +330,268 @@ pub struct OpenSshRequest<'a> {
     pub key_passphrase: Option<&'a Secret>,
     /// A host-key fingerprint the user chose to trust (`SHA256:…`).
     pub trusted_fingerprint: Option<&'a str>,
+}
+
+// What ssh says and asks ------------------------------------------------------
+
+/// How long `ssh` may take to authenticate (jump hosts included).
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Lines of `ssh`'s messages kept for the explanation of a failure.
+const TAIL_LINES: usize = 64;
+
+/// What `ssh` printed: the last lines, and how many forwards failed.
+#[derive(Debug, Default)]
+struct Messages {
+    lines: VecDeque<String>,
+    forward_failures: u64,
+    last_forward_failure: Option<String>,
+}
+
+impl Messages {
+    fn push(&mut self, line: &str) {
+        let line = line.trim_end_matches('\r').to_string();
+        if line.contains("open failed") || line.contains("forwarding failed") {
+            self.forward_failures += 1;
+            self.last_forward_failure = Some(line.clone());
+        }
+        if self.lines.len() == TAIL_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+
+    fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A new directory only this user can enter, with a short path: a Unix
+/// socket path is limited to about 100 bytes.
+fn private_dir() -> std::io::Result<PathBuf> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let dir = std::env::temp_dir().join(format!("kerno-ssh-{}", &id[..12]));
+    crate::private::create_dir(&dir)?;
+    Ok(dir)
+}
+
+/// The configuration every tunnel's `ssh` reads (`-F`), jump hosts
+/// included: no password and no keyboard-interactive login, so no server
+/// can put a question of its own in front of the askpass (one worded like
+/// the key's passphrase question would be answered); then the user's file
+/// and the system's (`system`), which `-F` would otherwise leave out. The
+/// first value of an option wins, so these three cannot be overridden below.
+fn guard_config(user: Option<&Path>, system: &str) -> String {
+    let mut text =
+        String::from("KbdInteractiveAuthentication no\nPasswordAuthentication no\nBatchMode no\n");
+    // A path that cannot be quoted is left out rather than half-read.
+    if let Some(user) = user.and_then(Path::to_str)
+        && !user.contains(['"', '\n'])
+    {
+        text.push_str(&format!("Include \"{user}\"\n"));
+    }
+    text.push_str(&format!("Include {system}\n"));
+    text
+}
+
+/// What the tunnel may answer.
+#[derive(Debug, Clone, Default)]
+struct Answers {
+    /// The key file of the connection, as given to `ssh -i`.
+    key: Option<String>,
+    passphrase: Option<Secret>,
+    trusted: Option<String>,
+}
+
+/// A host key `ssh` asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostKeyQuestion {
+    host: String,
+    port: u16,
+    algorithm: String,
+    fingerprint: String,
+}
+
+/// What the questions told about a failure.
+#[derive(Debug, Default)]
+struct Observed {
+    /// The `ssh` processes the passphrase was given to (a jump host's
+    /// `ssh` asks for the same key on its own).
+    passphrase_given: Vec<u32>,
+    /// `a passphrase is required` / `the passphrase is wrong`, for the key.
+    passphrase: Option<&'static str>,
+    /// Another key file (from the SSH configuration) asked for one.
+    other_key: Option<String>,
+    /// A host key that was not trusted.
+    host_key: Option<HostKeyQuestion>,
+}
+
+/// The answer to one question of the `ssh` process `asker`, or `None` to
+/// refuse it.
+fn decide(prompt: &str, asker: u32, answers: &Answers, observed: &mut Observed) -> Option<Secret> {
+    if prompt.contains("authenticity of host") {
+        let question = host_key_question(prompt)?;
+        if answers.trusted.as_deref() == Some(question.fingerprint.as_str()) {
+            return Some(Secret::new("yes"));
+        }
+        observed.host_key = Some(question);
+        return None;
+    }
+    if prompt.to_ascii_lowercase().contains("passphrase") {
+        // Exactly OpenSSH's own question for exactly this key (it cuts the
+        // path at 100 characters): nothing a server could word differently.
+        let named = prompt
+            .strip_prefix("Enter passphrase for key '")
+            .and_then(|rest| rest.strip_suffix("': "))
+            .unwrap_or_default();
+        let ours = answers.key.as_deref().is_some_and(|key| {
+            // Windows' ssh.exe names `C:\k\id` as `C:/k/id` (K69, D-138).
+            let (named, key) = match cfg!(windows) {
+                true => (named.replace('\\', "/"), key.replace('\\', "/")),
+                false => (named.to_string(), key.to_string()),
+            };
+            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(&named)))
+        });
+        if !ours {
+            // A question in other words names no key worth reporting.
+            if !named.is_empty() {
+                observed.other_key = Some(named.to_string());
+            }
+            return None;
+        }
+        // Asked twice by the same `ssh`: the first answer did not open it.
+        let asked_before = observed.passphrase_given.contains(&asker);
+        return match (&answers.passphrase, asked_before) {
+            (None, _) => {
+                observed.passphrase = Some("a passphrase is required");
+                None
+            }
+            (Some(_), true) => {
+                observed.passphrase = Some("the passphrase is wrong");
+                None
+            }
+            (Some(passphrase), false) => {
+                observed.passphrase_given.push(asker);
+                Some(passphrase.clone())
+            }
+        };
+    }
+    // Passwords, keyboard-interactive, anything else: refused.
+    None
+}
+
+/// The first `'…'` in `text`.
+fn quoted(text: &str) -> Option<&str> {
+    let (_, rest) = text.split_once('\'')?;
+    rest.split_once('\'').map(|(inside, _)| inside)
+}
+
+/// Reads ssh's "The authenticity of host 'h (ip)' can't be established. /
+/// ED25519 key fingerprint is SHA256:…" question.
+fn host_key_question(prompt: &str) -> Option<HostKeyQuestion> {
+    let named = quoted(prompt)?;
+    let name = named.split(" (").next().unwrap_or(named);
+    let (host, port) = host_and_port(name);
+    // "ED25519 key fingerprint is SHA256:…." (OpenSSH 9), "is: SHA256:…" (10).
+    let line = prompt
+        .lines()
+        .find(|line| line.contains(" key fingerprint is"))?;
+    let (algorithm, fingerprint) = line.split_once(" key fingerprint is")?;
+    let fingerprint = fingerprint
+        .trim_start_matches(':')
+        .split_whitespace()
+        .next()?
+        .trim_end_matches('.');
+    Some(HostKeyQuestion {
+        host,
+        port,
+        algorithm: algorithm.trim().to_string(),
+        fingerprint: fingerprint.to_string(),
+    })
+}
+
+/// `[h]:p` → (`h`, `p`); `h` → (`h`, 22), as known_hosts writes them.
+fn host_and_port(name: &str) -> (String, u16) {
+    if let Some(rest) = name.strip_prefix('[')
+        && let Some((host, port)) = rest.split_once("]:")
+        && let Ok(port) = port.parse()
+    {
+        return (host.to_string(), port);
+    }
+    (name.to_string(), 22)
+}
+
+/// Why `ssh` exited, from its questions and its messages. `key` is the
+/// connection's key file.
+fn failure(observed: &Observed, key: Option<&str>, stderr: &str) -> SshError {
+    if let Some(question) = &observed.host_key {
+        return SshError::UnknownHostKey {
+            host: question.host.clone(),
+            port: question.port,
+            algorithm: question.algorithm.clone(),
+            fingerprint: question.fingerprint.clone(),
+        };
+    }
+    // The key could not be opened: the user can type its passphrase.
+    if let (Some(reason), Some(key)) = (observed.passphrase, key) {
+        return SshError::Passphrase {
+            path: key.to_string(),
+            reason,
+        };
+    }
+    if let Some(changed) = host_key_changed(stderr) {
+        return changed;
+    }
+    let stderr = match &observed.other_key {
+        Some(other) => format!("the key {other} needs a passphrase, which ssh asked for\n{stderr}"),
+        None => stderr.to_string(),
+    };
+    SshError::OpenSsh { stderr }
+}
+
+/// ssh's "REMOTE HOST IDENTIFICATION HAS CHANGED!" message, read.
+fn host_key_changed(stderr: &str) -> Option<SshError> {
+    if !stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        return None;
+    }
+    let mut lines = stderr.lines();
+    let fingerprint = lines
+        .by_ref()
+        .find(|line| line.contains("sent by the remote host is"))
+        .and_then(|_| lines.next())
+        .map(|line| line.trim().trim_end_matches('.').to_string())
+        .unwrap_or_default();
+    let (file, line) = stderr
+        .lines()
+        .filter(|line| line.starts_with("Offending"))
+        .find_map(|line| line.split_once(" key in ").map(|(_, at)| at.trim()))
+        .and_then(|at| at.rsplit_once(':'))
+        .map(|(file, line)| (file.to_string(), line.parse().unwrap_or(0)))
+        .unwrap_or_default();
+    let name = stderr
+        .lines()
+        .find_map(|line| line.split_once("ost key for ").map(|(_, rest)| rest))
+        .and_then(|rest| rest.split(" has changed").next())
+        .unwrap_or_default();
+    let (host, port) = host_and_port(name);
+    Some(SshError::HostKeyChanged {
+        host,
+        port,
+        fingerprint,
+        file,
+        line,
+    })
 }
 
 // ~/.ssh/config ----------------------------------------------------------------
@@ -304,12 +671,18 @@ fn config_words(text: &str) -> Vec<String> {
 }
 
 /// The files an `Include` names: `~` expanded, relative to `dir`, a glob
-/// (`*`, `?`) in the file name matched against the directory, sorted.
+/// (`*`, `?`) in the file name matched against the directory, sorted. On
+/// Windows Kerno opens none that is not a file of this computer
+/// ([`crate::local_path::is_local_file`]): reading `\\host\share\…` would log in
+/// there; `ssh.exe` itself does what the user's file says (K69, D-138).
 fn include_paths(word: &str, dir: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let path = match (word.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => home.join(rest),
         _ => dir.join(word),
     };
+    if cfg!(windows) && !crate::local_path::is_local_file(&path.to_string_lossy()) {
+        return Vec::new();
+    }
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return Vec::new();
     };
@@ -375,7 +748,7 @@ mod tests {
     /// secret on the command line.
     #[test]
     fn the_arguments_follow_the_fields() {
-        let socket = Path::new("/tmp/kerno-ssh-1/db");
+        let socket = Via::Socket(Path::new("/tmp/kerno-ssh-1/db"));
         let base = [
             "-N",
             "-o",
@@ -489,23 +862,166 @@ mod tests {
         assert!(!safe_ssh_word("ops@-D8080", false));
     }
 
-    /// K64: on Windows the system's OpenSSH is not offered, even with an
-    /// `ssh` on `PATH`, and the reason says Windows.
+    /// K69: Windows' own `ssh.exe` comes before any on `PATH` (Git's, one
+    /// a program put in a user's folder), and the dialog reads the profile's
+    /// `.ssh\config`. Mutation seen: `PATH` searched first.
     #[cfg(windows)]
     #[test]
-    fn openssh_is_not_offered_on_windows_yet() {
+    fn windows_own_ssh_exe_comes_first() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ssh"), "").unwrap();
         std::fs::write(dir.path().join("ssh.exe"), "").unwrap();
         let path = std::env::join_paths([dir.path()]).unwrap();
+        let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        let system = root.join(r"System32\OpenSSH\ssh.exe");
+        let expected = match system.is_file() {
+            true => system,
+            false => dir.path().join("ssh.exe"),
+        };
+        assert_eq!(find_ssh(Some(&path)), Some(expected));
+        let home = Path::new(r"C:\Users\ada");
+        let env = OpenSshEnv::detect(Some(&path), Some(home), None, "k".into()).unwrap();
         assert_eq!(
-            OpenSshEnv::detect(Some(&path), None, None, "k".into()),
-            None
+            env.aliases_from,
+            Some(PathBuf::from(r"C:\Users\ada\.ssh\config"))
         );
-        assert!(
-            NOT_FOUND.contains("not available on Windows yet"),
-            "{NOT_FOUND}"
+    }
+
+    /// K69: an `Include` of the user's file that names another machine is
+    /// not opened when the aliases are listed. Mutation seen: the check
+    /// dropped (the share comes back as a file to read).
+    #[cfg(windows)]
+    #[test]
+    fn an_include_on_another_machine_is_not_read() {
+        let dir = Path::new(r"C:\Users\ada\.ssh");
+        for word in [r"\\k69-nowhere\share\config", "//k69-nowhere/share/config"] {
+            assert!(include_paths(word, dir, None).is_empty(), "{word}");
+        }
+        assert_eq!(
+            include_paths("extra", dir, None),
+            [PathBuf::from(r"C:\Users\ada\.ssh\extra")]
         );
+    }
+
+    /// K69: one `ssh -W` per stream on Windows: no `-N`, no `-L`, and the
+    /// login said at `LogLevel VERBOSE`. Mutation seen: `-N` kept.
+    #[test]
+    fn a_stream_of_its_own_is_ssh_w() {
+        let args = words(&tunnel_args(
+            &ssh(SshAuth::Agent { socket: None }),
+            Some(Path::new("C:/t/config")),
+            Via::Pipes,
+            "::1",
+            5432,
+        ));
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "LogLevel=VERBOSE",
+                "-F",
+                "C:/t/config",
+                "-W",
+                "[::1]:5432",
+                "--",
+                "prod",
+            ]
+        );
+    }
+
+    /// K69: `ssh -V`'s words, and 8.4 as the first that asks Kerno.
+    /// Mutation seen: `<=` for `<`.
+    #[test]
+    fn the_version_of_ssh_is_read() {
+        for (text, version) in [
+            ("OpenSSH_for_Windows_9.5p1, LibreSSL 3.8.2", (9, 5)),
+            ("OpenSSH_for_Windows_8.1p1, LibreSSL 3.0.2\r\n", (8, 1)),
+            ("OpenSSH_for_Windows_7.7p1, LibreSSL 2.6.5", (7, 7)),
+            ("OpenSSH_9.6p1 Ubuntu-3ubuntu13, OpenSSL 3.0.13", (9, 6)),
+            ("OpenSSH_10.0p2, LibreSSL 3.3.6", (10, 0)),
+        ] {
+            assert_eq!(ssh_version(text), Some(version), "{text}");
+        }
+        assert_eq!(ssh_version("ssh: not found"), None);
+        assert!(too_old((7, 7)) && too_old((8, 1)) && too_old((8, 3)));
+        assert!(!too_old((8, 4)) && !too_old((8, 6)) && !too_old((9, 5)) && !too_old((10, 0)));
+    }
+
+    /// K69: what an imported connection could make `ssh.exe` reach on
+    /// another machine is refused before it starts. Mutation seen: the UNC
+    /// check dropped.
+    #[test]
+    fn a_key_or_agent_on_another_machine_is_refused() {
+        for remote in [
+            r"\\host\share\id",
+            r"\\?\UNC\host\s\id",
+            r"\\.\C:\id",
+            "//host/share/id",
+            r"\/host\share\id",
+            "id_ed25519",
+        ] {
+            let auth = SshAuth::KeyFile {
+                path: remote.into(),
+            };
+            assert!(
+                matches!(refused_path(&auth), Some(SshError::Key { .. })),
+                "{remote}"
+            );
+        }
+        for local in [r"C:\Users\ada\.ssh\id", r"~\.ssh\id", "D:/keys/id"] {
+            let auth = SshAuth::KeyFile { path: local.into() };
+            assert!(refused_path(&auth).is_none(), "{local}");
+        }
+        let agent = |socket: &str| SshAuth::Agent {
+            socket: Some(socket.into()),
+        };
+        assert!(refused_path(&agent(r"\\.\pipe\openssh-ssh-agent")).is_none());
+        assert!(matches!(
+            refused_path(&agent(r"\\evil\pipe\x")),
+            Some(SshError::Agent(message)) if message.contains("not a local pipe")
+        ));
+        assert!(refused_path(&SshAuth::Agent { socket: None }).is_none());
+        assert!(refused_path(&SshAuth::Password).is_none());
+    }
+
+    /// K69: a wrong passphrase is told before `ssh.exe` runs, from the key
+    /// file itself; what cannot be told is left to `ssh`. Mutation seen:
+    /// `decrypt` not called (always `Some(true)`).
+    #[test]
+    fn a_passphrase_is_tried_on_the_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, passphrase: &str| {
+            let path = dir.path().join(name);
+            std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-C", "k69", "-N", passphrase, "-f"])
+                .arg(&path)
+                .status()
+                .ok()
+                .filter(|status| status.success())
+                .map(|_| path)
+        };
+        let (Some(encrypted), Some(plain)) = (make("enc", "k69 passphrase"), make("plain", ""))
+        else {
+            eprintln!("SKIPPED: ssh-keygen is not available");
+            return;
+        };
+        let opens =
+            |path: &Path, passphrase: &str| passphrase_opens(path, &Secret::new(passphrase));
+        assert_eq!(opens(&encrypted, "k69 passphrase"), Some(true));
+        assert_eq!(opens(&encrypted, "not it"), Some(false));
+        assert_eq!(opens(&plain, "anything"), None);
+        assert_eq!(opens(&dir.path().join("missing"), "x"), None);
+        std::fs::write(dir.path().join("pem"), "-----BEGIN RSA PRIVATE KEY-----\n").unwrap();
+        assert_eq!(opens(&dir.path().join("pem"), "x"), None);
     }
 
     #[cfg(unix)]
@@ -564,5 +1080,189 @@ mod tests {
             ]
         );
         assert!(host_aliases(&dir.path().join("missing"), None).is_empty());
+    }
+
+    fn answers(key: Option<&str>, passphrase: Option<&str>, trusted: Option<&str>) -> Answers {
+        Answers {
+            key: key.map(str::to_string),
+            passphrase: passphrase.map(Secret::new),
+            trusted: trusted.map(str::to_string),
+        }
+    }
+
+    const HOST_KEY_PROMPT: &str = "The authenticity of host '[10.0.0.5]:2222 ([10.0.0.5]:2222)' \
+         can't be established.\nED25519 key fingerprint is: SHA256:abcDEF+/12\nThis key is not \
+         known by any other names.\nAre you sure you want to continue connecting \
+         (yes/no/[fingerprint])? ";
+
+    #[test]
+    fn only_the_trusted_fingerprint_is_answered_yes() {
+        let mut observed = Observed::default();
+        let refused = decide(
+            HOST_KEY_PROMPT,
+            1,
+            &answers(None, None, None),
+            &mut observed,
+        );
+        assert!(refused.is_none());
+        assert_eq!(
+            observed.host_key,
+            Some(HostKeyQuestion {
+                host: "10.0.0.5".into(),
+                port: 2222,
+                algorithm: "ED25519".into(),
+                fingerprint: "SHA256:abcDEF+/12".into(),
+            })
+        );
+        let wrong = answers(None, None, Some("SHA256:other"));
+        assert!(decide(HOST_KEY_PROMPT, 1, &wrong, &mut Observed::default()).is_none());
+        let trusted = answers(None, None, Some("SHA256:abcDEF+/12"));
+        let mut observed = Observed::default();
+        let yes = decide(HOST_KEY_PROMPT, 1, &trusted, &mut observed).unwrap();
+        assert_eq!(yes.expose(), "yes");
+        assert_eq!(observed.host_key, None);
+        // OpenSSH 9 words it without the colon, the name without a port.
+        let old = "The authenticity of host 'bastion (10.0.0.5)' can't be established.\n\
+                   ECDSA key fingerprint is SHA256:xyz.\nAre you sure (yes/no)? ";
+        let question = host_key_question(old).unwrap();
+        assert_eq!(
+            (
+                question.host.as_str(),
+                question.port,
+                question.fingerprint.as_str()
+            ),
+            ("bastion", 22, "SHA256:xyz")
+        );
+    }
+
+    #[test]
+    fn the_tunnel_config_forbids_server_questions_before_any_other_file() {
+        let text = guard_config(
+            Some(Path::new("/home/ada/.ssh/my config")),
+            "/etc/ssh/ssh_config",
+        );
+        assert_eq!(
+            text,
+            "KbdInteractiveAuthentication no\nPasswordAuthentication no\nBatchMode no\n\
+             Include \"/home/ada/.ssh/my config\"\nInclude /etc/ssh/ssh_config\n"
+        );
+        assert!(!guard_config(Some(Path::new("/a\"b")), "/s").contains("/a"));
+        assert!(guard_config(None, "/s").starts_with("KbdInteractiveAuthentication no\n"));
+    }
+
+    #[test]
+    fn the_passphrase_goes_to_its_own_key_once() {
+        let key = "/a/very/long/path/to/a/key/file/that/ssh/cuts/after/a/hundred/characters/when/it/asks/for/id_ed25519_enc";
+        let prompt = format!("Enter passphrase for key '{}': ", &key[..100]);
+        let with = answers(Some(key), Some("s3cret"), None);
+        let mut observed = Observed::default();
+        let given = |asker, observed: &mut Observed| {
+            decide(&prompt, asker, &with, observed).map(|answer| answer.expose().to_string())
+        };
+        assert_eq!(given(7, &mut observed).as_deref(), Some("s3cret"));
+        // A jump host's `ssh` asks for the same key on its own.
+        assert_eq!(given(8, &mut observed).as_deref(), Some("s3cret"));
+        assert_eq!(observed.passphrase, None);
+        // Asked again by the same `ssh`: it was wrong.
+        assert_eq!(given(7, &mut observed), None);
+        assert_eq!(observed.passphrase, Some("the passphrase is wrong"));
+
+        let mut observed = Observed::default();
+        assert!(decide(&prompt, 7, &answers(Some(key), None, None), &mut observed).is_none());
+        assert_eq!(observed.passphrase, Some("a passphrase is required"));
+
+        // Another key's question (a jump host's, the config's) is refused.
+        let mut observed = Observed::default();
+        let other = "Enter passphrase for key '/home/ada/.ssh/id_other': ";
+        assert!(decide(other, 7, &with, &mut observed).is_none());
+        assert_eq!(
+            observed.other_key.as_deref(),
+            Some("/home/ada/.ssh/id_other")
+        );
+        assert_eq!(observed.passphrase, None);
+
+        // A prefix of the key's path, or the question inside other words
+        // (a server's own prompt), is not OpenSSH's question for this key.
+        let short = answers(Some("/home/ada/.ssh/id_ed25519"), Some("s3cret"), None);
+        for spoofed in [
+            "Enter passphrase for key '/home/ada/.ssh/id': ",
+            "Enter passphrase for key '/': ",
+            "bastion says: Enter passphrase for key '/home/ada/.ssh/id_ed25519': ",
+            "Enter passphrase for key '/home/ada/.ssh/id_ed25519': again",
+        ] {
+            assert!(
+                decide(spoofed, 7, &short, &mut Observed::default()).is_none(),
+                "{spoofed}"
+            );
+        }
+
+        // Passwords and anything else: refused.
+        for prompt in ["kerno@bastion's password: ", "Verification code: ", ""] {
+            assert!(decide(prompt, 7, &with, &mut Observed::default()).is_none());
+        }
+    }
+
+    #[test]
+    fn a_failure_names_what_ssh_asked() {
+        let mut observed = Observed {
+            passphrase: Some("a passphrase is required"),
+            ..Observed::default()
+        };
+        assert_eq!(
+            failure(&observed, Some("/k/id"), "Permission denied (publickey)."),
+            SshError::Passphrase {
+                path: "/k/id".into(),
+                reason: "a passphrase is required",
+            }
+        );
+        observed.passphrase = None;
+        observed.other_key = Some("/k/other".into());
+        let SshError::OpenSsh { stderr } = failure(&observed, None, "Permission denied") else {
+            panic!("an OpenSSH failure");
+        };
+        assert!(
+            stderr.starts_with("the key /k/other needs a passphrase"),
+            "{stderr}"
+        );
+        assert!(stderr.ends_with("Permission denied"), "{stderr}");
+    }
+
+    #[test]
+    fn a_changed_host_key_is_read_from_the_warning() {
+        let stderr = "@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+            The fingerprint for the ED25519 key sent by the remote host is\nSHA256:new+/key.\n\
+            Add correct host key in /h/.ssh/known_hosts to get rid of this message.\n\
+            Offending ED25519 key in /h/.ssh/known_hosts:7\n\
+            Host key for bastion has changed and you have requested strict checking.\n\
+            Host key verification failed.";
+        assert_eq!(
+            host_key_changed(stderr),
+            Some(SshError::HostKeyChanged {
+                host: "bastion".into(),
+                port: 22,
+                fingerprint: "SHA256:new+/key".into(),
+                file: "/h/.ssh/known_hosts".into(),
+                line: 7,
+            })
+        );
+        assert_eq!(host_key_changed("Permission denied"), None);
+    }
+
+    #[test]
+    fn messages_keep_a_bounded_tail_and_count_refused_forwards() {
+        let mut messages = Messages::default();
+        for index in 0..100 {
+            messages.push(&format!("line {index}\r"));
+        }
+        assert_eq!(messages.lines.len(), TAIL_LINES);
+        assert!(messages.text().ends_with("line 99"));
+        messages.push("channel 3: open failed: administratively prohibited: open failed");
+        assert_eq!(messages.forward_failures, 1);
+        assert!(
+            messages
+                .last_forward_failure
+                .as_deref()
+                .is_some_and(|line| line.contains("prohibited"))
+        );
     }
 }

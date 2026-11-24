@@ -29,7 +29,8 @@ use tokio::net::windows::named_pipe::{
 };
 use tokio::runtime::Runtime;
 
-use super::proof::{self, Bytes, SIZE};
+pub(crate) use super::proof::Bytes;
+use super::proof::{self, SIZE};
 use super::{MAX_LINE, READ_TIMEOUT};
 
 /// The file of the data directory that names the running instance's pipe
@@ -98,7 +99,7 @@ pub fn socket_path(data_dir: &Path) -> io::Result<PathBuf> {
 
 /// The pipe and the token the file at `path` holds. A file that does not
 /// hold them in Kerno's form is refused: nothing is opened from it.
-fn read_name_file(path: &Path) -> io::Result<(String, Bytes)> {
+pub(crate) fn read_name_file(path: &Path) -> io::Result<(String, Bytes)> {
     let text = std::fs::read_to_string(path)?;
     let mut lines = text.lines().map(str::trim);
     let (id, token) = (lines.next().unwrap_or_default(), lines.next());
@@ -112,14 +113,14 @@ fn read_name_file(path: &Path) -> io::Result<(String, Bytes)> {
     }
 }
 
-fn random() -> io::Result<Bytes> {
+pub(crate) fn random() -> io::Result<Bytes> {
     let mut bytes = [0; SIZE];
     getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
     Ok(bytes)
 }
 
 /// A runtime for the pipe's waits, on the calling thread.
-fn runtime() -> io::Result<Runtime> {
+pub(crate) fn runtime() -> io::Result<Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -144,7 +145,7 @@ async fn open(name: &str) -> io::Result<NamedPipeClient> {
 /// The pipe `name`, once the other end has proved it holds `token` and this
 /// end has proved it too. Any failure means no Kerno of this user's is
 /// there, and nothing more is written.
-async fn handshake(name: &str, token: &Bytes) -> io::Result<NamedPipeClient> {
+pub(crate) async fn handshake(name: &str, token: &Bytes) -> io::Result<NamedPipeClient> {
     let not_kerno = || {
         io::Error::new(
             ErrorKind::PermissionDenied,
@@ -189,6 +190,53 @@ pub fn running(path: &Path) -> bool {
         .is_ok()
 }
 
+/// A pipe [`new_pipe`] made.
+pub(crate) struct NewPipe {
+    /// Its first instance.
+    pub(crate) pipe: NamedPipeServer,
+    /// Its name (`\\.\pipe\kerno-…`).
+    pub(crate) name: String,
+    /// The 32 hex digits of its name.
+    pub(crate) id: String,
+    /// The token its peers prove they hold.
+    pub(crate) token: Bytes,
+}
+
+/// A new pipe under a random name, local peers only, and the file at `path`
+/// (a private file) naming it with a new random token, replacing one a crash
+/// left. Called inside a Tokio runtime. The running instance's pipe and each
+/// OpenSSH tunnel's askpass pipe (K69) are made here.
+pub(crate) fn new_pipe(path: &Path) -> io::Result<NewPipe> {
+    let id = crate::dialect::hex(&random()?[..16]);
+    let token = random()?;
+    let name = format!("{PREFIX}{id}");
+    let pipe = ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .create(&name)?;
+    // Written once the pipe exists.
+    crate::private::file_options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?
+        .write_all(format!("{id}\n{}\n", crate::dialect::hex(&token)).as_bytes())?;
+    Ok(NewPipe {
+        pipe,
+        name,
+        id,
+        token,
+    })
+}
+
+/// The next instance of the pipe `name`, made while a peer holds the
+/// current one: a second peer finds one free instead of a busy name.
+pub(crate) fn next_instance(name: &str) -> io::Result<NamedPipeServer> {
+    ServerOptions::new()
+        .reject_remote_clients(true)
+        .create(name)
+}
+
 /// Makes a new pipe and names it, with a new token, in `path`. `None` when
 /// a Kerno of this user's already listens on the pipe `path` names: it is
 /// left alone.
@@ -199,24 +247,16 @@ pub fn listen(path: &Path) -> io::Result<Option<Listener>> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let id = crate::dialect::hex(&random()?[..16]);
-    let token = random()?;
-    let name = format!("{PREFIX}{id}");
     let runtime = runtime()?;
-    let pipe = {
+    let NewPipe {
+        pipe,
+        name,
+        id,
+        token,
+    } = {
         let _entered = runtime.enter();
-        ServerOptions::new()
-            .first_pipe_instance(true)
-            .reject_remote_clients(true)
-            .create(&name)?
+        new_pipe(path)?
     };
-    // Written once the pipe exists, replacing one a crash left.
-    crate::private::file_options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?
-        .write_all(format!("{id}\n{}\n", crate::dialect::hex(&token)).as_bytes())?;
     if let Ok(mut slot) = LISTENING.lock() {
         *slot = Some((path.to_path_buf(), id.clone()));
     }
@@ -250,10 +290,7 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
             let _ = pipe.connect().await;
             // The next instance before this one is read: a second peer
             // finds one free instead of a busy name.
-            let Ok(next) = ServerOptions::new()
-                .reject_remote_clients(true)
-                .create(&name)
-            else {
+            let Ok(next) = next_instance(&name) else {
                 return;
             };
             let mut peer = std::mem::replace(&mut pipe, next);
@@ -274,6 +311,14 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
 /// without the line break. `None` when it does not prove it holds the token
 /// or sends nothing usable.
 async fn exchange(peer: &mut NamedPipeServer, token: &Bytes) -> Option<String> {
+    prove_peer(peer, token).await?;
+    read_line(peer).await
+}
+
+/// The listening end's half of the handshake: the peer's nonce, this end's
+/// answer, the peer's proof. `None` when the peer does not prove it holds
+/// `token`: nothing more may be read from it or written to it.
+pub(crate) async fn prove_peer(peer: &mut NamedPipeServer, token: &Bytes) -> Option<()> {
     let mut client_nonce = [0; SIZE];
     peer.read_exact(&mut client_nonce).await.ok()?;
     let server_nonce = random().ok()?;
@@ -282,10 +327,7 @@ async fn exchange(peer: &mut NamedPipeServer, token: &Bytes) -> Option<String> {
         .ok()?;
     let mut client_proof = [0; SIZE];
     peer.read_exact(&mut client_proof).await.ok()?;
-    if !proof::check_client(token, &server_nonce, &client_proof) {
-        return None;
-    }
-    read_line(peer).await
+    proof::check_client(token, &server_nonce, &client_proof).then_some(())
 }
 
 /// One line, without its line break; `None` when there is none.

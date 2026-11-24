@@ -61,6 +61,8 @@ fn closed() -> Error {
 impl SqliteSession {
     /// Opens the file on a new thread, which then owns the connection.
     pub(crate) async fn connect(params: &ConnectParams) -> Result<Self> {
+        // No file of another machine is opened (K69, D-138).
+        kerno_core::local_path::check_params(params)?;
         let file = params
             .file
             .clone()

@@ -19,7 +19,7 @@ mod proof;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(unix)]
 pub use unix::{Listener, SOCKET, forget, listen, running, send, serve, socket_path};
 #[cfg(windows)]

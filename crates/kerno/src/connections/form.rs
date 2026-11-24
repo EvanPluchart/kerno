@@ -502,7 +502,14 @@ impl ConnectionForm {
                 return None;
             }
             let path = expand_home(value);
-            if !path.is_file() {
+            // Windows: a file of another machine is never looked at, which
+            // would log in there with the user's credentials (K69, D-138).
+            if cfg!(windows) && !kerno_core::local_path::is_local_file(&path.to_string_lossy()) {
+                errors.push(error(
+                    field,
+                    format!("{what} must be {}", kerno_core::local_path::LOCAL_FILE),
+                ));
+            } else if !path.is_file() {
                 errors.push(error(
                     field,
                     format!("{what} not found: {}", path.display()),
