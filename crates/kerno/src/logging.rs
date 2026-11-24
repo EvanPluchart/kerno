@@ -51,15 +51,9 @@ pub fn init_with(directory: &Path, filter: EnvFilter, cx: &mut App) -> anyhow::R
 fn make_private(directory: &Path) -> std::io::Result<()> {
     let new_parent = directory.parent().filter(|parent| !parent.exists());
     std::fs::create_dir_all(directory)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        for directory in new_parent.into_iter().chain([directory]) {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
-        }
+    for directory in new_parent.into_iter().chain([directory]) {
+        kerno_core::private::restrict(directory, 0o700)?;
     }
-    #[cfg(not(unix))]
-    let _ = new_parent;
     Ok(())
 }
 

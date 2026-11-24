@@ -3,8 +3,6 @@
 //! instance socket ([`kerno_core::instance`]), open here. A URL may hold a
 //! password: only its redacted form is ever logged.
 
-use std::os::unix::net::UnixListener;
-
 use gpui_kit::{App, Entity, Window};
 use kerno_core::config::{ParsedUrl, parse_connection_url};
 use kerno_core::instance;
@@ -35,7 +33,7 @@ pub fn open(
 /// `listener`. The socket is accepted on a thread of its own; the window
 /// opens the URLs one after the other.
 pub fn listen(
-    listener: UnixListener,
+    listener: instance::Listener,
     workspace: &Entity<Workspace>,
     connections: &Entity<Connections>,
     window: &mut Window,

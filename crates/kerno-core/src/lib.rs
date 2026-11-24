@@ -28,6 +28,7 @@ pub mod openssh;
 pub mod password;
 pub mod pending;
 pub mod plan;
+pub mod private;
 pub mod result;
 pub mod schema;
 pub mod schema_doc;

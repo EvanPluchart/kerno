@@ -4,6 +4,9 @@
 //! test writes its own `ssh_config` and known_hosts: the developer's SSH
 //! files are never read.
 
+// The tunnel runs on Unix sockets: Unix only (K64, D-131).
+#![cfg(unix)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

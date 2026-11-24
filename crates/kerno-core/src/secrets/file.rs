@@ -5,10 +5,11 @@
 //! What this protects, exactly: the passwords are out of plain sight. A copy
 //! of the secrets file alone (a backup, a synced folder, a file search, a
 //! shared screen) shows nothing, and another user of the machine cannot read
-//! either file (mode 0600). It does not protect them from a program running
-//! as the same user, which can read the key file as well as the secrets
-//! file: the same level as DBeaver's saved passwords, `~/.pgpass` or an SSH
-//! key without a passphrase. Nothing is ever written in plain text.
+//! either file (mode 0600; on Windows, the access list the data directory
+//! passes on, see [`crate::private`]). It does not protect them from a
+//! program running as the same user, which can read the key file as well as
+//! the secrets file: the same level as DBeaver's saved passwords, `~/.pgpass`
+//! or an SSH key without a passphrase. Nothing is ever written in plain text.
 //!
 //! Every change re-reads the file under an exclusive lock (`secrets.lock`,
 //! an empty file), changes the one key, and replaces the file atomically (a
@@ -24,9 +25,8 @@
 //! next call starts a new file.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{ErrorKind, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use aes_gcm::aead::{Aead as _, KeyInit as _, Nonce, Payload};
@@ -146,12 +146,11 @@ impl FileSecretStore {
     fn lock(&self) -> Result<File> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| io_problem("could not be opened", &error))?;
-        let file = OpenOptions::new()
+        let file = crate::private::file_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o600)
             .open(self.path(LOCK_FILE))
             .map_err(|error| io_problem("could not be opened", &error))?;
         file.lock()
@@ -260,10 +259,9 @@ impl FileSecretStore {
             {
                 return Err(error);
             }
-            let mut file = OpenOptions::new()
+            let mut file = crate::private::file_options()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
                 .open(&temp)?;
             file.write_all(bytes)?;
             file.sync_all()?;

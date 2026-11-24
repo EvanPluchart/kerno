@@ -106,14 +106,8 @@ impl PasswordEnv {
         self.path
             .iter()
             .map(|dir| dir.join(program))
-            .find(|candidate| is_executable(candidate))
+            .find(|candidate| crate::tools::is_executable(candidate))
     }
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    path.metadata()
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Where the password of a session came from.
@@ -440,25 +434,26 @@ async fn read_file(
     env: &PasswordEnv,
     engine: Engine,
 ) -> std::result::Result<Option<String>, String> {
-    use std::os::unix::fs::PermissionsExt as _;
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return Ok(None);
     };
     let shown = env.display(path);
-    let mode = meta.permissions().mode() & 0o777;
+    // `None` on Windows, where no access list is read (`crate::private`):
+    // the file is read as libpq reads it there, without this check.
+    let mode = crate::private::mode(&meta);
     if !meta.is_file() {
         return Err(format!("{shown}{IGNORED}it is not a plain file."));
     }
-    match engine {
+    match (engine, mode) {
         // libpq's rule: group or world access and the file is not read.
-        Engine::Postgres if mode & 0o077 != 0 => {
+        (Engine::Postgres, Some(mode)) if mode & 0o077 != 0 => {
             return Err(format!(
                 "{shown}{IGNORED}other users can read it (permissions {mode:04o}); run \
                  chmod 600 {shown}."
             ));
         }
         // MySQL's: a world-writable option file is not read.
-        Engine::MySql | Engine::MariaDb if mode & 0o002 != 0 => {
+        (Engine::MySql | Engine::MariaDb, Some(mode)) if mode & 0o002 != 0 => {
             return Err(format!(
                 "{shown}{IGNORED}anyone can change it (permissions {mode:04o}); run chmod 600 \
                  {shown}."
@@ -744,6 +739,8 @@ mod tests {
         }
     }
 
+    // The command tests run `/bin/sh` scripts and set modes: Unix only (K64).
+    #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
@@ -752,6 +749,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn env(dir: &Path) -> PasswordEnv {
         PasswordEnv {
             path: vec![dir.to_path_buf()],
@@ -760,6 +758,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn line(program: &str, timeout: u64) -> CommandLine {
         CommandLine {
             program: program.into(),
@@ -768,6 +767,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_command_runs_without_a_shell_and_one_newline_is_trimmed() {
         let dir = tempfile::tempdir().unwrap();
@@ -788,6 +788,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failures_say_the_status_and_the_first_message_never_the_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -828,6 +829,7 @@ mod tests {
         assert!(error.to_string().contains("more than 64 KB"), "{error}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_command_that_hangs_is_stopped_at_its_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -860,6 +862,7 @@ mod tests {
         assert!(gone, "the command still runs");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_imported_command_does_not_run_before_it_is_confirmed() {
         let dir = tempfile::tempdir().unwrap();
@@ -904,6 +907,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pgpass_is_ignored_when_others_can_read_it() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -949,6 +953,8 @@ mod tests {
         assert_eq!(resolved.password.unwrap().expose(), "other");
     }
 
+    /// Unix: `PATH` is split on `:` (`;` on Windows).
+    #[cfg(unix)]
     #[test]
     fn detect_adds_the_usual_directories_once() {
         let env = PasswordEnv::detect(

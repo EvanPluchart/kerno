@@ -3062,15 +3062,12 @@ fn backup_size(path: &Path) -> Option<u64> {
 fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(path);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
     // It names the backup's objects: this user's to read, nobody else's.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)?.write_all(text.as_bytes())
+    kerno_core::private::file_options()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(text.as_bytes())
 }
 
 /// The server's roles, by name.

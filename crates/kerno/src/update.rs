@@ -15,7 +15,6 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -166,9 +165,7 @@ fn private_dir(parent: &Path, prefix: &str) -> Result<PathBuf, String> {
         .map(|since| since.as_nanos())
         .unwrap_or_default();
     let dir = parent.join(format!("{prefix}-{}-{stamp}", std::process::id()));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
+    kerno_core::private::create_dir(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     Ok(dir)
 }
@@ -750,11 +747,14 @@ pub mod tests {
         assert_eq!(fs::read(&path).unwrap(), body);
         let folder = path.parent().unwrap();
         assert_eq!(folder.parent(), Some(temp.path()));
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(
-            fs::metadata(folder).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(folder).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         // The two requests: the checksums first, then the file; Kerno's names for both.
         let calls = fake.calls();
         assert_eq!(calls.len(), 2);

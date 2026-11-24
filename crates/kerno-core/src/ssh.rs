@@ -37,7 +37,7 @@ use russh::keys::{
     Algorithm, EcdsaCurve, PrivateKeyWithHashAlg, PublicKeyOrCertificate, check_known_hosts_path,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::TcpListener;
 
 use crate::config::{Secret, SshAuth, SshConfig};
 use crate::openssh::{Forward, OpenSshRequest};
@@ -179,7 +179,7 @@ enum StreamKind {
     /// A channel of the built-in client.
     Channel(russh::ChannelStream<client::Msg>),
     /// The private socket OpenSSH forwards.
-    Local(UnixStream),
+    Local(crate::openssh::LocalStream),
 }
 
 impl std::fmt::Debug for TunnelStream {
@@ -260,13 +260,11 @@ impl Route {
                         forward.target().1
                     )));
                 }
-                let stream = UnixStream::connect(forward.socket())
-                    .await
-                    .map_err(|error| SshError::Forward {
-                        host: host.to_string(),
-                        port,
-                        reason: format!("the tunnel's socket did not answer: {error}"),
-                    })?;
+                let stream = forward.connect().await.map_err(|error| SshError::Forward {
+                    host: host.to_string(),
+                    port,
+                    reason: format!("the tunnel's socket did not answer: {error}"),
+                })?;
                 Ok(TunnelStream(StreamKind::Local(stream)))
             }
         }
@@ -537,25 +535,7 @@ async fn authenticate(
             accept(result).ok_or_else(|| rejected("private key"))
         }
         SshAuth::Agent { socket } => {
-            let mut agent = match socket {
-                Some(path) => AgentClient::connect_uds(path)
-                    .await
-                    .map(AgentClient::dynamic)
-                    .map_err(|error| {
-                        SshError::Agent(format!(
-                            "could not reach the agent at {}: {error}",
-                            path.display()
-                        ))
-                    })?,
-                None => AgentClient::connect_env()
-                    .await
-                    .map(AgentClient::dynamic)
-                    .map_err(|error| {
-                        SshError::Agent(format!(
-                            "could not reach the agent ({error}); is SSH_AUTH_SOCK set?"
-                        ))
-                    })?,
-            };
+            let mut agent = connect_agent(socket.as_deref()).await?;
             let identities = agent
                 .request_identities()
                 .await
@@ -587,6 +567,100 @@ async fn authenticate(
         }
     }
 }
+
+/// The SSH agent: at `socket`, else where `SSH_AUTH_SOCK` says (a Unix
+/// socket).
+#[cfg(unix)]
+async fn connect_agent(socket: Option<&Path>) -> Result<DynamicAgent, SshError> {
+    match socket {
+        Some(path) => AgentClient::connect_uds(path)
+            .await
+            .map(AgentClient::dynamic)
+            .map_err(|error| {
+                SshError::Agent(format!(
+                    "could not reach the agent at {}: {error}",
+                    path.display()
+                ))
+            }),
+        None => AgentClient::connect_env()
+            .await
+            .map(AgentClient::dynamic)
+            .map_err(|error| {
+                SshError::Agent(format!(
+                    "could not reach the agent ({error}); is SSH_AUTH_SOCK set?"
+                ))
+            }),
+    }
+}
+
+/// The SSH agent on Windows (K64): a named pipe of this machine (see
+/// [`agent_pipe`]).
+#[cfg(windows)]
+async fn connect_agent(socket: Option<&Path>) -> Result<DynamicAgent, SshError> {
+    let env = std::env::var_os("SSH_AUTH_SOCK");
+    let pipe = agent_pipe(socket.map(Path::as_os_str), env.as_deref())?;
+    AgentClient::connect_named_pipe(&pipe)
+        .await
+        .map(AgentClient::dynamic)
+        .map_err(|error| SshError::Agent(format!("could not reach the agent at {pipe}: {error}")))
+}
+
+/// The pipe of Windows' OpenSSH agent, which 1Password's takes over when it
+/// is on: where Windows' `ssh` looks when nothing else is said.
+#[cfg(any(windows, test))]
+const DEFAULT_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+/// The agent's pipe on Windows: the connection's own, else the one
+/// `SSH_AUTH_SOCK` names, else [`DEFAULT_AGENT_PIPE`]. A saved name may come
+/// from an imported file, and a pipe of another machine (`\\host\pipe\x`)
+/// would make Windows log in to that host with the user's credentials: a
+/// name that is not a pipe of this machine ([`is_local_pipe`]) is refused
+/// before anything is opened.
+#[cfg(any(windows, test))]
+fn agent_pipe(
+    saved: Option<&std::ffi::OsStr>,
+    env: Option<&std::ffi::OsStr>,
+) -> Result<String, SshError> {
+    let saved = saved.filter(|saved| !saved.is_empty());
+    let env = env.filter(|env| !env.is_empty());
+    let (name, next_step) = match (saved, env) {
+        (Some(saved), _) => (
+            saved,
+            "Clear it in the connection's SSH tab to use the system's agent.",
+        ),
+        (None, Some(env)) => (env, "Unset SSH_AUTH_SOCK to use the system's agent."),
+        (None, None) => return Ok(DEFAULT_AGENT_PIPE.to_string()),
+    };
+    match name.to_str().filter(|name| is_local_pipe(name)) {
+        Some(name) => Ok(name.to_string()),
+        None => Err(SshError::Agent(format!(
+            "The SSH agent's address “{}” is not a local pipe: on Windows it looks like \
+             {DEFAULT_AGENT_PIPE}. {next_step}",
+            name.to_string_lossy()
+        ))),
+    }
+}
+
+/// Whether `name` is a named pipe of this machine: `\\.\pipe\` (any case),
+/// then a name with no further `\` or `/` (nothing that would make it name
+/// something else), not `.` or `..`. A pipe of another host, `\\?\UNC\…`, a
+/// drive path, a Unix socket's path and the forward-slash spelling are not.
+#[cfg(any(windows, test))]
+fn is_local_pipe(name: &str) -> bool {
+    const PREFIX: &str = r"\\.\pipe\";
+    match (name.get(..PREFIX.len()), name.get(PREFIX.len()..)) {
+        (Some(head), Some(rest)) => {
+            head.eq_ignore_ascii_case(PREFIX)
+                && !rest.is_empty()
+                && !matches!(rest, "." | "..")
+                && !rest.contains(['\\', '/', '\0'])
+        }
+        _ => false,
+    }
+}
+
+/// An agent reached over any stream.
+type DynamicAgent = AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>;
 
 fn accept(result: AuthResult) -> Option<()> {
     result.success().then_some(())
@@ -762,5 +836,69 @@ mod tests {
 
         ssh.keepalive_secs = 0;
         assert_eq!(client_config(&ssh).keepalive_interval, None);
+    }
+
+    /// K64: on Windows the agent is a pipe of this machine only: the
+    /// connection's own, then `SSH_AUTH_SOCK`'s, then Windows' OpenSSH
+    /// agent's; a name from an imported file that leads anywhere else is
+    /// refused, saying what a valid one looks like. Strings in, a verdict
+    /// out: run on every system. Mutation seen: the prefix check dropped.
+    #[test]
+    fn the_windows_agent_is_a_pipe_of_this_machine_only() {
+        use std::ffi::OsStr;
+        for local in [
+            DEFAULT_AGENT_PIPE,
+            r"\\.\pipe\mine",
+            r"\\.\PIPE\1password-agent",
+        ] {
+            assert!(is_local_pipe(local), "{local}");
+        }
+        for other in [
+            r"\\some-host\pipe\x",
+            r"\\?\UNC\host\pipe\x",
+            r"\\.\pipe\..",
+            r"\\.\pipe\.",
+            r"\\.\pipe\..\..\C:\x",
+            r"\\.\pipe\a\b",
+            r"\\.\pipe\",
+            r"\\.\pipe",
+            "//./pipe/openssh-ssh-agent",
+            r"C:\Users\ada\agent.sock",
+            "/Users/ada/Library/Containers/agent.sock",
+            "",
+        ] {
+            assert!(!is_local_pipe(other), "{other}");
+        }
+
+        let mine = OsStr::new(r"\\.\pipe\mine");
+        let other = OsStr::new("other");
+        assert_eq!(
+            agent_pipe(Some(mine), Some(other)).unwrap(),
+            r"\\.\pipe\mine"
+        );
+        assert_eq!(agent_pipe(None, Some(mine)).unwrap(), r"\\.\pipe\mine");
+        assert_eq!(agent_pipe(None, None).unwrap(), DEFAULT_AGENT_PIPE);
+        let empty = OsStr::new("");
+        assert_eq!(
+            agent_pipe(Some(empty), Some(empty)).unwrap(),
+            DEFAULT_AGENT_PIPE
+        );
+        match agent_pipe(Some(OsStr::new(r"\\evil\pipe\x")), Some(mine)) {
+            Err(SshError::Agent(message)) => {
+                assert!(
+                    message.contains(r"“\\evil\pipe\x” is not a local pipe"),
+                    "{message}"
+                );
+                assert!(message.contains(DEFAULT_AGENT_PIPE), "{message}");
+                assert!(message.contains("connection's SSH tab"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match agent_pipe(None, Some(OsStr::new("/tmp/ssh-x/agent.1"))) {
+            Err(SshError::Agent(message)) => {
+                assert!(message.contains("SSH_AUTH_SOCK"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -648,8 +648,6 @@ mod tests {
 
     // Kerno's file (K33, D-106) ------------------------------------------------
 
-    use std::os::unix::fs::PermissionsExt as _;
-
     const SECRET_A: &str = "kerno-k33-alpha-\u{e9}t\u{e9}";
     const SECRET_B: &str = "kerno-k33-bravo-pass";
 
@@ -705,8 +703,10 @@ mod tests {
     }
 
     /// Mutation seen: `.mode(0o600)` dropped from `replace` and `lock`.
+    #[cfg(unix)]
     #[test]
     fn every_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         FileSecretStore::new(dir.path())
             .set("a", &Secret::new(SECRET_A))
@@ -793,8 +793,11 @@ mod tests {
     /// The previous content survives a write that fails, and a temporary
     /// file left by a crash changes nothing. Mutation seen: `replace`
     /// writing the file in place (`std::fs::write`).
+    /// Unix: a folder made read-only by its mode (Windows has no such mode).
+    #[cfg(unix)]
     #[test]
     fn a_failed_write_keeps_the_previous_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let store = FileSecretStore::new(dir.path());
         store.set("a", &Secret::new(SECRET_A)).unwrap();

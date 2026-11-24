@@ -1114,31 +1114,18 @@ impl WindowPlacement {
 
 /// Creates an empty file only its owner can read or write.
 fn create_private(path: &Path) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options
+    crate::private::file_options()
+        .write(true)
+        .create_new(true)
         .open(path)
         .map(|_| ())
         .map_err(|error| Error::io(format!("creating {}", path.display()), error))
 }
 
-/// Sets Unix permission bits; does nothing on other platforms.
+/// Sets Unix permission bits; does nothing on other platforms ([`crate::private`]).
 fn restrict(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
-            Error::io(format!("setting permissions of {}", path.display()), error)
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = (path, mode);
-    Ok(())
+    crate::private::restrict(path, mode)
+        .map_err(|error| Error::io(format!("setting permissions of {}", path.display()), error))
 }
 
 /// The folder beside the store that holds the copies taken before a

@@ -4,6 +4,9 @@
 //! a `.my.cnf` in a temporary `HOME`. The drivers' `password_sources` tests
 //! log in with them.
 
+// The fake `aws` is a `/bin/sh` script, the files have modes: Unix only (K64).
+#![cfg(unix)]
+
 use kerno_core::config::{ConnectionConfig, Engine, PasswordSource, Secret, TlsMode};
 use kerno_core::password::{self, PasswordOrigin};
 use kerno_core::testing;

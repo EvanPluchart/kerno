@@ -112,7 +112,7 @@ pub fn checksum_for(sums: &str, file: &str) -> Option<[u8; 32]> {
     })
 }
 
-fn parse_hex(hex: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
     }

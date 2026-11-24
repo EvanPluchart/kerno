@@ -1,5 +1,12 @@
 //! Kerno: a fast, native database client.
 
+// A release build on Windows is a GUI program: no console window opens with
+// it (as Recto's). `--version` and `--help` still print when their output
+// goes to a pipe or a file; typed in a console they print nothing, since
+// attaching to the console takes `unsafe` (K64, D-131). Debug builds keep
+// the console.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions;
 mod admin;
 mod ai_settings_view;
@@ -58,7 +65,6 @@ mod update;
 mod workspace;
 
 use std::io::Write as _;
-use std::os::unix::net::UnixListener;
 
 use gpui_kit::component::{TitleBar, WindowExt as _, input};
 use gpui_kit::{
@@ -172,12 +178,16 @@ fn main() {
     // The only place that looks the data directory up: everything below is
     // handed these paths.
     let paths = AppPaths::locate();
-    // One running instance: it opens the URL and comes to the front.
-    if let Some(url) = &url
-        && let Ok(paths) = &paths
-        && let Ok(socket) = instance::socket_path(&paths.data_dir)
-        && instance::send(&socket, url.expose()).is_ok()
-    {
+    // One running instance: it opens the URL and comes to the front. When
+    // the hand-off fails, this run opens the URL itself.
+    let handed = match (&url, &paths) {
+        (Some(url), Ok(paths)) => Some(
+            instance::socket_path(&paths.data_dir)
+                .and_then(|socket| instance::send(&socket, url.expose())),
+        ),
+        _ => None,
+    };
+    if let Some(Ok(())) = handed {
         return;
     }
     // The log first (K8): it needs only the paths, so every start failure
@@ -192,6 +202,16 @@ fn main() {
                 None
             }
         });
+    // Nobody listening is the usual first run; anything else is told (never
+    // the URL: it may hold a password).
+    if let Some(Err(error)) = &handed
+        && !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    {
+        tracing::warn!(%error, "the URL was not handed to a running Kerno: this one opens it");
+    }
     // Kerno's own files are read on another thread while the platform
     // starts up, so the first frame has the saved tabs and the right theme
     // without the UI thread ever touching the disk. The instance socket
@@ -236,7 +256,7 @@ fn main() {
 }
 
 /// The instance socket: `Some` when this instance holds it.
-type Listener = std::io::Result<Option<UnixListener>>;
+type Listener = std::io::Result<Option<instance::Listener>>;
 /// What [`load`] reads before the first frame.
 type Loaded = (Startup, Listener);
 
@@ -377,6 +397,8 @@ fn start(
             // The connections opened from a URL and never saved leave no
             // history or layout behind (J4); only this instance had them.
             cx.on_app_quit(|cx| {
+                // Windows: the pipe's file and token go (K64, D-131).
+                instance::forget();
                 let storage = AppState::get(cx).storage.clone();
                 bridge::spawn_blocking(cx, move || {
                     if let Err(error) = storage.forget_unknown_connections() {

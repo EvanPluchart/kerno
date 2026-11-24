@@ -361,6 +361,7 @@ pub fn exclusive_run() {
 /// proves its output was used. The returned environment's `PATH` and
 /// `HOME` are `dir` alone: the real `aws`, `op` and the developer's
 /// `~/.pgpass` and `~/.my.cnf` are never reached.
+#[cfg(unix)]
 pub fn fake_aws(dir: &std::path::Path) -> crate::password::PasswordEnv {
     use std::os::unix::fs::PermissionsExt as _;
     let script = dir.join("aws");
@@ -391,6 +392,7 @@ pub fn fake_aws_args(dir: &std::path::Path) -> Vec<String> {
 }
 
 /// Writes a password file (`.pgpass`, `.my.cnf`) in `dir` with `mode`.
+#[cfg(unix)]
 pub fn password_file(dir: &std::path::Path, name: &str, text: &str, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join(name);

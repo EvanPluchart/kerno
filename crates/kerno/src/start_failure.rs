@@ -9,7 +9,6 @@
 //! Kerno in the same run. A failure before the platform runs at all (no
 //! display) cannot show a window: stderr and the log are all there is.
 
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -217,7 +216,7 @@ pub fn open(error: &anyhow::Error, paths: Option<AppPaths>, url: Option<Secret>,
 
 /// Whether a running Kerno holds the instance socket of `data_dir`.
 fn in_use(data_dir: &std::path::Path) -> bool {
-    instance::socket_path(data_dir).is_ok_and(|socket| UnixStream::connect(socket).is_ok())
+    instance::socket_path(data_dir).is_ok_and(|socket| instance::running(&socket))
 }
 
 impl FailureWindow {

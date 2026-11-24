@@ -49,7 +49,9 @@ impl CancelRoute {
         let text = |error: &dyn std::fmt::Display| error.to_string();
         let sending = async {
             match &self.tunnel {
-                // A Unix socket directory, as tokio-postgres reads the host.
+                // A Unix socket directory, as tokio-postgres reads the host
+                // (on Unix only: elsewhere such a host is a host name).
+                #[cfg(unix)]
                 None if self.host.starts_with('/') => {
                     let path = format!("{}/.s.PGSQL.{}", self.host, self.port);
                     let stream = tokio::net::UnixStream::connect(path)

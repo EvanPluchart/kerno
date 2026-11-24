@@ -335,10 +335,21 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
         if let Some(stderr) = ssh_text.strip_prefix("OpenSSH: ") {
             openssh_words(stderr, config)
         } else if ssh_text.starts_with(crate::openssh::NOT_FOUND) {
+            // Windows: never offered yet (K64, D-131), installed or not.
+            let (headline, next_step) = match cfg!(unix) {
+                true => (
+                    "OpenSSH was not found on this computer.",
+                    "Choose the built-in client on the SSH tab, or install OpenSSH.",
+                ),
+                false => (
+                    "Tunnels through the system's OpenSSH are not available on Windows yet.",
+                    "Choose the built-in client on the SSH tab.",
+                ),
+            };
             (
                 FailureKind::Other,
-                "OpenSSH was not found on this computer.".to_string(),
-                "Choose the built-in client on the SSH tab, or install OpenSSH.".to_string(),
+                headline.to_string(),
+                next_step.to_string(),
             )
         } else if ssh_text.contains("is not known yet") {
             // The server named in the text: with OpenSSH, maybe a jump host.
@@ -1194,12 +1205,15 @@ mod tests {
             "The built-in SSH client cannot use the RSA key /k/id_rsa."
         );
         let explained = explain(
-            "SSH tunnel: OpenSSH was not found on this computer; use the built-in client",
+            &format!("SSH tunnel: {}", crate::openssh::NOT_FOUND),
             &config,
         );
         assert_eq!(
             explained.headline,
-            "OpenSSH was not found on this computer."
+            match cfg!(unix) {
+                true => "OpenSSH was not found on this computer.",
+                false => "Tunnels through the system's OpenSSH are not available on Windows yet.",
+            }
         );
         let explained = explain(
             "SSH tunnel: the SSH server could not connect to studio:5432: channel 2: open \

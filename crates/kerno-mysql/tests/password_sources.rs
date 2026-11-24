@@ -3,6 +3,9 @@
 //! through a fake `aws`, over TLS), with `~/.my.cnf` from a temporary
 //! `HOME`, and an imported command that waits for confirmation.
 
+// The fake `aws` is a `/bin/sh` script, the files have modes: Unix only (K64).
+#![cfg(unix)]
+
 mod common;
 
 use std::sync::Arc;

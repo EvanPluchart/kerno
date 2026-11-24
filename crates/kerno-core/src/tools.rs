@@ -699,10 +699,22 @@ pub fn find_all_in(tool: Tool, path_var: Option<&OsStr>, fallbacks: &[PathBuf]) 
         .collect()
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Whether `path` is a file this system would run: on Unix, one with an
+/// execute bit. Windows has no such bit (what runs is decided by the file's
+/// extension): any file.
+#[cfg(unix)]
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `path` is a file this system would run: on Unix, one with an
+/// execute bit. Windows has no such bit (what runs is decided by the file's
+/// extension): any file.
+#[cfg(not(unix))]
+pub(crate) fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// A tool's version, as `--version` prints it.
@@ -3016,6 +3028,7 @@ impl TaskSettings {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -3715,6 +3728,8 @@ mod tests {
         );
     }
 
+    /// Unix: the clean script's tool is a `/bin/sh` script.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_script_runs_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3865,6 +3880,8 @@ mod tests {
         assert!(std::mem::size_of::<Scanner>() < 256);
     }
 
+    /// Unix: a symbolic link and an executable script.
+    #[cfg(unix)]
     #[test]
     fn mysql_tls_options_follow_the_binary_not_the_server() {
         let maria_server = params(Engine::MariaDb);
@@ -4768,7 +4785,9 @@ mod tests {
         );
     }
 
+    // The fake tools are `/bin/sh` scripts with an execute bit: Unix only (K64).
     /// A fake tool in `dir` that prints `version` for `--version`.
+    #[cfg(unix)]
     fn versioned_tool(dir: &Path, name: &str, version: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).unwrap();
@@ -4779,12 +4798,14 @@ mod tests {
     }
 
     /// A fake client install: every tool of the family, at `version`.
+    #[cfg(unix)]
     fn fake_install(dir: &Path, family: ClientFamily, version: &str) {
         for tool in family.tools() {
             versioned_tool(dir, tool.name(), version);
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn clients_are_detected_once_per_real_folder() {
         let root = tempfile::tempdir().unwrap();
@@ -5065,6 +5086,7 @@ mod tests {
         assert_eq!(quote("$HOME"), "'$HOME'");
     }
 
+    #[cfg(unix)]
     fn fake_tool(dir: &Path, name: &str, mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
@@ -5073,6 +5095,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[test]
     fn find_searches_the_path_then_the_fallbacks() {
         let root = tempfile::tempdir().unwrap();
@@ -5118,6 +5141,7 @@ mod tests {
         assert_eq!(find_in(Tool::Psql, Some(&path_var), &fallbacks), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn find_all_lists_every_install_in_search_order_once() {
         let root = tempfile::tempdir().unwrap();
@@ -5173,12 +5197,15 @@ mod tests {
         }
     }
 
+    // The run tests start `/bin/sh` scripts: Unix only (K64).
+    #[cfg(unix)]
     fn collect() -> (Arc<Mutex<Vec<String>>>, impl Fn(String) + Send + 'static) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sink = lines.clone();
         (lines, move |line| sink.lock().unwrap().push(line))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_streams_lines_and_reports_the_exit_status() {
         let (lines, on_line) = collect();
@@ -5196,6 +5223,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_feeds_stdin_and_reports_a_missing_input() {
         let dir = tempfile::tempdir().unwrap();
@@ -5224,6 +5252,7 @@ mod tests {
 
     /// A client that stops reading (psql's ON_ERROR_STOP) ends the run at
     /// once, with what was fed so far; one that never reads is cancelled.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_client_that_stops_reading_its_script_ends_the_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -5284,6 +5313,7 @@ mod tests {
         assert!(!text.contains(PASSWORD), "{text}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_the_child() {
         let cancel = Arc::new(AtomicBool::new(false));

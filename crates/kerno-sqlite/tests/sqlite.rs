@@ -115,7 +115,9 @@ async fn files_open_as_they_are_and_never_get_created() {
 
 /// Acceptance 1 and 8: a file the user may only read is refused for
 /// writing in plain words, and opens read-only when the connection says so;
-/// a read-only connection opens a writable file read-only too.
+/// a read-only connection opens a writable file read-only too. Unix: the
+/// file is made read-only by its mode.
+#[cfg(unix)]
 #[tokio::test]
 async fn read_only_files_and_connections() {
     use std::os::unix::fs::PermissionsExt;

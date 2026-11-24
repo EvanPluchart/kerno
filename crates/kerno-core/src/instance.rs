@@ -1,28 +1,31 @@
 //! `kerno <url>` (CLAUDE.md §4 J4, Beekeeper #361, #2002): the command
 //! line, the connection a URL describes, and the one running instance.
 //!
-//! The first Kerno listens on a Unix socket in its data directory; a second
+//! The first Kerno listens on a channel of its data directory; a second
 //! `kerno <url>` sends it the URL, one line, and exits without opening a
-//! window. The socket is the user's alone (0600). A socket file left by a
-//! crash refuses connections: it is replaced. A URL may hold a password:
-//! nothing here logs it or puts it in an error message.
-//!
-//! A socket's path is short (104 bytes on macOS, 108 on Linux, its end
-//! included): a data directory too deep for it has its socket in a private
-//! folder of the user's runtime or temporary directory instead, named after
-//! the data directory (K56).
+//! window. On Unix the channel is a socket, the user's alone (`unix.rs`); on
+//! Windows a named pipe whose ends prove they can read a token of the data
+//! directory, the URL sent without its password (`windows.rs`, `proof.rs`,
+//! K64, D-131). A URL may hold a password: nothing here logs it or puts it
+//! in an error message.
 
-use std::io::{self, BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{ConnectionConfig, Engine, ParsedUrl, Secret, Secrets, parse_connection_url};
 use crate::storage::SavedConnection;
 
-/// The socket's file name in the data directory.
-pub const SOCKET: &str = "instance.sock";
-/// The longest line read from the socket: a URL, not a file.
+#[cfg(any(windows, test))]
+mod proof;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+#[cfg(unix)]
+pub use unix::{Listener, SOCKET, forget, listen, running, send, serve, socket_path};
+#[cfg(windows)]
+pub use windows::{Listener, PIPE_FILE, forget, listen, running, send, serve, socket_path};
+
+/// The longest line read from the channel: a URL, not a file.
 const MAX_LINE: u64 = 64 * 1024;
 /// How long a peer may take to send its line.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -99,6 +102,35 @@ pub fn redact_url(input: &str) -> String {
     }
 }
 
+/// The URL without its secrets: the password of `user:password@` and every
+/// option the URL parser takes for a secret (`password`, `sslpassword`, …);
+/// everything else as it was. For a hand-off whose other end cannot be
+/// checked (Windows' pipe, K64, D-131): the running Kerno asks for the
+/// password when it connects. `None` when the text is not a URL.
+pub fn without_password(input: &str) -> Option<String> {
+    let mut url = url::Url::parse(input.trim()).ok()?;
+    if url.password().is_some() {
+        url.set_password(None).ok()?;
+    }
+    if url
+        .query_pairs()
+        .any(|(key, _)| crate::config::is_secret_option(&key))
+    {
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| !crate::config::is_secret_option(key))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        match kept.is_empty() {
+            true => url.set_query(None),
+            false => {
+                url.query_pairs_mut().clear().extend_pairs(kept);
+            }
+        }
+    }
+    Some(url.to_string())
+}
+
 /// The connection a URL describes, with the engine's defaults for what it
 /// leaves out (as the connection dialog fills them), kept in memory under
 /// a new id; the password, if any, for this run only.
@@ -158,118 +190,6 @@ pub fn same_target(saved: &ConnectionConfig, url: &ConnectionConfig) -> bool {
         && saved.port == url.port
         && saved.user == url.user
         && database(saved) == database(url)
-}
-
-/// The longest socket path both systems take, in bytes, without the end
-/// byte `sun_path` keeps for it (macOS has room for 104 with it).
-const MAX_SOCKET_PATH: usize = 103;
-
-/// The socket of the instance using `data_dir`: in it when the path fits,
-/// otherwise in a private folder of the user's runtime directory
-/// (`XDG_RUNTIME_DIR`) or temporary directory, named after a hash of the
-/// data directory, one per data directory. That folder is made here when
-/// missing (0700); one that other users could reach, or that is not the
-/// data directory's owner's, is refused: no URL is ever sent there.
-pub fn socket_path(data_dir: &Path) -> io::Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .unwrap_or_else(std::env::temp_dir);
-    socket_path_under(data_dir, &base)
-}
-
-/// [`socket_path`], with the short socket's folder under `base`.
-fn socket_path_under(data_dir: &Path, base: &Path) -> io::Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
-    let path = data_dir.join(SOCKET);
-    if path.as_os_str().len() <= MAX_SOCKET_PATH {
-        return Ok(path);
-    }
-    let owner = std::fs::metadata(data_dir)?.uid();
-    let dir = base.join(format!("kerno-{owner}"));
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Err(error) if error.kind() != ErrorKind::AlreadyExists => return Err(error),
-        _ => {}
-    }
-    // Never followed: a link put there by someone else is refused.
-    let found = std::fs::symlink_metadata(&dir)?;
-    if !found.is_dir() || found.uid() != owner || found.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "{} is not a folder of this user's alone: the instance socket is not put there",
-                dir.display()
-            ),
-        ));
-    }
-    Ok(dir.join(format!(
-        "{:016x}.sock",
-        fnv1a(data_dir.as_os_str().as_bytes())
-    )))
-}
-
-/// FNV-1a, 64 bits: the same for a data directory in every build, so an
-/// instance and a `kerno <url>` of another version still meet.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-/// Hands `line` to the running instance. Fails when none listens.
-pub fn send(path: &Path, line: &str) -> io::Result<()> {
-    let mut stream = UnixStream::connect(path)?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()
-}
-
-/// Listens on `path`, replacing a socket left by a crash. `None` when a
-/// running instance already listens there: it is left alone.
-pub fn listen(path: &Path) -> io::Result<Option<UnixListener>> {
-    match UnixStream::connect(path) {
-        Ok(_) => return Ok(None),
-        // Nobody behind it: a crash left it.
-        Err(error) if error.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path)?,
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(Some(listener))
-}
-
-/// Accepts peers one after the other and hands each one's line to
-/// `on_line`, until `on_line` returns false. Blocking: run it on its own
-/// thread.
-pub fn serve(listener: UnixListener, mut on_line: impl FnMut(String) -> bool) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        if let Some(line) = read_line(stream)
-            && !on_line(line)
-        {
-            return;
-        }
-    }
-}
-
-/// One line from a peer, without its line break; `None` when it sent
-/// nothing usable in time.
-fn read_line(stream: UnixStream) -> Option<String> {
-    // macOS refuses socket options once the peer has closed its end (a
-    // peer that wrote its line and left): then nothing can block anyway.
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let mut line = String::new();
-    BufReader::new(stream.take(MAX_LINE))
-        .read_line(&mut line)
-        .ok()?;
-    let line = line.trim();
-    (!line.is_empty()).then(|| line.to_string())
 }
 
 #[cfg(test)]
@@ -403,67 +323,64 @@ mod tests {
         ));
     }
 
-    /// K56: a data directory too deep for a socket gets one in a private
-    /// folder elsewhere, the same each time and one per data directory;
-    /// both ends find it; a folder other users can reach is refused.
+    /// K64: what crosses Windows' pipe holds no secret, and nothing else of
+    /// the URL changes. Mutation seen: the removal skipped (`url` returned
+    /// as given).
     #[test]
-    fn a_long_data_directory_gets_a_short_socket_of_its_own() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let base = tempfile::tempdir().unwrap();
-        let short = dir.path().join("data");
-        std::fs::create_dir_all(&short).unwrap();
-        assert_eq!(
-            socket_path_under(&short, base.path()).unwrap(),
-            short.join(SOCKET)
-        );
-        let long = dir.path().join("d".repeat(60)).join("e".repeat(60));
-        let other = dir.path().join("d".repeat(60)).join("f".repeat(60));
-        for data in [&long, &other] {
-            std::fs::create_dir_all(data).unwrap();
+    fn a_handed_over_url_loses_its_password_and_nothing_else() {
+        for (given, sent) in [
+            (
+                "postgres://ada:hunter2@db.example.com:6543/shop?sslmode=require&application_name=k",
+                "postgres://ada@db.example.com:6543/shop?sslmode=require&application_name=k",
+            ),
+            (
+                "mysql://ann:p%40ss%3Aw%2Fd@[::1]:3307/s%20hop",
+                "mysql://ann@[::1]:3307/s%20hop",
+            ),
+            (
+                "postgresql://h/d?user=bob&password=hunter3&sslpassword=x&connect_timeout=5",
+                "postgresql://h/d?user=bob&connect_timeout=5",
+            ),
+            ("postgres://h/d?password=hunter4", "postgres://h/d"),
+            (
+                "mariadb://u@h/d?charset=utf8",
+                "mariadb://u@h/d?charset=utf8",
+            ),
+            (" postgres://h ", "postgres://h"),
+        ] {
+            let stripped = without_password(given).unwrap();
+            assert_eq!(stripped, sent, "{given}");
+            let (before, after) = (
+                parse_connection_url(given).unwrap(),
+                parse_connection_url(&stripped).unwrap(),
+            );
+            assert_eq!(after.password, None, "{given}");
+            assert_eq!(
+                ParsedUrl {
+                    password: None,
+                    ..before
+                },
+                after,
+                "{given}"
+            );
         }
-        // The defect: the system refuses a socket there.
-        assert!(long.join(SOCKET).as_os_str().len() > MAX_SOCKET_PATH);
-        assert!(listen(&long.join(SOCKET)).is_err());
-        let path = socket_path_under(&long, base.path()).unwrap();
-        assert!(path.as_os_str().len() <= MAX_SOCKET_PATH, "{path:?}");
-        assert_eq!(socket_path_under(&long, base.path()).unwrap(), path);
-        assert_ne!(socket_path_under(&other, base.path()).unwrap(), path);
-        let folder = path.parent().unwrap();
-        let mode = std::fs::metadata(folder).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
-
-        let listener = listen(&path).unwrap().expect("nobody listens yet");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        let sent = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            read_line(stream)
-        });
-        send(
-            &socket_path_under(&long, base.path()).unwrap(),
-            "postgres://h/k56",
-        )
-        .unwrap();
-        assert_eq!(sent.join().unwrap().as_deref(), Some("postgres://h/k56"));
-
-        // A folder other users can reach is not used.
-        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let refused = socket_path_under(&long, base.path()).unwrap_err();
-        assert_eq!(refused.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(without_password("not a url"), None);
     }
 
+    /// On both systems: the second end finds the first through the data
+    /// directory, and a live channel is never taken over.
     #[test]
     fn a_second_endpoint_hands_its_url_to_the_first() {
         let dir = tempfile::tempdir().unwrap();
         let path = socket_path(dir.path()).unwrap();
+        assert!(!running(&path));
         let listener = listen(&path).unwrap().expect("nobody listens yet");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        // A second instance does not take a live socket over.
-        assert!(listen(&path).unwrap().is_none());
-
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let (sent, received) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let mut left = 2;
@@ -473,30 +390,20 @@ mod tests {
                 left > 0
             })
         });
+        // A second instance does not take a live channel over (on Windows a
+        // live one is one that serves: it proves itself).
+        assert!(listen(&path).unwrap().is_none());
         send(&path, "postgres://u:pw@h/one").unwrap();
         // A peer that says nothing does not hold the next one up.
-        drop(UnixStream::connect(&path).unwrap());
+        assert!(running(&path));
         send(&path, "mysql://u@h/two").unwrap();
         server.join().unwrap();
         let lines: Vec<String> = received.try_iter().collect();
-        assert_eq!(lines, ["postgres://u:pw@h/one", "mysql://u@h/two"]);
-    }
-
-    #[test]
-    fn a_socket_left_by_a_crash_is_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("first-run").join(SOCKET);
-        // No instance: the hand-off fails, the caller opens the window.
-        assert!(send(&path, "postgres://h").is_err());
-        // The directory is made on a first run.
-        drop(listen(&path).unwrap().unwrap());
-        assert!(path.exists(), "a dropped listener leaves its file");
-        assert!(send(&path, "postgres://h").is_err());
-        let listener = listen(&path)
-            .unwrap()
-            .expect("the stale socket is replaced");
-        send(&path, "postgres://h").unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        assert_eq!(read_line(stream).as_deref(), Some("postgres://h"));
+        // Windows' pipe never carries the password (K64, D-131).
+        let first = match cfg!(windows) {
+            true => "postgres://u@h/one",
+            false => "postgres://u:pw@h/one",
+        };
+        assert_eq!(lines, [first, "mysql://u@h/two"]);
     }
 }

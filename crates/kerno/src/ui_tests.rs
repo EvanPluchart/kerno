@@ -77,6 +77,8 @@ mod menus;
 mod multi_run;
 mod open_url;
 mod openssh;
+// A fake `aws` script (`kerno_core::testing::fake_aws`): Unix only (K64).
+#[cfg(unix)]
 mod password_sources;
 mod portability;
 mod reconnect;
@@ -95,6 +97,8 @@ mod sqlite;
 mod table_loads;
 mod tabs_v11;
 mod tasks;
+// A fake `aws` script (`kerno_core::testing::fake_aws`): Unix only (K64).
+#[cfg(unix)]
 mod tool_passwords;
 mod tool_wizards;
 mod toolbar;

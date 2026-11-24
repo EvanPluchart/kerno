@@ -16,7 +16,6 @@ use crate::backup_dialog::{self, BackupDialog, Mode};
 /// A stand-in for a client tool: a shell script that prints `version` for
 /// `--version` and otherwise runs `body`.
 fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(name);
     std::fs::write(
@@ -26,7 +25,7 @@ fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> PathBuf {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    kerno_core::private::restrict(&path, 0o755).unwrap();
     path
 }
 

@@ -1794,9 +1794,7 @@ impl ConnectionDialog {
                             .test_support()
                             .text_xs()
                             .text_color(cx.theme().warning)
-                            .child(
-                                "OpenSSH was not found on this computer; use the built-in client.",
-                            ),
+                            .child(format!("{}.", kerno_core::openssh::NOT_FOUND)),
                     )
                 })
                 .child(

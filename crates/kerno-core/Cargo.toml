@@ -62,7 +62,14 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 aes = "0.9.4"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding"] }
 
+# The proof both ends of the running instance's pipe give on Windows (K64,
+# D-131): SHA-256, already in the tree at the version locked (the app's update
+# checksums use it). Windows only, and the tests of the proof everywhere.
+[target.'cfg(windows)'.dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 # The crate's own integration tests use its test support.
 kerno-core = { path = ".", features = ["test-support"] }
 tempfile = "3"
+sha2 = "0.10"

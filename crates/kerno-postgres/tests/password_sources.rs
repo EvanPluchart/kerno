@@ -3,6 +3,9 @@
 //! fake `aws`, over TLS), with `~/.pgpass` from a temporary `HOME`, and the
 //! failures told without the command's output.
 
+// The fake `aws` is a `/bin/sh` script, the files have modes: Unix only (K64).
+#![cfg(unix)]
+
 use std::sync::Arc;
 
 use kerno_core::config::{ConnectionConfig, PasswordSource, Secrets, TlsMode};
