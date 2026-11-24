@@ -4721,16 +4721,19 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
 - **The watcher** (G4): the read lock's session is checked only once the catalog and the key bounds are read
   (Kerno sends nothing else on it meanwhile), one check at a time, never dropped half-way; a check that has
   not answered yet is no evidence: only an error or another connection's id is a lost lock. The last check
-  waits 60 s: a session that does not answer by then fails the backup in words ("could not confirm …"),
-  and the lock goes when the app closes the session.
+  waits 60 s: a session that does not answer by then fails the backup in words ("could not confirm …").
+  Then the statement that does not answer is cancelled (the session's own `cancel()`, `KILL QUERY` from a
+  connection of its own on MySQL) and `UNLOCK TABLES` sent, 10 s at most each, so that the run always ends and
+  the session closes at once; closing it releases the lock in any case.
 - **The user's arguments** (G2, G9, G10): the folder backup refuses, naming the argument and what it sets
   instead, the options it sets per file (`where`, `tab`, `tables`, `ignore-table`, `ignore-table-data`,
   `databases`, `all-databases`, `no-data`, `no-create-info`, `xml`, `single-transaction`, `lock-all-tables`,
   `lock-tables`, `add-locks`, `triggers`, `routines`, `events`, `set-gtid-purged`), what would undo the files'
   settings (`opt`, `compact`, `set-charset`, `add-drop-table`), the replication position (`source-data`,
   `master-data`, `dump-replica`, `dump-slave`, `apply-replica-statements`, `apply-slave-statements`,
-  `include-source-host-port`, `include-master-host-port`: one position of the whole server, which files read at
-  different moments cannot give; the plain backup is the way to seed a replica) and `flush-logs` (each file
+  `include-source-host-port`, `include-master-host-port`: the folder backup does not write a replication
+  position, with or without "Block writes", and each file would print its own; the plain backup is the way to
+  seed a replica) and `flush-logs` (each file
   would flush the logs, and waits behind Kerno's table lock, 30 s, the reviewer's run). It takes
   `--set-gtid-purged=OFF` and `--skip-add-locks` as typed, drops `--skip-lock-tables` (it sets each file's
   locks) and reads `--skip-triggers` as the Triggers setting off. Both backups, plain and folder, refuse

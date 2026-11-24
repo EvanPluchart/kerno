@@ -1837,3 +1837,10 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   is told what Kerno cannot see, an error is said (G8); harmless arguments are taken (G9); a utf8mb4 backup
   into a server before 5.5.3 is said, `--ignore-table` refused, the lock test checks what the server saw (G10).
 - BENCH: one cut table among eight, and its key skewed, measured again.
+- After the re-run: a lock check that never answers is cancelled and the lock released within bounds, so the
+  run always ends; the refusal of a replication position says what is true with and without "Block writes";
+  tests added for `Execute` in the long statements, the Consistency sentences and a folder in utf8mb4.
+- A test run with that fix taken out held the server's read lock on the 8.4 test server for 1 h 41 min (its own
+  cleanup waited behind it, and every other MySQL test with it): the folder backup's driver tests now run under
+  a guard that kills the test's connections when its body ends or after 120 s, from a thread of its own; the
+  dialog's close of the session is bounded too.

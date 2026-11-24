@@ -2428,7 +2428,10 @@ impl BackupDialog {
                         let _ = sender.send(line);
                     });
                     let end = mysql_folder::back_up(job, session.clone(), on_line, cancel).await;
-                    session.close().await;
+                    // Bounded: a statement that never answers (cancelled by
+                    // the backup already) must not keep the run from ending;
+                    // the connection goes with the session then.
+                    let _ = tokio::time::timeout(Duration::from_secs(15), session.close()).await;
                     let size = end.outcome.is_ok().then(|| backup_size(&folder)).flatten();
                     Ended {
                         outcome: end.outcome.map(|()| ExitStatus::default()),

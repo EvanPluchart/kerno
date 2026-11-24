@@ -39,6 +39,7 @@ const WAIT: &str = "kerno_test_k63_wait";
 const SIZES: &str = "kerno_test_k63_sizes";
 const BUSY: &str = "kerno_test_k63_busy";
 const ARGS: &str = "kerno_test_k63_args";
+const STUCK: &str = "kerno_test_k63_stuck";
 
 /// One test of this file at a time: a test that holds the server's read
 /// lock would make the others' writes wait.
@@ -102,36 +103,125 @@ fn servers() -> Option<(Vec<Server>, PathBuf)> {
     Some((servers, client))
 }
 
-/// A session on `params`, in `database` when given.
+/// A session on `params`, in `database` when given; its connection is one
+/// the test's guard kills if the test runs past [`LIMIT`].
 async fn session(params: &ConnectParams, database: Option<&str>) -> Arc<dyn Session> {
     let mut params = params.clone();
     params.database = database.map(str::to_string);
-    common::connect(&params)
+    let session = common::connect(&params)
         .await
-        .unwrap_or_else(|error| panic!("connect to port {}: {error}", params.port))
+        .unwrap_or_else(|error| panic!("connect to port {}: {error}", params.port));
+    if let Some(id) = rows(&session, "SELECT CONNECTION_ID()").await[0][0].clone() {
+        OPENED.lock().unwrap().push((params.port, id));
+    }
+    session
 }
 
-/// Drops `databases` once `body` has run, also when it panicked.
+/// How long one test body may run on one server. Past it, the guard kills
+/// the test's connections (and with them any lock they hold), and the test
+/// fails: no lock a test takes can outlive it, whatever the code under test
+/// does.
+const LIMIT: Duration = Duration::from_secs(120);
+
+/// The connections the running test opened, by port (one test at a time:
+/// [`SERIAL`]).
+static OPENED: Mutex<Vec<(u16, String)>> = Mutex::new(Vec::new());
+
+/// Kills, from a thread, a runtime and a connection of its own (opened
+/// first), every connection the test opened on `params`' server and every
+/// one working in a `kerno_test_k63_*` database (the mysqldump and mysql
+/// processes): once told the test's body ended, or after [`LIMIT`] whatever
+/// happens. Its answer: whether the time ran out.
+fn guard(params: &ConnectParams) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+    let params = params.clone();
+    let (ended, wait) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the guard's runtime");
+        runtime.block_on(async move {
+            let killer = common::connect(&params).await;
+            let late = matches!(
+                wait.recv_timeout(LIMIT),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            let Ok(killer) = killer else {
+                eprintln!("GUARD: no connection to kill the test's ones");
+                return late;
+            };
+            let ours: Vec<String> = OPENED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(port, _)| *port == params.port)
+                .map(|(_, id)| id.clone())
+                .collect();
+            let listed = format!(
+                "SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND \
+                 (ID IN ({}) OR DB LIKE 'kerno\\_test\\_k63%' OR INFO LIKE '%kerno_test_k63%')",
+                if ours.is_empty() {
+                    "0".into()
+                } else {
+                    ours.join(", ")
+                }
+            );
+            let found = run(&killer, &listed)
+                .await
+                .ok()
+                .and_then(|done| done.results.first().map(|result| result.rows()))
+                .unwrap_or_default();
+            for row in found {
+                if let Some(id) = row.first().cloned().flatten() {
+                    eprintln!("GUARD: KILL {id}");
+                    let _ = run(&killer, &format!("KILL {id}")).await;
+                }
+            }
+            killer.close().await;
+            late
+        })
+    });
+    (ended, thread)
+}
+
+/// Drops `databases` once `body` has run, also when it panicked or ran past
+/// [`LIMIT`] (its connections then killed by [`guard`]).
 async fn with_scratch<F>(params: &ConnectParams, databases: &[&str], body: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let admin = session(params, None).await;
+    OPENED
+        .lock()
+        .unwrap()
+        .retain(|(port, _)| *port != params.port);
+    let (ended, guarding) = guard(params);
     let drop = |db: &str| format!("DROP DATABASE IF EXISTS {db}");
+    let admin = session(params, None).await;
     for db in databases {
         exec_ok(&admin, &drop(db)).await;
     }
-    let outcome = tokio::spawn(body).await;
+    let mut task = tokio::spawn(body);
+    let outcome = tokio::time::timeout(LIMIT + Duration::from_secs(20), &mut task).await;
+    if outcome.is_err() {
+        task.abort();
+    }
+    let _ = ended.send(());
+    let killed = guarding.join().unwrap_or(true);
     // A mysqldump killed mid-run may leave its server thread finishing a
-    // statement: the drop waits for it.
+    // statement: the drop waits for it, 60 s at most.
     let admin = session(params, None).await;
+    let _ = run(&admin, "SET SESSION lock_wait_timeout = 60").await;
     for db in databases {
-        run(&admin, &drop(db))
+        tokio::time::timeout(Duration::from_secs(90), run(&admin, &drop(db)))
             .await
+            .unwrap_or_else(|_| panic!("{}: still waiting after 90 s", drop(db)))
             .unwrap_or_else(|error| panic!("{}: {error}", drop(db)));
     }
-    if let Err(error) = outcome {
-        std::panic::resume_unwind(error.into_panic());
+    match outcome {
+        Err(_) => panic!("the test ran past {LIMIT:?}: its connections were killed"),
+        Ok(Err(error)) => std::panic::resume_unwind(error.into_panic()),
+        Ok(Ok(())) if killed => panic!("the test ran past {LIMIT:?}: its connections were killed"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -807,13 +897,16 @@ async fn cancelled(server: &'static Server) {
 /// server saw from Kerno's own session. One statement at a time, as a real
 /// session; each is also noted when it is asked for (`asked: …`). It can
 /// make the catalog's read of `information_schema.TABLES`, or the n-th
-/// `SELECT CONNECTION_ID()`, take longer.
+/// `SELECT CONNECTION_ID()`, take longer, or leave every check from the
+/// n-th on without an answer until it is cancelled, as a stuck statement.
 struct Recording {
     inner: Arc<dyn Session>,
     sent: Arc<Mutex<Vec<String>>>,
     one_at_a_time: tokio::sync::Mutex<()>,
     slow_catalog: Option<Duration>,
     slow_check: Option<(usize, Duration)>,
+    stuck_from: Option<usize>,
+    cancelled: tokio::sync::Notify,
 }
 
 impl Recording {
@@ -824,6 +917,8 @@ impl Recording {
             one_at_a_time: tokio::sync::Mutex::new(()),
             slow_catalog: None,
             slow_check: None,
+            stuck_from: None,
+            cancelled: tokio::sync::Notify::new(),
         }
     }
 }
@@ -855,17 +950,28 @@ impl Session for Recording {
         };
         let _one = self.one_at_a_time.lock().await;
         self.sent.lock().unwrap().push(sql.to_string());
-        let delay = match self.slow_check {
-            Some((n, delay)) if sql == "SELECT CONNECTION_ID()" && checks == n => Some(delay),
+        let check = sql == "SELECT CONNECTION_ID()";
+        let delay = match (self.slow_check, self.stuck_from) {
+            // "Never" for the backup's 60 s check: the test's guard ends it
+            // anyway.
+            (_, Some(n)) if check && checks >= n => Some(Duration::from_secs(300)),
+            (Some((n, delay)), _) if check && checks == n => Some(delay),
             _ if sql.contains("FROM information_schema.TABLES") => self.slow_catalog,
             _ => None,
         };
         if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = self.cancelled.notified() => {
+                    self.sent.lock().unwrap().push(format!("cancelled: {sql}"));
+                    return Err(kerno_core::Error::Cancelled);
+                }
+            }
         }
         self.inner.execute(sql, sink).await
     }
     async fn cancel(&self) -> kerno_core::Result<()> {
+        self.cancelled.notify_waiters();
         self.inner.cancel().await
     }
     async fn ping(&self) -> kerno_core::Result<()> {
@@ -1077,6 +1183,119 @@ async fn a_slow_session_is_not_a_lost_lock() {
         assert!(checks[1] > catalog_end, "{sent:?}");
     })
     .await;
+}
+
+/// The last check of the read lock never answers: the stuck statement is
+/// cancelled, the lock released, and the backup fails in words within a
+/// bound; the session then closes at once and a write goes through.
+#[tokio::test]
+async fn a_session_that_never_answers_ends_the_backup() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let server: &'static Server = Box::leak(Box::new(server));
+    with_scratch(&server.params, &[STUCK], async move {
+        let admin = session(&server.params, None).await;
+        fill_big(&admin, STUCK, 1_000).await;
+        let files = tempfile::tempdir().unwrap();
+        let folder = files.path().join("backup");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let kerno: Arc<dyn Session> = Arc::new(Recording {
+            // Every check after the one that reads the lock's id.
+            stuck_from: Some(2),
+            ..Recording::new(session(&server.params, None).await, sent.clone())
+        });
+        let (on_line, _) = sink();
+        let start = std::time::Instant::now();
+        let ended = mysql_folder::back_up(
+            FolderBackup {
+                tool_path: server.dump.clone(),
+                params: server.params.clone(),
+                options: folder_options(STUCK, 2, DumpMethod::LockAllTables),
+                folder: folder.clone(),
+                client: server.dump_version.clone(),
+                range_threshold: mysql_folder::RANGE_THRESHOLD,
+            },
+            kerno.clone(),
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let took = start.elapsed();
+        let said = ended.outcome.unwrap_err().to_string();
+        assert!(
+            said.contains("could not confirm that its read lock held"),
+            "{said}"
+        );
+        assert!(ended.removed && !folder.exists());
+        // The 60 s check, then 10 s at most for the cancel and 10 s for
+        // UNLOCK TABLES.
+        assert!(took < Duration::from_secs(85), "{took:?}");
+        let sent = sent.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|sql| sql.starts_with("cancelled: ")),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.last().map(String::as_str),
+            Some("UNLOCK TABLES"),
+            "{sent:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), kerno.close())
+            .await
+            .expect("the session closes");
+        let writer = session(&server.params, None).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run(&writer, &format!("INSERT INTO {STUCK}.t1 VALUES (2)")),
+        )
+        .await
+        .expect("no lock left")
+        .unwrap();
+    })
+    .await;
+}
+
+/// The list of long statements names one sent as a prepared statement
+/// (`Execute` in the process list), not only text queries (G8).
+#[tokio::test]
+async fn a_long_prepared_statement_is_listed() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let params = &server.params;
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname(params.host.clone())
+        .tcp_port(params.port)
+        .user(Some(params.user.clone()))
+        .pass(Some(testing::DB_PASSWORD))
+        .prefer_socket(false);
+    let mut prepared = match mysql_async::Conn::new(opts).await {
+        Ok(conn) => conn,
+        Err(error) => panic!("a binary-protocol connection: {error}"),
+    };
+    let sleeping = tokio::spawn(async move {
+        use mysql_async::prelude::Queryable;
+        let _: Vec<i64> = prepared.exec("SELECT SLEEP(?)", (9,)).await.unwrap();
+        prepared.disconnect().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let kerno = session(params, None).await;
+    let long = mysql_folder::long_statements(&kerno, 5).await.unwrap();
+    assert!(
+        long.iter()
+            .any(|(_, seconds, sql)| *seconds >= 5 && sql.contains("SLEEP")),
+        "{long:?}"
+    );
+    sleeping.await.unwrap();
 }
 
 /// Arguments that would stall the ranges behind Kerno's table lock, or hide

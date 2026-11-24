@@ -464,9 +464,8 @@ const OPT: &str = "it turns off what the folder's files rely on (DROP TABLE befo
                    character set, the table locks), which the backup's Settings choose";
 const AFTER: &str = "the folder backup writes them in a file of their own (the checkboxes in \
                      Settings)";
-const REPLICA: &str = "a replication position is one moment of the whole server, and the folder's \
-                       files are not read at one moment: use the plain backup (one file) to seed a \
-                       replica";
+const REPLICA: &str = "the folder backup does not write a replication position: use the plain backup \
+                       (one file) to seed a replica";
 const FLUSH: &str = "each file would flush the server's logs, and wait behind Kerno's table locks: \
                      use the plain backup for that";
 
@@ -1495,25 +1494,36 @@ async fn back_up_in(
     let at_end = match lost_at {
         Some(_) => Held::Lost,
         None => {
-            let (session, id) = (session.clone(), id.clone());
-            let last = tokio::spawn(async move {
+            let (checked, id) = (session.clone(), id.clone());
+            let mut last = tokio::spawn(async move {
                 // The session answers in order: the check under way first.
                 if let Some(check) = check {
                     let _ = check.await;
                 }
-                held(session, id).await
+                held(checked, id).await
             });
-            match tokio::time::timeout(FINAL_CHECK, last).await {
+            match tokio::time::timeout(FINAL_CHECK, &mut last).await {
                 Ok(Ok(found)) => found,
                 Ok(Err(_)) => Held::Lost,
-                Err(_) => Held::NoAnswer,
+                Err(_) => {
+                    // No new statement after this one; the one that does
+                    // not answer is cancelled, so that the lock can be
+                    // released and the session closed (each wait bounded:
+                    // the run always ends).
+                    last.abort();
+                    on_line("Kerno: the read lock's session does not answer; cancelling.".into());
+                    let _ = tokio::time::timeout(UNSTICK_WAIT, session.cancel()).await;
+                    let _ = tokio::time::timeout(
+                        UNSTICK_WAIT,
+                        exec::collect(session.clone(), "UNLOCK TABLES"),
+                    )
+                    .await;
+                    Held::NoAnswer
+                }
             }
         }
     };
     if let Held::NoAnswer = at_end {
-        // UNLOCK TABLES would wait behind the statement that does not
-        // answer; the lock goes when the app closes the session.
-        on_line("Kerno: the read lock's session does not answer.".into());
         return Err(Error::Config(format!(
             "Kerno could not confirm that its read lock held to the end (its session did not \
              answer within {} s): the backup may not be consistent, and its folder was removed. \
@@ -1537,6 +1547,10 @@ async fn back_up_in(
 
 /// How long the last check of the read lock's session may take.
 const FINAL_CHECK: Duration = Duration::from_secs(60);
+
+/// How long a session that does not answer gets for its cancel, then for
+/// `UNLOCK TABLES`.
+const UNSTICK_WAIT: Duration = Duration::from_secs(10);
 
 /// What a check of the read lock's session found.
 enum Held {

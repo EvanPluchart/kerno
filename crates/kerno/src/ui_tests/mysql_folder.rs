@@ -208,6 +208,21 @@ fn the_consistency_choice_is_said_and_needs_reload(cx: &mut TestAppContext) {
     assert!(app.has(cx, "backup-jobs"));
     let settings = cx.update(|cx| dialog.read(cx).settings(cx)).unwrap();
     assert_eq!(settings.format, BackupFormat::Directory);
+    // The Consistency row says what each choice does to the folder (G7).
+    for (at, said) in [
+        (
+            2usize,
+            "In the folder, with no lock at all, no table is cut",
+        ),
+        (0, "In the folder, each table is read at one moment"),
+        (
+            1,
+            "In the folder, Kerno holds the server's read lock for the whole backup",
+        ),
+    ] {
+        app.tap(cx, ("backup-method", at));
+        assert!(paints(&app, cx, said), "{said}");
+    }
     app.tap(cx, "wizard-simple");
     assert!(!app.has(cx, "simple-reset"));
     assert_eq!(method(cx, &dialog), (DumpMethod::LockAllTables, Some(jobs)));
@@ -526,6 +541,13 @@ fn a_utf8mb4_backup_for_an_old_server_is_said(cx: &mut TestAppContext) {
     app.use_client(cx, ClientFamily::MySql, &client);
     let said = "This backup was made in utf8mb4, which MySQL 5.1.73 does not have: the restore \
                 stops at its first statement (ERROR 1115).";
+    // A folder backup: its first file is read.
+    let folder = folder_of(&root, "folder", &["one"], BackupContent::All, true);
+    std::fs::write(
+        folder.join("0001-one.sql"),
+        "-- MySQL dump 10.13\n/*!40101 SET NAMES utf8mb4 */;\nSELECT 1;\n",
+    )
+    .unwrap();
     for (name, head, warned) in [
         (
             "new.sql",
@@ -537,9 +559,12 @@ fn a_utf8mb4_backup_for_an_old_server_is_said(cx: &mut TestAppContext) {
             "-- MySQL dump 10.13\n/*!40101 SET NAMES utf8 */;\nSELECT 1;\n",
             false,
         ),
+        ("folder", "", true),
     ] {
         let file = root.join(name);
-        std::fs::write(&file, head).unwrap();
+        if !head.is_empty() {
+            std::fs::write(&file, head).unwrap();
+        }
         let dialog = app.simple_dialog(cx, target, true).expect("the restore");
         // As a 5.1 server would be read.
         dialog.update(cx, |dialog, cx| dialog.set_server_version((5, 1, 73), cx));
