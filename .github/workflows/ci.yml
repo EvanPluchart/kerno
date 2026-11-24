@@ -5,10 +5,12 @@
 #   test-macos   the workspace tests; GitHub's macOS runners have no Docker, so the tests that need
 #                the kerno-* servers print why and skip themselves
 #   test-linux   the workspace tests with the kerno-* containers, the legacy MySQL ones included
-#   windows      step 1 of the Windows port (K64, D-131): cargo check and clippy of every crate and
-#                target, and kerno-core's tests; no container and no UI test there yet
+#   windows      clippy and the workspace tests on Windows, against a PostgreSQL 17 and a MySQL 8.4
+#                of the image seeded as the containers by scripts/windows-test-servers.sh (K68,
+#                D-137); MariaDB, SSH and the legacy MySQL servers are not there, their tests skip
 #   windows-package  the release's Windows zip, built by scripts/bundle-windows.sh and kept 7
-#                days with the run: a preview, nobody has seen it on a Windows screen
+#                days with the run, and pictures of the packaged app driven by keys against the
+#                seeded PostgreSQL (scripts/windows-app-pictures.ps1)
 #   macos-package    the release's .dmg, built by scripts/bundle-macos.sh and kept 7 days
 # The two package jobs also leave their compiled dependencies in a cache that release.yml reads
 # (shared keys): a release then compiles Kerno's own crates only on macOS and Windows.
@@ -93,9 +95,9 @@ jobs:
         run: scripts/test-env.sh down
 
   windows:
-    name: check, clippy, core tests (Windows)
+    name: test (Windows, PostgreSQL and MySQL)
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash
@@ -110,14 +112,43 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
-      - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test -p kerno-core -- --test-threads=3
+      # A PostgreSQL 17 and a MySQL 8.4 of the image, seeded as the kerno-* containers (K68).
+      - name: Start the test servers
+        run: scripts/windows-test-servers.sh up
+      - name: Test
+        run: cargo test --workspace --no-fail-fast -- --test-threads=3
+        env:
+          # The runner has these two; MariaDB, SSH and the legacy MySQL servers skip themselves.
+          KERNO_REQUIRE_SERVERS: kerno-postgres,kerno-mysql
+      # K67's runner tests, after the suite: the files they read in the runner's profile could
+      # change what the suite's tests find there.
+      - name: Home files for K67's tests
+        run: |
+          set -euo pipefail
+          home="$(cygpath -u "$USERPROFILE")"
+          mkdir -p "$home/.ssh"
+          printf 'Host k67-probe\n  HostName 127.0.0.1\n' > "$home/.ssh/config"
+          printf '[client]\npassword=not-read-on-windows\n' > "$home/.my.cnf"
+          appdata="$(cygpath -u "$APPDATA")"
+          mkdir -p "$appdata/postgresql"
+          printf '127.0.0.1:55432:*:kerno:kerno_test_pw\n' > "$appdata/postgresql/pgpass.conf"
+      - name: "K67: the home, the password files, the local clients, the update check"
+        run: |
+          cargo test -p kerno-core --test windows -- --nocapture --test-threads=1
+          cargo test -p kerno-postgres --test tools -- windows_k67 --nocapture
+          cargo test -p kerno-mysql --test tools -- windows_k67 --nocapture
+          cargo test -p kerno --bin kerno -- windows_k67 --nocapture
+        env:
+          KERNO_K67_RUNNER: "1"
+      - name: Stop the test servers
+        if: always()
+        run: scripts/windows-test-servers.sh down
 
   windows-package:
     name: release zip (Windows)
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -133,13 +164,25 @@ jobs:
           cache-on-failure: true
       - name: Build, check the version, launch once and zip
         run: scripts/bundle-windows.sh
+      # The packaged app at work: a connection from a URL, a query, a table, the connection
+      # dialog and Settings, against the seeded PostgreSQL (K68).
+      - name: Start the test servers
+        run: scripts/windows-test-servers.sh up
+      - name: Drive the app and keep pictures
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-app-pictures.ps1
+          target/release/kerno.exe dist/pictures
+      - name: Stop the test servers
+        if: always()
+        run: scripts/windows-test-servers.sh down
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kerno-windows-x86_64
-          # The zip, and the picture of the screen taken at the launch check.
+          # The zip, the picture of the screen taken at the launch check, and the app at work.
           path: |
             dist/*.zip
             dist/kerno-windows-launch.png
+            dist/pictures/*.png
           if-no-files-found: error
           retention-days: 7
 
