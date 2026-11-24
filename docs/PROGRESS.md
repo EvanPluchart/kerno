@@ -1786,5 +1786,6 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   second DBeaver import at once could copy a connection; a run on several connections said "Starting…" while
   it asked. Three tests read a state before
   it was there (the update relaunch, the fold marks, MySQL's own transaction after a sizes read).
-- Proved by the loops (numbers in M12, K71), three new tests seen failing without their fix, and the probe's
-  whole workspace on the Linux runner. Left: J15's import plans from the list in memory too (not reproduced).
+- Proved by the loops (numbers in M12, K71), four new tests seen failing without their fix, and the probe's
+  last run on the final code (45468100079): every loop 0 failures, the whole workspace on the Linux runner
+  2,120 passed, none failed. Left: J15's import plans from the list in memory too (not reproduced).
