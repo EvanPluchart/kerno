@@ -117,6 +117,15 @@ impl Mode {
         match self {
             Mode::Number => compare_cells(a, b, TypeKind::Decimal),
             Mode::Boolean => compare_cells(a, b, TypeKind::Boolean),
+            // A time of one precision against another (`DATETIME(3)` and
+            // `DATETIME(6)`): without the zeros of a fraction. Within one
+            // side every value has the same precision, so the server's byte
+            // order is kept.
+            Mode::Temporal => {
+                let trimmed = |cell: Option<&[u8]>| cell.map(without_trailing_zeros);
+                let (a, b) = (trimmed(a), trimmed(b));
+                compare_cells(a.as_deref(), b.as_deref(), TypeKind::Text)
+            }
             // `compare_cells` of any other kind: bytes, NULL last.
             _ => compare_cells(a, b, TypeKind::Text),
         }
@@ -220,11 +229,13 @@ pub struct Shared {
 }
 
 /// What two tables offer to compare: the keys their rows can be matched by
-/// (the source's row identity first), the columns both have, and the
+/// (the target's, its row identity first), the columns both have, and the
 /// columns only one has (said, not compared).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
     pub keys: Vec<Vec<String>>,
+    /// Keys the source holds unique and the target does not: not offered.
+    pub source_only_keys: Vec<Vec<String>>,
     /// In the source's order.
     pub shared: Vec<Shared>,
     pub only_in_source: Vec<String>,
@@ -268,12 +279,15 @@ impl Shape {
                 .map(|column| column.name.clone())
                 .collect()
         };
+        // Only a key the target holds unique: each statement of the script
+        // then changes one row at most, whatever the target's collation
+        // holds equal. The source's uniqueness is checked as it is read.
         let (source_keys, target_keys) = (keys(source), keys(target));
-        if source_keys.is_empty() && target_keys.is_empty() {
+        if target_keys.is_empty() {
             return Err(
-                "Neither table has a primary key or a unique key on NOT NULL columns, so \
-                        a row of one cannot be matched with its row in the other. Add a key to \
-                        one of them to compare their rows."
+                "The target table has no primary key or unique key on NOT NULL columns, so a \
+                 statement of the script could change several of its rows. Add a key to the \
+                 target, or swap the tables, to compare their rows."
                     .into(),
             );
         }
@@ -284,26 +298,22 @@ impl Shape {
                     .any(|column| &column.name == name && column.refused.is_none())
             })
         };
-        let mut usable_keys: Vec<Vec<String>> = Vec::new();
-        for key in source_keys.iter().chain(&target_keys) {
-            if usable(key) && !usable_keys.contains(key) {
-                usable_keys.push(key.clone());
-            }
-        }
+        let usable_keys: Vec<Vec<String>> =
+            target_keys.iter().filter(|k| usable(k)).cloned().collect();
         if usable_keys.is_empty() {
-            let key = source_keys
-                .first()
-                .or(target_keys.first())
-                .cloned()
-                .unwrap_or_default();
             return Err(format!(
-                "The key ({}) is not in both tables with the same kind of type, so the rows \
-                 cannot be matched.",
-                key.join(", ")
+                "The target's key ({}) is not in both tables with the same kind of type, so the \
+                 rows cannot be matched.",
+                target_keys[0].join(", ")
             ));
         }
+        let source_only_keys = source_keys
+            .into_iter()
+            .filter(|key| !target_keys.contains(key))
+            .collect();
         Ok(Shape {
             keys: usable_keys,
+            source_only_keys,
             shared,
             only_in_source: only(source, target),
             only_in_target: only(target, source),
@@ -358,6 +368,13 @@ impl Plan {
     ) -> std::result::Result<Plan, String> {
         if request.key.is_empty() {
             return Err("Pick the key the rows are matched by.".into());
+        }
+        if !keys(target).contains(&request.key) {
+            return Err(format!(
+                "The target does not hold ({}) unique, so a statement of the script could \
+                 change several of its rows.",
+                request.key.join(", ")
+            ));
         }
         let col = |name: &String| -> std::result::Result<Col, String> {
             let side = |structure: &TableStructure, which: &str| {
@@ -523,6 +540,26 @@ pub struct Row {
     pub target: Option<usize>,
     /// Indexes into [`Plan::columns`].
     pub changed: Box<[u32]>,
+    /// A row both sides hold under keys the target's server holds equal and
+    /// whose bytes differ (`a` and `A` under a `_ci` collation, `a` and
+    /// `a ` with PAD SPACE): its UPDATE also writes the source's spelling.
+    pub respelled: bool,
+    /// A row of one side whose key the other side's server holds equal to a
+    /// key of a row this compare did not keep beside it: no statement is
+    /// written for it, a comment says why.
+    pub held: bool,
+}
+
+impl Row {
+    /// Words for the row, its mark's or more precise ones.
+    pub fn words(&self) -> &'static str {
+        match (self.difference, self.respelled, self.held) {
+            (Difference::Different, true, _) => "key spelled otherwise",
+            (Difference::OnlyInSource, _, true) => "only in source, target holds its key",
+            (Difference::OnlyInTarget, _, true) => "only in target, source holds its key",
+            (difference, ..) => difference.mark().1,
+        }
+    }
 }
 
 /// How far a compare is.
@@ -640,6 +677,8 @@ impl Keep {
             source,
             target,
             changed,
+            respelled: false,
+            held: false,
         });
     }
 }
@@ -972,7 +1011,221 @@ pub async fn run(
             Some(ExecEvent::Finished(Err(error))) => return Err(error),
         }
     }
-    Ok(merge.finish())
+    let mut outcome = merge.finish();
+    reconcile(&sessions, plan, &mut outcome, cancel).await?;
+    Ok(outcome)
+}
+
+/// Kept rows asked of the other side at a time, one `SELECT` each joined by
+/// `UNION ALL`.
+const TWINS_BATCH: usize = 100;
+
+/// The `SELECT` that asks side `other` (0: source) which of `rows` (rows of
+/// the other side, `(n, key values)`) it holds, by its own equality: the
+/// one the script's `WHERE` uses. Each row found comes back as `n` and its
+/// key as that side prints it.
+fn twins_sql(
+    plan: &Plan,
+    other: usize,
+    rows: &[(usize, Vec<CellValue>)],
+    dialect: &dyn Dialect,
+) -> String {
+    let table = if other == 0 {
+        &plan.source
+    } else {
+        &plan.target
+    };
+    let names: Vec<String> = plan
+        .key
+        .iter()
+        .map(|col| dialect.quote_ident(&col.name))
+        .collect();
+    rows.iter()
+        .map(|(n, key)| {
+            let conditions: Vec<String> = plan
+                .key
+                .iter()
+                .zip(key)
+                .map(|(col, value)| {
+                    let name = dialect.quote_ident(&col.name);
+                    let info = if other == 0 { &col.source } else { &col.target };
+                    match value {
+                        CellValue::Null => format!("{name} IS NULL"),
+                        value => format!("{name} = {}", dialect.literal(value, info)),
+                    }
+                })
+                .collect();
+            format!(
+                "SELECT {n} AS {}, {} FROM {} WHERE {}",
+                dialect.quote_ident("kerno_row"),
+                names.join(", "),
+                dialect.table_name(table),
+                conditions.join(" AND ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// Asks `session` (side `other`) which of the kept rows `rows` of the other
+/// side it holds under a key its server takes for theirs: each found as the
+/// row's place in [`Outcome::rows`] and the key as that side prints it.
+async fn twins(
+    session: &Arc<dyn Session>,
+    plan: &Plan,
+    outcome: &Outcome,
+    other: usize,
+    rows: &[usize],
+    cancel: &AtomicBool,
+) -> Result<Vec<(usize, Vec<Option<Vec<u8>>>)>> {
+    let side = 1 - other;
+    let mut found = Vec::new();
+    for chunk in rows.chunks(TWINS_BATCH) {
+        if cancel.load(Atomic::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let asked: Vec<(usize, Vec<CellValue>)> = chunk
+            .iter()
+            .filter_map(|&index| {
+                let row = &outcome.rows[index];
+                let at = if side == 0 { row.source } else { row.target }?;
+                let key = (0..plan.key.len())
+                    .map(|column| kept_value(outcome, side, at, column))
+                    .collect();
+                Some((index, key))
+            })
+            .collect();
+        if asked.is_empty() {
+            continue;
+        }
+        let sql = twins_sql(plan, other, &asked, session.dialect());
+        let collected = exec::collect(session.clone(), sql).await.map_err(|error| {
+            refused(format!(
+                "The {} could not be asked which rows it holds under another spelling of their \
+                 key: {error}",
+                side_name(other)
+            ))
+        })?;
+        for result in collected.results {
+            for batch in &result.batches {
+                for row in 0..batch.row_count() {
+                    let index = batch.text(row, 0).and_then(|n| n.parse::<usize>().ok());
+                    let key = (1..batch.column_count())
+                        .map(|column| batch.cell(row, column).map(<[u8]>::to_vec))
+                        .collect();
+                    if let Some(index) = index {
+                        found.push((index, key));
+                    }
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// After the merge, which matched keys by their bytes: the kept rows of one
+/// side are asked of the other side, by that side's own equality (`a` and
+/// `A` under a `_ci` collation, PAD SPACE, `citext`, a uuid against text).
+/// A row only in the source the target holds is put together with its kept
+/// twin only in the target ([`pair`]); without a kept twin, and a row only
+/// in the target the source holds, it is `held`: no statement is written.
+async fn reconcile(
+    sessions: &[Arc<dyn Session>; 2],
+    plan: &Plan,
+    outcome: &mut Outcome,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let of = |outcome: &Outcome, difference| -> Vec<usize> {
+        (0..outcome.rows.len())
+            .filter(|&index| outcome.rows[index].difference == difference)
+            .collect()
+    };
+    let sources = of(outcome, Difference::OnlyInSource);
+    let found = twins(&sessions[1], plan, outcome, 1, &sources, cancel).await?;
+    pair(plan, outcome, found);
+    let targets = of(outcome, Difference::OnlyInTarget);
+    let found = twins(&sessions[0], plan, outcome, 0, &targets, cancel).await?;
+    for (index, _) in found {
+        outcome.rows[index].held = true;
+    }
+    Ok(())
+}
+
+/// Puts together the rows only in the source that the target holds
+/// (`found`: their place in [`Outcome::rows`] and the target's spelling of
+/// the key) with their kept twin only in the target: one row, different
+/// when a compared column differs or when the key's spelling can be written
+/// (text of one type on both sides), the same otherwise (a time of another
+/// precision or type, a uuid against text). A row whose twin was not kept
+/// is `held`.
+pub fn pair(plan: &Plan, outcome: &mut Outcome, found: Vec<(usize, Vec<Option<Vec<u8>>>)>) {
+    let width = plan.key.len();
+    let mut twins: HashMap<Vec<Option<Vec<u8>>>, usize> = HashMap::new();
+    for (index, row) in outcome.rows.iter().enumerate() {
+        if let (Difference::OnlyInTarget, Some(at)) = (row.difference, row.target) {
+            let key = (0..width)
+                .map(|column| outcome.kept[1].cell(at, column).map(<[u8]>::to_vec))
+                .collect();
+            twins.insert(key, index);
+        }
+    }
+    let respellable = plan.key.iter().all(|col| {
+        col.mode == Mode::Text
+            && col
+                .source
+                .data_type
+                .eq_ignore_ascii_case(&col.target.data_type)
+            && col.written()
+    });
+    let mut gone = vec![false; outcome.rows.len()];
+    for (index, key) in found {
+        let row = &outcome.rows[index];
+        let (Difference::OnlyInSource, Some(source)) = (row.difference, row.source) else {
+            continue;
+        };
+        let Some(twin) = twins.remove(&key) else {
+            outcome.rows[index].held = true;
+            continue;
+        };
+        let Some(target) = outcome.rows[twin].target else {
+            continue;
+        };
+        let changed: Box<[u32]> = plan
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(column, col)| {
+                let cell = |side: usize, at: usize| outcome.kept[side].cell(at, width + column);
+                !col.mode.same(cell(0, source), cell(1, target))
+            })
+            .map(|(column, _)| column as u32)
+            .collect();
+        outcome.counts.only_in_source -= 1;
+        outcome.counts.only_in_target -= 1;
+        gone[twin] = true;
+        if changed.is_empty() && !respellable {
+            outcome.counts.same += 1;
+            gone[index] = true;
+            continue;
+        }
+        outcome.counts.different += 1;
+        for &column in &changed {
+            outcome.changed[column as usize] += 1;
+        }
+        outcome.rows[index] = Row {
+            difference: Difference::Different,
+            source: Some(source),
+            target: Some(target),
+            changed,
+            respelled: respellable,
+            held: false,
+        };
+    }
+    let mut at = 0;
+    outcome.rows.retain(|_| {
+        at += 1;
+        !gone[at - 1]
+    });
 }
 
 /// A kept cell as a value to write: as [`fetched`] reads it.
@@ -1048,6 +1301,29 @@ fn by_references(
         order.reverse();
     }
     (order.into_iter().map(|node| rows[node]).collect(), cycle)
+}
+
+/// The comment written in place of the statement of each `held` row of
+/// `rows`, rows of side `side` (0: source, inserted; 1: target, deleted).
+fn held_notes(out: &mut Vec<String>, plan: &Plan, outcome: &Outcome, rows: &[&Row], side: usize) {
+    for row in rows.iter().filter(|row| row.held) {
+        let Some(at) = (if side == 0 { row.source } else { row.target }) else {
+            continue;
+        };
+        let key: Vec<Option<&[u8]>> = (0..plan.key.len())
+            .map(|column| outcome.kept[side].cell(at, column))
+            .collect();
+        let (verb, other) = if side == 0 {
+            ("not inserted", "target")
+        } else {
+            ("not deleted", "source")
+        };
+        out.push(commented(&format!(
+            "({}): {verb}: the {other} holds a row whose key its server takes for this one, \
+             spelled otherwise. Compare again once this script has run.",
+            key_text(&key)
+        )));
+    }
 }
 
 /// `statement` with a semicolon.
@@ -1134,9 +1410,14 @@ pub fn script(
     if !inserts.is_empty() {
         out.push(commented(&format!(
             "Rows only in the source, inserted: {}",
-            inserts.len()
+            inserts.iter().filter(|row| !row.held).count()
         )));
-        let rows: Vec<usize> = inserts.iter().filter_map(|row| row.source).collect();
+        held_notes(&mut out, plan, outcome, &inserts, 0);
+        let rows: Vec<usize> = inserts
+            .iter()
+            .filter(|row| !row.held)
+            .filter_map(|row| row.source)
+            .collect();
         let (rows, cycle) = by_references(plan, outcome, 0, &rows, false);
         if cycle {
             note(
@@ -1200,18 +1481,28 @@ pub fn script(
             let (Some(source), Some(target)) = (row.source, row.target) else {
                 continue;
             };
-            let set: Vec<(String, CellValue)> = row
-                .changed
+            // A key spelled otherwise takes the source's spelling; the
+            // `WHERE` stays on the target's, which its key holds unique.
+            let respelled = plan
+                .key
                 .iter()
-                .map(|&index| index as usize)
-                .filter(|&index| plan.columns[index].written())
-                .map(|index| {
-                    let col = &plan.columns[index];
-                    (
-                        col.name.clone(),
-                        kept_value(outcome, 0, source, first + index),
-                    )
-                })
+                .enumerate()
+                .filter(|_| row.respelled)
+                .map(|(column, col)| (col.name.clone(), kept_value(outcome, 0, source, column)));
+            let set: Vec<(String, CellValue)> = respelled
+                .chain(
+                    row.changed
+                        .iter()
+                        .map(|&index| index as usize)
+                        .filter(|&index| plan.columns[index].written())
+                        .map(|index| {
+                            let col = &plan.columns[index];
+                            (
+                                col.name.clone(),
+                                kept_value(outcome, 0, source, first + index),
+                            )
+                        }),
+                )
                 .collect();
             if set.is_empty() {
                 let key: Vec<Option<&[u8]>> = (0..first)
@@ -1240,9 +1531,14 @@ pub fn script(
         if deletes {
             out.push(commented(&format!(
                 "Rows only in the target, deleted: {}",
-                removals.len()
+                removals.iter().filter(|row| !row.held).count()
             )));
-            let rows: Vec<usize> = removals.iter().filter_map(|row| row.target).collect();
+            held_notes(&mut out, plan, outcome, &removals, 1);
+            let rows: Vec<usize> = removals
+                .iter()
+                .filter(|row| !row.held)
+                .filter_map(|row| row.target)
+                .collect();
             let (rows, _) = by_references(plan, outcome, 1, &rows, true);
             for row in rows {
                 let change = RowChange::Delete {
@@ -1796,10 +2092,21 @@ mod tests {
             ..TableStructure::default()
         };
         let shape = Shape::of(&source, &target).unwrap();
-        // The nullable `nick` and the partial index are no key.
-        assert_eq!(
-            shape.keys,
-            [vec!["id".to_string()], vec!["email".to_string()]]
+        // Only the target's keys: `email` is unique in the source alone, so
+        // a statement on it could hit two rows of the target. The nullable
+        // `nick` and the partial index are no key.
+        assert_eq!(shape.keys, [vec!["id".to_string()]]);
+        assert_eq!(shape.source_only_keys, [vec!["email".to_string()]]);
+        let request = Request {
+            source: t(),
+            target: t(),
+            key: vec!["email".into()],
+            columns: vec![],
+        };
+        assert!(
+            Plan::new(&request, &source, &target)
+                .unwrap_err()
+                .starts_with("The target does not hold (email) unique")
         );
         assert_eq!(
             (&shape.only_in_source[..], &shape.only_in_target[..]),
@@ -1811,15 +2118,17 @@ mod tests {
             Some("its type is text in the source and integer in the target")
         );
         assert!(column("total").unwritten.is_some() && column("total").refused.is_none());
-        // Without a key anywhere: refused in words.
+        // A target without a key: refused in words, whatever the source has.
         let keyless = table(vec![info("a", TypeKind::Text, None)]);
-        assert!(
-            Shape::of(&keyless, &keyless)
-                .unwrap_err()
-                .starts_with("Neither table has a primary key")
-        );
-        // The target's key serves when the source has none.
         let keyed = table(vec![info("a", TypeKind::Text, Some(1))]);
+        for source in [&keyless, &keyed] {
+            assert!(
+                Shape::of(source, &keyless)
+                    .unwrap_err()
+                    .starts_with("The target table has no primary key")
+            );
+        }
+        // The target's key serves when the source has none.
         assert_eq!(
             Shape::of(&keyless, &keyed).unwrap().keys,
             [vec!["a".to_string()]]
@@ -1828,8 +2137,8 @@ mod tests {
         let other = table(vec![info("b", TypeKind::Text, Some(1))]);
         assert_eq!(
             Shape::of(&keyed, &other).unwrap_err(),
-            "The key (a) is not in both tables with the same kind of type, so the rows cannot \
-             be matched."
+            "The target's key (b) is not in both tables with the same kind of type, so the rows \
+             cannot be matched."
         );
         // A plan refuses what the shape refused.
         let request = Request {
@@ -2072,6 +2381,101 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("INSERT").count(), 1);
+    }
+
+    /// F2: keys the target's server holds equal and whose bytes differ are
+    /// one row, never an INSERT and a DELETE.
+    #[test]
+    fn a_key_spelled_otherwise_is_one_row_never_an_insert_and_a_delete() {
+        let plan = plan_of(vec![
+            info("k", TypeKind::Text, Some(1)),
+            info("n", TypeKind::Integer, None),
+        ]);
+        // `a` and `A` for a `_ci` target, `b` and `b ` with PAD SPACE.
+        let source = vec![
+            row(&[Some("a"), Some("1")]),
+            row(&[Some("b"), Some("2")]),
+            row(&[Some("c"), Some("3")]),
+            row(&[Some("x"), Some("4")]),
+        ];
+        let target = vec![
+            row(&[Some("A"), Some("1")]),
+            row(&[Some("Y"), Some("5")]),
+            row(&[Some("b "), Some("9")]),
+        ];
+        let mut outcome = merge_sized(&plan, &source, &target, (9, 9)).unwrap();
+        assert_eq!(outcome.counts.differences(), 7);
+        // What the target answers for the rows only in the source: `a` is its
+        // `A`, `b` its `b `, `c` a row this compare did not keep (`C`).
+        let place = |outcome: &Outcome, key: &str| {
+            outcome
+                .rows
+                .iter()
+                .position(|row| {
+                    row.difference == Difference::OnlyInSource
+                        && outcome.kept[0].text(row.source.unwrap(), 0) == Some(key)
+                })
+                .unwrap()
+        };
+        let found = vec![
+            (place(&outcome, "a"), vec![Some(b"A".to_vec())]),
+            (place(&outcome, "b"), vec![Some(b"b ".to_vec())]),
+            (place(&outcome, "c"), vec![Some(b"C".to_vec())]),
+        ];
+        pair(&plan, &mut outcome, found);
+        let words: Vec<&str> = outcome.rows.iter().map(Row::words).collect();
+        assert_eq!(
+            words,
+            [
+                "only in target",
+                "key spelled otherwise",
+                "key spelled otherwise",
+                "only in source, target holds its key",
+                "only in source"
+            ]
+        );
+        assert_eq!(
+            (
+                outcome.counts.only_in_source,
+                outcome.counts.only_in_target,
+                outcome.counts.different
+            ),
+            (2, 1, 2)
+        );
+        let text = script(&plan, &outcome, &AnsiDialect, true).unwrap();
+        for line in [
+            "UPDATE \"s\".\"t\" SET \"k\" = 'a' WHERE \"k\" = 'A';",
+            "UPDATE \"s\".\"t\" SET \"k\" = 'b', \"n\" = 2 WHERE \"k\" = 'b ';",
+            "-- (c): not inserted: the target holds a row whose key its server takes for this one",
+            "INSERT INTO \"s\".\"t\" (\"k\", \"n\") VALUES ('x', 4);",
+            "DELETE FROM \"s\".\"t\" WHERE \"k\" = 'Y';",
+        ] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
+        assert!(!text.contains("VALUES ('a'") && !text.contains("WHERE \"k\" = 'A';\nDELETE"));
+        assert_eq!(text.matches("INSERT").count(), 1);
+        assert_eq!(text.matches("DELETE").count(), 1);
+        // A uuid against text: the target cannot keep another spelling, so a
+        // twin with the same values is the same row, not a difference.
+        let mut other = plan.clone();
+        other.key[0].target.data_type = "uuid".into();
+        let mut outcome = merge_sized(&other, &source[..1], &target[..1], (9, 9)).unwrap();
+        let a = place(&outcome, "a");
+        pair(&other, &mut outcome, vec![(a, vec![Some(b"A".to_vec())])]);
+        assert!(outcome.rows.is_empty());
+        assert_eq!((outcome.counts.same, outcome.counts.differences()), (1, 0));
+    }
+
+    /// F2: a time of one precision is matched with the same time of
+    /// another (`DATETIME(3)` against `DATETIME(6)`).
+    #[test]
+    fn times_of_two_precisions_are_one_key() {
+        let plan = plan_of(vec![info("at", TypeKind::DateTime, Some(1))]);
+        let source =
+            ["2024-01-01 10:00:00.500", "2024-01-01 10:00:01.000"].map(|k| row(&[Some(k)]));
+        let target =
+            ["2024-01-01 10:00:00.500000", "2024-01-01 10:00:01.000000"].map(|k| row(&[Some(k)]));
+        assert_eq!(merged(&plan, &source, &target).1.same, 2);
     }
 
     #[test]

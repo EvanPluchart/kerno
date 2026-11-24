@@ -753,6 +753,13 @@ impl DataCompareDialog {
         .into_iter()
         .filter(|(names, _)| !names.is_empty())
         .map(|(names, words)| format!("{words}: {}.", names.join(", ")))
+        .chain(shape.source_only_keys.iter().map(|key| {
+            format!(
+                "({}) is unique in the source only: not offered, since a statement of the script \
+                 could change several rows of the target.",
+                key.join(", ")
+            )
+        }))
         .chain(shape.shared.iter().filter_map(|column| {
             column
                 .refused

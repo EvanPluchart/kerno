@@ -251,21 +251,23 @@ fn the_dialog_picks_two_tables_and_says_what_cannot_be_compared(cx: &mut TestApp
     assert_eq!(request.columns, ["name", "total"]);
     app.click(cx, ("data-compare-column", 2usize));
 
-    // A target without a key is matched by the source's key (its uniqueness is checked as the
-    // rows are read); two tables without any key are refused before a row is read.
+    // A target without a key is refused before a row is read, whatever the source holds: a
+    // statement of the script could change several of its rows (K60 review, F1).
     app.step(cx, |window, cx| {
         dialog.update(cx, |dialog, cx| {
             dialog.set_fields(1, "kerno", keyless, "t", window, cx)
         })
     });
-    app.wait_until(cx, "a keyless target", |app, cx| problem(app, cx).is_none());
+    app.wait_until(cx, "a keyless target", |app, cx| {
+        problem(app, cx).is_some_and(|text| text.starts_with("The target table has no primary key"))
+    });
     app.step(cx, |window, cx| {
         dialog.update(cx, |dialog, cx| {
             dialog.set_fields(0, "kerno", keyless, "u", window, cx)
         })
     });
     app.wait_until(cx, "the keyless tables", |app, cx| {
-        problem(app, cx).is_some_and(|text| text.starts_with("Neither table has a primary key"))
+        problem(app, cx).is_some_and(|text| text.starts_with("The target table has no primary key"))
     });
     app.step(cx, |window, cx| {
         dialog.update(cx, |dialog, cx| {

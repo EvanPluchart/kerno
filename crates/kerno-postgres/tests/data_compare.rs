@@ -259,6 +259,108 @@ async fn the_script_makes_the_target_like_the_source() {
     assert!(failed.is_empty(), "cleanup failed: {failed:#?}");
 }
 
+const CITEXT_DATABASE: &str = "kerno_test_dc_citext";
+
+/// A session in the scratch database of the `citext` test.
+async fn citext_session() -> Arc<dyn Session> {
+    let mut params = kerno_core::testing::params(kerno_core::Engine::Postgres);
+    params.database = Some(CITEXT_DATABASE.into());
+    common::connect(&params)
+        .await
+        .expect("the scratch database")
+}
+
+async fn citext_round() {
+    let session = citext_session().await;
+    for sql in [
+        "CREATE EXTENSION citext",
+        "CREATE SCHEMA a",
+        "CREATE SCHEMA b",
+        "CREATE TABLE a.codes (code citext PRIMARY KEY, n int)",
+        "CREATE TABLE b.codes (code citext PRIMARY KEY, n int)",
+        "INSERT INTO a.codes VALUES ('a', 1), ('b', 2)",
+        "INSERT INTO b.codes VALUES ('A', 1), ('B', 3), ('c', 4)",
+    ] {
+        exec_ok(&session, sql).await;
+    }
+    let (source, target) = (TableRef::new("a", "codes"), TableRef::new("b", "codes"));
+    let a = session.table_structure(&source).await.unwrap();
+    let b = session.table_structure(&target).await.unwrap();
+    let request = Request {
+        source,
+        target,
+        key: vec!["code".into()],
+        columns: vec!["n".into()],
+    };
+    let plan = Plan::new(&request, &a, &b).unwrap();
+    let compare = || async {
+        let sessions = [citext_session().await, citext_session().await];
+        let outcome = data_compare::run(
+            sessions.clone(),
+            &plan,
+            Limits::default(),
+            |_| {},
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        for session in sessions {
+            session.close().await;
+        }
+        outcome
+    };
+    let found = compare().await;
+    // `a` and `A`, `b` and `B` are one row each for citext: never an INSERT
+    // and a DELETE.
+    assert_eq!(summary(&plan, &found), ["≠ a", "≠ b n", "− c"]);
+    let script = data_compare::script(&plan, &found, session.dialect(), true).unwrap();
+    for statement in split_statements(&script, session.dialect().lex_rules()) {
+        let sql = statement.text(&script);
+        let changed: u64 = run(&session, sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}\nin\n{script}"))
+            .results
+            .iter()
+            .filter_map(|result| result.rows_affected)
+            .sum();
+        assert!(changed <= 1, "{sql} changed {changed} rows");
+    }
+    assert_eq!(
+        summary(&plan, &compare().await),
+        Vec::<String>::new(),
+        "{script}"
+    );
+    assert_eq!(scalar(&session, "SELECT count(*) FROM b.codes").await, "2");
+    assert_eq!(
+        scalar(
+            &session,
+            "SELECT string_agg(code::text, ',' ORDER BY n) FROM b.codes"
+        )
+        .await,
+        "a,b"
+    );
+    session.close().await;
+}
+
+/// K60 review, F2: a `citext` key spelled otherwise on each side is one
+/// row, its key written in the source's spelling, in a scratch database
+/// (the fixture database's extensions are left as they are).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_citext_key_spelled_otherwise_is_one_row() {
+    let Some(admin) = common::session().await else {
+        return;
+    };
+    let cleanup = format!("DROP DATABASE IF EXISTS {CITEXT_DATABASE} WITH (FORCE)");
+    exec_ok(&admin, &cleanup).await;
+    exec_ok(&admin, &format!("CREATE DATABASE {CITEXT_DATABASE}")).await;
+    let outcome = tokio::spawn(citext_round()).await;
+    let dropped = run(&admin, &cleanup).await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    dropped.expect("the scratch database dropped");
+}
+
 /// The big run (`docs/BENCH.md`): `analytics.big_table` (1,000,000 rows,
 /// read only) against a scratch copy in `kerno_test_dc_big` with planted
 /// differences. Run alone, under `/usr/bin/time -l` for the peak memory:

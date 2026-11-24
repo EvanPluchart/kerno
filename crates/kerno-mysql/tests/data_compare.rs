@@ -255,3 +255,197 @@ async fn the_script_makes_a_mariadb_table_like_a_mysql_one() {
     }
     assert!(failed.is_empty(), "cleanup failed: {failed:#?}");
 }
+
+const CI_SOURCE: &str = "kerno_test_dc_ci_a";
+const CI_TARGET: &str = "kerno_test_dc_ci_b";
+
+/// The plan of `table` of the two `_ci` databases, by the target's first key.
+async fn ci_plan(session: &Arc<dyn Session>, table: &str) -> Result<Plan, String> {
+    let (a_table, b_table) = (
+        TableRef::new(CI_SOURCE, table),
+        TableRef::new(CI_TARGET, table),
+    );
+    let a = session.table_structure(&a_table).await.unwrap();
+    let b = session.table_structure(&b_table).await.unwrap();
+    let shape = Shape::of(&a, &b)?;
+    let request = Request {
+        source: a_table,
+        target: b_table,
+        key: shape.keys[0].clone(),
+        columns: shape
+            .shared
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+    };
+    Plan::new(&request, &a, &b)
+}
+
+async fn ci_compared(engine: Engine, plan: &Plan) -> Outcome {
+    let sessions = [common::session(engine).await, common::session(engine).await];
+    let outcome = data_compare::run(
+        sessions.clone(),
+        plan,
+        Limits::default(),
+        |_| {},
+        &AtomicBool::new(false),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{}: {error}", plan.source.name));
+    for session in sessions {
+        session.close().await;
+    }
+    outcome
+}
+
+/// Compares `table`, checks what is found, runs the script (deletes ticked)
+/// on the target, compares again: nothing left, and the target holds `rows`.
+async fn ci_round(engine: Engine, table: &str, found: &[&str], rows: &str) {
+    let session = common::session(engine).await;
+    let plan = ci_plan(&session, table).await.unwrap();
+    let outcome = ci_compared(engine, &plan).await;
+    assert_eq!(summary(&plan, &outcome), found, "{table}");
+    let script = data_compare::script(&plan, &outcome, session.dialect(), true).unwrap();
+    for statement in split_statements(&script, session.dialect().lex_rules()) {
+        let sql = statement.text(&script);
+        // Each statement changes one row at most.
+        let changed = run(&session, sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}\nin\n{script}"))
+            .results
+            .iter()
+            .filter_map(|result| result.rows_affected)
+            .sum::<u64>();
+        assert!(changed <= 1, "{sql} changed {changed} rows");
+    }
+    let again = ci_compared(engine, &plan).await;
+    assert_eq!(
+        summary(&plan, &again),
+        Vec::<String>::new(),
+        "{table}\n{script}"
+    );
+    assert_eq!(
+        scalar(
+            &session,
+            &format!("SELECT COUNT(*) FROM {CI_TARGET}.{table}")
+        )
+        .await,
+        rows,
+        "{table}"
+    );
+}
+
+async fn ci_cases(engine: Engine) {
+    let session = common::session(engine).await;
+    // MySQL 8's `_0900_ai_ci` has no pad; its `_unicode_ci` pads, as every
+    // MariaDB collation does.
+    let (ci, pad) = match engine {
+        Engine::MySql => ("utf8mb4_0900_ai_ci", "utf8mb4_unicode_ci"),
+        _ => ("utf8mb4_general_ci", "utf8mb4_general_ci"),
+    };
+    for database in [CI_SOURCE, CI_TARGET] {
+        for sql in [
+            format!("CREATE DATABASE {database} CHARACTER SET utf8mb4"),
+            format!(
+                "CREATE TABLE {database}.people (id int PRIMARY KEY, \
+                 email varchar(40) COLLATE {ci} NOT NULL{})",
+                if database == CI_SOURCE { " UNIQUE" } else { "" }
+            ),
+            format!(
+                "CREATE TABLE {database}.codes (code varchar(10) COLLATE {ci} PRIMARY KEY, n int)"
+            ),
+            format!(
+                "CREATE TABLE {database}.padded (code varchar(10) COLLATE {pad} PRIMARY KEY, n int)"
+            ),
+            format!(
+                "CREATE TABLE {database}.times (at datetime({}) PRIMARY KEY, n int)",
+                if database == CI_SOURCE { 3 } else { 6 }
+            ),
+        ] {
+            exec_ok(&session, &sql).await;
+        }
+    }
+    for sql in [
+        format!("INSERT INTO {CI_SOURCE}.people VALUES (1, 'bob@x')"),
+        format!("INSERT INTO {CI_TARGET}.people VALUES (1, 'Bob@x'), (2, 'bob@x')"),
+        format!("INSERT INTO {CI_SOURCE}.codes VALUES ('a', 1), ('b', 2)"),
+        format!("INSERT INTO {CI_TARGET}.codes VALUES ('A', 1), ('b', 3), ('c', 4)"),
+        format!("INSERT INTO {CI_SOURCE}.padded VALUES ('a', 1)"),
+        format!("INSERT INTO {CI_TARGET}.padded VALUES ('a ', 1)"),
+        format!(
+            "INSERT INTO {CI_SOURCE}.times VALUES ('2024-01-01 10:00:00.500', 1), \
+             ('2024-01-01 10:00:01', 2)"
+        ),
+        format!(
+            "INSERT INTO {CI_TARGET}.times VALUES ('2024-01-01 10:00:00.500', 1), \
+             ('2024-01-01 10:00:01', 3)"
+        ),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+
+    // F1: the target holds `email` without a unique key, and two of its
+    // rows are equal for its server: that key is not offered, and a plan on
+    // it is refused, so no statement can hit both rows. Its primary key is.
+    let a = session
+        .table_structure(&TableRef::new(CI_SOURCE, "people"))
+        .await
+        .unwrap();
+    let b = session
+        .table_structure(&TableRef::new(CI_TARGET, "people"))
+        .await
+        .unwrap();
+    let shape = Shape::of(&a, &b).unwrap();
+    assert_eq!(shape.keys, [vec!["id".to_string()]]);
+    assert_eq!(shape.source_only_keys, [vec!["email".to_string()]]);
+    let request = Request {
+        source: TableRef::new(CI_SOURCE, "people"),
+        target: TableRef::new(CI_TARGET, "people"),
+        key: vec!["email".into()],
+        columns: vec!["id".into()],
+    };
+    assert!(Plan::new(&request, &a, &b).is_err());
+    ci_round(engine, "people", &["≠ 1 email", "− 2"], "1").await;
+
+    // F2: `a` against `A` under a `_ci` key is one row, its key respelled.
+    ci_round(engine, "codes", &["≠ a", "≠ b n", "− c"], "2").await;
+    let session = common::session(engine).await;
+    assert_eq!(
+        scalar(
+            &session,
+            &format!("SELECT code FROM {CI_TARGET}.codes WHERE n = 1")
+        )
+        .await,
+        "a"
+    );
+    // F2: `a` against `a ` with PAD SPACE.
+    ci_round(engine, "padded", &["≠ a"], "1").await;
+    // F2: a DATETIME(3) key against a DATETIME(6) one.
+    ci_round(engine, "times", &["≠ 2024-01-01 10:00:01.000 n"], "2").await;
+}
+
+/// K60 review, F1 and F2: keys the target's server holds equal and whose
+/// bytes differ (`_ci`, PAD SPACE, two precisions of a time) are one row,
+/// and no statement of the script changes more than one row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keys_the_target_holds_equal_are_one_row() {
+    for engine in common::engines() {
+        let admin = common::session(engine).await;
+        let cleanup =
+            [CI_SOURCE, CI_TARGET].map(|database| format!("DROP DATABASE IF EXISTS {database}"));
+        for sql in &cleanup {
+            exec_ok(&admin, sql).await;
+        }
+        let outcome = tokio::spawn(ci_cases(engine)).await;
+        let mut failed = Vec::new();
+        for sql in &cleanup {
+            if let Err(error) = run(&admin, sql).await {
+                failed.push(format!("{sql}: {error}"));
+            }
+        }
+        if let Err(error) = outcome {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        assert!(failed.is_empty(), "cleanup failed: {failed:#?}");
+    }
+}

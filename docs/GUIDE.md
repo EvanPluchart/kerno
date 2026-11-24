@@ -675,11 +675,19 @@ its schema (not on MySQL and MariaDB) and the table, typed or picked from Tables
 asked from: change the target's schema, database or connection. ⇄ exchanges them. Both must be of the same
 kind: two PostgreSQL tables, or MySQL and MariaDB tables; another pairing is refused, and so is SQLite for now.
 
-Once both tables are read, the dialog shows the **key** the rows are matched by (the primary key, or a unique
-key on columns that never hold NULL; pick another when there are several) and the **columns** both tables
-have, each ticked: untick one to leave it out. A column only one table has is said and not compared; so is a
-column whose type is of another kind on each side. Tables without any key cannot be compared: a row of one
-could not be told which row of the other it is. Nothing is written: both tables are only read.
+Once both tables are read, the dialog shows the **key** the rows are matched by (the target's primary key, or a
+unique key of the target on columns that never hold NULL; pick another when there are several) and the
+**columns** both tables have, each ticked: untick one to leave it out. A column only one table has is said and
+not compared; so is a column whose type is of another kind on each side. The key must be unique in the target,
+so that each statement of the script changes one row at most: a target without a key cannot be compared, and a
+key only the source holds unique is not offered (the dialog says so). Nothing is written: both tables are only
+read.
+
+Two keys the target's server holds equal though they are written differently (`a` and `A` under a
+case-insensitive collation, `a` and `a ` where trailing spaces are ignored, `citext`, a uuid against text) are
+one row: it shows as "key spelled otherwise", its key as `source → target`, and its `UPDATE` writes the source's
+spelling. A row whose twin the compare could not keep is said, and the script writes a comment for it instead
+of a statement.
 
 The tab reads both tables at once, each in the order of its key, and compares their rows as they come, so a
 table of millions of rows takes little memory; each side's row counter and the time show, and Cancel stops
@@ -689,8 +697,9 @@ target`. The filters show one kind; "Any column ▾" shows the rows where one co
 count. Click a row to read all its values on both sides beside the list; its menu copies the key, either row,
 or the row as TSV, CSV, JSON, Markdown or an `INSERT`, and ⌘C copies it. Values are compared as the server
 types them: `1.50` and `1.5` are the same number, NULL is not an empty text, JSON is compared without its
-spaces, and keys compare by their exact text, whatever the collation (`a` and `A` are two keys). Each table is
-read in one statement: a row someone changes during the compare is compared as it was when its read began.
+spaces, and keys are read in the order of their exact text, then matched as the target's server matches them
+(above). Each table is read in one statement: a row someone changes during the compare is compared as it was
+when its read began.
 At most 10,000 differences are kept to show and to write; beyond, the counts go on and the tab says so.
 
 "Open script" opens, in a new query tab on the target, the statements that make it like the source: an `INSERT`

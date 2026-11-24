@@ -4014,11 +4014,30 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
 - **Same family only**, as D-103, in the data compare's own words (`data_compare::refusal`). SQLite is refused
   in words in the tree and the dialog: its keys would need an order of their own (storage classes) and a
   driver test pairing, left for later.
-- **The key** is the source's primary key, or a unique index without a predicate on NOT NULL columns (what
-  `row_identity` takes the first of; picked in the dialog when there are several), else the target's; columns
-  both tables have with the same kind of type. Without any key the compare is refused in words before a row is
-  read. A key the other side does not hold unique is found while reading: two rows with one key stop the
-  compare with the key said.
+- **The key** is one the **target** holds unique: its primary key, or a unique index without a predicate on
+  NOT NULL columns (what `row_identity` takes the first of; picked in the dialog when there are several), on
+  columns both tables have with the same kind of type. Each `UPDATE` and `DELETE` of the script is then
+  addressed by a key the target's own server keeps unique, whatever its collation holds equal (`_ci`, PAD
+  SPACE, `citext`): it changes one row at most. A key the source alone holds unique is not offered, and the
+  dialog says why (corrected after the review of 2026-11-24: the first version also offered the source's keys,
+  and a target holding `Bob@x` and `bob@x` under `_ai_ci` without a unique index got an `UPDATE` that changed
+  both). A target without a key is refused in words before a row is read. The source's uniqueness is checked
+  while reading, for keys equal in bytes; two source rows whose keys only the target's server holds equal are
+  caught after the merge (below).
+- **Keys equal for the server, different in bytes.** The merge matches keys by their bytes (the order below);
+  a key the target's server holds equal to another of different bytes (`a` and `A` under `_ci`, `a` and `a `
+  with PAD SPACE, `citext`, a uuid against text, `timestamp` against `timestamptz`) would otherwise come out as
+  an `INSERT` and a `DELETE`. After the merge, each kept row only in the source is asked of the target by the
+  target's own equality (`SELECT … WHERE key = literal`, the `WHERE` the script writes, a hundred rows to a
+  query joined by `UNION ALL`, through the key's index), and each kept row only in the target is asked of the
+  source the same way. A row the target holds whose twin was kept becomes one row (`data_compare::pair`):
+  different, its `UPDATE` addressed by the target's spelling and also writing the source's spelling when the
+  key is text of one type on both sides; the same, when nothing else differs and the spelling cannot be kept
+  (a uuid against text, a time of another type). A row whose twin was not kept (beyond the cap, or a second
+  source row the target holds the same), and a row only in the target the source holds, is `held`: no
+  statement, a comment says why. Times of two precisions (`DATETIME(3)` against `DATETIME(6)`) are one key
+  already in the merge: a temporal key is compared without the zeros that end its fraction. Beyond the cap the
+  counts cannot be corrected this way: the tab's partial line says so.
 - **The order both servers agree on.** Numbers and booleans by value, binary by its bytes (no collation
   applies to them); every other key column by the bytes of its text: PostgreSQL `CAST(k AS text) COLLATE "C"`,
   MySQL and MariaDB `CAST(CONVERT(k USING utf8mb4) AS BINARY)` (a `_bin` collation would ignore trailing
@@ -4081,4 +4100,4 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
 - **Not in this version**: another engine family or SQLite; a filter or a sample on either side; applying the
   differences from the tab (the script is the way); saving a comparison; more than 10,000 differences in one
   script (compare again after running it); keys whose text differs only by Unicode normalization (`é` composed
-  and decomposed are two keys).
+  and decomposed) are two keys unless the target's server holds them equal.

@@ -202,7 +202,7 @@ impl DiffGrid {
             return String::new();
         };
         if column == 0 {
-            return row.difference.mark().1.to_string();
+            return row.words().to_string();
         }
         let at = column - 1;
         let side = usize::from(row.source.is_none());
@@ -216,7 +216,10 @@ impl DiffGrid {
 
     fn changed(&self, row: &data_compare::Row, column: usize) -> bool {
         let key = self.found.plan.key.len();
-        column >= key && row.changed.contains(&((column - key) as u32))
+        if column < key {
+            return row.respelled;
+        }
+        row.changed.contains(&((column - key) as u32))
     }
 }
 
@@ -274,7 +277,7 @@ impl TableDelegate for DiffGrid {
             Difference::Different => theme.warning,
         };
         if column == 0 {
-            let (mark, words) = diff.difference.mark();
+            let (mark, words) = (diff.difference.mark().0, diff.words());
             return cell
                 .child(
                     div()
@@ -1202,14 +1205,20 @@ impl DataCompareTab {
         let loading = self.state == State::Loading;
         let reason = "The target connection is read-only: the script opens, and its statements \
                       will be refused there.";
-        let partial = self.found.as_ref().filter(|found| !found.outcome.complete).map(|found| {
-            format!(
-                "Showing the first {} of the {} differences: the counts are complete. The script \
-                 holds the rows shown; compare again once it has run.",
-                number(found.outcome.rows.len() as f64),
-                number(self.counts.differences() as f64)
-            )
-        });
+        let partial = self
+            .found
+            .as_ref()
+            .filter(|found| !found.outcome.complete)
+            .map(|found| {
+                format!(
+                    "Showing the first {} of the {} differences. The script holds the rows shown; \
+                 compare again once it has run. The counts beyond them may hold rows whose keys \
+                 differ only in a way the target's server ignores (case, trailing spaces): those \
+                 were checked for the rows shown only.",
+                    number(found.outcome.rows.len() as f64),
+                    number(self.counts.differences() as f64)
+                )
+            });
         v_flex()
             .flex_none()
             .px_3()
@@ -1365,7 +1374,7 @@ impl DataCompareTab {
             );
         };
         let plan = &found.plan;
-        let (mark, words) = row.difference.mark();
+        let (mark, words) = (row.difference.mark().0, row.words());
         let key = plan.key.len();
         let value = |side: usize, column: usize| -> Option<String> {
             let at = if side == 0 { row.source } else { row.target }?;
@@ -1377,7 +1386,11 @@ impl DataCompareTab {
         };
         let mut lines = Vec::new();
         for (column, col) in plan.cols().enumerate() {
-            let changed = column >= key && row.changed.contains(&((column - key) as u32));
+            let changed = if column < key {
+                row.respelled
+            } else {
+                row.changed.contains(&((column - key) as u32))
+            };
             let (source, target) = (value(0, column), value(1, column));
             let same = row.difference == Difference::Different && !changed;
             let line = v_flex()
@@ -1423,7 +1436,7 @@ impl DataCompareTab {
                             )
                     };
                     match (source, target) {
-                        (Some(source), Some(_)) if same || column < key => {
+                        (Some(source), Some(_)) if same || (column < key && !changed) => {
                             this.child(text("Both", source))
                         }
                         (source, target) => this
