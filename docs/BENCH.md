@@ -262,6 +262,10 @@ The 1-minute load at the start of each run was between 7.0 and 7.9 (the test ser
 agents' runs). "Faster" backs up about 2.2 times faster and restores about 2.2 times faster on 8.4, on one large
 table cut into ranges as on eight tables; about 1.7 and 2 times on 5.1. The files are the same size.
 
+These were taken before the review's F4 (D-135): the ranges of one table now start together while Kerno holds
+that table's read lock, which adds the start of the processes (tens of milliseconds) to the backup of a cut
+table. Not measured again.
+
 **The threshold** (`RANGE_THRESHOLD`, 32 MiB): one table of `big_table`'s rows, backed up and restored whole by
 one process, then cut into 8 ranges, three runs each (load 3 to 6):
 

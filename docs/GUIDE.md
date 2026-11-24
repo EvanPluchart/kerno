@@ -631,11 +631,21 @@ on N connections at once** loads several tables at a time (the parts of a large 
 failed restore stops the others and says which table, the server's error, what is loaded and what is not.
 
 With "Faster", **Block writes during the backup, so that every table is read at the same moment** (off by
-default) says how the backup is consistent. Off, each table is read at its own moment: an InnoDB table, or each
-part of a large one, in one snapshot, any other table locked while it is read; two tables are not read at the
-same instant. On, Kerno holds `FLUSH TABLES WITH READ LOCK` on the server from before the first table until the
-last: every write on that server waits until the backup ends, so Kerno shows the statement and asks first
-(twice on production). It needs the RELOAD privilege; an account without it is told so and cannot tick it.
+default) says how the backup is consistent. Off, each table is read at one moment, all its parts included (the
+parts of a large table start together while Kerno holds that table's read lock for a moment; a table whose lock
+does not come within 10 s is read whole), but two tables are not read at the same instant. On, Kerno holds
+`FLUSH TABLES WITH READ LOCK` on the server from before it lists the tables until the last is read: every write
+on that server waits until the backup ends, so Kerno shows the statement and asks first (twice on production),
+naming any query that has been running for 5 s or more, since the lock waits for it. A lock that does not come
+within 10 s stops the backup before it starts; one lost during the run (the server closed Kerno's session)
+fails it. It needs the RELOAD privilege; an account without it is told so and cannot tick it. The extra
+arguments may not set what the folder backup sets for each file (`--where`, `--tab`, `--no-data` and the like).
+
+A folder restored into a database that already holds some of the backup's tables is said before the run: those
+tables are dropped and created again from the backup; the database's other tables stay.
+
+MySQL and MariaDB tools talk `utf8mb4` with a server that has it (5.5.3 on): a MySQL 5.7 client no longer
+writes a 4-byte character (an emoji) as `?`, in the plain backup as in the folder.
 
 An old server needs an old client. MySQL's `mysqldump` 8.4 and later, and MariaDB's `mariadb-dump` 11.8, read
 no column of a MySQL 5.1 table (the backup would hold no table), and `mariadb-dump` cannot read MySQL 5.5 and

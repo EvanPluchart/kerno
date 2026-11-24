@@ -1809,3 +1809,16 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   in 0.8 s against 1.8 s, restored in 6.5 to 8.4 s against 14.3 to 17.1 s; eight tables of 30 MB about as much;
   on 5.1 about 1.7 and 2 times faster (one run).
 - Not verified: a GTID server, MySQL 8.0's clients on 5.1, an SSH tunnel, a pass in the real app.
+
+## 2026-11-24 — K63: the review's nine findings fixed
+
+- An independent review of ccc0b47 found nine faults, three confirmed by a run. Fixed on top, each with a test
+  seen failing before its fix (docs/plans/M12.md, the K63 table): a named table that is gone now stops the
+  run (F1); the read lock is watched, and a lost one fails the backup (F2); the tools talk `utf8mb4`, so a 5.7
+  client no longer writes a 4-byte character as `?`, in the plain backup too (F3); inside one table every range
+  reads one moment, under Kerno's short lock of that table, and only InnoDB tables are cut (F4); a panicked
+  task fails its file (F5); the plain backup fails on "it has no fields" (F6); the extra arguments may not set
+  what the folder sets, in any spelling (F7); the lock is taken before the tables are listed (F8); a lock that
+  does not come within 10 s stops the start, and the confirmation names the long queries (F9).
+- Added: a test that the lock is held during the run, a restore into a database that is not empty (said
+  before the run), and the size threshold's real path. D-135 amended (F4's rule above all).
