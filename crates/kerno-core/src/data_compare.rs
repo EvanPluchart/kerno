@@ -457,7 +457,8 @@ pub fn settings(engine: Engine) -> &'static [&'static str] {
             "SET TIME ZONE 'UTC'",
             "SET DateStyle TO ISO",
             "SET IntervalStyle TO postgres",
-            "SET extra_float_digits TO 1",
+            // Exact on every release: 1 is exact only from PostgreSQL 12.
+            "SET extra_float_digits TO 3",
         ],
         Some(Family::MySql) => &[
             "SET SESSION TRANSACTION READ ONLY",
@@ -495,9 +496,25 @@ pub fn select_sql(plan: &Plan, side: usize, dialect: &dyn Dialect) -> String {
     } else {
         (&plan.target, |col| &col.target)
     };
+    // MySQL and MariaDB print a FLOAT with six digits (1.2345678 and
+    // 1.2345679 both read `1.23457`): as a DOUBLE it prints the value it
+    // holds, which a FLOAT column takes back as it was.
+    let mysql = Family::of(dialect.engine()) == Some(Family::MySql);
     let columns: Vec<String> = plan
         .cols()
-        .map(|col| dialect.quote_ident(&col.name))
+        .map(|col| {
+            let name = dialect.quote_ident(&col.name);
+            if mysql
+                && info(col)
+                    .data_type
+                    .to_ascii_lowercase()
+                    .starts_with("float")
+            {
+                format!("({name} + 0e0)")
+            } else {
+                name
+            }
+        })
         .collect();
     let order: Vec<String> = plan
         .key
@@ -1326,6 +1343,29 @@ fn held_notes(out: &mut Vec<String>, plan: &Plan, outcome: &Outcome, rows: &[&Ro
     }
 }
 
+/// Whether a kept row of side `side` holds text that is not UTF-8 (a
+/// `SQL_ASCII` database, say): it would be written with U+FFFD in place of
+/// its bytes, so no statement is written for it, and `out` says why.
+fn not_utf8(out: &mut Vec<String>, plan: &Plan, outcome: &Outcome, side: usize, at: usize) -> bool {
+    let store = &outcome.kept[side];
+    let bad = (0..plan.width()).any(|column| {
+        store.columns()[column].kind != TypeKind::Binary
+            && store
+                .cell(at, column)
+                .is_some_and(|bytes| std::str::from_utf8(bytes).is_err())
+    });
+    if bad {
+        let key: Vec<Option<&[u8]>> = (0..plan.key.len()).map(|c| store.cell(at, c)).collect();
+        out.push(commented(&format!(
+            "({}): not written: a value of the {} is not UTF-8 text, and the script would change \
+             its bytes.",
+            key_text(&key),
+            side_name(side)
+        )));
+    }
+    bad
+}
+
 /// `statement` with a semicolon.
 fn ended(statement: String) -> String {
     format!("{statement};")
@@ -1438,6 +1478,9 @@ pub fn script(
             )
             .collect();
         for row in rows {
+            if not_utf8(&mut out, plan, outcome, 0, row) {
+                continue;
+            }
             let values: Vec<(String, CellValue)> = plan
                 .cols()
                 .enumerate()
@@ -1481,6 +1524,11 @@ pub fn script(
             let (Some(source), Some(target)) = (row.source, row.target) else {
                 continue;
             };
+            if not_utf8(&mut out, plan, outcome, 0, source)
+                || not_utf8(&mut out, plan, outcome, 1, target)
+            {
+                continue;
+            }
             // A key spelled otherwise takes the source's spelling; the
             // `WHERE` stays on the target's, which its key holds unique.
             let respelled = plan
@@ -1541,6 +1589,9 @@ pub fn script(
                 .collect();
             let (rows, _) = by_references(plan, outcome, 1, &rows, true);
             for row in rows {
+                if not_utf8(&mut out, plan, outcome, 1, row) {
+                    continue;
+                }
                 let change = RowChange::Delete {
                     key: key_of(1, row),
                 };
@@ -2478,6 +2529,61 @@ mod tests {
         assert_eq!(merged(&plan, &source, &target).1.same, 2);
     }
 
+    /// K60 review, F5: text that is not UTF-8 (a `SQL_ASCII` database) is
+    /// never written with U+FFFD in place of its bytes.
+    #[test]
+    fn text_that_is_not_utf8_is_never_written() {
+        let plan = simple();
+        let side = |rows: &[(&str, &[u8])]| -> Vec<RowBatch> {
+            let mut builder = BatchBuilder::new(3);
+            for (key, name) in rows {
+                builder.push_text(key);
+                builder.push_bytes(name);
+                builder.push_text("1");
+            }
+            vec![builder.finish()]
+        };
+        let source = side(&[("1", b"caf\xe9"), ("2", b"ok"), ("3", b"new")]);
+        let target = side(&[("2", b"caf\xe9"), ("4", b"old\xff")]);
+        let outcome = play(&plan, [source, target], Limits::default()).unwrap();
+        let text = script(&plan, &outcome, &AnsiDialect, true).unwrap();
+        for line in [
+            "-- (1): not written: a value of the source is not UTF-8 text",
+            "-- (2): not written: a value of the target is not UTF-8 text",
+            "-- (4): not written: a value of the target is not UTF-8 text",
+            "INSERT INTO \"s\".\"t\" (\"id\", \"name\", \"price\") VALUES (3, 'new', 1);",
+        ] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
+        assert!(!text.contains('\u{fffd}'), "{text}");
+        assert_eq!(text.matches("INSERT").count(), 1);
+        assert!(
+            !text.contains("UPDATE") && !text.contains("DELETE"),
+            "{text}"
+        );
+    }
+
+    /// K60 review, F3: a MySQL FLOAT is read as a DOUBLE, which prints it
+    /// whole.
+    #[test]
+    fn a_mysql_float_is_read_whole() {
+        let mut plan = plan_of(vec![
+            info("k", TypeKind::Integer, Some(1)),
+            info("f", TypeKind::Float, None),
+        ]);
+        for col in &mut plan.columns {
+            col.source.data_type = "float".into();
+        }
+        assert_eq!(
+            select_sql(&plan, 0, &My),
+            "SELECT `k`, (`f` + 0e0) FROM `s`.`t` ORDER BY `k`"
+        );
+        assert_eq!(
+            select_sql(&plan, 0, &AnsiDialect),
+            "SELECT \"k\", \"f\" FROM \"s\".\"t\" ORDER BY \"k\""
+        );
+    }
+
     #[test]
     fn only_engines_of_one_family_compare() {
         assert_eq!(refusal(Engine::MySql, Engine::MariaDb), None);
@@ -2491,6 +2597,8 @@ mod tests {
         );
         assert!(refusal(Engine::Sqlite, Engine::Sqlite).is_some());
         assert!(settings(Engine::Postgres).contains(&"SET TIME ZONE 'UTC'"));
+        // F4: exact floats on every PostgreSQL release, not from 12 only.
+        assert!(settings(Engine::Postgres).contains(&"SET extra_float_digits TO 3"));
         assert!(settings(Engine::MariaDb).contains(&"SET SESSION TRANSACTION READ ONLY"));
     }
 }

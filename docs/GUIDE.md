@@ -708,7 +708,8 @@ each row only in the target when "Also delete what only the target has" is ticke
 script, then run it there; the connection's rules apply (a read-only target refuses it, production asks twice).
 Switch that tab to manual commit to apply it all or nothing. Columns the server computes are compared but never
 written. Each value is written as its server prints it; types beyond the common ones (bit strings, spatial
-types, ranges) were not tried, so read their lines. New rows come before the rows that point at them through the
+types, ranges) were not tried, so read their lines; a row holding text that is not UTF-8 gets a comment, no
+statement. New rows come before the rows that point at them through the
 table's own foreign keys, and deleted rows after them; if a unique value moves from a deleted row to a new one,
 run the deletes first. When the script holds only the first 10,000 differences, compare again once it has run.
 

@@ -4056,7 +4056,12 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   shortest exact floats (`SET default_transaction_read_only`, `TIME ZONE`, `DateStyle`, `IntervalStyle`,
   `extra_float_digits`; MySQL `SET SESSION TRANSACTION READ ONLY`, `time_zone`), so nothing it runs writes and
   two servers print one value alike. A shared column of another kind of type on each side is listed, not
-  compared; columns only one side has are said, not compared.
+  compared; columns only one side has are said, not compared. Corrected after the review of 2026-11-24 (group
+  B): `extra_float_digits` is 3, exact on every PostgreSQL release (1 is exact from 12 only); MySQL and MariaDB
+  print a `FLOAT` with six digits (1.2345678 and 1.2345679 both read `1.23457`), so a `FLOAT` column is read as
+  `f + 0e0`, a DOUBLE printed whole, compared and written as such (a `FLOAT` column takes it back as it was);
+  a row holding text that is not UTF-8 (a `SQL_ASCII` database) is shown, and its statement is a comment that
+  says why: the script would have written U+FFFD in place of its bytes.
 - **Streamed and bounded.** One `SELECT` per side, both at once, each on a session of its own; the merge holds
   one batch per side (the execution channel's back-pressure) and copies each difference it keeps into two
   compact arenas (`BatchBuilder`, `ResultStore`), never a batch. It keeps 10,000 differences or 64 MiB of their

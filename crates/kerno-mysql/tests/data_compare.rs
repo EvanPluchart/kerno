@@ -361,6 +361,7 @@ async fn ci_cases(engine: Engine) {
                 "CREATE TABLE {database}.times (at datetime({}) PRIMARY KEY, n int)",
                 if database == CI_SOURCE { 3 } else { 6 }
             ),
+            format!("CREATE TABLE {database}.floats (id int PRIMARY KEY, f float)"),
         ] {
             exec_ok(&session, &sql).await;
         }
@@ -380,6 +381,9 @@ async fn ci_cases(engine: Engine) {
             "INSERT INTO {CI_TARGET}.times VALUES ('2024-01-01 10:00:00.500', 1), \
              ('2024-01-01 10:00:01', 3)"
         ),
+        // F3: the text protocol prints all three as 1.23457 and 3.14159.
+        format!("INSERT INTO {CI_SOURCE}.floats VALUES (1, 1.2345678), (2, 2.5), (3, 3.1415927)"),
+        format!("INSERT INTO {CI_TARGET}.floats VALUES (1, 1.2345679), (2, 2.5)"),
     ] {
         exec_ok(&session, &sql).await;
     }
@@ -422,6 +426,21 @@ async fn ci_cases(engine: Engine) {
     ci_round(engine, "padded", &["≠ a"], "1").await;
     // F2: a DATETIME(3) key against a DATETIME(6) one.
     ci_round(engine, "times", &["≠ 2024-01-01 10:00:01.000 n"], "2").await;
+    // F3: two FLOATs that differ in the eighth digit differ, and the script
+    // writes them whole (compared again exactly: nothing left).
+    ci_round(engine, "floats", &["≠ 1 f", "+ 3"], "3").await;
+    assert_eq!(
+        scalar(
+            &session,
+            &format!("SELECT f + 0e0 FROM {CI_TARGET}.floats WHERE id = 3")
+        )
+        .await,
+        scalar(
+            &session,
+            &format!("SELECT f + 0e0 FROM {CI_SOURCE}.floats WHERE id = 3")
+        )
+        .await
+    );
 }
 
 /// K60 review, F1 and F2: keys the target's server holds equal and whose
