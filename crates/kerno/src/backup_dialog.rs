@@ -1404,13 +1404,18 @@ impl BackupDialog {
             .tables
             .iter()
             .any(|table| !selection.schemas.contains(&table.schema))
-            || selection.schemas.iter().any(|schema| {
-                self.entry(schema).is_some_and(|entry| {
-                    self.visible(entry)
+            || selection
+                .schemas
+                .iter()
+                .any(|schema| match self.entry(schema) {
+                    Some(entry) => self
+                        .visible(entry)
                         .iter()
-                        .any(|table| !selection.tables.contains(table))
-                })
-            });
+                        .any(|table| !selection.tables.contains(table)),
+                    // Not listed yet (K65: a slower server): its ticked tables
+                    // are all that is known of it, never the whole schema.
+                    None => selection.tables.iter().any(|table| &table.schema == schema),
+                });
         let tables = || selection.tables.iter().cloned().collect();
         Ok(match (self.family, partial) {
             (_, true) => (Vec::new(), tables()),

@@ -1703,3 +1703,6 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   `scripts/install-linux-deps.sh`; an X.509 v3 client certificate from `scripts/test-env.sh`.
 - macOS: fmt, clippy and `cargo deny` clean; `kerno` 945 passed, `kerno-core` and `kerno-postgres` green.
   Nobody opened the Linux app; D-132 has the details.
+- One run of four on the same code showed four timing races of the slower runner: two fixed (a single table's
+  backup showed `--schema` while the tables were still listed; a test clock advanced too early), two seen once
+  and left (D-132).

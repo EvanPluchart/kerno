@@ -4331,3 +4331,11 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
   authentication), so that every OpenSSL writes X.509 v3; before 3.2 OpenSSL wrote v1 without one, which
   rustls refuses. Certificates already generated are kept.
 - **Skipped on Linux: none.** The ignored tests are the three measurements ignored on every system.
+- **Races the slower runner showed** (one run of four on the same code): a backup from the tree showed
+  `--schema` for a single ticked table while the schema's tables were still being listed (Start waits for the
+  list, so nothing wrong ran); a schema not listed yet now counts as partly ticked when a table of it is ticked.
+  The lock test of the foreign-key preview advanced the test clock once before the client had set its 10 s
+  timer; it now advances it at each try. Seen in that run too and not addressed, as they could not be
+  reproduced: `every_owner_of_a_session_closes_it_when_it_goes_away` (a MySQL session still idle in a
+  transaction when measured) and `updates::update_installs_the_checked_release_and_starts_it` (the tabs not yet
+  stored at the relaunch).

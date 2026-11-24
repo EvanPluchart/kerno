@@ -498,8 +498,13 @@ fn a_read_behind_a_lock_is_stopped(cx: &mut TestAppContext) {
     select_cell(&app, cx, &grid, (1, 2));
     cx.executor().advance_clock(REST);
     app.wait_until(cx, "the read waiting", |_, _| preview_waits());
-    cx.executor().advance_clock(Duration::from_secs(10));
-    app.wait_until(cx, "the too long read stopped", |_, _| !preview_waits());
+    // The clock moves on at each try: the server shows the read waiting
+    // before the client has set its 10 s timer (K65: on the Linux runner, one
+    // advance came too early and the timer never fired).
+    app.wait_until(cx, "the too long read stopped", |_, cx| {
+        cx.executor().advance_clock(Duration::from_secs(10));
+        !preview_waits()
+    });
     assert_eq!(
         read(cx, &panel, |panel, _| panel.preview_state()),
         "Not read: the server took longer than 10 s."
