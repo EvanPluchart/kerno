@@ -816,12 +816,14 @@ impl Fixture {
         });
     }
 
-    /// The folder pictures directory, with the files `names` in it.
+    /// The folder pictures directory, with the files `names` in it,
+    /// written as the dialog writes a picture (K65: with plain writes, a
+    /// prune called a moment before removed them on Linux).
     fn icons(&self, cx: &mut TestAppContext, names: &[&str]) -> PathBuf {
         let dir = cx.update(|cx| AppState::get(cx).paths.folder_icons());
         std::fs::create_dir_all(&dir).unwrap();
         for name in names {
-            std::fs::write(dir.join(name), b"picture").unwrap();
+            crate::folder_dialog::write_icon(&dir.join(name), b"picture").unwrap();
         }
         dir
     }

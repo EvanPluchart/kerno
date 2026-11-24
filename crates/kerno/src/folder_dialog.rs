@@ -408,8 +408,22 @@ pub fn store_folder_icon(source: &Path, dir: &Path) -> Result<String, String> {
     let name = format!("{:016x}.png", hasher.finish());
     let not_saved = |error: std::io::Error| format!("The picture could not be saved: {error}.");
     std::fs::create_dir_all(dir).map_err(not_saved)?;
-    std::fs::write(dir.join(&name), &png).map_err(not_saved)?;
+    write_icon(&dir.join(&name), &png).map_err(not_saved)?;
     Ok(name)
+}
+
+/// Writes a folder picture at `path`, with the clock's time of now: a prune
+/// called before keeps it (`remove_unused_icons`). Linux stamps a file with a
+/// coarse clock that can be a tick behind `SystemTime::now()`, so the time is
+/// set, on a file of another name that only then takes the picture's (K65).
+pub fn write_icon(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let part = path.with_extension("part");
+    std::fs::write(&part, bytes)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&part)?
+        .set_modified(SystemTime::now())?;
+    std::fs::rename(&part, path)
 }
 
 /// Removes from `dir` the pictures Kerno named that no folder uses and
@@ -611,20 +625,30 @@ mod tests {
     fn only_kernos_unused_and_older_pictures_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = |name: &str| dir.path().join(name);
-        for name in ["00000000000000aa.png", "00000000000000bb.png", "logo.png"] {
-            std::fs::write(path(name), b"x").unwrap();
-        }
+        // The times are set: Linux stamps a file with a coarse clock that
+        // can be behind `SystemTime::now()` (K65).
         let before = SystemTime::now();
-        std::fs::write(path("00000000000000cc.png"), b"x").unwrap();
+        let stamped = |name: &str, time: SystemTime| {
+            std::fs::write(path(name), b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path(name))
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        let second = std::time::Duration::from_secs(1);
+        for name in ["00000000000000aa.png", "00000000000000bb.png", "logo.png"] {
+            stamped(name, before - second);
+        }
+        stamped("00000000000000cc.png", before + second);
         let used = HashSet::from(["00000000000000aa.png".to_string()]);
         remove_unused_icons(dir.path(), &used, before).unwrap();
         assert!(path("00000000000000aa.png").exists(), "in use");
         assert!(!path("00000000000000bb.png").exists(), "unused");
         assert!(path("logo.png").exists(), "not a name of Kerno's");
         // Written after the call was made: a dialog may be about to use it.
-        let newer = path("00000000000000cc.png");
-        let written = std::fs::metadata(&newer).unwrap().modified().unwrap();
-        assert_eq!(newer.exists(), written > before);
+        assert!(path("00000000000000cc.png").exists());
         // No directory yet: nothing to do.
         remove_unused_icons(&path("missing"), &used, before).unwrap();
     }

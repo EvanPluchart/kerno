@@ -313,11 +313,16 @@ async fn an_unknown_host_key_is_shown_then_trusted_then_remembered() {
         .await
         .expect("trusted");
     probe(&tunnel, &config).await;
-    assert!(
-        setup.known_hosts().contains("[127.0.0.1]:52222"),
-        "{}",
-        setup.known_hosts()
-    );
+    // Found by OpenSSH's own lookup: Debian's and Ubuntu's OpenSSH write the
+    // host name hashed (K65).
+    let found = std::process::Command::new("ssh-keygen")
+        .arg("-F")
+        .arg(format!("[127.0.0.1]:{}", testing::SSH_PORT))
+        .arg("-f")
+        .arg(&setup.fixture.known_hosts)
+        .output()
+        .expect("ssh-keygen");
+    assert!(found.status.success(), "{}", setup.known_hosts());
     drop(tunnel);
     setup.open(&config, None, None).await.expect("remembered");
 

@@ -1993,7 +1993,18 @@ impl BackupDialog {
             .map(|(path, list)| (path, list, self.left_out()));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
         let running = bridge::spawn(cx, async move {
-            let started = std::time::SystemTime::now();
+            // The time of the file it replaces, to tell whether the tool
+            // opened it; not the clock, which Linux's file times can be a
+            // tick behind (K65).
+            let modified = |path: &Path| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+            };
+            let earlier = output
+                .as_ref()
+                .filter(|(_, existed)| *existed)
+                .map(|(path, _)| modified(path));
             if let Some(input) = &command.stdin
                 && let Ok(meta) = tokio::fs::metadata(input).await
             {
@@ -2054,9 +2065,9 @@ impl BackupDialog {
                         ended.removed = !existed && std::fs::remove_dir_all(path).is_ok();
                     }
                     Ok(_) | Err(Error::Cancelled) => {
-                        let written = std::fs::metadata(path)
-                            .and_then(|meta| meta.modified())
-                            .is_ok_and(|modified| modified >= started);
+                        let written = earlier
+                            .as_ref()
+                            .is_none_or(|earlier| modified(path) != *earlier);
                         ended.removed = written && std::fs::remove_file(path).is_ok();
                     }
                     Err(_) => {}

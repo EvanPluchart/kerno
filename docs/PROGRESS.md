@@ -1683,3 +1683,23 @@ into the morning's release, which stays unpublished until his go.
   tests, `kerno` 945, `kerno-postgres` 148, `kerno-mysql` 198, `kerno-sqlite` 30, all passing. Not done on
   Windows yet, in order: a CI job and a zip, a pass in the real app, the home folder and the update check, the
   local clients and the password presets, an installer and the update's install, the system OpenSSH tunnel.
+
+## 2026-11-24 — K65: the tests pass on Linux
+
+The workspace's tests on GitHub's `ubuntu-24.04` runner with the `kerno-*` containers (legacy MySQL too), from a
+probe workflow on the branch `linux-tests` (not merged). On 4aeff7e the app crate ended 932 passed, 13 failed;
+with `--no-fail-fast` four more failed in `kerno-core`, `kerno-mysql` and `kerno-postgres`. Now the whole
+workspace is green there: 2,101 passed, 3 ignored (the three measurements ignored on every system): `kerno`
+945, `kerno-core` 780, `kerno-mysql` 198, `kerno-postgres` 148, `kerno-sqlite` 30.
+
+- Defects of the Linux app, fixed: Query History took Ctrl+Y, the text fields' only Redo on Linux (now
+  Ctrl+Alt+E there, ⌘Y on macOS); a cancelled backup into a new file and a folder picture written just after a
+  prune depended on Linux's coarse file clock (both now independent of it; the code runs on macOS too, with
+  nothing changed for its user).
+- Tests that assumed macOS now say what is true on each system (keys of the kit's text fields and editor,
+  hashed known_hosts, Debian's `pg_wrapper`, the command box's padding, a click on a field cut at the page's
+  edge); none weakened, none skipped on Linux.
+- What the runner lacked: PostgreSQL 17's client from apt.postgresql.org (key checked by fingerprint) in
+  `scripts/install-linux-deps.sh`; an X.509 v3 client certificate from `scripts/test-env.sh`.
+- macOS: fmt, clippy and `cargo deny` clean; `kerno` 945 passed, `kerno-core` and `kerno-postgres` green.
+  Nobody opened the Linux app; D-132 has the details.

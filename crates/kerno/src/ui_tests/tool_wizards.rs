@@ -125,25 +125,36 @@ impl Fixture {
     }
 
     /// Scrolls the wizard's page (or the settings' section) until `id`
-    /// shows, then clicks it.
+    /// shows whole, then clicks it: a click at the middle of a field half
+    /// out of the page would land beside it (K65: the fonts of Linux lay the
+    /// page out a few pixels taller).
     pub(super) fn tap(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) {
         let id = id.into();
-        for step in 0..40 {
-            let visible = self.step(cx, |window, _| {
-                window
-                    .try_find(id.clone())
-                    .is_none_or(|element| element.visible())
-            });
+        for _ in 0..40 {
             let Some(page) = ["wizard-page", "settings-body"]
                 .into_iter()
                 .find(|page| self.has(cx, *page))
             else {
                 break;
             };
-            if visible {
+            // On the page and above it: scroll up; below or cut at its
+            // bottom: down. A button under the page is clicked at once.
+            let up = self.step(cx, |window, _| {
+                let page_bounds = window.find(page).bounds();
+                let element = window.within(page).try_find(id.clone())?;
+                let bounds = element.bounds();
+                if bounds.top() < page_bounds.top() {
+                    Some(true)
+                } else if element.visible() && bounds.bottom() <= page_bounds.bottom() {
+                    None
+                } else {
+                    Some(false)
+                }
+            });
+            let Some(up) = up else {
                 break;
-            }
-            let delta = if step < 15 { -120. } else { 120. };
+            };
+            let delta = if up { 120. } else { -120. };
             self.step(cx, |window, cx| {
                 window.scroll(
                     page,
@@ -658,12 +669,15 @@ fn a_running_backup_is_cancelled_from_the_progress_page(cx: &mut TestAppContext)
     let app = connected(cx, Engine::MySql);
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
+    // The file it writes has a time before the run's start, as Linux's
+    // coarse file clock can give it (K65): it is removed all the same.
+    // Mutation seen: the file's time compared with the run's start again.
     let client = fake_client(
         &root,
         "client",
         ClientFamily::MySql,
         "mysqldump  Ver 9.4.0 for macos15 on arm64 (Homebrew)",
-        r#"for arg in "$@"; do case $arg in --result-file=*) echo partial > "${arg#--result-file=}";; esac; done
+        r#"for arg in "$@"; do case $arg in --result-file=*) echo partial > "${arg#--result-file=}"; touch -t 202001010000 "${arg#--result-file=}";; esac; done
 echo "-- started"
 exec sleep 60"#,
     );

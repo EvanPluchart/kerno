@@ -32,13 +32,16 @@ CNF
       openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 \
         -extfile server.cnf -extensions ext -out server.crt 2>/dev/null
       # Client certificate for the kerno_cert role (certificate authentication).
+      # With an extension, so that every OpenSSL writes an X.509 v3
+      # certificate (before 3.2 it wrote v1 without one, which rustls refuses).
+      printf 'basicConstraints = CA:FALSE\nextendedKeyUsage = clientAuth\n' > client.ext
       openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=kerno_cert" 2>/dev/null
       openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 \
-        -out client.crt 2>/dev/null
+        -extfile client.ext -out client.crt 2>/dev/null
       # A second CA that signed nothing: verify-ca against it must fail.
       openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=Kerno Wrong CA" \
         -keyout wrong-ca.key -out wrong-ca.crt 2>/dev/null
-      rm -f ./*.csr ./*.srl server.cnf
+      rm -f ./*.csr ./*.srl server.cnf client.ext
       chmod 644 ./*.crt && chmod 600 ./*.key && chmod 644 server.key
     )
   fi

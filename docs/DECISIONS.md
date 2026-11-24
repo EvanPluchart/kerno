@@ -4284,3 +4284,50 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
   data" check, which runs on the UI thread and on Windows may wait up to about 7 s for a pipe that exists and
   does not answer (CLAUDE.md §1: the UI thread never waits on I/O); UI tests and the container tests on
   Windows; a pass in the real app.
+
+## D-132 — The tests on Linux, and what they showed broken there (K65; 2026-11-24)
+
+- **How it was run.** The workspace's tests on GitHub's `ubuntu-24.04` runner, the `kerno-*` containers up
+  (legacy MySQL included), `xvfb-run -a cargo test --workspace --no-fail-fast -- --test-threads=3` with
+  `KERNO_REQUIRE_CONTAINERS=1`, from a probe workflow on the branch `linux-tests` (not merged: `ci.yml`'s
+  `test-linux` job is the lasting one). Nobody opened the Linux app itself.
+- **Linux defaults changed.**
+
+  | Command | Before (Linux) | After (Linux) | Why |
+  |---|---|---|---|
+  | Query History | Ctrl+Y | Ctrl+Alt+E | Ctrl+Y is the text fields' only Redo on Linux |
+
+  Query History has no key context, so its Ctrl+Y took Redo from every text field and the editor. Ctrl+Alt+E is
+  DataGrip's Browse Console History; DBeaver has no key for it. macOS keeps ⌘Y. Written per platform in
+  `COMMANDS` with `cfg!`; the keymap file, the tooltips and Settings ▸ Shortcuts show the platform's.
+- **Kept: Format SQL on Ctrl+Shift+I.** In debug builds (the tests) the kit binds its inspector (GPUI's tool for
+  developers, ⌘⌥I on macOS) to Ctrl+Shift+I; a release build has no inspector at all (`gpui-component` compiles
+  it only with `debug_assertions` or its `inspector` feature). Format SQL wins over it as ⌘↵ wins over Confirm,
+  and no user loses a key they use.
+  DBeaver's Ctrl+Shift+F was not taken, to keep the guide's rule that ⌘ on macOS is Ctrl on Linux. The test
+  that lists the global defaults over a key of the kit lists it on Linux only.
+- **File times on Linux.** Linux stamps a file with a coarse clock that can be a tick behind
+  `SystemTime::now()`. Two checks compared a file's time with the clock and went wrong there. A cancelled backup
+  into a new file could keep its incomplete file: a file that was not there before the run is now the run's,
+  and a file it replaces is compared with its own time before the run, never the clock. A folder picture
+  written just after a prune was called could be removed by it: `folder_dialog::write_icon` writes it under
+  another name, sets its time from the clock and only then renames it. Both paths run on macOS too; what the
+  user sees there does not change.
+- **Tests made platform-aware**, each saying what is true on each system: Ctrl+Left moves a word in Linux text
+  fields (the refusal on the Shortcuts page names `MoveToNextWord`); the editor adds a cursor with Shift+Alt+Up
+  / Down and goes to its start with Ctrl+Home on Linux (the kit's keys; FEATURES says so); the search key is
+  pressed as `secondary-f`; Ubuntu's OpenSSH records host names hashed, so the test asks `ssh-keygen -F`;
+  Debian's `/usr/bin/pg_dump` is `pg_wrapper`, which reports the default version and dumps a remote server with
+  the newest client, so the "older pg_dump fails" test takes the first older real binary; the command box's
+  padding is read from the layout (7.5 px at the tests' 15 px text) instead of assumed (8 px and a border), and
+  Linux's short `/tmp` gives a command the box holds whole where macOS's long temporary path reaches its bound;
+  the wizards' `tap` scrolls until a field is whole before clicking its middle (a field cut at the page's edge
+  took no click on the runner, where the page lays out a few pixels taller).
+- **What the runner installs.** `scripts/install-linux-deps.sh` adds the PostgreSQL project's apt repository and
+  its PostgreSQL 17 client: Ubuntu 24.04's is 16, and pg_dump never dumps a newer server. The key is the one
+  the distribution's `postgresql-common` ships when it does, else postgresql.org's, and it must have the
+  fingerprint `B97B 0AFC AA1A 47F0 44F2 44A0 7FCC 7D46 ACCC 4CF8` or the script stops.
+- **Test certificates.** `scripts/test-env.sh` gives the client certificate two extensions (not a CA, client
+  authentication), so that every OpenSSL writes X.509 v3; before 3.2 OpenSSL wrote v1 without one, which
+  rustls refuses. Certificates already generated are kept.
+- **Skipped on Linux: none.** The ignored tests are the three measurements ignored on every system.

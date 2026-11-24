@@ -253,26 +253,34 @@ async fn pg_dump_through_the_ssh_tunnel_with_verify_full() {
     assert!(dump.contains("CREATE TABLE public.notes"), "{dump}");
 }
 
-/// The `pg_dump` that [`tools::find`] picks, when it is older than the
-/// server, fails: the non-zero exit and the tool's reason are reported.
+/// A `pg_dump` older than the server fails: the non-zero exit and the
+/// tool's reason are reported. The first older one found, in the order
+/// [`tools::find`] looks and then every client installed (K65: Debian's and
+/// Ubuntu's `/usr/bin/pg_dump` is `pg_wrapper`, which says the default
+/// version's number and dumps a remote server with the newest client: not an
+/// older `pg_dump`).
 #[tokio::test]
 async fn an_older_pg_dump_fails_with_its_reason() {
     let Some(session) = common::session().await else {
         return;
     };
     let server = server_major(&session).await;
-    let Some(pg_dump) = tools::find(Tool::PgDump) else {
-        eprintln!("SKIPPED: no pg_dump installed");
+    let installed = tools::detect_clients(&tools::ClientRoots::system(Vec::new()));
+    let candidates = tools::find_all(Tool::PgDump).into_iter().chain(
+        installed
+            .iter()
+            .filter_map(|install| install.path(Tool::PgDump).map(Path::to_path_buf)),
+    );
+    let older = candidates
+        .filter(|pg_dump| {
+            std::fs::canonicalize(pg_dump)
+                .is_ok_and(|real| real.file_name().is_some_and(|name| name == "pg_dump"))
+        })
+        .find(|pg_dump| major_version(pg_dump).is_some_and(|major| major < server));
+    let Some(pg_dump) = older else {
+        eprintln!("SKIPPED: no pg_dump older than the server ({server}) is installed");
         return;
     };
-    let major = major_version(&pg_dump);
-    if !major.is_some_and(|major| major < server) {
-        eprintln!(
-            "SKIPPED: {} (major {major:?}) is not older than the server ({server})",
-            pg_dump.display()
-        );
-        return;
-    }
     let files = tempfile::tempdir().unwrap();
     let command = tools::backup_command(
         &pg_dump,

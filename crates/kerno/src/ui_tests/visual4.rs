@@ -360,19 +360,24 @@ fn if_exists_waits_for_drop_statements_and_the_global_command_shows_whole(cx: &m
     std::fs::create_dir_all(&folder).unwrap();
     app.write_to(cx, &folder, None);
     app.tap(cx, "backup-command");
-    let (shown, text, visible) = app.step(cx, |window, _| {
+    let (shown, text, padding, visible) = app.step(cx, |window, _| {
         let command = window.find("backup-command");
+        let text = window.find("backup-command-text").bounds();
         (
             command.bounds().size.height,
-            window.find("backup-command-text").bounds().size.height,
+            text.size.height,
+            text.origin.y - command.bounds().origin.y,
             command.visible(),
         )
     });
     assert!(visible);
-    // The box's padding and border: 8 px each side, 1 px each side.
+    // Whole: the text and the box's padding above and below it (K65: read
+    // from the layout, 7.5 px at the 15 px of the tests' text, not assumed;
+    // and Linux's short temporary folder gives a command of 5 lines, which
+    // the box holds whole, where macOS's long one reaches the bound).
     assert!(
-        shown >= px(108.) || shown >= text + px(17.),
-        "the command box is {shown:?} high for {text:?} of text"
+        shown >= px(108.) || shown >= text + padding * 2.,
+        "the command box is {shown:?} high for {text:?} of text and {padding:?} of padding"
     );
 }
 

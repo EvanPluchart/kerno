@@ -847,7 +847,9 @@ nice -n 10 cargo run --release -p kerno
 Metal shaders are compiled at runtime, so the Metal toolchain is not required (see D-002 in
 [docs/DECISIONS.md](DECISIONS.md)).
 
-Linux (Debian or Ubuntu): install GPUI's native dependencies as root, then build the same way.
+Linux (Debian or Ubuntu): install GPUI's native dependencies as root, then build the same way. The script also
+adds the PostgreSQL project's apt repository (its key checked by fingerprint) for the PostgreSQL 17 client the
+tests' server needs: a distribution's older `pg_dump` refuses a newer server.
 
 ```sh
 sudo scripts/install-linux-deps.sh
@@ -939,7 +941,7 @@ structure or administration list); an entry is greyed where nothing focused take
 | Ctrl+4 / Ctrl+8 | Commit / roll back the transaction |
 | Ctrl+Alt+A | Switch between auto-commit and manual commit |
 | Cmd+E / Cmd+Shift+E | Explain / explain analyze |
-| Cmd+Y | Query history |
+| Cmd+Y (macOS; Ctrl+Alt+E on Linux, where Ctrl+Y is the text fields' Redo) | Query history |
 | Cmd+/ | Toggle line comment |
 | Cmd+Shift+/ | Toggle block comment |
 | Cmd+Shift+I | Format SQL |
