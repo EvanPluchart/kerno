@@ -5,6 +5,7 @@
 #   scripts/test-env.sh down    stop and remove the containers (data volumes are kept)
 #   scripts/test-env.sh reset   down, and delete the data volumes (forces a re-seed)
 #   scripts/test-env.sh status  show the containers
+#   scripts/test-env.sh generate  only generate the test certificates and keys (Windows runner, K68)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -77,8 +78,11 @@ case "${1:-}" in
   status)
     docker compose --profile legacy ps
     ;;
+  generate)
+    generate
+    ;;
   *)
-    sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

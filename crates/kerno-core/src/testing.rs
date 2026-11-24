@@ -3,7 +3,9 @@
 //!
 //! Tests call [`available`] first and return early when the container is
 //! down, after printing why. With `KERNO_REQUIRE_CONTAINERS=1` (set by `scripts/check.sh`) a
-//! missing container fails the test instead.
+//! missing container fails the test instead; `KERNO_REQUIRE_SERVERS` does so for the containers it
+//! names, comma-separated (the Windows runner's `kerno-postgres,kerno-mysql`, which has no MariaDB,
+//! SSH or legacy MySQL server: K68).
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream};
@@ -75,11 +77,17 @@ fn check(name: &str, port: u16) -> bool {
     let message = format!(
         "container {name} is not reachable on 127.0.0.1:{port}; start it with `scripts/test-env.sh up{legacy}`"
     );
-    if std::env::var_os("KERNO_REQUIRE_CONTAINERS").is_some() {
+    let named = std::env::var("KERNO_REQUIRE_SERVERS").unwrap_or_default();
+    if std::env::var_os("KERNO_REQUIRE_CONTAINERS").is_some() || names(&named, name) {
         panic!("{message}");
     }
     eprintln!("SKIPPED: {message}");
     false
+}
+
+/// Whether the comma-separated `list` names the container `name`.
+fn names(list: &str, name: &str) -> bool {
+    list.split(',').any(|item| item.trim() == name)
 }
 
 /// Whether the test container of `engine` is up. Prints a `SKIPPED` line
@@ -412,6 +420,29 @@ pub fn k67_runner() -> bool {
         eprintln!("SKIPPED: runs only on the Windows runner of the K67 probe (KERNO_K67_RUNNER)");
     }
     runner
+}
+
+/// This process's resident memory in KiB: `ps -o rss=` on Unix, the
+/// working set `tasklist` gives on Windows ("123,456 K", K68).
+pub fn resident_kb() -> u64 {
+    let pid = std::process::id().to_string();
+    let output = if cfg!(windows) {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+    } else {
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+    }
+    .expect("read this process's memory");
+    let text = String::from_utf8_lossy(&output.stdout);
+    // tasklist: the last quoted field; ps: the number alone.
+    let size = text.rsplit(",\"").next().unwrap_or_default();
+    let digits: String = size.chars().filter(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("no resident size in {text:?}"))
 }
 
 /// Windows: how many processes run the program `image` (`pg_dump.exe`),
@@ -886,5 +917,18 @@ mod proxy_tests {
         proxy.set(ProxyMode::Forward);
         let mut again = connect();
         assert_eq!(echoes(&mut again, b"back").unwrap(), b"back");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_list_of_required_servers_names_whole_container_names() {
+        let list = "kerno-postgres, kerno-mysql";
+        assert!(super::names(list, "kerno-postgres"));
+        assert!(super::names(list, "kerno-mysql"));
+        assert!(!super::names(list, "kerno-mysql57"));
+        assert!(!super::names(list, "kerno-mariadb"));
+        assert!(!super::names("", "kerno-postgres"));
     }
 }
