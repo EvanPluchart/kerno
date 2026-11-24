@@ -1646,3 +1646,17 @@ into the morning's release, which stays unpublished until his go.
   dark at the default size: the name reads in full; the wording stays.
 - Tests: `ui_tests::k62` (the backup part: the line, the task's list, the log of a real run of one small
   database), `backup_dialog::tests::the_databases_left_out_are_named`, each seen failing under a mutation.
+
+## 2026-11-24 — GitHub Actions: the checks and the release builds
+
+- The owner lifted his "no GitHub Actions" rule (free on a public repository) and asked for the builds and
+  the releases on GitHub; the sentence of `CLAUDE.md` §5 is replaced at his word (D-130).
+- `.github/workflows/ci.yml` (fmt, clippy, deny; tests on macOS without the containers, on Linux with them)
+  and `.github/workflows/release.yml` (a tag builds the `.dmg` and the six Linux packages with the local
+  scripts, checks them, writes `SHA256SUMS`, opens a draft release). Actions pinned to commits.
+- Proved on GitHub from a branch: lint and the macOS tests green; the release dry run green on its second
+  try, its eight files downloaded, the checksums verified, the `.dmg`'s signature and version checked, the
+  dry-run draft deleted. The first try failed on one check only: the x86_64 AppImage under the runner's
+  emulation; x86_64 packages are now started on an x86_64 runner (`scripts/check-linux-packages.sh [arch]`).
+- Found: 13 tests of the app fail on Linux, where the tests had never run (K65). A probe on a Windows
+  runner: every dependency compiles, 27 errors in `kerno-core` (K64).

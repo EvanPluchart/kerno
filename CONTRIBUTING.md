@@ -132,10 +132,13 @@ Kerno is MIT OR Apache-2.0 and must stay clean (CLAUDE.md §1).
 
 ## Releases
 
-There is no hosted CI and no GitHub Actions workflow: `scripts/check.sh` is the check. A release is built locally
-with `scripts/release.sh [version]` (clean tree, version equal to `Cargo.toml`, macOS `.dmg` and Linux tarball,
-`dist/SHA256SUMS`); it prints the `gh release create` command, and publishing is the owner's. Never add a remote,
-push, tag or publish from a change.
+GitHub Actions run the checks on every push to `main` and every pull request (`.github/workflows/ci.yml`: fmt,
+clippy, `cargo deny`, the tests on macOS without the containers and on Linux with them); `scripts/check.sh` is the
+same check run locally, and the one to run before a commit. A release is built by `.github/workflows/release.yml`
+from a tag `v<version>` (the version of `Cargo.toml`): the macOS `.dmg`, the Linux packages for both
+architectures and `SHA256SUMS`, attached to a draft release that the owner tries and publishes.
+`scripts/release.sh [version]` builds the same packages locally. Tagging, pushing and publishing are the owner's:
+never do them from a change.
 
 ## Commits
 

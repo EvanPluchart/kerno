@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Every check of the project, run locally (there is no CI), in this order; stops at the first failure
-# and prints one summary line per step:
+# Every check of the project, run locally (.github/workflows/ci.yml runs the same on GitHub), in this
+# order; stops at the first failure and prints one summary line per step:
 #   scripts/check.sh              fmt, clippy, deny, tests
 #   scripts/check.sh --no-tests   fmt, clippy, deny
 # Refuses to start when the 1-minute load average is above the number of cores.

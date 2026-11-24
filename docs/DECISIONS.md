@@ -4153,3 +4153,40 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
 - **Left out**, the next steps if users ask: per-connection name patterns beyond the tree's object filters
   (Filter ▸ already hides databases by name, DBeaver's navigator filters), a filter per schema, anything for
   MySQL.
+
+## D-130 — GitHub Actions run the checks and build the releases (2026-11-24)
+
+The owner's word: "setup les CI github actions pour qu'on fasse nos build et release sur github directement",
+since Actions are free on a public repository. It replaces his rule of 2026-11-13 (no Actions: the minutes
+cost money), which he asked to remove from `CLAUDE.md` §5.
+
+- **Two workflows, the local scripts inside.** `.github/workflows/ci.yml` is `scripts/check.sh` on runners;
+  `.github/workflows/release.yml` runs `scripts/bundle-macos.sh` and `scripts/bundle-linux.sh` as a local
+  release does, so a package built on GitHub and one built here come from the same steps. The scripts stay
+  the local way; nothing was moved into YAML but the wiring.
+- **A release is a draft.** A tag `v<version>` (checked against `Cargo.toml` before anything is built) builds
+  the seven packages, writes `SHA256SUMS` and opens a draft release with the notes of
+  `docs/release-notes/`. A published release is offered to every installed Kerno by the update check: the
+  draft keeps the owner's "I try it before it is out". "Run workflow" is a dry run from any branch (the
+  packages as artifacts; a draft named "dry run" only when asked).
+- **Runners.** macOS: `macos-15` (Apple Silicon, an Xcode that still carries the Metal compiler); the
+  script's launch check runs there (a window appears, the app quits). Linux: `ubuntu-24.04-arm`, because
+  the build image is arm64 and cross-compiles x86_64 (D-066): the same image, natively. Each architecture's
+  packages are started in clean containers on a runner of that architecture: the first run showed that an
+  AppImage does not start under the runner's qemu-user (its ELF header carries the AppImage mark, which the
+  kernel's qemu rule does not match), where Docker Desktop on a Mac runs it; so on GitHub nothing is
+  emulated, not even for the check (`scripts/check-linux-packages.sh [arch]`).
+- **Tests.** macOS runners have no Docker: the tests that need a server print why and skip themselves; the
+  Linux job starts the `kerno-*` containers, the legacy MySQL ones included, under `xvfb-run`.
+  `--no-fail-fast`, so that one run reports every crate.
+- **Supply chain.** Every action is pinned to a commit (the version in a comment), as the build image pins
+  its downloads; the token is read-only except in the job that opens the draft; no secret is used (the
+  macOS build is signed ad hoc, as before); release builds use no cache.
+- **Measured (2026-11-24).** CI: lint 7 min, macOS tests 21 min, Linux tests 16 min. Release: macOS 15 min,
+  Linux 22 min (about 9 min per architecture), the whole run under 30 min.
+- **What the first runs found.** The workspace tests had never run on Linux: 13 of the app's fail there
+  (shortcuts that collide with the kit's on Linux, backup tools, folder pictures, one font metric). They are
+  K65's; until it lands the Linux test job is red.
+- **Not in this decision.** A Windows build (K64 is its first step); a stable signing identity or
+  notarization (they need secrets and an Apple account); Dependabot for the pinned actions (update them by
+  hand, with their hash); the site.

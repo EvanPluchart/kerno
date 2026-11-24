@@ -1,0 +1,86 @@
+# The checks of scripts/check.sh, on GitHub's runners (free for a public repository), on every push
+# to main and every pull request. A branch named ci/... runs them too: the way to try a change to
+# this file before it reaches main.
+#   lint         fmt, clippy and cargo deny, on Linux (clippy on macOS is scripts/check.sh's)
+#   test-macos   the workspace tests; GitHub's macOS runners have no Docker, so the tests that need
+#                the kerno-* servers print why and skip themselves
+#   test-linux   the workspace tests with the kerno-* containers, the legacy MySQL ones included
+name: CI
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt, clippy, deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install GPUI's system dependencies
+        run: sudo scripts/install-linux-deps.sh
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # A failed job leaves its compiled dependencies to the next run too.
+          cache-on-failure: true
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          rust-version: ${{ steps.toolchain.outputs.channel }}
+
+  test-macos:
+    name: test (macOS, no containers)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # A failed job leaves its compiled dependencies to the next run too.
+          cache-on-failure: true
+      - run: cargo test --workspace --no-fail-fast -- --test-threads=3
+
+  test-linux:
+    name: test (Linux, with the containers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install GPUI's system dependencies
+        run: sudo scripts/install-linux-deps.sh
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # A failed job leaves its compiled dependencies to the next run too.
+          cache-on-failure: true
+      - name: Start the kerno-* test containers
+        run: scripts/test-env.sh up --legacy
+      - name: Test
+        run: xvfb-run -a cargo test --workspace --no-fail-fast -- --test-threads=3
+        env:
+          KERNO_REQUIRE_CONTAINERS: "1"
+      - name: Stop the test containers
+        if: always()
+        run: scripts/test-env.sh down

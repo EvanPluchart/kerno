@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Starts every Linux package of dist/ in clean containers and compares `kerno --version` with the
 # workspace version; one line per package and distribution, exit 1 if any fails:
-#   scripts/check-linux-packages.sh
+#   scripts/check-linux-packages.sh [aarch64] [x86_64]   both architectures when none is named
 # Distributions: Ubuntu 20.04 (the glibc 2.31 floor, the build image's) and Debian 13 (current
-# stable). arm64 runs natively; x86_64 under emulation (docker --platform linux/amd64), allowed
-# for this check only: the packages are built by scripts/bundle-linux.sh, never under emulation.
+# stable). On an arm64 host arm64 runs natively and x86_64 under emulation (docker --platform
+# linux/amd64), allowed for this check only: the packages are built by scripts/bundle-linux.sh,
+# never under emulation. The release workflow names one architecture per runner, each on a host of
+# that architecture: an AppImage does not start under plain qemu-user (its runtime's ELF header
+# carries the AppImage mark, which the kernel's qemu rule does not match).
 #   .deb       apt-get install ./kerno_<v>_<arch>.deb (its Depends must resolve), then kerno --version
 #   tarball    the .deb's Depends installed, unpacked, bin/kerno --version
 #   AppImage   the .deb's Depends installed, --appimage-extract-and-run --version (no FUSE needed)
@@ -18,11 +21,16 @@ version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Carg
 want="kerno $version"
 distros=(ubuntu:20.04 debian:13)
 failed=0
+archs=("$@")
+[ ${#archs[@]} -gt 0 ] || archs=(aarch64 x86_64)
+for arch in "${archs[@]}"; do
+  case $arch in aarch64 | x86_64) ;; *) echo "usage: scripts/check-linux-packages.sh [aarch64] [x86_64]" >&2; exit 2 ;; esac
+done
 
 cleanup() { docker ps -aq --filter name=kerno-check- | xargs docker rm -f >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-for arch in aarch64 x86_64; do
+for arch in "${archs[@]}"; do
   top=kerno-$version-linux-$arch
   if tar -tzf "dist/$top.tar.gz" | grep -qv "^$top/" || tar -tvzf "dist/$top.tar.gz" | grep -q '^[^-d]'; then
     echo "FAIL tarball listing $top: an entry outside $top/ or a link"
@@ -36,7 +44,7 @@ done
 before=$(docker images -aq --no-trunc)
 pulled=()
 
-for arch in aarch64 x86_64; do
+for arch in "${archs[@]}"; do
   case $arch in aarch64) platform=linux/arm64 deb_arch=arm64 ;; x86_64) platform=linux/amd64 deb_arch=amd64 ;; esac
   deb=kerno_${version}_$deb_arch.deb
   for distro in "${distros[@]}"; do

@@ -278,8 +278,13 @@ App tests run in a headless GPUI window (`crates/kerno/src/ui_tests.rs`, split b
 sidebar tree, menus, environments, toolbar, tool wizards, tasks, updates and so on) and read the app's state and
 storage. They never build the real update runner.
 
-There is no hosted CI and no GitHub Actions workflow. `scripts/check.sh` runs `cargo fmt --check`, clippy with
-`-D warnings`, `cargo deny check` and the workspace tests, starting the containers only if they are down and
+GitHub Actions run the checks and build the releases (D-130): `.github/workflows/ci.yml` on every push to `main`
+and every pull request (fmt, clippy and `cargo deny` on Linux; the tests on macOS, where the runners have no Docker
+and the tests that need a server skip themselves, and on Linux with the `kerno-*` containers);
+`.github/workflows/release.yml` from a tag `v<version>` (the scripts below on an Apple Silicon runner and an arm64
+Linux runner, then `SHA256SUMS` and a draft release). The same steps run locally: `scripts/check.sh` runs
+`cargo fmt --check`, clippy with `-D warnings`, `cargo deny check` and the workspace tests, starting the
+containers only if they are down and
 stopping them only if it started them; it refuses to start when the load average is above the core count.
 `scripts/release.sh [version]` builds the macOS `.dmg` and the Linux packages locally, starts each Linux package in
 clean containers (`scripts/check-linux-packages.sh`), writes `dist/SHA256SUMS` and prints the `gh release create`

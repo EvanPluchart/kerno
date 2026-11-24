@@ -1,0 +1,165 @@
+# Builds a release on GitHub's runners (free for a public repository) with the scripts a local
+# release uses, and opens a DRAFT release holding the packages:
+#   git tag -a v2026.12.1 -m "Kerno 2026.12.1" && git push origin v2026.12.1
+# The tag must be v<the workspace version of Cargo.toml>. Nothing is offered to an installed Kerno
+# while the release is a draft: download the packages from it, try them, then publish it by hand
+# (the release's page, or `gh release edit v2026.12.1 --draft=false`).
+# "Run workflow" builds the same packages from any branch as a dry run: they are the run's
+# artifacts, and no release is made unless "draft" is ticked (then a draft named "dry run", to
+# delete afterwards).
+#   macos    scripts/bundle-macos.sh on Apple Silicon: the .dmg, signed ad hoc, launched once
+#   linux    scripts/bundle-linux.sh on arm64: aarch64 built natively and x86_64 cross-compiled in
+#            the image of packaging/linux, then the aarch64 packages started in clean containers
+#   linux-x86_64  the x86_64 packages started in clean containers on an x86_64 runner: nothing is
+#            emulated here, not even for the check
+#   publish  SHA256SUMS over the seven packages, then the draft
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: Also open a draft release named "dry run" with the packages
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the workspace version, and compare it with the tag
+        id: read
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME is not v$version, the workspace version in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: macOS (arm64)
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build, sign, launch once and pack
+        run: scripts/bundle-macos.sh
+      - name: Name the disk image as the updater looks for it
+        run: mv "dist/Kerno-$VERSION.dmg" "dist/Kerno-$VERSION-macos-$(uname -m).dmg"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux (aarch64, x86_64)
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build both architectures
+        run: KERNO_JOBS=$(nproc) scripts/bundle-linux.sh
+      - name: Start every aarch64 package in clean containers
+        run: scripts/check-linux-packages.sh aarch64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-x86_64:
+    name: Linux x86_64 packages start
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux
+          path: dist
+      # An artifact does not keep the executable bit.
+      - run: chmod 755 dist/*.AppImage
+      - name: Start every x86_64 package in clean containers
+        run: scripts/check-linux-packages.sh x86_64
+
+  publish:
+    name: checksums and draft release
+    needs: [version, macos, linux, linux-x86_64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          # The seven packages of scripts/release.sh, in its order; a missing one fails here.
+          files=("Kerno-$VERSION-macos-arm64.dmg")
+          for arch in aarch64 x86_64; do
+            deb_arch=$([ "$arch" = aarch64 ] && echo arm64 || echo amd64)
+            files+=("kerno-$VERSION-linux-$arch.tar.gz" "kerno_${VERSION}_$deb_arch.deb" "Kerno-$VERSION-$arch.AppImage")
+          done
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$(ls | wc -l)" = 8 ] || { echo "::error::dist/ holds something else than the 7 packages and SHA256SUMS"; ls -la; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          retention-days: 7
+      - name: Open the draft release
+        if: github.ref_type == 'tag' || inputs.draft
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME title="Kerno $VERSION"
+            notes=(--generate-notes)
+            [ -f "docs/release-notes/v$VERSION.md" ] && notes=(--notes-file "docs/release-notes/v$VERSION.md")
+            gh release create "$tag" dist/* --draft --verify-tag --title "$title" "${notes[@]}"
+          else
+            # A draft's tag is made only when the draft is published: this one is to delete.
+            tag=v$VERSION-dry-run.$GITHUB_RUN_NUMBER
+            gh release create "$tag" dist/* --draft --target "$GITHUB_SHA" \
+              --title "Kerno $VERSION (dry run $GITHUB_RUN_NUMBER, delete me)" \
+              --notes "A dry run of the release workflow from $GITHUB_REF_NAME at $GITHUB_SHA. Never publish it."
+          fi
+          echo "Draft release $tag: $(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"

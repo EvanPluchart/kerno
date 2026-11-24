@@ -409,10 +409,13 @@ and a context-menu or palette entry where it fits §3.
 - `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo fmt --check` clean, `cargo deny check`
   clean.
 - Linux: the workspace builds in a Linux container (Docker, Debian/Ubuntu image with GPUI's system deps,
-  `nice`, `-j 3`). No GitHub Actions at all (owner, 2026-11-13: Actions minutes cost money): delete
-  `.github/workflows/`; `scripts/check.sh` runs fmt, clippy, deny and the tests with the containers locally,
-  and `scripts/release.sh` builds the macOS and Linux artifacts with a `SHA256SUMS` file and prints the
-  `gh release create` command for the owner, never runs it. Do not create a remote or push.
+  `nice`, `-j 3`). GitHub Actions do the checks and the release builds (owner, 2026-11-24: Actions are free
+  on a public repository; this replaces the rule of 2026-11-13 that forbade them):
+  `.github/workflows/ci.yml` runs fmt, clippy, deny and the tests on every push to main and every pull
+  request; `.github/workflows/release.yml` builds the macOS and Linux artifacts with a `SHA256SUMS` file
+  from a tag `vX.Y.Z` and opens a draft release, which the owner publishes. `scripts/check.sh` and
+  `scripts/release.sh` stay the same checks and the same build run locally. Pushing, tagging and publishing
+  stay the owner's word, each time.
 - Packaging scripts: `scripts/bundle-macos.sh` (`.app` + `.dmg`, ad-hoc signed) and
   `scripts/bundle-linux.sh` (tarball + `.desktop` file; AppImage if straightforward).
 
