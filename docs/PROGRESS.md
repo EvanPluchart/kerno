@@ -1844,3 +1844,8 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   cleanup waited behind it, and every other MySQL test with it): the folder backup's driver tests now run under
   a guard that kills the test's connections when its body ends or after 120 s, from a thread of its own; the
   dialog's close of the session is bounded too.
+- The CI of `main` after K63: on Windows clippy named two test constants used only by Unix-gated tests (now
+  gated the same way); on Linux the MySQL 5.1 server blocked the runner ("Host … is blocked because of many
+  connection errors") once the folder backup's tests had added to the connections that fail on purpose: a 5.x
+  server counts them only for a host whose name it can resolve, which a runner's is and this Mac's is not. The
+  four legacy test servers start with `--max_connect_errors=1000000`.

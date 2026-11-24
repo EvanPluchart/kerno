@@ -146,6 +146,11 @@ services:
       MYSQL_USER: kerno
       MYSQL_PASSWORD: kerno_test_pw
     command: &legacy-command
+      # The tests make connections fail on purpose (an old password hash, an
+      # old TLS, a client too new for the server). A 5.x server blocks a
+      # host after 10 such errors in a row when it can resolve its name, as
+      # on a CI runner; these servers never block.
+      - --max_connect_errors=1000000
       - --character-set-server=utf8
       - --ssl-ca=/kerno-tls/ca.crt
       - --ssl-cert=/kerno-tls/server.crt
@@ -199,6 +204,7 @@ services:
     # The server's own default character set (latin1), as most 5.1 servers
     # ran; the fixture's databases are utf8.
     command:
+      - --max_connect_errors=1000000
       - --ssl-ca=/kerno-tls/ca.crt
       - --ssl-cert=/kerno-tls/server.crt
       - --ssl-key=/kerno-tls/server-legacy.key

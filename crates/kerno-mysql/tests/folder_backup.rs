@@ -34,9 +34,11 @@ const OLD: &str = "kerno_test_k63_old";
 const HELD: &str = "kerno_test_k63_held";
 const LOST: &str = "kerno_test_k63_lost";
 const NAMES: &str = "kerno_test_k63_names";
+#[cfg(unix)]
 const MOVING: &str = "kerno_test_k63_moving";
 const WAIT: &str = "kerno_test_k63_wait";
 const SIZES: &str = "kerno_test_k63_sizes";
+#[cfg(unix)]
 const BUSY: &str = "kerno_test_k63_busy";
 const ARGS: &str = "kerno_test_k63_args";
 const STUCK: &str = "kerno_test_k63_stuck";
