@@ -2725,6 +2725,11 @@ mod tests {
             .map(String::as_str)
             .skip_while(|a| !a.starts_with("--verbose"))
             .collect();
+        // The file's path is joined with the system's separator.
+        let file = format!(
+            "--result-file={}",
+            job.folder.join("0001-big.part01.sql").display()
+        );
         assert_eq!(
             tail,
             [
@@ -2732,7 +2737,7 @@ mod tests {
                 "--single-transaction",
                 "--skip-triggers",
                 "--hex-blob",
-                "--result-file=/backups/db-folder/0001-big.part01.sql",
+                file.as_str(),
                 "--set-gtid-purged=OFF",
                 "--where=`id` < 251",
                 "--skip-add-locks",
