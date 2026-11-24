@@ -97,6 +97,7 @@ use crate::schema::TableRef;
 use crate::ssh::Tunnel;
 
 mod archive;
+pub mod mysql_folder;
 mod roles;
 
 pub use archive::{
@@ -1157,6 +1158,9 @@ pub struct MySqlBackup {
     pub hex_blob: bool,
     /// `--skip-comments` when off.
     pub comments: bool,
+    /// The folder backup's mysqldump processes at once, with
+    /// [`BackupFormat::Directory`] ([`mysql_folder`], K63).
+    pub jobs: Option<u32>,
 }
 
 impl Default for MySqlBackup {
@@ -1171,6 +1175,7 @@ impl Default for MySqlBackup {
             disable_keys: true,
             hex_blob: true,
             comments: true,
+            jobs: None,
         }
     }
 }
@@ -1909,6 +1914,10 @@ pub fn backup_command(
                 "MySQL and MariaDB backups are SQL scripts; the other formats are PostgreSQL's",
             )?;
             refuse(
+                my.jobs.is_some(),
+                "several mysqldump at once write a folder, one file per table",
+            )?;
+            refuse(
                 !options.schemas.is_empty(),
                 "a MySQL backup is of one database: name its tables",
             )?;
@@ -2273,18 +2282,38 @@ fn sql_script_command(
 }
 
 /// The format of a backup to restore: a folder holding `toc.dat` is a
-/// directory archive, a file starting with `PGDMP` a custom archive, one
+/// directory archive (a folder holding Kerno's [`mysql_folder::MANIFEST`]
+/// for MySQL and MariaDB), a file starting with `PGDMP` a custom archive, one
 /// with `ustar` at byte 257 a tar archive (pg_dump's tar has `toc.dat`
 /// first), anything else a SQL script. Blocking.
 pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFormat, String> {
     let format = if path.is_dir() {
-        if path.join("toc.dat").is_file() {
-            BackupFormat::Directory
-        } else {
-            return Err(format!(
-                "{} is a folder without toc.dat: not a pg_dump directory archive.",
-                path.display()
-            ));
+        match engine {
+            Engine::Postgres if path.join("toc.dat").is_file() => BackupFormat::Directory,
+            // A MySQL / MariaDB backup of one file per table (K63).
+            Engine::MySql | Engine::MariaDb if path.join(mysql_folder::MANIFEST).is_file() => {
+                BackupFormat::Directory
+            }
+            Engine::MySql | Engine::MariaDb if path.join("toc.dat").is_file() => {
+                return Err(format!(
+                    "{} is a PostgreSQL archive: MySQL and MariaDB restore SQL files.",
+                    path.display()
+                ));
+            }
+            Engine::MySql | Engine::MariaDb => {
+                return Err(format!(
+                    "{} is a folder without {}: not a backup Kerno made of a MySQL or MariaDB \
+                     database.",
+                    path.display(),
+                    mysql_folder::MANIFEST
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "{} is a folder without toc.dat: not a pg_dump directory archive.",
+                    path.display()
+                ));
+            }
         }
     } else {
         let mut start = Vec::new();
@@ -2299,7 +2328,7 @@ pub fn guess_format(path: &Path, engine: Engine) -> std::result::Result<BackupFo
             BackupFormat::Sql
         }
     };
-    if format != BackupFormat::Sql && engine != Engine::Postgres {
+    if matches!(format, BackupFormat::Custom | BackupFormat::Tar) && engine != Engine::Postgres {
         return Err(format!(
             "{} is a PostgreSQL archive: MySQL and MariaDB restore SQL files.",
             path.display()
@@ -4868,6 +4897,24 @@ mod tests {
             );
         }
         assert_eq!(guess_format(&script, Engine::MySql), Ok(BackupFormat::Sql));
+        // A MySQL / MariaDB folder backup is a folder with Kerno's manifest
+        // (K63); another folder is not offered as one.
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join(mysql_folder::MANIFEST), b"{}").unwrap();
+        for engine in [Engine::MySql, Engine::MariaDb] {
+            assert_eq!(guess_format(&folder, engine), Ok(BackupFormat::Directory));
+            assert!(
+                guess_format(&empty, engine)
+                    .unwrap_err()
+                    .contains("without kerno-backup.json")
+            );
+        }
+        assert!(
+            guess_format(&folder, Engine::Postgres)
+                .unwrap_err()
+                .contains("without toc.dat")
+        );
         assert!(
             guess_format(&dir.path().join("absent"), Engine::Postgres)
                 .unwrap_err()

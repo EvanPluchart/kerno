@@ -1035,7 +1035,8 @@ fn the_options_page_changes_the_command(cx: &mut TestAppContext) {
     app.wait_backup(cx, &dialog, &["ready"]);
     app.to_settings(cx, &dialog);
     let state = |cx: &mut TestAppContext| app.wizard_state(cx, &dialog);
-    assert!(!app.has(cx, ("backup-format", 1usize)), "SQL only");
+    // Plain SQL, or the folder of one file per table (K63).
+    assert!(app.has(cx, ("backup-format", 1usize)) && !app.has(cx, ("backup-format", 2usize)));
     app.tap(cx, ("backup-method", 1usize));
     app.tap(cx, "backup-events");
     app.tap(cx, "backup-routines");

@@ -24,7 +24,7 @@ use kerno_core::tools::{
     BackupFormat, BackupOptions, ClientFamily, DumpMethod, EngineBackup, RestoreOptions,
 };
 
-use super::{BackupDialog, Input, Loaded, Mode, Purpose, Step, View, is_view, refusal_text};
+use super::{BackupDialog, Input, Loaded, Mode, Purpose, Step, View, is_view};
 use crate::settings_ui::{self, OptionCards};
 
 /// The formats the simple view offers, the default first: PostgreSQL's
@@ -188,11 +188,17 @@ impl BackupDialog {
     }
 
     /// The simple backup's "Faster" is ticked (K48, D-117): a PostgreSQL
-    /// directory archive, written by pg_dump on [`faster_jobs`] connections.
+    /// directory archive written by pg_dump on [`faster_jobs`] connections,
+    /// or a MySQL / MariaDB folder of one file per table written by that
+    /// many mysqldump at once (K63, D-135).
     pub(super) fn faster_backup(&self, cx: &App) -> bool {
-        self.family == ClientFamily::Postgres
-            && self.backup.format == BackupFormat::Directory
-            && self.faster_jobs_typed(cx)
+        self.backup.format == BackupFormat::Directory && self.faster_jobs_typed(cx)
+    }
+
+    /// The simple backup's "Block writes during the backup" is ticked (K63):
+    /// the folder backup holds the server's read lock ("lock all tables").
+    pub(super) fn blocks_writes(&self) -> bool {
+        matches!(&self.backup.engine, EngineBackup::MySql(my) if my.method == DumpMethod::LockAllTables)
     }
 
     /// The simple restore's "Faster" is ticked: pg_restore on
@@ -208,9 +214,13 @@ impl BackupDialog {
         let (format, jobs) = if on {
             (BackupFormat::Directory, faster_jobs().to_string())
         } else {
-            (BackupFormat::Custom, String::new())
+            (simple_formats(self.family)[0], String::new())
         };
         self.backup.format = format;
+        // The read lock is the faster backup's own choice in this view.
+        if !on && let EngineBackup::MySql(my) = &mut self.backup.engine {
+            my.method = DumpMethod::default();
+        }
         self.jobs
             .update(cx, |input, cx| input.set_value(jobs, window, cx));
         cx.notify();
@@ -238,10 +248,15 @@ impl BackupDialog {
                     "the format",
                 );
                 note(self.backup.content != defaults.content, "the content");
-                note(
-                    self.backup.engine != defaults.engine,
-                    "the dump tool's options",
-                );
+                // The jobs are the Jobs field's; "Faster" shows the read lock.
+                let mut shown = self.backup.engine.clone();
+                if let EngineBackup::MySql(my) = &mut shown {
+                    my.jobs = None;
+                    if faster && my.method == DumpMethod::LockAllTables {
+                        my.method = DumpMethod::default();
+                    }
+                }
+                note(shown != defaults.engine, "the dump tool's options");
                 // The jobs count only with the directory format, the only
                 // one pg_dump runs them for.
                 let jobs =
@@ -295,6 +310,12 @@ impl BackupDialog {
                 let mut defaults = BackupOptions::new(self.engine, self.database.clone());
                 if simple_formats(self.family).contains(&self.backup.format) || faster {
                     defaults.format = self.backup.format;
+                }
+                if let EngineBackup::MySql(my) = &mut defaults.engine
+                    && faster
+                    && self.blocks_writes()
+                {
+                    my.method = DumpMethod::LockAllTables;
                 }
                 self.backup = defaults;
                 self.selection.complete = true;
@@ -516,6 +537,12 @@ impl BackupDialog {
                  some of its tables."
                     .into()
             }
+            EngineBackup::MySql(_) if self.backup.format == BackupFormat::Directory => {
+                "A folder of SQL scripts, one per table (a large table in several), written by \
+                 several mysqldump at once and run back by several mysql clients. The procedures, \
+                 functions, triggers and views come last, in their own files."
+                    .into()
+            }
             EngineBackup::MySql(my) => {
                 let read = match my.method {
                     DumpMethod::SingleTransaction => {
@@ -633,14 +660,31 @@ impl BackupDialog {
         let hint = self.format_hint();
         // pg_dump dumps several tables at once (`--jobs`) only into a
         // directory archive: offered beside PostgreSQL's archive (K48).
-        let speed = (self.family == ClientFamily::Postgres
-            && matches!(
+        // MySQL and MariaDB: several mysqldump of Kerno's own, into a folder
+        // (K63).
+        let speed = match self.family {
+            ClientFamily::Postgres => matches!(
                 self.backup.format,
                 BackupFormat::Custom | BackupFormat::Directory
-            ))
+            ),
+            ClientFamily::MySql => matches!(
+                self.backup.format,
+                BackupFormat::Sql | BackupFormat::Directory
+            ),
+        }
         .then(|| {
-            let hint = "The backup is then a folder, one file per table, which Kerno restores like \
-                        any backup. A single large table is still read by one connection.";
+            let hint = match self.family {
+                ClientFamily::Postgres => {
+                    "The backup is then a folder, one file per table, which Kerno restores like \
+                     any backup. A single large table is still read by one connection."
+                }
+                ClientFamily::MySql => {
+                    "The backup is then a folder, one file per table, which Kerno restores on \
+                     several connections too. A large table with a single-column whole-number \
+                     key is read in several parts at once; one without such a key is still read \
+                     by one connection."
+                }
+            };
             row(
                 "Speed",
                 v_flex()
@@ -662,6 +706,62 @@ impl BackupDialog {
                             .test_support()
                             .text_xs()
                             .text_color(theme.muted_foreground)
+                            .child(hint)
+                            .test_text(hint),
+                    ),
+                cx,
+            )
+        });
+        let consistency = (self.family == ClientFamily::MySql && faster).then(|| {
+            let lacks = self.can_lock == Some(false);
+            let on = self.blocks_writes();
+            let hint = if lacks {
+                "This account lacks the RELOAD privilege that the lock needs: each table is read \
+                 at its own moment."
+            } else if on {
+                "Kerno holds a read lock on the whole server (FLUSH TABLES WITH READ LOCK) from \
+                 before the first table until the last: every table is read at the same moment, \
+                 and every write on the server waits until the backup ends. Kerno asks before it \
+                 starts."
+            } else {
+                "Each table is read at its own moment: an InnoDB table, or each part of a large \
+                 one, in one consistent snapshot; any other table locked while it is read. Two \
+                 tables are not read at the same instant, and a row whose key changes during the \
+                 backup can be missed or written twice."
+            };
+            row(
+                "Writes",
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Checkbox::new("simple-block-writes")
+                            .label(
+                                "Block writes during the backup, so that every table is read at \
+                                 the same moment",
+                            )
+                            .checked(on)
+                            .disabled(lacks && !on)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                if let EngineBackup::MySql(my) = &mut this.backup.engine {
+                                    my.method = if *checked {
+                                        DumpMethod::LockAllTables
+                                    } else {
+                                        DumpMethod::SingleTransaction
+                                    };
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("simple-block-writes-hint")
+                            .test_support()
+                            .text_xs()
+                            .text_color(if lacks {
+                                theme.warning
+                            } else {
+                                theme.muted_foreground
+                            })
                             .child(hint)
                             .test_text(hint),
                     ),
@@ -713,6 +813,7 @@ impl BackupDialog {
         ]
         .into_iter()
         .chain(speed)
+        .chain(consistency)
         .chain([row("Client", self.simple_client(cx), cx)])
         .collect()
     }
@@ -793,11 +894,20 @@ impl BackupDialog {
                 Some(Ok(input))
                     if matches!(input.format, BackupFormat::Custom | BackupFormat::Directory)
             );
-        let speed = parallel.then(|| {
+        // A MySQL / MariaDB folder backup loads its files on several clients
+        // (K63).
+        let folder = matches!(&self.input, Some(Ok(input)) if input.manifest.is_some());
+        let speed = (parallel || folder).then(|| {
             let jobs = faster_jobs();
             let on = self.faster_restore(cx);
-            let hint = "Not all or nothing: if a step fails, pg_restore goes on and what it \
-                        restored stays.";
+            let hint = if folder {
+                "Several tables load at once, and the parts of a large InnoDB table side by side; \
+                 the procedures, triggers and views come last. A failure stops the others and \
+                 keeps what was loaded."
+            } else {
+                "Not all or nothing: if a step fails, pg_restore goes on and what it restored \
+                 stays."
+            };
             row(
                 "Speed",
                 v_flex()
@@ -809,7 +919,9 @@ impl BackupDialog {
                             )))
                             .checked(on)
                             .on_click(cx.listener(move |this, checked: &bool, window, cx| {
-                                this.restore.single_transaction = !*checked;
+                                // One transaction is PostgreSQL's.
+                                this.restore.single_transaction =
+                                    !*checked && this.family == ClientFamily::Postgres;
                                 let value = if *checked {
                                     jobs.to_string()
                                 } else {
@@ -913,7 +1025,7 @@ impl BackupDialog {
             let text = format!(
                 "{} To run it anyway, open Advanced settings… and allow it on its Client commands \
                  step.",
-                refusal_text(found, self.family, &self.database)
+                self.refusal_words(found)
             );
             parts.push(
                 div()

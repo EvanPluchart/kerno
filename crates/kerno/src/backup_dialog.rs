@@ -62,7 +62,7 @@ use kerno_core::tools::{
     self, BackupContent, BackupFormat, BackupOptions, ClientFamily, ClientInstall, ClientRoots,
     ClientWanted, Compatibility, DumpMethod, EngineBackup, Finding, GlobalBackupOptions, NameVars,
     RefusedRole, RestoreOptions, ScriptLogLevel, ScriptOptions, Stamp, TaskSettings, Tool,
-    ToolCommand,
+    ToolCommand, mysql_folder,
 };
 use kerno_core::{Error, Session, exec};
 
@@ -166,6 +166,9 @@ enum ToolState {
         compat: Compatibility,
         /// The folder asked for that is not a known client: not used.
         ignored: Option<PathBuf>,
+        /// A backup this client is known to get wrong on this server (K63):
+        /// said, and Start refused.
+        refused: Option<String>,
     },
     /// Nothing can run, and why.
     Missing(String),
@@ -188,6 +191,10 @@ struct Input {
     list: Option<Arc<str>>,
     /// The extensions that list creates, read once off the UI thread.
     extensions: Vec<String>,
+    /// A MySQL / MariaDB folder backup's manifest (K63), once read.
+    manifest: Option<Arc<mysql_folder::Manifest>>,
+    /// The folder's file that holds [`Input::refusal`].
+    refusal_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +340,9 @@ pub struct BackupDialog {
     script: ScriptOptions,
     selection: Selection,
     objects: Loaded<Vec<SchemaEntry>>,
+    /// MySQL / MariaDB: whether the account may hold the read lock of the
+    /// folder backup (RELOAD), once read; `None` while unknown (K63).
+    can_lock: Option<bool>,
     databases: Loaded<Vec<String>>,
     /// Global backup: the databases the user left out (what a task keeps).
     excluded: BTreeSet<String>,
@@ -659,6 +669,7 @@ impl BackupDialog {
                 ..Selection::default()
             },
             objects: Loaded::Loading,
+            can_lock: None,
             databases: Loaded::Loading,
             excluded: BTreeSet::new(),
             closed: Vec::new(),
@@ -777,30 +788,37 @@ impl BackupDialog {
                 cx,
             ))
         };
+        let mysql = self.family == ClientFamily::MySql;
         self.tasks.push(cx.spawn(async move |this, cx| {
             let (session, own) = match session {
                 None => (Ok(meta), false),
                 Some(opening) => (opening.await, true),
             };
-            let loaded = match session {
-                Err(error) => Loaded::Failed(error_text(&error)),
+            let (loaded, can_lock) = match session {
+                Err(error) => (Loaded::Failed(error_text(&error)), None),
                 Ok(session) => {
                     let reading = cx.update(|cx| {
                         bridge::spawn(cx, async move {
                             let objects = fetch_objects(&*session, &database).await;
+                            let can_lock = if mysql {
+                                mysql_folder::can_lock(&session).await.ok()
+                            } else {
+                                None
+                            };
                             if own {
                                 session.close().await;
                             }
-                            objects
+                            (objects, can_lock)
                         })
                     });
                     match reading.await {
-                        Ok(objects) => Loaded::Ready(objects),
-                        Err(error) => Loaded::Failed(error_text(&error)),
+                        (Ok(objects), can_lock) => (Loaded::Ready(objects), can_lock),
+                        (Err(error), _) => (Loaded::Failed(error_text(&error)), None),
                     }
                 }
             };
             let _ = this.update(cx, |this, cx| {
+                this.can_lock = can_lock;
                 if let Loaded::Ready(objects) = &loaded
                     && this.selection.current.is_none()
                 {
@@ -977,8 +995,9 @@ impl BackupDialog {
     fn choose_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picking = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            // A directory archive is a folder.
-            directories: self.mode == Mode::Restore && self.engine == Engine::Postgres,
+            // A directory archive, or a MySQL folder backup (K63), is a
+            // folder.
+            directories: self.mode == Mode::Restore,
             multiple: false,
             prompt: Some(
                 match self.mode {
@@ -1159,6 +1178,10 @@ impl BackupDialog {
                         cx,
                     );
                     set(&self.jobs, text(pg.jobs), window, cx);
+                }
+                if let EngineBackup::MySql(my) = &options.engine {
+                    let jobs = my.jobs.map(|n| n.to_string()).unwrap_or_default();
+                    set(&self.jobs, jobs, window, cx);
                 }
                 let (schemas, tables) = (options.schemas.clone(), options.tables.clone());
                 self.backup = options;
@@ -1569,11 +1592,81 @@ impl BackupDialog {
                 None
             };
         }
+        if let EngineBackup::MySql(my) = &mut options.engine {
+            my.jobs = if options.format == BackupFormat::Directory {
+                Self::number(&self.jobs, "Jobs", 1..65, cx)?
+            } else {
+                None
+            };
+        }
         options.output_folder = PathBuf::from(Self::text(&self.folder, cx));
         options.file_pattern = Self::text(&self.pattern, cx);
         options.extra_args = self.extra_value(cx);
         options.auth_user = self.auth_user_value(cx);
         Ok(options)
+    }
+
+    /// Whether the backup is MySQL's or MariaDB's folder of one file per
+    /// table, written by several mysqldump at once (K63).
+    fn folder_backup_mode(&self) -> bool {
+        self.mode == Mode::Backup
+            && self.family == ClientFamily::MySql
+            && self.backup.format == BackupFormat::Directory
+    }
+
+    /// The folder backup as the settings stand.
+    fn folder_backup(&self, cx: &App) -> Result<mysql_folder::FolderBackup, String> {
+        let (ToolState::Ready { path, install, .. }, Some(params)) =
+            (&self.tool_state, self.run_params(cx))
+        else {
+            return Err("The command appears once the client is found.".into());
+        };
+        Ok(mysql_folder::FolderBackup {
+            tool_path: path.clone(),
+            params,
+            options: self.backup_options(cx)?,
+            folder: self.output_path(cx)?,
+            client: install.version.clone(),
+            range_threshold: mysql_folder::RANGE_THRESHOLD,
+        })
+    }
+
+    /// The restore of a MySQL / MariaDB folder backup as the settings
+    /// stand; `None` for any other file.
+    fn folder_restore(&self, cx: &App) -> Option<Result<mysql_folder::FolderRestore, String>> {
+        let Some(Ok(Input {
+            path: folder,
+            manifest: Some(manifest),
+            ..
+        })) = &self.input
+        else {
+            return None;
+        };
+        let (ToolState::Ready { path, install, .. }, Some(params)) =
+            (&self.tool_state, self.run_params(cx))
+        else {
+            return Some(Err("The command appears once the client is found.".into()));
+        };
+        let jobs = match Self::number(&self.jobs, "Jobs", 1..65, cx) {
+            Ok(jobs) => jobs,
+            Err(why) => return Some(Err(why)),
+        };
+        let mut options = self.restore.clone();
+        options.database = self.database.clone();
+        options.input = folder.clone();
+        options.format = BackupFormat::Directory;
+        options.jobs = jobs;
+        options.extra_args = self.extra_value(cx);
+        options.auth_user = self.auth_user_value(cx);
+        options.allow_client_commands = self.allow_commands;
+        options.tool_version = install.version.clone();
+        Some(Ok(mysql_folder::FolderRestore {
+            tool_path: path.clone(),
+            params,
+            options,
+            manifest: (**manifest).clone(),
+            sent: Arc::default(),
+        }))
     }
 
     /// Whether the global backup writes databases (not the globals only).
@@ -1652,6 +1745,15 @@ impl BackupDialog {
     /// the override is on (the user goes in the settings).
     fn run_params(&self, cx: &App) -> Option<ConnectParams> {
         let mut params = self.params.clone()?;
+        // MySQL 5.1 and 5.5 offer TLS 1.0 only, which the clients built with
+        // OpenSSL 3 refuse ("unsupported protocol"): "prefer" goes without
+        // TLS there, as the connection itself does (K22, K63).
+        if self.engine == Engine::MySql
+            && self.server_version < (5, 6, 0)
+            && params.tls.mode == TlsMode::Prefer
+        {
+            params.tls.mode = TlsMode::Disable;
+        }
         if self.auth_user_value(cx).is_some() {
             let password = self.auth_password.read(cx).value().to_string();
             params.password = (!password.is_empty()).then(|| Secret::new(password));
@@ -1668,6 +1770,8 @@ impl BackupDialog {
         };
         let version = install.version.clone();
         let built = match self.mode {
+            // One mysqldump per table: the first table's stands for them.
+            Mode::Backup if self.folder_backup_mode() => self.folder_backup(cx)?.sample_command(),
             Mode::Backup => {
                 let options = self.backup_options(cx)?;
                 tools::backup_command(path, &params, &options, &self.output_path(cx)?)
@@ -1686,6 +1790,15 @@ impl BackupDialog {
                 let Some(Ok(input)) = &self.input else {
                     return Err("Choose the file to restore.".into());
                 };
+                // A folder backup: the first file's client stands for all.
+                if let Some(folder) = self.folder_restore(cx) {
+                    let folder = folder?;
+                    let first = folder.manifest.files().next().map(str::to_string);
+                    return match first {
+                        Some(first) => folder.file_command(&first).map_err(|e| error_text(&e)),
+                        None => Err("The backup's folder holds no file.".into()),
+                    };
+                }
                 let mut options = self.restore.clone();
                 options.database = self.database.clone();
                 options.input = input.path.clone();
@@ -1788,6 +1901,19 @@ impl BackupDialog {
         {
             return compat.warning(self.engine);
         }
+        if let ToolState::Ready {
+            refused: Some(why), ..
+        } = &self.tool_state
+        {
+            return Some(why.clone());
+        }
+        if self.can_lock == Some(false) && self.locks_for_backup(cx) {
+            return Some(
+                "This account lacks the RELOAD privilege that the read lock (“lock all tables”, \
+                 “block writes”) needs: choose another way to keep the backup consistent."
+                    .into(),
+            );
+        }
         if matches!(
             &self.input,
             Some(Ok(Input {
@@ -1815,9 +1941,47 @@ impl BackupDialog {
         }
     }
 
+    /// Runs the backup. A folder backup that holds the read lock (K63) is
+    /// confirmed first, as a write: twice on production.
+    pub fn back_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.locks_for_backup(cx) {
+            self.back_up_now(window, cx);
+            return;
+        }
+        let view = cx.entity();
+        sql_confirm::open(
+            Confirmation {
+                title: format!("Block writes on “{}”", self.name),
+                explanation: format!(
+                    "Kerno holds this read lock from before the first table is read until the \
+                     last one is: every write on the server of “{}”, to any database, waits \
+                     until the backup of “{}” ends. Cancel releases it.",
+                    self.name, self.database
+                ),
+                statement: Statement::Fixed("FLUSH TABLES WITH READ LOCK".into()),
+                action: "Back up",
+                destructive: false,
+                connection: self.name.clone(),
+                environment: self.environment.clone(),
+                writes: true,
+            },
+            window,
+            cx,
+            move |_, window, cx| view.update(cx, |this, cx| this.back_up_now(window, cx)),
+        );
+    }
+
+    /// Whether the backup will hold the server's read lock (K63).
+    fn locks_for_backup(&self, cx: &App) -> bool {
+        self.folder_backup_mode()
+            && self
+                .backup_options(cx)
+                .is_ok_and(|options| matches!(&options.engine, EngineBackup::MySql(my) if my.method == DumpMethod::LockAllTables))
+    }
+
     /// Runs the backup; a file or folder already there is replaced only
     /// once confirmed.
-    pub fn back_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn back_up_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Ok(command), Ok(output)) = (self.command(cx), self.output_path(cx)) else {
             return;
         };
@@ -1846,11 +2010,17 @@ impl BackupDialog {
             return;
         }
         if self.mode == Mode::Backup && self.backup.format == BackupFormat::Directory {
-            // pg_dump writes a directory archive only into a new folder.
+            // pg_dump writes a directory archive only into a new folder; a
+            // MySQL folder backup too, so that a failure removes only what it
+            // made (K63).
+            let why = if self.family == ClientFamily::Postgres {
+                "pg_dump writes a directory archive into a new folder"
+            } else {
+                "the backup is written into a new folder"
+            };
             window.push_notification(
                 Notification::warning(SharedString::from(format!(
-                    "{} already exists: pg_dump writes a directory archive into a new folder. \
-                     Change the file name.",
+                    "{} already exists: {why}. Change the file name.",
                     output.display()
                 ))),
                 cx,
@@ -1994,89 +2164,106 @@ impl BackupDialog {
             })
             .map(|(path, list)| (path, list, self.left_out()));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let running = bridge::spawn(cx, async move {
-            // The time of the file it replaces, to tell whether the tool
-            // opened it; not the clock, which Linux's file times can be a
-            // tick behind (K65).
-            let modified = |path: &Path| {
-                std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-            };
-            let earlier = output
-                .as_ref()
-                .filter(|(_, existed)| *existed)
-                .map(|(path, _)| modified(path));
-            if let Some(input) = &command.stdin
-                && let Ok(meta) = tokio::fs::metadata(input).await
-            {
-                total.store(meta.len(), Ordering::Relaxed);
-            }
-            let written = match &list {
-                None => Ok(()),
-                Some((path, list, left_out)) => {
-                    write_new(path, &tools::list_without(list, left_out))
+        // A MySQL / MariaDB folder backup and its restore run several tools
+        // at once (K63).
+        let folder_backup = self.folder_backup_mode().then(|| self.folder_backup(cx));
+        let folder_restore = if self.mode == Mode::Restore {
+            self.folder_restore(cx)
+        } else {
+            None
+        };
+        if let Some(Ok(job)) = &folder_restore {
+            self.feed = Some((job.sent.clone(), total.clone()));
+        }
+        let running: Task<Ended> = if let Some(job) = folder_backup {
+            self.run_folder_backup(job, sender, cancel, cx)
+        } else if let Some(job) = folder_restore {
+            run_folder_restore(job, total, sender, cancel, cx)
+        } else {
+            bridge::spawn(cx, async move {
+                // The time of the file it replaces, to tell whether the tool
+                // opened it; not the clock, which Linux's file times can be a
+                // tick behind (K65).
+                let modified = |path: &Path| {
+                    std::fs::metadata(path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                };
+                let earlier = output
+                    .as_ref()
+                    .filter(|(_, existed)| *existed)
+                    .map(|(path, _)| modified(path));
+                if let Some(input) = &command.stdin
+                    && let Ok(meta) = tokio::fs::metadata(input).await
+                {
+                    total.store(meta.len(), Ordering::Relaxed);
                 }
-            };
-            // A directory archive goes into a folder pg_dump makes. One there
-            // now (made since Start was checked) is not this run's: it is
-            // never removed, and nothing runs (K48).
-            let taken = output
-                .as_ref()
-                .filter(|_| directory)
-                .map(|(path, _)| path)
-                .filter(|path| std::fs::symlink_metadata(path).is_ok());
-            let outcome = match written {
-                Ok(()) if taken.is_some() => Err(Error::Config(format!(
-                    "{} already exists: pg_dump writes a directory archive into a new folder. \
+                let written = match &list {
+                    None => Ok(()),
+                    Some((path, list, left_out)) => {
+                        write_new(path, &tools::list_without(list, left_out))
+                    }
+                };
+                // A directory archive goes into a folder pg_dump makes. One there
+                // now (made since Start was checked) is not this run's: it is
+                // never removed, and nothing runs (K48).
+                let taken = output
+                    .as_ref()
+                    .filter(|_| directory)
+                    .map(|(path, _)| path)
+                    .filter(|path| std::fs::symlink_metadata(path).is_ok());
+                let outcome = match written {
+                    Ok(()) if taken.is_some() => Err(Error::Config(format!(
+                        "{} already exists: pg_dump writes a directory archive into a new folder. \
                      Nothing was run.",
-                    taken
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default()
-                ))),
-                Ok(()) => {
-                    tools::run(
-                        command,
-                        move |line| {
-                            let _ = sender.send(line);
-                        },
-                        cancel,
-                    )
-                    .await
-                }
-                Err(error) => Err(Error::Config(format!(
-                    "Kerno could not write the archive's list for pg_restore: {error}. Nothing \
+                        taken
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    ))),
+                    Ok(()) => {
+                        tools::run(
+                            command,
+                            move |line| {
+                                let _ = sender.send(line);
+                            },
+                            cancel,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(Error::Config(format!(
+                        "Kerno could not write the archive's list for pg_restore: {error}. Nothing \
                      was run."
-                ))),
-            };
-            if let Some((path, ..)) = &list {
-                let _ = std::fs::remove_file(path);
-            }
-            let mut ended = Ended {
-                outcome,
-                size: None,
-                removed: false,
-            };
-            if let Some((path, existed)) = &output {
-                match &ended.outcome {
-                    Ok(status) if status.success() => ended.size = backup_size(path),
-                    // The tool stopped short: what it wrote is incomplete.
-                    // What it never opened (it failed to connect) may be an
-                    // earlier backup: kept.
-                    Ok(_) | Err(Error::Cancelled) if directory => {
-                        ended.removed = !existed && std::fs::remove_dir_all(path).is_ok();
-                    }
-                    Ok(_) | Err(Error::Cancelled) => {
-                        let written = earlier
-                            .as_ref()
-                            .is_none_or(|earlier| modified(path) != *earlier);
-                        ended.removed = written && std::fs::remove_file(path).is_ok();
-                    }
-                    Err(_) => {}
+                    ))),
+                };
+                if let Some((path, ..)) = &list {
+                    let _ = std::fs::remove_file(path);
                 }
-            }
-            ended
-        });
+                let mut ended = Ended {
+                    outcome,
+                    size: None,
+                    removed: false,
+                };
+                if let Some((path, existed)) = &output {
+                    match &ended.outcome {
+                        Ok(status) if status.success() => ended.size = backup_size(path),
+                        // The tool stopped short: what it wrote is incomplete.
+                        // What it never opened (it failed to connect) may be an
+                        // earlier backup: kept.
+                        Ok(_) | Err(Error::Cancelled) if directory => {
+                            ended.removed = !existed && std::fs::remove_dir_all(path).is_ok();
+                        }
+                        Ok(_) | Err(Error::Cancelled) => {
+                            let written = earlier
+                                .as_ref()
+                                .is_none_or(|earlier| modified(path) != *earlier);
+                            ended.removed = written && std::fs::remove_file(path).is_ok();
+                        }
+                        Err(_) => {}
+                    }
+                }
+                ended
+            })
+        };
         self.running = Some(cx.spawn_in(window, async move |this, cx| {
             // The channel closes once the tool ended and `run` returned.
             while let Some(line) = receiver.recv().await {
@@ -2114,6 +2301,49 @@ impl BackupDialog {
             }
         }));
         cx.notify();
+    }
+
+    /// Runs a MySQL / MariaDB folder backup (K63): reads the catalog and
+    /// holds the read lock on a session of its own, closed at the end.
+    fn run_folder_backup(
+        &self,
+        job: Result<mysql_folder::FolderBackup, String>,
+        sender: tokio::sync::mpsc::UnboundedSender<String>,
+        cancel: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) -> Task<Ended> {
+        let job = match job {
+            Ok(job) => job,
+            Err(why) => return Task::ready(Ended::refused(why)),
+        };
+        let opening = self.connections.read(cx).open_session(
+            &self.connection,
+            Some(self.database.clone()),
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            let session = match opening.await {
+                Ok(session) => session,
+                Err(error) => return Ended::refused(error_text(&error)),
+            };
+            let folder = job.folder.clone();
+            let work = cx.update(|cx| {
+                bridge::spawn(cx, async move {
+                    let on_line: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line| {
+                        let _ = sender.send(line);
+                    });
+                    let end = mysql_folder::back_up(job, session.clone(), on_line, cancel).await;
+                    session.close().await;
+                    let size = end.outcome.is_ok().then(|| backup_size(&folder)).flatten();
+                    Ended {
+                        outcome: end.outcome.map(|()| ExitStatus::default()),
+                        size,
+                        removed: end.removed,
+                    }
+                })
+            });
+            work.await
+        })
     }
 
     /// How much of the file a restore or script has sent to its tool:
@@ -2326,7 +2556,7 @@ impl BackupDialog {
             },
             Err(Error::Config(message)) => Step::Finished {
                 success: false,
-                text: message,
+                text: format!("{message}{}", if ended.removed { kept } else { "" }),
             },
             Err(error) => Step::Finished {
                 success: false,
@@ -2501,6 +2731,23 @@ impl BackupDialog {
     /// out of the archive, in words.
     fn shown(&self, command: &ToolCommand) -> String {
         let mut text = command.display();
+        if self.folder_backup_mode() {
+            text.push_str(
+                "  # one mysqldump per table (a large table per range of its key), several at \
+                 once, into the folder",
+            );
+        }
+        if let Some(Ok(Input {
+            manifest: Some(manifest),
+            ..
+        })) = &self.input
+            && self.mode == Mode::Restore
+        {
+            text.push_str(&format!(
+                "  # one mysql per file of the folder ({} files), the tables first",
+                manifest.files().count()
+            ));
+        }
         let left_out = self.left_out();
         if !left_out.is_empty()
             && command
@@ -2625,6 +2872,12 @@ impl BackupDialog {
                     compat.warning(self.engine).unwrap_or_default()
                 ),
                 (
+                    ToolState::Ready {
+                        refused: Some(why), ..
+                    },
+                    _,
+                ) => format!("old client: {why}"),
+                (
                     ToolState::Ready { .. },
                     Some(Ok(Input {
                         refusal: Some(found),
@@ -2747,6 +3000,23 @@ impl BackupDialog {
             .unwrap_or_default()
     }
 
+    /// The restore settings a saved task would keep; for tests.
+    #[cfg(test)]
+    pub fn task_restore(&self, cx: &App) -> Option<RestoreOptions> {
+        match self.task_settings(cx) {
+            Ok(TaskSettings::Restore(options)) => Some(options),
+            _ => None,
+        }
+    }
+
+    /// Whether the account may hold the folder backup's read lock, as
+    /// read; set by a test that plays an account without RELOAD.
+    #[cfg(test)]
+    pub fn set_can_lock(&mut self, can: Option<bool>, cx: &mut Context<Self>) {
+        self.can_lock = can;
+        cx.notify();
+    }
+
     /// The folder of the client in use; for tests.
     #[cfg(test)]
     pub fn client_in_use(&self) -> Option<PathBuf> {
@@ -2770,6 +3040,44 @@ struct Ended {
     outcome: kerno_core::Result<ExitStatus>,
     size: Option<u64>,
     removed: bool,
+}
+
+impl Ended {
+    /// A run that did not start, and why.
+    fn refused(why: String) -> Self {
+        Self {
+            outcome: Err(Error::Config(format!("{why} Nothing was run."))),
+            size: None,
+            removed: false,
+        }
+    }
+}
+
+/// Runs the restore of a MySQL / MariaDB folder backup (K63), its files'
+/// size first, against which the bytes sent are counted.
+fn run_folder_restore(
+    job: Result<mysql_folder::FolderRestore, String>,
+    total: Arc<AtomicU64>,
+    sender: tokio::sync::mpsc::UnboundedSender<String>,
+    cancel: Arc<AtomicBool>,
+    cx: &App,
+) -> Task<Ended> {
+    let job = match job {
+        Ok(job) => job,
+        Err(why) => return Task::ready(Ended::refused(why)),
+    };
+    bridge::spawn(cx, async move {
+        total.store(job.total(), Ordering::Relaxed);
+        let on_line: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line| {
+            let _ = sender.send(line);
+        });
+        let end = mysql_folder::restore(job, on_line, cancel).await;
+        Ended {
+            outcome: end.outcome.map(|()| ExitStatus::default()),
+            size: None,
+            removed: false,
+        }
+    })
 }
 
 /// The connection's route for the tools: its secrets (in memory) and, for
@@ -2932,6 +3240,24 @@ fn examine(job: Job) -> Examined {
                     job.server_version,
                 ),
                 ignored: pick.ignored,
+                // An old server needs an old client (K63): said before any
+                // backup runs, with a client found that works.
+                refused: (job.mode == Mode::Backup)
+                    .then(|| {
+                        let found: Vec<(PathBuf, tools::ToolVersion)> = detected
+                            .iter()
+                            .filter_map(|install| {
+                                Some((install.dir.clone(), install.version.clone()?))
+                            })
+                            .collect();
+                        mysql_folder::dump_client_problem(
+                            pick.install.version.as_ref(),
+                            job.engine,
+                            job.server_version,
+                            &found,
+                        )
+                    })
+                    .flatten(),
             },
         },
     };
@@ -2949,9 +3275,56 @@ fn examine(job: Job) -> Examined {
         archive_database: None,
         list: None,
         extensions: Vec::new(),
+        manifest: None,
+        refusal_file: None,
     };
     if let ToolState::Ready { path, install, .. } = &state {
-        if format == BackupFormat::Sql {
+        if format == BackupFormat::Directory && job.engine != Engine::Postgres {
+            // A folder backup of MySQL / MariaDB (K63): its manifest, and
+            // every file checked for client commands before any runs.
+            let manifest = match mysql_folder::read_manifest(&file) {
+                Ok(manifest) => manifest,
+                Err(problem) => {
+                    return Examined {
+                        tool: state,
+                        detected,
+                        input: Some(Err(problem)),
+                    };
+                }
+            };
+            let mut options =
+                RestoreOptions::new(job.engine, job.database, file.clone(), BackupFormat::Sql);
+            options.tool_version = install.version.clone();
+            for name in manifest.files() {
+                options.input = file.join(name);
+                let found =
+                    tools::restore_command(path, &job.params, &options).and_then(|command| {
+                        match &command.script_check {
+                            Some(check) => {
+                                tools::find_client_command(check, &AtomicBool::new(false))
+                            }
+                            None => Ok(None),
+                        }
+                    });
+                match found {
+                    Ok(None) => {}
+                    Ok(Some(found)) => {
+                        input.refusal = Some(found);
+                        input.refusal_file = Some(name.to_string());
+                        break;
+                    }
+                    Err(error) => {
+                        return Examined {
+                            tool: state,
+                            detected,
+                            input: Some(Err(error_text(&error))),
+                        };
+                    }
+                }
+            }
+            input.archive_database = Some(manifest.database.clone());
+            input.manifest = Some(Arc::new(manifest));
+        } else if format == BackupFormat::Sql {
             let mut options =
                 RestoreOptions::new(job.engine, job.database, file.clone(), BackupFormat::Sql);
             options.tool_version = install.version.clone();
@@ -3605,11 +3978,17 @@ impl BackupDialog {
     /// used, another version than the server's.
     fn client_warning(&self) -> Option<String> {
         let ToolState::Ready {
-            compat, ignored, ..
+            compat,
+            ignored,
+            refused,
+            ..
         } = &self.tool_state
         else {
             return None;
         };
+        if let Some(why) = refused {
+            return Some(why.clone());
+        }
         let note = ignored.as_ref().map(|dir| {
             format!(
                 "{} is not a client detected or added in Settings ▸ Local clients: it is not \
@@ -3629,6 +4008,9 @@ impl BackupDialog {
             return None;
         };
         let format = match (input.format, self.engine) {
+            (BackupFormat::Directory, Engine::MySql | Engine::MariaDb) => {
+                "Kerno's folder backup, one SQL file per table, run by the mysql client"
+            }
             (BackupFormat::Custom, _) => "Custom archive, restored by pg_restore",
             (BackupFormat::Directory, _) => "Directory archive, restored by pg_restore",
             (BackupFormat::Tar, _) => "Tar archive, restored by pg_restore",
@@ -3670,7 +4052,10 @@ impl BackupDialog {
         };
         let warning = self.client_warning();
         let missing = matches!(self.tool_state, ToolState::Missing(_));
-        let blocks = matches!(&self.tool_state, ToolState::Ready { compat, .. } if compat.blocks());
+        let blocks = matches!(
+            &self.tool_state,
+            ToolState::Ready { compat, refused, .. } if compat.blocks() || refused.is_some()
+        );
         v_flex()
             .gap_1()
             .child(
@@ -4245,7 +4630,29 @@ impl BackupDialog {
                     .iter()
                     .map(|method| (*method, method.label()))
                     .collect();
+                let format = self.backup.format;
                 vec![
+                    Self::field(
+                        "Format",
+                        h_flex()
+                            .gap_3()
+                            .child(Self::chips(
+                                "backup-format",
+                                &[
+                                    (BackupFormat::Sql, "Plain SQL"),
+                                    (BackupFormat::Directory, "Folder, one file per table"),
+                                ],
+                                format,
+                                |this, format| this.backup.format = format,
+                                cx,
+                            ))
+                            .when(format == BackupFormat::Directory, |this| {
+                                this.child(div().text_sm().child("Jobs"))
+                                    .child(Self::small_input("backup-jobs", &self.jobs, 60.))
+                            })
+                            .into_any_element(),
+                        cx,
+                    ),
                     Self::field(
                         "Consistency",
                         Self::chips(
@@ -4626,13 +5033,24 @@ impl BackupDialog {
                 |t, on| t.restore.single_transaction = on,
                 cx,
             )],
-            ClientFamily::MySql => vec![Self::check(
-                "restore-foreign-keys",
-                "Turn foreign-key checks off while it runs",
-                r.disable_foreign_keys,
-                |t, on| t.restore.disable_foreign_keys = on,
-                cx,
-            )],
+            ClientFamily::MySql => {
+                let mut options = vec![Self::check(
+                    "restore-foreign-keys",
+                    "Turn foreign-key checks off while it runs",
+                    r.disable_foreign_keys,
+                    |t, on| t.restore.disable_foreign_keys = on,
+                    cx,
+                )];
+                // A folder backup's files load on several clients (K63).
+                if archive {
+                    options.push(Self::field(
+                        "Jobs",
+                        Self::small_input("restore-jobs", &self.jobs, 60.),
+                        cx,
+                    ));
+                }
+                options
+            }
         };
         rows.push(Self::group("Settings", options));
         rows.push(self.render_advanced(cx));
@@ -4685,6 +5103,18 @@ impl BackupDialog {
         rows
     }
 
+    /// [`refusal_text`], naming the file of a folder backup that holds it.
+    pub(super) fn refusal_words(&self, found: &Finding) -> String {
+        let text = refusal_text(found, self.family, &self.database);
+        match &self.input {
+            Some(Ok(Input {
+                refusal_file: Some(name),
+                ..
+            })) => text.replacen("of this file", &format!("of the backup's file {name}"), 1),
+            _ => text,
+        }
+    }
+
     /// The client command a file holds, and the opt-in to run it anyway.
     fn render_check(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
@@ -4695,7 +5125,7 @@ impl BackupDialog {
         else {
             return div().into_any_element();
         };
-        let text = refusal_text(found, self.family, &self.database);
+        let text = self.refusal_words(found);
         v_flex()
             .gap_2()
             .p_2()
@@ -5564,6 +5994,8 @@ mod tests {
             archive_database: Some("shop".into()),
             list: None,
             extensions: Vec::new(),
+            manifest: None,
+            refusal_file: None,
         };
         let pg = RestoreOptions::new(Engine::Postgres, "shop_copy", "/b", BackupFormat::Sql);
         let my = RestoreOptions::new(Engine::MySql, "shop_copy", "/b", BackupFormat::Sql);

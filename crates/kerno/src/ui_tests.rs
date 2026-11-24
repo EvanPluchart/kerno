@@ -76,6 +76,7 @@ mod k72;
 mod legacy;
 mod menus;
 mod multi_run;
+mod mysql_folder;
 mod open_url;
 mod openssh;
 // A fake `aws` script (`kerno_core::testing::fake_aws`): Unix only (K64).

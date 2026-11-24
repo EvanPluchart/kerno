@@ -49,7 +49,7 @@ fn bounds(app: &Fixture, cx: &mut TestAppContext, id: &'static str) -> Bounds<Pi
 
 impl Fixture {
     /// Answers the save panel a click on `id` opens with `path`.
-    fn save_as(&self, cx: &mut TestAppContext, id: &'static str, path: &Path) {
+    pub(super) fn save_as(&self, cx: &mut TestAppContext, id: &'static str, path: &Path) {
         self.tap(cx, id);
         let path = path.to_path_buf();
         cx.simulate_new_path_selection(move |_| Some(path));
