@@ -4073,7 +4073,8 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   one batch per side (the execution channel's back-pressure) and copies each difference it keeps into two
   compact arenas (`BatchBuilder`, `ResultStore`), never a batch. It keeps 10,000 differences or 64 MiB of their
   values, whichever comes first; beyond, the counts go on and the tab and the script say they show the first
-  ones. Large values are compared byte for byte as they arrive, no hash: a row is held whole while it is
+  ones (once one is turned down nothing more is kept, so they are the first ones indeed: corrected after the
+  review; the script is written off the UI thread, and Swap clears the deletes' tick). Large values are compared byte for byte as they arrive, no hash: a row is held whole while it is
   compared, since the drivers deliver it whole. Measured: 1,000,000 rows against 1,000,000 in 1.7 to 2.9 s, the
   whole process at 19 MiB of peak resident memory at most (`docs/BENCH.md`).
 - **A snapshot per side.** Each side is one statement, so each is consistent with itself, not with the other:

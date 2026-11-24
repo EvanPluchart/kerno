@@ -23,6 +23,23 @@ fn drawn(app: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
     })
 }
 
+/// The action of the Edit menu's entry `name`, as the menu bar gives it to the window.
+fn edit_menu_action(cx: &mut TestAppContext, name: &str) -> Box<dyn gpui_kit::Action> {
+    let menus = cx.update(|cx| cx.get_menus()).unwrap();
+    let edit = menus.iter().find(|menu| menu.name == "Edit").unwrap();
+    edit.items
+        .iter()
+        .find_map(|item| match item {
+            gpui_kit::OwnedMenuItem::Action {
+                name: found,
+                action,
+                ..
+            } if found.as_str() == name => Some(action.boxed_clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no {name} in the Edit menu"))
+}
+
 /// The same table `t` in two schemas of the test `tag`: `1` only in the source, `3` with
 /// another name, `4` only in the target, `5` with another price (and so another `total`, which
 /// the server computes); `2` the same. `extra_a` only in the source, `extra_b` only in the
@@ -406,6 +423,28 @@ fn the_tab_counts_shows_and_filters_the_differences(cx: &mut TestAppContext) {
 
     // A row's values, whole, on both sides.
     app.on_data_compare(cx, &tab, |tab, _, cx| tab.select(3, cx));
+    // Edit ▸ Copy, run as the menu bar runs it, copies the row as ⌘C does.
+    // The menu bar acts on the active window, as the app's is when in front.
+    app.step(cx, |window, _| window.activate_window());
+    app.click(cx, ("data-compare-cell", (3usize << 12) | 1));
+    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("before".into()));
+    let copy = edit_menu_action(cx, "Copy");
+    assert_eq!(
+        cx.update(|cx| cx.active_window()),
+        Some(app.window.into()),
+        "the menu acts on this window"
+    );
+    assert!(cx.update(|cx| cx.is_action_available(copy.as_ref())));
+    let selected = cx.update(|cx| tab.read(cx).selected_index());
+    assert_eq!(selected, Some(3), "the row clicked");
+    cx.update(|cx| cx.dispatch_action(copy.as_ref()));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("5\te\t5.00\t10.00")
+    );
     let values = drawn(&app, cx)
         .into_iter()
         .find(|text| text.starts_with("id: "))
@@ -446,8 +485,8 @@ fn the_tab_counts_shows_and_filters_the_differences(cx: &mut TestAppContext) {
     }
 }
 
-/// Cancel stops both reads, on the servers too: a million rows against ten, cancelled once
-/// the first rows came.
+/// Cancel stops both reads, on the servers too: a million rows against 400,000, cancelled
+/// while both statements run; both leave the server.
 #[gpui_kit::test]
 fn cancel_stops_both_reads_on_the_servers(cx: &mut TestAppContext) {
     if !testing::available(Engine::Postgres) {
@@ -460,7 +499,7 @@ fn cancel_stops_both_reads_on_the_servers(cx: &mut TestAppContext) {
         &[
             &format!("CREATE SCHEMA {copy}"),
             &format!(
-                "CREATE TABLE {copy}.big_table AS SELECT * FROM analytics.big_table WHERE id <= 10"
+                "CREATE TABLE {copy}.big_table AS SELECT * FROM analytics.big_table WHERE id <= 400000"
             ),
             &format!("ALTER TABLE {copy}.big_table ADD PRIMARY KEY (id)"),
         ],
@@ -488,11 +527,15 @@ fn cancel_stops_both_reads_on_the_servers(cx: &mut TestAppContext) {
             .to_vec(),
         },
     };
-    // The compare's own statement: a data tab on the table reads `SELECT *`.
-    let marker = "\"padding\" FROM \"analytics\".\"big_table\" ORDER BY \"id\"";
+    // The compare's own statements: a data tab on the table reads `SELECT *`.
+    let markers = [
+        "\"padding\" FROM \"analytics\".\"big_table\" ORDER BY \"id\"".to_string(),
+        format!("\"padding\" FROM \"{copy}\".\"big_table\" ORDER BY \"id\""),
+    ];
+    let running = |marker: &String| running_on_server(Engine::Postgres, marker);
     let tab = app.open_data_compare(cx, spec);
-    app.wait_until(cx, "the read on the server", |_, _| {
-        running_on_server(Engine::Postgres, marker)
+    app.wait_until(cx, "both reads on the server", |_, _| {
+        markers.iter().all(running)
     });
     app.click(cx, "data-compare-cancel");
     assert_eq!(cx.update(|cx| tab.read(cx).state_text()), "cancelled");
@@ -504,10 +547,10 @@ fn cancel_stops_both_reads_on_the_servers(cx: &mut TestAppContext) {
             .any(|text| text.starts_with("Cancelled after")),
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while running_on_server(Engine::Postgres, marker) {
+    while markers.iter().any(running) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the source's read still runs on the server"
+            "a read still runs on the server"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -560,6 +603,40 @@ fn open_script_opens_a_query_tab_on_the_target_and_runs_nothing(cx: &mut TestApp
             .len(),
         1
     );
+    // F7: Swap forgets the deletes' tick: it was given for the other table.
+    app.on_data_compare(cx, &tab, |tab, window, cx| tab.swap(window, cx));
+    app.wait_until(cx, "the swapped compare", |_, cx| {
+        cx.update(|cx| tab.read(cx).state_text()) == "ready"
+    });
+    let swapped = app.data_script(cx, &tab);
+    assert!(!swapped.contains("DELETE FROM"), "{swapped}");
+    assert!(swapped.contains("Tick “Also delete"), "{swapped}");
+}
+
+/// The script is what makes this dangerous: run on a production target, it asks a second time
+/// before anything is written (the query tab's own rule).
+#[gpui_kit::test]
+fn a_production_target_asks_twice_before_the_script_writes(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let (_scratch, a, b) = scratch("production");
+    let mut config = testing::config(Engine::Postgres);
+    config.environment = kerno_core::environment::PRODUCTION.into();
+    // Production tabs start in manual commit; this test is about confirming.
+    config.auto_commit = Some(true);
+    let app = connected_as(cx, config);
+    let spec = app.data_spec(cx, &a, &b);
+    let _tab = app.data_compare_tab(cx, spec);
+    app.click(cx, "data-compare-open-script");
+    app.press(cx, &["secondary-shift-enter"]);
+    assert!(app.has(cx, "sql-production"));
+    app.click(cx, "sql-confirm");
+    assert!(
+        app.has(cx, "sql-preview"),
+        "one click is not enough on production"
+    );
+    assert_eq!(rows_of(&b), "2:b,3:C,4:d,5:e");
 }
 
 /// Two tables with the same rows say so, and there is no script to open.
@@ -615,4 +692,53 @@ fn a_read_only_target_opens_the_script_and_refuses_it_there(cx: &mut TestAppCont
     app.wait_until(cx, "the refusal", |app, cx| !app.outcomes(cx).is_empty());
     assert_eq!(app.outcomes(cx)[0], "failed []");
     assert_eq!(rows_of(&b), "2:b,3:C,4:d,5:e");
+}
+
+/// A source without a key is compared by the target's key: its rows are matched one by one,
+/// and two of them with one key stop the compare in words, before any script exists. (A
+/// target without a key is refused in the dialog: `the_dialog_picks_two_tables_…`.)
+#[gpui_kit::test]
+fn a_source_without_a_key_is_checked_while_it_is_read(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let (a, b) = ("kerno_test_dc_ui_nokey_a", "kerno_test_dc_ui_nokey_b");
+    let drop = |schema: &str| format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&drop(a), &drop(b)],
+        &[
+            &format!("CREATE SCHEMA {a}"),
+            &format!("CREATE TABLE {a}.t (id int, name text, price numeric(12,2), total numeric)"),
+            &format!("INSERT INTO {a}.t VALUES (1, 'a', 1, 2), (2, 'b', 2, 4)"),
+            &format!("CREATE SCHEMA {b}"),
+            &format!(
+                "CREATE TABLE {b}.t (id int PRIMARY KEY, name text, price numeric(12,2), \
+                 total numeric)"
+            ),
+            &format!("INSERT INTO {b}.t VALUES (1, 'a', 1, 2)"),
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let spec = app.data_spec(cx, a, b);
+    let tab = app.data_compare_tab(cx, spec.clone());
+    let counts = cx.update(|cx| tab.read(cx).counts());
+    assert_eq!((counts.only_in_source, counts.same), (1, 1));
+    // The same key twice in the source: refused while reading, no script.
+    on_server(
+        Engine::Postgres,
+        &format!("INSERT INTO {a}.t VALUES (2, 'c', 3, 6)"),
+    );
+    app.click(cx, "data-compare-refresh");
+    app.wait_until(cx, "the refusal", |_, cx| {
+        cx.update(|cx| tab.read(cx).state_text()) != "loading"
+    });
+    let state = cx.update(|cx| tab.read(cx).state_text());
+    assert!(
+        state.contains("The source holds more than one row with the key (2)"),
+        "{state}"
+    );
+    let titles = app.titles(cx).len();
+    app.click(cx, "data-compare-open-script");
+    assert_eq!(app.titles(cx).len(), titles);
 }

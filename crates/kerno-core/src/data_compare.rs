@@ -649,8 +649,13 @@ impl Keep {
             .sum()
     }
 
-    /// Room for one more difference of these rows.
+    /// Room for one more difference of these rows. Once one is turned down
+    /// nothing more is kept: the differences kept are the first ones, so a
+    /// kept child never misses a parent that came before it.
     fn room(&mut self, rows: [Option<(&RowBatch, usize)>; 2]) -> bool {
+        if !self.complete {
+            return false;
+        }
         let bytes: usize = rows
             .iter()
             .flatten()
@@ -2094,6 +2099,19 @@ mod tests {
         let small = three_rows(&plan, limits);
         assert_eq!((small.rows.len(), small.complete), (2, false));
         assert!(three_rows(&plan, Limits::default()).complete);
+        // F6: a large row turned down, a smaller one after it is not kept:
+        // the differences kept are the first ones.
+        let source = vec![
+            row(&[Some("1"), Some("a"), Some("1")]),
+            row(&[Some("2"), Some("a much longer value"), Some("1")]),
+            row(&[Some("3"), Some("b"), Some("1")]),
+        ];
+        let limits = Limits {
+            rows: 100,
+            bytes: 10,
+        };
+        let outcome = play(&plan, [batches(&source, 3, 9), Vec::new()], limits).unwrap();
+        assert_eq!(summary(&plan, &outcome), ["+ 1"]);
     }
 
     fn unique(name: &str, columns: &[&str], predicate: Option<&str>) -> IndexInfo {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::{FocusableExt as _, TestTextExt as _};
+use gpui_kit::base::{FocusableExt as _, TestTextExt as _, input};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
@@ -428,6 +428,8 @@ pub struct DataCompareTab {
     generation: u64,
     load: Vec<Task<()>>,
     grid_subscription: Option<Subscription>,
+    /// The script being written, off the UI thread.
+    writing: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -476,6 +478,7 @@ impl DataCompareTab {
             generation: 0,
             load: Vec::new(),
             grid_subscription: None,
+            writing: None,
             _subscriptions: vec![follow],
         };
         tab.reload(window, cx);
@@ -791,6 +794,8 @@ impl DataCompareTab {
         std::mem::swap(&mut spec.request.source, &mut spec.request.target);
         self.found = None;
         self.grid = None;
+        // A tick given for the other table never deletes from this one.
+        self.deletes = false;
         self.reload(window, cx);
     }
 
@@ -875,6 +880,12 @@ impl DataCompareTab {
         cx.notify();
     }
 
+    /// The selected difference, an index into the outcome's rows; for tests.
+    #[cfg(test)]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
     /// Selects the `row`-th difference shown.
     #[cfg(test)]
     pub fn select(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -950,11 +961,21 @@ impl DataCompareTab {
             .is_some_and(|found| !found.outcome.rows.is_empty())
     }
 
-    /// The script of the differences kept, with what it is about.
-    pub fn script(&self, cx: &App) -> Option<String> {
-        let found = self.found.as_ref()?;
+    /// The script's heading: which side it makes like which. The
+    /// connections' names are the user's: commented line by line.
+    fn heading(&self, cx: &App) -> String {
+        commented(&format!(
+            "Data compare: makes {} like {}.\nNothing has run: read the script, then run it here, \
+             on the target. Switch this tab to manual commit to apply it all or nothing.",
+            self.side_label(1, cx),
+            self.side_label(0, cx)
+        ))
+    }
+
+    /// The script of `found` under `heading`.
+    fn script_of(heading: &str, found: &Found, deletes: bool) -> String {
         let dialect = found.sessions[1].dialect();
-        let body = match data_compare::script(&found.plan, &found.outcome, dialect, self.deletes) {
+        let body = match data_compare::script(&found.plan, &found.outcome, dialect, deletes) {
             Ok(body) => body,
             Err(error) => {
                 commented(&format!(
@@ -963,44 +984,67 @@ impl DataCompareTab {
                 )) + "\n"
             }
         };
-        // The connections' names are the user's: commented line by line.
-        let heading = commented(&format!(
-            "Data compare: makes {} like {}.\nNothing has run: read the script, then run it here, \
-             on the target. Switch this tab to manual commit to apply it all or nothing.",
-            self.side_label(1, cx),
-            self.side_label(0, cx)
-        ));
-        Some(format!("{heading}\n\n{body}"))
+        format!("{heading}\n\n{body}")
     }
 
-    /// Opens the script in a new query tab on the target; nothing runs.
+    /// The script of the differences kept, with what it is about.
+    #[cfg(test)]
+    pub fn script(&self, cx: &App) -> Option<String> {
+        let found = self.found.as_ref()?;
+        Some(Self::script_of(&self.heading(cx), found, self.deletes))
+    }
+
+    /// Opens the script in a new query tab on the target; nothing runs. It
+    /// is written off the UI thread (at the cap it is megabytes of text),
+    /// the button saying so meanwhile.
     pub fn open_script(&mut self, cx: &mut Context<Self>) {
-        if self.state != State::Ready || !self.differs() {
+        if self.state != State::Ready || !self.differs() || self.writing.is_some() {
             return;
         }
-        let Some(sql) = self.script(cx) else {
+        let Some(found) = self.found.clone() else {
             return;
         };
+        let (heading, deletes) = (self.heading(cx), self.deletes);
         let request = &self.spec.request;
-        cx.emit(DataCompareTabEvent::OpenScript {
-            title: format!("Make {} like {}", request.target.name, request.source.name),
-            target: self.spec.target.clone(),
-            sql,
-        });
+        let title = format!("Make {} like {}", request.target.name, request.source.name);
+        let target = self.spec.target.clone();
+        let generation = self.generation;
+        let writing =
+            cx.background_spawn(async move { Self::script_of(&heading, &found, deletes) });
+        self.writing = Some(cx.spawn(async move |this, cx| {
+            let sql = writing.await;
+            let _ = this.update(cx, |this, cx| {
+                this.writing = None;
+                if this.generation == generation {
+                    cx.emit(DataCompareTabEvent::OpenScript { target, title, sql });
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Copies the selected row as TSV, as the source has it (the target's
+    /// for a row only there): ⌘C and Edit ▸ Copy. Whether there was one.
+    fn copy_selected(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.selected else {
+            return false;
+        };
+        let Some(row) = self
+            .found
+            .as_ref()
+            .and_then(|found| found.outcome.rows.get(index))
+        else {
+            return false;
+        };
+        let side = usize::from(row.source.is_none());
+        self.copy_row(index, side, Some(CopyFormat::Tsv), cx);
+        true
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
-        if keystroke.key == "c"
-            && keystroke.modifiers.secondary(cx)
-            && let Some(index) = self.selected
-            && let Some(row) = self
-                .found
-                .as_ref()
-                .and_then(|found| found.outcome.rows.get(index))
-        {
-            let side = usize::from(row.source.is_none());
-            self.copy_row(index, side, Some(CopyFormat::Tsv), cx);
+        if keystroke.key == "c" && keystroke.modifiers.secondary(cx) && self.copy_selected(cx) {
             cx.stop_propagation();
         }
     }
@@ -1080,9 +1124,13 @@ impl DataCompareTab {
                 Button::new("data-compare-open-script")
                     .primary()
                     .small()
-                    .label("Open script")
+                    .label(if self.writing.is_some() {
+                        "Writing the script…"
+                    } else {
+                        "Open script"
+                    })
                     .tooltip("Open the script in a query tab on the target: nothing runs")
-                    .disabled(!ready || !self.differs())
+                    .disabled(!ready || !self.differs() || self.writing.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.open_script(cx))),
             )
     }
@@ -1504,6 +1552,10 @@ impl Render for DataCompareTab {
             .size_full()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.key_down(event, window, cx)
+            }))
+            // Edit ▸ Copy, as ⌘C.
+            .on_action(cx.listener(|this, _: &input::Copy, _, cx| {
+                this.copy_selected(cx);
             }))
             .child(self.render_header(cx))
             .child(self.render_toolbar(cx))
