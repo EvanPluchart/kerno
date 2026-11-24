@@ -903,11 +903,21 @@ fn copy_tables_opens_from_tools_and_from_the_palette(cx: &mut TestAppContext) {
     click_menu_entry(&app, cx, "Tools");
     click_menu_entry(&app, cx, "Copy tables to another connection…");
     assert!(app.has(cx, "transfer-dialog"));
-    app.wait_until(cx, "the table ticked", |app, cx| {
+    // The reading ends, then nothing blocks: a reading that failed is said
+    // with its reason (the server's, under a loaded machine), not waited out.
+    let blocked = |app: &Fixture, cx: &mut TestAppContext| {
         app.step(cx, |window, _| {
-            window.try_find("transfer-blocked").is_none()
+            let id = gpui_kit::ElementId::from("transfer-blocked");
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .find(|text| text.path().contains(&id))
+                .map(|text| text.text().to_string())
         })
+    };
+    app.wait_until(cx, "the tables read", |app, cx| {
+        blocked(app, cx).as_deref() != Some("Reading the tables…")
     });
+    assert_eq!(blocked(&app, cx), None, "the table is ticked");
     app.click(cx, "transfer-close");
     assert!(!app.has(cx, "transfer-dialog"));
 
