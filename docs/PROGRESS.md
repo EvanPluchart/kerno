@@ -1706,3 +1706,14 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - One run of four on the same code showed four timing races of the slower runner: two fixed (a single table's
   backup showed `--schema` while the tables were still listed; a test clock advanced too early), two seen once
   and left (D-132).
+
+## 2026-11-24 — K66: the Windows zip in the release
+
+- The owner: the Windows package belongs in the release, as he had asked. `scripts/bundle-windows.sh` builds
+  `kerno-<version>-windows-x86_64.zip` (`kerno.exe` with its icon and the C runtime inside), launches the app
+  once and keeps a picture of the screen; `release.yml` has a `windows` job and lists the zip in `SHA256SUMS`;
+  `ci.yml` builds it on every push (D-133).
+- Proved on GitHub: the CI green with the job; the launch check's picture looked at (the window is drawn);
+  a release dry run's nine files downloaded, their checksums verified, the zip and the executable inspected.
+- Not proved: the dry run's draft from a branch (HTTP 403, D-133); the app in a person's hands on Windows.
+

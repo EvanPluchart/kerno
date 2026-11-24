@@ -55,14 +55,15 @@ is K29.
 
 ## Windows (the owner's word, 2026-11-24: releases for macOS, Linux and Windows from CI)
 
-Step 1 is done (K64, D-131): the workspace compiles for `x86_64-pc-windows-msvc`, clippy is clean there,
-`kerno-core`'s tests pass there and a GitHub runner builds a release `kerno.exe`. Nobody has seen it on a Windows
-screen yet. Next, in order:
+Step 1 is done (K64, D-131): the workspace compiles for `x86_64-pc-windows-msvc`, clippy is clean there and
+`kerno-core`'s tests pass there. Step 2 is done (K66, D-133): the release carries
+`kerno-<version>-windows-x86_64.zip` (`kerno.exe` with its icon and the C runtime inside), built and launched
+once by the CI on every push; a picture of that launch is the only look at the Windows app so far: nobody has
+used it. A preview until the list below is done. Next, in order:
 
-1. A Windows job in the real CI (the probe workflow of the `windows` branch folded in) and a zip of `kerno.exe`
-   in `scripts/release.sh`'s `SHA256SUMS`; the executable's icon (a resource from a build script).
-2. A pass in the real app on Windows: the window, the menus, fonts, the secret store (Credential Manager through
-   `keyring`), the instance's pipe, the built-in SSH client and its agent pipe.
+1. A pass in the real app on Windows, by a person: the menus, fonts, the secret store (Credential Manager
+   through `keyring`), the instance's pipe, the built-in SSH client and its agent pipe.
+2. A line for Windows in the READMEs' install tables, once a person has used the zip.
 3. The home folder (`%USERPROFILE%` where `HOME` is read: `~/.ssh`, `.pgpass`, `.my.cnf`; libpq's
    `%APPDATA%\postgresql\pgpass.conf`) and the update check (`curl.exe` of `System32`).
 4. The local clients (`pg_dump.exe`, `mysqldump.exe`, …, in `Program Files` and on `PATH`) and the password

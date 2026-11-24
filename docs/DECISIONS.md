@@ -4339,3 +4339,32 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
   reproduced: `every_owner_of_a_session_closes_it_when_it_goes_away` (a MySQL session still idle in a
   transaction when measured) and `updates::update_installs_the_checked_release_and_starts_it` (the tabs not yet
   stored at the relaunch).
+
+## D-133 — Windows, step 2: a zip in the release, a preview (K66; 2026-11-24)
+
+The owner asked for the Windows package in the release itself, not only a build in the CI.
+
+- **A zip, not an installer.** `kerno-<version>-windows-x86_64.zip`: one folder with `kerno.exe`, the
+  licences, the notices and the README, listed in `SHA256SUMS` with the seven other packages. An installer
+  (and with it the in-app update's install) is the next step: it needs a tool and choices (per user or per
+  machine, the Start menu, uninstall) that a first package can do without.
+- **Nothing to install beside it.** The C runtime is linked in (`+crt-static` for the MSVC target, in
+  `.cargo/config.toml`): the executable imports no `VCRUNTIME140.dll`, checked on the built file.
+- **The icon** is a resource of the executable, numbered 1, the one GPUI loads for its windows: one `.ico`
+  made from the PNGs of `assets/icon/`, compiled in by the app's build script with `embed-resource`, which
+  GPUI already brings on Windows (no new package in the lock).
+- **Launched once by the CI.** As the macOS bundle, the script starts the app on a scratch data directory and
+  an in-memory secret store, waits for its data, checks that it still runs, and stops it. A picture of the
+  screen is kept with the run: the first, and so far the only, look at Kerno on Windows (the window, the
+  toolbar, the empty states, the taskbar icon: drawn). GitHub's runner has no graphics card: the app runs on
+  the software renderer there.
+- **A preview, said as one** in the release notes until a person has used it: no update check (it runs
+  `/usr/bin/curl`), no home folder (`~/.ssh`, `.pgpass`), no detection of the local clients, no OpenSSH
+  tunnel, private files that rely on the profile's access list (D-131).
+- **The dry run's draft from a branch is refused.** "Run workflow" with "draft" from a branch other than
+  `main` built the nine files, then GitHub answered HTTP 403 to the creation of the release with the job's
+  token, which had `contents: write`. My reading, not proved: a release whose target is a commit that changes
+  workflow files needs a permission the job's token cannot have. A dry run without "draft" keeps the packages
+  as artifacts, which is how these were checked. The path of a real release (a tag on `main`) creates no tag
+  and names no target: to verify at the next release.
+
