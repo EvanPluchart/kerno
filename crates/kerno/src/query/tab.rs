@@ -2614,6 +2614,9 @@ impl QueryTab {
         let declined = cx.weak_entity();
         if let Some(script) = self.scripting() {
             script.stage = Stage::Asking;
+            // The run on several connections reads it when the tab says it
+            // changed: without this it showed "Starting…" while it asked.
+            cx.notify();
         }
         sql_confirm::open_or_decline(
             confirmation,
