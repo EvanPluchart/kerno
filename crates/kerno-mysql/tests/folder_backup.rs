@@ -31,6 +31,16 @@ const CANCEL: &str = "kerno_test_k63_cancel";
 const FAIL_SOURCE: &str = "kerno_test_k63_fail_src";
 const FAIL_TARGET: &str = "kerno_test_k63_fail_dst";
 const OLD: &str = "kerno_test_k63_old";
+const HELD: &str = "kerno_test_k63_held";
+const LOST: &str = "kerno_test_k63_lost";
+const NAMES: &str = "kerno_test_k63_names";
+const MOVING: &str = "kerno_test_k63_moving";
+const WAIT: &str = "kerno_test_k63_wait";
+const SIZES: &str = "kerno_test_k63_sizes";
+
+/// One test of this file at a time: a test that holds the server's read
+/// lock would make the others' writes wait.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A server to test on, with the mysqldump that can back it up.
 struct Server {
@@ -171,7 +181,28 @@ fn data() -> Vec<String> {
     ]
 }
 
-const TABLES: [&str; 5] = ["big", "plain", "pairs", "loose", "empty_one"];
+const TABLES: [&str; 6] = ["big", "plain", "pairs", "loose", "empty_one", "chars"];
+
+/// A table of a 4-byte character (where the server has utf8mb4) and of
+/// every byte value.
+fn chars(utf8mb4: bool) -> Vec<String> {
+    let every: String = (0..=255u8).map(|byte| format!("{byte:02X}")).collect();
+    if utf8mb4 {
+        vec![
+            "CREATE TABLE chars (id INT NOT NULL PRIMARY KEY, label VARCHAR(20) CHARACTER SET \
+             utf8mb4, raw VARBINARY(300)) ENGINE=InnoDB"
+                .into(),
+            format!("INSERT INTO chars VALUES (1, 'a\u{1F600}b\u{00E9}', X'{every}')"),
+        ]
+    } else {
+        vec![
+            "CREATE TABLE chars (id INT NOT NULL PRIMARY KEY, label VARCHAR(20), \
+             raw VARBINARY(300)) ENGINE=InnoDB"
+                .into(),
+            format!("INSERT INTO chars VALUES (1, 'ab', X'{every}')"),
+        ]
+    }
+}
 
 /// What must come back: per table its rows and checksum, then the views,
 /// routines, triggers and events, the database's name taken out.
@@ -204,6 +235,7 @@ async fn contents(admin: &Arc<dyn Session>, db: &str) -> Vec<Vec<Option<String>>
              WHERE EVENT_SCHEMA = '{db}' ORDER BY 1"
         ),
         format!("SELECT COUNT(*), SUM(doubled) FROM {db}.big_twice_odd"),
+        format!("SELECT id, HEX(label), HEX(raw) FROM {db}.chars ORDER BY id"),
     ] {
         all.extend(rows(admin, &sql).await);
     }
@@ -258,14 +290,22 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
     for sql in SCHEMA.iter().map(|sql| sql.to_string()).chain(data()) {
         exec_ok(&source, &sql).await;
     }
+    // A 4-byte character where the server has utf8mb4, and every byte value
+    // in a binary column: compared byte for byte (F3).
+    let server_version = admin.server().version_number;
+    for sql in chars(server_version >= (5, 5, 3)) {
+        exec_ok(&source, &sql).await;
+    }
     let files = tempfile::tempdir().unwrap();
     let folder = files.path().join("backup");
     let (on_line, lines) = sink();
+    let mut options = folder_options(SOURCE, 4, DumpMethod::SingleTransaction);
+    options.utf8mb4 = tools::utf8mb4(server.dump_version.as_ref(), server_version);
     let ended = mysql_folder::back_up(
         FolderBackup {
             tool_path: server.dump.clone(),
             params: server.params.clone(),
-            options: folder_options(SOURCE, 4, DumpMethod::SingleTransaction),
+            options,
             folder: folder.clone(),
             client: server.dump_version.clone(),
             // Every table with an integer key and rows is cut.
@@ -291,10 +331,12 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
         pieces,
         [
             ("big", 4),
+            ("chars", 1),
             ("empty_one", 1),
             ("loose", 1),
             ("pairs", 1),
-            ("plain", 4)
+            // MyISAM: no snapshot, so never cut (D-135).
+            ("plain", 1)
         ]
         .map(|(name, n)| (name.to_string(), n)),
         "{}",
@@ -310,6 +352,7 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
             options: RestoreOptions {
                 tool_version: tools::version(&client),
                 jobs: Some(4),
+                utf8mb4: tools::utf8mb4(tools::version(&client).as_ref(), server_version),
                 ..RestoreOptions::new(Engine::MySql, TARGET, &folder, BackupFormat::Directory)
             },
             manifest,
@@ -327,11 +370,16 @@ async fn round_trip(server: &'static Server, client: PathBuf) {
         contents(&admin, TARGET).await,
     );
     assert_eq!(target, source, "{}", server.label);
-    assert_eq!(source.len(), TABLES.len() + 2 + 2 + 1 + 1 + 1, "{source:?}");
+    assert_eq!(
+        source.len(),
+        TABLES.len() + 2 + 2 + 1 + 1 + 1 + 1,
+        "{source:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_folder_backup_restores_identical_on_every_server() {
+    let _serial = SERIAL.lock().await;
     let Some((servers, client)) = servers() else {
         return;
     };
@@ -356,6 +404,7 @@ async fn a_folder_backup_restores_identical_on_every_server() {
 /// fails (each table "has no fields") instead of writing an empty backup.
 #[tokio::test]
 async fn a_client_that_cannot_read_5_1_is_refused_and_its_empty_backup_fails() {
+    let _serial = SERIAL.lock().await;
     let Some(dump) = tools::find(Tool::MysqlDump) else {
         eprintln!("SKIPPED: the MySQL client tools are not installed");
         return;
@@ -412,6 +461,7 @@ async fn a_client_that_cannot_read_5_1_is_refused_and_its_empty_backup_fails() {
 /// loads.
 #[tokio::test]
 async fn a_failed_restore_says_what_is_in_and_a_refused_one_loads_nothing() {
+    let _serial = SERIAL.lock().await;
     let Some((servers, client)) = servers() else {
         return;
     };
@@ -564,11 +614,87 @@ fn dumps_running(database: &str) -> Vec<String> {
         .collect()
 }
 
-/// Cancelled while each mysqldump waits on the server (`SLEEP` in its
-/// `--where`), with and without Kerno's read lock: every mysqldump is
-/// stopped, the folder is removed, and a write then goes through at once.
+/// `rows` rows of about 200 bytes in `db.big` (InnoDB, an integer key), by
+/// doubling, and a one-row table `db.t1` to write to: a mysqldump of `big`
+/// takes long enough to be seen running.
+async fn fill_big(admin: &Arc<dyn Session>, db: &str, rows: u64) {
+    exec_ok(admin, &format!("CREATE DATABASE {db}")).await;
+    exec_ok(
+        admin,
+        &format!(
+            "CREATE TABLE {db}.big (id INT NOT NULL PRIMARY KEY, pad CHAR(200) NOT NULL) \
+             ENGINE=InnoDB"
+        ),
+    )
+    .await;
+    exec_ok(
+        admin,
+        &format!("INSERT INTO {db}.big VALUES (1, REPEAT('x', 200))"),
+    )
+    .await;
+    let mut have = 1u64;
+    while have < rows {
+        exec_ok(
+            admin,
+            &format!(
+                "INSERT INTO {db}.big SELECT id + {have}, pad FROM {db}.big \
+                 WHERE id + {have} <= {rows}"
+            ),
+        )
+        .await;
+        have *= 2;
+    }
+    exec_ok(
+        admin,
+        &format!("CREATE TABLE {db}.t1 (id INT PRIMARY KEY) ENGINE=InnoDB"),
+    )
+    .await;
+    exec_ok(admin, &format!("INSERT INTO {db}.t1 VALUES (1)")).await;
+}
+
+/// The folder backup of `db` on `server` with `method`, its big table
+/// left whole, started in the background.
+fn start_backup(
+    server: &'static Server,
+    db: &str,
+    method: DumpMethod,
+    folder: &std::path::Path,
+    kerno: Arc<dyn Session>,
+    on_line: OnLine,
+    cancel: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<mysql_folder::FolderEnd> {
+    tokio::spawn(mysql_folder::back_up(
+        FolderBackup {
+            tool_path: server.dump.clone(),
+            params: server.params.clone(),
+            options: folder_options(db, 3, method),
+            folder: folder.to_path_buf(),
+            client: server.dump_version.clone(),
+            range_threshold: u64::MAX,
+        },
+        kerno,
+        on_line,
+        cancel,
+    ))
+}
+
+/// Waits (30 s at most) for `flag`.
+async fn until(flag: &AtomicBool, what: &str) {
+    for _ in 0..600 {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{what} did not come");
+}
+
+/// Cancelled while mysqldump reads a large table, with and without Kerno's
+/// read lock: every mysqldump is stopped, the folder is removed, and a
+/// write then goes through at once.
 #[tokio::test]
 async fn a_cancelled_backup_leaves_no_tool_no_folder_and_no_lock() {
+    let _serial = SERIAL.lock().await;
     let Some((servers, _)) = servers() else {
         return;
     };
@@ -585,57 +711,36 @@ async fn a_cancelled_backup_leaves_no_tool_no_folder_and_no_lock() {
 async fn cancelled(server: &'static Server) {
     eprintln!("--- {}", server.label);
     let admin = session(&server.params, None).await;
-    exec_ok(&admin, &format!("CREATE DATABASE {CANCEL}")).await;
-    for table in ["t1", "t2", "t3"] {
-        exec_ok(
-            &admin,
-            &format!("CREATE TABLE {CANCEL}.{table} (id INT PRIMARY KEY) ENGINE=InnoDB"),
-        )
-        .await;
-        exec_ok(&admin, &format!("INSERT INTO {CANCEL}.{table} VALUES (1)")).await;
-    }
+    fill_big(&admin, CANCEL, 400_000).await;
     for method in [DumpMethod::SingleTransaction, DumpMethod::LockAllTables] {
         let files = tempfile::tempdir().unwrap();
         let folder = files.path().join("backup");
         let cancel = Arc::new(AtomicBool::new(false));
-        let (stop, started) = (cancel.clone(), Arc::new(AtomicBool::new(false)));
+        let started = Arc::new(AtomicBool::new(false));
         let seen = started.clone();
         let on_line: OnLine = Arc::new(move |line: String| {
             eprintln!("  | {line}");
-            // A mysqldump has connected: stop the run soon after.
-            if line.starts_with("[t") && line.contains("Retrieving") {
+            if line.starts_with("[big] -- Retrieving rows") {
                 seen.store(true, Ordering::Relaxed);
             }
         });
-        let mut options = folder_options(CANCEL, 3, method);
-        options.extra_args = "--where=SLEEP(5)=0".into();
         // Kept open past the run, as the app keeps its session until the
         // end: the lock goes with UNLOCK TABLES, not with the connection.
         let kerno = session(&server.params, None).await;
-        let running = tokio::spawn(mysql_folder::back_up(
-            FolderBackup {
-                tool_path: server.dump.clone(),
-                params: server.params.clone(),
-                options,
-                folder: folder.clone(),
-                client: server.dump_version.clone(),
-                range_threshold: mysql_folder::RANGE_THRESHOLD,
-            },
+        let running = start_backup(
+            server,
+            CANCEL,
+            method,
+            &folder,
             kerno.clone(),
             on_line,
-            cancel,
-        ));
-        for _ in 0..100 {
-            if started.load(Ordering::Relaxed) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(started.load(Ordering::Relaxed), "no mysqldump started");
+            cancel.clone(),
+        );
+        until(&started, "the rows of the big table").await;
         assert!(folder.exists());
         #[cfg(unix)]
         assert!(!dumps_running(CANCEL).is_empty());
-        stop.store(true, Ordering::Relaxed);
+        cancel.store(true, Ordering::Relaxed);
         let ended = running.await.unwrap();
         assert!(
             matches!(ended.outcome, Err(kerno_core::Error::Cancelled)),
@@ -663,9 +768,505 @@ async fn cancelled(server: &'static Server) {
     }
 }
 
+/// With "lock all tables", the read lock is held while mysqldump runs: a
+/// write from another session waits, and lands only once Kerno released
+/// the lock at the end.
+#[tokio::test]
+async fn the_read_lock_holds_writes_until_the_end() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let wanted = ["MySQL", "kerno-mysql51"];
+    for server in servers
+        .into_iter()
+        .filter(|s| wanted.contains(&s.label.as_str()))
+    {
+        let server: &'static Server = Box::leak(Box::new(server));
+        with_scratch(&server.params, &[HELD], held(server)).await;
+    }
+}
+
+async fn held(server: &'static Server) {
+    eprintln!("--- {}", server.label);
+    let admin = session(&server.params, None).await;
+    fill_big(&admin, HELD, 400_000).await;
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let (started, unlocked) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let (seen, released) = (started.clone(), unlocked.clone());
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let kept = said.clone();
+    let on_line: OnLine = Arc::new(move |line: String| {
+        eprintln!("  | {line}");
+        kept.lock().unwrap().push(line.clone());
+        if line.starts_with("[big] -- Retrieving rows") {
+            seen.store(true, Ordering::Relaxed);
+        }
+        if line == "Kerno: UNLOCK TABLES" {
+            *released.lock().unwrap() = Some(std::time::Instant::now());
+        }
+    });
+    let kerno = session(&server.params, None).await;
+    let running = start_backup(
+        server,
+        HELD,
+        DumpMethod::LockAllTables,
+        &folder,
+        kerno.clone(),
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    );
+    until(&started, "the rows of the big table").await;
+    let writer = session(&server.params, None).await;
+    let writing = tokio::spawn(async move {
+        run(&writer, &format!("INSERT INTO {HELD}.t1 VALUES (2)"))
+            .await
+            .unwrap();
+        std::time::Instant::now()
+    });
+    let ended = running.await.unwrap();
+    ended.outcome.unwrap();
+    let written = writing.await.unwrap();
+    let released = unlocked.lock().unwrap().expect("the lock released");
+    assert!(
+        written >= released,
+        "the write landed while the lock was said to be held"
+    );
+    // The lock first, then the catalog and the plan (F8).
+    let said = said.lock().unwrap().clone();
+    let at = |start: &str| {
+        said.iter()
+            .position(|line| line.starts_with(start))
+            .unwrap()
+    };
+    assert!(
+        at("Kerno: FLUSH TABLES WITH READ LOCK") < at("Kerno: 2 tables into"),
+        "{said:?}"
+    );
+    kerno.close().await;
+}
+
+/// The read lock lost during the run (Kerno's session closed by the server,
+/// as an idle timeout or a proxy would): the backup fails in plain words and
+/// its folder is removed.
+#[tokio::test]
+async fn a_lost_read_lock_fails_the_backup() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let wanted = ["MySQL", "kerno-mysql57"];
+    for server in servers
+        .into_iter()
+        .filter(|s| wanted.contains(&s.label.as_str()))
+    {
+        let server: &'static Server = Box::leak(Box::new(server));
+        with_scratch(&server.params, &[LOST], lost(server)).await;
+    }
+}
+
+async fn lost(server: &'static Server) {
+    eprintln!("--- {}", server.label);
+    let admin = session(&server.params, None).await;
+    fill_big(&admin, LOST, 400_000).await;
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let started = Arc::new(AtomicBool::new(false));
+    let seen = started.clone();
+    let on_line: OnLine = Arc::new(move |line: String| {
+        eprintln!("  | {line}");
+        if line.starts_with("[big] -- Retrieving rows") {
+            seen.store(true, Ordering::Relaxed);
+        }
+    });
+    let kerno = session(&server.params, None).await;
+    let id = rows(&kerno, "SELECT CONNECTION_ID()").await[0][0]
+        .clone()
+        .unwrap();
+    let running = start_backup(
+        server,
+        LOST,
+        DumpMethod::LockAllTables,
+        &folder,
+        kerno,
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    );
+    until(&started, "the rows of the big table").await;
+    exec_ok(&admin, &format!("KILL {id}")).await;
+    let ended = running.await.unwrap();
+    let said = ended.outcome.unwrap_err().to_string();
+    assert!(
+        said.contains("The lock that kept writes out was lost at")
+            && said.contains("the backup is not consistent"),
+        "{said}"
+    );
+    assert!(ended.removed && !folder.exists());
+}
+
+/// Tables named in the settings that the database no longer holds stop
+/// the backup before anything runs, each named; a name that differs only
+/// by case is missing on a server that compares names with case.
+#[tokio::test]
+async fn named_tables_that_are_gone_stop_the_backup() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let server: &'static Server = Box::leak(Box::new(server));
+    with_scratch(&server.params, &[NAMES], async move {
+        let admin = session(&server.params, None).await;
+        exec_ok(&admin, &format!("CREATE DATABASE {NAMES}")).await;
+        for table in ["kept", "Orders"] {
+            exec_ok(
+                &admin,
+                &format!("CREATE TABLE {NAMES}.{table} (id INT PRIMARY KEY)"),
+            )
+            .await;
+        }
+        let fold = rows(&admin, "SELECT @@lower_case_table_names").await[0][0].clone();
+        assert_eq!(
+            fold.as_deref(),
+            Some("0"),
+            "a server that compares names with case"
+        );
+        let mut options = folder_options(NAMES, 2, DumpMethod::SingleTransaction);
+        options.tables = ["kept", "orders", "renamed_away"]
+            .map(|name| kerno_core::schema::TableRef::new(NAMES, name))
+            .to_vec();
+        let files = tempfile::tempdir().unwrap();
+        let folder = files.path().join("backup");
+        let (on_line, _) = sink();
+        let ended = mysql_folder::back_up(
+            FolderBackup {
+                tool_path: server.dump.clone(),
+                params: server.params.clone(),
+                options,
+                folder: folder.clone(),
+                client: server.dump_version.clone(),
+                range_threshold: mysql_folder::RANGE_THRESHOLD,
+            },
+            session(&server.params, None).await,
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let said = ended.outcome.unwrap_err().to_string();
+        assert!(
+            said.contains("does not hold: “orders”, “renamed_away”")
+                && said.contains("Nothing was run"),
+            "{said}"
+        );
+        assert!(!folder.exists());
+    })
+    .await;
+}
+
+/// A mysqldump that starts a second late when its file is the second range:
+/// the way two ranges of one table start apart under load.
+#[cfg(unix)]
+fn late_second_range(dir: &std::path::Path, real: &std::path::Path) -> PathBuf {
+    let path = dir.join("mysqldump");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *part02*) sleep 1;; esac\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    kerno_core::private::restrict(&path, 0o755).unwrap();
+    path
+}
+
+/// Inside one table every range reads one moment: a row whose key moves
+/// from the first range into the second between their starts is restored
+/// once, never lost nor doubled.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_range_of_a_table_reads_one_moment() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, client)) = servers() else {
+        return;
+    };
+    let wanted = ["MySQL", "MariaDB", "kerno-mysql51"];
+    for server in servers
+        .into_iter()
+        .filter(|s| wanted.contains(&s.label.as_str()))
+    {
+        let server: &'static Server = Box::leak(Box::new(server));
+        let client = client.clone();
+        let target = format!("{MOVING}_dst");
+        let target: &'static str = Box::leak(target.into_boxed_str());
+        with_scratch(
+            &server.params,
+            &[MOVING, target],
+            moving(server, client, target),
+        )
+        .await;
+    }
+}
+
+#[cfg(unix)]
+async fn moving(server: &'static Server, client: PathBuf, target: &'static str) {
+    eprintln!("--- {}", server.label);
+    let admin = session(&server.params, None).await;
+    exec_ok(&admin, &format!("CREATE DATABASE {MOVING}")).await;
+    exec_ok(&admin, &format!("CREATE DATABASE {target}")).await;
+    exec_ok(
+        &admin,
+        &format!("CREATE TABLE {MOVING}.moving (id INT NOT NULL PRIMARY KEY, v INT) ENGINE=InnoDB"),
+    )
+    .await;
+    let values: Vec<String> = (1..=1000).map(|i| format!("({i}, {i})")).collect();
+    exec_ok(
+        &admin,
+        &format!("INSERT INTO {MOVING}.moving VALUES {}", values.join(", ")),
+    )
+    .await;
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let wrapper = late_second_range(files.path(), &server.dump);
+    let started = Arc::new(AtomicBool::new(false));
+    let seen = started.clone();
+    let on_line: OnLine = Arc::new(move |line: String| {
+        eprintln!("  | {line}");
+        if line.starts_with("[moving 1/2] -- Retrieving table structure") {
+            seen.store(true, Ordering::Relaxed);
+        }
+    });
+    let backing = tokio::spawn(mysql_folder::back_up(
+        FolderBackup {
+            tool_path: wrapper,
+            params: server.params.clone(),
+            options: folder_options(MOVING, 2, DumpMethod::SingleTransaction),
+            folder: folder.clone(),
+            client: server.dump_version.clone(),
+            range_threshold: 1,
+        },
+        session(&server.params, None).await,
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    until(&started, "the first range's snapshot").await;
+    // Row 5 moves from the first range (`id < 501`) into the second.
+    let writer = session(&server.params, None).await;
+    let moved = tokio::spawn(async move {
+        run(
+            &writer,
+            &format!("UPDATE {MOVING}.moving SET id = 2000 WHERE id = 5"),
+        )
+        .await
+        .unwrap();
+    });
+    backing.await.unwrap().outcome.unwrap();
+    moved.await.unwrap();
+    let manifest = mysql_folder::read_manifest(&folder).unwrap();
+    assert_eq!(manifest.tables[0].files.len(), 2, "cut in two ranges");
+    let (on_line, _) = sink();
+    mysql_folder::restore(
+        FolderRestore {
+            tool_path: client.clone(),
+            params: server.params.clone(),
+            options: RestoreOptions {
+                tool_version: tools::version(&client),
+                jobs: Some(2),
+                ..RestoreOptions::new(Engine::MySql, target, &folder, BackupFormat::Directory)
+            },
+            manifest,
+            sent: Arc::default(),
+        },
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .outcome
+    .unwrap();
+    let restored = rows(
+        &admin,
+        &format!("SELECT COUNT(*), SUM(id IN (5, 2000)) FROM {target}.moving"),
+    )
+    .await;
+    assert_eq!(
+        restored[0],
+        [Some("1000".to_string()), Some("1".to_string())],
+        "{}: the moved row lost or doubled",
+        server.label
+    );
+}
+
+/// A read lock that does not come (a statement reads a table for longer
+/// than the lock may wait) stops the start after `LOCK_WAIT`, in plain
+/// words, before any folder is made; the statement is seen in the list of
+/// long statements the confirmation names.
+#[tokio::test]
+async fn a_read_lock_that_does_not_come_stops_the_start() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, _)) = servers() else {
+        return;
+    };
+    let Some(server) = servers.into_iter().find(|server| server.label == "MySQL") else {
+        return;
+    };
+    let server: &'static Server = Box::leak(Box::new(server));
+    with_scratch(&server.params, &[WAIT], async move {
+        let admin = session(&server.params, None).await;
+        exec_ok(&admin, &format!("CREATE DATABASE {WAIT}")).await;
+        exec_ok(
+            &admin,
+            &format!("CREATE TABLE {WAIT}.t (id INT PRIMARY KEY)"),
+        )
+        .await;
+        exec_ok(&admin, &format!("INSERT INTO {WAIT}.t VALUES (1)")).await;
+        let reader = session(&server.params, None).await;
+        let reading = tokio::spawn(async move {
+            let _ = run(&reader, &format!("SELECT SLEEP(16) FROM {WAIT}.t")).await;
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let kerno = session(&server.params, None).await;
+        let long = mysql_folder::long_statements(&kerno, 1).await.unwrap();
+        assert!(
+            long.iter().any(|(_, _, text)| text.contains("SLEEP(16)")),
+            "{long:?}"
+        );
+        let files = tempfile::tempdir().unwrap();
+        let folder = files.path().join("backup");
+        let (on_line, _) = sink();
+        let since = std::time::Instant::now();
+        let ended = start_backup(
+            server,
+            WAIT,
+            DumpMethod::LockAllTables,
+            &folder,
+            kerno,
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let said = ended.outcome.unwrap_err().to_string();
+        assert!(
+            said.contains("The read lock did not come within 10 s"),
+            "{said}"
+        );
+        assert!(
+            since.elapsed() < Duration::from_secs(14),
+            "{:?}",
+            since.elapsed()
+        );
+        assert!(!folder.exists());
+        reading.await.unwrap();
+    })
+    .await;
+}
+
+/// The sizes are read fresh (MySQL 8.0.3 on caches them for a day): a
+/// table that grew past the threshold since its size was last read is cut,
+/// one just under it is not.
+#[tokio::test]
+async fn the_sizes_are_read_fresh_and_only_a_table_above_the_threshold_is_cut() {
+    let _serial = SERIAL.lock().await;
+    if !testing::available(Engine::MySql) {
+        return;
+    }
+    let params = testing::params(Engine::MySql);
+    let params: &'static ConnectParams = Box::leak(Box::new(params));
+    with_scratch(params, &[SIZES], async move {
+        let admin = session(params, None).await;
+        exec_ok(&admin, &format!("CREATE DATABASE {SIZES}")).await;
+        for (table, rows_wanted) in [("above", 170_000), ("below", 110_000)] {
+            exec_ok(
+                &admin,
+                &format!("CREATE TABLE {SIZES}.{table} LIKE kerno_analytics.big_table"),
+            )
+            .await;
+            // Read once while empty: the server keeps that size.
+            rows(
+                &admin,
+                &format!(
+                    "SELECT DATA_LENGTH FROM information_schema.TABLES \
+                     WHERE TABLE_SCHEMA = '{SIZES}' AND TABLE_NAME = '{table}'"
+                ),
+            )
+            .await;
+            exec_ok(
+                &admin,
+                &format!(
+                    "INSERT INTO {SIZES}.{table} SELECT * FROM kerno_analytics.big_table \
+                     WHERE id <= {rows_wanted}"
+                ),
+            )
+            .await;
+        }
+        // InnoDB's own estimate follows a bulk load within seconds.
+        let fresh = session(params, None).await;
+        exec_ok(&fresh, "SET SESSION information_schema_stats_expiry = 0").await;
+        let size = |table: &'static str| {
+            let fresh = fresh.clone();
+            async move {
+                rows(
+                    &fresh,
+                    &format!(
+                        "SELECT DATA_LENGTH FROM information_schema.TABLES \
+                         WHERE TABLE_SCHEMA = '{SIZES}' AND TABLE_NAME = '{table}'"
+                    ),
+                )
+                .await[0][0]
+                    .clone()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            }
+        };
+        for _ in 0..60 {
+            if size("above").await > mysql_folder::RANGE_THRESHOLD {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let (above, below) = (size("above").await, size("below").await);
+        eprintln!("above {above}, below {below}");
+        assert!(above > mysql_folder::RANGE_THRESHOLD && below < mysql_folder::RANGE_THRESHOLD);
+        // A session that keeps the default expiry still sees the old size.
+        let cached = rows(
+            &admin,
+            &format!(
+                "SELECT DATA_LENGTH FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = '{SIZES}' AND TABLE_NAME = 'above'"
+            ),
+        )
+        .await[0][0]
+            .clone()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        eprintln!("cached {cached}");
+        let catalog = mysql_folder::read_catalog(
+            &session(params, None).await,
+            SIZES,
+            mysql_folder::RANGE_THRESHOLD,
+        )
+        .await
+        .unwrap();
+        let options = folder_options(SIZES, 4, DumpMethod::SingleTransaction);
+        let (tables, _) = mysql_folder::plan(&catalog, &options, 4, mysql_folder::RANGE_THRESHOLD);
+        let files: Vec<(String, usize)> = tables
+            .iter()
+            .map(|table| (table.table.clone(), table.files.len()))
+            .collect();
+        assert_eq!(files, [("above".to_string(), 4), ("below".to_string(), 1)]);
+    })
+    .await;
+}
+
 /// `can_lock` reads the RELOAD privilege of the account in use.
 #[tokio::test]
 async fn the_account_s_reload_privilege_is_read() {
+    let _serial = SERIAL.lock().await;
     for engine in common::engines() {
         let admin = common::session(engine).await;
         assert!(mysql_folder::can_lock(&admin).await.unwrap(), "{engine:?}");

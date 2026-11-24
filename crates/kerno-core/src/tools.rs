@@ -1230,6 +1230,12 @@ pub struct BackupOptions {
     /// password is asked at each run and never kept here.
     #[serde(default)]
     pub auth_user: Option<String>,
+    /// MySQL / MariaDB: `--default-character-set=utf8mb4`, from
+    /// [`utf8mb4`] (the server and the client have it); otherwise a client
+    /// that defaults to `utf8` (mysqldump 5.7) writes a 4-byte character as
+    /// `?`. Set at each run, never kept.
+    #[serde(skip)]
+    pub utf8mb4: bool,
 }
 
 fn default_pattern() -> String {
@@ -1268,6 +1274,7 @@ impl BackupOptions {
             file_pattern: default_pattern(),
             extra_args: String::new(),
             auth_user: None,
+            utf8mb4: false,
         }
     }
 }
@@ -1376,6 +1383,10 @@ pub struct RestoreOptions {
     /// (K39, [`list_without`]), written by the caller before the run.
     #[serde(skip)]
     pub use_list: Option<PathBuf>,
+    /// MySQL / MariaDB: the client reads the file as `utf8mb4` (see
+    /// [`BackupOptions::utf8mb4`]).
+    #[serde(skip)]
+    pub utf8mb4: bool,
 }
 
 impl RestoreOptions {
@@ -1404,6 +1415,7 @@ impl RestoreOptions {
             allow_client_commands: false,
             tool_version: None,
             use_list: None,
+            utf8mb4: false,
         }
     }
 }
@@ -1928,6 +1940,9 @@ pub fn backup_command(
             if params.engine == Engine::MariaDb && !is_mariadb_client(tool_path) {
                 args.push("--column-statistics=0".into());
             }
+            if options.utf8mb4 {
+                args.push(UTF8MB4.into());
+            }
             match options.content {
                 BackupContent::All => {}
                 BackupContent::SchemaOnly => args.push("--no-data".into()),
@@ -2152,6 +2167,9 @@ pub fn restore_command(
             if options.disable_foreign_keys {
                 command.args.push(FOREIGN_KEYS_OFF.into());
             }
+            if options.utf8mb4 {
+                command.args.push(UTF8MB4.into());
+            }
             command.args.extend(extra);
             Ok(command)
         }
@@ -2160,6 +2178,20 @@ pub fn restore_command(
         )),
         (Engine::Sqlite, _) => Err(Error::Unsupported(NO_CLIENT_TOOLS.into())),
     }
+}
+
+/// The character set a MySQL / MariaDB tool talks in, when [`utf8mb4`].
+const UTF8MB4: &str = "--default-character-set=utf8mb4";
+
+/// Whether a MySQL / MariaDB tool of version `client` should talk to a
+/// server of version `server` in `utf8mb4`: both have it (MySQL 5.5.3,
+/// MariaDB 5.5). A server without it (5.1 to 5.5.2) holds no 4-byte
+/// character, and the tool keeps its default there.
+pub fn utf8mb4(client: Option<&ToolVersion>, server: (u32, u32, u32)) -> bool {
+    server >= (5, 5, 3)
+        && client.is_some_and(|client| {
+            client.number >= if client.mariadb { (5, 5, 0) } else { (5, 5, 3) }
+        })
 }
 
 /// `mysql`'s option that turns foreign-key checks off for the session
