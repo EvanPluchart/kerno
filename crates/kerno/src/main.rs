@@ -13,6 +13,8 @@ mod compare_dialog;
 mod compare_tab;
 mod connections;
 mod data;
+mod data_compare_dialog;
+mod data_compare_tab;
 mod database_dialog;
 mod dbeaver_import;
 mod engine_logo;
@@ -723,6 +725,7 @@ fn menus() -> Vec<Menu> {
                         command("execute_script"),
                         command("copy_tables"),
                         command("compare_schemas"),
+                        command("compare_data"),
                         command("export_schema"),
                         separator(),
                         command("foreign_data_wrappers"),

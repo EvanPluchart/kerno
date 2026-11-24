@@ -152,6 +152,7 @@ fn tab_entry(menu: TabMenu, action: &TabAction) -> Palette {
         A::TurnOffUpdateChecks => {
             Here("the switch of Settings ▸ Updates, which the settings' search finds")
         }
+        A::CompareData => Command("compare_data"),
     }
 }
 
@@ -273,6 +274,7 @@ fn tree_entry(action: Action) -> Palette {
         Action::EditColumn | Action::Properties => Command("edit_object"),
         Action::ViewDiagram => Command("view_diagram"),
         Action::CompareWith => Command("compare_schemas"),
+        Action::CompareData => Command("compare_data"),
         Action::ExportSchema => Command("export_schema"),
     }
 }
@@ -727,6 +729,7 @@ fn every_entry_of_the_schema_tree_is_in_the_palette() {
         Action::Properties,
         Action::ViewDiagram,
         Action::CompareWith,
+        Action::CompareData,
         Action::ExportSchema,
     ];
     let mut palettes: Vec<(String, Palette)> = actions

@@ -1548,3 +1548,23 @@ Still open (for the owner):
 - Tests: `ui_tests::k56` (8; PostgreSQL where a server is needed, fixtures read only) and the core test
   `instance::tests::a_long_data_directory_gets_a_short_socket_of_its_own`, each seen failing under a mutation
   (`docs/plans/M12.md`, K56).
+
+## 2026-11-24, night — K60: data compare
+
+- The rows of two tables of the same engine family compared by a key, item 1 of the roadmap (TOOL-22), the
+  owner's request of 2026-11-23: "Compare data with…" on a table and in a data tab's menu, Server ▸ Tools ▸
+  Compare Data… and the palette; a dialog as the schema compare's with the table, the key and the columns; a tab
+  with the counts and the rows that differ, one per key, a changed cell as `source → target`, the filters, a
+  row's values and its copies; "Open script" opens the statements that make the target like the source in a
+  query tab on the target, nothing run (D-126).
+- Both tables are read at once, each by one `SELECT` in the order of its key, and merged as they arrive: a batch
+  per side and the differences kept (10,000 at most) are all that is held. The order is one no collation
+  changes (numbers by value, the rest by the bytes of its text) and is checked as the rows come, so a server
+  that orders otherwise stops the compare instead of giving wrong counts; proved with keys that sort one way in
+  en_US or a `_ci` collation and another in bytes, on PostgreSQL and on MySQL against MariaDB.
+- Measured: 1,000,000 rows of `analytics.big_table` against a scratch copy with 4,000 planted differences in
+  1.7 to 2.9 s, the whole test process at 19 MiB of peak memory at most (`docs/BENCH.md`).
+- Tests: `data_compare::tests` (16), the driver round trips (PostgreSQL; MySQL against MariaDB: compare, run
+  the script on the target, compare again, nothing left), `ui_tests::data_compare` (7), each seen failing under
+  a mutation (`docs/plans/M12.md`, K60). Scratch schemas and databases `kerno_test_dc_*` only, dropped also on a
+  failure; the fixtures are only read.

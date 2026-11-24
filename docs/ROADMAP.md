@@ -6,9 +6,10 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
 
 ## Beyond v1, in order
 
-1. **Data compare** (TOOL-22). Runs one ordered `SELECT` per side through `Session::execute`, keyed by the
-   row identity the table view already computes, and merges the two streams. Applying differences reuses the
-   pending-edit SQL and its transactional apply. No trait change.
+1. **Data compare** (TOOL-22): built (K60, D-126; see below). Still to come: another engine pairing and
+   SQLite (an order for its storage classes), a filter or a sample on either side, applying the differences
+   from the tab with the pending-edit apply instead of a script, saving a comparison, more than 10,000
+   differences in one script.
 2. **Visual query builder** (TOOL-26). Uses the schema tree, foreign keys and the dialect's quoting and
    `LIMIT/OFFSET`; its output is SQL text in a query tab. No trait change.
 3. **SQLite**: built (K29, D-102; see below), still to come for it: backup and restore (`VACUUM INTO`,
@@ -37,6 +38,10 @@ schemas of the same engine family, the script that brings one to the other opene
 still to come: another engine pairing (a type mapping, as J13's copy has), a SQL file against a live schema,
 whole servers (several schemas at once), privileges and owners, saving a comparison, `ALTER TYPE … ADD VALUE` for
 new enum labels, and a column type changed under a view (the view dropped and created around it).
+**Data compare** (item 1; TOOL-22; K60, D-126): the rows of two tables of the same engine family matched by a
+key, read as two ordered streams merged in bounded memory (1,000,000 rows against 1,000,000 in about 2 s), the
+differences in a tab and the script that makes the target like the source opened in a query tab, never run;
+what is still to come is under item 1. No trait change: it runs on `Session::execute` and the pending-edit SQL.
 
 Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47; J18, D-069), read-only; still to come: editing the schema
 from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
@@ -148,7 +153,7 @@ The order and the driver-trait extension of each are in "Beyond v1, in order" ab
 | TOOL-20 | Dashboards | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-30 | Task scheduler | PG, My | Saved tasks are done (TOOL-21); DBeaver Community has no scheduler either, and one needs a background runner while Kerno is closed |
 | TOOL-31 | Maintenance tools and data transfers as tasks | PG, My | The four client-tool wizards save tasks; the maintenance dialog and the export wizard have no serialisable settings yet (M10 Part 11b) |
-| TOOL-22 | Data compare, schema compare | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
+| TOOL-22 | Data compare, schema compare | PG, My | Done in v1.2: schema compare (K30, D-103), data compare (K60, D-126) |
 | TOOL-23 | Mock data generator | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-24 | AI assistant | PG, My | Done in v1.1 (J17, D-068): Settings → AI, editor menu ▸ AI: Write SQL / Explain query, plan, error; opt-in, to the endpoint the user configures only |
 | TOOL-25 | Debugger | PG | Outside v1 (CLAUDE.md §4, last paragraph) |

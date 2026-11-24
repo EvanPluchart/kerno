@@ -3959,3 +3959,80 @@ info colour over 1.2 s, so two redraws differed by a few per cent of a 17 px dis
   instance from a newer `kerno <url>`. Not a security measure: the folder is.
 - Both ends (the listener, the hand-off of `kerno <url>`, the start-failure window's check) call the same
   `instance::socket_path`.
+
+## D-126 — Data compare: rows merged in key order, the script opened in a query tab, never run (K60; 2026-11-24)
+
+Item 1 of `docs/ROADMAP.md` (TOOL-22), the owner's request of 2026-11-23 for the next release. DBeaver's data
+compare is in its paid editions: nothing was read or ported; the references are Kerno's own schema compare (K30,
+D-103), data transfer (J13) and pending-edit SQL. Choices:
+
+- **Ways in.** "Compare data with…" on a table of the tree; the same entry in a data tab's menu, which here is
+  the menu of its tab in the strip (the data tab's own toolbar and the grid's menus are other items' ground,
+  `data/tab.rs` and `query/grid.rs`, and are left as they are); Server ▸ Tools ▸ Compare Data… and the palette
+  (the active data tab's table, else nothing picked). The dialog is the schema compare's with a table field and
+  a list of the tables there; both sides start on the table asked from, said as "the same table" until the
+  target is changed.
+- **Same family only**, as D-103, in the data compare's own words (`data_compare::refusal`). SQLite is refused
+  in words in the tree and the dialog: its keys would need an order of their own (storage classes) and a
+  driver test pairing, left for later.
+- **The key** is the source's primary key, or a unique index without a predicate on NOT NULL columns (what
+  `row_identity` takes the first of; picked in the dialog when there are several), else the target's; columns
+  both tables have with the same kind of type. Without any key the compare is refused in words before a row is
+  read. A key the other side does not hold unique is found while reading: two rows with one key stop the
+  compare with the key said.
+- **The order both servers agree on.** Numbers and booleans by value, binary by its bytes (no collation
+  applies to them); every other key column by the bytes of its text: PostgreSQL `CAST(k AS text) COLLATE "C"`,
+  MySQL and MariaDB `CAST(CONVERT(k USING utf8mb4) AS BINARY)` (a `_bin` collation would ignore trailing
+  spaces; a latin1 column's own bytes would not be the UTF-8 the driver hands over). The merge compares keys
+  the same way (`sort::compare_cells`) and checks each side's keys rise strictly: a server that orders
+  otherwise stops the compare with both keys said, instead of wrong counts. Proved with keys that sort `a, B,
+  é, Z` in en_US and `B, Z, a, é` in bytes, on PostgreSQL (`COLLATE "en_US"`) and MySQL / MariaDB (`_ci`). The
+  price: a text key is sorted by the server (its index is in another order); an integer key reads in its
+  index's order.
+- **Values as the engine types them.** Numbers by value (`1.50` is `1.5`), booleans in any spelling, times
+  without trailing zeros in a fraction of a second, JSON without the whitespace between its tokens
+  (`format::compact_json`; key order as printed: `jsonb` and MySQL's JSON order keys themselves, PostgreSQL's
+  `json` and MariaDB's JSON, a text column, keep them as written, so a reordered key there is a difference),
+  everything else byte for byte; NULL is not the empty string. JSON against a text column is compared as JSON
+  (MySQL's JSON is a type, MariaDB's text). Each side's session is told first: read-only, UTC, ISO dates, the
+  shortest exact floats (`SET default_transaction_read_only`, `TIME ZONE`, `DateStyle`, `IntervalStyle`,
+  `extra_float_digits`; MySQL `SET SESSION TRANSACTION READ ONLY`, `time_zone`), so nothing it runs writes and
+  two servers print one value alike. A shared column of another kind of type on each side is listed, not
+  compared; columns only one side has are said, not compared.
+- **Streamed and bounded.** One `SELECT` per side, both at once, each on a session of its own; the merge holds
+  one batch per side (the execution channel's back-pressure) and copies each difference it keeps into two
+  compact arenas (`BatchBuilder`, `ResultStore`), never a batch. It keeps 10,000 differences or 64 MiB of their
+  values, whichever comes first; beyond, the counts go on and the tab and the script say they show the first
+  ones. Large values are compared byte for byte as they arrive, no hash: a row is held whole while it is
+  compared, since the drivers deliver it whole. Measured: 1,000,000 rows against 1,000,000 in 1.7 to 2.9 s, the
+  whole process at 19 MiB of peak resident memory at most (`docs/BENCH.md`).
+- **A snapshot per side.** Each side is one statement, so each is consistent with itself, not with the other:
+  a row changed during the compare is compared as its server had it when its read began. The tab says so.
+- **Cancel** stops both reads: the merge is dropped and both sessions are closed, which stops the statements on
+  their servers (D-103's stop). The tab says how far it got.
+- **The script, never run.** "Open script" writes into a new query tab on the target the statements that make
+  it like the source, by the pending-edit generator (`edit_statements`) in the target's dialect: `INSERT` with
+  the key and every written column for rows only in the source, `UPDATE` of the changed written columns keyed
+  by the target's own key values, and `DELETE` for rows only in the target only when "Also delete what only
+  the target has" is ticked (a count in a comment otherwise). Columns the target's server computes (stored or
+  virtual, an identity it always makes) are compared but never written; a key that is an identity always made
+  is written with `OVERRIDING SYSTEM VALUE` so the rows match after the script. Order: inserts (parents first
+  along the table's own foreign keys), updates, deletes (children first); rows in a cycle come last with a
+  comment. This order lets an updated row point at a new one and leave a deleted one; a unique value that
+  moves from a deleted row to a new one fails until the deletes are run first by hand (said in the guide). No
+  `BEGIN`/`COMMIT` is written, as K30's script: the heading says to switch the tab to manual commit to apply it
+  all or nothing. A MySQL or MariaDB target with a `TIMESTAMP` column starts with `SET time_zone = '+00:00'`
+  (the values were read in UTC); a PostgreSQL key a sequence makes gets a comment that its sequence did not
+  move. Every comment line goes through `compare::commented`, so a key holding a line break never leaves SQL
+  out of its comment. The target's rules apply when the tab runs it (read-only refuses, production asks twice).
+- **The view** is a tab (one per pair of tables, key and columns; not restored after a restart): both sides,
+  Swap, Refresh, Open script; filters with counts (All differences, Only in source, Only in target, Different,
+  and Same as a count), a column filter (the rows where one column differs, with each column's count); the
+  differences in the kit's table, one row per key, a changed cell as `source → target`; the selected row's
+  values whole on both sides in a panel beside it (the query tab's value panel follows a result grid and is not
+  reused); copy as the grid copies (`export::export_to_string`: TSV, CSV, JSON, Markdown, SQL INSERT), the key
+  alone, and ⌘C.
+- **Not in this version**: another engine family or SQLite; a filter or a sample on either side; applying the
+  differences from the tab (the script is the way); saving a comparison; more than 10,000 differences in one
+  script (compare again after running it); keys whose text differs only by Unicode normalization (`é` composed
+  and decomposed are two keys).

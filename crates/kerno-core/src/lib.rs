@@ -7,6 +7,7 @@ pub mod browse;
 pub mod compare;
 pub mod config;
 pub mod connector;
+pub mod data_compare;
 pub mod dbeaver;
 pub mod dialect;
 pub mod driver;

@@ -225,6 +225,8 @@ pub enum TabAction {
     OpenReleasePage,
     SkipVersion,
     TurnOffUpdateChecks,
+    /// A data tab's: compares its table's rows with another's (K60).
+    CompareData,
 }
 
 impl TabAction {
@@ -314,6 +316,7 @@ impl TabAction {
             Self::OpenReleasePage => "Open release page",
             Self::SkipVersion => "Skip this version",
             Self::TurnOffUpdateChecks => "Turn off update checks",
+            Self::CompareData => "Compare data with…",
         }
         .to_string()
     }

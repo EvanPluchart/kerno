@@ -63,6 +63,7 @@ use crate::connections::manager::{
     Connections, ConnectionsEvent, InputAnswer, InputRequest, Status,
 };
 use crate::data::tab::{DataTab, DataTabEvent};
+use crate::data_compare_tab::{self, DataCompareTab, DataCompareTabEvent};
 use crate::erd_tab::{DiagramTab, DiagramTabEvent};
 use crate::extensions_tab::{ExtensionsTab, ExtensionsTabEvent};
 use crate::import_dialog::{self, ImportDialog};
@@ -216,6 +217,8 @@ enum OpenTab {
     Extensions(Entity<ExtensionsTab>),
     /// A schema compare (K30); not restored after a restart.
     Compare(Entity<CompareTab>),
+    /// A data compare (K60); not restored after a restart.
+    DataCompare(Entity<DataCompareTab>),
 }
 
 impl OpenTab {
@@ -282,6 +285,13 @@ impl OpenTab {
         }
     }
 
+    fn data_compare(&self) -> Option<&Entity<DataCompareTab>> {
+        match self {
+            OpenTab::DataCompare(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
     /// A restored tab reads nothing, and opens no session, until it is
     /// shown.
     fn defer_until_shown(&self, cx: &mut App) {
@@ -292,6 +302,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             OpenTab::Compare(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
+            OpenTab::DataCompare(tab) => tab.update(cx, |tab, cx| tab.defer_until_shown(cx)),
             // A query tab opens its session on its first run.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
         }
@@ -306,6 +317,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             OpenTab::Compare(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
+            OpenTab::DataCompare(tab) => tab.update(cx, |tab, cx| tab.reveal(window, cx)),
             // Called at every frame: the Tasks view reads its list when it
             // opens and when a task changes, never from here.
             OpenTab::Query(_) | OpenTab::TableEditor(_) | OpenTab::Tasks(_) => {}
@@ -323,7 +335,8 @@ impl OpenTab {
             | OpenTab::Tasks(_)
             | OpenTab::Diagram(_)
             | OpenTab::Extensions(_)
-            | OpenTab::Compare(_) => {}
+            | OpenTab::Compare(_)
+            | OpenTab::DataCompare(_) => {}
         }
     }
 
@@ -338,6 +351,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.entity_id(),
             OpenTab::Extensions(tab) => tab.entity_id(),
             OpenTab::Compare(tab) => tab.entity_id(),
+            OpenTab::DataCompare(tab) => tab.entity_id(),
         }
     }
 
@@ -379,7 +393,8 @@ impl OpenTab {
             | OpenTab::Tasks(_)
             | OpenTab::Diagram(_)
             | OpenTab::Extensions(_)
-            | OpenTab::Compare(_) => Vec::new(),
+            | OpenTab::Compare(_)
+            | OpenTab::DataCompare(_) => Vec::new(),
             OpenTab::TableEditor(tab) => {
                 if tab.read(cx).dirty(cx) {
                     vec![Loss::Form]
@@ -401,6 +416,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Extensions(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Compare(tab) => Some(tab.read(cx).target().connection.clone()),
+            OpenTab::DataCompare(tab) => Some(tab.read(cx).target().connection.clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -416,6 +432,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Extensions(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Compare(tab) => Some(tab.read(cx).target().clone()),
+            OpenTab::DataCompare(tab) => Some(tab.read(cx).target().clone()),
             OpenTab::Tasks(_) => None,
         }
     }
@@ -431,6 +448,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.focus_handle(cx),
             OpenTab::Extensions(tab) => tab.focus_handle(cx),
             OpenTab::Compare(tab) => tab.focus_handle(cx),
+            OpenTab::DataCompare(tab) => tab.focus_handle(cx),
         }
     }
 
@@ -445,7 +463,8 @@ impl OpenTab {
             OpenTab::TableEditor(_)
             | OpenTab::Tasks(_)
             | OpenTab::Extensions(_)
-            | OpenTab::Compare(_) => None,
+            | OpenTab::Compare(_)
+            | OpenTab::DataCompare(_) => None,
         }
     }
 
@@ -460,6 +479,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.read(cx).title(),
             OpenTab::Extensions(tab) => tab.read(cx).title(),
             OpenTab::Compare(tab) => tab.read(cx).title(),
+            OpenTab::DataCompare(tab) => tab.read(cx).title(),
         }
     }
 
@@ -477,7 +497,8 @@ impl OpenTab {
             | OpenTab::Tasks(_)
             | OpenTab::Diagram(_)
             | OpenTab::Extensions(_)
-            | OpenTab::Compare(_) => false,
+            | OpenTab::Compare(_)
+            | OpenTab::DataCompare(_) => false,
             OpenTab::TableEditor(tab) => tab.read(cx).dirty(cx),
         };
         let title = self.title(cx);
@@ -499,6 +520,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.read(cx).status(cx),
             OpenTab::Extensions(tab) => tab.read(cx).status(cx),
             OpenTab::Compare(tab) => tab.read(cx).status(cx),
+            OpenTab::DataCompare(tab) => tab.read(cx).status(cx),
         }
     }
 
@@ -513,6 +535,7 @@ impl OpenTab {
             OpenTab::Diagram(tab) => tab.clone().into(),
             OpenTab::Extensions(tab) => tab.clone().into(),
             OpenTab::Compare(tab) => tab.clone().into(),
+            OpenTab::DataCompare(tab) => tab.clone().into(),
         }
     }
 }
@@ -830,6 +853,9 @@ impl Workspace {
     fn tab_menu(&self, tab: &OpenTab, index: usize, cx: &App) -> Vec<Entry> {
         let (group, position, count) = self.place_of(index).unwrap_or((self.panes.focused(), 0, 1));
         let mut entries = tabs::tab_menu(tab.kind(cx), position, count);
+        if tab.data().is_some() {
+            entries.extend([Entry::Separator, Entry::Item(TabAction::CompareData, None)]);
+        }
         let split = self.panes.can_split(tab.entity_id(), group).err();
         entries.extend(tabs::group_entries(
             self.panes.groups().len(),
@@ -1632,6 +1658,91 @@ impl Workspace {
         crate::compare_dialog::open(self.connections.clone(), workspace, source, window, cx);
     }
 
+    /// Shows the data compare of `spec`: in the tab that already shows it,
+    /// else in a new one (K60).
+    pub fn open_data_compare(
+        &mut self,
+        spec: data_compare_tab::Spec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DataCompareTab> {
+        let open = self.tabs.iter().position(|tab| {
+            tab.data_compare()
+                .is_some_and(|tab| tab.read(cx).spec() == &spec)
+        });
+        if let Some(index) = open {
+            self.activate_tab(index, window, cx);
+            return self.tabs[index]
+                .data_compare()
+                .expect("a data compare tab")
+                .clone();
+        }
+        let connections = self.connections.clone();
+        let tab = cx.new(|cx| DataCompareTab::new(spec, connections, window, cx));
+        // One subscription per tab: `close_tab_at` drops it with the tab.
+        let subscription = cx.subscribe_in(
+            &tab,
+            window,
+            |this, _, event: &DataCompareTabEvent, window, cx| match event {
+                DataCompareTabEvent::OpenScript { target, title, sql } => {
+                    this.open_query(title.clone(), sql, Some(target.clone()), window, cx);
+                }
+            },
+        );
+        self.tab_subscriptions.insert(tab.entity_id(), subscription);
+        self.tabs.push(OpenTab::DataCompare(tab.clone()));
+        self.adopt_last_tab();
+        self.activate_tab(self.active_index(), window, cx);
+        tab
+    }
+
+    /// Opens "Compare data…" with `source` (a place and a table) on both
+    /// sides, when given; the palette's command takes the active data
+    /// tab's table.
+    fn compare_data(
+        &mut self,
+        source: Option<(Target, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = source.or_else(|| {
+            let tab = self.active_open()?.data()?;
+            self.data_tab_place(tab, cx)
+        });
+        let workspace = cx.entity().downgrade();
+        crate::data_compare_dialog::open(self.connections.clone(), workspace, source, window, cx);
+    }
+
+    /// The place and the name of a data tab's table: its own schema, or
+    /// its database on engines without schemas.
+    fn data_tab_place(&self, tab: &Entity<DataTab>, cx: &App) -> Option<(Target, String)> {
+        let tab = tab.read(cx);
+        let (target, table) = (tab.target(), tab.table());
+        let meta = self.connections.read(cx).meta_session(&target.connection)?;
+        let place = if meta.dialect().has_schemas() {
+            Target {
+                schema: Some(table.schema.clone()),
+                ..target.clone()
+            }
+        } else {
+            Target {
+                connection: target.connection.clone(),
+                database: Some(table.schema.clone()),
+                schema: None,
+            }
+        };
+        Some((place, table.name.clone()))
+    }
+
+    /// The open data compare tabs, in tab order; for tests.
+    #[cfg(test)]
+    pub fn data_compare_tabs(&self) -> Vec<Entity<DataCompareTab>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.data_compare().cloned())
+            .collect()
+    }
+
     /// Opens "Export schema…" on the schema of `target`, `tables` ticked
     /// alone when given (K31).
     pub fn export_schema(
@@ -2062,6 +2173,7 @@ impl Workspace {
             OpenTab::Diagram(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             OpenTab::Extensions(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             OpenTab::Compare(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            OpenTab::DataCompare(tab) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             OpenTab::Tasks(_) => {}
         }
         // A closed query tab can be opened again, with its text.
@@ -2432,6 +2544,11 @@ impl Workspace {
             | TabAction::OpenReleasePage
             | TabAction::SkipVersion
             | TabAction::TurnOffUpdateChecks => self.update_action(action, window, cx),
+            TabAction::CompareData => {
+                let data = tab.as_ref().and_then(OpenTab::data);
+                let source = data.and_then(|data| self.data_tab_place(data, cx));
+                self.compare_data(source, window, cx);
+            }
             // The editor runs its entries itself.
             other => tracing::warn!(?other, "not an action of the window"),
         }
@@ -2949,6 +3066,9 @@ impl Workspace {
             }
             NavigatorEvent::ExportSchema { target, tables } => {
                 self.export_schema(target.clone(), tables.clone(), window, cx);
+            }
+            NavigatorEvent::CompareData { target, table } => {
+                self.compare_data(Some((target.clone(), table.clone())), window, cx);
             }
             NavigatorEvent::ManageExtensions { target, extension } => {
                 self.open_extensions(target.clone(), extension.clone(), window, cx);
@@ -4424,6 +4544,7 @@ impl Workspace {
             Some(OpenTab::Diagram(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             Some(OpenTab::Extensions(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             Some(OpenTab::Compare(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
+            Some(OpenTab::DataCompare(tab)) => tab.update(cx, |tab, cx| tab.cancel(cx)),
             _ => {}
         }
     }
@@ -7678,6 +7799,11 @@ impl Render for Workspace {
                     // The active tab's place is the source to start from.
                     let source = this.active_open().and_then(|tab| tab.target(cx));
                     this.compare_schemas(source, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CompareData, window, cx| {
+                    this.compare_data(None, window, cx)
                 }),
             )
             .on_action(cx.listener(

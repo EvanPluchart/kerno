@@ -206,6 +206,30 @@ pointer in a key column, two runs (the machine busy, 1-minute load 6 to 15). Ave
 | 300 columns (30 keys), 1,000 rows, across and back, one column a frame, 600 frames | 8.02 / 7.01 ms; 11.08 / 11.12 | 8.27 / 7.43 ms; 19.56 / 10.47 |
 | The same, down and up, 17 rows a frame, 116 frames | 8.47 / 8.02 ms; 9.35 / 15.99 | 8.28 / 7.90 ms; 9.47 / 12.45 |
 
+## Data compare (K60)
+
+The rows of `analytics.big_table` (1,000,000 rows of 20 columns: integers, numerics, floats, text, dates, times,
+timestamps with and without zone, a uuid, `jsonb`, an array, `inet`, an enum) against a copy in the scratch
+schema `kerno_test_dc_big`, made and dropped by the run, with 1,000 rows deleted, 1,000 added and 2,000 changed:
+the core's compare (`data_compare::run`, the same code the tab runs) on two sessions of the PostgreSQL 17 test
+server, both read at once, merged as they arrive. Release build, measured on 2026-11-24 with
+`/usr/bin/time -l` around the test process alone (the copy, the compare and the script), the machine shared
+with other builds (1-minute load 8 to 27).
+
+| Measure | Result |
+|---|---|
+| Compare, 1,000,000 rows against 1,000,000, four runs | 2.9, 2.1, 1.7, 2.0 s (the first before progress was told at most every 100 ms) |
+| Found | 1,000 only in the source, 1,000 only in the target, 2,000 different, 997,000 the same: the planted ones |
+| Differences kept (all 4,000) | 1.98 MB in their arenas; the script of their statements 774 kB |
+| Peak memory of the whole process (maximum resident set size) | 18.3 to 19.1 MiB |
+
+The memory does not grow with the tables: each side holds the batch being merged (the execution channel lets
+four wait), the differences kept are copied out of their batches, and at most 10,000 of them (or 64 MiB of
+their values) are kept; beyond, they are counted. The key is an integer, read in its index's order; a text key
+is ordered by the bytes of its text (D-126), which the server sorts first.
+
+`cargo test -p kerno-postgres --release --test data_compare -- --ignored` runs it.
+
 ## Reproducing
 
 ```sh

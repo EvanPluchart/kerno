@@ -661,6 +661,42 @@ What only the target has is dropped only when "Also drop what only the target ha
 why, with the source's definition. Swap and Refresh compare again; a row's menu opens the object in the source
 or the target.
 
+## Compare the rows of two tables
+
+Right-click a table in the tree (or the tab of its data) and choose "Compare data with…", or use Server ▸ Tools
+▸ Compare Data… and the palette, which start from the data tab on screen. The dialog asks for two tables: the
+**source**, the model, and the **target**, what the script will change, each a saved connection, its database,
+its schema (not on MySQL and MariaDB) and the table, typed or picked from Tables ▾. Both start on the table you
+asked from: change the target's schema, database or connection. ⇄ exchanges them. Both must be of the same
+kind: two PostgreSQL tables, or MySQL and MariaDB tables; another pairing is refused, and so is SQLite for now.
+
+Once both tables are read, the dialog shows the **key** the rows are matched by (the primary key, or a unique
+key on columns that never hold NULL; pick another when there are several) and the **columns** both tables
+have, each ticked: untick one to leave it out. A column only one table has is said and not compared; so is a
+column whose type is of another kind on each side. Tables without any key cannot be compared: a row of one
+could not be told which row of the other it is. Nothing is written: both tables are only read.
+
+The tab reads both tables at once, each in the order of its key, and compares their rows as they come, so a
+table of millions of rows takes little memory; each side's row counter and the time show, and Cancel stops
+both reads on their servers. Then it counts the rows only in the source (`+`), only in the target (`−`),
+different (`≠`) and the same, and shows the differences one row per key: a changed cell reads `source →
+target`. The filters show one kind; "Any column ▾" shows the rows where one column differs, with each column's
+count. Click a row to read all its values on both sides beside the list; its menu copies the key, either row,
+or the row as TSV, CSV, JSON, Markdown or an `INSERT`, and ⌘C copies it. Values are compared as the server
+types them: `1.50` and `1.5` are the same number, NULL is not an empty text, JSON is compared without its
+spaces, and keys compare by their exact text, whatever the collation (`a` and `A` are two keys). Each table is
+read in one statement: a row someone changes during the compare is compared as it was when its read began.
+At most 10,000 differences are kept to show and to write; beyond, the counts go on and the tab says so.
+
+"Open script" opens, in a new query tab on the target, the statements that make it like the source: an
+`INSERT` for each row only in the source, an `UPDATE` of the changed columns for each different row, and a
+`DELETE` for each row only in the target when "Also delete what only the target has" is ticked. Nothing has
+run: read the script, then run it there; the connection's rules apply (a read-only target refuses it,
+production asks twice). Switch that tab to manual commit to apply it all or nothing. Columns the server
+computes are compared but never written. New rows come before the rows that point at them through the table's
+own foreign keys, and deleted rows after them; if a unique value moves from a deleted row to a new one, run the
+deletes first. When the script holds only the first 10,000 differences, compare again once it has run.
+
 ## Export a schema as a document
 
 Right-click a schema (a database on MySQL, MariaDB and SQLite) and choose "Export schema…", or a table or a view

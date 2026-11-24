@@ -52,6 +52,7 @@ mod connection_scripts;
 mod coverage;
 mod critique;
 mod daily_use;
+mod data_compare;
 mod dbeaver_import;
 mod editing_v11;
 mod editor_v11;

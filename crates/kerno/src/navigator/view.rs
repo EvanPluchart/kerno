@@ -129,6 +129,8 @@ pub enum NavigatorEvent {
     /// Export the schema of `target` as a document, `tables` ticked alone
     /// when given (K31).
     ExportSchema { target: Target, tables: Vec<String> },
+    /// Compare the rows of `table` of `target` with another table's (K60).
+    CompareData { target: Target, table: String },
     /// Tell the user something went otherwise than asked.
     Warn(String),
     /// Ask the AI assistant this, in a query tab on `target` (K53).
@@ -1253,6 +1255,13 @@ impl Navigator {
                 }
             }
             Action::CompareWith => self.perform_tool(ToolEntry::CompareSchemas, id, window, cx),
+            Action::CompareData => {
+                if let NodeKind::Object(ObjectRef::Relation(table, _)) = &node.kind {
+                    let target = Self::target_of(connection, &node, true);
+                    let table = table.name.clone();
+                    cx.emit(NavigatorEvent::CompareData { target, table });
+                }
+            }
             Action::ExportSchema => {
                 let tables = match &node.kind {
                     NodeKind::Object(ObjectRef::Relation(table, _)) => vec![table.name.clone()],
@@ -1631,6 +1640,9 @@ impl Navigator {
             // menu entry that does nothing.
             (Action::CompareWith, _) if saved.config.engine.is_file() => {
                 Some("comparing SQLite schemas is not supported yet")
+            }
+            (Action::CompareData, _) if saved.config.engine.is_file() => {
+                Some("comparing the rows of SQLite tables is not supported yet")
             }
             // PostgreSQL cannot drop the database a session is in.
             (Action::Drop, Some(ObjectRef::Database(name)))

@@ -216,6 +216,8 @@ gpui_kit::actions!(
         CopyTables,
         /// Compares two schemas and opens the script between them (K30).
         CompareSchemas,
+        /// Compares the rows of two tables and opens the script between them (K60).
+        CompareData,
         /// Writes a schema's structure as a document (K31).
         ExportSchema,
         /// The foreign data wrappers of a PostgreSQL database.
@@ -2376,6 +2378,19 @@ pub const COMMANDS: &[Command] = &[
             "compare databases"
         ],
         CompareSchemas
+    ),
+    command!(
+        "compare_data",
+        "Compare Data…",
+        "Server",
+        [],
+        [
+            "data compare",
+            "diff rows",
+            "synchronize data",
+            "compare tables"
+        ],
+        CompareData
     ),
     command!(
         "export_schema",
