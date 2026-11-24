@@ -35,6 +35,7 @@ mod open_url;
 mod portability;
 mod query;
 mod quick_open;
+mod save_panel;
 mod schema_export_dialog;
 mod settings;
 mod settings_ui;

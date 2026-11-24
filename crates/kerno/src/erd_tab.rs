@@ -648,12 +648,10 @@ impl DiagramTab {
             self.title().replace(" · ", "-"),
             format.extension()
         );
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let picking = cx.prompt_for_new_path(&home, Some(&name));
+        let picking =
+            crate::save_panel::ask(crate::save_panel::SaveKind::Diagram, None, Some(name), cx);
         self.load.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.export_to(format, path, window, cx)
                 });

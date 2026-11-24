@@ -1539,3 +1539,6 @@ Still open (for the owner):
   failing with K37's breath. Captures light and dark of the strip, the bar and two frames of the mark, offscreen.
 - "Test connection" said a password just typed in the dialog came from Kerno's file (or the keychain). It now
   says "Password typed here", and still says where a saved one, untouched, really came from.
+- Each save panel (an export, a backup, a schema document, a diagram, the connections' export, a saved script, a
+  new database file) opened in the home folder. Each kind now opens in the folder it last saved in, the home
+  folder when that folder is gone.

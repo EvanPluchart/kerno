@@ -783,13 +783,15 @@ impl ConnectionDialog {
     /// A file that is there already is kept as it is and opened, never
     /// emptied: the panel's "Replace?" cannot wipe a database.
     fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
-        let picking = cx.prompt_for_new_path(&home, Some("database.db"));
+        let picking = crate::save_panel::ask(
+            crate::save_panel::SaveKind::DatabaseFile,
+            None,
+            Some("database.db".into()),
+            cx,
+        );
         let input = self.inputs.file.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(path))) = picking.await else {
+            let Some(path) = picking.await else {
                 return;
             };
             let making = this.update(cx, |_, cx| {

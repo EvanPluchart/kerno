@@ -418,20 +418,14 @@ impl BackupDialog {
     /// backup would write.
     fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder = PathBuf::from(Self::text(&self.folder, cx));
-        let folder = if folder.is_absolute() {
-            folder
-        } else {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-        };
         let name = self.output_path(cx).ok().and_then(|path| {
             path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         });
-        let picking = cx.prompt_for_new_path(&folder, name.as_deref());
+        let picking =
+            crate::save_panel::ask(crate::save_panel::SaveKind::Backup, Some(folder), name, cx);
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 // The macOS panel asks before it returns a file that exists; a Linux
                 // panel may not (it depends on the desktop's portal), so Kerno asks there.
                 let probe = path.clone();

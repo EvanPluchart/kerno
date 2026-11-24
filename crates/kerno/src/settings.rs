@@ -85,6 +85,9 @@ pub struct Settings {
     /// The folder the last backup of a database was written to: the next
     /// one is proposed there (K26).
     pub backup_folder: Option<PathBuf>,
+    /// The folder each kind of save panel last saved in (K56,
+    /// [`crate::save_panel`]), by kind; the backup's is `backup_folder`.
+    pub save_folders: BTreeMap<String, PathBuf>,
     /// Text size of the interface, in points.
     pub ui_font_size: f32,
     /// Text size of the SQL editors.
@@ -241,6 +244,7 @@ impl Default for Settings {
             client_folders: Vec::new(),
             default_clients: BTreeMap::new(),
             backup_folder: None,
+            save_folders: BTreeMap::new(),
             ui_font_size: 13.0,
             editor_font_size: 12.5,
             grid_font_size: 11.5,
@@ -441,6 +445,7 @@ mod tests {
             client_folders: vec![PathBuf::from("/opt/pg/bin")],
             default_clients: [(ClientFamily::Postgres, PathBuf::from("/opt/pg/bin"))].into(),
             backup_folder: Some(PathBuf::from("/Users/me/backups")),
+            save_folders: [("export".to_string(), PathBuf::from("/Users/me/exports"))].into(),
             ui_font_size: 15.0,
             editor_font_size: 14.0,
             grid_font_size: 13.0,

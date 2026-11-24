@@ -29,6 +29,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::bridge;
 use crate::connections::manager::{Connections, Status};
 use crate::query::plan_view::number;
+use crate::save_panel::{self, SaveKind};
 use crate::tabs::Target;
 use crate::theme;
 
@@ -296,12 +297,9 @@ impl ExportDialog {
             Source::Query { .. } => "result".into(),
         };
         let name = format!("{stem}.{}", self.format.extension());
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let picking = cx.prompt_for_new_path(&home, Some(&name));
+        let picking = save_panel::ask(SaveKind::Export, None, Some(name), cx);
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 let _ = this.update_in(cx, |this, window, cx| this.export_to(path, window, cx));
             }
         }));

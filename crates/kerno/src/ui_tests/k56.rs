@@ -581,3 +581,62 @@ fn a_tested_password_says_where_it_really_came_from(cx: &mut TestAppContext) {
     app.type_text(cx, testing::DB_PASSWORD);
     assert_eq!(tested_password(&app, cx), "Password typed here");
 }
+
+/// 6. Each kind of save panel opens in the folder it last saved in, its
+/// own: the home folder first, then the folder chosen, the home folder
+/// again once that folder is gone; another kind keeps to its own.
+#[gpui_kit::test]
+fn each_save_panel_opens_where_its_kind_last_saved(cx: &mut TestAppContext) {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let dir = tempfile::tempdir().unwrap();
+    let folder = std::fs::canonicalize(dir.path()).unwrap().join("exports");
+    std::fs::create_dir(&folder).unwrap();
+    let app = open(cx, memory_storage());
+    // The panel of the connections' export, answered with `file`; the
+    // folder it opened in.
+    let export = |app: &Fixture, cx: &mut TestAppContext, file: Option<std::path::PathBuf>| {
+        let connections = app.connections.clone();
+        app.step(cx, |window, cx| {
+            crate::portability::open_export(connections, window, cx);
+        });
+        app.click(cx, "portable-choose-file");
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(std::path::PathBuf::new()));
+        let seen = opened.clone();
+        cx.simulate_new_path_selection(move |at| {
+            *seen.borrow_mut() = at.to_path_buf();
+            file
+        });
+        app.step(cx, |_, _| ());
+        app.press(cx, &["escape"]);
+        opened.take()
+    };
+    assert_eq!(export(&app, cx, Some(folder.join("one.json"))), home);
+    app.wait_until(cx, "the folder kept", |_, cx| {
+        cx.update(|cx| {
+            AppState::get(cx)
+                .settings
+                .save_folders
+                .get("connections")
+                .cloned()
+        })
+        .as_ref()
+            == Some(&folder)
+    });
+    assert_eq!(export(&app, cx, None), folder);
+    // A query tab's "Save as…" has its own memory: the home folder.
+    app.press(cx, &["secondary-t"]);
+    app.dispatch(cx, actions::SaveFileAs);
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(std::path::PathBuf::new()));
+    let seen = opened.clone();
+    cx.simulate_new_path_selection(move |at| {
+        *seen.borrow_mut() = at.to_path_buf();
+        None
+    });
+    app.step(cx, |_, _| ());
+    assert_eq!(opened.take(), home);
+    // The folder gone: the home folder again.
+    std::fs::remove_dir_all(&folder).unwrap();
+    assert_eq!(export(&app, cx, None), home);
+}

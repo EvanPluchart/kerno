@@ -3507,23 +3507,22 @@ impl Workspace {
         let tab = tab.read(cx);
         let (directory, name) = match tab.file() {
             Some(file) => (
-                file.parent().map(Path::to_path_buf).unwrap_or_default(),
+                file.parent().map(Path::to_path_buf),
                 file.file_name()
                     .map(|name| name.to_string_lossy().into_owned()),
             ),
             None => (
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default(),
+                None,
                 Some(format!(
                     "{}.sql",
                     tab.title().to_lowercase().replace(' ', "-")
                 )),
             ),
         };
-        let picking = cx.prompt_for_new_path(&directory, name.as_deref());
+        let picking =
+            crate::save_panel::ask(crate::save_panel::SaveKind::SqlFile, directory, name, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.save_active_tab_to(path, window, cx)
                 });

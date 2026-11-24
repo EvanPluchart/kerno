@@ -198,12 +198,14 @@ impl ExportSetup {
     }
 
     fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let picking = cx.prompt_for_new_path(&home, Some("kerno-connections.json"));
+        let picking = crate::save_panel::ask(
+            crate::save_panel::SaveKind::Connections,
+            None,
+            Some("kerno-connections.json".into()),
+            cx,
+        );
         self.work = Some(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 let _ = this.update_in(cx, |this, window, cx| this.export_to(path, window, cx));
             }
         }));

@@ -442,21 +442,21 @@ impl SchemaExportDialog {
     pub fn choose_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (folder, name) = match &self.output {
             Some(path) => (
-                path.parent().map(Path::to_path_buf).unwrap_or_default(),
+                path.parent().map(Path::to_path_buf),
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             ),
-            None => (
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default(),
-                schema_doc::file_name(&self.schema, self.format),
-            ),
+            None => (None, schema_doc::file_name(&self.schema, self.format)),
         };
-        let picking = cx.prompt_for_new_path(&folder, Some(&name));
+        let picking = crate::save_panel::ask(
+            crate::save_panel::SaveKind::SchemaDocument,
+            folder,
+            Some(name),
+            cx,
+        );
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = picking.await {
+            if let Some(path) = picking.await {
                 let probe = path.clone();
                 let exists = cx
                     .background_executor()
