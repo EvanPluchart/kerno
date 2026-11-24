@@ -98,6 +98,8 @@ pub enum Action {
     CompareWith,
     /// The data compare with this table as the source (K60).
     CompareData,
+    /// Test data for this table: a script, or rows inserted (K72).
+    GenerateTestData,
     /// The structure of this schema (a database), or of this table or view
     /// alone at first, written as a document (K31).
     ExportSchema,
@@ -151,6 +153,7 @@ impl Action {
             Action::ViewDiagram => "View diagram",
             Action::CompareWith => "Compare with…",
             Action::CompareData => "Compare data with…",
+            Action::GenerateTestData => "Fill with test data…",
             Action::ExportSchema => "Export schema…",
         }
     }
@@ -244,7 +247,14 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
                 ReadInConsole,
             ],
             // Backup and Truncate are under Tools ▸ ([`tool_entries`]).
-            vec![Export, ImportCsv, ViewDiagram, CompareData, ExportSchema],
+            vec![
+                Export,
+                ImportCsv,
+                ViewDiagram,
+                CompareData,
+                GenerateTestData,
+                ExportSchema,
+            ],
             all_templates.to_vec(),
             vec![AddColumn],
             vec![ShowDdl, CopyName, CopyQualifiedName],
@@ -1240,6 +1250,8 @@ mod tests {
             EditColumn,
             ViewDiagram,
             CompareData,
+            // Opens on a read-only connection: only its Insert writes, and refuses.
+            GenerateTestData,
             ExportSchema,
             // The manager says itself what a read-only connection refuses.
             ManageExtensions,

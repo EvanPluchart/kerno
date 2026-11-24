@@ -218,6 +218,8 @@ gpui_kit::actions!(
         CompareSchemas,
         /// Compares the rows of two tables and opens the script between them (K60).
         CompareData,
+        /// Makes test data for a table: a script, or rows inserted (K72).
+        GenerateTestData,
         /// Writes a schema's structure as a document (K31).
         ExportSchema,
         /// The foreign data wrappers of a PostgreSQL database.
@@ -2397,6 +2399,21 @@ pub const COMMANDS: &[Command] = &[
             "compare tables"
         ],
         CompareData
+    ),
+    command!(
+        "generate_test_data",
+        "Generate Test Data…",
+        "Server",
+        [],
+        [
+            "mock data",
+            "fake rows",
+            "sample data",
+            "seed",
+            "insert rows",
+            "fill table"
+        ],
+        GenerateTestData
     ),
     command!(
         "export_schema",

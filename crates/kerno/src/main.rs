@@ -57,6 +57,7 @@ mod state;
 mod structure;
 mod tabs;
 mod tasks_view;
+mod test_data_dialog;
 mod theme;
 mod transfer_dialog;
 #[cfg(test)]
@@ -745,6 +746,7 @@ fn menus() -> Vec<Menu> {
                         command("copy_tables"),
                         command("compare_schemas"),
                         command("compare_data"),
+                        command("generate_test_data"),
                         command("export_schema"),
                         separator(),
                         command("foreign_data_wrappers"),

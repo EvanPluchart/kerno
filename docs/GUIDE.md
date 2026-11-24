@@ -749,6 +749,42 @@ statement. New rows come before the rows that point at them through the
 table's own foreign keys, and deleted rows after them; if a unique value moves from a deleted row to a new one,
 run the deletes first. When the script holds only the first 10,000 differences, compare again once it has run.
 
+## Generate test data for a table
+
+Right-click a table in the tree (or the tab of its data) and choose "Fill with test data…", or use Server ▸
+Tools ▸ Generate Test Data… and the palette, which start from the data tab on screen. It works on PostgreSQL,
+MySQL, MariaDB and SQLite. The rows are made on this computer, nothing is sent anywhere: this is not the AI
+assistant's "Generate test data…" (under AI ▸), which writes what a model imagines.
+
+The dialog reads the table once and shows one line per column with the values it will get, guessed from its
+type, its keys and its name, and that kind's settings: a **sequence** (start, step) for a key of whole numbers,
+starting after the largest value the table holds; a **random number** or **decimal** in a range the type can
+hold; **random words** to a length the column holds; an **email address**, a **first**, **last** or **full
+name**, a **phone number**, a **city**, a **country** (a two-letter code where the column is short), a **web
+address** or a **user name** for a text column named so; dates and times in a range of days (with the zone
+where the type keeps one); UUIDs; a small JSON object; one of an enum's or a `SET`'s labels; random bytes or
+bits; arrays of up to three elements. A **foreign key** picks keys that exist in the referenced table (a key of
+several columns as a whole, among its first 10,000 keys). Columns the server makes (generated, identity,
+auto-increment) are left to it; a column with a default can be left to its default; a nullable column gets a
+**share of NULL** (10 % by default outside the keys). Pick another kind with the button of its line; the
+settings change with it.
+
+Every value comes from the **seed**: the same seed and settings give the same rows, New seed gives others. Keys
+stay unique: a sequence never repeats, a unique text ends with a number beyond the rows there, and other values
+are drawn again until they differ (compared without case, as a case-insensitive server would). What cannot
+work is said before anything runs: a range the type cannot hold, more rows than a unique column has values for,
+a referenced table without rows, a MySQL `TIMESTAMP` outside 1970 to 2038. Rules Kerno does not check (a
+`CHECK`, an exclusion constraint, a partial unique index) are listed under the columns: a row that breaks one
+stops the insert, and nothing is kept. The preview shows the first ten rows as they will be written, and
+follows each change.
+
+Ask for 1 to 1,000,000 rows. **Open script** writes the `INSERT` statements (500 rows each) into a new query tab
+on the table's connection, up to 10,000 rows, and runs nothing. **Insert…** shows the first statement, asks as
+the connection's environment says (production asks twice), then inserts every row in one transaction, with
+progress and Cancel: all of them, or none. A row the server refuses is named with the server's message, and
+nothing is kept. A read-only connection offers Open script only. Once the rows are in, an open data tab of the
+table shows them.
+
 ## Export a schema as a document
 
 Right-click a schema (a database on MySQL, MariaDB and SQLite) and choose "Export schema…", or a table or a view

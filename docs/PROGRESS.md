@@ -1761,3 +1761,15 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   the designed window in light and dark. Locally: the full script passes, each of its checks seen failing.
   Not proved locally: the picture itself, hidden by a mounted 0.1.0 image of the same volume name.
 
+## 2026-11-24 — K72: test data for a table
+
+- The owner's pick for the next release (ROADMAP TOOL-23): "Fill with test data…" on a table, from the tree, a
+  data tab's menu and the palette (Generate Test Data…), on PostgreSQL, MySQL, MariaDB and SQLite. The rows are made here from a
+  seed, exact about the table's types, keys and foreign keys; a preview follows the settings; "Open script"
+  opens the `INSERT` statements in a query tab and runs nothing, "Insert…" inserts them in one transaction
+  under the environment's rules (D-141).
+- Proved by the core's unit tests (every generator, bounds, uniqueness, the NULL share, the script), a driver
+  test per engine (1,000 rows of every common type inserted and their rules kept, the script of 1,000 more run
+  as written, an empty parent refused, a refused row keeping nothing) and six UI tests, each seen failing
+  under a mutation; captures light and dark.
+- Not done: values read from a file or another table, CHECK rules kept, settings saved as a task (D-141).

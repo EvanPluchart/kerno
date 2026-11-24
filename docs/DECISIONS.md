@@ -4509,3 +4509,82 @@ image:
   before. Each miss fails the build with a line naming it. (A file that is not a valid store is removed from
   the volume by macOS itself; the byte check catches that too.)
 
+## D-141 — Test data for a table: made here from a seed, exact about the table's rules (K72; 2026-11-24)
+
+TOOL-23 of `docs/ROADMAP.md` ("Mock data generator"; the task named it TOOL-20, which is Dashboards), the
+owner's pick for the next release. The AI assistant's "Generate test data…" (K53) writes what a model imagines;
+this one is local, repeatable and checked against the table. DBeaver's mock data generator
+(`ext.mockdata`) is not in the Community sources Kerno reads (`~/VM/refs/dbeaver` has no such plugin): nothing
+was ported, `THIRD_PARTY_NOTICES.md` is unchanged, and the word lists were written for Kerno. Choices:
+
+- **Where it is.** "Fill with test data…" in a table's menu of the tree, beside "Compare data with…" (not under
+  Tools ▸, as the task said: SQLite has no Tools ▸, its client tools being absent, D-102, and `tools.rs` was
+  another agent's ground tonight; Compare data is in that same group); in a data tab's menu (its tab in the
+  strip, as K60); Server ▸ Tools ▸ Generate Test Data… and the palette, on the active data tab's table, else a
+  notification that says where to start. It opens on a read-only connection (Open script runs nothing): only
+  Insert is off there, with a line that says why. Not "Generate test data…", the task's words: that is K53's
+  entry under AI ▸ of the same menu, and two entries of one name in one menu are one too many (the full
+  suite's `ai_ask` test, which clicks K53's entry by its name, clicked this one). The palette's command and the
+  dialog's title keep "Generate Test Data…" / "Generate test data for …"; the AI's command is "AI: Generate
+  Test Data…".
+- **One module in `kerno-core`** (`test_data.rs`), no trait change, no dependency. The random source is a
+  counter-based SplitMix64 written there: each value is a pure function of the seed, a stream (the column, its
+  NULLs, a foreign key), the row number and an attempt number. So the preview is exactly the first rows of the
+  run, a batch boundary changes nothing, and changing one column's settings leaves the other columns' values as
+  they were. The seed starts as six random digits (`getrandom`, already a dependency) and can be typed.
+- **The guess** per column, from its type, its keys and its name: generated, identity and auto-increment
+  columns are left to the server and cannot be changed (an identity written by hand would leave its sequence
+  behind); a foreign key picks among the referenced table's keys; a whole-number column that is a unique key
+  alone gets a sequence from the largest value there + 1; a text column named `email`, `first_name`,
+  `last_name`/`surname`, `name`/`full_name`, `*phone*`, `city`, `*country*`, `url`/`website`, `username` gets
+  that shape when the column holds at least the shape's usual width (else random words), `*uuid*`/`*guid*` a
+  UUID; MariaDB's JSON (a long text checked by `json_valid`) JSON; otherwise the type's own kind. A column
+  with a default can be left to it; a nullable column gets 10 % NULL unless it is part of a key. The settings
+  of each kind are two fields (start and step, min and max, min and max length, from and to dates); its
+  default range fits the type: 1 to 1,000 clamped to the type, 0.00 to 1,000.00 at the column's scale, 5 to
+  40 characters within the column's length, 2020-01-01 to 2026-12-31, MySQL `YEAR` 2000 to 2030.
+- **The type's bounds** are read from the type as the server prints it: the width of each integer
+  (signed or unsigned; MySQL `YEAR` 1901-2155; SQLite's 64 bits), `numeric(p,s)` and `decimal(p,s)` (p up to
+  38; past it, or without precision, ±10^37), `varchar(n)`/`char(n)` and MySQL `tinytext`, `binary(n)` exactly
+  n, `varbinary(n)`, `bit(n)`, MySQL `TIMESTAMP` 1970-01-02 to 2038-01-18. A setting the column cannot hold is
+  refused in words before a row is made, naming the column and its range.
+- **Keys.** The unique sets are the primary key, the unique constraints and the unique indexes on plain
+  columns without a predicate (a partial or expression index is said as a rule Kerno does not check). Before
+  anything runs, the values a set can take are counted (a range's width, two booleans, the labels, the
+  referenced keys, a key of several columns counted once); fewer than the rows asked is refused. While rows are
+  made, each set's values are remembered and a row whose values are taken is drawn again (up to 100 times);
+  text compares without case, as a `_ci` collation would. A unique text ends with a number counted from the
+  table's row count + 1, so it never repeats and does not meet the rows already there; a sequence starts after
+  the table's largest value. UUIDs are random: the same seed run twice on the same table makes the same UUIDs,
+  and a unique UUID column then refuses the second run (said by the server, nothing kept).
+- **Foreign keys.** The referenced table's distinct keys are read once, the first 10,000 in key order (said
+  when there are more), and a row picks one; a key of several columns is picked whole. A table that references
+  itself picks among the rows already there. An empty referenced table: the column is NULL when it may be,
+  else refused before anything runs ("… has no rows … add rows there first").
+- **What Kerno does not check**, listed under the columns: `CHECK` and exclusion constraints (with their
+  text), partial or expression unique indexes; on SQLite, which lists no CHECK apart, a CHECK found in the
+  table's SQL. A row that breaks one stops the insert and nothing is kept. SQLite has no enum type: a column
+  held to a list by a CHECK is such a rule, left to its default or to the user's settings.
+- **Values** are written by the dialect's own literal writer (`Dialect::literal`) from the server's text form:
+  numbers bare, text quoted, bytes as the dialect's byte literal, booleans as `TRUE`/`FALSE`, times with
+  `+00` where the type keeps a zone, arrays as PostgreSQL's array text with each element quoted, bits as a
+  bit string (MySQL's `b'…'`). The lists of names, cities, countries and words were written for Kerno; mail
+  addresses are on `example.com`, `.org` and `.net` (RFC 2606), phone numbers in the fictional 555-01xx range.
+- **Bounds of a run.** 1 to 1,000,000 rows: Insert streams them in batches, but every row of a unique key is
+  remembered to keep it unique (a few tens of megabytes at a million). "Open script" writes at most 10,000
+  rows (about a megabyte or two of text; more would make the editor slow), refused beyond with Insert offered;
+  it is written off the UI thread.
+- **The two ways out.** "Open script" is the default button: the `INSERT` statements, 500 rows each (or about
+  1 MiB of text), under a heading in comments (`compare::commented`, so a table name holding a line break
+  cannot leave SQL out of its comment), in a new query tab on the table's connection, nothing run; the tab's
+  own rules apply when it runs. "Insert…" goes through the confirmation every write goes through
+  (`sql_confirm`, `writes: true`): the first statement with three rows and the count of the others, the
+  environment's rules (production asks twice). Then one transaction on a session of its own, each batch under
+  a savepoint; a batch the server refuses is tried again row by row to name the row; everything is rolled back
+  and the row and the server's message shown. Cancel rolls back between batches and stops the running
+  statement. Once in, the tree and an open data tab of the table are refreshed (as an import does).
+- **Not in this version**: values read from a file or another table; CHECK rules read and kept; values tied
+  across columns (a city of its country, an end after its start); saving the settings or a task; generated
+  values for types Kerno has no kind for (geometry, ranges, `inet`, …: NULL where allowed, else refused in
+  words); MySQL `TIMESTAMP` values are written as wall times in the session's zone.
+

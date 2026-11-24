@@ -39,6 +39,7 @@ pub mod sql;
 pub mod ssh;
 pub mod storage;
 pub mod table_draft;
+pub mod test_data;
 #[cfg(feature = "test-support")]
 pub mod testing;
 pub mod tools;

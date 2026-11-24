@@ -26,8 +26,8 @@ out of v1 follow in the sections below; IDs refer to `docs/DBEAVER-PARITY.md`.
    `Dialect` defaults refuse and the UI hides the entry (as it does for engines without schemas). If a new
    engine needs a capability the trait cannot express, add a method with a refusing default rather than a
    branch on the engine name in the UI.
-5. **Mock data generator, dashboards, scheduled tasks** (TOOL-20, TOOL-30, TOOL-23). Built on `execute` and
-   the dialect's `literal`; the scheduler needs a background runner and a place in the storage migrations.
+5. **Dashboards, scheduled tasks** (TOOL-20, TOOL-30); the mock data generator (TOOL-23) is built (below). Built
+   on `execute`; the scheduler needs a background runner and a place in the storage migrations.
 6. **Cloud sync** of connections, saved queries and settings. Extends `storage.rs` (a sync log beside the
    migrations) and never carries secrets: those stay on the machine, in Kerno's file or the keychain (D-106). Opt-in, with a visible account.
 7. **PostgreSQL debugger** (TOOL-25). PostgreSQL-only; needs the debugger extension on the server and a new
@@ -42,6 +42,11 @@ new enum labels, and a column type changed under a view (the view dropped and cr
 key, read as two ordered streams merged in bounded memory (1,000,000 rows against 1,000,000 in about 2 s), the
 differences in a tab and the script that makes the target like the source opened in a query tab, never run;
 what is still to come is under item 1. No trait change: it runs on `Session::execute` and the pending-edit SQL.
+**Test data** (item 5; TOOL-23; K72, D-141): "Fill with test data…" on a table of PostgreSQL, MySQL, MariaDB or
+SQLite (Generate Test Data… in the palette), rows made from a seed, exact about the types, keys and foreign
+keys, written as a script in a query tab or inserted in one transaction. Still to come: a sample from a file or
+another table, `CHECK` rules read and kept, values that refer to each other across columns (a city that matches
+its country), saving the settings as a task. No trait change.
 
 Built in v1.1 and no longer on this list: **ER diagrams** (NAV-58, OBJ-20, CM-47; J18, D-069), read-only; still to come: editing the schema
 from the diagram, layouts saved between runs, a diagram of several schemas or of a multi-selection of the tree (needs NAV-34).
@@ -172,7 +177,7 @@ The order and the driver-trait extension of each are in "Beyond v1, in order" ab
 | TOOL-30 | Task scheduler | PG, My | Saved tasks are done (TOOL-21); DBeaver Community has no scheduler either, and one needs a background runner while Kerno is closed |
 | TOOL-31 | Maintenance tools and data transfers as tasks | PG, My | The four client-tool wizards save tasks; the maintenance dialog and the export wizard have no serialisable settings yet (M10 Part 11b) |
 | TOOL-22 | Data compare, schema compare | PG, My | Done in v1.2: schema compare (K30, D-103), data compare (K60, D-126) |
-| TOOL-23 | Mock data generator | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |
+| TOOL-23 | Mock data generator | PG, My | Done in v1.2: "Fill with test data…" (K72, D-141), SQLite too |
 | TOOL-24 | AI assistant | PG, My | Done in v1.1 (J17, D-068): Settings → AI, editor menu ▸ AI: Write SQL / Explain query, plan, error; opt-in, to the endpoint the user configures only |
 | TOOL-25 | Debugger | PG | Outside v1 (CLAUDE.md §4, last paragraph) |
 | TOOL-26 | Visual query builder | PG, My | Outside v1 (CLAUDE.md §4, last paragraph) |

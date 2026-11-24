@@ -131,6 +131,8 @@ pub enum NavigatorEvent {
     ExportSchema { target: Target, tables: Vec<String> },
     /// Compare the rows of `table` of `target` with another table's (K60).
     CompareData { target: Target, table: String },
+    /// Make test data for `table` of `target` (K72).
+    GenerateTestData { target: Target, table: String },
     /// Tell the user something went otherwise than asked.
     Warn(String),
     /// Ask the AI assistant this, in a query tab on `target` (K53).
@@ -1266,6 +1268,13 @@ impl Navigator {
                     let target = Self::target_of(connection, &node, true);
                     let table = table.name.clone();
                     cx.emit(NavigatorEvent::CompareData { target, table });
+                }
+            }
+            Action::GenerateTestData => {
+                if let NodeKind::Object(ObjectRef::Relation(table, _)) = &node.kind {
+                    let target = Self::target_of(connection, &node, true);
+                    let table = table.name.clone();
+                    cx.emit(NavigatorEvent::GenerateTestData { target, table });
                 }
             }
             Action::ExportSchema => {

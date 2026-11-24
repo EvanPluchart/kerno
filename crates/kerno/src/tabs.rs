@@ -227,6 +227,8 @@ pub enum TabAction {
     TurnOffUpdateChecks,
     /// A data tab's: compares its table's rows with another's (K60).
     CompareData,
+    /// A data tab.s: makes test data for its table (K72).
+    GenerateTestData,
 }
 
 impl TabAction {
@@ -317,6 +319,7 @@ impl TabAction {
             Self::SkipVersion => "Skip this version",
             Self::TurnOffUpdateChecks => "Turn off update checks",
             Self::CompareData => "Compare data with…",
+            Self::GenerateTestData => "Fill with test data…",
         }
         .to_string()
     }

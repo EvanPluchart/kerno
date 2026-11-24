@@ -860,7 +860,11 @@ impl Workspace {
         let (group, position, count) = self.place_of(index).unwrap_or((self.panes.focused(), 0, 1));
         let mut entries = tabs::tab_menu(tab.kind(cx), position, count);
         if tab.data().is_some() {
-            entries.extend([Entry::Separator, Entry::Item(TabAction::CompareData, None)]);
+            entries.extend([
+                Entry::Separator,
+                Entry::Item(TabAction::CompareData, None),
+                Entry::Item(TabAction::GenerateTestData, None),
+            ]);
         }
         let split = self.panes.can_split(tab.entity_id(), group).err();
         entries.extend(tabs::group_entries(
@@ -1719,6 +1723,41 @@ impl Workspace {
         crate::data_compare_dialog::open(self.connections.clone(), workspace, source, window, cx);
     }
 
+    /// Opens "Generate test data…" on `source` (a place and a table), else on
+    /// the active data tab's table (K72).
+    fn generate_test_data(
+        &mut self,
+        source: Option<(Target, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = source.or_else(|| {
+            let tab = self.active_open()?.data()?;
+            self.data_tab_place(tab, cx)
+        });
+        let Some((target, name)) = source else {
+            window.push_notification(
+                Notification::warning(
+                    "Generate test data: open a table, or right-click one in the tree.",
+                ),
+                cx,
+            );
+            return;
+        };
+        let Some(schema) = target.schema.clone().or_else(|| target.database.clone()) else {
+            return;
+        };
+        let workspace = cx.entity().downgrade();
+        crate::test_data_dialog::open(
+            self.connections.clone(),
+            workspace,
+            target,
+            TableRef::new(schema, name),
+            window,
+            cx,
+        );
+    }
+
     /// The place and the name of a data tab's table: its own schema, or
     /// its database on engines without schemas.
     fn data_tab_place(&self, tab: &Entity<DataTab>, cx: &App) -> Option<(Target, String)> {
@@ -2553,6 +2592,11 @@ impl Workspace {
                 let source = data.and_then(|data| self.data_tab_place(data, cx));
                 self.compare_data(source, window, cx);
             }
+            TabAction::GenerateTestData => {
+                let data = tab.as_ref().and_then(OpenTab::data);
+                let source = data.and_then(|data| self.data_tab_place(data, cx));
+                self.generate_test_data(source, window, cx);
+            }
             // The editor runs its entries itself.
             other => tracing::warn!(?other, "not an action of the window"),
         }
@@ -3073,6 +3117,9 @@ impl Workspace {
             }
             NavigatorEvent::CompareData { target, table } => {
                 self.compare_data(Some((target.clone(), table.clone())), window, cx);
+            }
+            NavigatorEvent::GenerateTestData { target, table } => {
+                self.generate_test_data(Some((target.clone(), table.clone())), window, cx);
             }
             NavigatorEvent::ManageExtensions { target, extension } => {
                 self.open_extensions(target.clone(), extension.clone(), window, cx);
@@ -4047,7 +4094,7 @@ impl Workspace {
 
     /// Shows what an import added: the tables of its schema in the tree,
     /// and the rows of an open data tab of the table.
-    fn imported(
+    pub(crate) fn imported(
         &mut self,
         target: &Target,
         table: &TableRef,
@@ -7808,6 +7855,11 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &crate::actions::CompareData, window, cx| {
                     this.compare_data(None, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::GenerateTestData, window, cx| {
+                    this.generate_test_data(None, window, cx)
                 }),
             )
             .on_action(cx.listener(
