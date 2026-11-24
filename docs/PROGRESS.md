@@ -1748,3 +1748,16 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   there. A deliberate red run showed each of those tests failing under its mutation.
 - macOS: fmt, clippy and `cargo deny` clean; `kerno-core` and `kerno` green. Not seen: the Windows screens (the
   dialog's hint, Settings ▸ Local clients, no console window), MariaDB on Windows, the password command's presets.
+
+## 2026-11-24 — K73: the macOS disk image opens on a designed window
+
+- The owner's request of 2026-11-16, picked for the next release: the `.dmg` opens on a window of its own,
+  a background from the brand with an arrow from Kerno to Applications, no bars, 128-point icons in place,
+  Kerno's icon on the volume (D-142).
+- The layout is a `.DS_Store` Finder wrote once on GitHub's runner (`packaging/macos/make-dmg-layout.sh`),
+  committed and copied into every image by `scripts/bundle-macos.sh`: no Finder at build time. The script
+  then checks the compressed image as it ships and fails, never falls back to a plain image.
+- Proved on the `macos-15` runner (a probe workflow on the `macos-dmg` branch): the script's image opened on
+  the designed window in light and dark. Locally: the full script passes, each of its checks seen failing.
+  Not proved locally: the picture itself, hidden by a mounted 0.1.0 image of the same volume name.
+

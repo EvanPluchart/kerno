@@ -809,7 +809,8 @@ start, never deleted.
 ## Install
 
 The packages are on the [releases page](https://github.com/EvanPluchart/kerno/releases/latest); the README has
-the short version. To build them yourself, `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
+the short version. On macOS, open the `.dmg` and drag Kerno onto the Applications folder beside it, as its window
+shows. To build them yourself, `scripts/bundle-macos.sh` builds `dist/Kerno.app` and a `.dmg`, and
 `scripts/bundle-linux.sh` builds the Linux packages (below).
 
 On macOS the bundle is signed ad hoc unless `KERNO_SIGN_IDENTITY` names a code-signing identity of yours

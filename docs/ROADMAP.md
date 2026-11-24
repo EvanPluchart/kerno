@@ -104,11 +104,9 @@ unless sample rows are ticked, "What is sent", nothing run by itself):
   logout send `terminate:` straight to AppKit, and the pinned gpui has no `applicationShouldTerminate` to
   answer it. The server rolls the transaction back when the socket closes; pending edits and an unapplied
   table form are lost. Closing it needs that hook in the kit (the owner's fork) or a second `unsafe`.
-- **The inside of the macOS disk image is plain** (owner, 2026-11-16): the `.dmg` opens on Finder's default
-  window, two icons on a grey background. For the next release `scripts/bundle-macos.sh` gives it a
-  background picture in the brand's colours, a fixed window size, large icons placed on it (Kerno on the
-  left, Applications on the right, an arrow between them) and the volume icon. A notarized build (an Apple
-  developer account, the owner's) would remove the "Open Anyway" step of the first launch.
+- **The macOS build is not notarized** (owner, 2026-11-16): a notarized build (an Apple developer account,
+  the owner's) would remove the "Open Anyway" step of the first launch. The plain inside of the disk image
+  noted here at the same time is gone: it opens on a window of its own (K73, D-142).
 
 - **What old MySQL servers still miss in Kerno** (K22, D-094). On MySQL 5.1 the navigator lists functions and
   procedures without their arguments (they are in `mysql.proc.param_list`, readable only with SELECT on the

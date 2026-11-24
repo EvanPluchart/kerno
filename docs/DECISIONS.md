@@ -4456,3 +4456,56 @@ one that finds the user's files, its updates and the backup tools.
   the command building reads as MySQL's (its name; that code is another item's, and no MariaDB was on the
   runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
   OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
+
+## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
+
+The owner asked on 2026-11-16 (ROADMAP, "Limits found on the way") that the `.dmg` open on a window of its
+own, and picked it for the next release. Finder keeps a folder's window (its size and bars, the icon size,
+the background picture, each icon's place) in the folder's `.DS_Store`. Three ways to put that file in the
+image:
+
+- **Finder writes it at every build** (AppleScript on the mounted image, what `create-dmg` does). Not chosen:
+  every build would need a Finder that answers and a shell allowed to control it. Whether a shell may
+  control Finder cannot be checked without asking, and the question is a system dialog left on the screen
+  until someone answers it; a local build would also open a Finder window each time. On GitHub's runner Finder answers (the whole generator takes about 10 s
+  there), but it would be the one step of the release outside the script's control.
+- **The file written without Finder** (the Python libraries behind `dmgbuild`, or a writer of our own). Not
+  chosen: a Python package fetched on the release's path, or a few hundred lines writing two undocumented
+  formats (Finder's store and the alias of the background picture).
+- **Chosen: Finder writes it once, the file is committed.** `packaging/macos/make-dmg-layout.sh` mounts a
+  scratch image holding the same names, `dmg-layout.applescript` arranges its window, and the `.DS_Store`
+  Finder leaves is kept as `packaging/macos/dmg-window.dsstore`; the committed one was made on GitHub's
+  `macos-15` runner by K73's probe workflow. `scripts/bundle-macos.sh` copies it into every image: no Finder
+  at build time, the same layout from the runner and from a Mac. The generator refuses to run while a volume
+  named Kerno is mounted, and gives up after two minutes with a plain message if Finder does not answer.
+- **Why it stays right.** The file names `Kerno.app` and `Applications` with their places, the window, and
+  the background through an alias and a bookmark that name the volume `Kerno` and the path
+  `/.background/background.tiff`: nothing a build changes. Shown on the runner: images built afterwards by
+  the script, each a new volume with new dates, open on the window with its background. Changing the window,
+  the places or the picture's file name means running the generator again; changing the picture does not.
+- **Its limit.** The picture is found through the volume's name. While another volume named Kerno is mounted
+  (an older Kerno image left open), the new one mounts as "Kerno 1" and Finder looks for the picture on the
+  other one: the window keeps its size and places but has no background. Seen on the owner's Mac, where an
+  image of 0.1.0 was mounted; the same image under another volume name showed its background there (macOS
+  27). Any layout Finder writes has this limit.
+- **The picture.** `packaging/macos/dmg-background.svg`, 640 × 400: a grey-olive surface kept near a
+  relative luminance of 0.18, so that Finder's labels keep about 4.5:1 whether it draws them black or white
+  (in the dark appearance both were seen, on macOS 15 and 27); an arrow in lime made of the mark's parts
+  (three disks and the chevron) between the two icons' places, and the lime mark below. The users' own
+  Finder settings still apply on top (a tab bar or a path bar shown everywhere, file extensions shown).
+  `render-background.swift` renders it with AppKit (no `rsvg-convert` on the runner or on the owner's Mac)
+  into 1x and 2x PNGs, which are committed; the build joins them into a retina TIFF with `tiffutil`, part
+  of macOS.
+- **The volume icon** is `.VolumeIcon.icns` and the custom-icon flag on the volume's root, written as the
+  `com.apple.FinderInfo` attribute with `xattr` (part of macOS; `SetFile` is a deprecated developer tool).
+- **How the image is made.** `hdiutil create -srcfolder` leaves a `.DS_Store` of the source folder out and
+  does not carry the root's flag, so the image is made read-write, completed while mounted out of Finder's
+  sight (`-nobrowse`, so Finder never rewrites the layout), then converted to `UDZO` and verified. Each
+  hdiutil step that creates, mounts, unmounts or converts keeps D-134's five tries. It adds about 8 s on the
+  runner (15 s instead of 7).
+- **No plain image shipped silently.** There is no fallback: a missing file stops the script, and the
+  compressed image is then mounted read-only and checked as a user gets it: the layout byte for byte, the
+  background, the volume icon and its flag, the app's signature, and its binary the one signed and launched
+  before. Each miss fails the build with a line naming it. (A file that is not a valid store is removed from
+  the volume by macOS itself; the byte check catches that too.)
+

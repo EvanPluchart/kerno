@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+  <title>Kerno disk image background</title>
+  <!-- Finder draws the icon labels black in the light appearance and white in the dark one, over
+       this picture: the surface stays near a relative luminance of 0.18, about 4.5:1 for both. -->
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#747D64"/>
+      <stop offset="1" stop-color="#6A735B"/>
+    </linearGradient>
+  </defs>
+  <rect width="640" height="400" fill="url(#surface)"/>
+  <!-- From Kerno (centre 160,180) to Applications (480,180): three disks and a chevron, the parts
+       of the mark, in lime. -->
+  <g fill="#C8F03C">
+    <rect x="262" y="172" width="16" height="16" rx="5"/>
+    <rect x="290" y="172" width="16" height="16" rx="5"/>
+    <rect x="318" y="172" width="16" height="16" rx="5"/>
+    <path d="M346 150H370L400 180L370 210H346L376 180Z"/>
+  </g>
+  <!-- The mark in lime (kerno-symbol-mono-c8f03c.svg), 40 px, bottom centre. -->
+  <path transform="translate(300 336) scale(0.15625)" fill="#C8F03C" d="M62 44H94A14 14 0 0 1 108 58V74A14 14 0 0 1 94 88H62A14 14 0 0 1 48 74V58A14 14 0 0 1 62 44Z M62 168H94A14 14 0 0 1 108 182V198A14 14 0 0 1 94 212H62A14 14 0 0 1 48 198V182A14 14 0 0 1 62 168Z M62 106H120V150H62A14 14 0 0 1 48 136V120A14 14 0 0 1 62 106Z M152 44H214L130 128L214 212H152L68 128Z"/>
+</svg>

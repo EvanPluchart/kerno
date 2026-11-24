@@ -17,7 +17,7 @@ app=dist/Kerno.app
 dmg=dist/Kerno-$version.dmg
 
 nice -n 10 cargo build --release -p kerno
-binary=target/release/kerno
+binary=${CARGO_TARGET_DIR:-target}/release/kerno
 # The oldest macOS the binary runs on, as the linker recorded it.
 minos=$(otool -l "$binary" | awk '/LC_BUILD_VERSION/ {found = 1} found && $1 == "minos" {print $2; exit}')
 
@@ -98,22 +98,61 @@ if [ "${KERNO_SKIP_LAUNCH_CHECK:-}" != 1 ]; then
   echo "launch check: quit cleanly"
 fi
 
-# The disk image: the app and a link to /Applications to drag it onto.
-stage=$(mktemp -d -t kerno-dmg)
+# The disk image: the app and a link to /Applications to drag it onto, in the window Finder opens
+# on (D-142): the background picture, the icons' places and the window's size are Finder's
+# .DS_Store, written once by packaging/macos/make-dmg-layout.sh and copied in here, so no Finder
+# is needed; the volume's icon is Kerno's. Made read-write, completed while mounted out of
+# Finder's sight, then compressed.
+# hdiutil now and then fails on a busy machine ("Resource busy", seen on GitHub's runner): five
+# tries for each of its steps, its own words shown at each failure.
+hdi() {
+  for try in 1 2 3 4 5; do
+    if hdiutil "$@"; then return 0; fi
+    echo "disk image: hdiutil $1 failed (try $try of 5)" >&2
+    [ "$try" = 5 ] || sleep 5
+  done
+  return 1
+}
+work=$(mktemp -d -t kerno-dmg)
+mnt=$work/mnt
+trap '[ -n "${pid:-}" ] && kill "$pid" 2>/dev/null; [ -d "$mnt" ] && hdiutil detach -quiet -force "$mnt"; rm -rf "$work" "${data:-}"' EXIT
+stage=$work/stage
+mkdir -p "$stage/.background"
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
+tiffutil -cathidpicheck packaging/macos/dmg-background.png packaging/macos/dmg-background@2x.png \
+  -out "$stage/.background/background.tiff"
+cp assets/icon/kerno.icns "$stage/.VolumeIcon.icns"
+hdi create -ov -volname Kerno -srcfolder "$stage" -format UDRW "$work/rw.dmg"
+mkdir "$mnt"
+hdi attach -nobrowse -noautoopen -mountpoint "$mnt" "$work/rw.dmg"
+# hdiutil leaves out a .DS_Store of the source folder: it goes in on the mounted volume.
+cp packaging/macos/dmg-window.dsstore "$mnt/.DS_Store"
+# The volume shows .VolumeIcon.icns once its root carries the custom-icon Finder flag.
+xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 "$mnt"
+rm -rf "$mnt/.fseventsd"
+hdi detach "$mnt"
+rmdir "$mnt"
 rm -f "$dmg"
-# hdiutil now and then fails on a busy machine ("Resource busy", seen on GitHub's runner): a few
-# tries, its own words shown at each failure.
-for try in 1 2 3 4 5; do
-  if hdiutil create -volname Kerno -srcfolder "$stage" -format UDZO "$dmg"; then break; fi
-  rm -f "$dmg"
-  if [ "$try" = 5 ]; then
-    echo "disk image: hdiutil create failed 5 times" >&2
-    exit 1
-  fi
-  echo "disk image: hdiutil create failed (try $try), again in 5 s" >&2
-  sleep 5
-done
-rm -rf "$stage"
-echo "disk image: $dmg ($(du -h "$dmg" | cut -f1))"
+hdi convert -ov "$work/rw.dmg" -format UDZO -o "$dmg"
+hdiutil verify "$dmg"
+
+# What ships is checked as a user mounts it: the layout, the background and the volume icon are
+# there, and the app is the one signed and launched above.
+fail() {
+  echo "disk image: $1" >&2
+  exit 1
+}
+mkdir "$mnt"
+hdi attach -nobrowse -noautoopen -readonly -mountpoint "$mnt" "$dmg"
+cmp -s packaging/macos/dmg-window.dsstore "$mnt/.DS_Store" || fail "the window layout is missing"
+[ -s "$mnt/.background/background.tiff" ] || fail "the background is missing"
+[ -s "$mnt/.VolumeIcon.icns" ] || fail "the volume icon is missing"
+[ "$(xattr -px com.apple.FinderInfo "$mnt" | tr -d ' \n' | cut -c17-18)" = 04 ] \
+  || fail "the volume icon is not switched on"
+codesign --verify --deep --strict "$mnt/Kerno.app"
+cmp -s "$app/Contents/MacOS/kerno" "$mnt/Kerno.app/Contents/MacOS/kerno" \
+  || fail "the app inside is not the one built"
+hdi detach "$mnt"
+rm -rf "$work"
+echo "disk image: $dmg ($(du -h "$dmg" | cut -f1)), opens on Kerno's window"

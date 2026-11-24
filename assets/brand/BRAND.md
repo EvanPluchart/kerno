@@ -17,6 +17,7 @@ speed, without the database cylinder every other client uses. Kerno means "core"
 | `kerno-app-icon-dark.svg` | Night tile with lime mark (alternate, not the app icon) |
 | `kerno-macos-1024.svg`, `kerno-icon-1024.png` | macOS icon on Apple's grid (824 px tile, 100 px inset) |
 | `../icon/kerno.icns`, `../icon/kerno-<size>.png` | Built icons used by `scripts/bundle-*.sh` |
+| `../../packaging/macos/dmg-background.svg` (and its 1x and 2x PNGs) | The macOS disk image's window: an arrow of the mark's parts and the lime mark (D-142) |
 
 The wordmark is Inter SemiBold (OFL) converted to outlines, tracking -2 %.
 
