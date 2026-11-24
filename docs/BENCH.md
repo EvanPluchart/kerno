@@ -264,7 +264,26 @@ table cut into ranges as on eight tables; about 1.7 and 2 times on 5.1. The file
 
 These were taken before the review's F4 (D-135): the ranges of one table now start together while Kerno holds
 that table's read lock, which adds the start of the processes (tens of milliseconds) to the backup of a cut
-table. Not measured again.
+table.
+
+**After the second review** (G5, the scheduler; same machine and tools, 8 processes, 2026-11-24 21:00–21:25, the
+1-minute load 3.3 to 8.0 at the start of each run): eight tables, one of 1M rows of `big_table` (238 MB, cut in
+8) and seven of 125,000 rows (whole), 570.6 MB written, 16 files; then the same with the large table's key
+skewed (its last 1,000 ids moved up by 10⁹, so the first range holds 999,000 rows). "Before G5" is the same
+build with the old queue (only its first item may start).
+
+| Database | Plain backup | Plain restore | Faster backup | Faster restore |
+|---|---|---|---|---|
+| One cut table among eight | 3.40, 3.28, 3.94 s | 29.72, 31.32, 27.70 s | 1.15, 1.74, 1.55 s | 8.09, 15.77, 9.48 s |
+| The same, before G5 | 3.61, 4.31, 3.72 s | 27.81, 28.99, 30.11 s | 1.29, 1.82, 1.24 s | 8.80, 10.34, 9.95 s |
+| Its key skewed | 3.94, 4.46, 3.79 s | 28.93, 26.92, 26.80 s | 3.34, 2.09, 2.15 s | 18.91, 17.31, 17.57 s |
+| The same, before G5 | 3.39, 3.51, 3.31 s | 30.13, 27.01, 25.71 s | 3.01, 2.16, 3.66 s | 19.11, 18.23, 18.32 s |
+
+With one cut table the two queues are the same within the noise: the cut table comes first and starts on an
+empty pool in both, and the old queue then let the single files take each process its ranges freed. G5 changes
+the order only when a cut table waits behind running files (a second cut table): the files behind it now take
+the free processes meanwhile. A skewed key leaves one range with most of the rows: the backup then gains about
+1.6 times, the restore 1.5 times, against 2.2 to 3 and 2.8 to 3.4 with an even key.
 
 **The threshold** (`RANGE_THRESHOLD`, 32 MiB): one table of `big_table`'s rows, backed up and restored whole by
 one process, then cut into 8 ranges, three runs each (load 3 to 6):

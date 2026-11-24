@@ -1822,3 +1822,18 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   does not come within 10 s stops the start, and the confirmation names the long queries (F9).
 - Added: a test that the lock is held during the run, a restore into a database that is not empty (said
   before the run), and the size threshold's real path. D-135 amended (F4's rule above all).
+
+## 2026-11-24 — K63: the second review's ten findings fixed
+
+- A second review of the fixes found ten more, two confirmed by a run (a row doubled on MySQL 5.1; the
+  replication options stalling each range 30 s). Fixed on top, each test seen failing on the code before it
+  (docs/plans/M12.md, the second K63 table): a table is cut only where its ranges read one moment, by server
+  version, engine and consistency (D-135's table: before 5.5.3 only under "Block writes", where any engine is
+  cut; never under "No locks") (G1, G7); the folder refuses the replication position and `--flush-logs`, both
+  backups `--log-error` and `--verbose` turned off (G2); the restore's words follow the backup's content, in the
+  wizard and the confirmation (G3); the lock's watcher starts after the catalog and takes no answer for no
+  evidence (G4); single files fill the processes a cut table waits for (G5); "it has no fields" fails only a
+  MySQL backup, on mysqldump's own line (G6); long `Execute` statements are named, an account without PROCESS
+  is told what Kerno cannot see, an error is said (G8); harmless arguments are taken (G9); a utf8mb4 backup
+  into a server before 5.5.3 is said, `--ignore-table` refused, the lock test checks what the server saw (G10).
+- BENCH: one cut table among eight, and its key skewed, measured again.

@@ -4661,10 +4661,9 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
   CONSISTENT SNAPSHOT` on every client tried (5.5 to 26.10, MariaDB's 11.8, on MySQL 5.1 to 8.4 and MariaDB
   11). Writers of that table wait for those few tens of milliseconds; 30 s without every signal releases the
   lock and fails the backup. A lock that does not come within 10 s, or is refused (no LOCK TABLES privilege),
-  dumps that table whole by one process, and the log says so. Only InnoDB tables are cut: a MyISAM or MEMORY
-  table has no snapshot, so it is read whole under `--lock-tables` (a choice the owner asked to weigh: keeping
-  Kerno's lock for the whole read of a cut MyISAM table would block its writers as long, for a gain at backup
-  only, since its ranges load one after the other). Across tables, each mysqldump reads at its own moment (an
+  dumps that table whole by one process, and the log says so. Which tables are cut, by server version, engine
+  and consistency, is the table of the bullet "Which tables are cut" below (amended after the second review,
+  G1: the table lock gives one moment only where metadata locks exist). Across tables, each mysqldump reads at its own moment (an
   InnoDB table with `--single-transaction`, any other under `--lock-tables`): two tables are not read at the
   same instant, and the wizard says so in plain words. **"Block writes"** (off by default): Kerno's own session
   holds `FLUSH TABLES WITH READ LOCK`, taken before the catalog is read (F8, as `--lock-all-tables`), until the
@@ -4686,7 +4685,8 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
   backup sets per file, in any spelling mysqldump takes (a prefix, a `skip-` or `loose-` form, a short letter):
   `where`, `tab`, `tables`, `no-data`, `no-create-info`, `single-transaction`, `lock-all-tables`,
   `lock-tables`, `add-locks`, `databases`, `all-databases`, `triggers`, `routines`, `events`, `xml`, `opt`,
-  `set-gtid-purged` (F7; the general refusal list already covered `--result-file` / `-r`).
+  `set-gtid-purged` (F7; the general refusal list already covered `--result-file` / `-r`). Amended by the
+  second review: see "The user's arguments" below.
 - **utf8mb4** (F3). The tools talk `--default-character-set=utf8mb4` (dump, plain and folder, and the
   restore's client) when the server has it (5.5.3 on) and the client knows it (MySQL 5.5.3, MariaDB 5.5);
   accepted by 5.7.44, 26.10, 8.4.13 and MariaDB 11.8.9. Before, mysqldump 5.7 talked `utf8` and wrote a 4-byte
@@ -4702,7 +4702,50 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
   (the old client below, with `--skip-triggers`, exits 0 and writes no table).
 - **A restore into a database that is not empty** is said before the run: the backup's tables it already
   holds are dropped and created again from the backup, its other tables stay (or, for a backup made without
-  DROP TABLE statements, the restore stops at the first of them).
+  DROP TABLE statements, the restore stops at the first of them). Amended by the second review (G3): below.
+- **Which tables are cut** (amended after the second review, G1 and G7; the coordinator's two decisions):
+  a table is cut only where every range reads one moment, otherwise it is read whole by one process.
+
+  | Consistency | Server | InnoDB table | MyISAM, MEMORY, other | Why |
+  |---|---|---|---|---|
+  | Single transaction (default) | MySQL 5.5.3 and later, every MariaDB Kerno supports | cut, its ranges started under Kerno's `LOCK TABLES t READ` | whole, under `--lock-tables` | metadata locks: the table lock waits for a transaction that already wrote to `t`, and holds its COMMIT, until every range has its snapshot |
+  | Single transaction | MySQL before 5.5.3 (5.1, 5.5.0 to 5.5.2) | whole, one snapshot | whole, under `--lock-tables` | no metadata locks: a transaction that already wrote to `t` can COMMIT under `LOCK TABLES t READ`, between two ranges' snapshots (a row doubled on 5.1, the reviewer's run) |
+  | Block writes (`FLUSH TABLES WITH READ LOCK`) | every version | cut | cut (its ranges load one after the other) | nothing commits while the lock is held, the COMMIT of an open transaction included: every table is read at one moment, whatever its engine |
+  | No locks | every version | whole | whole | the user asked for no lock at all, and a cut table needs one |
+
+  So on 5.1 "Block writes" is what lets a large table be read on several connections, and the wizard's hint
+  says so on such a server.
+- **The scheduler** (G5): a table cut into N ranges starts once N processes are free (or none runs), and the
+  single files behind it fill the free processes meanwhile. A second cut table waits until enough processes
+  are free again, so its ranges still start together.
+- **The watcher** (G4): the read lock's session is checked only once the catalog and the key bounds are read
+  (Kerno sends nothing else on it meanwhile), one check at a time, never dropped half-way; a check that has
+  not answered yet is no evidence: only an error or another connection's id is a lost lock. The last check
+  waits 60 s: a session that does not answer by then fails the backup in words ("could not confirm …"),
+  and the lock goes when the app closes the session.
+- **The user's arguments** (G2, G9, G10): the folder backup refuses, naming the argument and what it sets
+  instead, the options it sets per file (`where`, `tab`, `tables`, `ignore-table`, `ignore-table-data`,
+  `databases`, `all-databases`, `no-data`, `no-create-info`, `xml`, `single-transaction`, `lock-all-tables`,
+  `lock-tables`, `add-locks`, `triggers`, `routines`, `events`, `set-gtid-purged`), what would undo the files'
+  settings (`opt`, `compact`, `set-charset`, `add-drop-table`), the replication position (`source-data`,
+  `master-data`, `dump-replica`, `dump-slave`, `apply-replica-statements`, `apply-slave-statements`,
+  `include-source-host-port`, `include-master-host-port`: one position of the whole server, which files read at
+  different moments cannot give; the plain backup is the way to seed a replica) and `flush-logs` (each file
+  would flush the logs, and waits behind Kerno's table lock, 30 s, the reviewer's run). It takes
+  `--set-gtid-purged=OFF` and `--skip-add-locks` as typed, drops `--skip-lock-tables` (it sets each file's
+  locks) and reads `--skip-triggers` as the Triggers setting off. Both backups, plain and folder, refuse
+  `--log-error` and `--verbose` turned off in any spelling: Kerno reads mysqldump's lines (a table it could not
+  read, a range's snapshot). mysqldump 5.7.44, 26.10 and mariadb-dump 11.8 have no other option that sends
+  those lines elsewhere or silences them.
+- **"it has no fields"** (G6) fails a MySQL or MariaDB backup only, on mysqldump's own line ("-- Skipping dump
+  data for table …, it has no fields"), not on the phrase in another line or another tool's output.
+- **What a restore does to the tables already there** (G3) follows the backup's content: rows added (data
+  only: a table that already holds some of them stops on a duplicate key, or ends with rows twice without a
+  key), dropped and created again (all, with DROP TABLE), dropped and created again empty (definitions only,
+  with DROP TABLE), or a stop at the first (no DROP TABLE). The wizard and the confirmation say it.
+- **A plain backup in utf8mb4 into an older server** (G10): since F3, a backup of a 5.5.3 or later server
+  starts with `SET NAMES utf8mb4`, which MySQL before 5.5.3 refuses (ERROR 1115, at the first statement). The
+  restore wizard reads the file's first 4 KB: on such a server it says so before anything runs.
 - **The restore.** The folder is offered by the restore as one backup (the open panel takes folders for
   MySQL too). "Faster: restore on N connections at once", off by default as PostgreSQL's: N `mysql` clients,
   one file each; a table's first file alone, then its ranges side by side when its engine at the backup

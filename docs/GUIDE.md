@@ -42,7 +42,8 @@ something Kerno offers, Kerno says so in words that name the release it needs, i
 
 | What | MySQL 5.1 | 5.5 | 5.6 | 5.7 | What Kerno does without it |
 | --- | --- | --- | --- | --- | --- |
-| `utf8mb4` (5.5.3) | no | yes | yes | yes | The connection speaks `utf8`. A character a column's character set cannot hold (an emoji in a `utf8` column, on any release) is refused by an edit, see the next row |
+| `utf8mb4` (5.5.3) | no | yes | yes | yes | The connection speaks `utf8`. A character a column's character set cannot hold (an emoji in a `utf8` column, on any release) is refused by an edit, see the next row. A backup of a newer server starts with `SET NAMES utf8mb4` and stops at its first statement on 5.1 (ERROR 1115): the restore says so before it runs |
+| Metadata locks (5.5.3) | no | yes | yes | yes | The faster backup cuts a large table into parts read at once only with “Block writes”: `LOCK TABLES … READ` does not hold back a transaction that already wrote |
 | Strict mode on by default (5.7) | no | no | no | yes | Outside strict mode the server stores a value too long for its column, out of range, or with a character it cannot hold, cut or changed, with only a warning. Kerno stops the apply at that statement and changes nothing: "the server would store another value than the one written: Data truncated for column 'c' at row 1" |
 | TLS that Kerno accepts (TLS 1.2 with an ECDHE key exchange) | no (TLS 1.0) | no (TLS 1.0) | yes (OpenSSL builds) | build-dependent (5.7.44's official build offers DHE only: no) | SSL mode "prefer" connects without TLS; "require" and "verify-*" refuse with "This server only offers an old TLS that Kerno does not accept." and the next step (prefer or disable on a trusted network, an SSH tunnel, or a server update) |
 | Passwords with the pre-4.1 hash (`old_passwords`) | can sign in | can sign in | refused by the server (5.6.5) | gone | Refused: "The account … has an old password hash that Kerno does not accept." The administrator sets the password again with `old_passwords = 0` |
@@ -624,28 +625,41 @@ it made, never a folder that was already there: a folder of that name stops the 
 
 MySQL and MariaDB get the same **Faster: back up on N connections at once** beside their SQL script: Kerno runs
 N `mysqldump` at once, one per table, into a folder of SQL files, and cuts a large table whose key is one
-whole-number column into parts read side by side (a large table without such a key is still read by one
-connection). The procedures, functions, triggers, events and views come last, in their own files, and a small
+whole-number column into parts read side by side, where every part can be read at the same moment: a large
+InnoDB table (MySQL 5.5.3 and later, every MariaDB), and with **Block writes** (below) a large table of any engine
+on any version, MySQL 5.1 included. Any other table is read by one connection, and so is every table with
+"No locks". The procedures, functions, triggers, events and views come last, in their own files, and a small
 `kerno-backup.json` names every file: **Restore…** takes that folder as one backup, and its **Faster: restore
 on N connections at once** loads several tables at a time (the parts of a large InnoDB table side by side). A
 failed restore stops the others and says which table, the server's error, what is loaded and what is not.
 
 With "Faster", **Block writes during the backup, so that every table is read at the same moment** (off by
 default) says how the backup is consistent. Off, each table is read at one moment, all its parts included (the
-parts of a large table start together while Kerno holds that table's read lock for a moment; a table whose lock
-does not come within 10 s is read whole), but two tables are not read at the same instant. On, Kerno holds
+parts of a large InnoDB table start together while Kerno holds that table's read lock for a moment; a table whose
+lock does not come within 10 s is read whole; before MySQL 5.5.3 that lock does not hold back a transaction that
+already wrote, so no table is cut there), but two tables are not read at the same instant. On, Kerno holds
 `FLUSH TABLES WITH READ LOCK` on the server from before it lists the tables until the last is read: every write
 on that server waits until the backup ends, so Kerno shows the statement and asks first (twice on production),
 naming any query that has been running for 5 s or more, since the lock waits for it. A lock that does not come
 within 10 s stops the backup before it starts; one lost during the run (the server closed Kerno's session)
-fails it. It needs the RELOAD privilege; an account without it is told so and cannot tick it. The extra
-arguments may not set what the folder backup sets for each file (`--where`, `--tab`, `--no-data` and the like).
+fails it. It needs the RELOAD privilege; an account without it is told so and cannot tick it. Without the PROCESS
+privilege Kerno sees only its own account's queries, and the confirmation says so. The extra arguments may not
+set what the folder backup sets for each file (`--where`, `--tab`, `--no-data`, `--ignore-table` and the like),
+nor ask for a replication position (`--source-data`, `--master-data`, `--dump-replica`…: use the plain backup to
+seed a replica) or `--flush-logs`; each refusal names the argument and what the folder sets instead.
+`--set-gtid-purged=OFF`, `--skip-add-locks`, `--skip-lock-tables` and `--skip-triggers` are taken. Neither
+backup takes `--log-error` or `--skip-verbose`: Kerno reads what mysqldump says.
 
-A folder restored into a database that already holds some of the backup's tables is said before the run: those
-tables are dropped and created again from the backup; the database's other tables stay.
+A folder restored into a database that already holds some of the backup's tables is said before the run, and in
+the confirmation, as the backup was made: those tables are dropped and created again from the backup (empty, for
+a backup of the definitions only), the database's other tables stay; without DROP TABLE statements the restore
+stops at the first of them; a backup of the rows only adds its rows to the tables there (a table that already
+holds some stops on a duplicate key, or ends with rows twice when it has no key).
 
 MySQL and MariaDB tools talk `utf8mb4` with a server that has it (5.5.3 on): a MySQL 5.7 client no longer
-writes a 4-byte character (an emoji) as `?`, in the plain backup as in the folder.
+writes a 4-byte character (an emoji) as `?`, in the plain backup as in the folder. Such a backup starts with
+`SET NAMES utf8mb4`, which a server before 5.5.3 refuses (ERROR 1115): restoring it into MySQL 5.1, the wizard
+says so before it runs.
 
 An old server needs an old client. MySQL's `mysqldump` 8.4 and later, and MariaDB's `mariadb-dump` 11.8, read
 no column of a MySQL 5.1 table (the backup would hold no table), and `mariadb-dump` cannot read MySQL 5.5 and
