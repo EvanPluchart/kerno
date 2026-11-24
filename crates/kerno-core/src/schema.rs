@@ -7,7 +7,7 @@
 use crate::result::TypeKind;
 
 /// A database on the server.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseInfo {
     /// Database name.
     pub name: String,
@@ -23,6 +23,31 @@ pub struct DatabaseInfo {
     pub is_system: bool,
     /// Comment.
     pub comment: Option<String>,
+    /// The database takes connections at all (PostgreSQL's `datallowconn`;
+    /// `template0` does not). Always `true` on MySQL, MariaDB and SQLite.
+    pub allows_connections: bool,
+    /// The account may open a session in it: it takes connections and the
+    /// account has the CONNECT privilege on it (K62). Always `true` on
+    /// MySQL, MariaDB and SQLite, which list only what the account sees.
+    pub can_connect: bool,
+}
+
+/// Both flags `true`: what every engine but PostgreSQL says of each of its
+/// databases.
+impl Default for DatabaseInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            owner: None,
+            encoding: None,
+            collation: None,
+            size_bytes: None,
+            is_system: false,
+            comment: None,
+            allows_connections: true,
+            can_connect: true,
+        }
+    }
 }
 
 /// A schema of the connected database (PostgreSQL only).

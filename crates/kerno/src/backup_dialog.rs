@@ -815,17 +815,27 @@ impl BackupDialog {
     fn load_databases(&mut self, meta: Arc<dyn Session>, cx: &mut Context<Self>) {
         let reading = bridge::spawn(cx, async move { meta.databases().await });
         self.tasks.push(cx.spawn(async move |this, cx| {
+            // pg_dumpall would stop at a database this account may not
+            // open: not offered, and left out of the backup (K62).
+            let mut closed = Vec::new();
             let loaded = match reading.await {
                 Ok(databases) => Loaded::Ready(
                     databases
                         .into_iter()
                         .filter(|database| !database.name.starts_with("template"))
+                        .filter(|database| {
+                            if !database.can_connect && database.allows_connections {
+                                closed.push(database.name.clone());
+                            }
+                            database.can_connect
+                        })
                         .map(|database| database.name)
                         .collect(),
                 ),
                 Err(error) => Loaded::Failed(error_text(&error)),
             };
             let _ = this.update(cx, |this, cx| {
+                this.excluded.extend(closed);
                 this.databases = loaded;
                 cx.notify();
             });

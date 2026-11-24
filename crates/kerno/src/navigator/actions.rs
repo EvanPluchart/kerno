@@ -193,6 +193,15 @@ pub fn actions(node: &Node, has_schemas: bool) -> Vec<Vec<Action>> {
     ]
     .map(Generate);
     let groups: Vec<Vec<Action>> = match &node.kind {
+        // A database this account may not open (K62): only what runs on
+        // the connection's own session; Refresh lists the databases again.
+        NodeKind::Object(ObjectRef::Database(_)) if node.is_closed() => {
+            vec![
+                vec![CreateDatabase],
+                vec![CopyName, CopyQualifiedName],
+                vec![Drop],
+            ]
+        }
         NodeKind::Object(ObjectRef::Database(_)) if has_schemas => {
             vec![
                 vec![NewQueryHere, CreateSchema, CreateDatabase],
@@ -462,6 +471,11 @@ pub fn tool_entries(
     let Some(family) = kerno_core::tools::ClientFamily::of(engine) else {
         return Vec::new();
     };
+    // Every tool reads or writes inside the database: none on one this
+    // account may not open (K62).
+    if node.is_some_and(Node::is_closed) {
+        return Vec::new();
+    }
     let has_schemas = family == kerno_core::tools::ClientFamily::Postgres;
     let object = match node.map(|node| &node.kind) {
         None => None,
@@ -1527,5 +1541,26 @@ mod tests {
         // A new column opens the table's form instead.
         assert_eq!(create_template(AddColumn, &pg, "shop", Some(&orders)), None);
         assert_eq!(create_template(Drop, &pg, "shop", None), None);
+    }
+
+    /// K62: a database this account may not open keeps what runs on the
+    /// connection's own session; nothing that opens one inside it, no
+    /// Tools ▸.
+    #[test]
+    fn a_closed_database_offers_only_what_needs_no_session_in_it() {
+        use Action::*;
+        let mut closed = node(NodeKind::Object(ObjectRef::Database("billing".into())));
+        closed.children = Children::Closed(super::super::model::NOT_ALLOWED);
+        assert_eq!(
+            actions(&closed, true),
+            [
+                vec![CreateDatabase],
+                vec![CopyName, CopyQualifiedName],
+                vec![Drop],
+                vec![Refresh]
+            ]
+        );
+        let pg = kerno_postgres::PgDialect;
+        assert!(tool_labels(Some(&closed), &pg).is_empty());
     }
 }

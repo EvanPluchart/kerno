@@ -319,6 +319,68 @@ pub struct ConnectionConfig {
     /// [`crate::password`]). Set by every import, never exported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub password_command_unconfirmed: bool,
+    /// PostgreSQL: which databases the schema tree and the database pickers
+    /// show (K62). Exported with the connection; absent means all.
+    #[serde(default, skip_serializing_if = "DatabasesShown::is_all")]
+    pub databases_shown: DatabasesShown,
+}
+
+/// Which databases of a PostgreSQL server the schema tree shows (K62,
+/// DBeaver's "Show all databases"). MySQL, MariaDB and SQLite list only
+/// what the account may see: they always show all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabasesShown {
+    /// Every database of the server, templates included.
+    #[default]
+    All,
+    /// The databases this account may open, without the templates.
+    Available,
+    /// The database the connection opens on, alone.
+    DefaultOnly,
+}
+
+impl DatabasesShown {
+    /// Every choice, in the order the connection dialog lists them.
+    pub const ALL: [Self; 3] = [Self::All, Self::Available, Self::DefaultOnly];
+
+    /// The choice in the connection dialog's words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Available => "Those this account can open",
+            Self::DefaultOnly => "Only the default database",
+        }
+    }
+
+    pub fn is_all(&self) -> bool {
+        *self == Self::All
+    }
+
+    /// The databases of `listed` to show. `default` is the database the
+    /// connection opens on (its Database field, else the one the server put
+    /// the session in): always shown, even one the account may not open.
+    /// When it is not listed, "only the default" shows what "those this
+    /// account can open" does: never an empty tree.
+    pub fn shown<'a>(
+        self,
+        listed: &'a [crate::schema::DatabaseInfo],
+        default: Option<&str>,
+    ) -> Vec<&'a crate::schema::DatabaseInfo> {
+        let is_default = |name: &str| default == Some(name);
+        let only_default =
+            self == Self::DefaultOnly && listed.iter().any(|database| is_default(&database.name));
+        listed
+            .iter()
+            .filter(|database| match self {
+                Self::All => true,
+                _ if is_default(&database.name) => true,
+                _ if only_default => false,
+                // A template is a system database on PostgreSQL.
+                _ => database.can_connect && !database.is_system,
+            })
+            .collect()
+    }
 }
 
 /// Where a connection's database password comes from (J3). The command
@@ -509,6 +571,7 @@ impl ConnectionConfig {
             client_dir: None,
             password_source: PasswordSource::Stored,
             password_command_unconfirmed: false,
+            databases_shown: DatabasesShown::All,
         }
     }
 
@@ -2843,5 +2906,102 @@ mod tests {
             &sqlite("/data/shop.db"),
             &sqlite("/data/other.db")
         ));
+    }
+
+    fn database(name: &str, can_connect: bool, is_system: bool) -> crate::schema::DatabaseInfo {
+        crate::schema::DatabaseInfo {
+            name: name.into(),
+            can_connect,
+            allows_connections: name != "template0",
+            is_system,
+            ..Default::default()
+        }
+    }
+
+    fn shown(
+        shown: DatabasesShown,
+        listed: &[crate::schema::DatabaseInfo],
+        default: Option<&str>,
+    ) -> Vec<String> {
+        shown
+            .shown(listed, default)
+            .into_iter()
+            .map(|database| database.name.clone())
+            .collect()
+    }
+
+    /// K62: all, those this account can open (no template), or the default
+    /// alone; the default database is always there, even closed.
+    #[test]
+    fn the_databases_shown_follow_the_connections_choice() {
+        let listed = [
+            database("app_dev", true, false),
+            database("billing", false, false),
+            database("postgres", true, false),
+            database("template0", false, true),
+            database("template1", true, true),
+        ];
+        let all: Vec<String> = listed.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(shown(DatabasesShown::All, &listed, Some("app_dev")), all);
+        assert_eq!(
+            shown(DatabasesShown::Available, &listed, Some("app_dev")),
+            ["app_dev", "postgres"]
+        );
+        assert_eq!(
+            shown(DatabasesShown::DefaultOnly, &listed, Some("app_dev")),
+            ["app_dev"]
+        );
+        // An empty Database field: the database the server put the session
+        // in is the default.
+        assert_eq!(
+            shown(DatabasesShown::DefaultOnly, &listed, Some("postgres")),
+            ["postgres"]
+        );
+        // The default itself closed: still shown, never an empty tree.
+        assert_eq!(
+            shown(DatabasesShown::DefaultOnly, &listed, Some("billing")),
+            ["billing"]
+        );
+        assert_eq!(
+            shown(DatabasesShown::Available, &listed, Some("billing")),
+            ["app_dev", "billing", "postgres"]
+        );
+        // A default not listed (or not known): what the account can open.
+        for default in [Some("gone"), None] {
+            assert_eq!(
+                shown(DatabasesShown::DefaultOnly, &listed, default),
+                ["app_dev", "postgres"]
+            );
+        }
+    }
+
+    /// K62: the choice travels with the connection in an export; a stored
+    /// connection or a file without it reads as "all", and "all" is not
+    /// written.
+    #[test]
+    fn the_databases_shown_travel_in_an_export_and_default_to_all() {
+        let old = r#"{"name":"Shop","engine":"postgres","host":"db","port":5432,"user":"ada"}"#;
+        let loaded: ConnectionConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(loaded.databases_shown, DatabasesShown::All);
+        assert!(
+            !serde_json::to_string(&loaded)
+                .unwrap()
+                .contains("databases_shown")
+        );
+        let file = format!(r#"{{"kerno_connections": 1, "connections": [{old}]}}"#);
+        assert_eq!(
+            import_connections(&file).unwrap()[0].databases_shown,
+            DatabasesShown::All
+        );
+
+        let mut config = ConnectionConfig::new(Engine::Postgres);
+        config.name = "Shop".into();
+        config.databases_shown = DatabasesShown::DefaultOnly;
+        let json = export_connections(std::slice::from_ref(&config)).unwrap();
+        assert!(
+            json.contains("\"databases_shown\": \"default-only\""),
+            "{json}"
+        );
+        assert_eq!(import_connections(&json).unwrap(), [config]);
     }
 }

@@ -24,7 +24,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use kerno_core::Error;
-use kerno_core::config::{Engine, Secrets, SshClient, TlsMode};
+use kerno_core::config::{DatabasesShown, Engine, Secrets, SshClient, TlsMode};
 use kerno_core::environment;
 use kerno_core::error::{Explained, explain};
 use kerno_core::ssh::SshError;
@@ -1040,6 +1040,37 @@ impl ConnectionDialog {
             .into_any_element()
     }
 
+    /// PostgreSQL: which databases the tree shows (K62), DBeaver's "Show
+    /// all databases" as a choice of three.
+    fn databases_shown_picker(&self, cx: &Context<Self>) -> impl IntoElement {
+        let chosen = self.form.databases_shown;
+        let view = cx.entity();
+        Button::new("conn-databases-shown")
+            .outline()
+            .dropdown_caret(true)
+            .label(SharedString::from(format!(
+                "Databases shown: {}",
+                chosen.label()
+            )))
+            .tooltip("Which of the server's databases the tree and the database pickers show")
+            .dropdown_menu(move |mut menu: PopupMenu, _, _| {
+                for option in DatabasesShown::ALL {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option.label())
+                            .checked(option == chosen)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.form.databases_shown = option;
+                                    cx.notify();
+                                })
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     /// What the listing of the databases found, under the field.
     fn render_databases(&self, cx: &App) -> AnyElement {
         let muted = cx.theme().muted_foreground;
@@ -1361,7 +1392,12 @@ impl ConnectionDialog {
                                     .child(div().flex_1().child(
                                         Input::new(&self.inputs.database).id("conn-database"),
                                     ))
-                                    .child(self.database_picker(cx)),
+                                    .child(self.database_picker(cx))
+                                    // Beside the field, not under it: the
+                                    // tab grows no taller (K56).
+                                    .when(self.form.engine == Engine::Postgres, |this| {
+                                        this.child(self.databases_shown_picker(cx))
+                                    }),
                             )
                             .child(self.render_databases(cx)),
                         cx,

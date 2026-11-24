@@ -94,6 +94,9 @@ pub(crate) async fn databases(session: &MysqlSession) -> Result<Vec<DatabaseInfo
                 collation: opt(row, 2),
                 size_bytes: number(row, 3),
                 comment: opt(row, 4),
+                // SHOW DATABASES and SCHEMATA list only what the account sees.
+                allows_connections: true,
+                can_connect: true,
             }
         })
         .collect();

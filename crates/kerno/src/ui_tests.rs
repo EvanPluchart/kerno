@@ -71,6 +71,7 @@ mod k54;
 mod k55;
 mod k56;
 mod k59;
+mod k62;
 mod legacy;
 mod menus;
 mod multi_run;
@@ -8707,7 +8708,7 @@ fn running_in_a_tab_of_a_closed_connection_connects_first(cx: &mut TestAppContex
     app.wait_until(cx, "the databases and schemas of the selectors", |_, cx| {
         cx.update(|cx| {
             let tab = tab.read(cx);
-            !tab.databases().is_empty() && tab.schemas().iter().any(|schema| schema == "public")
+            !tab.databases(cx).is_empty() && tab.schemas().iter().any(|schema| schema == "public")
         })
     });
     app.wait_until(cx, "the history", |app, _| {
@@ -13110,7 +13111,7 @@ fn the_tab_toolbar_changes_its_connection_database_and_schema(cx: &mut TestAppCo
     app.wait_until(cx, "the databases", |_, cx| {
         cx.update(|cx| {
             tab.read(cx)
-                .databases()
+                .databases(cx)
                 .contains(&"kerno_other".to_string())
         })
     });
@@ -13133,7 +13134,7 @@ fn the_tab_toolbar_changes_its_connection_database_and_schema(cx: &mut TestAppCo
     app.wait_until(cx, "the MySQL databases", |_, cx| {
         cx.update(|cx| {
             tab.read(cx)
-                .databases()
+                .databases(cx)
                 .contains(&"kerno_other".to_string())
         })
     });

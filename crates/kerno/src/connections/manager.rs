@@ -1342,7 +1342,12 @@ impl Connections {
             };
             let databases = session.databases().await;
             session.close().await;
-            Ok(databases?.into_iter().map(|info| info.name).collect())
+            // Only what the session could open there (K62).
+            Ok(databases?
+                .into_iter()
+                .filter(|info| info.can_connect)
+                .map(|info| info.name)
+                .collect())
         })
     }
 }

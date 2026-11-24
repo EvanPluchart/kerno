@@ -76,7 +76,9 @@ pub(crate) async fn databases(session: &PgSession) -> Result<Vec<DatabaseInfo>> 
                     CASE WHEN d.datallowconn AND pg_catalog.has_database_privilege(d.oid, 'CONNECT') \
                          THEN pg_catalog.pg_database_size(d.oid) END, \
                     d.datistemplate OR NOT d.datallowconn, \
-                    pg_catalog.shobj_description(d.oid, 'pg_database') \
+                    pg_catalog.shobj_description(d.oid, 'pg_database'), \
+                    d.datallowconn, \
+                    d.datallowconn AND pg_catalog.has_database_privilege(d.oid, 'CONNECT') \
              FROM pg_catalog.pg_database d \
              ORDER BY d.datistemplate, d.datname",
         )
@@ -91,6 +93,8 @@ pub(crate) async fn databases(session: &PgSession) -> Result<Vec<DatabaseInfo>> 
             size_bytes: number(row, 4),
             is_system: flag(row, 5),
             comment: opt(row, 6),
+            allows_connections: flag(row, 7),
+            can_connect: flag(row, 8),
         })
         .collect())
 }

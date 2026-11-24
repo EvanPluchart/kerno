@@ -2354,9 +2354,7 @@ impl Workspace {
                     Status::Connected { .. }
                 )
             }),
-            databases: query
-                .map(|tab| tab.databases().to_vec())
-                .unwrap_or_default(),
+            databases: query.map(|tab| tab.databases(cx)).unwrap_or_default(),
             database: status.as_ref().and_then(|status| status.database.clone()),
             transaction: status
                 .as_ref()

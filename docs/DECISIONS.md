@@ -4114,3 +4114,37 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   differences from the tab (the script is the way); saving a comparison; more than 10,000 differences in one
   script (compare again after running it); keys whose text differs only by Unicode normalization (`é` composed
   and decomposed) are two keys unless the target's server holds them equal.
+
+## D-129 — Which databases a PostgreSQL connection shows (K62; 2026-11-24)
+
+- **The case.** A user's report: an account allowed into one database of a server that holds about twenty.
+  Kerno listed them all, templates included, and the ones the account may not enter could be told apart only
+  by clicking each, which failed in red. DBeaver lists the default database alone unless "Show all databases"
+  is ticked (`PostgreConstants.PROP_SHOW_NON_DEFAULT_DB`), and two advanced switches add the databases that
+  take no connection and the templates.
+- **What the catalog says first.** `DatabaseInfo` carries `allows_connections` and `can_connect` (the CONNECT
+  privilege), read in the query that lists the databases. A database the account may not open is dimmed and
+  says so when opened, without any connection tried: knowing costs nothing, trying costs a failed login per
+  click (and on some servers a line in the log or a lockout counter). A session refused anyway is said in plain
+  words first, through the classifier of connection failures (SQLSTATE 42501 added).
+- **Three choices, not DBeaver's three switches.** All (today's behaviour), "Those this account can open"
+  (`can_connect`, no template), "Only the default database". DBeaver's switches combine into states nobody
+  wants (templates shown but not the other databases) and its "unavailable" means `datallowconn`, not the
+  privilege the report is about. The default database is always shown, dimmed if closed, and "only the default"
+  falls back to "those this account can open" when the default is not listed: never an empty tree.
+- **All stays the default for existing and new connections**: nothing changes for anyone who did not ask, and
+  an empty tree on a new connection would read as "my data is gone" (CLAUDE.md §3 item 8). An import from
+  DBeaver follows DBeaver: an imported connection shows what DBeaver showed (the default database alone when
+  the switch was off, DBeaver's default). One difference: DBeaver's "Show all databases" alone still lists the
+  databases the account has no CONNECT privilege on; Kerno's "Those this account can open" hides them.
+- **PostgreSQL only.** MySQL and MariaDB list only the databases the account may see (`SHOW DATABASES` and
+  `SCHEMATA` filter by privilege), and DBeaver has no such switch there; SQLite has one database. The select is
+  not drawn for them and their connections save All.
+- **Where it applies.** The tree (applied when it is drawn, from the saved settings, as the object filters are:
+  a save shows at once, no reconnect) and every picker that runs inside a database (the toolbar's, the status
+  bar's, the query tab's), which also never offer a closed database or a system one. The connection dialog's
+  Database list keeps every database the account can open: it is how the default is chosen. The cue is one
+  muted line after the databases, "N databases hidden", whose click or Enter opens the connection's dialog.
+- **Left out**, the next steps if users ask: per-connection name patterns beyond the tree's object filters
+  (Filter ▸ already hides databases by name, DBeaver's navigator filters), a filter per schema, anything for
+  MySQL.

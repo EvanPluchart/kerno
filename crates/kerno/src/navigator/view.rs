@@ -30,7 +30,7 @@ use gpui_kit::{
     TestSupportExt as _, WeakEntity, Window, div, img, px,
 };
 use kerno_core::browse::Filter;
-use kerno_core::config::{FolderLook, ObjectFilter, exact_mask, parent_folder};
+use kerno_core::config::{DatabasesShown, FolderLook, ObjectFilter, exact_mask, parent_folder};
 use kerno_core::maintenance::Maintenance;
 use kerno_core::schema::{Change, Dependent, ObjectRef, RelationKind, RoutineKind, TableRef};
 use kerno_core::sql::{
@@ -639,6 +639,12 @@ impl Navigator {
         else {
             return;
         };
+        // A database this account may not open is never read: its refresh
+        // lists the databases again, which shows a privilege granted since.
+        if tree.node(id).is_some_and(Node::is_closed) {
+            self.reload(connection, cx);
+            return;
+        }
         if let Some(target) = tree.refresh_target(id)
             && let Some(load) = tree.refresh(&target)
         {
@@ -998,6 +1004,11 @@ impl Navigator {
         cx.spawn(async move |this, cx| {
             let outcome = fetching.await;
             let _ = this.update(cx, |this, cx| {
+                let config =
+                    (this.connections.read(cx).get(&connection)).map(|saved| saved.config.clone());
+                let outcome = outcome.map_err(|error: kerno_core::Error| {
+                    read_failure(&error, &reading, &load.database, config.as_ref())
+                });
                 let Some(browse) = this.live(&connection, generation) else {
                     return;
                 };
@@ -1005,12 +1016,7 @@ impl Navigator {
                 if browse.loading.remove(&load.id).is_none() {
                     return;
                 }
-                browse.tree.finish(
-                    &load.id,
-                    outcome.map_err(|error: kerno_core::Error| {
-                        format!("Could not read {reading}: {}", describe(&error))
-                    }),
-                );
+                browse.tree.finish(&load.id, outcome);
                 this.advance_reveal(&connection, cx);
                 this.sync(cx);
             });
@@ -2702,6 +2708,20 @@ impl Navigator {
             .find(|write| write.connection == connection && write.node == node)
     }
 
+    /// The databases the tree of `connection` holds a session in or reads
+    /// from now, sorted; for tests (K62).
+    #[cfg(test)]
+    pub fn sessions_of(&self, connection: &str) -> Vec<String> {
+        let Some(browse) = self.browse.get(connection) else {
+            return Vec::new();
+        };
+        let reading = browse.loading.values().map(|loading| &loading.session);
+        (browse.sessions.keys().chain(reading).cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// The writes running, by key, with what each says; for tests.
     #[cfg(test)]
     pub fn writes(&self) -> Vec<(u64, String)> {
@@ -2723,6 +2743,11 @@ impl Navigator {
                 browse
                     .tree
                     .set_object_filters(saved.config.navigator_filters.clone());
+                // PostgreSQL only: the others list what the account sees (K62).
+                browse.tree.set_databases_shown(match saved.config.engine {
+                    Engine::Postgres => saved.config.databases_shown,
+                    _ => DatabasesShown::All,
+                });
                 let matched =
                     !filter.is_empty() && saved.config.name.to_lowercase().contains(filter);
                 browse.tree.set_filter(if matched { "" } else { filter });
@@ -2851,6 +2876,10 @@ impl Navigator {
         };
         match model::parse_row(&id) {
             Some(RowId::Connection(connection)) => self.open_connection(connection, cx),
+            // The databases the connection's choice hides: its settings (K62).
+            Some(RowId::Object { connection, local }) if local == model::HIDDEN_NOTE => {
+                Sidebar::edit(self.connections.clone(), connection.to_string(), window, cx)
+            }
             Some(RowId::Object { .. }) => {
                 let Some((connection, node)) = self.object(&id) else {
                     return;
@@ -2874,9 +2903,12 @@ impl Navigator {
         cx: &mut Context<Self>,
     ) {
         match self.selected_node(window, cx) {
-            // Any node of a database leads to its extensions (K27).
+            // Any node of a database leads to its extensions (K27); not one
+            // this account may not open (K62).
             Some((connection, node)) if action == Action::ManageExtensions => {
-                self.manage_extensions(&connection, &node, cx)
+                if !node.is_closed() {
+                    self.manage_extensions(&connection, &node, cx)
+                }
             }
             Some((connection, node)) => self.run_entry(&connection, action, &node, window, cx),
             None => {}
@@ -3683,6 +3715,27 @@ impl Navigator {
                         .children(details),
                 )
             }
+            // What the connection's choice hides: a click (and Enter) opens
+            // its settings, where the choice is (K62).
+            model::HIDDEN_NOTE => {
+                let (connections, connection) = (self.connections.clone(), connection.to_string());
+                row.child(
+                    div()
+                        .id(("databases-hidden", at))
+                        .test_support()
+                        .min_w_0()
+                        .cursor_pointer()
+                        .child(line_text(label, theme.muted_foreground))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Edit the connection to choose the databases shown")
+                                .build(window, cx)
+                        })
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            Sidebar::edit(connections.clone(), connection.clone(), window, cx);
+                        }),
+                )
+            }
             LINE_ERROR => row.child(line_text(label, theme.danger)),
             LINE_NEXT => row.child(line_text(label, theme.foreground)),
             LINE_DETAIL => row.child(
@@ -3897,6 +3950,37 @@ fn kind_name(object: &ObjectRef) -> &'static str {
         ObjectRef::Schema(_) => "schema",
         ObjectRef::Database(_) => "database",
     }
+}
+
+/// What a failed read of the tree says on its row (C14). A session that
+/// could not open in `database` (a privilege, a server's rule) is said in
+/// plain words first, then the server's own (CLAUDE.md §3 item 5, K62);
+/// a statement's error is said as it is.
+fn read_failure(
+    error: &Error,
+    reading: &str,
+    database: &str,
+    config: Option<&kerno_core::config::ConnectionConfig>,
+) -> String {
+    let raw = format!("Could not read {reading}: {}", describe(error));
+    let explained = match (error, config) {
+        (Error::Connect(_), Some(config)) => kerno_core::error::explain(
+            &error.to_string(),
+            &kerno_core::config::ConnectionConfig {
+                database: Some(database.to_string()),
+                ..config.clone()
+            },
+        ),
+        _ => return raw,
+    };
+    if explained.kind == kerno_core::error::FailureKind::Other {
+        return raw;
+    }
+    [explained.headline, explained.next_step, raw]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The name of an object without its schema: what a rename starts from.
@@ -4456,4 +4540,44 @@ fn plain_markdown(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use kerno_core::DbError;
+    use kerno_core::config::ConnectionConfig;
+
+    use super::*;
+
+    /// K62: a session refused in a database is said in plain words first,
+    /// then the server's line; a statement's error with the same code, or
+    /// a failure with no plain words, is said as it is.
+    #[test]
+    fn a_refused_session_is_said_in_plain_words_first() {
+        let config = ConnectionConfig::new(Engine::Postgres);
+        let refused = Error::Connect("permission denied for database \"billing\" [42501]".into());
+        let text = read_failure(&refused, "the schemas", "billing", Some(&config));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "You may not connect to database “billing”.");
+        assert_eq!(
+            lines.last(),
+            Some(
+                &"Could not read the schemas: could not connect: permission denied for \
+                  database \"billing\" [42501]"
+            )
+        );
+        let statement = Error::Db(Box::new(DbError {
+            code: Some("42501".into()),
+            ..DbError::message("permission denied for schema shop")
+        }));
+        assert_eq!(
+            read_failure(&statement, "the objects of shop", "billing", Some(&config)),
+            "Could not read the objects of shop: permission denied for schema shop [42501]"
+        );
+        let other = Error::Connect("something unheard of".into());
+        assert_eq!(
+            read_failure(&other, "the schemas", "billing", Some(&config)),
+            "Could not read the schemas: could not connect: something unheard of"
+        );
+    }
 }

@@ -217,6 +217,9 @@ pub enum FailureKind {
     Tls,
     /// The database named in the settings does not exist.
     NoDatabase,
+    /// The account may not connect to the database (PostgreSQL's CONNECT
+    /// privilege, K62).
+    NotAllowed,
     /// The SSH server could not be reached.
     SshUnreachable,
     /// The SSH server refused the login.
@@ -298,6 +301,10 @@ const AUTHENTICATION: [&str; 5] = [
 ];
 
 const NO_DATABASE: [&str; 2] = ["[3D000]", "1049 (42000)"];
+
+/// PostgreSQL's "permission denied for database", at connect: no CONNECT
+/// privilege.
+const NOT_ALLOWED: [&str; 1] = ["[42501]"];
 
 fn any(raw: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| raw.contains(marker))
@@ -459,6 +466,18 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
             FailureKind::Authentication,
             format!("The server refused the login of user “{user}”."),
             next.to_string(),
+        )
+    } else if any(raw, &NOT_ALLOWED) {
+        let headline = match config.database.as_deref().filter(|name| !name.is_empty()) {
+            Some(database) => format!("You may not connect to database “{database}”."),
+            None => "You may not connect to this database.".to_string(),
+        };
+        (
+            FailureKind::NotAllowed,
+            headline,
+            "Ask the server's administrator for the CONNECT privilege on it, or choose another \
+             database."
+                .to_string(),
         )
     } else if any(raw, &NO_DATABASE) {
         let headline = match config.database.as_deref().filter(|name| !name.is_empty()) {
@@ -970,6 +989,12 @@ mod tests {
                 "could not connect: Unknown database 'no_such_db' [1049 (42000)]",
                 NoDatabase,
                 "Database “shop” does not exist on this server.",
+            ),
+            // K62: no CONNECT privilege on the database.
+            (
+                "could not connect: permission denied for database \"shop\" [42501]",
+                NotAllowed,
+                "You may not connect to database “shop”.",
             ),
             // TLS.
             (

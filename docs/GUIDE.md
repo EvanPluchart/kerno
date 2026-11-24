@@ -13,6 +13,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Passwords from a command, AWS RDS IAM, 1Password, .pgpass and .my.cnf](#passwords-from-a-command-aws-rds-iam-1password-pgpass-and-mycnf)
 - [Open a connection from the shell](#open-a-connection-from-the-shell)
 - [Move your setup to another computer](#move-your-setup-to-another-computer)
+- [Which databases a PostgreSQL connection shows](#which-databases-a-postgresql-connection-shows)
 - [AI assistant and what it sends](#ai-assistant-and-what-it-sends)
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
@@ -186,7 +187,34 @@ saved queries of their connection. **Also import the saved passwords** (off by d
 computer's secret store. Importing the same file again adds nothing twice. An SSH tunnel's jump servers come
 as its jump hosts (through the system's OpenSSH). Under each connection the preview says what was left out and
 what to check ("To check: certificate pasted in DBeaver, not in a file: save it to a file and choose it on the
-SSL tab"), and the report after the import lists them again, connection by connection.
+SSL tab"), and the report after the import lists them again, connection by connection. A PostgreSQL
+connection shows the databases DBeaver showed (see the next section).
+
+## Which databases a PostgreSQL connection shows
+
+In the schema tree, a database the account may not open (it has no CONNECT privilege there, or the database
+takes no connection, as `template0`) is dimmed. Opening it shows one line, "This account may not connect here."
+or "This database takes no connection.": Kerno knows it from the server's catalog and tries no connection. Its
+menu keeps what runs from the connection's own database (Create database…, Drop…, Copy name, Filter ▸); its
+Refresh lists the databases again, so a privilege granted since shows. If a session is refused anyway (a rule
+of the server's `pg_hba.conf`, a privilege revoked meanwhile), the row says "You may not connect to database
+“x”." first, then the server's words.
+
+On a server with many databases, choose what the tree shows in the connection's settings: **Databases shown**,
+beside the Database field, PostgreSQL only.
+
+- **All** (the default): every database, templates included.
+- **Those this account can open**: the databases with the CONNECT privilege, no template.
+- **Only the default database**: the one in the Database field, or where the server puts the session when it is
+  empty.
+
+The database the connection opens on is always shown. The tree follows as soon as the settings are saved; a
+line after the databases says how many are hidden ("12 databases hidden"), and a click on it (or Enter) opens
+the settings. The main toolbar's database picker, the status bar's and a query tab's offer the databases the
+tree shows, never one the account may not open; the Database list of the settings offers every database the
+account can open. MySQL and MariaDB list only what the account may see, and have no such choice. To hide
+databases by name, use Filter ▸ on a database of the tree. An import from DBeaver keeps DBeaver's "Show all
+databases" (off in DBeaver: the default database alone), and an exported connections file carries the choice.
 
 ## AI assistant and what it sends
 

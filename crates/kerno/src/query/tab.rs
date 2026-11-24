@@ -38,9 +38,10 @@ use kerno_core::browse::{
     Filter, Operator, Query, Source as QuerySource, and_where, count_from, described, distinct_sql,
     one_of_sql, select_from,
 };
+use kerno_core::config::DatabasesShown;
 use kerno_core::editable::{self, Editable, ReadOnly, Source as EditSource};
 use kerno_core::environment;
-use kerno_core::schema::{RelationKind, TableRef, TableStructure};
+use kerno_core::schema::{DatabaseInfo, RelationKind, TableRef, TableStructure};
 use kerno_core::sql::{
     ApplyFailure, CellValue, RowChange, RowSql, StatementClass, StatementKind, TxCommand,
     apply_edits, apply_edits_in_transaction, classify,
@@ -518,9 +519,9 @@ pub struct QueryTab {
     session: Option<Arc<dyn Session>>,
     /// The database and schema the session was last seen in (C6).
     session_place: (Option<String>, Option<String>),
-    /// Databases of the connection and schemas of the database, for the
-    /// selectors.
-    databases: Vec<String>,
+    /// Databases of the connection (as the server lists them; what the
+    /// selectors offer is [`Self::databases`]) and schemas of the database.
+    databases: Vec<DatabaseInfo>,
     schemas: Vec<String>,
     results: Vec<ResultPane>,
     active_result: usize,
@@ -1513,11 +1514,7 @@ impl QueryTab {
                     if this.placed != placed {
                         return;
                     }
-                    this.databases = databases
-                        .into_iter()
-                        .filter(|database| !database.is_system)
-                        .map(|database| database.name)
-                        .collect();
+                    this.databases = databases;
                     if wants_schemas {
                         this.schemas = schemas
                             .into_iter()
@@ -3601,9 +3598,30 @@ impl QueryTab {
         .detach();
     }
 
-    /// The databases the tab can switch to.
-    pub fn databases(&self) -> &[String] {
-        &self.databases
+    /// The databases the tab can switch to: those the tree shows (the
+    /// connection's choice, K62) but the system ones and the ones this
+    /// account may not open.
+    pub fn databases(&self, cx: &App) -> Vec<String> {
+        let connections = self.connections.read(cx);
+        let Some(target) = self.target.as_ref() else {
+            return Vec::new();
+        };
+        let shown = match connections
+            .get(&target.connection)
+            .map(|saved| &saved.config)
+        {
+            Some(config) if config.engine == kerno_core::Engine::Postgres => config.databases_shown,
+            _ => DatabasesShown::All,
+        };
+        let default = connections
+            .meta_session(&target.connection)
+            .and_then(|meta| meta.database());
+        shown
+            .shown(&self.databases, default.as_deref())
+            .into_iter()
+            .filter(|database| !database.is_system && database.can_connect)
+            .map(|database| database.name.clone())
+            .collect()
     }
 
     /// The schemas the tab can switch to; for tests.
@@ -3641,7 +3659,7 @@ impl QueryTab {
         Choices {
             connections: self.connection_choices(cx),
             connection: target.map(|target| target.connection.clone()),
-            databases: self.databases.clone(),
+            databases: self.databases(cx),
             database: target.and_then(|target| {
                 target.database.clone().or_else(|| {
                     connections
@@ -6387,7 +6405,7 @@ impl QueryTab {
 
         // What the menus offer, captured when they open.
         let choices = self.connection_choices(cx);
-        let (databases, schemas) = (self.databases.clone(), self.schemas.clone());
+        let (databases, schemas) = (self.databases(cx), self.schemas.clone());
         let running = matches!(self.activity, Activity::Running { .. });
         // Stop while a statement runs or rows are on their way; a result
         // that only waits for "Fetch more" has nothing to stop.

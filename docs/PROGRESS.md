@@ -1620,3 +1620,17 @@ into the morning's release, which stays unpublished until his go.
   from_the_palette` timed out once and was not seen again.
 - Not verified in the real app: K61's Edit ▸ Copy on the tree (its tests only), a real sleep for K57, and
   the last form of data compare after its review (the pass ran on the build before the fixes).
+
+## 2026-11-24 — K62: which databases a PostgreSQL connection shows
+
+- From a user's report: an account allowed into one database of twenty saw them all, and learnt which ones it
+  could not enter only by clicking each (a red line). A database the account may not open (the CONNECT
+  privilege, or `datallowconn`) is now dimmed and opens on a muted line that says so, with no connection tried;
+  a session refused anyway says "You may not connect to database “x”." first.
+- A PostgreSQL connection chooses what its tree and its database pickers show: All (the default), Those this
+  account can open, Only the default database; on the Database field's line of the dialog, applied on save
+  without a reconnect, with "N databases hidden" after the databases (a click opens the dialog). The DBeaver
+  import follows DBeaver's "Show all databases"; the connections file carries the choice
+  (`docs/plans/M12.md`, K62; D-129).
+- Tests: a driver test as a role of its own, core and app unit tests, `ui_tests::k62` (2), each seen failing
+  under a mutation; captures `final/m12-databases-shown-*`.

@@ -8,8 +8,10 @@
 //! `registry/DataSourceParser.java`, the credentials file's cipher and key
 //! from `model/impl/app/DefaultValueEncryptor.java` and `BaseProjectImpl.java`,
 //! the script bindings from `BaseProjectImpl.loadMetadata`, an SSH tunnel's
-//! jump servers from `net/ssh/SSHUtils.loadHostConfigurations` (K58). Lenient:
-//! unknown fields are ignored, missing ones defaulted.
+//! jump servers from `net/ssh/SSHUtils.loadHostConfigurations` (K58), the
+//! databases a PostgreSQL connection shows from `ext/postgresql/PostgreConstants`
+//! and `model/PostgreDataSource.prepareReadDatabaseListStatement` (K62).
+//! Lenient: unknown fields are ignored, missing ones defaulted.
 //!
 //! The archive is untrusted: its entries are read in memory, never written
 //! to disk, each one and all of them together under a cap, and an entry
@@ -22,7 +24,8 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::config::{
-    ConnectionConfig, Engine, Secret, Secrets, SshAuth, SshClient, SshConfig, TlsMode, folder_path,
+    ConnectionConfig, DatabasesShown, Engine, Secret, Secrets, SshAuth, SshClient, SshConfig,
+    TlsMode, folder_path,
 };
 use crate::environment::{self, EnvironmentDef, EnvironmentRules, Tint};
 
@@ -413,6 +416,27 @@ fn flag(map: &Map<String, Value>, key: &str) -> Option<bool> {
     }
 }
 
+/// What a DBeaver PostgreSQL connection shows of the server's databases
+/// (K62): its "Show all databases" off, DBeaver's default, lists the
+/// default database alone; on, those that take connections and are no
+/// template, unless "Show unavailable databases" or "Show template
+/// databases" is on too. The switches are provider properties, as text.
+fn databases_shown(cfg: &Map<String, Value>) -> DatabasesShown {
+    let empty = Map::new();
+    let properties = cfg
+        .get("provider-properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let on = |key: &str| flag(properties, key).unwrap_or(false);
+    if !on("@dbeaver-show-non-default-db@") {
+        DatabasesShown::DefaultOnly
+    } else if on("@dbeaver-show-unavailable-db@") || on("@dbeaver-show-template-db@") {
+        DatabasesShown::All
+    } else {
+        DatabasesShown::Available
+    }
+}
+
 /// The engine of a DBeaver provider and driver, or what to say instead.
 fn engine(provider: &str, driver: &str) -> Result<Engine, String> {
     match (provider, driver) {
@@ -518,6 +542,9 @@ fn map_connection(
     config.group = connection.folder.clone();
     config.read_only = flag(json, "read-only").unwrap_or(false);
     config.save_password = flag(json, "save-password").unwrap_or(true);
+    if engine == Engine::Postgres {
+        config.databases_shown = databases_shown(cfg);
+    }
     let not_mapped = &mut connection.not_mapped;
     if engine.is_file() {
         let file = (!connection.database.is_empty())
@@ -1000,6 +1027,7 @@ pub fn sample_project() -> Vec<u8> {
                 "configuration": {
                     "host": "db.example.com", "port": "5433", "database": "shop",
                     "type": "prod", "color": "198,47,61",
+                    "provider-properties": {"@dbeaver-show-non-default-db@": "true"},
                     "handlers": {
                         "ssh_tunnel": {
                             "enabled": true, "save-password": true,
@@ -1103,6 +1131,8 @@ mod tests {
         assert_eq!(config.color.as_deref(), Some("red"));
         assert_eq!(config.tls.mode, TlsMode::VerifyFull);
         assert_eq!(config.tls.ca_file, Some(PathBuf::from("/certs/ca.pem")));
+        // "Show all databases" on, nothing else (K62).
+        assert_eq!(config.databases_shown, DatabasesShown::Available);
         let ssh = config.ssh.as_ref().unwrap();
         assert_eq!(
             (ssh.host.as_str(), ssh.port, ssh.user.as_str()),
@@ -1124,6 +1154,8 @@ mod tests {
         );
         // A type of the file, found by its name.
         assert_eq!(blog.environment, "staging");
+        // MySQL lists what the account sees: nothing to choose (K62).
+        assert_eq!(blog.databases_shown, DatabasesShown::All);
 
         let legacy = find(&export, "Legacy");
         let config = legacy.config.as_ref().unwrap();
@@ -1165,6 +1197,43 @@ mod tests {
                 ("", "scratch", None),
                 ("reports", "monthly", Some("postgres-jdbc-1")),
             ]
+        );
+    }
+
+    /// K62: an imported PostgreSQL connection shows what DBeaver showed:
+    /// "Show all databases" off (or absent, DBeaver's default) is the
+    /// default database alone; on, those this account can open, or all
+    /// with unavailable or template databases shown too.
+    #[test]
+    fn the_databases_a_postgres_connection_shows_follow_dbeaver() {
+        let shown = |properties: Value| {
+            let cfg = serde_json::json!({ "provider-properties": properties });
+            databases_shown(cfg.as_object().unwrap())
+        };
+        let non_default = "@dbeaver-show-non-default-db@";
+        let unavailable = "@dbeaver-show-unavailable-db@";
+        let template = "@dbeaver-show-template-db@";
+        assert_eq!(shown(serde_json::json!({})), DatabasesShown::DefaultOnly);
+        assert_eq!(
+            shown(serde_json::json!({ non_default: "false", template: "true" })),
+            DatabasesShown::DefaultOnly
+        );
+        assert_eq!(
+            shown(serde_json::json!({ non_default: "true" })),
+            DatabasesShown::Available
+        );
+        assert_eq!(
+            shown(serde_json::json!({ non_default: "true", unavailable: "true" })),
+            DatabasesShown::All
+        );
+        assert_eq!(
+            shown(serde_json::json!({ non_default: "true", template: "true" })),
+            DatabasesShown::All
+        );
+        let none = serde_json::json!({});
+        assert_eq!(
+            databases_shown(none.as_object().unwrap()),
+            DatabasesShown::DefaultOnly
         );
     }
 

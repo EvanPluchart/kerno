@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kerno_core::config::{
-    ConnectionConfig, DEFAULT_COMMAND_TIMEOUT, Engine, ObjectFilter, PasswordSource, Secret,
-    Secrets, SshAuth, SshClient, SshConfig, TlsConfig, TlsMode, bootstrap_refusal,
-    is_secret_option, parse_connection_url,
+    ConnectionConfig, DEFAULT_COMMAND_TIMEOUT, DatabasesShown, Engine, ObjectFilter,
+    PasswordSource, Secret, Secrets, SshAuth, SshClient, SshConfig, TlsConfig, TlsMode,
+    bootstrap_refusal, is_secret_option, parse_connection_url,
 };
 use kerno_core::sql::{LexRules, split_statements};
 
@@ -162,6 +162,8 @@ pub struct ConnectionForm {
     /// The command came from an imported file and is not confirmed yet.
     pub command_unconfirmed: bool,
     pub database: String,
+    /// PostgreSQL: which databases the tree shows (K62).
+    pub databases_shown: DatabasesShown,
     /// SQLite: the database file.
     pub file: String,
     /// Extra driver options, one `key=value` per line.
@@ -283,6 +285,7 @@ impl ConnectionForm {
             op_reference,
             command_unconfirmed: config.password_command_unconfirmed,
             database: config.database.clone().unwrap_or_default(),
+            databases_shown: config.databases_shown,
             file: text(&config.file),
             options: config
                 .options
@@ -749,6 +752,11 @@ impl ConnectionForm {
             client_dir: self.client_dir.clone(),
             password_command_unconfirmed: self.command_unconfirmed && !password_source.is_stored(),
             password_source,
+            // MySQL and MariaDB list only what the account sees (K62).
+            databases_shown: match self.engine {
+                Engine::Postgres => self.databases_shown,
+                _ => DatabasesShown::All,
+            },
         };
         // Secrets are kept exactly as typed (a password may start or end
         // with a space), and only the ones the chosen methods use.

@@ -93,6 +93,84 @@ async fn databases_and_schemas() {
     assert_eq!(shop.owner.as_deref(), Some("kerno"));
 }
 
+/// K62: the scratch database and login role of
+/// [`databases_an_account_may_not_open_are_marked`]; roles are cluster-wide,
+/// the `kerno_test_` prefix makes them ours.
+const K62_DATABASE: &str = "kerno_test_k62_closed";
+const K62_ROLE: &str = "kerno_test_k62_role";
+
+/// K62: an account without the CONNECT privilege on a database, and
+/// `template0`, which takes no connection, are told apart from what it may
+/// open; a connect to the closed one is said in plain words.
+#[tokio::test]
+async fn databases_an_account_may_not_open_are_marked() {
+    let Some(session) = common::session().await else {
+        return;
+    };
+    let cleanup = [
+        format!(
+            "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity \
+             WHERE usename = '{K62_ROLE}'"
+        ),
+        format!("DROP DATABASE IF EXISTS {K62_DATABASE} WITH (FORCE)"),
+        format!("DROP ROLE IF EXISTS {K62_ROLE}"),
+    ];
+    for sql in &cleanup {
+        exec_ok(&session, sql).await;
+    }
+    // Run apart, so the cleanup below also runs when it fails.
+    let outcome = tokio::spawn(closed_databases(session.clone())).await;
+    let mut failed = Vec::new();
+    for sql in &cleanup {
+        if let Err(error) = run(&session, sql).await {
+            failed.push(format!("{sql}: {error}"));
+        }
+    }
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    assert!(failed.is_empty(), "cleanup failed: {failed:#?}");
+}
+
+async fn closed_databases(session: std::sync::Arc<dyn kerno_core::Session>) {
+    for sql in [
+        format!("CREATE DATABASE {K62_DATABASE}"),
+        format!("REVOKE CONNECT ON DATABASE {K62_DATABASE} FROM PUBLIC"),
+        format!("CREATE ROLE {K62_ROLE} LOGIN PASSWORD 'kerno_test_pw'"),
+    ] {
+        exec_ok(&session, &sql).await;
+    }
+    // Not the superuser `kerno`, which may connect anywhere.
+    let mut params = kerno_core::testing::params(kerno_core::Engine::Postgres);
+    params.user = K62_ROLE.into();
+    params.database = Some("kerno".into());
+    let account = common::connect(&params).await.unwrap();
+    let databases = account.databases().await.unwrap();
+    account.close().await;
+    let access = |name: &str| {
+        let database = databases.iter().find(|d| d.name == name).unwrap();
+        (database.allows_connections, database.can_connect)
+    };
+    assert_eq!(access("kerno"), (true, true));
+    assert_eq!(access(K62_DATABASE), (true, false));
+    assert_eq!(access("template0"), (false, false));
+    assert_eq!(access("template1"), (true, true));
+
+    // Tried anyway: refused, and said in plain words.
+    params.database = Some(K62_DATABASE.into());
+    let error = common::connect(&params).await.err().expect("refused");
+    assert!(matches!(error, Error::Connect(_)), "{error:?}");
+    let config = kerno_core::config::ConnectionConfig {
+        database: Some(K62_DATABASE.into()),
+        ..kerno_core::testing::config(kerno_core::Engine::Postgres)
+    };
+    let explained = kerno_core::error::explain(&error.to_string(), &config);
+    assert_eq!(
+        explained.headline,
+        format!("You may not connect to database “{K62_DATABASE}”.")
+    );
+}
+
 #[tokio::test]
 async fn objects_of_a_schema() {
     let Some(session) = common::session().await else {

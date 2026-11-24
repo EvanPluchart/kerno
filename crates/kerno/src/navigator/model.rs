@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use kerno_core::config::ObjectFilter;
+use kerno_core::config::{DatabasesShown, ObjectFilter};
 use kerno_core::schema::{
     ConstraintKind, DatabaseInfo, ExtensionInfo, ObjectRef, RelationKind, RoutineKind, SchemaInfo,
     SchemaObjects, TableRef, TableStructure, TypeShape,
@@ -97,7 +97,16 @@ pub enum Children {
     Loaded(Vec<Node>),
     /// Why the server did not answer.
     Failed(String),
+    /// A database this account may not open: why, said without asking the
+    /// server (K62).
+    Closed(&'static str),
 }
+
+/// What a database that takes no connection says under it (`template0`).
+/// Both lines are short: whole at the sidebar's default width.
+pub const NO_CONNECTIONS: &str = "This database takes no connection.";
+/// What a database the account has no CONNECT privilege on says under it.
+pub const NOT_ALLOWED: &str = "This account may not connect here.";
 
 /// One node of the tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +134,11 @@ impl Node {
     pub fn is_enum(&self) -> bool {
         matches!(self.kind, NodeKind::Object(ObjectRef::Type(_)))
             && matches!(self.children, Children::Loaded(_))
+    }
+
+    /// Whether the node is a database this account may not open (K62).
+    pub fn is_closed(&self) -> bool {
+        matches!(self.children, Children::Closed(_))
     }
 }
 
@@ -191,6 +205,10 @@ pub struct Tree {
     reopen: HashMap<String, Vec<String>>,
     /// The database the connection's session is in, when it is listed.
     default: Option<String>,
+    /// The databases as the server listed them.
+    listed: Vec<DatabaseInfo>,
+    /// Which of them the connection shows (K62).
+    shown: DatabasesShown,
 }
 
 impl Tree {
@@ -217,6 +235,7 @@ impl Tree {
         databases: Vec<DatabaseInfo>,
         current: Option<&str>,
     ) -> Option<Load> {
+        self.listed = databases.clone();
         let (system, user): (Vec<_>, Vec<_>) = databases
             .into_iter()
             .partition(|database| database.is_system);
@@ -232,16 +251,44 @@ impl Tree {
                 id: format!("db:{}", database.name),
                 kind: NodeKind::Object(ObjectRef::Database(database.name.clone())),
                 hint: database.size_bytes.map(compact_bytes),
-                muted: database.is_system,
+                muted: database.is_system || !database.can_connect,
                 schema: (!self.has_schemas).then(|| database.name.clone()),
                 database: database.name.clone(),
                 label: database.name,
-                children: Children::Unloaded,
+                // Said at once, without a session that would only fail.
+                children: if !database.allows_connections {
+                    Children::Closed(NO_CONNECTIONS)
+                } else if !database.can_connect {
+                    Children::Closed(NOT_ALLOWED)
+                } else {
+                    Children::Unloaded
+                },
                 expanded: false,
             })
             .collect();
         let id = format!("db:{}", self.default.clone()?);
         self.expand(&id)
+    }
+
+    /// Shows only the databases `shown` keeps (K62): they stay loaded, so
+    /// a change shows at once.
+    pub fn set_databases_shown(&mut self, shown: DatabasesShown) {
+        self.shown = shown;
+    }
+
+    /// The databases the connection's choice hides.
+    fn hidden_by_choice(&self) -> HashSet<&str> {
+        let shown: HashSet<&str> = self
+            .shown
+            .shown(&self.listed, self.default.as_deref())
+            .into_iter()
+            .map(|database| database.name.as_str())
+            .collect();
+        self.listed
+            .iter()
+            .map(|database| database.name.as_str())
+            .filter(|name| !shown.contains(name))
+            .collect()
     }
 
     /// The database the connection's session is in, when it is listed.
@@ -280,7 +327,8 @@ impl Tree {
     pub fn refresh(&mut self, id: &str) -> Option<Load> {
         let has_schemas = self.has_schemas;
         let node = self.node_mut(id)?;
-        if matches!(node.children, Children::Loading) {
+        // A closed database is never read (K62).
+        if matches!(node.children, Children::Loading | Children::Closed(_)) {
             return None;
         }
         let load = load_for(node, has_schemas)?;
@@ -369,6 +417,7 @@ impl Tree {
     /// its filter hides; `None` when no filter applies to them.
     pub fn hidden_below(&self, id: Option<&str>) -> Option<usize> {
         let filter = self.active_filter(id)?;
+        let hidden = self.hidden_by_choice();
         let children = match id {
             None => &self.roots,
             Some(id) => match &self.node(id)?.children {
@@ -379,6 +428,8 @@ impl Tree {
         Some(
             children
                 .iter()
+                // What the connection's choice hides is not counted twice.
+                .filter(|child| id.is_some() || !hidden.contains(child.label.as_str()))
                 .filter(|child| filter_name(child).is_some_and(|name| !filter.shows(name)))
                 .count(),
         )
@@ -386,9 +437,12 @@ impl Tree {
 
     /// The rows to show.
     pub fn items(&self) -> Vec<Item> {
+        let hidden = self.hidden_by_choice();
         let shown = |node: &&Node| {
             let filter = self.active_filter(None);
-            filter_name(node).is_none_or(|name| filter.is_none_or(|filter| filter.shows(name)))
+            !hidden.contains(node.label.as_str())
+                && filter_name(node)
+                    .is_none_or(|name| filter.is_none_or(|filter| filter.shows(name)))
         };
         let mut items: Vec<Item> = self
             .roots
@@ -403,6 +457,19 @@ impl Tree {
                 label: format!(
                     "{hidden} database{} hidden by a filter",
                     if hidden == 1 { "" } else { "s" }
+                ),
+                expanded: false,
+                children: Vec::new(),
+            });
+        }
+        // What the connection's choice hides, and the way to change it.
+        if !hidden.is_empty() {
+            items.push(Item {
+                id: HIDDEN_NOTE.to_string(),
+                label: format!(
+                    "{} database{} hidden",
+                    hidden.len(),
+                    if hidden.len() == 1 { "" } else { "s" }
                 ),
                 expanded: false,
                 children: Vec::new(),
@@ -1022,6 +1089,10 @@ fn note(parent: &Node, text: &str) -> Item {
     }
 }
 
+/// The id of the line that says how many databases the connection's
+/// choice hides (K62): a click opens the connection's settings.
+pub const HIDDEN_NOTE: &str = "hidden\u{1f}note";
+
 /// Whether `id` is a note line rather than a node.
 pub fn is_note(id: &str) -> bool {
     id.rsplit(SEP).next() == Some("note")
@@ -1284,6 +1355,7 @@ fn item(node: &Node, filter: &str, tree: &Tree) -> Option<Item> {
         Children::Unloaded | Children::Loading => vec![note(node, "Loading…")],
         // One row: the first line; the rest is in its tooltip (C14).
         Children::Failed(message) => vec![note(node, message.lines().next().unwrap_or_default())],
+        Children::Closed(why) => vec![note(node, why)],
         Children::Loaded(children) if children.is_empty() => vec![note(node, "Nothing here")],
         Children::Loaded(children) => {
             let object_filter = tree.active_filter(Some(&node.id));
@@ -2106,6 +2178,101 @@ mod tests {
         // A default the server does not list marks nothing.
         tree.set_databases(vec![database("kerno", false)], Some("gone"));
         assert_eq!(tree.default_database(), None);
+    }
+
+    /// K62: the databases of a server as an account allowed into `app_dev`
+    /// only sees them.
+    fn closed_server() -> Vec<DatabaseInfo> {
+        let closed = |name: &str, allows: bool, is_system: bool| DatabaseInfo {
+            can_connect: false,
+            allows_connections: allows,
+            ..database(name, is_system)
+        };
+        vec![
+            database("app_dev", false),
+            closed("billing", true, false),
+            database("postgres", false),
+            closed("template0", false, true),
+            database("template1", true),
+        ]
+    }
+
+    /// K62: a database the account may not open is dimmed, and opening it
+    /// says why at once: nothing to load, and a refresh reads nothing.
+    #[test]
+    fn a_closed_database_says_why_without_a_load() {
+        let mut tree = Tree::new(true);
+        tree.set_databases(closed_server(), Some("app_dev"));
+        let billing = tree.node("db:billing").unwrap();
+        assert!(billing.muted && billing.is_closed());
+        assert!(!tree.node("db:postgres").unwrap().muted);
+        assert_eq!(tree.expand("db:billing"), None);
+        assert_eq!(tree.expand("db:template0"), None);
+        assert_eq!(tree.refresh("db:billing"), None);
+        assert_eq!(
+            outline(&tree.items()),
+            [
+                // The default, being read.
+                "v app_dev".to_string(),
+                "  Loading…".to_string(),
+                "v billing".to_string(),
+                format!("  {NOT_ALLOWED}"),
+                "> postgres".to_string(),
+                "v template0".to_string(),
+                format!("  {NO_CONNECTIONS}"),
+                "> template1".to_string(),
+            ]
+        );
+    }
+
+    /// K62: the connection's choice hides databases, says how many after
+    /// the last one, and changes at once; the default stays, even closed.
+    #[test]
+    fn the_connections_choice_hides_databases_and_says_how_many() {
+        let mut tree = Tree::new(true);
+        tree.set_databases(closed_server(), Some("app_dev"));
+        let roots = |tree: &Tree| -> Vec<String> {
+            tree.items().into_iter().map(|item| item.label).collect()
+        };
+        assert_eq!(
+            roots(&tree),
+            ["app_dev", "billing", "postgres", "template0", "template1"]
+        );
+        tree.set_databases_shown(DatabasesShown::Available);
+        assert_eq!(roots(&tree), ["app_dev", "postgres", "3 databases hidden"]);
+        let note = tree.items().pop().unwrap();
+        assert_eq!(note.id, HIDDEN_NOTE);
+        assert!(is_note(&note.id));
+        tree.set_databases_shown(DatabasesShown::DefaultOnly);
+        assert_eq!(roots(&tree), ["app_dev", "4 databases hidden"]);
+
+        // An object filter on top: what the choice hid is not counted again.
+        let mut filters = BTreeMap::new();
+        filters.insert(
+            "databases".to_string(),
+            ObjectFilter {
+                include: Vec::new(),
+                exclude: vec!["postgres".into(), "template*".into()],
+                enabled: true,
+            },
+        );
+        tree.set_object_filters(filters);
+        tree.set_databases_shown(DatabasesShown::Available);
+        assert_eq!(
+            roots(&tree),
+            [
+                "app_dev",
+                "1 database hidden by a filter",
+                "3 databases hidden"
+            ]
+        );
+
+        // A closed default is still there, dimmed.
+        let mut tree = Tree::new(true);
+        tree.set_databases(closed_server(), Some("billing"));
+        tree.set_databases_shown(DatabasesShown::DefaultOnly);
+        assert_eq!(roots(&tree), ["billing", "4 databases hidden"]);
+        assert!(tree.node("db:billing").unwrap().muted);
     }
 
     #[test]
