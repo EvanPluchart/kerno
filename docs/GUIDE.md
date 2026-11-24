@@ -647,7 +647,8 @@ privilege Kerno sees only its own account's queries, and the confirmation says s
 set what the folder backup sets for each file (`--where`, `--tab`, `--no-data`, `--ignore-table` and the like),
 nor ask for a replication position (`--source-data`, `--master-data`, `--dump-replica`…: use the plain backup to
 seed a replica) or `--flush-logs`; each refusal names the argument and what the folder sets instead.
-`--set-gtid-purged=OFF`, `--skip-add-locks`, `--skip-lock-tables` and `--skip-triggers` are taken. Neither
+`--set-gtid-purged=OFF` and `--skip-add-locks` are kept; `--skip-lock-tables` is dropped (the folder sets each
+file's lock) and `--skip-triggers` turns Triggers off. Neither
 backup takes `--log-error` or `--skip-verbose`: Kerno reads what mysqldump says.
 
 A folder restored into a database that already holds some of the backup's tables is said before the run, and in

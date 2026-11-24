@@ -266,24 +266,26 @@ These were taken before the review's F4 (D-135): the ranges of one table now sta
 that table's read lock, which adds the start of the processes (tens of milliseconds) to the backup of a cut
 table.
 
-**After the second review** (G5, the scheduler; same machine and tools, 8 processes, 2026-11-24 21:00–21:25, the
-1-minute load 3.3 to 8.0 at the start of each run): eight tables, one of 1M rows of `big_table` (238 MB, cut in
-8) and seven of 125,000 rows (whole), 570.6 MB written, 16 files; then the same with the large table's key
-skewed (its last 1,000 ids moved up by 10⁹, so the first range holds 999,000 rows). "Before G5" is the same
-build with the old queue (only its first item may start).
+**After the second review** (G5, the scheduler; same machine and tools, 8 processes, 2026-11-24 21:00–21:25):
+eight tables, one of 1M rows of `big_table` (238 MB, cut in 8) and seven of 125,000 rows (whole), 570.6 MB
+written, 16 files; then the same with the large table's key skewed (its last 1,000 ids moved up by 10⁹, so the
+first range holds 999,000 rows). "Before G5" is the same build with the old queue (only its first item may
+start). Each run waits for a 1-minute load below 8 before each of its steps; the loads read then are in the last
+column, one group per run.
 
-| Database | Plain backup | Plain restore | Faster backup | Faster restore |
-|---|---|---|---|---|
-| One cut table among eight | 3.40, 3.28, 3.94 s | 29.72, 31.32, 27.70 s | 1.15, 1.74, 1.55 s | 8.09, 15.77, 9.48 s |
-| The same, before G5 | 3.61, 4.31, 3.72 s | 27.81, 28.99, 30.11 s | 1.29, 1.82, 1.24 s | 8.80, 10.34, 9.95 s |
-| Its key skewed | 3.94, 4.46, 3.79 s | 28.93, 26.92, 26.80 s | 3.34, 2.09, 2.15 s | 18.91, 17.31, 17.57 s |
-| The same, before G5 | 3.39, 3.51, 3.31 s | 30.13, 27.01, 25.71 s | 3.01, 2.16, 3.66 s | 19.11, 18.23, 18.32 s |
+| Database | Plain backup | Plain restore | Faster backup | Faster restore | Load at each step |
+|---|---|---|---|---|---|
+| One cut table among eight | 3.40, 3.28, 3.94 s | 29.72, 31.32, 27.70 s | 1.15, 1.74, 1.55 s | 8.09, 15.77, 9.48 s | 3.3 4.2; 4.7 5.1 8.0; 7.8 7.5 8.0 |
+| The same, before G5 | 3.61, 4.31, 3.72 s | 27.81, 28.99, 30.11 s | 1.29, 1.82, 1.24 s | 8.80, 10.34, 9.95 s | 7.3 6.2; 6.8 6.9 6.1; 5.1 5.1 5.8 |
+| Its key skewed | 3.94, 4.46, 3.79 s | 28.93, 26.92, 26.80 s | 3.34, 2.09, 2.15 s | 18.91, 17.31, 17.57 s | 7.1 6.9; 7.0 6.8 7.2; 7.2 6.9 5.6 |
+| The same, before G5 | 3.39, 3.51, 3.31 s | 30.13, 27.01, 25.71 s | 3.01, 2.16, 3.66 s | 19.11, 18.23, 18.32 s | 5.1 3.9; 4.6 4.3 4.9; 5.5 5.5 5.5 |
 
 With one cut table the two queues are the same within the noise: the cut table comes first and starts on an
 empty pool in both, and the old queue then let the single files take each process its ranges freed. G5 changes
-the order only when a cut table waits behind running files (a second cut table): the files behind it now take
-the free processes meanwhile. A skewed key leaves one range with most of the rows: the backup then gains about
-1.6 times, the restore 1.5 times, against 2.2 to 3 and 2.8 to 3.4 with an even key.
+the order only when a cut table waits behind running files (a second cut table): the files behind it then take
+the free processes meanwhile. That case was not measured. With an even key "Faster" backs up 1.9 to 3.0 times
+faster and restores 2.0 to 3.7 times faster (the 15.77 s restore ran at a load of 8.0); a skewed key leaves one
+range with most of the rows: 1.2 to 2.1 times for the backup, 1.5 for the restore.
 
 **The threshold** (`RANGE_THRESHOLD`, 32 MiB): one table of `big_table`'s rows, backed up and restored whole by
 one process, then cut into 8 ranges, three runs each (load 3 to 6):
