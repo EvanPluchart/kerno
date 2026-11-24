@@ -9097,7 +9097,31 @@ fn session_history(engine: Engine, role: &str) -> String {
             unreachable!("SQLite has no test server: these tests run on the server engines")
         }
     };
-    on_server(engine, &sql)
+    let sessions = on_server(engine, &sql);
+    if engine == Engine::Postgres {
+        return sessions;
+    }
+    // The open transactions: when and how each began, and the statement
+    // that began it when the server still has it.
+    let transactions = on_server(
+        engine,
+        &format!(
+            "SELECT json_pretty(json_arrayagg(concat_ws(' | ', x.trx_mysql_thread_id, \
+             x.trx_state, x.trx_started, x.trx_is_read_only, x.trx_isolation_level, \
+             x.trx_tables_locked, x.trx_rows_locked, v.variable_value, e.state, e.access_mode, \
+             e.autocommit, e.nesting_event_type, left(s.sql_text, 200)))) \
+             FROM information_schema.innodb_trx x \
+             JOIN performance_schema.threads t ON t.processlist_id = x.trx_mysql_thread_id \
+             LEFT JOIN performance_schema.variables_by_thread v ON v.thread_id = t.thread_id \
+             AND v.variable_name = 'autocommit' \
+             LEFT JOIN performance_schema.events_transactions_current e \
+             ON e.thread_id = t.thread_id \
+             LEFT JOIN performance_schema.events_statements_history s \
+             ON s.thread_id = t.thread_id AND s.event_id = e.nesting_event_id \
+             WHERE t.processlist_user = '{role}'"
+        ),
+    );
+    format!("{sessions}\nopen transactions: {transactions}")
 }
 
 /// Lets the app and the server work for up to twenty seconds, until `role`
