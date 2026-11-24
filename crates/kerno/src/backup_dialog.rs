@@ -334,8 +334,12 @@ pub struct BackupDialog {
     selection: Selection,
     objects: Loaded<Vec<SchemaEntry>>,
     databases: Loaded<Vec<String>>,
-    /// Global backup: the databases left out.
+    /// Global backup: the databases the user left out (what a task keeps).
     excluded: BTreeSet<String>,
+    /// Global backup: the databases this account may not open, read from the
+    /// server at each opening, never kept with a task; left out of every run
+    /// and said (K62).
+    closed: Vec<String>,
     /// The file the macOS save panel returned when it already existed: the
     /// panel asked before replacing it, so the backup does not ask again.
     agreed_replace: Option<PathBuf>,
@@ -659,6 +663,7 @@ impl BackupDialog {
             objects: Loaded::Loading,
             databases: Loaded::Loading,
             excluded: BTreeSet::new(),
+            closed: Vec::new(),
             folder,
             pattern,
             extra,
@@ -835,7 +840,7 @@ impl BackupDialog {
                 Err(error) => Loaded::Failed(error_text(&error)),
             };
             let _ = this.update(cx, |this, cx| {
-                this.excluded.extend(closed);
+                this.closed = closed;
                 this.databases = loaded;
                 cx.notify();
             });
@@ -1569,6 +1574,12 @@ impl BackupDialog {
         Ok(options)
     }
 
+    /// Whether the global backup writes databases (not the globals only).
+    fn dumps_databases(&self) -> bool {
+        let g = &self.global;
+        !(g.globals_only || g.roles_only || g.tablespaces_only)
+    }
+
     fn global_options(&self, cx: &App) -> Result<GlobalBackupOptions, String> {
         let mut options = self.global.clone();
         options.encoding = self.encoding_value(cx)?;
@@ -1660,7 +1671,13 @@ impl BackupDialog {
                 tools::backup_command(path, &params, &options, &self.output_path(cx)?)
             }
             Mode::GlobalBackup => {
-                let options = self.global_options(cx)?;
+                let mut options = self.global_options(cx)?;
+                // Left out of this run, not of the task (K62).
+                if self.dumps_databases() {
+                    options
+                        .exclude_databases
+                        .extend(self.closed.iter().cloned());
+                }
                 tools::global_backup_command(path, &params, &options, &self.output_path(cx)?)
             }
             Mode::Restore => {
@@ -1941,6 +1958,13 @@ impl BackupDialog {
         self.shown_command = Some(self.shown(&command));
         self.output = output.as_ref().map(|(path, _)| path.clone());
         self.log.clear();
+        // Said first, and kept with a task's run (K62).
+        if self.mode == Mode::GlobalBackup
+            && self.dumps_databases()
+            && let Some(text) = left_out_closed(&self.closed, usize::MAX)
+        {
+            self.log.push_back(text.into());
+        }
         self.roles = None;
         self.step = Step::Running;
         self.showing_clients = false;
@@ -3351,6 +3375,21 @@ fn refusal_text(found: &Finding, family: ClientFamily, database: &str) -> String
     text
 }
 
+/// What a global backup says of the databases this account may not open
+/// (K62): the first `max` named, then how many more; `None` for none.
+fn left_out_closed(names: &[String], max: usize) -> Option<String> {
+    let (first, rest) = names.split_at(names.len().min(max));
+    let mut listed = first.join(", ");
+    if !rest.is_empty() {
+        listed.push_str(&format!(" and {} more", rest.len()));
+    }
+    Some(match names.len() {
+        0 => return None,
+        1 => format!("Left out, this account may not open it: {listed}"),
+        _ => format!("Left out, this account may not open them: {listed}"),
+    })
+}
+
 fn program_name(command: &ToolCommand) -> String {
     command
         .program
@@ -3936,6 +3975,17 @@ impl BackupDialog {
                     ),
             )
             .child(body)
+            .children(left_out_closed(&self.closed, 3).map(|text| {
+                let all = left_out_closed(&self.closed, usize::MAX).unwrap_or_default();
+                div()
+                    .id("global-databases-closed")
+                    .test_support()
+                    .text_sm()
+                    .text_color(theme.warning)
+                    .child(SharedString::from(text.clone()))
+                    .test_text(text)
+                    .tooltip(move |window, cx| Tooltip::new(all.clone()).build(window, cx))
+            }))
             .into_any_element()
     }
 
@@ -5591,5 +5641,25 @@ mod tests {
         );
         assert!(error.to_string().starts_with("invalid connection settings"));
         assert_eq!(error_text(&Error::Cancelled), "query cancelled");
+    }
+
+    /// K62: the databases a global backup leaves out, said in one line.
+    #[test]
+    fn the_databases_left_out_are_named() {
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(left_out_closed(&[], 3), None);
+        assert_eq!(
+            left_out_closed(&names(&["billing"]), 3).unwrap(),
+            "Left out, this account may not open it: billing"
+        );
+        let five = names(&["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            left_out_closed(&five, 3).unwrap(),
+            "Left out, this account may not open them: a, b, c and 2 more"
+        );
+        assert_eq!(
+            left_out_closed(&five, usize::MAX).unwrap(),
+            "Left out, this account may not open them: a, b, c, d, e"
+        );
     }
 }

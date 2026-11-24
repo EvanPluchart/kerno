@@ -4145,6 +4145,11 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   bar's, the query tab's), which also never offer a closed database or a system one. The connection dialog's
   Database list keeps every database the account can open: it is how the default is chosen. The cue is one
   muted line after the databases, "N databases hidden", whose click or Enter opens the connection's dialog.
+- **A global backup never leaves a database out without a word.** pg_dumpall would stop at a database the
+  account may not open, so it is left out, and said where the databases are listed and as the first line of
+  the run's log ("Left out, this account may not open it: billing"): a partial backup that does not say so
+  would be trusted wrongly. The list is read from the server at each run; a saved task keeps only what the
+  user unticked.
 - **Left out**, the next steps if users ask: per-connection name patterns beyond the tree's object filters
   (Filter ▸ already hides databases by name, DBeaver's navigator filters), a filter per schema, anything for
   MySQL.

@@ -321,9 +321,41 @@ fn the_tree_shows_what_the_connection_chose_and_says_what_is_closed(cx: &mut Tes
         cx.update(|cx| dialog.read(cx).objects_loaded())
     });
     assert!(!app.shows_label(cx, CLOSED));
+    // Said where the databases are listed, without a hover.
+    let said = format!("Left out, this account may not open it: {CLOSED}");
+    let painted = app.step(cx, |window, _| {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .map(|text| text.text().to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(painted.contains(&said), "{painted:#?}");
     let now = app.wizard_state(cx, &dialog);
     assert!(
         now.contains("--exclude-database") && now.contains(CLOSED),
         "{now}"
     );
+    // A task keeps only what the user left out: the closed ones are read
+    // again from the server at each run.
+    let kept = cx.update(|cx| dialog.read(cx).task_settings(cx)).unwrap();
+    let kerno_core::tools::TaskSettings::GlobalBackup(kept) = kept else {
+        panic!("{kept:?}")
+    };
+    assert!(
+        !kept.exclude_databases.contains(&CLOSED.to_string()),
+        "{kept:?}"
+    );
+
+    // The run says it first in its log: one small database, into a
+    // temporary folder.
+    let dir = tempfile::tempdir().unwrap();
+    app.tap(cx, "global-databases-none");
+    app.click_label(cx, "postgres");
+    app.tap(cx, "wizard-next");
+    app.write_to(cx, dir.path(), Some("k62"));
+    app.tap(cx, "backup-start");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done"), "{state}");
+    let log = cx.update(|cx| dialog.read(cx).log());
+    assert_eq!(log.first(), Some(&said), "{log:#?}");
 }

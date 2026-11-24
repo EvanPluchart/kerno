@@ -1634,3 +1634,15 @@ into the morning's release, which stays unpublished until his go.
   (`docs/plans/M12.md`, K62; D-129).
 - Tests: a driver test as a role of its own, core and app unit tests, `ui_tests::k62` (2), each seen failing
   under a mutation; captures `final/m12-databases-shown-*`.
+
+## 2026-11-24 — K62, after its review: a global backup says what it left out
+
+- The review of K62's first commit: the global backup left the databases this account may not open out of
+  pg_dumpall's run without a word, and froze them into a saved task's list. It now says so under its list of
+  databases ("Left out, this account may not open it: billing"; the first three and "and N more", all in the
+  tooltip) and as the first line of the run's log, which a task's run keeps; they are read from the server
+  at each opening of the wizard and added to that run only, a task keeping only what the user unticked.
+- The "Databases shown" button with its longest label and a 22-character database name, captured light and
+  dark at the default size: the name reads in full; the wording stays.
+- Tests: `ui_tests::k62` (the backup part: the line, the task's list, the log of a real run of one small
+  database), `backup_dialog::tests::the_databases_left_out_are_named`, each seen failing under a mutation.

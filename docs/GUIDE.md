@@ -212,9 +212,12 @@ The database the connection opens on is always shown. The tree follows as soon a
 line after the databases says how many are hidden ("12 databases hidden"), and a click on it (or Enter) opens
 the settings. The main toolbar's database picker, the status bar's and a query tab's offer the databases the
 tree shows, never one the account may not open; the Database list of the settings offers every database the
-account can open. MySQL and MariaDB list only what the account may see, and have no such choice. To hide
-databases by name, use Filter ▸ on a database of the tree. An import from DBeaver keeps DBeaver's "Show all
-databases" (off in DBeaver: the default database alone), and an exported connections file carries the choice.
+account can open. A global backup (pg_dumpall) leaves out the databases the account may not open, and says
+so under its list of databases and as the first line of its log ("Left out, this account may not open them:
+billing, crm"); a saved task reads them again at each run. MySQL and MariaDB list only what the account may
+see, and have no such choice. To hide databases by name, use Filter ▸ on a database of the tree. An import
+from DBeaver keeps DBeaver's "Show all databases" (off in DBeaver: the default database alone), and an
+exported connections file carries the choice.
 
 ## AI assistant and what it sends
 
