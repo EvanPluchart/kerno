@@ -1591,3 +1591,32 @@ Still open (for the owner):
   routes it to what its ⌘C does (the selected object's name, the selected cell). The other surfaces have no ⌘C,
   Paste or Select All of their own. Test: `ui_tests::k54::edit_copy_does_what_the_key_does_on_every_surface`,
   each of the three seen failing without its handler.
+
+## 2026-11-24, night — 2026.11.2 prepared a second time, not published
+
+The owner's word of the evening of 2026-11-23, from his phone: all five things proposed for the night go
+into the morning's release, which stays unpublished until his go.
+
+- In, each merged with the whole check green on `main` in a build directory of its own (2,026 tests in the
+  evening, 2,100 after the last merge of the night): K54 (a foreign key's arrow that left with the pointer,
+  the Edit menu's standard entries), K55 (the palette's words in any order, the tab strip, the query bar,
+  the running mark; D-127), K56 (seven defects of dialogs and tabs; D-128), K57 (an update found without
+  restarting; D-123), K58 (the DBeaver import's jump servers; D-124), K59 (the result's filter and foreign
+  keys in every result; D-125), K60 (data compare; D-126), K61 (two defects of the night's pass).
+- Reviews. The automatic review of the K58 commit found two defects, fixed the same hour: a jump host after
+  a comma or after `user@` could start with `-` (each jump host is now checked by itself), and the note about
+  a hop's key wrote the imported file's path inside a command to paste. An independent review of K60, asked
+  before it could ship, found that the script's UPDATE and DELETE could match several rows of the target (a
+  key unique on the source only; keys the server holds equal and whose bytes differ), that a MySQL FLOAT was
+  read with six digits, and six smaller things: all fixed by K60's author in three commits, the first proved
+  by running the script on scratch targets under `_ai_ci`, PAD SPACE and citext keys and comparing again.
+- A pass in the real app on the build of 02:04 (parts A to K of the night's brief): the keys the Edit menu
+  now declares act once everywhere; nothing blocking; the two defects it found are K61. Left as they are,
+  cosmetic: the theme chosen while the DBeaver import dialog is open is taken only once it is closed; "Open
+  script" twice gives two tabs with one title; the running mark's halo looked faint in two dark captures
+  taken 0.7 s apart (the phase of the captures is not known).
+- Two tests that failed once each under the night's load and pass alone: the folding test clicked before
+  the parse had ended (it now tries until its mark is there); `transfer::copy_tables_opens_from_tools_and_
+  from_the_palette` timed out once and was not seen again.
+- Not verified in the real app: K61's Edit ▸ Copy on the tree (its tests only), a real sleep for K57, and
+  the last form of data compare after its review (the pass ran on the build before the fixes).
