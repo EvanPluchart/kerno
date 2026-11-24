@@ -546,7 +546,8 @@ fn decide(prompt: &str, asker: u32, answers: &Answers, observed: &mut Observed) 
             .and_then(|rest| rest.strip_suffix("': "))
             .unwrap_or_default();
         let ours = answers.key.as_deref().is_some_and(|key| {
-            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(named)))
+            let (named, key) = (key_spelling(named), key_spelling(key));
+            !named.is_empty() && (named == key || (named.len() == 100 && key.starts_with(&named)))
         });
         if !ours {
             // A question in other words names no key worth reporting.
@@ -574,6 +575,18 @@ fn decide(prompt: &str, asker: u32, answers: &Answers, observed: &mut Observed) 
     }
     // Passwords, keyboard-interactive, anything else: refused.
     None
+}
+
+/// A key file's path as compared with the one `ssh` names in its question:
+/// as is on Unix; on Windows with `/` for `\` and ASCII case folded, the way
+/// Windows reads a path (`~/.ssh/id` expands to `C:\Users\x/.ssh/id`, and a
+/// jump host's `IdentityFile` may be written either way: K69, S6).
+fn key_spelling(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 /// The first `'…'` in `text`.
@@ -1303,6 +1316,28 @@ mod tests {
         );
         assert!(!guard_config(Some(Path::new("/a\"b")), "/s").contains("/a"));
         assert!(guard_config(None, "/s").starts_with("KbdInteractiveAuthentication no\n"));
+    }
+
+    /// Windows: the key named with `/` or `\`, in any ASCII case, is the
+    /// same key (S6); on Unix, only the exact path is. Mutation seen: the
+    /// exact comparison on Windows.
+    #[test]
+    fn the_key_is_known_in_either_spelling_on_windows() {
+        let with = answers(Some(r"C:\Users\Ada\.ssh/id_pem"), Some("s3cret"), None);
+        for named in [
+            r"C:\Users\Ada\.ssh/id_pem",
+            "C:/Users/Ada/.ssh/id_pem",
+            r"c:\users\ada\.SSH\id_pem",
+        ] {
+            let prompt = format!("Enter passphrase for key '{named}': ");
+            let given = decide(&prompt, 1, &with, &mut Observed::default());
+            assert_eq!(
+                given.is_some(),
+                cfg!(windows) || named.starts_with(r"C:\Users\Ada\.ssh/")
+            );
+        }
+        let other = "Enter passphrase for key 'C:/Users/Ada/.ssh/id_other': ";
+        assert!(decide(other, 1, &with, &mut Observed::default()).is_none());
     }
 
     #[test]

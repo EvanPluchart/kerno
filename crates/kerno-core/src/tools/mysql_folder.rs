@@ -1438,7 +1438,10 @@ pub async fn back_up(
     cancel: Arc<AtomicBool>,
 ) -> FolderEnd {
     let mut made = false;
-    let job = match job.settled() {
+    // Windows: a folder of another computer is never made nor written (K69,
+    // D-138); each mysqldump's file is checked again where it runs.
+    let checked = crate::local_path::check(&job.folder, "backup folder");
+    let job = match checked.and_then(|()| job.settled()) {
         Ok(job) => job,
         Err(error) => {
             return FolderEnd {
@@ -1829,6 +1832,8 @@ fn plain_name(name: &str) -> bool {
 /// Reads the manifest of a backup folder and checks it names only plain
 /// files that are there. Blocking.
 pub fn read_manifest(folder: &Path) -> std::result::Result<Manifest, String> {
+    // Windows: a folder of another computer is never read (K69, D-138).
+    crate::local_path::check(folder, "backup folder").map_err(|error| error.to_string())?;
     let path = folder.join(MANIFEST);
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -3225,6 +3230,7 @@ mod tests {
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
+            files: Vec::new(),
         };
         let job = |file: &str| Job {
             file: file.into(),
@@ -3345,6 +3351,14 @@ mod tests {
         assert!(command.args.contains(&charset), "{:?}", command.args);
     }
 
+    /// Windows: a backup folder on another computer is never read (K69).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_of_another_computer_is_never_read() {
+        let error = read_manifest(Path::new(r"\\k69-nowhere\share\backup")).unwrap_err();
+        assert!(error.contains("another computer"), "{error}");
+    }
+
     /// A pool task that panics is a failure of its file, with its label.
     #[cfg(unix)]
     #[tokio::test]
@@ -3359,6 +3373,7 @@ mod tests {
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
+            files: Vec::new(),
         };
         let job = |file: &str| Job {
             file: file.into(),

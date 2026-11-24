@@ -46,6 +46,11 @@ const PEERS: usize = 8;
 /// How long a client waits for the instance's proof.
 const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the listening end waits for a peer's first bytes, its nonce: a
+/// real client writes it the moment it opens the pipe, so a peer that says
+/// nothing holds its place no longer than this (K69, S2).
+const NONCE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Windows' `ERROR_PIPE_BUSY`: every instance of the pipe is taken for the
 /// moment (the instance makes the next one at once).
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -287,7 +292,9 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
     } = listener;
     runtime.block_on(async {
         // Each peer in a task of its own (K69, R4): one that connects and
-        // says nothing delays nobody; at most `PEERS` at once.
+        // says nothing delays nobody; at most `PEERS` at once, the next one
+        // waiting its turn (S2): a peer that says nothing holds its place a
+        // second at most (`NONCE_TIMEOUT`).
         let peers = std::sync::Arc::new(tokio::sync::Semaphore::new(PEERS));
         let (sent, mut lines) = tokio::sync::mpsc::channel::<String>(PEERS);
         loop {
@@ -302,8 +309,9 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
                         return;
                     };
                     let mut peer = std::mem::replace(&mut pipe, next);
-                    let Ok(permit) = peers.clone().try_acquire_owned() else {
-                        continue;
+                    // The semaphore is never closed: the wait always ends.
+                    let Ok(permit) = peers.clone().acquire_owned().await else {
+                        return;
                     };
                     let sent = sent.clone();
                     tokio::spawn(async move {
@@ -334,12 +342,16 @@ async fn exchange(peer: &mut NamedPipeServer, token: &Bytes) -> Option<String> {
     read_line(peer).await
 }
 
-/// The listening end's half of the handshake: the peer's nonce, this end's
-/// answer, the peer's proof. `None` when the peer does not prove it holds
-/// `token`: nothing more may be read from it or written to it.
+/// The listening end's half of the handshake: the peer's nonce (within
+/// [`NONCE_TIMEOUT`]), this end's answer, the peer's proof. `None` when the
+/// peer does not prove it holds `token`: nothing more may be read from it or
+/// written to it.
 pub(crate) async fn prove_peer(peer: &mut NamedPipeServer, token: &Bytes) -> Option<()> {
     let mut client_nonce = [0; SIZE];
-    peer.read_exact(&mut client_nonce).await.ok()?;
+    tokio::time::timeout(NONCE_TIMEOUT, peer.read_exact(&mut client_nonce))
+        .await
+        .ok()?
+        .ok()?;
     let server_nonce = random().ok()?;
     peer.write_all(&proof::server_answer(token, &client_nonce, &server_nonce))
         .await
@@ -472,6 +484,49 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        server.join().unwrap();
+        drop(silent);
+        assert_eq!(received.try_iter().collect::<Vec<_>>(), ["postgres://h"]);
+    }
+
+    /// Eight peers that say nothing (another account opening the pipe again
+    /// and again) take every place: a URL sent then waits its turn, a second
+    /// at most, and arrives (K69, S2). Mutation seen: a peer beyond the
+    /// places let go (the URL is lost).
+    #[test]
+    fn eight_silent_peers_then_a_proved_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path()).unwrap();
+        let listener = listen(&path).unwrap().expect("nobody listens yet");
+        let (sent, received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve(listener, |line| {
+                sent.send(line).unwrap();
+                false
+            })
+        });
+        let (name, _) = read_name_file(&path).unwrap();
+        let runtime = runtime().unwrap();
+        let silent: Vec<NamedPipeClient> = {
+            let _entered = runtime.enter();
+            (0..PEERS)
+                .map(|_| {
+                    loop {
+                        match ClientOptions::new().open(&name) {
+                            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            opened => break opened.unwrap(),
+                        }
+                    }
+                })
+                .collect()
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        send(&path, "postgres://h").unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "{took:?}");
         server.join().unwrap();
         drop(silent);
         assert_eq!(received.try_iter().collect::<Vec<_>>(), ["postgres://h"]);

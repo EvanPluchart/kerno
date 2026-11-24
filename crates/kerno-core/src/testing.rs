@@ -541,19 +541,31 @@ pub mod k69 {
     /// port, with the plain key.
     pub const JUMP: &str = "k69-jump";
 
+    /// A second hop for a chain of jump hosts (`k69-jump,k69-hop2`): the
+    /// SSH server's first port under another name, so that OpenSSH sees no
+    /// loop, with the plain key.
+    pub const HOP2: &str = "k69-hop2";
+
+    /// The jump host [`JUMP`]'s port with the PEM key (its passphrase is
+    /// [`PASSPHRASE`]), written with `/` where `-i` has `\`.
+    pub const JUMP_PEM: &str = "k69-jump-pem";
+
     /// A configuration file of the test's own in `dir`, with its own
     /// known_hosts (filled with the server's keys when `known`): the jump
-    /// host [`JUMP`] takes the plain key, the target only the key a test
-    /// gives (`-i`); no agent.
+    /// hosts [`JUMP`] and [`HOP2`] take the plain key, [`JUMP_PEM`] the PEM
+    /// one, the target only the key a test gives (`-i`); no agent.
     pub fn openssh(dir: &Path, askpass: PathBuf, known: bool) -> super::OpenSshFixture {
         let slashes = |path: &Path| path.display().to_string().replace('\\', "/");
         let known_hosts = dir.join("known_hosts");
         let config = dir.join("ssh_config");
+        let plain = slashes(&key("kerno_k69"));
         let text = format!(
-            "Host {JUMP}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{}\"\n\
+            "Host {JUMP}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{plain}\"\n\
+             Host {HOP2}\n  HostName 127.0.0.1\n  Port {SSH_PORT}\n  IdentityFile \"{plain}\"\n\
+             Host {JUMP_PEM}\n  HostName 127.0.0.1\n  Port {JUMP_PORT}\n  IdentityFile \"{}\"\n\
              Host *\n  IdentitiesOnly yes\n  IdentityAgent none\n  \
              UserKnownHostsFile \"{}\"\n  UpdateHostKeys no\n  ConnectTimeout 10\n",
-            slashes(&key("kerno_k69")),
+            slashes(&key("kerno_k69_pem")),
             slashes(&known_hosts),
         );
         std::fs::write(&config, text).expect("write the test ssh_config");
@@ -609,6 +621,27 @@ pub mod k69 {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_string)
+            .collect()
+    }
+
+    /// The running `ssh.exe` processes whose command line holds `marker`:
+    /// each one's executable (`Win32_Process.ExecutablePath`, the file
+    /// Windows started, whatever its command line says) and command line.
+    pub fn ssh_executables(marker: &str) -> Vec<(PathBuf, String)> {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | \
+                 ForEach-Object { \"$($_.ExecutablePath)`t$($_.CommandLine)\" }",
+            ])
+            .output()
+            .expect("list the processes");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim_end().split_once('\t'))
+            .filter(|(_, command)| command.contains(marker))
+            .map(|(path, command)| (PathBuf::from(path), command.to_string()))
             .collect()
     }
 

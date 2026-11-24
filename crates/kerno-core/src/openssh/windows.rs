@@ -31,7 +31,16 @@
 //! A passphrase Kerno could try on the key file itself
 //! ([`super::passphrase_opens`]) is known right before `ssh` starts, and given
 //! to every question for that key; one it could not try (a PEM key) is given
-//! once per `ssh`, a second question meaning it was wrong.
+//! once per hop of a stream (its `ssh` and each jump host's, which `ssh`
+//! starts itself with the same environment, so the same number), a question
+//! beyond that meaning it was wrong.
+//!
+//! A jump host's `ssh` is started by `ssh.exe` itself (`-J`): Windows'
+//! OpenSSH writes its command as `"<argv[0]>" … -F <file> -W … <jump>`,
+//! `argv[0]` quoted (OpenSSH's `ssh.c`, the `WINDOWS` branch), and `argv[0]`
+//! is the absolute path Kerno started, so every hop runs that same
+//! `ssh.exe`, a path with a space included; OpenSSH's fall-back to a plain
+//! `ssh` is left out on Windows. The tests check each process's executable.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -81,7 +90,8 @@ const MAX_MESSAGE: usize = 8192;
 /// How long one peer may take on the pipe, proofs included.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many peers of the askpass pipe are served at once; more wait outside.
+/// How many peers of the askpass pipe are served at once; more wait their
+/// turn (S2), each silent one holding its place a second at most.
 const PEERS: usize = 8;
 
 /// The process ids of every `ssh.exe` tree Kerno started and has not stopped
@@ -92,9 +102,12 @@ static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// Stops every `ssh.exe` Kerno started and its jump hosts' `ssh.exe`, now,
 /// waiting for `taskkill`: what the app does when it quits, when the runtime
 /// that would stop them one by one is going away.
+/// The list stays locked across the kills (S3): a stream dropped meanwhile
+/// waits in [`release`] with its process's handle still held, so no pid is
+/// given to another process before its `taskkill` ran.
 pub fn stop_all() {
-    let pids = std::mem::take(&mut *lock(&LIVE));
-    for pid in pids {
+    let mut live = lock(&LIVE);
+    for pid in live.drain(..) {
         let _ = taskkill(pid).status();
     }
 }
@@ -167,10 +180,13 @@ impl Tree {
     }
 }
 
-/// Drops `child` and takes its pid off [`LIVE`]: its handle goes now.
+/// Takes `pid` off [`LIVE`] and drops `child`, its handle, under the list's
+/// lock: [`stop_all`] never kills a pid whose handle went (S3).
 fn release(child: Child, pid: u32) {
-    lock(&LIVE).retain(|live| *live != pid);
+    let mut live = lock(&LIVE);
+    live.retain(|listed| *listed != pid);
     drop(child);
+    drop(live);
 }
 
 impl Drop for Tree {
@@ -398,7 +414,10 @@ impl Forward {
             made.name,
             made.token,
             Arc::new(answers.clone()),
-            verified,
+            Giving {
+                verified,
+                hops: 1 + jump.split(',').filter(|hop| !hop.trim().is_empty()).count(),
+            },
             spawns.clone(),
         ));
         // From here on dropping `forward` cleans everything up.
@@ -701,19 +720,28 @@ async fn version(ssh: &Path) -> Option<(u32, u32)> {
 
 // Questions from ssh ----------------------------------------------------------
 
+/// How the tunnel answers a passphrase: `verified` when Kerno opened the key
+/// with it; `hops`, the `ssh` processes of one stream that may ask for it
+/// (the stream's own and one per jump host of the field).
+#[derive(Debug, Clone, Copy)]
+struct Giving {
+    verified: bool,
+    hops: usize,
+}
+
 /// Answers the questions of the tunnel's `ssh` processes: each peer in a
-/// task of its own, at most [`PEERS`] at once (more are let go at once),
-/// each once it proved it holds the token.
+/// task of its own, at most [`PEERS`] at once, the next one waiting its
+/// turn (S2); each once it proved it holds the token.
 async fn respond(
     mut pipe: NamedPipeServer,
     name: String,
     token: Bytes,
     answers: Arc<Answers>,
-    verified: bool,
+    giving: Giving,
     spawns: Arc<Spawns>,
 ) {
     let peers = Arc::new(Semaphore::new(PEERS));
-    // A distinct asker for each answer of a passphrase Kerno verified.
+    // A distinct asker for each answer given.
     let fresh = Arc::new(AtomicU64::new(1 << 31));
     loop {
         // An error here is a peer that wrote and closed before this call:
@@ -723,12 +751,13 @@ async fn respond(
             return;
         };
         let mut peer = std::mem::replace(&mut pipe, next);
-        let Ok(permit) = peers.clone().try_acquire_owned() else {
-            continue;
+        // The semaphore is never closed: the wait always ends.
+        let Ok(permit) = peers.clone().acquire_owned().await else {
+            return;
         };
         let (answers, spawns, fresh) = (answers.clone(), spawns.clone(), fresh.clone());
         tokio::spawn(async move {
-            let exchange = answer(&mut peer, &token, &answers, verified, &spawns, &fresh);
+            let exchange = answer(&mut peer, &token, &answers, giving, &spawns, &fresh);
             let _ = tokio::time::timeout(ASK_TIMEOUT, exchange).await;
             drop(permit);
         });
@@ -743,7 +772,7 @@ async fn answer(
     peer: &mut NamedPipeServer,
     token: &Bytes,
     answers: &Answers,
-    verified: bool,
+    giving: Giving,
     spawns: &Spawns,
     fresh: &AtomicU64,
 ) -> Option<()> {
@@ -758,12 +787,13 @@ async fn answer(
             asking.questions += 1;
             // A verified passphrase answers every question for its key (a
             // jump host's `ssh` asks for it too); one Kerno could not try,
-            // once per `ssh`.
-            let asker = match verified {
-                true => fresh.fetch_add(1, Ordering::SeqCst),
-                false => spawn,
+            // once per hop of this stream (S5): past that, the asker of the
+            // last answer asks again, which `decide` takes as a wrong one.
+            let given = &asking.observed.passphrase_given;
+            let asker = match given.last() {
+                Some(&last) if !giving.verified && given.len() >= giving.hops => last,
+                _ => u32::try_from(fresh.fetch_add(1, Ordering::SeqCst)).unwrap_or(u32::MAX),
             };
-            let asker = u32::try_from(asker).unwrap_or(u32::MAX);
             decide(prompt, asker, answers, &mut asking.observed)
         })
     };
@@ -854,6 +884,16 @@ mod tests {
         key: &str,
         verified: bool,
     ) -> (PathBuf, Arc<Spawns>, JoinHandle<()>) {
+        serve_hops(runtime, dir, key, verified, 1)
+    }
+
+    fn serve_hops(
+        runtime: &tokio::runtime::Runtime,
+        dir: &Path,
+        key: &str,
+        verified: bool,
+        hops: usize,
+    ) -> (PathBuf, Arc<Spawns>, JoinHandle<()>) {
         let file = dir.join("ask");
         let made = {
             let _entered = runtime.enter();
@@ -870,10 +910,76 @@ mod tests {
             made.name,
             made.token,
             Arc::new(answers),
-            verified,
+            Giving { verified, hops },
             spawns.clone(),
         ));
         (file, spawns, responder)
+    }
+
+    /// A passphrase Kerno could not try, asked by a stream behind one jump
+    /// host (its `ssh` and the jump host's, one number): given once to each,
+    /// a third question meaning it was wrong (S5). Mutation seen: once per
+    /// stream (the jump host's answer used the target's).
+    #[test]
+    fn an_unverified_passphrase_is_given_once_per_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\Users\ada\.ssh\id_pem";
+        let (file, spawns, responder) = serve_hops(&runtime, dir.path(), key, false, 2);
+        let listed = Listed::new(&spawns);
+        let prompt = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
+        for _ in 0..2 {
+            assert_eq!(
+                ask(&file, prompt.as_bytes()).as_deref(),
+                Some(&b"s3cret"[..])
+            );
+        }
+        assert_eq!(ask(&file, prompt.as_bytes()).as_deref(), Some(&b""[..]));
+        assert_eq!(
+            listed.take().observed.passphrase,
+            Some("the passphrase is wrong")
+        );
+        responder.abort();
+    }
+
+    /// Eight peers that say nothing take every place: a proved question
+    /// waits its turn, a second at most, and is answered (S2). Mutation
+    /// seen: a peer beyond the places let go.
+    #[test]
+    fn eight_silent_peers_then_a_proved_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let key = r"C:\k";
+        let (file, spawns, responder) = serve(&runtime, dir.path(), key, true);
+        let (name, _) = named::read_name_file(&file).unwrap();
+        let silent: Vec<_> = {
+            let _entered = runtime.enter();
+            (0..PEERS)
+                .map(|_| {
+                    loop {
+                        match tokio::net::windows::named_pipe::ClientOptions::new().open(&name) {
+                            // ERROR_PIPE_BUSY: the next instance is on its way.
+                            Err(error) if error.raw_os_error() == Some(231) => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            opened => break opened.unwrap(),
+                        }
+                    }
+                })
+                .collect()
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let listed = Listed::new(&spawns);
+        let prompt = format!("{}\nEnter passphrase for key '{key}': ", listed.id);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            ask(&file, prompt.as_bytes()).as_deref(),
+            Some(&b"s3cret"[..])
+        );
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        drop(silent);
+        responder.abort();
     }
 
     /// The whole question through a real pipe: answered once both ends

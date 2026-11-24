@@ -293,6 +293,14 @@ mod tests {
         assert!(resolve_with(Path::new(r"\\host\x"), "key", Some(home)).is_err());
     }
 
+    /// A task's `~\` folder is the profile's, a full path once expanded (what
+    /// the backup wizard judges, S4); on Unix it stays as it is.
+    #[test]
+    fn a_home_folder_is_a_full_path_once_expanded() {
+        let folder = expand(Path::new(r"~\dumps"));
+        assert_eq!(folder.is_absolute(), cfg!(windows), "{}", folder.display());
+    }
+
     /// The refusals are Windows' only, and say what a valid path looks like.
     #[test]
     fn only_windows_refuses_and_says_what_to_use() {

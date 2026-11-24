@@ -1806,6 +1806,9 @@ impl BackupDialog {
                 return Err("This wizard writes no file.".into());
             }
         };
+        // `~/…` (`~\…` on Windows, as an imported task may hold) is the
+        // user's folder: expanded before it is judged (K69, S4).
+        let folder = kerno_core::local_path::expand(&folder);
         if !folder.is_absolute() {
             return Err("Choose the folder the backup is written to.".into());
         }
