@@ -4181,7 +4181,7 @@ cost money), which he asked to remove from `CLAUDE.md` §5.
   `--no-fail-fast`, so that one run reports every crate.
 - **Supply chain.** Every action is pinned to a commit (the version in a comment), as the build image pins
   its downloads; the token is read-only except in the job that opens the draft; no secret is used (the
-  macOS build is signed ad hoc, as before); release builds use no cache.
+  macOS build is signed ad hoc, as before). Release builds used no cache at first; D-134 changed that.
 - **Measured (2026-11-24).** CI: lint 7 min, macOS tests 21 min, Linux tests 16 min. Release: macOS 15 min,
   Linux 22 min (about 9 min per architecture), the whole run under 30 min.
 - **What the first runs found.** The workspace tests had never run on Linux: 13 of the app's fail there
@@ -4366,4 +4366,32 @@ The owner asked for the Windows package in the release itself, not only a build 
   `contents: write`; the same run from `main` opened its draft with the nine files (checked, then deleted).
   My reading: a release whose target is a commit that changes workflow files needs a permission the job's
   token cannot have. From a branch, a dry run without "draft" keeps the packages as artifacts.
+
+## D-134 — A release in about 15 minutes instead of 25 (2026-11-24)
+
+The owner asked why a release took 25 minutes, then to make it faster. Measured on the first releases: the
+three builds run side by side, each compiling about 500 crates from nothing on a runner of 3 or 4 cores;
+Linux was the longest (21 min: the image, then two architectures one after the other), Windows 20, macOS 13.
+
+- **Linux: one runner per architecture.** `scripts/bundle-linux.sh [aarch64] [x86_64]` builds what it is
+  told; the release's `linux` job is a matrix of the two, both on arm64 runners in the same image (aarch64
+  native, x86_64 cross-compiled, as before). Measured: 11 and 10 min instead of 21.
+- **macOS and Windows: the dependencies come from a cache.** A cache saved by a tag's run can only be read by
+  that tag, so a release cannot feed the next one; a run on `main` can. `ci.yml` therefore builds the two
+  packages on every push (`macos-package`, `windows-package`), which also proves them at every push, and
+  saves their compiled dependencies under a key that `release.yml` reads without saving (`shared-key`,
+  `save-if: false`). Kerno's own crates are always compiled by the release itself: the cache holds
+  dependencies only (the action's rule). Measured: Windows 7.5 min instead of 20, macOS's build 4.5 min
+  instead of 11.
+- **Why this is still a release I trust.** The dependencies are the ones `Cargo.lock` pins, compiled by the
+  same toolchain on the same kind of runner; cargo checks each cached unit against its inputs before using
+  it; the key changes with the lock file and the toolchain. What a clean build protected against (a stale
+  or tampered cache) is narrowed, not gone: caches are written only by this repository's own workflows on
+  `main`.
+- **Linux keeps whole builds**: its target directory is inside the build container, out of the cache's
+  reach. Putting it within reach (a bind mount, the pruning the action does, root-owned files) or caching
+  the image is the next step if 11 minutes is still too long.
+- **The disk image step is retried.** The first measured run failed in `hdiutil create` after a good build
+  and launch check, with no message (`-quiet`): a known "Resource busy" of busy machines.
+  `scripts/bundle-macos.sh` now tries five times and shows hdiutil's own words.
 

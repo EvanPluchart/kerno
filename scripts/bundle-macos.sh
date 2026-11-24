@@ -103,6 +103,17 @@ stage=$(mktemp -d -t kerno-dmg)
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
 rm -f "$dmg"
-hdiutil create -quiet -volname Kerno -srcfolder "$stage" -format UDZO "$dmg"
+# hdiutil now and then fails on a busy machine ("Resource busy", seen on GitHub's runner): a few
+# tries, its own words shown at each failure.
+for try in 1 2 3 4 5; do
+  if hdiutil create -volname Kerno -srcfolder "$stage" -format UDZO "$dmg"; then break; fi
+  rm -f "$dmg"
+  if [ "$try" = 5 ]; then
+    echo "disk image: hdiutil create failed 5 times" >&2
+    exit 1
+  fi
+  echo "disk image: hdiutil create failed (try $try), again in 5 s" >&2
+  sleep 5
+done
 rm -rf "$stage"
 echo "disk image: $dmg ($(du -h "$dmg" | cut -f1))"

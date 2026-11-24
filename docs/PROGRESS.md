@@ -1726,3 +1726,12 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - The tag `v2026.11.3` makes `release.yml` build the nine files and open a draft: the first real use of the
   tag's path (the dry runs took the other one). Publishing waits for the owner, who tries the draft first.
 
+## 2026-11-24 — A release in about 15 minutes (D-134)
+
+- 2026.11.3 was published (the first release built by GitHub Actions: a tag, a draft with nine files, the
+  owner's "je valide"). He asked why it took 25 minutes and to make it faster.
+- The Linux architectures are built side by side (`scripts/bundle-linux.sh [arch]`, a matrix); macOS and
+  Windows start from the dependencies compiled on `main` by two package jobs of `ci.yml` (`macos-package`
+  is new). Measured on a dry run from a branch: Windows 7.5 min, Linux 11 and 10 min, macOS's build 4.5 min;
+  that run's macOS job then failed in `hdiutil create`, which is now retried.
+
