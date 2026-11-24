@@ -9063,10 +9063,19 @@ fn held_by(engine: Engine, role: &str) -> (usize, usize) {
             "SELECT count(*) || '/' || count(*) FILTER (WHERE state LIKE 'idle in transaction%') \
              FROM pg_stat_activity WHERE usename = '{role}'"
         ),
+        // The transaction as the server's SQL sees it (begun, not ended), not
+        // InnoDB's own: after a read of `information_schema.TABLES`' sizes
+        // MySQL 8.4 can keep an InnoDB transaction on the idle session, with
+        // autocommit on and the statement's transaction committed, until the
+        // session's next statement (K71; in the app the connection's 5 s
+        // keep-alive is that statement, in the tests the clock stands still).
         Engine::MySql | Engine::MariaDb => format!(
-            "SELECT concat(count(*), '/', count(CASE WHEN p.command = 'Sleep' THEN t.trx_id END)) \
+            "SELECT concat(count(*), '/', \
+             count(CASE WHEN p.command = 'Sleep' AND e.state = 'ACTIVE' THEN 1 END)) \
              FROM information_schema.processlist p \
-             LEFT JOIN information_schema.innodb_trx t ON t.trx_mysql_thread_id = p.id \
+             LEFT JOIN performance_schema.threads t ON t.processlist_id = p.id \
+             LEFT JOIN performance_schema.events_transactions_current e \
+             ON e.thread_id = t.thread_id \
              WHERE p.user = '{role}'"
         ),
         kerno_core::Engine::Sqlite => {
