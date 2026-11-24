@@ -203,20 +203,37 @@ impl Locker {
 
     /// [`Locker::start`] on `database` of the test server (its own when `None`).
     fn start_in(engine: Engine, database: Option<&str>, table: &str) -> Self {
+        let lock = match engine {
+            Engine::Postgres => vec![
+                "BEGIN".to_string(),
+                format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
+            ],
+            Engine::MySql | Engine::MariaDb => vec![format!("LOCK TABLES {table} WRITE")],
+            kerno_core::Engine::Sqlite => {
+                unreachable!("SQLite has no test server: these tests run on the server engines")
+            }
+        };
+        Self::holding(engine, database, lock)
+    }
+
+    /// A PostgreSQL `sequence` of `database` held by an `ALTER SEQUENCE` left
+    /// in its transaction: a read of its last value (a schema's listing in the
+    /// tree) waits for it. A table's lock no longer holds a listing (K71).
+    pub(super) fn sequence(database: &str, sequence: &str) -> Self {
+        let lock = vec![
+            "BEGIN".to_string(),
+            format!("ALTER SEQUENCE {sequence} INCREMENT BY 1"),
+        ];
+        Self::holding(Engine::Postgres, Some(database), lock)
+    }
+
+    /// Runs `lock` on a session of its own in `database` and keeps it.
+    fn holding(engine: Engine, database: Option<&str>, lock: Vec<String>) -> Self {
         use kerno_core::Driver as _;
         let database = database.map(str::to_string);
-        let (own_id, lock) = match engine {
-            Engine::Postgres => (
-                "SELECT pg_backend_pid()",
-                vec![
-                    "BEGIN".to_string(),
-                    format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
-                ],
-            ),
-            Engine::MySql | Engine::MariaDb => (
-                "SELECT CONNECTION_ID()",
-                vec![format!("LOCK TABLES {table} WRITE")],
-            ),
+        let own_id = match engine {
+            Engine::Postgres => "SELECT pg_backend_pid()",
+            Engine::MySql | Engine::MariaDb => "SELECT CONNECTION_ID()",
             kerno_core::Engine::Sqlite => {
                 unreachable!("SQLite has no test server: these tests run on the server engines")
             }
@@ -4141,21 +4158,43 @@ fn setting_a_comment_behind_a_lock_is_cancelled(cx: &mut TestAppContext) {
     }
 }
 
-/// C3: a read of the tree waiting for a lock (the objects of a schema: `pg_total_relation_size`
-/// waits for it) shows "Loading…" with a Cancel: its button, its row's menu ("Cancel loading")
-/// and Cmd+. on its row stop it on the server; the row says so in plain words, and the tree's
-/// other reads of that database run at once on a new session, the lock still held.
+/// A database of the test's own (a lock held in it stalls no other test's
+/// reads of `kerno`), with the schemas `held` (a table `t`, a sequence `s`)
+/// and `other` (a table `u`).
+fn k15_database(database: &str) -> Scratch {
+    let scratch = Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)")],
+        &[&format!("CREATE DATABASE {database}")],
+    );
+    for sql in [
+        "CREATE SCHEMA held",
+        "CREATE TABLE held.t (id INT PRIMARY KEY)",
+        "CREATE SEQUENCE held.s",
+        "CREATE SCHEMA other",
+        "CREATE TABLE other.u (id INT PRIMARY KEY)",
+    ] {
+        on_database(Engine::Postgres, Some(database), sql);
+    }
+    scratch
+}
+
+/// C3: a read of the tree waiting for a lock (the objects of a schema: the last value of a
+/// sequence an `ALTER SEQUENCE` holds; a table's lock no longer holds it, K71) shows
+/// "Loading…" with a Cancel: its button, its row's menu ("Cancel loading") and Cmd+. on its
+/// row stop it on the server; the row says so in plain words, and the tree's other reads of
+/// that database run at once on a new session, the lock still held.
 #[gpui_kit::test]
 fn a_tree_read_behind_a_lock_is_cancelled_and_the_tree_reads_on(cx: &mut TestAppContext) {
     if !testing::available(Engine::Postgres) {
         return;
     }
-    let name = "kerno_ui_k15_tree";
-    let _scratch = k15_table(name);
+    let database = "kerno_ui_k15_tree";
+    let _scratch = k15_database(database);
     let app = connected(cx, Engine::Postgres);
-    let schema = ["kerno", name];
+    let schema = [database, "held"];
     app.open_path(cx, &schema);
-    let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+    let locker = Locker::sequence(database, "held.s");
     // Real-app pass: it was a red line, cut at the sidebar's width; a cancel the user asked
     // for is not a failure: short, muted.
     let cancelled = crate::navigator::view::CANCELLED_LOAD;
@@ -4194,12 +4233,12 @@ fn a_tree_read_behind_a_lock_is_cancelled_and_the_tree_reads_on(cx: &mut TestApp
         );
         stopped_on_the_server(&app, cx, &locker);
         // The same database reads on, the lock still held.
-        app.act(cx, Action::Refresh, &["kerno", "shop"]);
-        app.open_path(cx, &["kerno", "shop", "Tables", "customers"]);
+        app.act(cx, Action::Refresh, &[database, "other"]);
+        app.open_path(cx, &[database, "other", "Tables", "u"]);
     }
     drop(locker);
     app.act(cx, Action::Refresh, &schema);
-    app.open_path(cx, &["kerno", name, "Tables", "t"]);
+    app.open_path(cx, &[database, "held", "Tables", "t"]);
 }
 
 /// C3: a read of the tree that gets no answer in 30 s is stopped on the server, and its row
@@ -4209,12 +4248,12 @@ fn a_tree_read_that_takes_too_long_is_stopped(cx: &mut TestAppContext) {
     if !testing::available(Engine::Postgres) {
         return;
     }
-    let name = "kerno_ui_k15_slow";
-    let _scratch = k15_table(name);
+    let database = "kerno_ui_k15_slow";
+    let _scratch = k15_database(database);
     let app = connected(cx, Engine::Postgres);
-    let schema = ["kerno", name];
+    let schema = [database, "held"];
     app.open_path(cx, &schema);
-    let locker = Locker::start(Engine::Postgres, &format!("{name}.t"));
+    let locker = Locker::sequence(database, "held.s");
     app.toggle(cx, &schema);
     wait_for_the_lock(&app, cx, &locker);
     cx.executor().advance_clock(Duration::from_secs(29));
@@ -4223,10 +4262,8 @@ fn a_tree_read_that_takes_too_long_is_stopped(cx: &mut TestAppContext) {
     assert!(app.tree(cx).iter().any(|line| line.trim() == "Loading…"));
     cx.executor().advance_clock(Duration::from_secs(2));
     app.step(cx, |_, _| ());
-    let late = format!(
-        "Could not read the objects of {name}: the server took longer than 30 s. Refresh to try \
-         again."
-    );
+    let late = "Could not read the objects of held: the server took longer than 30 s. Refresh \
+                to try again.";
     assert!(
         app.tree(cx).iter().any(|line| line.trim() == late),
         "{:#?}",

@@ -456,8 +456,8 @@ fn nothing_is_read_while_hidden_or_moving(cx: &mut TestAppContext) {
 }
 
 /// Whether the preview's statement waits for the lock on the server.
-/// Not `Locker::blocks`: another session can wait for it too, and stay
-/// (likely the tree's read of the schema's sizes).
+/// Not `Locker::blocks`: another session of the app can wait for the lock
+/// too (the table's size no longer does, K71).
 fn preview_waits() -> bool {
     on_server(
         Engine::Postgres,
