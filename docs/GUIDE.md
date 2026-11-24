@@ -688,14 +688,15 @@ spaces, and keys compare by their exact text, whatever the collation (`a` and `A
 read in one statement: a row someone changes during the compare is compared as it was when its read began.
 At most 10,000 differences are kept to show and to write; beyond, the counts go on and the tab says so.
 
-"Open script" opens, in a new query tab on the target, the statements that make it like the source: an
-`INSERT` for each row only in the source, an `UPDATE` of the changed columns for each different row, and a
-`DELETE` for each row only in the target when "Also delete what only the target has" is ticked. Nothing has
-run: read the script, then run it there; the connection's rules apply (a read-only target refuses it,
-production asks twice). Switch that tab to manual commit to apply it all or nothing. Columns the server
-computes are compared but never written. New rows come before the rows that point at them through the table's
-own foreign keys, and deleted rows after them; if a unique value moves from a deleted row to a new one, run the
-deletes first. When the script holds only the first 10,000 differences, compare again once it has run.
+"Open script" opens, in a new query tab on the target, the statements that make it like the source: an `INSERT`
+for each row only in the source, an `UPDATE` of the changed columns for each different row, and a `DELETE` for
+each row only in the target when "Also delete what only the target has" is ticked. Nothing has run: read the
+script, then run it there; the connection's rules apply (a read-only target refuses it, production asks twice).
+Switch that tab to manual commit to apply it all or nothing. Columns the server computes are compared but never
+written. Each value is written as its server prints it; types beyond the common ones (bit strings, spatial
+types, ranges) were not tried, so read their lines. New rows come before the rows that point at them through the
+table's own foreign keys, and deleted rows after them; if a unique value moves from a deleted row to a new one,
+run the deletes first. When the script holds only the first 10,000 differences, compare again once it has run.
 
 ## Export a schema as a document
 

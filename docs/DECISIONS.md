@@ -4025,6 +4025,13 @@ D-103), data transfer (J13) and pending-edit SQL. Choices:
   (the values were read in UTC); a PostgreSQL key a sequence makes gets a comment that its sequence did not
   move. Every comment line goes through `compare::commented`, so a key holding a line break never leaves SQL
   out of its comment. The target's rules apply when the tab runs it (read-only refuses, production asks twice).
+- **Which types were written back.** A value is written as the dialect's literal of its server's text (bytes as
+  a byte literal). The round trips ran the script and compared again for PostgreSQL text, integer, numeric,
+  `timestamptz`, `jsonb`, `bytea`, `text[]` and an identity always made, and for MySQL against MariaDB varchar,
+  int, decimal, `TIMESTAMP`, `datetime(6)`, JSON against text, varbinary and `AUTO_INCREMENT`. The big run
+  compared, without writing back, uuid, `inet`, an enum, real and double, an integer array, date and time.
+  Anything else is written the same way and was not tried: MySQL `BIT` and spatial types, PostgreSQL `money`
+  under another `lc_monetary`, ranges, geometric types.
 - **The view** is a tab (one per pair of tables, key and columns; not restored after a restart): both sides,
   Swap, Refresh, Open script; filters with counts (All differences, Only in source, Only in target, Different,
   and Same as a count), a column filter (the rows where one column differs, with each column's count); the
