@@ -762,7 +762,173 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
     app.tap(cx, "restore-start");
     app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
     assert_eq!(painted(&app, cx, &said), 2);
+    // One true sentence: not "on top of" beside "replaces" (L4).
+    assert!(paints(
+        &app,
+        cx,
+        "where the dump's DROP TABLE statements, if it has any, replace the tables they name"
+    ));
+    assert_eq!(painted(&app, cx, "on top of what"), 0);
     app.tap(cx, "sql-cancel");
+    app.tap(cx, "backup-close");
+
+    // A database whose tables cannot be read (it does not exist): every
+    // table of the backup there is replaced, said once, in the wizard and
+    // the confirmation (L4).
+    let missing = "kerno_test_k74_ui_none";
+    on_server(engine, &format!("DROP DATABASE IF EXISTS {missing}"));
+    let folder = folder_of(&root, "unread", &["one"], BackupContent::All, true);
+    let dialog = app.simple_dialog(cx, missing, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &folder);
+    app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    app.wait_until(cx, "the read that fails", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_read_ended())
+    });
+    let unread = format!(
+        "Kerno could not read which tables “{missing}” holds: every table of the backup that \
+         exists there is dropped and replaced."
+    );
+    assert_eq!(painted(&app, cx, &unread), 1);
+    assert!(paints(
+        &app,
+        cx,
+        &format!("A restore drops and replaces the backup's tables that “{missing}” holds")
+    ));
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    assert_eq!(painted(&app, cx, &unread), 2);
+    assert!(paints(
+        &app,
+        cx,
+        "dropping and replacing the backup's tables that the database holds"
+    ));
+    assert_eq!(painted(&app, cx, "on top of what"), 0);
+    app.tap(cx, "sql-cancel");
+    app.tap(cx, "backup-close");
+
+    // A name that differs only by case is another table where the server
+    // tells case apart (`lower_case_table_names` = 0) (L4).
+    let folds = on_server(engine, "SELECT @@lower_case_table_names") != "0";
+    on_server(engine, &format!("CREATE TABLE {target}.Two (id INT)"));
+    let folder = folder_of(&root, "case", &["two"], BackupContent::All, true);
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &folder);
+    app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    assert_eq!(
+        painted(&app, cx, "already holds the backup's table (“two”)"),
+        usize::from(folds),
+        "lower_case_table_names folds: {folds}"
+    );
+    app.tap(cx, "backup-close");
+}
+
+/// K74, F3 and F4: a folder restore cancelled once the definitions ran
+/// says, in the dialog, which tables are now empty, as the database holds
+/// them (not "what ran before it stopped is kept"); an extra argument that
+/// changes what the mysql client prints is refused before Start. The
+/// client is the real mysql, except that a file's rows wait 30 s (a
+/// stand-in script in front of it; Unix only).
+#[gpui_kit::test]
+fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) || !fake_tools_run() {
+        return;
+    }
+    let Some(real) = kerno_core::tools::find(kerno_core::tools::Tool::Mysql) else {
+        eprintln!("SKIPPED: no mysql client");
+        return;
+    };
+    let target = "kerno_test_k74_ui_cancel";
+    let _scratch = Scratch::new(
+        engine,
+        &[&format!("DROP DATABASE IF EXISTS {target}")],
+        &[
+            &format!("CREATE DATABASE {target}"),
+            &format!("CREATE TABLE {target}.one (id INT PRIMARY KEY)"),
+            &format!("INSERT INTO {target}.one VALUES (1), (2)"),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let real = real.display().to_string();
+    let client = fake_client(
+        &root,
+        "slow-rows",
+        ClientFamily::MySql,
+        "mysql  Ver 8.4.6 for macos15 on arm64",
+        &format!(
+            "case \"$*\" in *--unbuffered*|*--execute=*) exec '{real}' \"$@\";; esac\nexec sleep 30"
+        ),
+    );
+    // Real files: a table's definition, then its rows.
+    let folder = folder_of(&root, "real", &["one", "two"], BackupContent::All, true);
+    for (at, table) in ["one", "two"].iter().enumerate() {
+        std::fs::write(
+            folder.join(format!("{:04}-{table}.sql", at + 1)),
+            format!(
+                "/*!40014 SET FOREIGN_KEY_CHECKS=0 */;\nDROP TABLE IF EXISTS `{table}`;\n\
+                 /*!40101 SET @saved_cs_client     = @@character_set_client */;\n\
+                 CREATE TABLE `{table}` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) \
+                 ENGINE=InnoDB;\n/*!40101 SET character_set_client = @saved_cs_client */;\n\
+                 INSERT INTO `{table}` VALUES (1),(2),(3);\n"
+            ),
+        )
+        .unwrap();
+    }
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &folder);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    // F4: an option that changes the client's output stops Start.
+    app.tap(cx, "backup-advanced");
+    app.to_settings(cx, &dialog);
+    app.replace_text(cx, "backup-extra-args", "--force --table");
+    assert!(!cx.update(|cx| dialog.read(cx).ready_to_start(cx)));
+    assert!(paints(
+        &app,
+        cx,
+        "“--table” is not allowed for a folder restore"
+    ));
+    app.replace_text(cx, "backup-extra-args", "--force");
+    assert!(cx.update(|cx| dialog.read(cx).ready_to_start(cx)));
+
+    // F3: cancelled while the rows wait, every definition run.
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    app.tap(cx, "sql-confirm");
+    app.wait_until(cx, "the rows' clients", |_, cx| {
+        cx.update(|cx| dialog.read(cx).log())
+            .iter()
+            .any(|line| line.contains("mysql clients at once"))
+    });
+    app.tap(cx, "backup-cancel");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.starts_with(
+            "failed: Cancelled: mysql was stopped. Loaded: none. Empty now: “one”, \
+                           “two”."
+        ) && !state.contains("what ran before it stopped is kept")
+            && state.contains("Run the restore again"),
+        "{state}"
+    );
+    assert_eq!(
+        on_server(engine, &format!("SELECT COUNT(*) FROM {target}.one")),
+        "0"
+    );
 }
 
 /// A backup made in utf8mb4 (its first lines set it), restored into a

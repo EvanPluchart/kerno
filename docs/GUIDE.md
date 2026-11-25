@@ -648,7 +648,9 @@ on N connections at once** first creates every table of the backup, one after th
 (two tables linked by a foreign key cannot be dropped and created side by side), then loads several tables'
 rows at a time (the parts of a large InnoDB table side by side). A failed or cancelled restore stops the others
 and says which table, the server's error, and, as the database holds them then, which tables are loaded,
-partly loaded, empty or missing; running it again starts each table over.
+partly loaded, empty or missing; running it again starts each table over. Kerno reads what the mysql client
+prints during such a restore, so the extra arguments that change it (`--table`, `--xml`, `--html`,
+`--vertical`, `--silent`, `--verbose` and their letters) are refused there, under the field.
 
 With "Faster", **Block writes during the backup, so that every table is read at the same moment** (off by
 default) says how the backup is consistent. Off, each table is read at one moment, all its parts included (the

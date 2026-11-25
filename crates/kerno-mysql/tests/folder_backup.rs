@@ -46,6 +46,8 @@ const ARGS: &str = "kerno_test_k63_args";
 const STUCK: &str = "kerno_test_k63_stuck";
 const AGAIN_SOURCE: &str = "kerno_test_k74_src";
 const AGAIN_TARGET: &str = "kerno_test_k74_dst";
+const NEWLINE_SOURCE: &str = "kerno_test_k74_nl_src";
+const NEWLINE_TARGET: &str = "kerno_test_k74_nl_dst";
 
 /// One test of this file at a time: a test that holds the server's read
 /// lock would make the others' writes wait.
@@ -135,11 +137,17 @@ static OPENED: Mutex<Vec<(u16, String)>> = Mutex::new(Vec::new());
 
 /// Kills, from a thread, a runtime and a connection of its own (opened
 /// first), every connection the test opened on `params`' server and every
-/// one working in a `kerno_test_k63_*` or `kerno_test_k74_*` database (the
-/// mysqldump and mysql processes): once told the test's body ended, or
+/// one working in one of `databases`, the test's own (the mysqldump and
+/// mysql processes connect into them): once told the test's body ended, or
 /// after [`LIMIT`] whatever happens. Its answer: whether the time ran out.
-fn guard(params: &ConnectParams) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+fn guard(
+    params: &ConnectParams,
+    databases: &[&str],
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
     let params = params.clone();
+    // Only the test's own databases, by their exact names: another test's
+    // or another run's are never touched (K74, L6).
+    let named: Vec<String> = databases.iter().map(|db| format!("DB = '{db}'")).collect();
     let (ended, wait) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -165,13 +173,16 @@ fn guard(params: &ConnectParams) -> (std::sync::mpsc::Sender<()>, std::thread::J
                 .collect();
             let listed = format!(
                 "SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND \
-                 (ID IN ({}) OR DB LIKE 'kerno\\_test\\_k63%' OR INFO LIKE '%kerno_test_k63%' \
-                 OR DB LIKE 'kerno\\_test\\_k74%' OR INFO LIKE '%kerno_test_k74%')",
+                 (ID IN ({}){})",
                 if ours.is_empty() {
                     "0".into()
                 } else {
                     ours.join(", ")
-                }
+                },
+                named
+                    .iter()
+                    .map(|clause| format!(" OR {clause}"))
+                    .collect::<String>()
             );
             let found = run(&killer, &listed)
                 .await
@@ -201,7 +212,7 @@ where
         .lock()
         .unwrap()
         .retain(|(port, _)| *port != params.port);
-    let (ended, guarding) = guard(params);
+    let (ended, guarding) = guard(params, databases);
     let drop = |db: &str| format!("DROP DATABASE IF EXISTS {db}");
     let admin = session(params, None).await;
     for db in databases {
@@ -2108,4 +2119,190 @@ async fn again(
         .outcome
         .unwrap_or_else(|error| panic!("{}: after the failure: {error}", server.label));
     assert_eq!(counts(AGAIN_TARGET).await, expected, "{}", server.label);
+
+    // A manifest whose first table has no file (edited by hand): the other
+    // tables' definitions are still cut where they are (L5). And every
+    // byte of the folder is counted once in the progress (L3).
+    let mut ghost = manifest.clone();
+    ghost.tables.insert(
+        0,
+        mysql_folder::TableFiles {
+            table: "kerno_ghost".into(),
+            engine: Some("InnoDB".into()),
+            files: Vec::new(),
+        },
+    );
+    let job = FolderRestore {
+        tool_path: client.clone(),
+        params: server.params.clone(),
+        options: RestoreOptions {
+            tool_version: tools::version(&client),
+            jobs: Some(8),
+            utf8mb4: tools::utf8mb4(tools::version(&client).as_ref(), server_version),
+            ..RestoreOptions::new(
+                Engine::MySql,
+                AGAIN_TARGET,
+                &folder,
+                BackupFormat::Directory,
+            )
+        },
+        manifest: ghost,
+        sent: Arc::default(),
+    };
+    let (total, sent) = (job.total(), job.sent.clone());
+    let (on_line, _) = sink();
+    mysql_folder::restore(job, on_line, Arc::new(AtomicBool::new(false)))
+        .await
+        .outcome
+        .unwrap_or_else(|error| panic!("{}: a table with no file: {error}", server.label));
+    assert_eq!(counts(AGAIN_TARGET).await, expected, "{}", server.label);
+    assert_eq!(sent.load(Ordering::Relaxed), total, "{}", server.label);
+}
+
+/// K74, F2: a table and a column whose names hold a newline and the line
+/// that ends a definition (mysqldump writes names raw), backed up in a
+/// folder and restored twice into the same database: both runs end well,
+/// every table equal to the source (rows and `CHECKSUM TABLE`). Before the
+/// fix the cut fell inside CREATE TABLE: ERROR 1064, and every run again
+/// the same.
+#[tokio::test]
+async fn names_that_hold_a_newline_restore_again_and_again() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, client)) = servers() else {
+        return;
+    };
+    for server in servers {
+        if !matches!(server.label.as_str(), "MySQL" | "MariaDB") {
+            continue;
+        }
+        let server: &'static Server = Box::leak(Box::new(server));
+        with_scratch(
+            &server.params,
+            &[NEWLINE_SOURCE, NEWLINE_TARGET],
+            newline_names(server, client.clone()),
+        )
+        .await;
+    }
+}
+
+async fn newline_names(server: &'static Server, client: PathBuf) {
+    let admin = session(&server.params, None).await;
+    for db in [NEWLINE_SOURCE, NEWLINE_TARGET] {
+        exec_ok(&admin, &format!("CREATE DATABASE {db}")).await;
+    }
+    let end = "/*!40101 SET character_set_client = @saved_cs_client */;";
+    let table = format!("t\n{end}\nx");
+    let column = format!("c\n{end}\ny");
+    let source = session(&server.params, Some(NEWLINE_SOURCE)).await;
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB".to_string(),
+        format!(
+            "CREATE TABLE `{table}` (id INT NOT NULL PRIMARY KEY, `{column}` INT, \
+             note VARCHAR(90) DEFAULT 'q\n{end}', CONSTRAINT fk FOREIGN KEY (`{column}`) \
+             REFERENCES parent (id)) \
+             ENGINE=InnoDB"
+        ),
+        format!("CREATE TABLE plain (id INT NOT NULL PRIMARY KEY, `{column}` INT) ENGINE=InnoDB"),
+        "INSERT INTO parent VALUES (1), (2)".into(),
+        format!("INSERT INTO `{table}` VALUES (1, 2, 'a\nb'), (2, 1, '{end}'), (3, NULL, NULL)"),
+        "INSERT INTO plain VALUES (1, 1), (2, 22)".into(),
+    ] {
+        exec_ok(&source, &sql).await;
+    }
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let (on_line, _) = sink();
+    let server_version = admin.server().version_number;
+    let mut options = folder_options(NEWLINE_SOURCE, 4, DumpMethod::SingleTransaction);
+    options.utf8mb4 = tools::utf8mb4(server.dump_version.as_ref(), server_version);
+    mysql_folder::back_up(
+        FolderBackup {
+            tool_path: server.dump.clone(),
+            params: server.params.clone(),
+            options,
+            folder: folder.clone(),
+            client: server.dump_version.clone(),
+            range_threshold: mysql_folder::RANGE_THRESHOLD,
+        },
+        source,
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .outcome
+    .unwrap_or_else(|error| panic!("{}: the backup failed: {error}", server.label));
+    let manifest = mysql_folder::read_manifest(&folder).unwrap();
+    let state = |db: &'static str| {
+        let (admin, table) = (admin.clone(), table.clone());
+        async move {
+            let mut all = Vec::new();
+            for name in ["parent", table.as_str(), "plain"] {
+                let quoted = format!("`{db}`.`{name}`");
+                all.extend(rows(&admin, &format!("SELECT COUNT(*) FROM {quoted}")).await);
+                let sum = rows(&admin, &format!("CHECKSUM TABLE {quoted}")).await;
+                all.push(vec![sum[0][1].clone()]);
+            }
+            all
+        }
+    };
+    let expected = state(NEWLINE_SOURCE).await;
+    for run in 0..3 {
+        // The third run: the parent's file without its definition's end
+        // line, which runs whole, in a client of its own (F2).
+        if run == 2 {
+            let parent = manifest
+                .tables
+                .iter()
+                .find(|table| table.table == "parent")
+                .unwrap();
+            let path = folder.join(&parent.files[0].file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let cut = text.replacen(&format!("{end}\n"), "", 1);
+            assert_ne!(cut, text);
+            std::fs::write(&path, cut).unwrap();
+            // A row the restore must replace.
+            exec_ok(
+                &admin,
+                &format!("INSERT INTO {NEWLINE_TARGET}.parent VALUES (3)"),
+            )
+            .await;
+        }
+        let (on_line, lines) = sink();
+        mysql_folder::restore(
+            FolderRestore {
+                tool_path: client.clone(),
+                params: server.params.clone(),
+                options: RestoreOptions {
+                    tool_version: tools::version(&client),
+                    jobs: Some(4),
+                    utf8mb4: tools::utf8mb4(tools::version(&client).as_ref(), server_version),
+                    ..RestoreOptions::new(
+                        Engine::MySql,
+                        NEWLINE_TARGET,
+                        &folder,
+                        BackupFormat::Directory,
+                    )
+                },
+                manifest: manifest.clone(),
+                sent: Arc::default(),
+            },
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .outcome
+        .unwrap_or_else(|error| panic!("{}: run {run}: {error}", server.label));
+        assert_eq!(
+            state(NEWLINE_TARGET).await,
+            expected,
+            "{}: run {run}",
+            server.label
+        );
+        let alone = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("Kerno: 1 of the tables' first files run whole"));
+        assert_eq!(alone, run == 2, "{}: run {run}", server.label);
+    }
 }

@@ -949,12 +949,15 @@ pub struct ToolCommand {
 /// A part of what [`run`] feeds a tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StdinPart {
-    /// The bytes `range` of the file at `path`.
+    /// The bytes `range` of the file at `path`, opened when the feed
+    /// reaches it; `counted` in [`ToolCommand::sent`] or not (a part fed
+    /// twice is counted once).
     File {
         path: PathBuf,
         range: std::ops::Range<u64>,
+        counted: bool,
     },
-    /// A text of Kerno's own.
+    /// A text of Kerno's own, never counted.
     Text(String),
 }
 
@@ -2670,22 +2673,25 @@ pub async fn run(
     if let Some((name, password)) = &command.password {
         child.env(name, password.expose());
     }
-    // Every file opened before the child starts: one that cannot be read
-    // fails the run, never a script cut short.
-    let open = async |path: &Path| {
-        tokio::fs::File::open(path)
-            .await
-            .map_err(|error| Error::io(format!("could not open {}", path.display()), error))
-    };
+    // Every file checked before the child starts, and each opened only when
+    // the feed reaches it, then closed: a run of a thousand parts holds one
+    // open at a time (K74, F1). One that cannot be read then fails the run,
+    // never a script cut short.
     let mut input = Vec::new();
     if let Some(path) = &command.stdin {
-        input.push(Fed::File(open(path).await?, 0..u64::MAX));
-    }
-    for part in &command.stdin_parts {
-        input.push(match part {
-            StdinPart::File { path, range } => Fed::File(open(path).await?, range.clone()),
-            StdinPart::Text(text) => Fed::Text(text.clone()),
+        input.push(StdinPart::File {
+            path: path.clone(),
+            range: 0..u64::MAX,
+            counted: true,
         });
+    }
+    input.extend(command.stdin_parts.iter().cloned());
+    for part in &input {
+        if let StdinPart::File { path, .. } = part {
+            tokio::fs::metadata(path)
+                .await
+                .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?;
+        }
     }
     child.stdin(if input.is_empty() {
         Stdio::null()
@@ -2704,7 +2710,7 @@ pub async fn run(
         .then_some(input)
         .zip(child.stdin.take())
         .map(|(input, pipe)| tokio::spawn(feed(input, pipe, command.sent.clone())));
-    let _feeding = Feeding(feeding);
+    let mut feeding = Feeding(feeding);
 
     let mut stdout = child.stdout.take().map(BufReader::new);
     let mut stderr = child.stderr.take().map(BufReader::new);
@@ -2712,6 +2718,20 @@ pub async fn run(
     let mut tick = tokio::time::interval(CANCEL_POLL);
     loop {
         tokio::select! {
+            // A part that could not be read: the child must not go on with
+            // what it was given (K74, F1).
+            fed = async {
+                match feeding.0.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if feeding.0.is_some() => {
+                feeding.0 = None;
+                if let Ok(Err(error)) = fed {
+                    let _ = child.kill().await;
+                    return Err(error);
+                }
+            }
             read = read_line(&mut stdout, &mut out_line) => {
                 if !emit(read, &mut out_line, &on_line) { stdout = None; }
             }
@@ -2734,54 +2754,59 @@ pub async fn run(
     }
 }
 
-/// Copies `input` to the child's standard input, counting the bytes in
+/// Copies `input` to the child's standard input, each file opened when its
+/// turn comes and closed after, counting the bytes of the counted parts in
 /// `sent`, then closes it (the end of the script). Stops quietly when the
-/// child closes its end first: it stopped on an error, or was killed.
-async fn feed(input: Vec<Fed>, mut pipe: tokio::process::ChildStdin, sent: Arc<AtomicU64>) {
+/// child closes its end first: it stopped on an error, or was killed. A
+/// file that cannot be opened or read is an error: [`run`] then kills the
+/// child.
+async fn feed(
+    input: Vec<StdinPart>,
+    mut pipe: tokio::process::ChildStdin,
+    sent: Arc<AtomicU64>,
+) -> Result<()> {
     use tokio::io::AsyncSeekExt as _;
     let mut chunk = vec![0; 256 * 1024];
     for part in input {
-        let (mut file, range) = match part {
-            Fed::Text(text) => {
+        let (path, range, counted) = match part {
+            StdinPart::Text(text) => {
                 if pipe.write_all(text.as_bytes()).await.is_err() {
-                    return;
+                    return Ok(());
                 }
-                sent.fetch_add(text.len() as u64, Ordering::Relaxed);
                 continue;
             }
-            Fed::File(file, range) => (file, range),
+            StdinPart::File {
+                path,
+                range,
+                counted,
+            } => (path, range, counted),
         };
-        if range.start > 0
-            && file
-                .seek(std::io::SeekFrom::Start(range.start))
+        let failed = |error| Error::io(format!("could not read {}", path.display()), error);
+        let mut file = tokio::fs::File::open(&path).await.map_err(failed)?;
+        if range.start > 0 {
+            file.seek(std::io::SeekFrom::Start(range.start))
                 .await
-                .is_err()
-        {
-            return;
+                .map_err(failed)?;
         }
         let mut file = file.take(range.end.saturating_sub(range.start));
         loop {
-            let read = match file.read(&mut chunk).await {
-                Ok(0) => break,
-                Err(_) => return,
-                Ok(read) => read,
+            let read = match file.read(&mut chunk).await.map_err(failed)? {
+                0 => break,
+                read => read,
             };
             if pipe.write_all(&chunk[..read]).await.is_err() {
-                return;
+                return Ok(());
             }
-            sent.fetch_add(read as u64, Ordering::Relaxed);
+            if counted {
+                sent.fetch_add(read as u64, Ordering::Relaxed);
+            }
         }
     }
-}
-
-/// A part of the standard input, opened.
-enum Fed {
-    File(tokio::fs::File, std::ops::Range<u64>),
-    Text(String),
+    Ok(())
 }
 
 /// Aborts the feeding task when [`run`] returns, however it returns.
-struct Feeding(Option<tokio::task::JoinHandle<()>>);
+struct Feeding(Option<tokio::task::JoinHandle<Result<()>>>);
 
 impl Drop for Feeding {
     fn drop(&mut self) {
@@ -5710,6 +5735,108 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("absent.sql"), "{error}");
         assert!(!error.to_string().contains(PASSWORD));
+    }
+
+    /// K74, F1: 600 parts of 600 files feed one child in order, each counted
+    /// as asked, under a limit of 64 open files: run in a child of this test
+    /// binary started under `ulimit -n 64` (this process's own limit is
+    /// left alone, the other tests share it). Unix only: `ulimit`, `/bin/sh`.
+    #[cfg(unix)]
+    #[test]
+    fn parts_are_opened_one_at_a_time() {
+        const CHILD: &str = "KERNO_FEED_UNDER_A_LIMIT";
+        let name = "tools::tests::parts_are_opened_one_at_a_time";
+        if std::env::var_os(CHILD).is_none() {
+            let me = std::env::current_exe().unwrap();
+            let ran = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
+                .arg(me)
+                .args(["--exact", name, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&ran.stdout).to_string()
+                + &String::from_utf8_lossy(&ran.stderr);
+            assert!(ran.status.success(), "{said}");
+            assert!(said.contains("1 passed"), "{said}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.sql");
+        let mut command = shell(&format!("cat > '{}'", out.display()));
+        let mut want = String::new();
+        for at in 0..600 {
+            let path = dir.path().join(format!("{at:04}.sql"));
+            std::fs::write(&path, format!("-- head {at}\nSELECT {at};\n")).unwrap();
+            // Its second line only, counted; then a text of Kerno's own.
+            let head = format!("-- head {at}\n").len() as u64;
+            command.stdin_parts.push(StdinPart::File {
+                path,
+                range: head..u64::MAX,
+                counted: at % 2 == 0,
+            });
+            command
+                .stdin_parts
+                .push(StdinPart::Text(format!("-- {at}\n")));
+            want.push_str(&format!("SELECT {at};\n-- {at}\n"));
+        }
+        let sent = command.sent.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = runtime
+            .block_on(run(command, |_| {}, Arc::new(AtomicBool::new(false))))
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), want);
+        let counted: usize = (0..600)
+            .filter(|at| at % 2 == 0)
+            .map(|at| format!("SELECT {at};\n").len())
+            .sum();
+        assert_eq!(sent.load(Ordering::Relaxed), counted as u64);
+    }
+
+    /// K74, F1: a part that cannot be read once the child runs (it went
+    /// away after the check) fails the run and kills the child: it never
+    /// goes on with a script cut short.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_part_that_cannot_be_read_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sql");
+        let gone = dir.path().join("gone.sql");
+        std::fs::write(&first, "SELECT 1;\n").unwrap();
+        // A folder passes the check and fails at its read.
+        std::fs::create_dir(&gone).unwrap();
+        let mut command = shell("cat > /dev/null; echo finished");
+        for path in [first, gone.clone()] {
+            command.stdin_parts.push(StdinPart::File {
+                path,
+                range: 0..u64::MAX,
+                counted: true,
+            });
+        }
+        let (lines, on_line) = collect();
+        let error = run(command, on_line, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("gone.sql"), "{error}");
+        assert!(!lines.lock().unwrap().contains(&"finished".to_string()));
+        // A part missing before the start: nothing runs.
+        let mut missing = shell("echo started");
+        missing.stdin_parts.push(StdinPart::File {
+            path: dir.path().join("absent.sql"),
+            range: 0..u64::MAX,
+            counted: true,
+        });
+        let (lines, on_line) = collect();
+        let error = run(missing, on_line, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("absent.sql"), "{error}");
+        assert!(lines.lock().unwrap().is_empty());
     }
 
     /// A client that stops reading (psql's ON_ERROR_STOP) ends the run at

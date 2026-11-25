@@ -599,6 +599,11 @@ impl BackupDialog {
                  undone.",
                 self.database
             )
+        } else if self.plain_replaces() {
+            format!(
+                "A restore runs the dump in “{}” and cannot be undone.",
+                self.database
+            )
         } else {
             format!(
                 "A restore writes into “{}” on top of what it holds and cannot be undone.",
@@ -624,7 +629,14 @@ impl BackupDialog {
         else {
             return None;
         };
-        let fold = |name: &str| name.to_lowercase();
+        // Without case only where the server compares names so (L4).
+        let fold = |name: &str| {
+            if self.target_folds {
+                name.to_lowercase()
+            } else {
+                name.to_string()
+            }
+        };
         let has = |name: &&str| held.iter().any(|have| fold(have) == fold(name));
         let quoted = |name: &str| format!("“{name}”");
         let tables = manifest
@@ -649,11 +661,51 @@ impl BackupDialog {
     /// folder backup with its definitions and DROP TABLE, some of whose
     /// tables are there (K74).
     pub(super) fn replaces(&self) -> bool {
-        self.held_by_target().is_some_and(|(manifest, tables, _)| {
-            manifest.options.add_drop_table
-                && manifest.content != BackupContent::DataOnly
-                && !tables.is_empty()
-        })
+        let Some(Ok(Input {
+            manifest: Some(manifest),
+            ..
+        })) = &self.input
+        else {
+            return false;
+        };
+        let drops = manifest.options.add_drop_table && manifest.content != BackupContent::DataOnly;
+        drops
+            && match self.held_by_target() {
+                Some((_, tables, _)) => !tables.is_empty(),
+                // Not read: every table of the backup there is replaced (L4).
+                None => !self.target_reading,
+            }
+    }
+
+    /// Whether a plain MySQL dump goes into a database that holds tables:
+    /// its DROP TABLE statements, if it has any, replace those it names.
+    fn plain_replaces(&self) -> bool {
+        self.mode == Mode::Restore
+            && self.family == ClientFamily::MySql
+            && matches!(
+                &self.input,
+                Some(Ok(Input {
+                    manifest: None,
+                    format: BackupFormat::Sql,
+                    ..
+                }))
+            )
+            && self
+                .target_tables
+                .as_ref()
+                .is_some_and(|held| !held.is_empty())
+    }
+
+    /// What the confirmation says the restore does to what the database
+    /// holds (K74, L4): one sentence, true with the other words.
+    pub(super) fn restore_clause(&self) -> &'static str {
+        if self.replaces() {
+            "dropping and replacing the backup's tables that the database holds"
+        } else if self.plain_replaces() {
+            "where the dump's DROP TABLE statements, if it has any, replace the tables they name"
+        } else {
+            "on top of what the database holds"
+        }
     }
 
     /// A folder backup restored into a database that already holds some of
@@ -685,8 +737,8 @@ impl BackupDialog {
         let Some((_, tables, views)) = self.held_by_target() else {
             return if drops && !self.target_reading {
                 format!(
-                    " Kerno could not read which tables “{database}” holds: each table of the \
-                     backup that is there is dropped and replaced."
+                    " Kerno could not read which tables “{database}” holds: every table of the \
+                     backup that exists there is dropped and replaced."
                 )
             } else {
                 String::new()

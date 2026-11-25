@@ -1927,3 +1927,16 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   confirmation; the backup's Speed hint no longer points at a hidden row.
 - Not verified: a database of hundreds of tables (the definitions are now one after the other), a
   `mariadb-dump` folder, the real app.
+
+## 2026-11-25 — K74: the independent review's findings fixed
+
+- Two regressions confirmed by the review, fixed before the merge (D-143, M12's K74 table): a restore of more
+  than about 250 tables failed on macOS with "Too many open files" (every part of the client's input was
+  opened before it started; now one at a time, a part that cannot be read kills the client); a table or column
+  NAME holding a newline and the definition's end line put the cut inside CREATE TABLE (quotes and comments
+  are now followed; a file whose definition is not found runs alone, never in the shared run).
+- Also: a cancel says which tables it left empty, in the dialog; output options (`--table`, `--xml`…) refused
+  for a folder restore; the client's `ERROR` line kept; an empty table said empty; the progress reaches the
+  total; one true sentence when the target cannot be read and for a plain dump; names compared as the server
+  does; a manifest table without a file; the tests' guard only kills its own databases' connections.
+- Each fix seen failing under a mutation. Left: `--force` makes mysql exit 0 after errors (before K74).

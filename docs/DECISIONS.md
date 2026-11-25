@@ -4521,8 +4521,9 @@ called three tables "partly loaded"; one of them was empty, one held its old row
   `/*!40101 SET @saved_cs_client` or `CREATE TABLE ` to the line `/*!40101 SET character_set_client =
   @saved_cs_client */;` that mysqldump writes after a CREATE TABLE (`--skip-set-charset`, which leaves it out, is
   already refused). A file where it is not found (rows before a definition, no end line within 64 MiB; a
-  `mariadb-dump` file, none tried here, that would end it otherwise) runs whole in the definitions' run: correct,
-  only slower. Checked on files written by mysqldump
+  `mariadb-dump` file, none tried here, that would end it otherwise) runs whole, on a client of its own
+  (amended after the review, F2: first in the definitions' run): correct, only slower. Checked on files
+  written by mysqldump
   26.10 from MySQL 8.4 and MariaDB 11 and 5.7.44 from 5.7 (`tests/fixtures/mysqldump/`: a partitioned table, an
   empty one, `--skip-comments`, no DROP TABLE, definitions only, `--replace`, `--insert-ignore`, a column
   comment that reads like a statement).
@@ -4551,7 +4552,41 @@ called three tables "partly loaded"; one of them was empty, one held its old row
 - **The Speed hint** of the MySQL backup said "with “Block writes” below" while that row shows only once
   "Faster" is ticked: unticked, it says "offered once this is ticked".
 - **Cost.** The definitions now run one after the other where they ran N at once: a few milliseconds each on the
-  test servers (not measured for a database of a thousand tables; BENCH.md's K63 numbers were not taken again).
+  test servers (the review measured 300 definitions one after the other: no cost seen; BENCH.md's K63 numbers
+  were not taken again).
+
+**Amended after the independent review of 2026-11-25** (two regressions against 2853007, fixed before the merge):
+
+- **One file open at a time** (F1). The first version opened every part of the client's input before the
+  child started: a restore of more than about 250 tables failed on macOS ("Too many open files"; an app
+  started from Finder has 256). Now `tools::run` checks each file before the start (a missing one: nothing
+  runs) and opens each part when the feed reaches it, then closes it; a part that cannot be read then kills
+  the child and fails the run, never a script cut short. A definition counts as run only when its marker came
+  back, even when the client exits 0. Lists of tables in a message stop at ten ("… and 15 more").
+- **Quotes read, not guessed** (F2). mysqldump writes the newlines of a string as `\n` but a name's raw: a table
+  or column named with a newline and the end line put the cut inside CREATE TABLE, and every run failed the
+  same way. `find_definition` now follows backtick, single and double quotes (doubling and backslashes) and
+  comments from the file's start, and takes a line for the definition's start or end only when it starts in
+  code. A file whose definition is not found never goes into the shared definitions' run (a file cut inside a
+  quote would swallow the next tables'): it runs whole, on a client of its own, after that run and before any
+  rows.
+- **What a cancel left** (F3): the dialog says it, as for a failure ("Cancelled: mysql was stopped. Loaded:
+  none. Empty now: …"), not "what ran before it stopped is kept".
+- **The client's output** (F4): Kerno reads it (the markers, the read of the database after a stop). The
+  options that change it are refused for a folder restore before Start, in every spelling the client takes
+  (`--table`, `--xml`, `--html`, `--vertical`, `--auto-vertical-output`, `--silent`, `--verbose`,
+  `--column-type-info`, a prefix, `--loose-…`, `-t -X -H -E -s -v -m` among other letters). Stripping them
+  from Kerno's own commands was not chosen: the user's other arguments (TLS, plugins) must reach every client.
+- **Smaller points**: the failure is said by the client's last `ERROR …` line, not the last line it quoted (L1);
+  a table found empty is "Empty now" whether or not its marker came back (L2); the definitions' bytes count in
+  the progress, each byte of the folder once (L3); when the target cannot be read the wizard and the
+  confirmation say one thing ("every table of the backup that exists there is dropped and replaced"), and a
+  plain dump's confirmation no longer says "on top of" beside "replace"; names are compared without case only
+  where the server's `lower_case_table_names` says so (L4); one entry per table of the manifest, a table
+  without a file included (L5); the driver tests' guard kills only connections working in the databases the
+  test named (L6).
+- **Left**: L7, `--force` in the extra arguments makes `mysql` exit 0 after errors, so a file can "succeed"
+  with statements that failed (as before K74, plain restore too); MariaDB's own `mariadb-dump` files not tried.
 
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 

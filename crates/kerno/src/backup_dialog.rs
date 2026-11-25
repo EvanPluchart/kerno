@@ -350,6 +350,9 @@ pub struct BackupDialog {
     target_tables: Option<Vec<String>>,
     /// They are being read: Start waits (K74).
     target_reading: bool,
+    /// The server compares table names without case
+    /// (`lower_case_table_names` other than 0), once read (K74, L4).
+    target_folds: bool,
     databases: Loaded<Vec<String>>,
     /// Global backup: the databases the user left out (what a task keeps).
     excluded: BTreeSet<String>,
@@ -679,6 +682,7 @@ impl BackupDialog {
             can_lock: None,
             target_tables: None,
             target_reading: false,
+            target_folds: false,
             databases: Loaded::Loading,
             excluded: BTreeSet::new(),
             closed: Vec::new(),
@@ -854,13 +858,24 @@ impl BackupDialog {
         let reading = bridge::spawn(cx, async move {
             let session = opening.await.ok()?;
             let objects = fetch_objects(&*session, &database).await.ok();
+            // Whether `Child` and `child` are one table there (L4).
+            let folds = exec::collect(session.clone(), "SELECT @@lower_case_table_names")
+                .await
+                .ok()
+                .and_then(|done| done.results.first().map(|result| result.rows()))
+                .and_then(|rows| rows.first().and_then(|row| row.first().cloned().flatten()))
+                .is_some_and(|value| value.trim() != "0");
             session.close().await;
-            objects
+            objects.map(|objects| (objects, folds))
         });
         self.tasks.push(cx.spawn(async move |this, cx| {
-            let objects = reading.await;
+            let read = reading.await;
             let _ = this.update(cx, |this, cx| {
                 this.target_reading = false;
+                let objects = read.map(|(objects, folds)| {
+                    this.target_folds = folds;
+                    objects
+                });
                 this.target_tables = objects.map(|entries| {
                     entries
                         .into_iter()
@@ -1964,6 +1979,19 @@ impl BackupDialog {
         {
             return Some(why.clone());
         }
+        // A folder restore reads what its clients print (K74, F4).
+        if self.mode == Mode::Restore
+            && matches!(
+                &self.input,
+                Some(Ok(Input {
+                    manifest: Some(_),
+                    ..
+                }))
+            )
+            && let Some(why) = mysql_folder::restore_refusal(&self.extra_value(cx))
+        {
+            return Some(why);
+        }
         // What the restore replaces is said first (K74).
         if self.target_reading && self.mode == Mode::Restore {
             return Some(format!(
@@ -2190,7 +2218,7 @@ impl BackupDialog {
                         allow_commands: self.allow_commands,
                         script,
                         restore: &self.restore,
-                        replaces: self.replaces(),
+                        into: self.restore_clause(),
                     }),
                     self.overlap_words()
                 ),
@@ -2342,6 +2370,7 @@ impl BackupDialog {
                     outcome,
                     size: None,
                     removed: false,
+                    said: None,
                 };
                 if no_fields.load(Ordering::Relaxed)
                     && matches!(&ended.outcome, Ok(status) if status.success())
@@ -2450,6 +2479,7 @@ impl BackupDialog {
                         outcome: end.outcome.map(|()| ExitStatus::default()),
                         size,
                         removed: end.removed,
+                        said: None,
                     }
                 })
             });
@@ -2663,7 +2693,12 @@ impl BackupDialog {
             },
             Err(Error::Cancelled) => Step::Finished {
                 success: false,
-                text: format!("Cancelled: {program} was stopped.{kept}"),
+                // A folder restore says what it left, as the database holds
+                // it: every table it had defined is empty (K74, F3).
+                text: match &ended.said {
+                    Some(said) => format!("Cancelled: {program} was stopped. {said}"),
+                    None => format!("Cancelled: {program} was stopped.{kept}"),
+                },
             },
             Err(Error::Config(message)) => Step::Finished {
                 success: false,
@@ -3064,6 +3099,13 @@ impl BackupDialog {
         self.target_tables.is_some() && !self.target_reading
     }
 
+    /// Whether the read of the target's tables ended, well or not; for
+    /// tests.
+    #[cfg(test)]
+    pub fn target_read_ended(&self) -> bool {
+        !self.target_reading
+    }
+
     /// The server's version as read; set by a test that plays an older
     /// server.
     #[cfg(test)]
@@ -3175,6 +3217,9 @@ struct Ended {
     outcome: kerno_core::Result<ExitStatus>,
     size: Option<u64>,
     removed: bool,
+    /// A cancelled folder restore: what it left, as the database holds it
+    /// (K74, F3).
+    said: Option<String>,
 }
 
 /// What a backup whose client read no column of a table says (F6).
@@ -3278,6 +3323,7 @@ impl Ended {
             outcome: Err(Error::Config(format!("{why} Nothing was run."))),
             size: None,
             removed: false,
+            said: None,
         }
     }
 }
@@ -3305,6 +3351,7 @@ fn run_folder_restore(
             outcome: end.outcome.map(|()| ExitStatus::default()),
             size: None,
             removed: false,
+            said: end.said,
         }
     })
 }
@@ -3916,8 +3963,9 @@ struct Explained<'a> {
     allow_commands: bool,
     script: bool,
     restore: &'a RestoreOptions,
-    /// The restore drops and replaces tables the database holds (K74).
-    replaces: bool,
+    /// What the restore does to what the database holds, as a clause
+    /// (K74): "on top of what the database holds", or how it replaces.
+    into: &'a str,
 }
 
 /// What the confirmation says: the file, the database, the connection;
@@ -3940,11 +3988,7 @@ fn restore_explanation(about: &Explained) -> String {
             about.input.path.display(),
             about.database,
             about.connection,
-            if about.replaces {
-                "dropping and replacing the backup's tables that the database holds"
-            } else {
-                "on top of what the database holds"
-            }
+            about.into
         )
     };
     let archive = about.input.format != BackupFormat::Sql;
@@ -4720,7 +4764,21 @@ impl BackupDialog {
     /// Extra arguments and another user, shared by every wizard.
     fn render_advanced(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let extra_error = tools::extra_args(&self.extra_value(cx), self.family).err();
+        let folder_restore = self.mode == Mode::Restore
+            && matches!(
+                &self.input,
+                Some(Ok(Input {
+                    manifest: Some(_),
+                    ..
+                }))
+            );
+        // A folder restore refuses what changes the client's output (K74,
+        // F4), said where the arguments are typed.
+        let extra_error = match tools::extra_args(&self.extra_value(cx), self.family) {
+            Err(error) => Some(error_text(&error)),
+            Ok(_) if folder_restore => mysql_folder::restore_refusal(&self.extra_value(cx)),
+            Ok(_) => None,
+        };
         let mut rows = vec![
             Self::field(
                 "Extra arguments",
@@ -4734,7 +4792,8 @@ impl BackupDialog {
                                 .test_support()
                                 .text_xs()
                                 .text_color(theme.danger)
-                                .child(SharedString::from(error_text(&error))),
+                                .child(SharedString::from(error.clone()))
+                                .test_text(error),
                         ),
                         None => this.child(Self::muted(
                             "Passed to the tool after Kerno's own, split as a shell would. The \
@@ -6317,7 +6376,7 @@ mod tests {
             allow_commands: case.allow,
             script: case.script,
             restore: case.restore,
-            replaces: false,
+            into: "on top of what the database holds",
         })
     }
 

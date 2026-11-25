@@ -744,6 +744,9 @@ pub struct FolderEnd {
     pub outcome: Result<()>,
     /// A backup's folder this run made was removed.
     pub removed: bool,
+    /// A cancelled restore: what it left, as the database holds it (K74,
+    /// F3).
+    pub said: Option<String>,
 }
 
 /// The rows of a query, as text.
@@ -970,6 +973,29 @@ fn failure_line(line: &str) -> bool {
     !line.starts_with("-- ") && !line.contains("Warning") && !line.trim().is_empty()
 }
 
+/// What a tool said of its failure: its last `ERROR …` line, else its last
+/// line that says a failure ([`failure_line`]). A server error that quotes
+/// several lines is not reduced to the last of them (K74, L1).
+#[derive(Debug, Clone, Default)]
+struct Said {
+    error: Option<String>,
+    other: Option<String>,
+}
+
+impl Said {
+    fn hear(&mut self, line: &str) {
+        if line.starts_with("ERROR ") {
+            self.error = Some(line.to_string());
+        } else if failure_line(line) {
+            self.other = Some(line.to_string());
+        }
+    }
+
+    fn last(&self) -> Option<String> {
+        self.error.clone().or_else(|| self.other.clone())
+    }
+}
+
 /// mysqldump's note when it reads no column of a table: a client that does
 /// not understand this server (8.4 and later on MySQL 5.1); it still exits
 /// 0 when the triggers are left out, with no table in the file.
@@ -1014,7 +1040,7 @@ fn spawn_job(
     stop: &Arc<AtomicBool>,
     started: Option<Arc<AtomicUsize>>,
 ) {
-    let said: Arc<Mutex<(Option<String>, bool)>> = Arc::default();
+    let said: Arc<Mutex<(Said, bool)>> = Arc::default();
     let counted = Arc::new(AtomicBool::new(false));
     let (sink, heard, label) = (on_line.clone(), said.clone(), job.label.clone());
     let (seen, count) = (counted.clone(), started.clone());
@@ -1025,9 +1051,7 @@ fn spawn_job(
             move |line| {
                 if let Ok(mut said) = heard.lock() {
                     said.1 |= no_fields_line(&line);
-                    if failure_line(&line) {
-                        said.0 = Some(line.clone());
-                    }
+                    said.0.hear(&line);
                 }
                 if line.starts_with(SNAPSHOT_TAKEN)
                     && let Some(count) = &count
@@ -1045,7 +1069,10 @@ fn spawn_job(
         {
             started.fetch_add(1, Ordering::Relaxed);
         }
-        let (last, no_fields) = said.lock().map(|said| said.clone()).unwrap_or_default();
+        let (last, no_fields) = said
+            .lock()
+            .map(|said| (said.0.last(), said.1))
+            .unwrap_or_default();
         (outcome, last, no_fields)
     });
     names.insert(handle.id(), (group, job.file, job.label));
@@ -1412,12 +1439,17 @@ pub async fn back_up(
             return FolderEnd {
                 outcome: Err(error),
                 removed: false,
+                said: None,
             };
         }
     };
     let outcome = back_up_in(&job, &session, &on_line, &cancel, &mut made).await;
     let removed = outcome.is_err() && made && std::fs::remove_dir_all(&job.folder).is_ok();
-    FolderEnd { outcome, removed }
+    FolderEnd {
+        outcome,
+        removed,
+        said: None,
+    }
 }
 
 async fn back_up_in(
@@ -1900,9 +1932,10 @@ impl FolderRestore {
         if ran.success() {
             return Ok(lines);
         }
-        let last = lines.iter().rev().find(|line| failure_line(line));
+        let mut said = Said::default();
+        lines.iter().for_each(|line| said.hear(line));
         Err(Error::Config(
-            last.cloned().unwrap_or_else(|| format!("{ran}")),
+            said.last().unwrap_or_else(|| format!("{ran}")),
         ))
     }
 }
@@ -1964,14 +1997,88 @@ pub struct Definition {
 /// How far into a file Kerno looks for the end of its table's definition.
 const DEFINITION_WITHIN: u64 = 64 << 20;
 
+/// Where the SQL text is at the end of a line: in code, or inside a quote or
+/// a comment that goes on to the next line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quoted {
+    Code,
+    Backtick,
+    Single,
+    Double,
+    Comment,
+}
+
+impl Quoted {
+    /// The state after `line`, starting in `self`. mysqldump writes the
+    /// newlines of a string as `\n` but an identifier's raw: a table or
+    /// column name may hold a newline and anything after it (K74, F2).
+    fn after(mut self, line: &[u8]) -> Self {
+        let mut at = 0;
+        while at < line.len() {
+            let (byte, next) = (line[at], line.get(at + 1).copied());
+            match self {
+                Quoted::Code => match byte {
+                    b'`' => self = Quoted::Backtick,
+                    b'\'' => self = Quoted::Single,
+                    b'"' => self = Quoted::Double,
+                    b'#' => return self,
+                    b'-' if next == Some(b'-')
+                        && line
+                            .get(at + 2)
+                            .is_none_or(|after| after.is_ascii_whitespace()) =>
+                    {
+                        return self;
+                    }
+                    // `/*!…*/` and `/*+…*/` are code the server runs.
+                    b'/' if next == Some(b'*')
+                        && !matches!(line.get(at + 2), Some(b'!') | Some(b'+')) =>
+                    {
+                        self = Quoted::Comment;
+                        at += 1;
+                    }
+                    _ => {}
+                },
+                Quoted::Backtick if byte == b'`' => {
+                    if next == Some(b'`') {
+                        at += 1;
+                    } else {
+                        self = Quoted::Code;
+                    }
+                }
+                Quoted::Single | Quoted::Double if byte == b'\\' => at += 1,
+                Quoted::Single | Quoted::Double => {
+                    let quote = if self == Quoted::Single { b'\'' } else { b'"' };
+                    if byte == quote {
+                        if next == Some(quote) {
+                            at += 1;
+                        } else {
+                            self = Quoted::Code;
+                        }
+                    }
+                }
+                Quoted::Comment if byte == b'*' && next == Some(b'/') => {
+                    self = Quoted::Code;
+                    at += 1;
+                }
+                Quoted::Backtick | Quoted::Comment => {}
+            }
+            at += 1;
+        }
+        self
+    }
+}
+
 /// Finds the definition in the first file of a table, or `None` when it is
 /// not where mysqldump puts it (no definition, rows before it, its end not
-/// found): such a file then runs whole, alone (K74). Blocking.
+/// found): such a file then runs whole, in a client of its own (K74). Every
+/// line is read for what it is: a line inside a quoted name or a comment is
+/// never taken for the definition's start or end (F2). Blocking.
 pub fn find_definition(path: &Path) -> std::io::Result<Option<Definition>> {
     use std::io::BufRead as _;
     let len = std::fs::metadata(path)?.len();
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
     let (mut at, mut start, mut created, mut lines) = (0u64, None, false, 0u64);
+    let mut state = Quoted::Code;
     let mut line = Vec::new();
     while at < DEFINITION_WITHIN {
         line.clear();
@@ -1980,6 +2087,13 @@ pub fn find_definition(path: &Path) -> std::io::Result<Option<Definition>> {
             break;
         }
         lines += 1;
+        // Only a line that starts in code says anything.
+        let starts_in_code = state == Quoted::Code;
+        state = state.after(&line);
+        if !starts_in_code {
+            at += read;
+            continue;
+        }
         let text = String::from_utf8_lossy(&line);
         let opens = text.starts_with("DROP TABLE ")
             || text.starts_with("/*!40101 SET @saved_cs_client")
@@ -2103,6 +2217,67 @@ async fn tables_now(
     Ok(now)
 }
 
+/// The `mysql` client's options that change what it prints: Kerno reads
+/// that output in a folder restore (the definitions' markers, the read of
+/// the database after a failure), by their long names.
+const PRINTS: [&str; 9] = [
+    "table",
+    "xml",
+    "html",
+    "vertical",
+    "auto-vertical-output",
+    "silent",
+    "verbose",
+    "column-type-info",
+    "execute",
+];
+
+/// The same by their letters: `-t -X -H -E -s -v -m -e`.
+const PRINTS_LETTERS: [char; 8] = ['t', 'X', 'H', 'E', 's', 'v', 'm', 'e'];
+
+/// The client's letters whose value may follow them in the same word
+/// (`-hhost`): the rest of the word is that value.
+const VALUE_LETTERS: [char; 6] = ['h', 'u', 'p', 'P', 'S', 'D'];
+
+/// Why the user's extra arguments `text` cannot go to a folder restore's
+/// clients, or `None` (K74, F4): an option that changes what the client
+/// prints, in any spelling the client takes (a prefix, a `loose-` form,
+/// letters together).
+pub fn restore_refusal(text: &str) -> Option<String> {
+    // Words the client gets; one that does not split is refused elsewhere.
+    let words = super::extra_args(text, super::ClientFamily::MySql).unwrap_or_default();
+    words.iter().find_map(|word| {
+        let refused = if let Some(long) = word.strip_prefix("--") {
+            let mut name = long
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .replace('_', "-");
+            while let Some(rest) = ["loose-", "enable-"]
+                .iter()
+                .find_map(|prefix| name.strip_prefix(prefix))
+            {
+                name = rest.to_string();
+            }
+            !name.is_empty() && PRINTS.iter().any(|own| own.starts_with(&name))
+        } else if let Some(letters) = word.strip_prefix('-') {
+            letters
+                .chars()
+                .take_while(|letter| !VALUE_LETTERS.contains(letter))
+                .any(|letter| PRINTS_LETTERS.contains(&letter))
+        } else {
+            false
+        };
+        refused.then(|| {
+            format!(
+                "“{word}” is not allowed for a folder restore: it changes what the mysql client \
+                 prints, which Kerno reads to know which tables are in. Leave it out."
+            )
+        })
+    })
+}
+
 /// How a stopped step of the restore ended: cancelled (`Ok`), or failed on
 /// a label with what the client said.
 type Stopped = Option<std::result::Result<(), (String, String)>>;
@@ -2137,24 +2312,42 @@ async fn define(
     cancel: &Arc<AtomicBool>,
 ) -> Stopped {
     let manifest = &job.manifest;
+    // Only the definitions found: a file whose definition was not found
+    // runs whole, in a client of its own (F2).
+    let found: Vec<(usize, Definition, &Piece)> = manifest
+        .tables
+        .iter()
+        .enumerate()
+        .filter_map(|(index, table)| {
+            Some((
+                index,
+                definitions.get(index).copied().flatten()?,
+                table.files.first()?,
+            ))
+        })
+        .collect();
+    let (_, _, first) = found.first()?;
     let mut parts = Vec::new();
-    // The line of the run each table's part starts on, while known.
-    let mut starts = Vec::new();
-    let mut line = Some(1u64);
-    for (index, table) in manifest.tables.iter().enumerate() {
-        starts.push(line);
-        let Some(first) = table.files.first() else {
-            continue;
-        };
-        let definition = definitions.get(index).copied().flatten();
+    // The line of the run each table's part starts on.
+    let mut starts = BTreeMap::new();
+    let mut line = 1u64;
+    for (index, definition, piece) in &found {
+        starts.insert(*index, line);
+        let path = job.options.input.join(&piece.file);
+        // The file's settings are counted with its rows, fed again later
+        // (L3).
         parts.push(StdinPart::File {
-            path: job.options.input.join(&first.file),
-            range: 0..definition.map_or(u64::MAX, |definition| definition.end),
+            path: path.clone(),
+            range: 0..definition.start,
+            counted: false,
+        });
+        parts.push(StdinPart::File {
+            path,
+            range: definition.start..definition.end,
+            counted: true,
         });
         parts.push(StdinPart::Text(format!("\nSELECT '{DEFINED}{index}';\n")));
-        line = line
-            .zip(definition)
-            .map(|(line, definition)| line + definition.lines + 2);
+        line += definition.lines + 2;
     }
     let label = |index: Option<usize>| {
         index
@@ -2164,22 +2357,18 @@ async fn define(
                 |table| table.table.clone(),
             )
     };
-    let first = manifest.tables.first()?.files.first()?;
     let mut command = match job.file_command(&first.file) {
         Ok(command) => command,
         Err(error) => return Some(Err((label(None), said(&error)))),
     };
     command.stdin = None;
     command.script_check = None;
-    // Not counted in the progress: the rows' runs feed every file's
-    // settings again.
-    command.sent = Arc::default();
     command.stdin_parts = parts;
     command.args.extend([
         "--unbuffered".to_string(),
         "--skip-column-names".to_string(),
     ]);
-    let heard: Arc<Mutex<(BTreeSet<usize>, Option<String>)>> = Arc::default();
+    let heard: Arc<Mutex<(BTreeSet<usize>, Said)>> = Arc::default();
     let (marks, sink) = (heard.clone(), on_line.clone());
     let ran = run(
         command,
@@ -2194,29 +2383,36 @@ async fn define(
                 marks.0.insert(index);
                 return;
             }
-            if failure_line(&line) {
-                marks.1 = Some(line.clone());
-            }
+            marks.1.hear(&line);
             sink(format!("[definitions] {line}"));
         },
         cancel.clone(),
     )
     .await;
-    let (marked, last) = heard.lock().map(|heard| heard.clone()).unwrap_or_default();
+    let (marked, last) = heard
+        .lock()
+        .map(|heard| (heard.0.clone(), heard.1.last()))
+        .unwrap_or_default();
+    // Only what the client said back: a definition is in once its marker
+    // came (F1).
     defined.extend(marked);
     // The table whose definition was running when it stopped.
-    let at = (0..manifest.tables.len()).find(|index| !defined.contains(index));
+    let at = found
+        .iter()
+        .map(|(index, ..)| *index)
+        .find(|index| !defined.contains(index));
     let file = at
         .and_then(|index| manifest.tables.get(index))
         .and_then(|table| table.files.first())
         .map(|piece| piece.file.as_str())
         .unwrap_or_default();
-    let start = at.and_then(|index| starts.get(index).copied().flatten());
+    let start = at.and_then(|index| starts.get(&index).copied());
     match ran {
-        Ok(status) if status.success() => {
-            defined.extend(0..manifest.tables.len());
-            None
-        }
+        Ok(status) if status.success() && at.is_none() => None,
+        Ok(status) if status.success() => Some(Err((
+            label(at),
+            "the mysql client ended without saying that this table's definition ran".into(),
+        ))),
         Err(Error::Cancelled) => Some(Ok(())),
         Ok(status) => Some(Err((
             label(at),
@@ -2225,7 +2421,8 @@ async fn define(
                 |last| in_its_file(&last, start, file),
             ),
         ))),
-        Err(error) => Some(Err((label(at), said(&error)))),
+        // A part that could not be read: the error names its file.
+        Err(error) => Some(Err((label(None), said(&error)))),
     }
 }
 
@@ -2244,9 +2441,11 @@ pub async fn restore(
     on_line: Arc<dyn Fn(String) + Send + Sync>,
     cancel: Arc<AtomicBool>,
 ) -> FolderEnd {
+    let mut said = None;
     FolderEnd {
-        outcome: restore_in(&job, &on_line, &cancel).await,
+        outcome: restore_in(&job, &on_line, &cancel, &mut said).await,
         removed: false,
+        said,
     }
 }
 
@@ -2254,8 +2453,14 @@ async fn restore_in(
     job: &FolderRestore,
     on_line: &Arc<dyn Fn(String) + Send + Sync>,
     cancel: &Arc<AtomicBool>,
+    stopped_said: &mut Option<String>,
 ) -> Result<()> {
     let manifest = &job.manifest;
+    // Options that change what the client prints would hide the markers
+    // and the read afterwards (F4).
+    if let Some(why) = restore_refusal(&job.options.extra_args) {
+        return Err(Error::Config(why));
+    }
     let mut checks = Vec::new();
     for file in manifest.files() {
         checks.extend(job.file_command(file)?.script_check.take());
@@ -2265,12 +2470,17 @@ async fn restore_in(
     // where a foreign key links them, and a table created while another is
     // locked for its rows fails it (MariaDB).
     let defines = manifest.content != BackupContent::DataOnly;
-    let firsts: Vec<PathBuf> = manifest
+    // One per table, in the manifest's order (L5).
+    let firsts: Vec<Option<PathBuf>> = manifest
         .tables
         .iter()
-        .filter(|_| defines)
-        .filter_map(|table| table.files.first())
-        .map(|piece| job.options.input.join(&piece.file))
+        .map(|table| {
+            table
+                .files
+                .first()
+                .filter(|_| defines)
+                .map(|piece| job.options.input.join(&piece.file))
+        })
         .collect();
     // All the files before the first client: a refusal loads nothing.
     let checking = cancel.clone();
@@ -2280,16 +2490,18 @@ async fn restore_in(
             .try_for_each(|check| check_script(check, &checking))?;
         firsts
             .iter()
-            .map(|path| {
-                find_definition(path)
-                    .map_err(|error| Error::io(format!("could not read {}", path.display()), error))
+            .map(|path| match path {
+                Some(path) => find_definition(path).map_err(|error| {
+                    Error::io(format!("could not read {}", path.display()), error)
+                }),
+                None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()
     })
     .await
     .map_err(|error| Error::io("checking the backup's files", std::io::Error::other(error)))??;
     let mut defined = BTreeSet::new();
-    let stopped = if defines && !manifest.tables.is_empty() {
+    let mut stopped = if defines && !manifest.tables.is_empty() {
         on_line(format!(
             "Kerno: the {} tables' definitions first, one after the other on one connection.",
             manifest.tables.len()
@@ -2298,9 +2510,45 @@ async fn restore_in(
     } else {
         None
     };
+    // A first file whose definition Kerno could not find runs whole, each
+    // in a client of its own, one after the other, before any rows: never
+    // inside the definitions' run, which a file cut inside a quote would
+    // break (F2).
+    let mut alone = VecDeque::new();
+    for (index, table) in manifest.tables.iter().enumerate() {
+        if let (true, None, Some(piece)) = (
+            defines,
+            definitions.get(index).copied().flatten(),
+            table.files.first(),
+        ) {
+            let mut command = job.file_command(&piece.file)?;
+            command.script_check = None;
+            alone.push_back(Stage::Side(vec![Job {
+                file: piece.file.clone(),
+                label: table.table.clone(),
+                command,
+            }]));
+        }
+    }
+    let wholes = if stopped.is_none() && !alone.is_empty() {
+        on_line(format!(
+            "Kerno: {} of the tables' first files run whole, each on a connection of its own, \
+             one after the other: Kerno could not find where their definition ends.",
+            alone.len()
+        ));
+        let wholes = run_pool(vec![alone], 1, on_line.clone(), cancel, None, false).await;
+        if let Some(failure) = &wholes.failure {
+            stopped = Some(Err(failure.clone()));
+        } else if wholes.cancelled {
+            stopped = Some(Ok(()));
+        }
+        wholes
+    } else {
+        PoolEnd::default()
+    };
     // Each table's rows, side by side: the first file without its
-    // definition (a file whose definition Kerno could not find ran whole
-    // above), then its ranges.
+    // definition (one that ran whole above is not run again), then its
+    // ranges.
     let mut groups = Vec::new();
     let mut ran_whole = Vec::new();
     for (index, table) in manifest.tables.iter().enumerate() {
@@ -2317,18 +2565,22 @@ async fn restore_in(
                             StdinPart::File {
                                 path: path.clone(),
                                 range: 0..definition.start,
+                                counted: true,
                             },
                             StdinPart::File {
                                 path,
                                 range: definition.end..definition.len,
+                                counted: true,
                             },
                         ];
                     }
-                    // Nothing but the definition, or all of it ran.
-                    _ => {
+                    // Nothing but the definition, which ran.
+                    Some(_) => {
                         ran_whole.push((index, piece.file.clone()));
                         continue;
                     }
+                    // Run whole above.
+                    None => continue,
                 }
             }
             let file = Job {
@@ -2379,12 +2631,14 @@ async fn restore_in(
     } else {
         (PoolEnd::default(), None)
     };
-    // A file that ran whole with the definitions is in.
+    // A file that is only its definition is in once that ran; a file run
+    // whole is as its run ended.
     for (index, file) in ran_whole {
         if defined.contains(&index) {
             tables.states.insert(file, FileState::Done);
         }
     }
+    tables.states.extend(wholes.states);
     let failure = match &stopped {
         Some(Err(failure)) => Some(failure.clone()),
         _ => tables
@@ -2431,6 +2685,8 @@ async fn restore_in(
         ))),
         None => {
             on_line(format!("Kerno: {summary}"));
+            // For the dialog's own words after a cancel (F3).
+            *stopped_said = Some(summary);
             Err(Error::Cancelled)
         }
     }
@@ -2473,7 +2729,7 @@ fn restore_summary(
             loaded_by_files(manifest, tables)
         );
     }
-    let list = |names: &[String]| names.join(", ");
+    let list = capped;
     let (mut whole, mut partly, mut empty, mut missing, mut kept, mut unsure) = (
         Vec::new(),
         Vec::new(),
@@ -2500,10 +2756,11 @@ fn restore_summary(
         match now {
             _ if done => whole.push(name),
             Some(Now::Missing) => missing.push(name),
+            // Empty is empty, whether or not its marker came back (L2).
+            Some(Now::Empty) => empty.push(name),
             // Neither its definition nor its rows ran (the definition that
             // failed may have stopped before its DROP).
-            Some(_) if !started => kept.push(name),
-            Some(Now::Empty) => empty.push(name),
+            Some(Now::Rows) if !started => kept.push(name),
             Some(Now::Rows) => partly.push(name),
             None => unsure.push(name),
         }
@@ -2558,6 +2815,20 @@ fn restore_summary(
     text
 }
 
+/// `names` in a message: the first ten, then how many more (F1).
+fn capped(names: &[String]) -> String {
+    const SHOWN: usize = 10;
+    if names.len() > SHOWN {
+        format!(
+            "{} and {} more",
+            names[..SHOWN].join(", "),
+            names.len() - SHOWN
+        )
+    } else {
+        names.join(", ")
+    }
+}
+
 /// The tables a stopped restore loaded, partly loaded and did not start,
 /// as its files' states say, for a restore that dropped nothing first.
 fn loaded_by_files(manifest: &Manifest, tables: &PoolEnd) -> String {
@@ -2585,7 +2856,7 @@ fn loaded_by_files(manifest: &Manifest, tables: &PoolEnd) -> String {
         if names.is_empty() {
             "none".to_string()
         } else {
-            names.join(", ")
+            capped(names)
         }
     };
     format!(
@@ -3481,6 +3752,28 @@ mod tests {
                 Some("INSERT  IGNORE INTO"),
             ),
             ("57-nothing.sql", "DROP TABLE IF EXISTS `nothing`;", None),
+            // A table and a column whose names hold a newline and the end
+            // line (F2): mysqldump writes names raw.
+            (
+                "84-newline-table.sql",
+                "DROP TABLE IF EXISTS `t\n",
+                Some("INSERT INTO `t\n"),
+            ),
+            (
+                "84-newline-column.sql",
+                "DROP TABLE IF EXISTS `plain`;",
+                Some("INSERT INTO `plain`"),
+            ),
+            (
+                "maria-newline-table.sql",
+                "DROP TABLE IF EXISTS `t\n",
+                Some("INSERT INTO `t\n"),
+            ),
+            (
+                "maria-newline-column.sql",
+                "DROP TABLE IF EXISTS `plain`;",
+                Some("INSERT INTO `plain`"),
+            ),
         ] {
             let path = folder.join(file);
             let text = std::fs::read_to_string(&path).unwrap();
@@ -3499,6 +3792,8 @@ mod tests {
             assert!(definition.starts_with(opens), "{file}: {definition}");
             assert!(definition.ends_with(end), "{file}: {definition}");
             assert!(definition.contains("\nCREATE TABLE `"), "{file}");
+            // The whole CREATE TABLE, its last line included.
+            assert!(definition.contains("\n) ENGINE="), "{file}: {definition}");
             for word in ["DROP TABLE", "CREATE TABLE", "INSERT", "LOCK TABLES"] {
                 assert!(!before.contains(word), "{file}: {word} before");
             }
@@ -3536,10 +3831,76 @@ mod tests {
             "ERROR 1050 (42S01) at line 23 of 0002-b.sql: Table 'b' already exists"
         );
         assert_eq!(in_its_file(said, None, "0002-b.sql"), said);
+        // A server error quoting several lines is said by its ERROR line,
+        // not by the last line it quoted (L1).
+        let mut heard = Said::default();
+        for line in [
+            "ERROR 1064 (42000) at line 3: You have an error near 'x",
+            "SELECT 'kerno-defi' at line 1",
+            "",
+        ] {
+            heard.hear(line);
+        }
+        assert_eq!(
+            heard.last().as_deref(),
+            Some("ERROR 1064 (42000) at line 3: You have an error near 'x")
+        );
+        let mut heard = Said::default();
+        heard.hear("mysqldump: Got error: 1044");
+        assert_eq!(heard.last().as_deref(), Some("mysqldump: Got error: 1044"));
         assert_eq!(
             in_its_file("ERROR 2013: lost", Some(1), "x.sql"),
             "ERROR 2013: lost"
         );
+    }
+
+    /// K74, F4: options that change what the mysql client prints are
+    /// refused for a folder restore, in every spelling; the others pass.
+    #[test]
+    fn a_folder_restore_refuses_what_changes_the_client_s_output() {
+        for refused in [
+            "--table",
+            "--tab",
+            "--xml",
+            "--html",
+            "--vertical",
+            "--loose-vertical",
+            "--auto-vertical-output",
+            "--silent",
+            "--verbose",
+            "--column-type-info",
+            "--vert",
+            "-t",
+            "-X",
+            "-H",
+            "-E",
+            "-s",
+            "-vv",
+            "-m",
+            "-Ns",
+            "--force -t",
+        ] {
+            let why = restore_refusal(refused).unwrap_or_else(|| panic!("{refused} let through"));
+            assert!(
+                why.contains("changes what the mysql client prints"),
+                "{why}"
+            );
+        }
+        for taken in [
+            "",
+            "--force",
+            "--skip-column-names",
+            "-N",
+            "--show-warnings",
+            "--tee=/tmp/x",
+            "--default-character-set=utf8mb4",
+            "-hlocalhost",
+            "-utest",
+            "--max-allowed-packet=1G",
+            "--version-check",
+        ] {
+            assert_eq!(restore_refusal(taken), None, "{taken}");
+        }
     }
 
     /// K74: a stopped restore of a backup that defines its tables says
@@ -3582,13 +3943,40 @@ mod tests {
              start."
         );
         // The second definition failed after its DROP: the first table is
-        // empty, the second missing, the others as they were, rows and all.
+        // empty, the second missing, the third as it was, rows and all; the
+        // fourth is empty, and said so although its definition is not known
+        // to have run (L2: a table created whose marker never came back).
         let read = reached(&["big"], [Now::Empty, Now::Missing, Now::Rows, Now::Empty]);
         let text = restore_summary(&manifest, "db", &PoolEnd::default(), None, &read);
         assert!(
             text.starts_with(
-                "Loaded: none. Empty now: “big”. Missing now: “big no key”. Not loaded, as they \
-                 were before: “small”, “tiny/odd”."
+                "Loaded: none. Empty now: “big”, “tiny/odd”. Missing now: “big no key”. Not \
+                 loaded, as they were before: “small”."
+            ),
+            "{text}"
+        );
+        // A long list is cut, with how many more (F1).
+        let mut long = manifest.clone();
+        let one = long.tables[0].clone();
+        long.tables = (0..25)
+            .map(|at| TableFiles {
+                table: format!("t{at:02}"),
+                ..one.clone()
+            })
+            .collect();
+        let none = Reached {
+            defined: BTreeSet::new(),
+            dropped: Dropped::Read(
+                (0..25)
+                    .map(|at| (format!("t{at:02}"), Now::Missing))
+                    .collect(),
+            ),
+        };
+        let text = restore_summary(&long, "db", &PoolEnd::default(), None, &none);
+        assert!(
+            text.starts_with(
+                "Loaded: none. Missing now: “t00”, “t01”, “t02”, “t03”, “t04”, “t05”, “t06”, \
+                 “t07”, “t08”, “t09” and 15 more."
             ),
             "{text}"
         );
