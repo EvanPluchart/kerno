@@ -76,11 +76,17 @@ et suivantes). Les bibliothèques nécessaires et les options de l'AppImage sont
 
 ### Windows (x86_64, aperçu)
 
-`kerno-<version>-windows-x86_64.zip` : décompressez-le et lancez `kerno.exe` ; il n'y a rien d'autre à
-installer. C'est un aperçu : l'application démarre et dessine sa fenêtre, mais personne ne l'a encore utilisée
-sous Windows. Elle n'y vérifie pas les mises à jour, et le tunnel par l'OpenSSH du système, les outils de
-sauvegarde locaux et `~/.pgpass` n'y sont pas encore disponibles ; la suite est dans la
-[feuille de route](docs/ROADMAP.md).
+`Kerno-<version>-windows-x86_64-setup.exe` installe Kerno pour votre compte seulement, sans droits
+d'administrateur, avec une entrée dans le menu Démarrer et un désinstalleur.
+`kerno-<version>-windows-x86_64.zip` est la même application sans rien installer : décompressez-le et lancez
+`kerno.exe`. Windows peut signaler un éditeur inconnu (SmartScreen : **Informations complémentaires**, puis
+**Exécuter quand même**) : les fichiers ne sont pas signés.
+
+C'est un aperçu : ses tests tournent sous Windows contre de vrais serveurs PostgreSQL et MySQL à chaque
+changement, et l'installeur comme la mise à jour y sont essayés par des scripts, mais personne ne l'a encore
+utilisé à la main sur un bureau Windows. Kerno y vérifie les mises à jour et les installe ; vos `pg_dump` et
+`mysqldump` installés, le `pgpass.conf` de libpq et l'OpenSSH du système servent comme sur les autres
+systèmes. Ce qui reste est dans la [feuille de route](docs/ROADMAP.md).
 
 ## Premiers pas
 
@@ -299,9 +305,9 @@ test sont décrites dans le [guide](docs/GUIDE.md#build-from-source).
 
 ## État du projet
 
-Version 2026.11.3. Elle couvre PostgreSQL, MySQL, MariaDB et SQLite sous macOS (Apple
-Silicon) et Linux (x86_64 et arm64). D'autres moteurs, la comparaison de données et d'autres fonctions sont
-sur la [feuille de route](docs/ROADMAP.md).
+Version 2026.11.4. Elle couvre PostgreSQL, MySQL, MariaDB et SQLite sous macOS (Apple
+Silicon), Linux (x86_64 et arm64) et, en aperçu, Windows (x86_64). D'autres moteurs, la comparaison de
+données et d'autres fonctions sont sur la [feuille de route](docs/ROADMAP.md).
 
 ## Licence
 

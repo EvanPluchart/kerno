@@ -72,10 +72,16 @@ libraries they need and the AppImage's options are in the [guide](docs/GUIDE.md#
 
 ### Windows (x86_64, preview)
 
-`kerno-<version>-windows-x86_64.zip`: unpack it and run `kerno.exe`; there is nothing else to install. It is a
-preview: the app starts and draws its window, but nobody has used it on Windows yet. It does not check for
-updates there, and the tunnel through the system's OpenSSH, the local backup tools and `~/.pgpass` are not
-available yet; what comes next is on the [roadmap](docs/ROADMAP.md).
+`Kerno-<version>-windows-x86_64-setup.exe` installs Kerno for your account only, without administrator rights,
+with a Start menu entry and an uninstaller. `kerno-<version>-windows-x86_64.zip` is the same app with nothing to
+install: unpack it and run `kerno.exe`. Windows may warn about an unknown publisher (SmartScreen: **More info**,
+then **Run anyway**): the files are not signed.
+
+It is a preview: its tests run on Windows against real PostgreSQL and MySQL servers at every change, and the
+installer and the update are tried there by scripts, but nobody has used it by hand on a Windows desktop yet.
+Kerno checks for updates there and installs them; your installed `pg_dump` and `mysqldump`, libpq's
+`pgpass.conf` and the system's OpenSSH are used as on the other systems. What is left is on the
+[roadmap](docs/ROADMAP.md).
 
 ## First steps
 
@@ -277,9 +283,9 @@ the local checks and the test databases are described in the [guide](docs/GUIDE.
 
 ## Status
 
-Version 2026.11.3. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon) and Linux
-(x86_64 and arm64); MySQL from 5.1 on, with what each old release lacks said in the
-[guide](docs/GUIDE.md#supported-servers). Other engines, data compare and more are on the
+Version 2026.11.4. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon), Linux
+(x86_64 and arm64) and, as a preview, Windows (x86_64); MySQL from 5.1 on, with what each old release lacks
+said in the [guide](docs/GUIDE.md#supported-servers). Other engines, data compare and more are on the
 [roadmap](docs/ROADMAP.md).
 
 ## Licence

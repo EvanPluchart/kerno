@@ -4402,7 +4402,7 @@ dependencies = [
 
 [[package]]
 name = "kerno"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "kerno-core"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm",
@@ -4467,7 +4467,7 @@ dependencies = [
 
 [[package]]
 name = "kerno-mysql"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "async-trait",
  "kerno-core",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "kerno-postgres"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "kerno-sqlite"
-version = "2026.11.3"
+version = "2026.11.4"
 dependencies = [
  "async-trait",
  "kerno-core",

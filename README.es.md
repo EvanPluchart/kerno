@@ -75,11 +75,17 @@ posteriores). Las bibliotecas que necesitan y las opciones del AppImage están e
 
 ### Windows (x86_64, vista previa)
 
-`kerno-<version>-windows-x86_64.zip`: descomprímelo y ejecuta `kerno.exe`; no hay nada más que instalar. Es una
-vista previa: la aplicación arranca y dibuja su ventana, pero nadie la ha usado todavía en Windows. Allí no
-comprueba las actualizaciones, y el túnel por el OpenSSH del sistema, las herramientas locales de copia de
-seguridad y `~/.pgpass` aún no están disponibles; lo que viene después está en la
-[hoja de ruta](docs/ROADMAP.md).
+`Kerno-<version>-windows-x86_64-setup.exe` instala Kerno solo para tu cuenta, sin derechos de administrador,
+con una entrada en el menú Inicio y un desinstalador. `kerno-<version>-windows-x86_64.zip` es la misma
+aplicación sin instalar nada: descomprímelo y ejecuta `kerno.exe`. Windows puede avisar de un editor
+desconocido (SmartScreen: **Más información** y luego **Ejecutar de todas formas**): los archivos no están
+firmados.
+
+Es una vista previa: sus pruebas se ejecutan en Windows contra servidores PostgreSQL y MySQL reales en cada
+cambio, y el instalador y la actualización se prueban allí con scripts, pero nadie la ha usado todavía a mano
+en un escritorio de Windows. Kerno comprueba allí las actualizaciones y las instala; tus `pg_dump` y
+`mysqldump` instalados, el `pgpass.conf` de libpq y el OpenSSH del sistema se usan como en los demás
+sistemas. Lo que queda está en la [hoja de ruta](docs/ROADMAP.md).
 
 ## Primeros pasos
 
@@ -293,8 +299,9 @@ empaquetado, las comprobaciones locales y las bases de datos de prueba se descri
 
 ## Estado
 
-Versión 2026.11.3. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon) y Linux
-(x86_64 y arm64). Otros motores, la comparación de datos y más están en la [hoja de ruta](docs/ROADMAP.md).
+Versión 2026.11.4. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon), Linux
+(x86_64 y arm64) y, como vista previa, Windows (x86_64). Otros motores, la comparación de datos y más están
+en la [hoja de ruta](docs/ROADMAP.md).
 
 ## Licencia
 

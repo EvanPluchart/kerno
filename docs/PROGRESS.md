@@ -2066,3 +2066,17 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   "Imported …" in the success colour and draws its "To check" notes in the warning colour, as the preview does.
   M12's K80; UI tests in `ui_tests/k80.rs`, each seen failing without its part; headless captures light and
   dark looked at.
+
+## 2026-11-25 — 2026.11.4 prepared
+
+- The owner's eleven picks of 2026-11-24 are in: a faster release (C2), Windows 3a (K67), 3b (K68), 3c (K70)
+  and the tunnel through the system's OpenSSH there (K69), the faster MySQL/MariaDB backup and restore (K63),
+  the tests that failed now and then (K71), the designed disk image (K73), test data for a table (K72).
+- Four passes in the real app on macOS found what the tests had not: a folder restore that deadlocked into a
+  full database (K74), a tree left on closed sessions by Reconnect and the Read-only switch (K75), the test
+  data dialog's layout and its seed (K76), a tree that lost its place and an import with nothing to import
+  (K77), a backup whose trigger names its database restored into another one (K78); and the CI's runners
+  found a tool runner that could lose a read error (K79).
+- Version 2026.11.4, its notes (`docs/release-notes/v2026.11.4.md`) and the READMEs' Windows section (the
+  installer, the update from the app, what is still a preview). The tag `v2026.11.4` makes `release.yml`
+  build the ten files and open a draft; publishing waits for the owner, who tries the draft first.
