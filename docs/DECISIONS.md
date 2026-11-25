@@ -4585,8 +4585,10 @@ was ported, `THIRD_PARTY_NOTICES.md` is unchanged, and the word lists were writt
   made, each set's values are remembered and a row whose values are taken is drawn again (up to 100 times);
   text compares without case, as a `_ci` collation would. A unique text ends with a number counted from the
   table's row count + 1, so it never repeats and does not meet the rows already there; a sequence starts after
-  the table's largest value. UUIDs are random: the same seed run twice on the same table makes the same UUIDs,
-  and a unique UUID column then refuses the second run (said by the server, nothing kept).
+  the table's largest value. Amended by K76: every value of a unique set (UUIDs, random numbers, dates, the
+  pairs of a junction table) is drawn for its row's number after the rows already in the table, so the same
+  seed run twice on the same table no longer makes the first run's keys again (it did, and the server refused
+  the second run).
 - **Foreign keys.** The referenced table's distinct keys are read once, the first 10,000 in key order (said
   when there are more), and a row picks one; a key of several columns is picked whole. A table that references
   itself picks among the rows already there. An empty referenced table: the column is NULL when it may be,
@@ -4617,6 +4619,42 @@ was ported, `THIRD_PARTY_NOTICES.md` is unchanged, and the word lists were writt
   across columns (a city of its country, an end after its start); saving the settings or a task; generated
   values for types Kerno has no kind for (geometry, ranges, `inet`, …: NULL where allowed, else refused in
   words); MySQL `TIMESTAMP` values are written as wall times in the session's zone.
+
+**Amended by K76 (2026-11-25), after a pass in the real app:**
+
+- **What the seed promises.** The dialog said "the same settings give the same rows"; a second run with the
+  same seed inserted unique values that carried on after the rows already there ("…mo1" then "…m51"). That is
+  right (a refusal would be worse), the sentence was not. It now says: the same settings give the same rows,
+  except values that must be unique, which continue after the rows already in the table (the dialog, the
+  script's heading, the guide). Made exact in the core: a column of a unique set draws its values for the
+  row's number plus the table's row count (a sequence keeps its start, which is its setting), and only those
+  columns are drawn again when a row repeats a key; every other value is the one an empty table would get.
+  So on an empty table the same settings give the same rows, retries included, and on a table that holds
+  them the same settings insert again.
+- **The last settings per table** (connection, database, table) are kept in memory for the run of the app,
+  never in the store: the rows, the seed, each column's kind, settings and NULL share. The dialog opens on
+  them while the table has the same columns and each still accepts its kind, else on the guess. A setting left
+  as it started takes the value it starts with now (a sequence from the largest key there now); one the user
+  typed stays. New seed is the way to other rows.
+- **SQLite's dates in text.** A SQLite text column whose default is a date or a time (`CURRENT_TIMESTAMP`,
+  `CURRENT_DATE`, `CURRENT_TIME`, `datetime(…)`, `date(…)`, `time(…)`, a literal date) or whose name says so
+  (`*_at`, `timestamp`; `*_date`, `date`; `time`) is guessed as a date and time, a date or a time of day, and
+  left to its default when it has one; every SQLite text column offers those three kinds, written as SQLite's
+  `CURRENT_TIMESTAMP` writes them. The default's entry keeps its K72 label, "Leave to the default"; no choice
+  was added. Other engines are unchanged: their date columns have date types, and a column with a default is
+  still guessed from its type there.
+- **The layout** fits the window's smallest size (720 × 440): the column's name takes a fifth of a line and is
+  cut first, the kind 220 points (its longest label whole), the settings what is left, NULL % 48 points; the
+  body scrolls and the buttons stay in view. A disabled NULL % field is drawn as a disabled button is (the
+  theme's muted background, its border at half), because the kit's disabled field looks enabled in the dark
+  theme. The CHECK a note names stays the catalog's text, as the server prints it.
+- **Tooltips over a dialog.** GPUI shows an element's `.tooltip(…)` after the pointer rests on it, and a click
+  while it waits does not cancel it: a click on the tree's "N databases hidden" line opened the connection's
+  dialog and the tooltip appeared over it, until the pointer left the line's place beneath. Kerno's tooltips
+  on plain elements of the tree now come from one helper (`tip.rs`) whose view draws nothing once a dialog is
+  open, and stays hidden after. It serves elements outside dialogs only (it would hide a tooltip inside one);
+  the kit's buttons manage theirs. Converted: the six of the tree (`navigator/view.rs`); the other plain
+  tooltips (tabs, grid cells, the status bar) open no dialog on a click and are left as they were.
 
 
 ## D-140 — The tests that failed now and then: fixed where the wrong thing happens (K71; 2026-11-24)

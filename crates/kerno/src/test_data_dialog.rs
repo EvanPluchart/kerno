@@ -10,6 +10,7 @@
 //! (production twice), and inserts every row in one transaction, with
 //! progress and Cancel, or none.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,6 +42,52 @@ use crate::workspace::Workspace;
 
 /// Rows of the first `INSERT` the confirmation shows.
 const SHOWN_ROWS: usize = 3;
+
+/// A column line's share for the column's name, and the widths of its kind
+/// (the longest, "A key of the referenced table", whole) and of its NULL %.
+const NAME_SHARE: f32 = 0.2;
+const KIND_WIDTH: f32 = 220.;
+const NULLS_WIDTH: f32 = 48.;
+
+/// What the dialog says the seed does (K76: values that must be unique are
+/// drawn after the rows already there, so a second run does not repeat them).
+const SAME_ROWS: &str = "The same settings give the same rows, except values that must be \
+                         unique, which continue after the rows already in the table.";
+
+/// The last settings of each table, for the run of the app (K76, in memory
+/// only): the dialog opens on them again, its seed included; New seed is the
+/// way to other rows.
+#[derive(Default)]
+struct Kept(HashMap<(String, Option<String>, TableRef), Last>);
+
+impl gpui_kit::Global for Kept {}
+
+#[derive(Clone)]
+struct Last {
+    settings: Settings,
+    /// The columns' names when kept: a table changed since gets the guess.
+    names: Vec<String>,
+    /// Each column's settings as its kind started then: a setting left as it
+    /// was takes the one it starts with now (a sequence from the largest key
+    /// there now).
+    started: Vec<ColumnSettings>,
+}
+
+/// The key of a table's kept settings: its connection, its database (the
+/// connection's own when the place names none, so that the tree, a data tab
+/// and the palette find the same settings) and the table.
+fn kept_key(
+    connections: &Entity<Connections>,
+    target: &Target,
+    table: &TableRef,
+    cx: &App,
+) -> (String, Option<String>, TableRef) {
+    let database = target.database.clone().or_else(|| {
+        let saved = connections.read(cx).get(&target.connection)?;
+        saved.config.database.clone()
+    });
+    (target.connection.clone(), database, table.clone())
+}
 
 /// One column's line.
 struct Line {
@@ -86,6 +133,9 @@ pub struct TestDataDialog {
     cancel: Arc<AtomicBool>,
     /// The session of the insert while it runs, to cancel its statement.
     session: Option<Arc<dyn Session>>,
+    /// The table's last valid settings in this run of the app, until the
+    /// table is read.
+    last: Option<Last>,
     tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -119,7 +169,8 @@ pub fn open(
             .title(SharedString::from(title.clone()))
             .w(px(940.))
             .on_ok(|_, _, _| false)
-            .content(move |content, _, _| content.child(view.clone()))
+            // The body scrolls in a short window; the buttons stay in view (K76).
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
     Some(view)
 }
@@ -146,9 +197,17 @@ impl TestDataDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let rows = cx.new(|cx| InputState::new(window, cx).default_value("100"));
-        let seed = cx
-            .new(|cx| InputState::new(window, cx).default_value(test_data::new_seed().to_string()));
+        let key = kept_key(&connections, &target, &table, cx);
+        let last = cx
+            .try_global::<Kept>()
+            .and_then(|kept| kept.0.get(&key))
+            .cloned();
+        let (rows, seed) = match &last {
+            Some(last) => (last.settings.rows, last.settings.seed),
+            None => (100, test_data::new_seed()),
+        };
+        let rows = cx.new(|cx| InputState::new(window, cx).default_value(rows.to_string()));
+        let seed = cx.new(|cx| InputState::new(window, cx).default_value(seed.to_string()));
         let subscriptions = [&rows, &seed]
             .map(|input| {
                 cx.subscribe(input, |this, _, event: &InputEvent, cx| {
@@ -174,6 +233,7 @@ impl TestDataDialog {
             step: Step::Settings,
             cancel: Arc::new(AtomicBool::new(false)),
             session: None,
+            last,
             tasks: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -215,10 +275,53 @@ impl TestDataDialog {
         }));
     }
 
-    /// One line per column, as guessed.
+    /// The key of the table's kept settings.
+    fn key(&self, cx: &App) -> (String, Option<String>, TableRef) {
+        kept_key(&self.connections, &self.target, &self.table, cx)
+    }
+
+    /// The columns' kept settings, if the table still has those columns and
+    /// they can still get those kinds.
+    fn kept_columns(&mut self, facts: &Facts) -> Option<Vec<ColumnSettings>> {
+        let last = self.last.take()?;
+        let names: Vec<String> = facts
+            .structure
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let fits = last.names == names
+            && (last.settings.columns.iter().enumerate())
+                .all(|(index, line)| test_data::kinds(facts, index).contains(&line.kind));
+        fits.then(|| {
+            (last.settings.columns.iter().zip(&last.started).enumerate())
+                .map(|(index, (line, then))| {
+                    let now = test_data::defaults(facts, index, line.kind);
+                    ColumnSettings {
+                        from: if line.from == then.from {
+                            now.from
+                        } else {
+                            line.from.clone()
+                        },
+                        to: if line.to == then.to {
+                            now.to
+                        } else {
+                            line.to.clone()
+                        },
+                        ..line.clone()
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// One line per column: as kept from the last time, or as guessed.
     fn take_facts(&mut self, facts: Facts, window: &mut Window, cx: &mut Context<Self>) {
         let mut lines = Vec::new();
-        for line in test_data::guess(&facts) {
+        let columns = self
+            .kept_columns(&facts)
+            .unwrap_or_else(|| test_data::guess(&facts));
+        for line in columns {
             let [from, to, nulls] = [line.from, line.to, line.nulls.to_string()].map(|text| {
                 let input = cx.new(|cx| InputState::new(window, cx).default_value(text));
                 self._subscriptions.push(cx.subscribe(
@@ -295,6 +398,17 @@ impl TestDataDialog {
                 return;
             }
         };
+        let last = Last {
+            names: (facts.structure.columns.iter())
+                .map(|c| c.name.clone())
+                .collect(),
+            started: (settings.columns.iter().enumerate())
+                .map(|(index, line)| test_data::defaults(&facts, index, line.kind))
+                .collect(),
+            settings: settings.clone(),
+        };
+        let key = self.key(cx);
+        cx.default_global::<Kept>().0.insert(key, last);
         let checking = cx.background_spawn(async move {
             let plan = Plan::new(&facts, &settings)?;
             let rows = plan
@@ -393,9 +507,11 @@ impl TestDataDialog {
             .unwrap_or_default();
         let seed = number(&value(&self.seed, cx)).unwrap_or_default();
         format!(
-            "{} rows of test data for {}.{} on {connection}, seed {seed}.\nWritten by Kerno's \
-             Generate test data; nothing ran. Run the script to insert them;\nswitch the tab to \
-             manual commit first to keep all of them or none.",
+            "{} rows of test data for {}.{} on {connection}, seed {seed}.\nThe same settings \
+             give the same rows, except values that must be unique,\nwhich continue after the \
+             rows already in the table.\nWritten by Kerno's Generate test data; nothing ran. Run \
+             the script to insert them;\nswitch the tab to manual commit first to keep all of \
+             them or none.",
             grouped(plan.rows()),
             self.table.schema,
             self.table.name,
@@ -634,6 +750,16 @@ impl TestDataDialog {
         self.check(cx);
     }
 
+    /// The rows and the seed as typed, and each column's kind; for tests.
+    #[cfg(test)]
+    pub fn typed(&self, cx: &App) -> (String, String, Vec<Kind>) {
+        (
+            value(&self.rows, cx),
+            value(&self.seed, cx),
+            self.lines.iter().map(|line| line.kind).collect(),
+        )
+    }
+
     /// The index of the column `name`; for tests.
     #[cfg(test)]
     pub fn column(&self, name: &str) -> usize {
@@ -650,18 +776,26 @@ impl TestDataDialog {
 
     // Rendering -------------------------------------------------------------------
 
+    /// One line per column. The column's name takes a share of the width and
+    /// the settings what is left, so that a line fits the dialog at the
+    /// window's smallest size with the longest kind and the widest settings
+    /// (K76): only the column's name is cut, never a setting.
     fn render_lines(&self, facts: &Facts, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
+        // A disabled field as a disabled button is drawn: grey, its border
+        // faint (the kit's disabled field looks enabled in the dark theme).
+        let (off_background, off_border) = (theme.muted, theme.input.opacity(0.5));
         let view = cx.entity();
+        let name_width = gpui_kit::relative(NAME_SHARE);
         let header = h_flex()
             .gap_2()
             .text_xs()
             .text_color(muted)
-            .child(div().w(px(220.)).flex_none().child("Column"))
-            .child(div().w(px(220.)).flex_none().child("Values"))
-            .child(div().w(px(250.)).flex_none().child("Settings"))
-            .child(div().w(px(70.)).flex_none().child("NULL %"));
+            .child(div().w(name_width).flex_none().child("Column"))
+            .child(div().w(px(KIND_WIDTH)).flex_none().child("Values"))
+            .child(div().flex_1().min_w_0().child("Settings"))
+            .child(div().w(px(NULLS_WIDTH)).flex_none().child("NULL %"));
         let rows = self.lines.iter().enumerate().map(|(index, line)| {
             let column = &facts.structure.columns[index];
             let offered = test_data::kinds(facts, index);
@@ -688,20 +822,25 @@ impl TestDataDialog {
             let params = line.kind.params();
             let setting = |input: &Entity<InputState>, id: &'static str, name: &'static str| {
                 h_flex()
+                    .flex_1()
+                    .min_w_0()
                     .gap_1()
-                    .child(div().text_xs().text_color(muted).child(name))
+                    .child(div().flex_none().text_xs().text_color(muted).child(name))
                     .child(
                         div()
-                            .w(px(84.))
+                            .flex_1()
+                            .min_w_0()
                             .child(Input::new(input).small().id((id, index))),
                     )
             };
+            let nulls_off =
+                !column.nullable || matches!(line.kind, Kind::Null | Kind::Server | Kind::Default);
             h_flex()
                 .gap_2()
                 .py(px(2.))
                 .child(
                     v_flex()
-                        .w(px(220.))
+                        .w(name_width)
                         .flex_none()
                         .min_w_0()
                         .child(
@@ -720,7 +859,7 @@ impl TestDataDialog {
                         ),
                 )
                 .child(
-                    div().w(px(220.)).flex_none().child(
+                    div().w(px(KIND_WIDTH)).flex_none().child(
                         Button::new(("test-data-kind", index))
                             .small()
                             .outline()
@@ -731,7 +870,7 @@ impl TestDataDialog {
                             .dropdown_menu(menu),
                     ),
                 )
-                .child(h_flex().w(px(250.)).flex_none().gap_2().when_some(
+                .child(h_flex().flex_1().min_w_0().gap_2().when_some(
                     params,
                     |this, [first, second]| {
                         this.child(setting(&line.from, "test-data-from", first))
@@ -739,17 +878,14 @@ impl TestDataDialog {
                     },
                 ))
                 .child(
-                    div().w(px(70.)).flex_none().child(
+                    div().w(px(NULLS_WIDTH)).flex_none().child(
                         Input::new(&line.nulls)
                             .small()
                             .id(("test-data-nulls", index))
-                            .disabled(
-                                !column.nullable
-                                    || matches!(
-                                        line.kind,
-                                        Kind::Null | Kind::Server | Kind::Default
-                                    ),
-                            ),
+                            .disabled(nulls_off)
+                            .when(nulls_off, |input| {
+                                input.bg(off_background).border_color(off_border)
+                            }),
                     ),
                 )
                 .into_any_element()
@@ -760,6 +896,7 @@ impl TestDataDialog {
             .child(
                 v_flex()
                     .id("test-data-columns")
+                    .test_support()
                     .max_h(px(250.))
                     .overflow_y_scroll()
                     .children(rows),
@@ -835,17 +972,20 @@ impl TestDataDialog {
     fn render_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         let (muted, warning) = (theme.muted_foreground, theme.warning);
+        let intro = format!(
+            "Rows made on this computer from the seed. {SAME_ROWS} Keys stay unique, foreign \
+             keys point at rows that exist. Open script writes the statements in a query tab and \
+             runs nothing; Insert asks first, then inserts every row in one transaction, or none."
+        );
         let mut body = vec![
             div()
+                .id("test-data-intro")
+                .test_support()
+                .test_text(intro.clone())
                 .text_sm()
                 .text_color(muted)
                 .whitespace_normal()
-                .child(
-                    "Rows made on this computer from the seed: the same settings give the same \
-                     rows. Keys stay unique, foreign keys point at rows that exist. Open script \
-                     writes the statements in a query tab and runs nothing; Insert asks first, \
-                     then inserts every row in one transaction, or none.",
-                )
+                .child(SharedString::from(intro))
                 .into_any_element(),
             h_flex()
                 .gap_3()
@@ -1002,7 +1142,7 @@ impl Render for TestDataDialog {
         };
         let footer = h_flex().justify_end().gap_2();
         let table = format!("{}.{}", self.table.schema, self.table.name);
-        let body: Vec<AnyElement> = match &self.step {
+        let mut body: Vec<AnyElement> = match &self.step {
             Step::Settings => self.render_settings(cx),
             Step::Running { inserted } => {
                 let total = self.plan().map_or(0, Plan::rows);
@@ -1068,13 +1208,28 @@ impl Render for TestDataDialog {
                 ]
             }
         };
+        // Every step ends with its buttons: they stay below the body, which
+        // scrolls when the window is too short for it.
+        let footer = body.pop();
         v_flex()
             .id("test-data-dialog")
             .test_support()
             .test_text(format!("Generate test data for {table}"))
+            .flex_1()
+            .min_h_0()
             .gap_3()
             .pt_1()
-            .children(body)
+            .child(
+                v_flex()
+                    .id("test-data-body")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap_3()
+                    .children(body),
+            )
+            .children(footer)
     }
 }
 

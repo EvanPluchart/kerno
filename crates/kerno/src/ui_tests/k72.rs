@@ -419,3 +419,208 @@ fn a_sqlite_table_gets_its_rows(cx: &mut TestAppContext) {
     app.close_dialogs(cx);
     app.wait_for_rows(cx, "Rows 1–100 of 100");
 }
+
+/// One answer of a query on the SQLite file, on a session of its own.
+fn on_file(file: &std::path::Path, sql: &str) -> String {
+    use kerno_core::Driver as _;
+    let params = kerno_core::config::ConnectParams {
+        engine: Engine::Sqlite,
+        host: String::new(),
+        port: 0,
+        tunnel: None,
+        user: String::new(),
+        password: None,
+        database: None,
+        file: Some(file.to_path_buf()),
+        tls: Default::default(),
+        read_only: false,
+        options: Default::default(),
+    };
+    let sql = sql.to_string();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let session = kerno_sqlite::SqliteDriver.connect(&params).await.unwrap();
+            let outcome = kerno_core::exec::collect(session.clone(), sql)
+                .await
+                .unwrap();
+            session.close().await;
+            outcome
+                .results
+                .into_iter()
+                .next()
+                .and_then(|result| result.rows().into_iter().next())
+                .and_then(|row| row.into_iter().next().flatten())
+                .unwrap_or_default()
+        })
+}
+
+impl Fixture {
+    /// Insert, confirmed once, until done.
+    fn insert_test_data(&self, cx: &mut TestAppContext, dialog: &Entity<TestDataDialog>) {
+        self.click(cx, "test-data-insert");
+        self.click(cx, "sql-confirm");
+        self.wait_until(cx, "the insert", |app, cx| {
+            !app.test_data_state(cx, dialog).starts_with("running")
+        });
+        assert!(
+            self.test_data_state(cx, dialog).starts_with("done"),
+            "{}",
+            self.test_data_state(cx, dialog)
+        );
+    }
+}
+
+/// K76: the dialog says what the seed does, and it is true: the same seed on the empty table
+/// twice gives the same rows; on the table those rows went into, the values that must be unique
+/// continue after them, so the same settings insert again. The dialog keeps the table's last
+/// settings, seed included, for the run of the app; New seed changes it.
+#[gpui_kit::test]
+fn the_same_seed_gives_the_same_rows_and_the_dialog_keeps_its_settings(cx: &mut TestAppContext) {
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let schema = "kerno_test_k76_ui_same";
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")],
+        &[
+            &format!("CREATE SCHEMA {schema}"),
+            &format!(
+                "CREATE TABLE {schema}.t (id uuid PRIMARY KEY, n integer NOT NULL UNIQUE, \
+                 code text NOT NULL UNIQUE, name text, qty integer NOT NULL)"
+            ),
+        ],
+    );
+    let rows = || {
+        on_server(
+            Engine::Postgres,
+            &format!(
+                "SELECT string_agg(concat_ws('|', id, n, code, coalesce(name, 'NULL'), qty), ',' \
+                 ORDER BY n) FROM {schema}.t"
+            ),
+        )
+    };
+    let distinct = |column: &str| {
+        on_server(
+            Engine::Postgres,
+            &format!("SELECT count(DISTINCT {column}) FROM {schema}.t"),
+        )
+    };
+    let app = connected(cx, Engine::Postgres);
+    let dialog = app.test_data(cx, schema);
+    let intro = drawn(&app, cx)
+        .into_iter()
+        .find(|text| text.starts_with("Rows made on this computer"))
+        .expect("the dialog's first words");
+    assert!(
+        intro.contains(
+            "The same settings give the same rows, except values that must be unique, which \
+             continue after the rows already in the table."
+        ),
+        "{intro}"
+    );
+    app.type_test_data(cx, &dialog, "rows", "", "20");
+    app.type_test_data(cx, &dialog, "seed", "", "4242");
+    app.type_test_data(cx, &dialog, "from", "qty", "1");
+    app.type_test_data(cx, &dialog, "to", "qty", "9");
+    let kinds = cx.update(|cx| dialog.read(cx).typed(cx)).2;
+    app.insert_test_data(cx, &dialog);
+    let first = rows();
+    assert_eq!(first.split(',').count(), 20);
+    app.close_dialogs(cx);
+
+    // Opened again on the emptied table: the same settings, the same rows.
+    on_server(Engine::Postgres, &format!("TRUNCATE {schema}.t"));
+    let dialog = app.test_data(cx, schema);
+    assert_eq!(
+        cx.update(|cx| dialog.read(cx).typed(cx)),
+        ("20".to_string(), "4242".to_string(), kinds)
+    );
+    let (names, preview) = app.test_data_preview(cx, &dialog);
+    let qty = names
+        .iter()
+        .position(|n| n == "qty")
+        .expect("the qty column");
+    for row in preview {
+        assert!(
+            (1..=9).contains(&row[qty].parse::<i32>().unwrap()),
+            "{row:?}"
+        );
+    }
+    app.insert_test_data(cx, &dialog);
+    assert_eq!(rows(), first);
+    app.close_dialogs(cx);
+
+    // Again on the table those rows are in: the keys continue after them, the sequence from
+    // the largest number there now (its start was left as guessed).
+    let dialog = app.test_data(cx, schema);
+    app.insert_test_data(cx, &dialog);
+    for column in ["id", "n", "code"] {
+        assert_eq!(distinct(column), "40", "{column}");
+    }
+    assert_eq!(
+        on_server(Engine::Postgres, &format!("SELECT max(n) FROM {schema}.t")),
+        "40"
+    );
+    app.close_dialogs(cx);
+    // The tree's entry finds the same settings.
+    let path = ["kerno", schema, "Tables", "t"];
+    app.open_path(cx, &path);
+    app.act(cx, Action::GenerateTestData, &path);
+    assert!(app.shows_test_data(cx, schema));
+    let seed = app.step(cx, |window, _| {
+        window.find("test-data-seed").value().map(str::to_string)
+    });
+    assert_eq!(seed.as_deref(), Some("4242"));
+    app.close_dialogs(cx);
+    // New seed: other rows.
+    let dialog = app.test_data(cx, schema);
+    assert_eq!(cx.update(|cx| dialog.read(cx).typed(cx)).1, "4242");
+    app.click(cx, "test-data-new-seed");
+    assert_ne!(cx.update(|cx| dialog.read(cx).typed(cx)).1, "4242");
+}
+
+/// K76: a SQLite text column that holds a date: left to its default when it has one, else a
+/// date by its name; the rows go in with the server's timestamps and the dates drawn.
+#[gpui_kit::test]
+fn a_sqlite_text_column_of_dates_gets_dates_or_its_default(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kerno_test_k76.db");
+    assert!(kerno_sqlite::new_database_file(&file).unwrap());
+    on_file(
+        &file,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT CURRENT_TIMESTAMP, \
+         due_date TEXT, note TEXT)",
+    );
+    let app = connected_as(cx, super::sqlite::file_config(&file));
+    let dialog = app.test_data(cx, "main");
+    assert_eq!(
+        cx.update(|cx| dialog.read(cx).typed(cx)).2,
+        [Kind::Server, Kind::Default, Kind::Date, Kind::Words]
+    );
+    assert_eq!(app.test_data_preview(cx, &dialog).0, ["due_date", "note"]);
+    app.insert_test_data(cx, &dialog);
+    assert_eq!(
+        on_file(
+            &file,
+            "SELECT count(*) FROM t WHERE created_at GLOB \
+             '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'"
+        ),
+        "100"
+    );
+    assert_eq!(
+        on_file(
+            &file,
+            "SELECT count(*) FROM t WHERE due_date IS NULL OR due_date GLOB \
+             '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
+        ),
+        "100"
+    );
+    assert_ne!(
+        on_file(&file, "SELECT count(DISTINCT due_date) FROM t"),
+        "1"
+    );
+}

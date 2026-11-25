@@ -59,6 +59,7 @@ mod tabs;
 mod tasks_view;
 mod test_data_dialog;
 mod theme;
+mod tip;
 mod transfer_dialog;
 #[cfg(test)]
 mod ui_tests;

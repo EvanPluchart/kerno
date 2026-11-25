@@ -825,12 +825,17 @@ where the type keeps one); UUIDs; a small JSON object; one of an enum's or a `SE
 bits; arrays of up to three elements. A **foreign key** picks keys that exist in the referenced table (a key of
 several columns as a whole, among its first 10,000 keys). Columns the server makes (generated, identity,
 auto-increment) are left to it; a column with a default can be left to its default; a nullable column gets a
-**share of NULL** (10 % by default outside the keys). Pick another kind with the button of its line; the
-settings change with it.
+**share of NULL** (10 % by default outside the keys). On SQLite, which keeps dates as text, a text column whose
+default is a date or a time (`CURRENT_TIMESTAMP`, `datetime('now')`, …) is left to that default, and one named
+like a date (`created_at`, `due_date`, `date`, `time`, `timestamp`) gets dates or times written as SQLite
+writes them. Pick another kind with the button of its line; the settings change with it.
 
-Every value comes from the **seed**: the same seed and settings give the same rows, New seed gives others. Keys
-stay unique: a sequence never repeats, a unique text ends with a number beyond the rows there, and other values
-are drawn again until they differ (compared without case, as a case-insensitive server would). What cannot
+Every value comes from the **seed**: the same settings give the same rows, except values that must be unique,
+which continue after the rows already in the table. So the same seed on an empty table gives the same rows
+each time, and on a table that already holds them it inserts again without repeating a key. New seed gives
+other rows. The dialog keeps each table's last settings, seed included, until Kerno quits. Keys stay unique: a
+sequence never repeats, a unique text ends with a number beyond the rows there, and other values are drawn
+again until they differ (compared without case, as a case-insensitive server would). What cannot
 work is said before anything runs: a range the type cannot hold, more rows than a unique column has values for,
 a referenced table without rows, a MySQL `TIMESTAMP` outside 1970 to 2038. Rules Kerno does not check (a
 `CHECK`, an exclusion constraint, a partial unique index) are listed under the columns: a row that breaks one

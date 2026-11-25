@@ -852,6 +852,10 @@ pub fn kinds(facts: &Facts, column: usize) -> Vec<Kind> {
         kinds.push(Kind::Reference);
     }
     kinds.extend(type_kinds(info));
+    // SQLite keeps dates and times as text (K76).
+    if facts.engine == Engine::Sqlite && info.kind == TypeKind::Text {
+        kinds.extend([Kind::Date, Kind::DateTime, Kind::Time]);
+    }
     if info.default.is_some() {
         kinds.push(Kind::Default);
     }
@@ -924,6 +928,16 @@ pub fn guess(facts: &Facts) -> Vec<ColumnSettings> {
                 Kind::Sequence
             } else if info.kind == TypeKind::Integer {
                 Kind::Integer
+            } else if facts.engine == Engine::Sqlite
+                && info.kind == TypeKind::Text
+                && let Some(kind) = text_time(info)
+            {
+                // A date the server writes is left to it (K76).
+                if info.default.is_some() {
+                    Kind::Default
+                } else {
+                    kind
+                }
             } else if info.kind == TypeKind::Text && named_uuid && offered.contains(&Kind::Uuid) {
                 Kind::Uuid
             } else if info.kind == TypeKind::Text
@@ -958,6 +972,41 @@ pub fn guess(facts: &Facts) -> Vec<ColumnSettings> {
             }
         })
         .collect()
+}
+
+/// The kind of time a text column holds, from its default (`CURRENT_TIMESTAMP`,
+/// `datetime('now')`, a literal date) or else its name (`created_at`,
+/// `birth_date`, `time`): SQLite's way of keeping dates (K76).
+fn text_time(info: &ColumnInfo) -> Option<Kind> {
+    let default = info
+        .default
+        .as_deref()
+        .unwrap_or_default()
+        .trim_matches(|c: char| c == '(' || c == ')' || c == '\'' || c == '"' || c.is_whitespace())
+        .to_ascii_lowercase();
+    let literal_date = default.get(..10).and_then(parse_date).is_some();
+    let by_default = if default == "current_timestamp"
+        || default.starts_with("datetime(")
+        || literal_date && default.len() > 10
+    {
+        Some(Kind::DateTime)
+    } else if default == "current_date" || default.starts_with("date(") || literal_date {
+        Some(Kind::Date)
+    } else if default == "current_time" || default.starts_with("time(") {
+        Some(Kind::Time)
+    } else {
+        None
+    };
+    let name = info.name.to_ascii_lowercase();
+    by_default.or(if name.ends_with("_at") || name == "timestamp" {
+        Some(Kind::DateTime)
+    } else if name.ends_with("_date") || name == "date" {
+        Some(Kind::Date)
+    } else if name == "time" {
+        Some(Kind::Time)
+    } else {
+        None
+    })
 }
 
 /// Whether a CHECK holds `column` to valid JSON (MariaDB's `JSON` type).
@@ -1093,6 +1142,12 @@ struct Written {
     info: ColumnInfo,
     make: Gen,
     nulls: u8,
+    /// Part of a set no two rows may share (K76): only its values are drawn
+    /// again when a row repeats a key, and they are drawn for the row's
+    /// number after the rows already in the table, so that a second run with
+    /// the same seed does not draw the first run's keys again; every other
+    /// value stays the one the same settings gave on an empty table.
+    unique: bool,
 }
 
 /// The settings checked against the table: what [`Plan::values`] makes.
@@ -1105,6 +1160,10 @@ pub struct Plan {
     /// The unique sets, as places in `columns`.
     uniques: Vec<Vec<usize>>,
     parents: Vec<Vec<Vec<CellValue>>>,
+    /// Per foreign key, whether its key is part of a unique set.
+    unique_keys: Vec<bool>,
+    /// The rows already in the table.
+    before: u64,
 }
 
 fn quoted(name: &str) -> String {
@@ -1235,6 +1294,7 @@ impl Plan {
                 info: info.clone(),
                 make,
                 nulls: line.nulls,
+                unique: facts.unique_sets().iter().any(|set| set.contains(&index)),
             });
         }
         // Every column left to the server: one written as DEFAULT, which
@@ -1245,8 +1305,16 @@ impl Plan {
                 info: facts.column(0).clone(),
                 make: Gen::Default,
                 nulls: 0,
+                unique: false,
             });
         }
+        let unique_keys = (0..facts.parents.len())
+            .map(|key| {
+                columns.iter().any(|c| {
+                    c.unique && matches!(c.make, Gen::Reference { key: k, .. } if k == key)
+                })
+            })
+            .collect();
         let place = |index: usize| columns.iter().position(|c| c.index == index);
         let mut uniques = Vec::new();
         for set in facts.unique_sets() {
@@ -1278,6 +1346,8 @@ impl Plan {
             columns,
             uniques,
             parents: facts.parents.clone(),
+            unique_keys,
+            before: facts.rows,
         })
     }
 
@@ -1314,22 +1384,34 @@ impl Plan {
         self.columns
             .iter()
             .map(|column| {
+                // A unique value's row and attempt; a sequence's start is its
+                // own setting, already beyond the rows there.
+                let (at, attempt) = match (column.unique, &column.make) {
+                    (true, Gen::Sequence { .. }) => (row, attempt),
+                    (true, _) => (row + self.before, attempt),
+                    (false, _) => (row, 0),
+                };
                 if column.nulls > 0
-                    && Draw::new(self.seed, null_stream(column.index), row, attempt).below(100)
+                    && Draw::new(self.seed, null_stream(column.index), at, attempt).below(100)
                         < u64::from(column.nulls)
                 {
                     return CellValue::Null;
                 }
                 if let Gen::Reference { key, part } = column.make {
                     let parents = &self.parents[key];
+                    let (at, attempt) = if self.unique_keys[key] {
+                        (row + self.before, attempt)
+                    } else {
+                        (row, 0)
+                    };
                     let pick = *picks[key].get_or_insert_with(|| {
-                        Draw::new(self.seed, key_stream(key), row, attempt)
+                        Draw::new(self.seed, key_stream(key), at, attempt)
                             .below(parents.len() as u64) as usize
                     });
                     return parents[pick][part].clone();
                 }
-                let mut draw = Draw::new(self.seed, value_stream(column.index), row, attempt);
-                column.make.value(&mut draw, row)
+                let mut draw = Draw::new(self.seed, value_stream(column.index), at, attempt);
+                column.make.value(&mut draw, at)
             })
             .collect()
     }
@@ -1491,8 +1573,9 @@ fn gen_of(
             .map_err(|_| format!("The {what} of {name} is not a length."))
     };
     let unique = facts.unique_alone(index);
-    // The number a unique text column ends with: beyond the rows there.
-    let number = unique.then_some(facts.rows + 1);
+    // The number a unique text column ends with: from 1 at the row drawn,
+    // which is shifted beyond the rows there (`Written::shift`).
+    let number = unique.then_some(1);
     let make = match line.kind {
         Kind::Default | Kind::Server => Gen::Default,
         Kind::Null => Gen::Null,
@@ -2953,5 +3036,124 @@ mod tests {
         assert_eq!(drawn, HashSet::from([-1, 0, 1]));
         let wide = draw.between(i128::from(i64::MIN), i128::from(u64::MAX));
         assert!(wide >= i128::from(i64::MIN) && wide <= i128::from(u64::MAX));
+    }
+
+    /// K76: the same settings give the same rows, except the values that must be unique, which
+    /// continue after the rows already in the table: a second run with the same seed draws none
+    /// of the first run's keys again, and keeps every other value.
+    #[test]
+    fn unique_values_continue_after_the_rows_there_and_the_rest_repeats() {
+        let mut facts = facts(
+            Engine::Postgres,
+            vec![
+                key(column("id", "uuid", TypeKind::Uuid, false), 1),
+                column("code", "integer", TypeKind::Integer, false),
+                column("label", "text", TypeKind::Text, false),
+                column("pa", "integer", TypeKind::Integer, false),
+                column("pb", "integer", TypeKind::Integer, false),
+            ],
+        );
+        facts.structure.indexes = vec![
+            unique_index("code_key", &["code"]),
+            unique_index("pair_key", &["pa", "pb"]),
+        ];
+        facts.structure.foreign_keys = vec![
+            foreign_key(&["pa"], "a", &["id"]),
+            foreign_key(&["pb"], "b", &["id"]),
+        ];
+        let keys = |n: u32| (1..=n).map(|k| vec![text(&k.to_string())]).collect();
+        facts.parents = vec![keys(30), keys(30)];
+        let run = |facts: &Facts| -> Vec<Vec<CellValue>> {
+            let mut settings = settings(facts, 50, 11);
+            settings.columns[1] = line(Kind::Integer, "1", "1000000");
+            Plan::new(facts, &settings)
+                .unwrap()
+                .values()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // An empty table twice: the same rows.
+        let first = run(&facts);
+        assert_eq!(first, run(&facts));
+        // The same seed on the table those rows went into.
+        facts.rows = 50;
+        let second = run(&facts);
+        let column = |rows: &[Vec<CellValue>], i: usize| -> HashSet<String> {
+            rows.iter().map(|row| shown(&row[i])).collect()
+        };
+        for (i, name) in [(0, "id"), (1, "code")] {
+            assert!(
+                column(&first, i).is_disjoint(&column(&second, i)),
+                "{name} drew the first run's values again"
+            );
+        }
+        let pairs = |rows: &[Vec<CellValue>]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|row| (shown(&row[3]), shown(&row[4])))
+                .collect()
+        };
+        assert!(
+            pairs(&first) != pairs(&second),
+            "the pairs drew the same keys again"
+        );
+        // What need not be unique is drawn as before.
+        let labels = |rows: &[Vec<CellValue>]| -> Vec<CellValue> {
+            rows.iter().map(|row| row[2].clone()).collect()
+        };
+        assert_eq!(labels(&first), labels(&second));
+    }
+
+    /// K76: a SQLite text column that holds a date or a time is guessed from its default, left
+    /// to the default when it has one, and otherwise from its name.
+    #[test]
+    fn a_sqlite_text_column_of_dates_is_guessed_from_its_default_and_its_name() {
+        let text_column = |name: &str, default: Option<&str>| ColumnInfo {
+            default: default.map(Into::into),
+            ..column(name, "TEXT", TypeKind::Text, true)
+        };
+        let sqlite = |info| facts(Engine::Sqlite, vec![info]);
+        for (name, default, time) in [
+            ("created_at", Some("CURRENT_TIMESTAMP"), Kind::DateTime),
+            ("made", Some("datetime('now')"), Kind::DateTime),
+            ("day", Some("CURRENT_DATE"), Kind::Date),
+            ("day", Some("'2024-05-01'"), Kind::Date),
+            ("clock", Some("current_time"), Kind::Time),
+        ] {
+            let facts = sqlite(text_column(name, default));
+            assert_eq!(text_time(facts.column(0)), Some(time), "{default:?}");
+            assert_eq!(guess(&facts)[0].kind, Kind::Default, "{default:?}");
+            assert!(kinds(&facts, 0).contains(&time));
+        }
+        for (name, time) in [
+            ("updated_at", Kind::DateTime),
+            ("timestamp", Kind::DateTime),
+            ("birth_date", Kind::Date),
+            ("date", Kind::Date),
+            ("time", Kind::Time),
+        ] {
+            let facts = sqlite(text_column(name, None));
+            let guessed = &guess(&facts)[0];
+            assert_eq!(guessed.kind, time, "{name}");
+            // Rows written: the time drawn as SQLite's CURRENT_TIMESTAMP writes it.
+            let line = ColumnSettings {
+                nulls: 0,
+                ..guessed.clone()
+            };
+            let values = texts(&values_of(&facts, line, 5));
+            let width = match time {
+                Kind::DateTime => 19,
+                Kind::Date => 10,
+                _ => 8,
+            };
+            assert!(values.iter().all(|v| v.len() == width), "{values:?}");
+        }
+        // A plain text keeps its words; another engine's text is not a date.
+        assert_eq!(
+            guess(&sqlite(text_column("note", None)))[0].kind,
+            Kind::Words
+        );
+        let elsewhere = facts_with(text_column("created_at", Some("'2024-05-01'")));
+        assert!(!kinds(&elsewhere, 0).contains(&Kind::Date));
+        assert_eq!(guess(&elsewhere)[0].kind, Kind::Words);
     }
 }

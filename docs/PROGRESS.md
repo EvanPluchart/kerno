@@ -1894,3 +1894,18 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Two reviews after: the installer's own code in the download's folder, the user's TEMP given back to the Kerno it
   starts, the install check behind a guard, Windows' programs only from C:\Windows, a bounded wait, and a failed
   version left on "Release page" until a check is asked for (D-139's review blocks).
+
+## 2026-11-25 — K76: "Fill with test data" after a pass in the real app
+
+- A pass in the real app found six faults in K72's dialog and around it, all fixed (D-141 amended): a line's
+  max length ran under NULL % (every line now fits at the window's smallest size, 720 × 440, and the body
+  scrolls under buttons that stay in view); the disabled NULL % looked enabled in the dark theme; "the same
+  settings give the same rows" was not true of unique values, which continue after the rows already there (the
+  sentence now says so, and the core makes it exact: only unique values are drawn after the rows there, and
+  only they are drawn again on a repeated key); the seed and the settings were new at each opening (kept per
+  table until Kerno quits, a sequence's start left as guessed following the table); a SQLite text column
+  holding a date got random words (guessed from its default, then left to it, or from its name); the tree's
+  "N databases hidden" tooltip stayed over the connection's dialog its click opened (the tree's tooltips now
+  come from `tip.rs`, which draws nothing once a dialog is open).
+- Proved by two core unit tests and three UI tests, each seen failing under a one-line mutation (M12, K72),
+  K72's tests unchanged and passing, and headless captures light and dark at 720 × 440 and 1280 × 800.

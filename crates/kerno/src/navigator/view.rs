@@ -17,7 +17,6 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::{TreeEntry, TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
@@ -62,6 +61,7 @@ use crate::sql_confirm::{self, Confirmation, Reach, Statement};
 use crate::state::AppState;
 use crate::tabs::Target;
 use crate::theme;
+use crate::tip::tip;
 
 /// What the rest of the window does for the navigator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3673,14 +3673,11 @@ impl Navigator {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("unsaved")
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("Opened from a URL, not saved: its menu saves it")
-                                        .build(window, cx)
-                                }),
+                                .tooltip(tip("Opened from a URL, not saved: its menu saves it")),
                         )
                     })
                     .when_some(environment, |this, (chrome, name)| {
-                        let tip = format!("{} · {name} environment", config.engine.label());
+                        let hint = format!("{} · {name} environment", config.engine.label());
                         this.child(
                             div()
                                 .id(("connection-env", at))
@@ -3692,9 +3689,7 @@ impl Navigator {
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(chrome.bar_text)
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(tip.clone()).build(window, cx)
-                                })
+                                .tooltip(tip(hint))
                                 .child(name.clone())
                                 .test_text(name),
                         )
@@ -3709,9 +3704,7 @@ impl Navigator {
                                 .child(state_label)
                                 // Where the password came from (J3).
                                 .when_some(password_origin, |this, origin| {
-                                    this.tooltip(move |window, cx| {
-                                        Tooltip::new(origin.clone()).build(window, cx)
-                                    })
+                                    this.tooltip(tip(origin))
                                 }),
                         )
                     }),
@@ -3793,10 +3786,7 @@ impl Navigator {
                         .min_w_0()
                         .cursor_pointer()
                         .child(line_text(label, theme.muted_foreground))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Edit the connection to choose the databases shown")
-                                .build(window, cx)
-                        })
+                        .tooltip(tip("Edit the connection to choose the databases shown"))
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             Sidebar::edit(connections.clone(), connection.clone(), window, cx);
@@ -3814,7 +3804,7 @@ impl Navigator {
                         SharedString::from(label.lines().next().unwrap_or_default().to_string()),
                         theme.muted_foreground,
                     ))
-                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx)),
+                    .tooltip(tip(label)),
             ),
             _ => {
                 let failed = model::parent_of(local)
@@ -3840,9 +3830,7 @@ impl Navigator {
                             .test_support()
                             .min_w_0()
                             .child(line_text(label, theme.danger))
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(message.clone()).build(window, cx)
-                            }),
+                            .tooltip(tip(message)),
                     ),
                     // "Loading…": a Cancel beside it while the read runs (C3).
                     None if self.load_of_row(&row_id).is_some() => {
