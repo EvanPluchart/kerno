@@ -3512,6 +3512,7 @@ mod tests {
             env: Vec::new(),
             password: None,
             stdin: None,
+            stdin_parts: Vec::new(),
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
