@@ -4,7 +4,36 @@
 //! session was closed", and Reconnect did not mend it. Now the tree is read again on the new
 //! sessions; a read of the tree whose session was lost opens a new one and reads once more.
 
+use std::collections::BTreeSet;
+
 use super::*;
+
+/// The open nodes of the first connection's tree, and the selected row (K77).
+fn place(app: &Fixture, cx: &mut TestAppContext) -> (BTreeSet<String>, Option<String>) {
+    cx.update(|cx| {
+        let id = app.connections.read(cx).saved()[0].id.clone();
+        let navigator = app.workspace.read(cx).navigator(cx);
+        let navigator = navigator.read(cx);
+        (navigator.open_nodes(&id), navigator.selected_id(cx))
+    })
+}
+
+/// K77: waits until the first connection's tree is read again and put back where the user
+/// was, then says where that is.
+fn settled(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    how: &str,
+) -> (BTreeSet<String>, Option<String>) {
+    app.wait_until(cx, &format!("{how}: the tree put back"), |app, cx| {
+        cx.update(|cx| {
+            let id = app.connections.read(cx).saved()[0].id.clone();
+            let navigator = app.workspace.read(cx).navigator(cx);
+            !navigator.read(cx).settling(&id)
+        })
+    });
+    place(app, cx)
+}
 
 /// What the tree's rows say when a read failed.
 fn failures(app: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
@@ -96,9 +125,28 @@ fn the_tree_reads_on_after_every_way_a_connection_is_opened_again(cx: &mut TestA
         let state = |cx: &mut TestAppContext| cx.update(|cx| data.read(cx).state(cx));
         app.wait_until(cx, "the rows", |_, cx| state(cx).contains(" of "));
         let rows = state(cx);
+        // K77: a table open on its columns, and selected.
+        let table_row = match engine {
+            Engine::Postgres => vec!["kerno", "shop", "Tables", table],
+            _ => vec!["kerno", "Tables", table],
+        };
+        app.open_path(cx, &[table_row.as_slice(), &["Columns"]].concat());
+        app.click_row(cx, &table_row, false);
 
         for how in ["toolbar toggle", "menu toggle", "dialog", "reconnect"] {
             let old = kept(&app, cx, own_key(engine)).expect("the tree's session");
+            // K77: where the user is, put back after each way.
+            // The table first; then the row a click on a chevron selected.
+            let before = settled(&app, cx, "before");
+            let selected = before.1.as_deref().unwrap_or_default();
+            assert!(
+                how != "toolbar toggle" || selected.ends_with("rel:customers"),
+                "{engine:?}, {how}: {before:?}"
+            );
+            assert!(
+                before.0.len() >= 3 && !selected.is_empty(),
+                "{engine:?}, {how}: {before:?}"
+            );
             match how {
                 "toolbar toggle" => {
                     // Read-only on, a statement run and cancelled in a query tab, read-only off.
@@ -157,6 +205,7 @@ fn the_tree_reads_on_after_every_way_a_connection_is_opened_again(cx: &mut TestA
             app.wait_until(cx, &format!("{how}: the tree read again"), |app, cx| {
                 kept(app, cx, own_key(engine)).is_some_and(|now| !Arc::ptr_eq(&now, &old))
             });
+            assert_eq!(settled(&app, cx, how), before, "{engine:?}, {how}");
             read_unread(&app, cx, engine, how);
 
             // The data tab reads its rows again on a session of its own, and a query tab runs.
@@ -355,6 +404,7 @@ fn a_tree_read_when_the_server_went_away_mends_once_it_is_back(cx: &mut TestAppC
         let path = unread(engine);
         app.open_path(cx, &path);
         let old = kept(&app, cx, own_key(engine)).expect("the tree's session");
+        let before = settled(&app, cx, "before");
 
         proxy.set(ProxyMode::Drop);
         app.toggle(cx, &path);
@@ -371,6 +421,22 @@ fn a_tree_read_when_the_server_went_away_mends_once_it_is_back(cx: &mut TestAppC
             matches!(app.status(cx, 0), Status::Connected { .. })
                 && kept(app, cx, own_key(engine)).is_some_and(|now| !Arc::ptr_eq(&now, &old))
         });
+        // K77: the rows open before are open again, the one opened while it was lost too, and
+        // selected, as its chevron's click left it.
+        let (open, selected) = settled(&app, cx, "back");
+        assert!(
+            open.is_superset(&before.0),
+            "{engine:?}: {before:?} → {open:?}"
+        );
+        assert!(open.len() > before.0.len(), "{engine:?}: {open:?}");
+        assert!(app.is_open(cx, &path), "{engine:?}");
+        let last = path.last().unwrap();
+        assert!(
+            selected
+                .as_deref()
+                .is_some_and(|row| row.ends_with(&format!(":{last}"))),
+            "{engine:?}: {selected:?}"
+        );
         read_unread(&app, cx, engine, "back");
     }
 }
@@ -384,7 +450,11 @@ fn a_database_file_tree_reads_on_after_it_is_opened_again(cx: &mut TestAppContex
     let app = connected_as(cx, super::sqlite::file_config(&file));
     let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
     app.open_path(cx, &["main", "Tables"]);
+    app.click_row(cx, &["main", "Tables"], false);
     for how in ["read-only on", "reconnect", "read-only off"] {
+        // K77: where the user is, put back after each way.
+        let place = settled(&app, cx, "before");
+        assert!(place.1.is_some(), "{how}");
         let (old, before) = (kept(&app, cx, "").unwrap(), meta(&app, cx).unwrap());
         let action = match how {
             "reconnect" => SidebarAction::Reconnect,
@@ -395,13 +465,55 @@ fn a_database_file_tree_reads_on_after_it_is_opened_again(cx: &mut TestAppContex
         app.wait_until(cx, &format!("{how}: the tree read again"), |app, cx| {
             kept(app, cx, "").is_some_and(|now| !Arc::ptr_eq(&now, &old))
         });
+        assert_eq!(settled(&app, cx, how), place, "{how}");
         let table = ["main", "Tables", "customers"];
         app.open_path(cx, &table);
-        app.toggle(cx, &table);
+        if !app.is_open(cx, &table) {
+            app.toggle(cx, &table);
+        }
         app.wait_until(cx, &format!("{how}: the columns"), |app, cx| {
             app.shows(cx, &["main", "Tables", "customers", "Columns"])
                 || !failures(app, cx).is_empty()
         });
         assert_eq!(failures(&app, cx), Vec::<String>::new(), "{how}");
     }
+}
+
+/// K77: a node that was open and is gone from the server when the tree is read again is simply
+/// not there; the rest is put back, and the putting back ends. Seen failing (timed out) with a
+/// missing node left waiting.
+#[gpui_kit::test]
+fn a_node_gone_when_the_tree_is_read_again_is_not_there(cx: &mut TestAppContext) {
+    const SCHEMA: &str = "kerno_test_k77_gone";
+    if !testing::available(Engine::Postgres) {
+        return;
+    }
+    let drop = format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE");
+    let _scratch = Scratch::new(
+        Engine::Postgres,
+        &[&drop],
+        &[
+            &format!("CREATE SCHEMA {SCHEMA}"),
+            &format!("CREATE TABLE {SCHEMA}.t (id integer)"),
+        ],
+    );
+    let app = connected(cx, Engine::Postgres);
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    app.open_path(cx, &["kerno", SCHEMA, "Tables", "t", "Columns"]);
+    app.open_path(cx, &["kerno", "shop", "Tables", "customers"]);
+    let before = settled(&app, cx, "before");
+    let gone: BTreeSet<String> = (before.0.iter())
+        .filter(|node| node.contains(SCHEMA))
+        .cloned()
+        .collect();
+    assert_eq!(gone.len(), 3, "{before:?}");
+
+    on_server(Engine::Postgres, &drop);
+    let old = meta(&app, cx).unwrap();
+    app.sidebar_does(cx, Subject::Connection(id), SidebarAction::Reconnect);
+    wait_reopened(&app, cx, &old, "reconnect");
+    let (open, _) = settled(&app, cx, "reconnect");
+    assert_eq!(open, &before.0 - &gone);
+    assert!(!app.shows(cx, &["kerno", SCHEMA]), "{:#?}", app.tree(cx));
+    assert!(app.shows(cx, &["kerno", "shop", "Tables", "customers"]));
 }

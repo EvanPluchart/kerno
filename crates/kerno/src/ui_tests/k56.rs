@@ -162,7 +162,17 @@ fn the_other_tall_dialogs_keep_their_buttons_in_a_short_window(cx: &mut TestAppC
     });
     app.wait_until(cx, "the export", |app, cx| app.has(cx, "portable-done"));
     app.click(cx, "portable-close");
+    // One connection gone since, for the import to write (K77: with nothing to write, Import is
+    // off).
+    let gone = app.storage.connections().unwrap().pop().unwrap().id;
+    app.storage.delete_connection(&gone).unwrap();
+    let list = app.connections.clone();
+    cx.update(|cx| list.update(cx, |list, cx| list.reload(cx)));
+    app.wait_until(cx, "the list", |app, cx| {
+        cx.update(|cx| app.connections.read(cx).saved().len()) == 11
+    });
     app.import_preview(cx, file);
+    assert!(!app.has(cx, "import-nothing"));
     in_view(
         &app,
         cx,
@@ -170,8 +180,16 @@ fn the_other_tall_dialogs_keep_their_buttons_in_a_short_window(cx: &mut TestAppC
         HEIGHT,
         "import preview",
     );
-    // Without a password to give, Next imports: the result has Close.
+    // The connection added back asks about its password: Import, then the result has Close.
     app.click(cx, "import-next");
+    in_view(
+        &app,
+        cx,
+        &["import-back", "import-confirm"],
+        HEIGHT,
+        "passwords",
+    );
+    app.click(cx, "import-confirm");
     app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
     in_view(&app, cx, &["import-close"], HEIGHT, "import done");
     app.click(cx, "import-close");

@@ -1984,3 +1984,22 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   only, shown on the runner with a working helper planted under `ssh.exe`'s own folder that never ran; the
   listing and each `taskkill` given 5 s; the chain test counts by the parent chain; the instance's pipe reads
   its lines while every place is held.
+
+## 2026-11-25 — K77: four things from the second pass in the real app
+
+- A connection opened again (Reconnect, the Read-only switch, its settings saved, a lost connection back) put its
+  schema tree back with every schema closed and no row selected. Where the user was is now kept when the tree
+  learns of it (the open nodes from the model, the selected row, the scroll) and put back as the new sessions
+  read: each node opens as an expand reads it, a node gone is not there, a failed read shows its row as before;
+  the row is selected again unless another was chosen meanwhile. D-144 amended (K75's "not chosen" reversed).
+- The DBeaver import and the connections file import turn their Import button off when nothing would be written
+  and say why in a line beside it ("Nothing to import: every connection Kerno can take from this file is already
+  here.", "Nothing is ticked: …").
+- "Fill with test data": a disabled NULL % field's text is given a disabled button's colour (the muted grey at
+  half), which the field dims again: fainter than the button's, in both themes; the connection dialog the request
+  named has no disabled field (D-102), so the kit's disabled button on the same line was the reference. A SQLite
+  text column named `*_time` or `time_*` (not `time_zone`) is guessed as a time of day; `*_at`, `timestamp`,
+  `datetime` stay a date and time, `*_date` a date. D-141 amended.
+- Proved by the three K75 tests of a tree opened again, extended (PostgreSQL, MySQL, SQLite), a new one for a
+  node dropped meanwhile, two DBeaver tests and the connections file's test, and the core test of the names, each
+  seen failing under a one-line mutation; headless captures of the dialog light and dark (not committed).

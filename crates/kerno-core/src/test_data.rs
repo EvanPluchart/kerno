@@ -976,7 +976,7 @@ pub fn guess(facts: &Facts) -> Vec<ColumnSettings> {
 
 /// The kind of time a text column holds, from its default (`CURRENT_TIMESTAMP`,
 /// `datetime('now')`, a literal date) or else its name (`created_at`,
-/// `birth_date`, `time`): SQLite's way of keeping dates (K76).
+/// `birth_date`, `start_time`): SQLite's way of keeping dates (K76, K77).
 fn text_time(info: &ColumnInfo) -> Option<Kind> {
     let default = info
         .default
@@ -998,15 +998,24 @@ fn text_time(info: &ColumnInfo) -> Option<Kind> {
         None
     };
     let name = info.name.to_ascii_lowercase();
-    by_default.or(if name.ends_with("_at") || name == "timestamp" {
-        Some(Kind::DateTime)
-    } else if name.ends_with("_date") || name == "date" {
-        Some(Kind::Date)
-    } else if name == "time" {
-        Some(Kind::Time)
-    } else {
-        None
-    })
+    // `word` or `*_word`; a time of day `time_*` too (`time_of_day`), not `time_zone`.
+    let named = |word: &str| name == word || name.ends_with(&format!("_{word}"));
+    let a_time = named("time") || name.starts_with("time_") && !name.starts_with("time_zone");
+    by_default.or(
+        if name.ends_with("_at")
+            || ["timestamp", "datetime", "date_time"]
+                .into_iter()
+                .any(named)
+        {
+            Some(Kind::DateTime)
+        } else if named("date") {
+            Some(Kind::Date)
+        } else if a_time {
+            Some(Kind::Time)
+        } else {
+            None
+        },
+    )
 }
 
 /// Whether a CHECK holds `column` to valid JSON (MariaDB's `JSON` type).
@@ -3130,6 +3139,19 @@ mod tests {
             ("birth_date", Kind::Date),
             ("date", Kind::Date),
             ("time", Kind::Time),
+            // K77: a time of day by its name; `*_at`, `timestamp`, `datetime` stay a date
+            // and time, `*_date` a date.
+            ("at_time", Kind::Time),
+            ("start_time", Kind::Time),
+            ("time_of_day", Kind::Time),
+            ("opens_at_time", Kind::Time),
+            ("due_date", Kind::Date),
+            ("starts_at", Kind::DateTime),
+            ("time_at", Kind::DateTime),
+            ("datetime", Kind::DateTime),
+            ("created_datetime", Kind::DateTime),
+            ("event_date_time", Kind::DateTime),
+            ("sent_timestamp", Kind::DateTime),
         ] {
             let facts = sqlite(text_column(name, None));
             let guessed = &guess(&facts)[0];
@@ -3148,10 +3170,13 @@ mod tests {
             assert!(values.iter().all(|v| v.len() == width), "{values:?}");
         }
         // A plain text keeps its words; another engine's text is not a date.
-        assert_eq!(
-            guess(&sqlite(text_column("note", None)))[0].kind,
-            Kind::Words
-        );
+        for name in ["note", "time_zone", "time_zone_name", "timezone"] {
+            assert_eq!(
+                guess(&sqlite(text_column(name, None)))[0].kind,
+                Kind::Words,
+                "{name}"
+            );
+        }
         let elsewhere = facts_with(text_column("created_at", Some("'2024-05-01'")));
         assert!(!kinds(&elsewhere, 0).contains(&Kind::Date));
         assert_eq!(guess(&elsewhere)[0].kind, Kind::Words);

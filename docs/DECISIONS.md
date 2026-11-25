@@ -4470,9 +4470,9 @@ update; the tree learned of it only once its status read `Connecting`, and kept 
   closed by the user, the tree's row would close, the tabs would act as for a Disconnect), or forgetting the
   tree on `Connecting` (an automatic reconnection would then select the connection's row and take the
   selection away from where the user was, as a first connection does).
-- **What the user sees.** The tree is read again from its databases, its open folders closed, as after a
-  Disconnect and Connect. Not chosen: keeping which folders were open and reading them again, more code for a
-  rare moment; the tree's other choices (filters, which databases show) are settings and stay.
+- **What the user sees.** The tree is read again from its databases, as after a Disconnect and Connect, and,
+  since K77, put back where the user was (below); the tree's other choices (filters, which databases show) are
+  settings and stay.
 - **One more read, reads only.** A tree read whose session is closed or lost lets that session go and reads
   once more on a new one, without asking (CLAUDE.md §4 A5), and asks the manager to check the connection, as a
   query tab does. Only the tree's loads (schemas, objects, columns, extensions) read again: the confirmed
@@ -4608,6 +4608,26 @@ called three tables "partly loaded"; one of them was empty, one held its old row
   disabled and the reason only by the field on the Settings page (in the simple view, nowhere). The reason now
   shows above the buttons wherever Start is (the simple view, the wizard's last page), as "Cannot start: …",
   for every reason `blocked()` gives.
+**Amended by K77 (2026-11-25), after the second pass in the real app:** K75's "not chosen: keeping which
+folders were open" lost the user's place at each Read-only switch. Now:
+
+- **What is kept.** When the tree learns that the connection is opened again or lost, before its tree goes: the
+  open nodes, taken from the model (not from the rows shown, which the filter cuts), each only under open ones;
+  the selected row, or the one selected at the tree's last rebuild when the tree has already left the sidebar
+  (a save's list change comes first); the scroll offset. Kept by connection outside the tree's browse, so a lost
+  connection whose retry fails (the browse forgotten) keeps it; a Disconnect drops it: the user closed it.
+- **How it comes back.** Lazily, the way an expand reads, on the new sessions: once the databases are listed and
+  after each read, a node that is there opens (and is read when its children are not known), one whose parent
+  is still read waits, one missing from a parent read since is gone, one under a failed read is dropped (its
+  row says the failure, as today). Not chosen: reading every node again before showing the tree (a slow schema
+  would hold the whole tree; a node gone would have to be told apart from one not read yet anyway), or showing
+  the old tree until the new one is read (rows on closed sessions, with menus that would act on them).
+- **The selected row** is selected again once its row is there, without scrolling to it, unless another row is
+  selected by then; the scroll offset is put back at each change while the tree grows (the kit clamps it to the
+  rows there). A click on a row ends both. A wheel scroll while it grows is overridden at the next change, a
+  matter of the reads' time.
+- **Only the reopenings.** Refresh and Try again read from scratch as before; the first connection selects the
+  connection's row as before, except when a place is waiting to come back.
 
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 
@@ -4777,6 +4797,19 @@ was ported, `THIRD_PARTY_NOTICES.md` is unchanged, and the word lists were writt
   open, and stays hidden after. It serves elements outside dialogs only (it would hide a tooltip inside one);
   the kit's buttons manage theirs. Converted: the six of the tree (`navigator/view.rs`); the other plain
   tooltips (tabs, grid cells, the status bar) open no dialog on a click and are left as they were.
+
+**Amended by K77 (2026-11-25), after the second pass in the real app:**
+
+- **A disabled NULL % field in dark** still read as enabled: K76's muted fill is the dialog's own colour in the
+  dark theme. The request named the connection dialog's disabled fields, but that dialog has none (D-102 hides
+  what does not apply); the reference taken is the kit's disabled button on the same line ("Made by the
+  server"), whose text is the muted grey at half. The field's text is given that colour, which the kit's field
+  dims again: fainter than the button's text (the "0" barely there in dark), on K76's fill and border, a look
+  no other control has. Not chosen: the button's look exactly, which gives back K76's text, the one found too
+  close to an enabled field. The other disabled fields of Kerno keep the kit's look (not part of the request).
+- **A time of day by its name.** SQLite's text columns: `time`, `*_time` and `time_*` are a time of day, except
+  `time_zone*`; checked first, `*_at`, `timestamp`, `datetime`, `date_time` (alone or after `_`) are a date and
+  time, then `date` and `*_date` a date. Not widened to `date_*` or `timestamp_*` (`date_format` is no date).
 
 
 ## D-140 — The tests that failed now and then: fixed where the wrong thing happens (K71; 2026-11-24)

@@ -294,6 +294,17 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
         "{}",
         other.summary(fresh, &again)
     );
+    // K77: nothing to write: Import is off and the dialog says why.
+    assert_eq!(
+        super::ai_endpoints::text_of(&other, fresh, "import-nothing"),
+        "Nothing to import: everything in this file is already here."
+    );
+    other.click(fresh, "import-next");
+    assert!(
+        other.summary(fresh, &again).starts_with("preview |"),
+        "{}",
+        other.summary(fresh, &again)
+    );
     other.click(fresh, "import-cancel");
 
     // This data directory's own local client stays through a replace.

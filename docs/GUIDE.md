@@ -211,7 +211,9 @@ unlinked cannot read any of the old secrets. Files written by earlier versions s
 DBeaver, File ▸ Export ▸ Project: a `.dbp` file) or a `data-sources.json`. It lists the folders and their
 connections, ticked, or greyed with the reason; untick what you do not want, then Import. The scripts become
 saved queries of their connection. **Also import the saved passwords** (off by default) puts them in this
-computer's secret store. Importing the same file again adds nothing twice. An SSH tunnel's jump servers come
+computer's secret store. Importing the same file again adds nothing twice: with nothing ticked, or every
+connection already here, the Import button is off and the dialog says why (so does a connections file whose
+items are all here already). An SSH tunnel's jump servers come
 as its jump hosts (through the system's OpenSSH). Under each connection the preview says what was left out and
 what to check ("To check: certificate pasted in DBeaver, not in a file: save it to a file and choose it on the
 SSL tab"), and the report after the import lists them again, connection by connection. A PostgreSQL
@@ -250,10 +252,14 @@ exported connections file carries the choice.
 
 Reconnect, the Read-only switch (its toolbar button, the connection's menu, the palette), saving an open
 connection's settings and a connection that comes back after the server went away all close the connection's
-sessions and open new ones. The schema tree is then read again from the databases, its folders closed; a table
-open in a tab reads its rows again, and a query tab opens a new session at its next statement. An open
-transaction is never carried over: the first three ask about it before, and a lost connection says that the
-server rolled it back.
+sessions and open new ones. The schema tree is then read again on the new sessions and put back where you were:
+while the connection opens its line says "Connecting…" (or "Connection lost: reconnecting…"), then "Loading
+databases…"; then the rows that were open come back open, each with its own "Loading…" line until it is read, the
+row you had selected is selected again and the tree scrolls back as far as its rows allow. A row that no longer
+exists on the server is simply not there; a click on a row meanwhile keeps your choice. A table open in a tab
+reads its rows again, and a query tab opens a new session at its next statement. An open transaction is never
+carried over: the first three ask about it before, and a lost connection says that the server rolled it back.
+After Disconnect then Connect, the tree starts afresh.
 
 A read of the tree whose session the server closed (an administrator, a timeout) opens a new session and reads
 again once, without a word. If that fails too, its row says so in plain words first ("The connection to
@@ -859,8 +865,9 @@ several columns as a whole, among its first 10,000 keys). Columns the server mak
 auto-increment) are left to it; a column with a default can be left to its default; a nullable column gets a
 **share of NULL** (10 % by default outside the keys). On SQLite, which keeps dates as text, a text column whose
 default is a date or a time (`CURRENT_TIMESTAMP`, `datetime('now')`, …) is left to that default, and one named
-like a date (`created_at`, `due_date`, `date`, `time`, `timestamp`) gets dates or times written as SQLite
-writes them. Pick another kind with the button of its line; the settings change with it.
+like a date (`created_at`, `due_date`, `date`, `timestamp`) or a time of day (`time`, `start_time`,
+`time_of_day`) gets dates or times written as SQLite writes them. Pick another kind with the button of its
+line; the settings change with it.
 
 Every value comes from the **seed**: the same settings give the same rows, except values that must be unique,
 which continue after the rows already in the table. So the same seed on an empty table gives the same rows

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
@@ -1049,10 +1050,43 @@ impl ImportSetup {
             );
         }
         let has_passwords = !self.password_rows().is_empty();
+        // Nothing would be written: the button is off and the dialog says
+        // why (K77).
+        let looks = &AppState::get(cx).settings.folder_looks;
+        let writes_any = (self.plan.connections.iter())
+            .chain(&self.plan.environments)
+            .chain(&self.plan.tasks)
+            .any(|action| self.writes(*action))
+            || self
+                .file
+                .folders
+                .keys()
+                .any(|path| !looks.contains_key(path));
+        let empty = (self.file.connections.is_empty() && self.file.environments.is_empty())
+            && (self.file.tasks.is_empty() && self.file.folders.is_empty());
+        let nothing = (!writes_any).then_some(if replaced > 0 {
+            "Nothing to import: tick “Replace” to write the items with the same id."
+        } else if empty {
+            "Nothing to import: this file is empty."
+        } else {
+            "Nothing to import: everything in this file is already here."
+        });
         body.push(
             h_flex()
                 .justify_end()
                 .gap_2()
+                .when_some(nothing, |this, nothing| {
+                    this.child(
+                        div()
+                            .id("import-nothing")
+                            .test_support()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(nothing)
+                            .test_text(nothing),
+                    )
+                })
                 .child(
                     Button::new("import-cancel")
                         .ghost()
@@ -1067,6 +1101,7 @@ impl ImportSetup {
                         } else {
                             "Import"
                         })
+                        .disabled(!writes_any)
                         .on_click(cx.listener(|this, _, window, cx| this.next(window, cx))),
                 )
                 .into_any_element(),

@@ -1068,7 +1068,7 @@ fn connections_are_exported_without_secrets_and_imported_back(cx: &mut TestAppCo
     assert!(!exported.contains("export-me-not"));
 
     // J15: the file keeps the connection's id, so importing it where it
-    // came from finds it unchanged and adds nothing.
+    // came from finds it unchanged and adds nothing: Import is off (K77).
     let (workspace, source) = (app.workspace.clone(), file.clone());
     app.step(cx, move |window, cx| {
         workspace.update(cx, |workspace, cx| {
@@ -1078,9 +1078,10 @@ fn connections_are_exported_without_secrets_and_imported_back(cx: &mut TestAppCo
     app.wait_until(cx, "the import preview", |app, cx| {
         app.has(cx, "import-dialog")
     });
+    assert!(app.has(cx, "import-nothing"));
     app.click(cx, "import-next");
-    app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
-    app.click(cx, "import-close");
+    assert!(!app.has(cx, "import-done"));
+    app.click(cx, "import-cancel");
     assert_eq!(app.storage.connections().unwrap().len(), 1);
 
     // A file that is not an export changes nothing.

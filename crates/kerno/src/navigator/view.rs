@@ -193,6 +193,25 @@ struct Browse {
     generation: u64,
     /// The table to select once the way to it is loaded (see [`Navigator::reveal`]).
     revealing: Option<Revealing>,
+    /// Where the user was before the connection was opened again, put back
+    /// as the reads come in (K77).
+    restoring: Option<Restore>,
+}
+
+/// Where the user was in the tree of a connection opened again (Reconnect,
+/// the Read-only switch, its settings saved, a lost connection back): the
+/// nodes open again, each read on the new sessions as an expand reads it,
+/// the row selected again, the scroll put back (K77).
+#[derive(Debug, Clone, Default)]
+struct Restore {
+    /// The nodes that were open and are not yet, each after the one above it.
+    open: Vec<String>,
+    /// The row that was selected (a row id of the sidebar), until it is again.
+    selected: Option<String>,
+    /// The tree's scroll offset, put back while the tree grows back.
+    scroll: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    /// Every node is open again or gone: put back once more, then dropped.
+    done: bool,
 }
 
 /// The sidebar's one tree (DBeaver's Database Navigator): folders and
@@ -206,6 +225,12 @@ pub struct Navigator {
     sidebar: WeakEntity<Sidebar>,
     /// The connections being browsed, by id.
     browse: HashMap<String, Browse>,
+    /// Where the user was in the tree of a connection being opened again,
+    /// until its new tree starts (K77).
+    restore: HashMap<String, Restore>,
+    /// The row selected at the last [`Self::sync`]: a row that went with its
+    /// connection's tree is still known (K77).
+    last_selected: Option<String>,
     /// The connection rows that are open (not kept between runs).
     expanded: HashSet<String>,
     /// The connection of the selected row, otherwise the one opened last.
@@ -358,6 +383,8 @@ impl Navigator {
             connections,
             sidebar,
             browse: HashMap::new(),
+            restore: HashMap::new(),
+            last_selected: None,
             expanded: HashSet::new(),
             current: None,
             generation: 0,
@@ -487,13 +514,30 @@ impl Navigator {
     /// Browses an open connection once it is connected, opens it, and
     /// forgets its tree when it closes.
     fn follow_status(&mut self, id: &str, cx: &mut Context<Self>) {
-        match self.connections.read(cx).status(id) {
+        let status = self.connections.read(cx).status(id);
+        // Opened again or lost: where the user was is kept until the tree is
+        // read again (K77). Closed by the user, the tree starts afresh.
+        let reopened = match &status {
+            Status::Connected { .. } => !self.browsing_meta(id, cx),
+            Status::Disconnected => false,
+            _ => true,
+        };
+        if reopened
+            && !self.restore.contains_key(id)
+            && let Some(place) = self.place_of(id, cx)
+        {
+            self.restore.insert(id.to_string(), place);
+        }
+        match status {
             Status::Connected { .. } if !self.browse.contains_key(id) => {
+                let restoring = self.restore.contains_key(id);
                 self.expanded.insert(id.to_string());
                 self.current = Some(id.to_string());
                 self.load_databases(id, cx);
                 self.sync(cx);
-                self.select_id(&model::connection_row(id), cx);
+                if !restoring {
+                    self.select_id(&model::connection_row(id), cx);
+                }
                 return;
             }
             // Opened again (Reconnect, the read-only toggle, a lost
@@ -504,6 +548,7 @@ impl Navigator {
             // Closed by the user: the row closes too.
             Status::Disconnected => {
                 self.forget(id, cx);
+                self.restore.remove(id);
                 self.expanded.remove(id);
             }
             // The row stays open, so what went wrong shows under it.
@@ -513,6 +558,33 @@ impl Navigator {
             _ => {}
         }
         self.sync(cx);
+    }
+
+    /// Where the user is in the tree of `connection`, when it is browsed:
+    /// its open nodes, its selected row (or the one selected last, when the
+    /// tree has already gone from the sidebar), the scroll (K77).
+    fn place_of(&self, connection: &str, cx: &App) -> Option<Restore> {
+        let browse = self.browse.get(connection)?;
+        let state = self.tree_state.read(cx);
+        // Opened again while its tree was still growing back: what was left
+        // to put back is kept too.
+        let pending = browse.restoring.clone().unwrap_or_default();
+        let selected = (state.selected_item().map(|item| item.id.to_string()))
+            .or(pending.selected)
+            .or_else(|| self.last_selected.clone())
+            .filter(|row| {
+                matches!(model::parse_row(row), Some(RowId::Object { connection: of, .. })
+                    if of == connection)
+            });
+        let mut open = browse.tree.open_ids();
+        open.extend(pending.open);
+        Some(Restore {
+            open,
+            selected,
+            scroll: (pending.scroll)
+                .or_else(|| Some(state.scroll_handle().0.borrow().base_handle.offset())),
+            done: false,
+        })
     }
 
     /// Whether the tree of `connection` was read through its session now.
@@ -563,6 +635,7 @@ impl Navigator {
                 loading: HashMap::new(),
                 generation,
                 revealing,
+                restoring: self.restore.remove(connection),
             },
         );
         // On the tree's session of the connection's own database.
@@ -585,13 +658,24 @@ impl Navigator {
                 match outcome {
                     Ok(databases) => {
                         browse.root = Root::Loaded;
-                        if let Some(load) = browse.tree.set_databases(databases, current.as_deref())
+                        let load = browse.tree.set_databases(databases, current.as_deref());
+                        // The connection's database opens by itself: closed
+                        // again when the user had closed it (K77).
+                        if let (Some(restore), Some(load)) = (&browse.restoring, &load)
+                            && !restore.open.contains(&load.id)
                         {
+                            browse.tree.collapse(&load.id);
+                        }
+                        if let Some(load) = load {
                             this.run(&connection, load, cx);
                         }
                         this.advance_reveal(&connection, cx);
+                        this.advance_restore(&connection, cx);
                     }
-                    Err(error) => browse.root = Root::Failed(describe(&error).to_string()),
+                    Err(error) => {
+                        browse.root = Root::Failed(describe(&error).to_string());
+                        browse.restoring = None;
+                    }
                 }
                 this.sync(cx);
             });
@@ -952,10 +1036,12 @@ impl Navigator {
             let message = why.message(&loading.reading, id == ROOT_LOAD);
             if id == ROOT_LOAD {
                 browse.root = Root::Failed(message);
+                browse.restoring = None;
             } else {
                 browse.tree.finish(&id, Err(message));
             }
         }
+        self.advance_restore(connection, cx);
         self.sync(cx);
     }
 
@@ -1071,6 +1157,7 @@ impl Navigator {
                 }
                 browse.tree.finish(&load.id, outcome);
                 this.advance_reveal(&connection, cx);
+                this.advance_restore(&connection, cx);
                 this.sync(cx);
             });
         })
@@ -1164,6 +1251,44 @@ impl Navigator {
             Reveal::Missing => browse.revealing = None,
         }
         self.sync(cx);
+    }
+
+    /// Opens again the nodes of a [`Restore`] that are there, reading those
+    /// whose children are not known yet; one that is not there once the node
+    /// above it is read is gone, and forgotten. Called again as loads finish.
+    fn advance_restore(&mut self, connection: &str, cx: &mut Context<Self>) {
+        let Some(browse) = self.browse.get_mut(connection) else {
+            return;
+        };
+        // The databases come first.
+        if browse.root != Root::Loaded {
+            return;
+        }
+        let Some(mut restore) = browse.restoring.take() else {
+            return;
+        };
+        let tree = &mut browse.tree;
+        let mut loads = Vec::new();
+        restore.open.retain(|id| {
+            if tree.node(id).is_some() {
+                loads.extend(tree.expand(id));
+                return false;
+            }
+            // Not there: waits while the way to it is being read.
+            let mut above = model::parent_of(id);
+            while let Some(parent) = above {
+                if let Some(node) = tree.node(parent) {
+                    return matches!(node.children, Children::Loading);
+                }
+                above = model::parent_of(parent);
+            }
+            false
+        });
+        restore.done = restore.open.is_empty() && loads.is_empty() && browse.loading.is_empty();
+        browse.restoring = Some(restore);
+        for load in loads {
+            self.run(connection, load, cx);
+        }
     }
 
     /// Selects the row `id` and scrolls to it; whether it is shown.
@@ -2782,6 +2907,34 @@ impl Navigator {
             .collect()
     }
 
+    /// The open nodes of the tree of `connection`; for tests.
+    #[cfg(test)]
+    pub fn open_nodes(&self, connection: &str) -> BTreeSet<String> {
+        (self.tree(connection).map(Tree::open_ids))
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether the tree of `connection` is being read or put back (K77);
+    /// for tests.
+    #[cfg(test)]
+    pub fn settling(&self, connection: &str) -> bool {
+        self.restore.contains_key(connection)
+            || self.browse.get(connection).is_none_or(|browse| {
+                browse.restoring.is_some()
+                    || browse.root == Root::Loading
+                    || !browse.loading.is_empty()
+            })
+    }
+
+    /// The id of the selected row; for tests.
+    #[cfg(test)]
+    pub fn selected_id(&self, cx: &App) -> Option<String> {
+        let state = self.tree_state.read(cx);
+        state.selected_item().map(|item| item.id.to_string())
+    }
+
     /// The writes running, by key, with what each says; for tests.
     #[cfg(test)]
     pub fn writes(&self) -> Vec<(u64, String)> {
@@ -2833,12 +2986,52 @@ impl Navigator {
             |id| self.subtree(id, connections),
         );
         let items: Vec<TreeItem> = items.into_iter().map(tree_item).collect();
-        self.tree_state.update(cx, |state, cx| {
+        // Where the user was in a tree read again (K77).
+        let places: Vec<(String, Option<String>, Option<_>)> = (self.browse.iter())
+            .filter_map(|(connection, browse)| {
+                let restore = browse.restoring.as_ref()?;
+                Some((connection.clone(), restore.selected.clone(), restore.scroll))
+            })
+            .collect();
+        let (last, reselected) = self.tree_state.update(cx, |state, cx| {
             let selected = state.selected_item().map(|item| item.id.clone());
             state.set_items(items, cx);
-            let index = selected.and_then(|id| state.index_of(&id));
+            let index = selected.as_ref().and_then(|id| state.index_of(id));
             state.set_selected_index(index, cx);
+            let mut reselected = Vec::new();
+            for (connection, row, scroll) in places {
+                // Unless another row was selected meanwhile.
+                if let Some(row) = row
+                    && state.selected_index().is_none()
+                    && let Some(index) = state.index_of(&row.into())
+                {
+                    state.set_selected_index(Some(index), cx);
+                    reselected.push(connection);
+                }
+                if let Some(scroll) = scroll {
+                    state
+                        .scroll_handle()
+                        .0
+                        .borrow()
+                        .base_handle
+                        .set_offset(scroll);
+                }
+            }
+            (selected, reselected)
         });
+        if let Some(last) = last {
+            self.last_selected = Some(last.to_string());
+        }
+        for (connection, browse) in &mut self.browse {
+            if let Some(restore) = &mut browse.restoring {
+                if reselected.contains(connection) {
+                    restore.selected = None;
+                }
+                if restore.done {
+                    browse.restoring = None;
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -2902,6 +3095,11 @@ impl Navigator {
             .and_then(|entry| connection_of(&entry.item().id).map(str::to_string));
         if connection.is_some() {
             self.current = connection;
+        }
+        // The user's choice: no place put back over it (K77).
+        let restores = (self.browse.values_mut()).filter_map(|browse| browse.restoring.as_mut());
+        for restore in restores.chain(self.restore.values_mut()) {
+            (restore.selected, restore.scroll) = (None, None);
         }
         self.tree_state
             .update(cx, |state, cx| state.set_selected_index(Some(index), cx));

@@ -783,9 +783,15 @@ impl TestDataDialog {
     fn render_lines(&self, facts: &Facts, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        // A disabled field as a disabled button is drawn: grey, its border
-        // faint (the kit's disabled field looks enabled in the dark theme).
-        let (off_background, off_border) = (theme.muted, theme.input.opacity(0.5));
+        // A disabled field as the kit draws a disabled button ("Made by the
+        // server" on the line above): its text at half the muted grey, its
+        // border faint, on the muted fill (the kit's disabled field looks
+        // enabled in the dark theme, K76, K77).
+        let (off_background, off_border, off_text) = (
+            theme.muted,
+            theme.input.opacity(0.5),
+            theme.muted_foreground.opacity(0.5),
+        );
         let view = cx.entity();
         let name_width = gpui_kit::relative(NAME_SHARE);
         let header = h_flex()
@@ -884,7 +890,10 @@ impl TestDataDialog {
                             .id(("test-data-nulls", index))
                             .disabled(nulls_off)
                             .when(nulls_off, |input| {
-                                input.bg(off_background).border_color(off_border)
+                                input
+                                    .bg(off_background)
+                                    .border_color(off_border)
+                                    .text_color(off_text)
                             }),
                     ),
                 )

@@ -243,21 +243,29 @@ fn folder_looks_travel_with_exported_connections(cx: &mut TestAppContext) {
         app.wait_until(cx, "the import preview", |app, cx| {
             app.has(cx, "import-dialog")
         });
+        // Nothing to write (K77): Import is off.
+        let nothing = app.has(cx, "import-nothing");
         app.click(cx, "import-next");
-        app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
-        app.click(cx, "import-close");
+        if nothing {
+            assert!(!app.has(cx, "import-done"));
+            app.click(cx, "import-cancel");
+        } else {
+            app.wait_until(cx, "the import", |app, cx| app.has(cx, "import-done"));
+            app.click(cx, "import-close");
+        }
         assert_eq!(app.storage.connections().unwrap().len(), 1);
+        nothing
     };
     // A folder without a look takes the file's: colour and glyph.
     set(&app, cx, FolderLook::default());
-    import(&app, cx);
+    assert!(!import(&app, cx));
     assert_eq!(
         app.looks(cx),
         BTreeMap::from([("Work".to_string(), look(Some("blue"), Some("server"), None))])
     );
-    // One that has a look keeps it.
+    // One that has a look keeps it: nothing to import.
     set(&app, cx, look(Some("red"), None, None));
-    import(&app, cx);
+    assert!(import(&app, cx));
     assert_eq!(
         app.looks(cx),
         BTreeMap::from([("Work".to_string(), look(Some("red"), None, None))])

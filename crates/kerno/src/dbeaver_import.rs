@@ -667,6 +667,17 @@ impl DbeaverImport {
             .iter()
             .filter(|fate| **fate == Fate::Import(true))
             .count();
+        // Nothing ticked: the button is off and the dialog says why (K77).
+        let nothing = (chosen == 0).then(|| {
+            let fates = || self.fates.iter();
+            if fates().any(|fate| *fate == Fate::Import(false)) {
+                "Nothing is ticked: tick the connections to import."
+            } else if fates().any(|fate| matches!(fate, Fate::Exists(_) | Fate::Repeat(_))) {
+                "Nothing to import: every connection Kerno can take from this file is already here."
+            } else {
+                "Nothing to import: Kerno cannot take any connection of this file."
+            }
+        });
         let mut body = vec![
             div()
                 .id("dbeaver-items")
@@ -736,6 +747,18 @@ impl DbeaverImport {
             h_flex()
                 .justify_end()
                 .gap_2()
+                .when_some(nothing, |this, nothing| {
+                    this.child(
+                        div()
+                            .id("dbeaver-nothing")
+                            .test_support()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(nothing)
+                            .test_text(nothing),
+                    )
+                })
                 .child(
                     Button::new("dbeaver-cancel")
                         .ghost()
@@ -749,6 +772,7 @@ impl DbeaverImport {
                             "Import {}",
                             count(chosen, "connection", "connections")
                         )))
+                        .disabled(chosen == 0)
                         .on_click(cx.listener(|this, _, window, cx| this.import(window, cx))),
                 )
                 .into_any_element(),

@@ -36,7 +36,11 @@ fn sources(cx: &mut TestAppContext, home: Option<&Path>, ports: Vec<(String, u16
 }
 
 /// The text painted inside the element `id`.
-fn text_of(app: &Fixture, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> String {
+pub(super) fn text_of(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    id: impl Into<gpui_kit::ElementId>,
+) -> String {
     let id = id.into();
     app.step(cx, |window, _| {
         gpui_kit::base::test_support::texts(window)

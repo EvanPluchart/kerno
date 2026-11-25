@@ -300,6 +300,22 @@ impl Tree {
         find(&self.roots, id)
     }
 
+    /// The ids of the open nodes the user sees open (each under open ones,
+    /// whatever the filter hides), every node after the one above it (K77).
+    pub fn open_ids(&self) -> Vec<String> {
+        fn walk(nodes: &[Node], open: &mut Vec<String>) {
+            for node in nodes.iter().filter(|node| node.expanded) {
+                open.push(node.id.clone());
+                if let Children::Loaded(children) = &node.children {
+                    walk(children, open);
+                }
+            }
+        }
+        let mut open = Vec::new();
+        walk(&self.roots, &mut open);
+        open
+    }
+
     fn node_mut(&mut self, id: &str) -> Option<&mut Node> {
         find_mut(&mut self.roots, id)
     }

@@ -150,7 +150,7 @@ fn a_dbeaver_project_is_previewed_then_imported_once(cx: &mut TestAppContext) {
     }
 
     // Again: only Blog is new; nothing else twice.
-    let view = app.dbeaver_preview(cx, path);
+    let view = app.dbeaver_preview(cx, path.clone());
     let summary = cx.update(|cx| view.read(cx).summary());
     assert!(
         summary.contains(&format!("Shop Exists(\"{shop_id}\")")),
@@ -166,6 +166,50 @@ fn a_dbeaver_project_is_previewed_then_imported_once(cx: &mut TestAppContext) {
     // Not asked this time: Blog has no password.
     let (blog_id, _) = app.by_name("Blog");
     assert!(!secrets::has_secrets(store.as_ref(), &blog_id).unwrap());
+
+    // K77: a third time nothing is left to import: the button is off and the dialog says why.
+    let view = app.dbeaver_preview(cx, path);
+    assert_eq!(
+        super::ai_endpoints::text_of(&app, cx, "dbeaver-nothing"),
+        "Nothing to import: every connection Kerno can take from this file is already here."
+    );
+    app.click(cx, "dbeaver-import");
+    let summary = cx.update(|cx| view.read(cx).summary());
+    assert!(summary.starts_with("preview |"), "{summary}");
+    assert_eq!(app.storage.connections().unwrap().len(), 4);
+    app.click(cx, "dbeaver-cancel");
+}
+
+/// K77: with every connection unticked, Import is off and the dialog says that nothing is ticked;
+/// ticking one turns it on.
+#[gpui_kit::test]
+fn nothing_ticked_imports_nothing_and_says_so(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let view = app.dbeaver_preview(cx, project_file(&dir));
+    assert!(!app.has(cx, "dbeaver-nothing"));
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            for index in 0..5 {
+                view.set_ticked(index, false, cx);
+            }
+        })
+    });
+    assert_eq!(
+        super::ai_endpoints::text_of(&app, cx, "dbeaver-nothing"),
+        "Nothing is ticked: tick the connections to import."
+    );
+    app.click(cx, "dbeaver-import");
+    let summary = cx.update(|cx| view.read(cx).summary());
+    assert!(summary.starts_with("preview |"), "{summary}");
+    assert!(app.storage.connections().unwrap().is_empty());
+    cx.update(|cx| view.update(cx, |view, cx| view.set_ticked(1, true, cx)));
+    assert!(!app.has(cx, "dbeaver-nothing"));
+    app.click(cx, "dbeaver-import");
+    app.wait_until(cx, "the import", |_, cx| {
+        cx.update(|cx| view.read(cx).summary()).starts_with("done")
+    });
+    assert_eq!(app.storage.connections().unwrap().len(), 1);
 }
 
 /// K71: a connection written to the store a moment before (an import just
