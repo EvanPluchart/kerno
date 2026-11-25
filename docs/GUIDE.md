@@ -644,8 +644,11 @@ InnoDB table (MySQL 5.5.3 and later, every MariaDB), and with **Block writes** (
 on any version, MySQL 5.1 included. Any other table is read by one connection, and so is every table with
 "No locks". The procedures, functions, triggers, events and views come last, in their own files, and a small
 `kerno-backup.json` names every file: **Restore…** takes that folder as one backup, and its **Faster: restore
-on N connections at once** loads several tables at a time (the parts of a large InnoDB table side by side). A
-failed restore stops the others and says which table, the server's error, what is loaded and what is not.
+on N connections at once** first creates every table of the backup, one after the other on one connection
+(two tables linked by a foreign key cannot be dropped and created side by side), then loads several tables'
+rows at a time (the parts of a large InnoDB table side by side). A failed or cancelled restore stops the others
+and says which table, the server's error, and, as the database holds them then, which tables are loaded,
+partly loaded, empty or missing; running it again starts each table over.
 
 With "Faster", **Block writes during the backup, so that every table is read at the same moment** (off by
 default) says how the backup is consistent. Off, each table is read at one moment, all its parts included (the
@@ -666,10 +669,14 @@ file's lock) and `--skip-triggers` turns Triggers off. Neither
 backup takes `--log-error` or `--skip-verbose`: Kerno reads what mysqldump says.
 
 A folder restored into a database that already holds some of the backup's tables is said before the run, and in
-the confirmation, as the backup was made: those tables are dropped and created again from the backup (empty, for
-a backup of the definitions only), the database's other tables stay; without DROP TABLE statements the restore
-stops at the first of them; a backup of the rows only adds its rows to the tables there (a table that already
-holds some stops on a duplicate key, or ends with rows twice when it has no key).
+the confirmation, as the backup was made: how many of the backup's tables are there, and that they are dropped
+and replaced with the backup's (empty, for a backup of the definitions only), the database's other tables stay,
+and a restore that stops leaves a table it has not finished empty or missing until it runs again; without DROP
+TABLE statements the restore stops at the first of them; a backup of the rows only adds its rows to the tables
+there (a table that already holds some stops on a duplicate key, or ends with rows twice when it has no key).
+The wizard reads the database's tables again after each run, so a second restore from the same wizard says
+what the first one left. For a plain SQL dump, the wizard says that a dump with DROP TABLE statements replaces
+its tables in a database that is not empty, without naming them (that would mean reading the whole file first).
 
 MySQL and MariaDB tools talk `utf8mb4` with a server that has it (5.5.3 on): a MySQL 5.7 client no longer
 writes a 4-byte character (an emoji) as `?`, in the plain backup as in the folder. Such a backup starts with

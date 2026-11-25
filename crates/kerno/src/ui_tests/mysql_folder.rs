@@ -1,7 +1,9 @@
 //! K63: the faster backup of MySQL and MariaDB, several mysqldump at once
 //! into a folder that the restore loads on several mysql clients; the
 //! consistency choice, with and without the RELOAD privilege; an old server
-//! that needs an old client (docs/plans/M12.md, D-135).
+//! that needs an old client (docs/plans/M12.md, D-135). K74: a restore
+//! again into a database that holds the backup's tables, said before and
+//! after (D-143).
 
 use kerno_core::tools::{
     BackupContent, BackupFormat, ClientFamily, DumpMethod, EngineBackup, MySqlBackup, mysql_folder,
@@ -119,8 +121,9 @@ fn a_faster_mysql_backup_is_a_folder_the_restore_loads_on_several_clients(cx: &m
         paints(
             app,
             cx,
-            "“kerno_test_k63_ui_dst” already holds “one”, which the backup has too: each is \
-             dropped and created again from the backup; the database's other tables stay.",
+            "“kerno_test_k63_ui_dst” already holds 1 of the backup's 2 tables (“one”): each is \
+             dropped and replaced with the backup's table and rows; the tables only in \
+             “kerno_test_k63_ui_dst” stay.",
         )
     });
     app.tap(cx, "simple-parallel");
@@ -349,6 +352,225 @@ exit 0"#,
     assert!(!file.exists());
 }
 
+/// K74, with the real tools on MySQL 8.4: a folder backup of a parent and
+/// a child linked by a foreign key, restored with "Faster" into an empty
+/// database, then again from the same wizard (Back): the second time the
+/// wizard and the confirmation say that the backup's tables there are
+/// dropped and replaced, how many, and what a stopped restore leaves. A
+/// file that fails after its table's drop: the failure says which tables
+/// are empty or missing, as the database holds them, and what to do; run
+/// again, everything is in.
+#[gpui_kit::test]
+fn a_restore_again_says_what_it_replaces_and_a_failure_what_it_left(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let (source, target) = ("kerno_test_k74_ui_src", "kerno_test_k74_ui_dst");
+    let drop = |name: &str| format!("DROP DATABASE IF EXISTS {name}");
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop(source), &drop(target)],
+        &[
+            &format!("CREATE DATABASE {source}"),
+            &format!("CREATE DATABASE {target}"),
+            &format!("CREATE TABLE {target}.extra (id INT)"),
+            &format!("CREATE TABLE {source}.parent (id INT PRIMARY KEY, code VARCHAR(9) UNIQUE)"),
+            &format!(
+                "CREATE TABLE {source}.child (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY \
+                 (parent_id) REFERENCES {source}.parent (id))"
+            ),
+            &format!("INSERT INTO {source}.parent VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+            &format!("INSERT INTO {source}.child VALUES (1, 3), (2, 2)"),
+        ],
+    );
+    let app = connected(cx, engine);
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+
+    let dialog = app.simple_dialog(cx, source, false).expect("the backup");
+    let state = app.wait_backup(cx, &dialog, &["ready", "no tool", "old client"]);
+    if !state.starts_with("ready") {
+        eprintln!("SKIPPED: no usable client tool: {state}");
+        return;
+    }
+    app.tap(cx, "simple-faster");
+    let folder = root.join("k74");
+    app.save_as(cx, "simple-choose-file", &folder);
+    app.tap(cx, "backup-start");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: "), "{state}");
+    app.tap(cx, "backup-close");
+
+    let counts = || {
+        on_server(
+            engine,
+            &format!(
+                "SELECT CONCAT((SELECT COUNT(*) FROM {target}.parent), '/', \
+                 (SELECT COUNT(*) FROM {target}.child), '/', (SELECT COUNT(*) FROM {target}.extra))"
+            ),
+        )
+    };
+    let replaced = format!(
+        "“{target}” already holds all 2 of the backup's tables (“child” and “parent”): each is \
+         dropped and replaced with the backup's table and rows; the tables only in “{target}” \
+         stay. Kerno creates the backup's tables first, one after the other, then loads their \
+         rows: if the restore stops, a table it has not finished is left empty or missing until \
+         you run it again."
+    );
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &folder);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    // Into a database that holds none of the backup's tables: nothing is
+    // replaced.
+    assert_eq!(painted(&app, cx, "already holds"), 0);
+    assert!(paints(
+        &app,
+        cx,
+        &format!("A restore writes into “{target}” on top of what it holds")
+    ));
+    app.tap(cx, "simple-parallel");
+    let restore = |app: &Fixture, cx: &mut TestAppContext| {
+        app.tap(cx, "restore-start");
+        app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    };
+    restore(&app, cx);
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: mysql finished"), "{state}");
+    assert_eq!(counts(), "3/2/0");
+
+    // Again, from the same wizard: what it holds now is read again and said,
+    // in the wizard and in the confirmation.
+    app.tap(cx, "backup-back");
+    app.wait_until(cx, "the tables read again", |app, cx| {
+        painted(app, cx, &replaced) == 1
+    });
+    assert!(paints(
+        &app,
+        cx,
+        &format!("A restore drops and replaces the backup's tables that “{target}” holds")
+    ));
+    restore(&app, cx);
+    assert_eq!(painted(&app, cx, &replaced), 2);
+    assert!(paints(
+        &app,
+        cx,
+        "dropping and replacing the backup's tables that the database holds"
+    ));
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: mysql finished"), "{state}");
+    assert_eq!(counts(), "3/2/0");
+
+    // The child's file fails after its DROP: the failure says it is missing
+    // and the parent as it was, as the database holds them.
+    let manifest = mysql_folder::read_manifest(&folder).unwrap();
+    let child = folder.join(&manifest.tables[0].files[0].file);
+    let original = std::fs::read_to_string(&child).unwrap();
+    let at = original.find("CREATE TABLE").unwrap();
+    std::fs::write(
+        &child,
+        format!("{}THIS IS NOT SQL;\n{}", &original[..at], &original[at..]),
+    )
+    .unwrap();
+    app.tap(cx, "backup-back");
+    app.wait_until(cx, "the tables read again", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    restore(&app, cx);
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    // The child's definition runs first (the manifest's order): the
+    // parent's never ran, and it still holds its rows.
+    let said = "Loaded: none. Missing now: “child”. Not loaded, as they were before: “parent”. The \
+                restore drops and creates each of the backup's tables in “kerno_test_k74_ui_dst” \
+                first, then loads their rows: a table it did not finish stays empty or missing.";
+    let next = "Run the restore again: it drops each of the backup's tables and loads it from \
+                the start.";
+    assert!(
+        state.starts_with("failed: mysql failed on child: ERROR 1064")
+            && state.contains(" of 0001-child.sql: ")
+            && state.contains(said)
+            && state.ends_with(next),
+        "{state}"
+    );
+    assert!(paints(&app, cx, said));
+    assert_eq!(
+        on_server(
+            engine,
+            &format!(
+                "SELECT CONCAT((SELECT COUNT(*) FROM {target}.parent), '/', \
+                 (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{target}' \
+                 AND TABLE_NAME = 'child'))"
+            )
+        ),
+        "3/0"
+    );
+    // Run again with the file mended: everything is in.
+    std::fs::write(&child, original).unwrap();
+    app.tap(cx, "backup-back");
+    app.wait_until(cx, "the tables read again", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    restore(&app, cx);
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(state.starts_with("done: mysql finished"), "{state}");
+    assert_eq!(counts(), "3/2/0");
+}
+
+/// K74: the Speed row's hint names "Block writes" as offered once
+/// "Faster" is ticked while that row is hidden, and as below once it shows;
+/// on a server before 5.5.3 too.
+#[gpui_kit::test]
+fn the_speed_hint_points_only_at_a_row_that_shows(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let client = fake_client(
+        &root,
+        "mysql",
+        ClientFamily::MySql,
+        "mysqldump  Ver 8.4.6 for macos15 on arm64",
+        "exit 0",
+    );
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let dialog = app
+        .simple_dialog(cx, "kerno_other", false)
+        .expect("the backup");
+    app.wait_backup(cx, &dialog, &["ready"]);
+    for version in [(8, 4, 6), (5, 1, 73)] {
+        app.step(cx, |_, cx| {
+            dialog.update(cx, |dialog, cx| dialog.set_server_version(version, cx))
+        });
+        assert!(!app.has(cx, "simple-block-writes"), "{version:?}");
+        assert!(
+            paints(&app, cx, "“Block writes”, offered once this is ticked")
+                && !paints(&app, cx, "“Block writes” below"),
+            "{version:?}"
+        );
+        app.tap(cx, "simple-faster");
+        assert!(app.has(cx, "simple-block-writes"), "{version:?}");
+        assert!(
+            paints(&app, cx, "“Block writes” below")
+                && !paints(&app, cx, "offered once this is ticked"),
+            "{version:?}"
+        );
+        app.tap(cx, "simple-faster");
+    }
+}
+
 /// How many painted texts hold `part`.
 fn painted(app: &Fixture, cx: &mut TestAppContext, part: &str) -> usize {
     app.step(cx, |window, _| {
@@ -441,7 +663,7 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
     );
     let app = connected(cx, engine);
     app.use_client(cx, ClientFamily::MySql, &client);
-    let held = format!("“{target}” already holds “one”");
+    let held = format!("“{target}” already holds");
     let cases = [
         (
             "data",
@@ -449,9 +671,10 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
             BackupContent::DataOnly,
             true,
             Some(
-                "which the backup has rows for: the backup holds rows only, so they are added to \
-                 the tables already there; a table that already holds some of them stops the \
-                 restore on a duplicate key, or ends with rows twice when it has no key.",
+                " “one”, which the backup has rows for: the backup holds rows only, so they are \
+                 added to the tables already there; a table that already holds some of them stops \
+                 the restore on a duplicate key, or ends with rows twice when it has no key."
+                    .to_string(),
             ),
         ),
         (
@@ -459,10 +682,13 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
             &["one", "two"][..],
             BackupContent::All,
             true,
-            Some(
-                "which the backup has too: each is dropped and created again from the backup; the \
-                 database's other tables stay.",
-            ),
+            Some(format!(
+                " 1 of the backup's 2 tables (“one”): each is dropped and replaced with the \
+                 backup's table and rows; the tables only in “{target}” stay. Kerno creates the \
+                 backup's tables first, one after the other, then loads their rows: if the \
+                 restore stops, a table it has not finished is left empty or missing until you \
+                 run it again."
+            )),
         ),
         (
             "all-no-drop",
@@ -470,8 +696,9 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
             BackupContent::All,
             false,
             Some(
-                "which the backup has too, and the backup was made without DROP TABLE \
-                 statements: the restore stops at the first of them.",
+                " “one”, which the backup has too, and the backup was made without DROP TABLE \
+                 statements: the restore stops at the first of them."
+                    .to_string(),
             ),
         ),
         (
@@ -479,11 +706,11 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
             &["one", "two"][..],
             BackupContent::SchemaOnly,
             true,
-            Some(
-                "which the backup has too: the backup holds definitions only, so each is dropped \
-                 and created again empty: the rows it holds now are gone; the database's other \
-                 tables stay.",
-            ),
+            Some(format!(
+                " 1 of the backup's 2 tables (“one”): the backup holds definitions only, so each \
+                 is dropped and created again empty, and the rows it holds now are gone; the \
+                 tables only in “{target}” stay."
+            )),
         ),
         ("none", &["two"][..], BackupContent::All, true, None),
     ];
@@ -498,7 +725,7 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
         app.wait_until(cx, "the database's tables", |_, cx| {
             cx.update(|cx| dialog.read(cx).target_loaded())
         });
-        let said = words.map(|words| format!("{held}, {words}"));
+        let said = words.map(|words| format!("{held}{words}"));
         match &said {
             Some(said) => assert_eq!(painted(&app, cx, said), 1, "{name}"),
             None => assert_eq!(painted(&app, cx, &held), 0, "{name}"),
@@ -513,6 +740,29 @@ fn the_restore_says_what_happens_to_the_tables_already_there(cx: &mut TestAppCon
         app.tap(cx, "sql-cancel");
         app.tap(cx, "backup-close");
     }
+    // A plain dump into that database: its DROP TABLE statements are said,
+    // the tables unnamed (K74).
+    let plain = root.join("plain.sql");
+    std::fs::write(&plain, "SELECT 1;\n").unwrap();
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &plain);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    assert!(state.starts_with("ready: "), "{state}");
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    let said = format!(
+        "“{target}” is not empty: a dump made with DROP TABLE statements, as mysqldump writes by \
+         default, drops each of its tables that “{target}” holds and creates it again from the \
+         dump; the other tables stay. Kerno does not read the whole file first to name them."
+    );
+    assert_eq!(painted(&app, cx, &said), 1);
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    assert_eq!(painted(&app, cx, &said), 2);
+    app.tap(cx, "sql-cancel");
 }
 
 /// A backup made in utf8mb4 (its first lines set it), restored into a

@@ -22,7 +22,7 @@ use gpui_kit::{
 use kerno_core::config::Engine;
 use kerno_core::tools::{
     BackupContent, BackupFormat, BackupOptions, ClientFamily, DumpMethod, EngineBackup,
-    RestoreOptions,
+    RestoreOptions, mysql_folder,
 };
 
 use super::{BackupDialog, Input, Loaded, Mode, Purpose, Step, View, is_view};
@@ -593,17 +593,27 @@ impl BackupDialog {
             }
             _ => String::new(),
         };
+        let base = if self.replaces() {
+            format!(
+                "A restore drops and replaces the backup's tables that “{}” holds and cannot be \
+                 undone.",
+                self.database
+            )
+        } else {
+            format!(
+                "A restore writes into “{}” on top of what it holds and cannot be undone.",
+                self.database
+            )
+        };
         format!(
-            "A restore writes into “{}” on top of what it holds and cannot be undone. Kerno \
-             shows the command and asks before it runs.{tail}{}{old}",
-            self.database,
+            "{base} Kerno shows the command and asks before it runs.{tail}{}{old}",
             self.overlap_words()
         )
     }
 
-    /// A folder backup restored into a database that already holds some of
-    /// its tables: what happens to them (K63).
-    pub(super) fn overlap_words(&self) -> String {
+    /// A folder backup's tables and views that the target database holds,
+    /// once its tables are read (K74).
+    fn held_by_target(&self) -> Option<(&mysql_folder::Manifest, Vec<String>, Vec<String>)> {
         let (
             Some(Ok(Input {
                 manifest: Some(manifest),
@@ -612,58 +622,142 @@ impl BackupDialog {
             Some(held),
         ) = (&self.input, &self.target_tables)
         else {
-            return String::new();
+            return None;
         };
         let fold = |name: &str| name.to_lowercase();
-        let both: Vec<String> = manifest
+        let has = |name: &&str| held.iter().any(|have| fold(have) == fold(name));
+        let quoted = |name: &str| format!("“{name}”");
+        let tables = manifest
             .tables
             .iter()
             .map(|table| table.table.as_str())
-            .chain(
-                manifest
-                    .after
-                    .iter()
-                    .flat_map(|after| after.objects.iter().map(String::as_str)),
-            )
-            .filter(|name| held.iter().any(|have| fold(have) == fold(name)))
-            .map(|name| format!("“{name}”"))
+            .filter(has)
+            .map(quoted)
             .collect();
-        if both.is_empty() {
+        let views = manifest
+            .after
+            .iter()
+            .filter(|after| after.kind == mysql_folder::AfterKind::Views)
+            .flat_map(|after| after.objects.iter().map(String::as_str))
+            .filter(has)
+            .map(quoted)
+            .collect();
+        Some((manifest, tables, views))
+    }
+
+    /// Whether the restore drops and replaces tables the target holds: a
+    /// folder backup with its definitions and DROP TABLE, some of whose
+    /// tables are there (K74).
+    pub(super) fn replaces(&self) -> bool {
+        self.held_by_target().is_some_and(|(manifest, tables, _)| {
+            manifest.options.add_drop_table
+                && manifest.content != BackupContent::DataOnly
+                && !tables.is_empty()
+        })
+    }
+
+    /// A folder backup restored into a database that already holds some of
+    /// its tables: what happens to them, how many there are, and what a
+    /// stopped restore leaves (K63, K74). A plain dump: that its DROP TABLE
+    /// statements replace tables, unnamed.
+    pub(super) fn overlap_words(&self) -> String {
+        let database = &self.database;
+        let Some(Ok(input)) = &self.input else {
+            return String::new();
+        };
+        if self.mode != Mode::Restore || self.family != ClientFamily::MySql {
             return String::new();
         }
-        let shown = if both.len() > 6 {
-            format!("{} and {} more", both[..6].join(", "), both.len() - 6)
-        } else {
-            listed(&both)
+        let Some(manifest) = &input.manifest else {
+            // Which tables a dump drops is known only by reading all of it,
+            // which can take minutes for a large one: not named (K74).
+            return match &self.target_tables {
+                Some(held) if !held.is_empty() => format!(
+                    " “{database}” is not empty: a dump made with DROP TABLE statements, as \
+                     mysqldump writes by default, drops each of its tables that “{database}” \
+                     holds and creates it again from the dump; the other tables stay. Kerno does \
+                     not read the whole file first to name them."
+                ),
+                _ => String::new(),
+            };
         };
-        if manifest.content == BackupContent::DataOnly {
+        let drops = manifest.options.add_drop_table && manifest.content != BackupContent::DataOnly;
+        let Some((_, tables, views)) = self.held_by_target() else {
+            return if drops && !self.target_reading {
+                format!(
+                    " Kerno could not read which tables “{database}” holds: each table of the \
+                     backup that is there is dropped and replaced."
+                )
+            } else {
+                String::new()
+            };
+        };
+        if tables.is_empty() && views.is_empty() {
+            return String::new();
+        }
+        let shown = |names: &[String]| {
+            if names.len() > 6 {
+                format!("{} and {} more", names[..6].join(", "), names.len() - 6)
+            } else {
+                listed(names)
+            }
+        };
+        if manifest.content == BackupContent::DataOnly || !manifest.options.add_drop_table {
+            let both: Vec<String> = tables.iter().chain(&views).cloned().collect();
+            let both = shown(&both);
+            return if manifest.content == BackupContent::DataOnly {
+                format!(
+                    " “{database}” already holds {both}, which the backup has rows for: the \
+                     backup holds rows only, so they are added to the tables already there; a \
+                     table that already holds some of them stops the restore on a duplicate key, \
+                     or ends with rows twice when it has no key."
+                )
+            } else {
+                format!(
+                    " “{database}” already holds {both}, which the backup has too, and the backup \
+                     was made without DROP TABLE statements: the restore stops at the first of \
+                     them."
+                )
+            };
+        }
+        let total = manifest.tables.len();
+        let views_too = if views.is_empty() {
+            String::new()
+        } else {
+            format!(", and its views {} are replaced too", shown(&views))
+        };
+        let schema = manifest.content == BackupContent::SchemaOnly;
+        let mut text = if tables.is_empty() {
             format!(
-                " “{}” already holds {shown}, which the backup has rows for: the backup holds \
-                 rows only, so they are added to the tables already there; a table that already \
-                 holds some of them stops the restore on a duplicate key, or ends with rows twice \
-                 when it has no key.",
-                self.database
-            )
-        } else if manifest.options.add_drop_table && manifest.content == BackupContent::SchemaOnly {
-            format!(
-                " “{}” already holds {shown}, which the backup has too: the backup holds \
-                 definitions only, so each is dropped and created again empty: the rows it holds \
-                 now are gone; the database's other tables stay.",
-                self.database
-            )
-        } else if manifest.options.add_drop_table {
-            format!(
-                " “{}” already holds {shown}, which the backup has too: each is dropped and \
-                 created again from the backup; the database's other tables stay.",
-                self.database
+                " “{database}” already holds the backup's views {}: they are replaced.",
+                shown(&views)
             )
         } else {
+            let count = match (tables.len(), total) {
+                (_, 1) => "the backup's table".to_string(),
+                (n, total) if n == total => format!("all {total} of the backup's tables"),
+                (n, total) => format!("{n} of the backup's {total} tables"),
+            };
             format!(
-                " “{}” already holds {shown}, which the backup has too, and the backup was made \
-                 without DROP TABLE statements: the restore stops at the first of them.",
-                self.database
+                " “{database}” already holds {count} ({}): {}{views_too}; the tables only in \
+                 “{database}” stay.",
+                shown(&tables),
+                if schema {
+                    "the backup holds definitions only, so each is dropped and created again \
+                     empty, and the rows it holds now are gone"
+                } else {
+                    "each is dropped and replaced with the backup's table and rows"
+                }
             )
+        };
+        if !schema && !tables.is_empty() {
+            text.push_str(
+                " Kerno creates the backup's tables first, one after the other, then loads their \
+                 rows: if the restore stops, a table it has not finished is left empty or missing \
+                 until you run it again.",
+            );
         }
+        text
     }
 
     /// The client in use, small, with the way to another one.
@@ -754,24 +848,31 @@ impl BackupDialog {
             ),
         }
         .then(|| {
+            // The "Writes" row shows only with "Faster" ticked (K74).
+            let block = if faster {
+                "“Block writes” below"
+            } else {
+                "“Block writes”, offered once this is ticked"
+            };
             let hint = match self.family {
                 ClientFamily::Postgres => {
                     "The backup is then a folder, one file per table, which Kerno restores like \
                      any backup. A single large table is still read by one connection."
+                        .to_string()
                 }
-                ClientFamily::MySql if self.server_version < (5, 5, 3) => {
+                ClientFamily::MySql if self.server_version < (5, 5, 3) => format!(
                     "The backup is then a folder, one file per table, which Kerno restores on \
                      several connections too. On this server, a large table with a single-column \
-                     whole-number key is read in several parts at once only with “Block writes” \
-                     below: only then is every part read at one moment. Otherwise each table is \
-                     read by one connection."
-                }
-                ClientFamily::MySql => {
+                     whole-number key is read in several parts at once only with {block}: only \
+                     then is every part read at one moment. Otherwise each table is read by one \
+                     connection."
+                ),
+                ClientFamily::MySql => format!(
                     "The backup is then a folder, one file per table, which Kerno restores on \
                      several connections too. A large InnoDB table with a single-column \
                      whole-number key is read in several parts at once, and a large table of any \
-                     engine with “Block writes” below; any other is still read by one connection."
-                }
+                     engine with {block}; any other is still read by one connection."
+                ),
             };
             row(
                 "Speed",
@@ -794,7 +895,7 @@ impl BackupDialog {
                             .test_support()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(hint)
+                            .child(SharedString::from(hint.clone()))
                             .test_text(hint),
                     ),
                 cx,

@@ -348,6 +348,8 @@ pub struct BackupDialog {
     /// A MySQL / MariaDB restore: the tables and views the database holds,
     /// once read, said beside a folder backup that has some of them.
     target_tables: Option<Vec<String>>,
+    /// They are being read: Start waits (K74).
+    target_reading: bool,
     databases: Loaded<Vec<String>>,
     /// Global backup: the databases the user left out (what a task keeps).
     excluded: BTreeSet<String>,
@@ -676,6 +678,7 @@ impl BackupDialog {
             objects: Loaded::Loading,
             can_lock: None,
             target_tables: None,
+            target_reading: false,
             databases: Loaded::Loading,
             excluded: BTreeSet::new(),
             closed: Vec::new(),
@@ -724,7 +727,7 @@ impl BackupDialog {
         match mode {
             Mode::Backup => dialog.load_objects(meta, cx),
             Mode::GlobalBackup => dialog.load_databases(meta, cx),
-            Mode::Restore if dialog.family == ClientFamily::MySql => dialog.load_target(meta, cx),
+            Mode::Restore if dialog.family == ClientFamily::MySql => dialog.load_target(cx),
             Mode::Restore | Mode::ExecuteScript => {}
         }
         dialog
@@ -839,14 +842,15 @@ impl BackupDialog {
     }
 
     /// Lists the tables and views of the database a MySQL / MariaDB restore
-    /// goes into.
-    fn load_target(&mut self, meta: Arc<dyn Session>, cx: &mut Context<Self>) {
+    /// goes into: when the wizard opens and again after each run, which may
+    /// have filled it (K74). Start waits for it.
+    fn load_target(&mut self, cx: &mut Context<Self>) {
         let database = self.database.clone();
         let opening =
             self.connections
                 .read(cx)
                 .open_session(&self.connection, Some(database.clone()), cx);
-        let _ = meta;
+        self.target_reading = true;
         let reading = bridge::spawn(cx, async move {
             let session = opening.await.ok()?;
             let objects = fetch_objects(&*session, &database).await.ok();
@@ -856,6 +860,7 @@ impl BackupDialog {
         self.tasks.push(cx.spawn(async move |this, cx| {
             let objects = reading.await;
             let _ = this.update(cx, |this, cx| {
+                this.target_reading = false;
                 this.target_tables = objects.map(|entries| {
                     entries
                         .into_iter()
@@ -1959,6 +1964,13 @@ impl BackupDialog {
         {
             return Some(why.clone());
         }
+        // What the restore replaces is said first (K74).
+        if self.target_reading && self.mode == Mode::Restore {
+            return Some(format!(
+                "Kerno is reading which tables “{}” holds.",
+                self.database
+            ));
+        }
         if self.can_lock == Some(false) && self.locks_for_backup(cx) {
             return Some(
                 "This account lacks the RELOAD privilege that the read lock (“lock all tables”, \
@@ -2178,6 +2190,7 @@ impl BackupDialog {
                         allow_commands: self.allow_commands,
                         script,
                         restore: &self.restore,
+                        replaces: self.replaces(),
                     }),
                     self.overlap_words()
                 ),
@@ -2671,6 +2684,10 @@ impl BackupDialog {
         {
             self.check_roles(cx);
         }
+        // What the run left in the database, for the next one's words.
+        if self.mode == Mode::Restore && self.family == ClientFamily::MySql {
+            self.load_target(cx);
+        }
         if self.close_when_stopped {
             window.close_dialog(cx);
         }
@@ -2842,8 +2859,14 @@ impl BackupDialog {
             && self.mode == Mode::Restore
         {
             text.push_str(&format!(
-                "  # one mysql per file of the folder ({} files), the tables first",
-                manifest.files().count()
+                "  # one mysql per file of the folder ({} files), the tables first: {}",
+                manifest.files().count(),
+                if manifest.content == BackupContent::DataOnly {
+                    "their rows, several at once"
+                } else {
+                    "every table's definition, one after the other on one connection, then their \
+                     rows, several at once"
+                }
             ));
         }
         let left_out = self.left_out();
@@ -3038,7 +3061,7 @@ impl BackupDialog {
     /// Whether the restore's target database's tables are read; for tests.
     #[cfg(test)]
     pub fn target_loaded(&self) -> bool {
-        self.target_tables.is_some()
+        self.target_tables.is_some() && !self.target_reading
     }
 
     /// The server's version as read; set by a test that plays an older
@@ -3893,6 +3916,8 @@ struct Explained<'a> {
     allow_commands: bool,
     script: bool,
     restore: &'a RestoreOptions,
+    /// The restore drops and replaces tables the database holds (K74).
+    replaces: bool,
 }
 
 /// What the confirmation says: the file, the database, the connection;
@@ -3911,10 +3936,15 @@ fn restore_explanation(about: &Explained) -> String {
     } else {
         format!(
             "This runs {program} on this computer: it restores {} into the database “{}” of \
-             “{}”, on top of what the database holds.",
+             “{}”, {}.",
             about.input.path.display(),
             about.database,
-            about.connection
+            about.connection,
+            if about.replaces {
+                "dropping and replacing the backup's tables that the database holds"
+            } else {
+                "on top of what the database holds"
+            }
         )
     };
     let archive = about.input.format != BackupFormat::Sql;
@@ -6287,6 +6317,7 @@ mod tests {
             allow_commands: case.allow,
             script: case.script,
             restore: case.restore,
+            replaces: false,
         })
     }
 

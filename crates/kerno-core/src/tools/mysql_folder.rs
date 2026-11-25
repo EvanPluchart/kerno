@@ -24,7 +24,7 @@
 //! LOCK` from before the first mysqldump until the last has ended, so that
 //! everything is read at one moment; any end of the run releases it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BackupContent, BackupFormat, BackupOptions, CANCEL_POLL, DumpMethod, EngineBackup, MySqlBackup,
-    RestoreOptions, ToolCommand, ToolVersion, backup_command, check_script, restore_command, run,
+    RestoreOptions, StdinPart, ToolCommand, ToolVersion, backup_command, check_script,
+    restore_command, run,
 };
 use crate::Session;
 use crate::config::{ConnectParams, Engine};
@@ -1866,15 +1867,378 @@ impl FolderRestore {
     fn jobs(&self) -> usize {
         self.options.jobs.unwrap_or(1).clamp(1, 64) as usize
     }
+
+    /// The `mysql` command that runs `sql` itself, not a file, with the
+    /// account and options of the files: Kerno's own statements before and
+    /// after them (K74).
+    fn statement_command(&self, sql: &str) -> Result<ToolCommand> {
+        let mut command = self.file_command(MANIFEST)?;
+        command.stdin = None;
+        command.script_check = None;
+        command.args.push("--batch".into());
+        command.args.push("--skip-column-names".into());
+        command.args.push(format!("--execute={sql}"));
+        Ok(command)
+    }
+
+    /// Runs `sql` on one `mysql` client: the lines it wrote, or a failure
+    /// with its last line.
+    async fn run_statements(&self, sql: &str, cancel: Arc<AtomicBool>) -> Result<Vec<String>> {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let kept = lines.clone();
+        let ran = run(
+            self.statement_command(sql)?,
+            move |line| {
+                if let Ok(mut lines) = kept.lock() {
+                    lines.push(line);
+                }
+            },
+            cancel,
+        )
+        .await?;
+        let lines = lines.lock().map(|lines| lines.clone()).unwrap_or_default();
+        if ran.success() {
+            return Ok(lines);
+        }
+        let last = lines.iter().rev().find(|line| failure_line(line));
+        Err(Error::Config(
+            last.cloned().unwrap_or_else(|| format!("{ran}")),
+        ))
+    }
 }
 
-/// Loads a backup folder: the tables first, [`FolderRestore::options`]'s
-/// jobs clients at once (the first file of a table alone, then its ranges
-/// side by side on InnoDB, one after the other otherwise), then the files
-/// after the tables, in order, by one client. Every file is checked for
-/// client commands before any client starts. A failure stops the others
-/// and says which table, where, and what is in and what is not; what was
-/// loaded stays, as with a plain SQL file.
+/// How long one statement of a `mysql --execute` may be: well under the
+/// command line's limit on every system (32,767 characters on Windows).
+const EXECUTE_LIMIT: usize = 8_000;
+
+/// `items` joined by `separator` into texts of at most [`EXECUTE_LIMIT`]
+/// bytes after `head` (a single item longer than that alone).
+fn batches(head: &str, items: &[String], separator: &str) -> Vec<String> {
+    let mut batches: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for item in items {
+        if !current.is_empty() && current.len() + separator.len() + item.len() > EXECUTE_LIMIT {
+            batches.push(format!("{head}{current}"));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push_str(separator);
+        }
+        current.push_str(item);
+    }
+    if !current.is_empty() {
+        batches.push(format!("{head}{current}"));
+    }
+    batches
+}
+
+/// What a tool's failure says, without the error kind's own words.
+fn said(error: &Error) -> String {
+    match error {
+        Error::Config(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn backticked(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// Where a table's definition is in the first file of its table, as
+/// mysqldump writes it: from its `DROP TABLE` (or `CREATE TABLE`) to the
+/// line that ends it, `/*!40101 SET character_set_client = @saved_cs_client
+/// */;` (written after every CREATE TABLE by mysqldump 5.7.44 and 26.10,
+/// from MySQL and MariaDB servers: `--skip-set-charset`, which drops it, is
+/// refused).
+/// What comes before is the file's settings, what comes after its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Definition {
+    pub start: u64,
+    pub end: u64,
+    /// The file's size.
+    pub len: u64,
+    /// The lines before `end`.
+    pub lines: u64,
+}
+
+/// How far into a file Kerno looks for the end of its table's definition.
+const DEFINITION_WITHIN: u64 = 64 << 20;
+
+/// Finds the definition in the first file of a table, or `None` when it is
+/// not where mysqldump puts it (no definition, rows before it, its end not
+/// found): such a file then runs whole, alone (K74). Blocking.
+pub fn find_definition(path: &Path) -> std::io::Result<Option<Definition>> {
+    use std::io::BufRead as _;
+    let len = std::fs::metadata(path)?.len();
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let (mut at, mut start, mut created, mut lines) = (0u64, None, false, 0u64);
+    let mut line = Vec::new();
+    while at < DEFINITION_WITHIN {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)? as u64;
+        if read == 0 {
+            break;
+        }
+        lines += 1;
+        let text = String::from_utf8_lossy(&line);
+        let opens = text.starts_with("DROP TABLE ")
+            || text.starts_with("/*!40101 SET @saved_cs_client")
+            || text.starts_with("CREATE TABLE ");
+        if start.is_none() && opens {
+            start = Some(at);
+        }
+        if start.is_some() && text.starts_with("CREATE TABLE ") {
+            created = true;
+        }
+        if created && text.trim_end() == "/*!40101 SET character_set_client = @saved_cs_client */;"
+        {
+            // The definition's last line ends with its newline.
+            return Ok(start
+                .filter(|_| line.ends_with(b"\n"))
+                .map(|start| Definition {
+                    start,
+                    end: at + read,
+                    len,
+                    lines,
+                }));
+        }
+        let rows = ["INSERT ", "REPLACE ", "LOCK TABLES "]
+            .iter()
+            .any(|word| text.starts_with(word));
+        if rows {
+            return Ok(None);
+        }
+        at += read;
+    }
+    Ok(None)
+}
+
+/// What Kerno writes after each table's definition in the definitions'
+/// run, and reads back from the client: that definition ran.
+const DEFINED: &str = "kerno-defined:";
+
+/// What a table of the backup is in the target after a stopped restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Now {
+    Missing,
+    Empty,
+    Rows,
+}
+
+/// What Kerno knows of the backup's tables in the target after a stopped
+/// restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Dropped {
+    /// The files define no table (rows only): their states say it.
+    No,
+    /// Read from the target once the clients ended, per table.
+    Read(BTreeMap<String, Now>),
+    /// Tables were (or may have been) dropped, and the target could not be
+    /// read: why.
+    Unread(String),
+}
+
+/// Reads, on one `mysql` client, which of `tables` the target holds, and
+/// whether each holds a row. Within 30 s each read.
+async fn tables_now(
+    job: &FolderRestore,
+    tables: &[String],
+) -> std::result::Result<BTreeMap<String, Now>, String> {
+    // Never behind a lock a stopped client's statement still holds for long.
+    let head = "/*!50503 SET SESSION lock_wait_timeout = 10 */; ";
+    let read = async |queries: Vec<String>| -> std::result::Result<BTreeMap<usize, bool>, String> {
+        let mut found = BTreeMap::new();
+        for sql in batches(head, &queries, "; ") {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let lines =
+                tokio::time::timeout(Duration::from_secs(30), job.run_statements(&sql, cancel))
+                    .await
+                    .map_err(|_| "it did not answer within 30 s".to_string())?
+                    .map_err(|error| said(&error))?;
+            for line in lines {
+                if let Some((at, yes)) = line.split_once('\t')
+                    && let Ok(at) = at.trim().parse::<usize>()
+                {
+                    found.insert(at, yes.trim() == "1");
+                }
+            }
+        }
+        Ok(found)
+    };
+    let hex = |name: &str| -> String { name.bytes().map(|byte| format!("{byte:02X}")).collect() };
+    let there = read(
+        tables
+            .iter()
+            .enumerate()
+            .map(|(at, name)| {
+                format!(
+                    "SELECT {at}, EXISTS(SELECT 1 FROM information_schema.TABLES WHERE \
+                     TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME = \
+                     _utf8 X'{}')",
+                    hex(name)
+                )
+            })
+            .collect(),
+    )
+    .await?;
+    let held = read(
+        tables
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| there.get(at) == Some(&true))
+            .map(|(at, name)| format!("SELECT {at}, EXISTS(SELECT 1 FROM {})", backticked(name)))
+            .collect(),
+    )
+    .await?;
+    let mut now = BTreeMap::new();
+    for (at, name) in tables.iter().enumerate() {
+        let state = match (there.get(&at), held.get(&at)) {
+            (Some(false), _) => Now::Missing,
+            (Some(true), Some(false)) => Now::Empty,
+            (Some(true), Some(true)) => Now::Rows,
+            _ => return Err(format!("no answer for “{name}”")),
+        };
+        now.insert(name.clone(), state);
+    }
+    Ok(now)
+}
+
+/// How a stopped step of the restore ended: cancelled (`Ok`), or failed on
+/// a label with what the client said.
+type Stopped = Option<std::result::Result<(), (String, String)>>;
+
+/// Says a client's "at line N" of the definitions' run as the line of the
+/// table's own file, which starts on line `start` of the run.
+fn in_its_file(said: &str, start: Option<u64>, file: &str) -> String {
+    let Some((before, after)) = said.split_once(" at line ") else {
+        return said.to_string();
+    };
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    match (digits.parse::<u64>(), start) {
+        (Ok(line), Some(start)) if line >= start => format!(
+            "{before} at line {} of {file}{}",
+            line - start + 1,
+            &after[digits.len()..]
+        ),
+        _ => said.to_string(),
+    }
+}
+
+/// Runs every table's definition on one client, in the manifest's order:
+/// the first file of each table up to the end of its definition (the whole
+/// file where [`find_definition`] found none), each followed by a marker
+/// the client prints back, so that `defined` holds the tables whose
+/// definition ran, also after a failure or a cancel.
+async fn define(
+    job: &FolderRestore,
+    definitions: &[Option<Definition>],
+    defined: &mut BTreeSet<usize>,
+    on_line: &Arc<dyn Fn(String) + Send + Sync>,
+    cancel: &Arc<AtomicBool>,
+) -> Stopped {
+    let manifest = &job.manifest;
+    let mut parts = Vec::new();
+    // The line of the run each table's part starts on, while known.
+    let mut starts = Vec::new();
+    let mut line = Some(1u64);
+    for (index, table) in manifest.tables.iter().enumerate() {
+        starts.push(line);
+        let Some(first) = table.files.first() else {
+            continue;
+        };
+        let definition = definitions.get(index).copied().flatten();
+        parts.push(StdinPart::File {
+            path: job.options.input.join(&first.file),
+            range: 0..definition.map_or(u64::MAX, |definition| definition.end),
+        });
+        parts.push(StdinPart::Text(format!("\nSELECT '{DEFINED}{index}';\n")));
+        line = line
+            .zip(definition)
+            .map(|(line, definition)| line + definition.lines + 2);
+    }
+    let label = |index: Option<usize>| {
+        index
+            .and_then(|index| manifest.tables.get(index))
+            .map_or_else(
+                || "the tables' definitions".to_string(),
+                |table| table.table.clone(),
+            )
+    };
+    let first = manifest.tables.first()?.files.first()?;
+    let mut command = match job.file_command(&first.file) {
+        Ok(command) => command,
+        Err(error) => return Some(Err((label(None), said(&error)))),
+    };
+    command.stdin = None;
+    command.script_check = None;
+    // Not counted in the progress: the rows' runs feed every file's
+    // settings again.
+    command.sent = Arc::default();
+    command.stdin_parts = parts;
+    command.args.extend([
+        "--unbuffered".to_string(),
+        "--skip-column-names".to_string(),
+    ]);
+    let heard: Arc<Mutex<(BTreeSet<usize>, Option<String>)>> = Arc::default();
+    let (marks, sink) = (heard.clone(), on_line.clone());
+    let ran = run(
+        command,
+        move |line| {
+            let Ok(mut marks) = marks.lock() else {
+                return;
+            };
+            if let Some(index) = line
+                .strip_prefix(DEFINED)
+                .and_then(|index| index.trim().parse().ok())
+            {
+                marks.0.insert(index);
+                return;
+            }
+            if failure_line(&line) {
+                marks.1 = Some(line.clone());
+            }
+            sink(format!("[definitions] {line}"));
+        },
+        cancel.clone(),
+    )
+    .await;
+    let (marked, last) = heard.lock().map(|heard| heard.clone()).unwrap_or_default();
+    defined.extend(marked);
+    // The table whose definition was running when it stopped.
+    let at = (0..manifest.tables.len()).find(|index| !defined.contains(index));
+    let file = at
+        .and_then(|index| manifest.tables.get(index))
+        .and_then(|table| table.files.first())
+        .map(|piece| piece.file.as_str())
+        .unwrap_or_default();
+    let start = at.and_then(|index| starts.get(index).copied().flatten());
+    match ran {
+        Ok(status) if status.success() => {
+            defined.extend(0..manifest.tables.len());
+            None
+        }
+        Err(Error::Cancelled) => Some(Ok(())),
+        Ok(status) => Some(Err((
+            label(at),
+            last.map_or_else(
+                || format!("{status}"),
+                |last| in_its_file(&last, start, file),
+            ),
+        ))),
+        Err(error) => Some(Err((label(at), said(&error)))),
+    }
+}
+
+/// Loads a backup folder: every table's definition first, one after the
+/// other on one client ([`define`]); then the tables' rows,
+/// [`FolderRestore::options`]'s jobs clients at once (the first file of a
+/// table without its definition, then its ranges side by side on InnoDB,
+/// one after the other otherwise); then the files after the tables, in
+/// order, by one client. Every file is checked for client commands before
+/// any client starts. A failure stops the others and says which table,
+/// where, what is in and what is not, and which tables it left empty or
+/// missing, as the target holds them; what was loaded stays, as with a
+/// plain SQL file.
 pub async fn restore(
     job: FolderRestore,
     on_line: Arc<dyn Fn(String) + Send + Sync>,
@@ -1892,14 +2256,81 @@ async fn restore_in(
     cancel: &Arc<AtomicBool>,
 ) -> Result<()> {
     let manifest = &job.manifest;
-    let mut groups = Vec::new();
     let mut checks = Vec::new();
-    for table in &manifest.tables {
+    for file in manifest.files() {
+        checks.extend(job.file_command(file)?.script_check.take());
+    }
+    // Every table's definition first, one after the other on one client
+    // (K74, D-143): files that drop and create tables side by side deadlock
+    // where a foreign key links them, and a table created while another is
+    // locked for its rows fails it (MariaDB).
+    let defines = manifest.content != BackupContent::DataOnly;
+    let firsts: Vec<PathBuf> = manifest
+        .tables
+        .iter()
+        .filter(|_| defines)
+        .filter_map(|table| table.files.first())
+        .map(|piece| job.options.input.join(&piece.file))
+        .collect();
+    // All the files before the first client: a refusal loads nothing.
+    let checking = cancel.clone();
+    let definitions = tokio::task::spawn_blocking(move || {
+        checks
+            .iter()
+            .try_for_each(|check| check_script(check, &checking))?;
+        firsts
+            .iter()
+            .map(|path| {
+                find_definition(path)
+                    .map_err(|error| Error::io(format!("could not read {}", path.display()), error))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|error| Error::io("checking the backup's files", std::io::Error::other(error)))??;
+    let mut defined = BTreeSet::new();
+    let stopped = if defines && !manifest.tables.is_empty() {
+        on_line(format!(
+            "Kerno: the {} tables' definitions first, one after the other on one connection.",
+            manifest.tables.len()
+        ));
+        define(job, &definitions, &mut defined, on_line, cancel).await
+    } else {
+        None
+    };
+    // Each table's rows, side by side: the first file without its
+    // definition (a file whose definition Kerno could not find ran whole
+    // above), then its ranges.
+    let mut groups = Vec::new();
+    let mut ran_whole = Vec::new();
+    for (index, table) in manifest.tables.iter().enumerate() {
         let mut stages = VecDeque::new();
         let mut rest = Vec::new();
         for (at, piece) in table.files.iter().enumerate() {
             let mut command = job.file_command(&piece.file)?;
-            checks.extend(command.script_check.take());
+            command.script_check = None;
+            if at == 0 && defines {
+                match definitions.get(index).copied().flatten() {
+                    Some(definition) if manifest.content != BackupContent::SchemaOnly => {
+                        let path = command.stdin.take().unwrap_or_default();
+                        command.stdin_parts = vec![
+                            StdinPart::File {
+                                path: path.clone(),
+                                range: 0..definition.start,
+                            },
+                            StdinPart::File {
+                                path,
+                                range: definition.end..definition.len,
+                            },
+                        ];
+                    }
+                    // Nothing but the definition, or all of it ran.
+                    _ => {
+                        ran_whole.push((index, piece.file.clone()));
+                        continue;
+                    }
+                }
+            }
             let file = Job {
                 file: piece.file.clone(),
                 label: match table.files.len() {
@@ -1924,43 +2355,76 @@ async fn restore_in(
     let mut finishing = VecDeque::new();
     for after in &manifest.after {
         let mut command = job.file_command(&after.file)?;
-        checks.extend(command.script_check.take());
+        command.script_check = None;
         finishing.push_back(Stage::Side(vec![Job {
             file: after.file.clone(),
             label: after.label().into(),
             command,
         }]));
     }
-    // All the files before the first client: a refusal loads nothing.
-    let checking = cancel.clone();
-    tokio::task::spawn_blocking(move || {
-        checks
-            .iter()
-            .try_for_each(|check| check_script(check, &checking))
-    })
-    .await
-    .map_err(|error| Error::io("checking the backup's files", std::io::Error::other(error)))??;
-    on_line(format!(
-        "Kerno: {} tables from {} files, {} mysql clients at once.",
-        manifest.tables.len(),
-        manifest.files().count(),
-        job.jobs()
-    ));
-    let tables = run_pool(groups, job.jobs(), on_line.clone(), cancel, None, false).await;
-    let finished = if tables.failure.is_none() && !tables.cancelled {
-        Some(run_pool(vec![finishing], 1, on_line.clone(), cancel, None, false).await)
+    let (mut tables, finished) = if stopped.is_none() {
+        on_line(format!(
+            "Kerno: {} tables from {} files, {} mysql clients at once.",
+            manifest.tables.len(),
+            manifest.files().count(),
+            job.jobs()
+        ));
+        let tables = run_pool(groups, job.jobs(), on_line.clone(), cancel, None, false).await;
+        let finished = if tables.failure.is_none() && !tables.cancelled {
+            Some(run_pool(vec![finishing], 1, on_line.clone(), cancel, None, false).await)
+        } else {
+            None
+        };
+        (tables, finished)
     } else {
-        None
+        (PoolEnd::default(), None)
     };
-    let failure = tables
-        .failure
-        .clone()
-        .or_else(|| finished.as_ref().and_then(|end| end.failure.clone()));
-    let cancelled = tables.cancelled || finished.as_ref().is_some_and(|end| end.cancelled);
+    // A file that ran whole with the definitions is in.
+    for (index, file) in ran_whole {
+        if defined.contains(&index) {
+            tables.states.insert(file, FileState::Done);
+        }
+    }
+    let failure = match &stopped {
+        Some(Err(failure)) => Some(failure.clone()),
+        _ => tables
+            .failure
+            .clone()
+            .or_else(|| finished.as_ref().and_then(|end| end.failure.clone())),
+    };
+    let cancelled = matches!(stopped, Some(Ok(())))
+        || tables.cancelled
+        || finished.as_ref().is_some_and(|end| end.cancelled);
     if failure.is_none() && !cancelled {
         return Ok(());
     }
-    let summary = restore_summary(manifest, &tables, finished.as_ref());
+    // What the definitions left: read from the target once every client
+    // ended.
+    let dropped = if defines {
+        let names: Vec<String> = manifest
+            .tables
+            .iter()
+            .map(|table| table.table.clone())
+            .collect();
+        match tables_now(job, &names).await {
+            Ok(now) => Dropped::Read(now),
+            Err(why) => Dropped::Unread(why),
+        }
+    } else {
+        Dropped::No
+    };
+    let defined: BTreeSet<&str> = defined
+        .iter()
+        .filter_map(|index| manifest.tables.get(*index))
+        .map(|table| table.table.as_str())
+        .collect();
+    let summary = restore_summary(
+        manifest,
+        &job.options.database,
+        &tables,
+        finished.as_ref(),
+        &Reached { defined, dropped },
+    );
     match failure {
         Some((label, reason)) => Err(Error::Config(format!(
             "mysql failed on {label}: {reason}. {summary}"
@@ -1972,9 +2436,131 @@ async fn restore_in(
     }
 }
 
-/// What a stopped restore loaded: the tables in, partly in, not started,
-/// and the files after the tables.
-fn restore_summary(manifest: &Manifest, tables: &PoolEnd, after: Option<&PoolEnd>) -> String {
+/// What a stopped restore reached besides its files: the tables whose
+/// definition ran, and what the target holds.
+struct Reached<'a> {
+    defined: BTreeSet<&'a str>,
+    dropped: Dropped,
+}
+
+/// What a stopped restore into `database` loaded: the tables in, partly in,
+/// not started, and the files after the tables; for a backup that defines
+/// its tables, which ones the target now holds empty or not at all (K74).
+fn restore_summary(
+    manifest: &Manifest,
+    database: &str,
+    tables: &PoolEnd,
+    after: Option<&PoolEnd>,
+    reached: &Reached,
+) -> String {
+    let dropped = &reached.dropped;
+    let after_left: Vec<&str> = manifest
+        .after
+        .iter()
+        .filter(|file| {
+            !after.is_some_and(|end| end.states.get(&file.file) == Some(&FileState::Done))
+        })
+        .map(AfterFile::label)
+        .collect();
+    let after_text = if after_left.is_empty() {
+        String::new()
+    } else {
+        format!(" Not loaded either: the {}.", after_left.join(" and the "))
+    };
+    if *dropped == Dropped::No {
+        return format!(
+            "{}{after_text} What was loaded stays.",
+            loaded_by_files(manifest, tables)
+        );
+    }
+    let list = |names: &[String]| names.join(", ");
+    let (mut whole, mut partly, mut empty, mut missing, mut kept, mut unsure) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    for table in &manifest.tables {
+        let name = format!("“{}”", table.table);
+        let done = table
+            .files
+            .iter()
+            .all(|piece| tables.states.get(&piece.file) == Some(&FileState::Done));
+        let started = reached.defined.contains(table.table.as_str())
+            || table
+                .files
+                .iter()
+                .any(|piece| tables.states.contains_key(&piece.file));
+        let now = match dropped {
+            Dropped::Read(now) => now.get(&table.table).copied(),
+            _ => None,
+        };
+        match now {
+            _ if done => whole.push(name),
+            Some(Now::Missing) => missing.push(name),
+            // Neither its definition nor its rows ran (the definition that
+            // failed may have stopped before its DROP).
+            Some(_) if !started => kept.push(name),
+            Some(Now::Empty) => empty.push(name),
+            Some(Now::Rows) => partly.push(name),
+            None => unsure.push(name),
+        }
+    }
+    let mut text = format!(
+        "Loaded: {}.",
+        if whole.is_empty() {
+            "none".to_string()
+        } else {
+            list(&whole)
+        }
+    );
+    for (names, what) in [
+        (&partly, "Partly loaded (some of their rows)"),
+        (&empty, "Empty now"),
+        (&missing, "Missing now"),
+        (&kept, "Not loaded, as they were before"),
+    ] {
+        if !names.is_empty() {
+            text.push_str(&format!(" {what}: {}.", list(names)));
+        }
+    }
+    if let Dropped::Unread(why) = dropped
+        && !unsure.is_empty()
+    {
+        text.push_str(&format!(
+            " Not finished: {}; each may now be empty, partly loaded or missing (Kerno could not \
+             read “{database}” to tell: {why}).",
+            list(&unsure)
+        ));
+    }
+    let drops = manifest.options.add_drop_table;
+    if !(empty.is_empty() && missing.is_empty() && unsure.is_empty()) {
+        text.push_str(&format!(
+            " The restore {} each of the backup's tables in “{database}” first, then loads \
+             their rows: a table it did not finish stays empty or missing.",
+            if drops {
+                "drops and creates"
+            } else {
+                "creates"
+            }
+        ));
+    }
+    text.push_str(&after_text);
+    text.push_str(if drops {
+        " Run the restore again: it drops each of the backup's tables and loads it from the \
+         start."
+    } else {
+        " The backup has no DROP TABLE statements: drop the tables it created before you run \
+         it again."
+    });
+    text
+}
+
+/// The tables a stopped restore loaded, partly loaded and did not start,
+/// as its files' states say, for a restore that dropped nothing first.
+fn loaded_by_files(manifest: &Manifest, tables: &PoolEnd) -> String {
     let (mut whole, mut partly, mut none) = (Vec::new(), Vec::new(), Vec::new());
     for table in &manifest.tables {
         let done = table
@@ -2002,34 +2588,12 @@ fn restore_summary(manifest: &Manifest, tables: &PoolEnd, after: Option<&PoolEnd
             names.join(", ")
         }
     };
-    let after_done: Vec<&str> = manifest
-        .after
-        .iter()
-        .filter(|file| {
-            after.is_some_and(|end| end.states.get(&file.file) == Some(&FileState::Done))
-        })
-        .map(AfterFile::label)
-        .collect();
-    let after_left: Vec<&str> = manifest
-        .after
-        .iter()
-        .map(AfterFile::label)
-        .filter(|label| !after_done.contains(label))
-        .collect();
-    let mut text = format!(
+    format!(
         "Loaded: {}. Partly loaded (some rows, or a table stopped midway): {}. Not loaded: {}.",
         list(&whole),
         list(&partly),
         list(&none)
-    );
-    if !after_left.is_empty() {
-        text.push_str(&format!(
-            " Not loaded either: the {}.",
-            after_left.join(" and the ")
-        ));
-    }
-    text.push_str(" What was loaded stays.");
-    text
+    )
 }
 
 /// What a backup of a MySQL server of `server` version with this mysqldump
@@ -2380,6 +2944,7 @@ mod tests {
             env: Vec::new(),
             password: None,
             stdin: None,
+            stdin_parts: Vec::new(),
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
@@ -2513,6 +3078,7 @@ mod tests {
             env: Vec::new(),
             password: None,
             stdin: None,
+            stdin_parts: Vec::new(),
             sent: Arc::default(),
             tunnel: None,
             script_check: None,
@@ -2853,12 +3419,203 @@ mod tests {
         tables
             .states
             .insert("0002-big_no_key.sql".into(), FileState::Failed);
-        let text = restore_summary(&manifest, &tables, None);
+        let rows_only = Reached {
+            defined: BTreeSet::new(),
+            dropped: Dropped::No,
+        };
+        let text = restore_summary(&manifest, "db", &tables, None, &rows_only);
         assert_eq!(
             text,
             "Loaded: “small”. Partly loaded (some rows, or a table stopped midway): “big”, \
              “big no key”. Not loaded: “tiny/odd”. Not loaded either: the routines, triggers and \
              events and the views. What was loaded stays."
+        );
+    }
+
+    /// K74: the definition in a table's first file, as mysqldump 26.10
+    /// wrote it from MySQL 8.4 and MariaDB 11 and mysqldump 5.7.44 from 5.7
+    /// (`tests/fixtures/mysqldump`): a partitioned table, an empty one,
+    /// without comments, without DROP TABLE, definitions only, `--replace`,
+    /// `--insert-ignore`, a column comment that reads like a statement.
+    /// Before it only settings, in it the DROP and CREATE, after it only
+    /// rows and settings; a file that is not shaped so runs whole.
+    #[test]
+    fn a_table_s_definition_is_found_where_mysqldump_writes_it() {
+        let folder = crate::testing::fixtures().join("mysqldump");
+        let end = "/*!40101 SET character_set_client = @saved_cs_client */;\n";
+        for (file, opens, rows) in [
+            (
+                "84-child.sql",
+                "DROP TABLE IF EXISTS `child`;",
+                Some("INSERT INTO `child`"),
+            ),
+            (
+                "84-parted.sql",
+                "DROP TABLE IF EXISTS `parted`;",
+                Some("INSERT INTO"),
+            ),
+            ("84-child-schema.sql", "DROP TABLE IF EXISTS `child`;", None),
+            (
+                "84-child-replace.sql",
+                "DROP TABLE",
+                Some("REPLACE INTO `child`"),
+            ),
+            (
+                "maria-parted-nocomments.sql",
+                "DROP TABLE",
+                Some("LOCK TABLES `parted`"),
+            ),
+            (
+                "maria-child-ignore.sql",
+                "DROP TABLE",
+                Some("INSERT IGNORE INTO"),
+            ),
+            (
+                "57-child-nodrop.sql",
+                "/*!40101 SET @saved_cs_client",
+                Some("INSERT INTO"),
+            ),
+            (
+                "57-child-ignore.sql",
+                "DROP TABLE",
+                Some("INSERT  IGNORE INTO"),
+            ),
+            ("57-nothing.sql", "DROP TABLE IF EXISTS `nothing`;", None),
+        ] {
+            let path = folder.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let found = find_definition(&path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{file}"));
+            let (start, end_at) = (found.start as usize, found.end as usize);
+            assert_eq!(found.len as usize, text.len(), "{file}");
+            assert_eq!(
+                found.lines as usize,
+                text[..end_at].lines().count(),
+                "{file}"
+            );
+            let (before, definition, after) =
+                (&text[..start], &text[start..end_at], &text[end_at..]);
+            assert!(definition.starts_with(opens), "{file}: {definition}");
+            assert!(definition.ends_with(end), "{file}: {definition}");
+            assert!(definition.contains("\nCREATE TABLE `"), "{file}");
+            for word in ["DROP TABLE", "CREATE TABLE", "INSERT", "LOCK TABLES"] {
+                assert!(!before.contains(word), "{file}: {word} before");
+            }
+            assert!(!after.contains("CREATE TABLE") && !after.contains("DROP TABLE"));
+            match rows {
+                Some(rows) => assert!(after.contains(rows), "{file}: {after}"),
+                None => assert!(!after.contains("INSERT"), "{file}: {after}"),
+            }
+        }
+        // Rows only, rows before a definition, a definition never ended:
+        // the file runs whole.
+        let scratch = tempfile::tempdir().unwrap();
+        for text in [
+            "/*!40014 SET FOREIGN_KEY_CHECKS=0 */;\nLOCK TABLES `t` WRITE;\nINSERT INTO `t` VALUES \
+             (1);\nUNLOCK TABLES;\n",
+            "INSERT INTO `t` VALUES (1);\nDROP TABLE IF EXISTS `t`;\nCREATE TABLE `t` (a int);\n\
+             /*!40101 SET character_set_client = @saved_cs_client */;\n",
+            "DROP TABLE IF EXISTS `t`;\nCREATE TABLE `t` (a int);\nINSERT INTO `t` VALUES (1);\n",
+            "DROP TABLE IF EXISTS `t`;\nCREATE TABLE `t` (a int);\n\
+             /*!40101 SET character_set_client = @saved_cs_client */;",
+        ] {
+            let path = scratch.path().join("t.sql");
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(find_definition(&path).unwrap(), None, "{text}");
+        }
+    }
+
+    /// K74: a failure of the definitions' run is said at the line of the
+    /// table's own file.
+    #[test]
+    fn a_line_of_the_definitions_run_is_said_in_its_own_file() {
+        let said = "ERROR 1050 (42S01) at line 64: Table 'b' already exists";
+        assert_eq!(
+            in_its_file(said, Some(42), "0002-b.sql"),
+            "ERROR 1050 (42S01) at line 23 of 0002-b.sql: Table 'b' already exists"
+        );
+        assert_eq!(in_its_file(said, None, "0002-b.sql"), said);
+        assert_eq!(
+            in_its_file("ERROR 2013: lost", Some(1), "x.sql"),
+            "ERROR 2013: lost"
+        );
+    }
+
+    /// K74: a stopped restore of a backup that defines its tables says
+    /// which are in, which hold some of their rows, which are empty or
+    /// missing, from what the target holds, and which it never reached;
+    /// never "partly loaded" for a table with no row.
+    #[test]
+    fn a_failed_restore_says_which_tables_it_left_empty_or_missing() {
+        let manifest = manifest();
+        let all = ["big", "big no key", "small", "tiny/odd"];
+        let reached = |defined: &[&'static str], states: [Now; 4]| Reached {
+            defined: defined.iter().copied().collect(),
+            dropped: Dropped::Read(
+                all.iter()
+                    .zip(states)
+                    .map(|(name, now)| (name.to_string(), now))
+                    .collect(),
+            ),
+        };
+        // Every definition ran; then a file failed.
+        let mut tables = PoolEnd::default();
+        for (file, state) in [
+            ("0001-big.part01.sql", FileState::Done),
+            ("0001-big.part02.sql", FileState::Stopped),
+            ("0002-big_no_key.sql", FileState::Stopped),
+            ("0003-small.sql", FileState::Failed),
+            ("0004-tiny_odd.sql", FileState::Done),
+        ] {
+            tables.states.insert(file.into(), state);
+        }
+        let read = reached(&all, [Now::Rows, Now::Empty, Now::Missing, Now::Rows]);
+        let text = restore_summary(&manifest, "db", &tables, None, &read);
+        assert_eq!(
+            text,
+            "Loaded: “tiny/odd”. Partly loaded (some of their rows): “big”. Empty now: “big no \
+             key”. Missing now: “small”. The restore drops and creates each of the backup's \
+             tables in “db” first, then loads their rows: a table it did not finish stays empty \
+             or missing. Not loaded either: the routines, triggers and events and the views. Run \
+             the restore again: it drops each of the backup's tables and loads it from the \
+             start."
+        );
+        // The second definition failed after its DROP: the first table is
+        // empty, the second missing, the others as they were, rows and all.
+        let read = reached(&["big"], [Now::Empty, Now::Missing, Now::Rows, Now::Empty]);
+        let text = restore_summary(&manifest, "db", &PoolEnd::default(), None, &read);
+        assert!(
+            text.starts_with(
+                "Loaded: none. Empty now: “big”. Missing now: “big no key”. Not loaded, as they \
+                 were before: “small”, “tiny/odd”."
+            ),
+            "{text}"
+        );
+        // The target could not be read.
+        let unread = Reached {
+            defined: all.into_iter().collect(),
+            dropped: Dropped::Unread("it did not answer within 30 s".into()),
+        };
+        let text = restore_summary(&manifest, "db", &tables, None, &unread);
+        assert!(
+            text.starts_with(
+                "Loaded: “tiny/odd”. Not finished: “big”, “big no key”, “small”; each may now be \
+                 empty, partly loaded or missing (Kerno could not read “db” to tell: it did not \
+                 answer within 30 s)."
+            ),
+            "{text}"
+        );
+        // A backup without DROP TABLE says so.
+        let mut manifest = manifest;
+        manifest.options.add_drop_table = false;
+        let text = restore_summary(&manifest, "db", &tables, None, &read);
+        assert!(
+            text.ends_with(
+                "The backup has no DROP TABLE statements: drop the tables it created before you \
+                 run it again."
+            ),
+            "{text}"
         );
     }
 

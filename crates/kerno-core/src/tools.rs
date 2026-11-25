@@ -932,6 +932,10 @@ pub struct ToolCommand {
     pub password: Option<(&'static str, Secret)>,
     /// A file fed to the child's standard input.
     pub stdin: Option<PathBuf>,
+    /// Parts of files and texts fed to the child's standard input after
+    /// `stdin`, in this order: the definitions or the rows of a folder
+    /// backup's files (K74).
+    pub stdin_parts: Vec<StdinPart>,
     /// How many bytes of `stdin` [`run`] has fed to the child so far: the
     /// progress of a script, against the file's size.
     pub sent: Arc<AtomicU64>,
@@ -940,6 +944,18 @@ pub struct ToolCommand {
     /// A script the child will read, which [`run`] checks with
     /// [`check_script`] before starting it.
     pub script_check: Option<ScriptCheck>,
+}
+
+/// A part of what [`run`] feeds a tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinPart {
+    /// The bytes `range` of the file at `path`.
+    File {
+        path: PathBuf,
+        range: std::ops::Range<u64>,
+    },
+    /// A text of Kerno's own.
+    Text(String),
 }
 
 /// A script to check for client commands, see [`check_script`].
@@ -2476,6 +2492,7 @@ fn connection_command(tool_path: &Path, params: &ConnectParams) -> Result<ToolCo
             .filter(|password| !password.is_empty())
             .map(|password| (password_var, password)),
         stdin: None,
+        stdin_parts: Vec::new(),
         sent: Arc::default(),
         tunnel: params.tunnel.clone().map(|tunnel| TunnelHop {
             tunnel,
@@ -2653,18 +2670,27 @@ pub async fn run(
     if let Some((name, password)) = &command.password {
         child.env(name, password.expose());
     }
-    let input = match &command.stdin {
-        Some(path) => Some(
-            tokio::fs::File::open(path)
-                .await
-                .map_err(|error| Error::io(format!("could not open {}", path.display()), error))?,
-        ),
-        None => None,
+    // Every file opened before the child starts: one that cannot be read
+    // fails the run, never a script cut short.
+    let open = async |path: &Path| {
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|error| Error::io(format!("could not open {}", path.display()), error))
     };
-    child.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
+    let mut input = Vec::new();
+    if let Some(path) = &command.stdin {
+        input.push(Fed::File(open(path).await?, 0..u64::MAX));
+    }
+    for part in &command.stdin_parts {
+        input.push(match part {
+            StdinPart::File { path, range } => Fed::File(open(path).await?, range.clone()),
+            StdinPart::Text(text) => Fed::Text(text.clone()),
+        });
+    }
+    child.stdin(if input.is_empty() {
         Stdio::null()
+    } else {
+        Stdio::piped()
     });
     child.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child.spawn().map_err(|error| {
@@ -2674,7 +2700,8 @@ pub async fn run(
         )
     })?;
     // Fed beside the reading of the output, and stopped with the child.
-    let feeding = input
+    let feeding = (!input.is_empty())
+        .then_some(input)
         .zip(child.stdin.take())
         .map(|(input, pipe)| tokio::spawn(feed(input, pipe, command.sent.clone())));
     let _feeding = Feeding(feeding);
@@ -2710,22 +2737,47 @@ pub async fn run(
 /// Copies `input` to the child's standard input, counting the bytes in
 /// `sent`, then closes it (the end of the script). Stops quietly when the
 /// child closes its end first: it stopped on an error, or was killed.
-async fn feed(
-    mut input: tokio::fs::File,
-    mut pipe: tokio::process::ChildStdin,
-    sent: Arc<AtomicU64>,
-) {
+async fn feed(input: Vec<Fed>, mut pipe: tokio::process::ChildStdin, sent: Arc<AtomicU64>) {
+    use tokio::io::AsyncSeekExt as _;
     let mut chunk = vec![0; 256 * 1024];
-    loop {
-        let read = match input.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(read) => read,
+    for part in input {
+        let (mut file, range) = match part {
+            Fed::Text(text) => {
+                if pipe.write_all(text.as_bytes()).await.is_err() {
+                    return;
+                }
+                sent.fetch_add(text.len() as u64, Ordering::Relaxed);
+                continue;
+            }
+            Fed::File(file, range) => (file, range),
         };
-        if pipe.write_all(&chunk[..read]).await.is_err() {
+        if range.start > 0
+            && file
+                .seek(std::io::SeekFrom::Start(range.start))
+                .await
+                .is_err()
+        {
             return;
         }
-        sent.fetch_add(read as u64, Ordering::Relaxed);
+        let mut file = file.take(range.end.saturating_sub(range.start));
+        loop {
+            let read = match file.read(&mut chunk).await {
+                Ok(0) => break,
+                Err(_) => return,
+                Ok(read) => read,
+            };
+            if pipe.write_all(&chunk[..read]).await.is_err() {
+                return;
+            }
+            sent.fetch_add(read as u64, Ordering::Relaxed);
+        }
     }
+}
+
+/// A part of the standard input, opened.
+enum Fed {
+    File(tokio::fs::File, std::ops::Range<u64>),
+    Text(String),
 }
 
 /// Aborts the feeding task when [`run`] returns, however it returns.
@@ -5600,6 +5652,7 @@ mod tests {
             env: vec![("KERNO_VISIBLE".into(), "seen".into())],
             password: Some(("PGPASSWORD", Secret::new(PASSWORD))),
             stdin: None,
+            stdin_parts: Vec::new(),
             sent: Arc::default(),
             tunnel: None,
             script_check: None,

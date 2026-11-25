@@ -1909,3 +1909,21 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   come from `tip.rs`, which draws nothing once a dialog is open).
 - Proved by two core unit tests and three UI tests, each seen failing under a one-line mutation (M12, K72),
   K72's tests unchanged and passing, and headless captures light and dark at 720 × 440 and 1280 × 800.
+
+## 2026-11-25 — K74: a MySQL folder backup restored again into a full database
+
+- The pass in the real app found it: restored a second time into the same database, a folder backup failed 1
+  run in 2 on a deadlock between two tables linked by a foreign key, and its message called an empty table
+  "partly loaded". Reproduced in a driver test (MySQL 8.4: ERROR 1213 in 5 runs of 21 and 2 of 31; MariaDB 11:
+  ERROR 1205 in 11 of 31; MySQL 5.7: none; none into an empty database in 93): the server's metadata locks
+  between files that drop and create linked tables side by side. Dropping every table first was not enough
+  (MariaDB, ERROR 1100 in 2 of 31) (D-143).
+- The restore now runs every table's definition first, one after the other on one connection, then the rows on
+  N clients, as before; it finds where each file's definition ends and feeds the client parts of the files, no
+  temporary file. 31 restores in 31 on each of the three servers after the fix.
+- A stopped restore says, as the database holds them then, which tables are loaded, partly loaded, empty,
+  missing or as they were, and to run it again. The wizard reads the database's tables again after each run
+  and says how many of the backup's tables are there and that they are dropped and replaced, and so does the
+  confirmation; the backup's Speed hint no longer points at a hidden row.
+- Not verified: a database of hundreds of tables (the definitions are now one after the other), a
+  `mariadb-dump` folder, the real app.

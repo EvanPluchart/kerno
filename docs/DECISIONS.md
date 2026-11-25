@@ -4487,6 +4487,72 @@ update; the tree learned of it only once its status read `Connecting`, and kept 
   with its old settings. The administration tab does the same in a narrower window (read, not reproduced):
   left, its next read fails once and opens a new session.
 
+## D-143 — A folder restore defines every table first, on one connection, then loads the rows side by side (K74; 2026-11-25)
+
+The pass in the real app of 2026-11-25 restored a MySQL folder backup (K63, D-135) with "Faster" into a
+database, then the same folder again into that database, now full: 1 run in 2 failed with "ERROR 1213 … at
+line 22: Deadlock found when trying to get lock" on one of two tables linked by a foreign key. The message
+called three tables "partly loaded"; one of them was empty, one held its old rows, and a trigger was gone.
+
+- **The cause, measured.** Reproduced in `kerno-mysql/tests/folder_backup.rs` (a 20,000-row table with a
+  trigger and a view, a parent with a UNIQUE column, a child with a foreign key to it; restored with 8 clients
+  into an empty database, then again and again). Before the fix: MySQL 8.4 failed in 5 runs of 21, then 2 of 31,
+  always ERROR 1213 at line 22 of the parent's or the child's file, which is that file's `DROP TABLE IF EXISTS`;
+  MariaDB 11 failed in 11 of 31 with ERROR 1205 (lock wait timeout) at the same line of the parent's file; MySQL
+  5.7 in none of 31. `SHOW ENGINE INNODB STATUS` showed no deadlock after a 1213: it is not InnoDB's row locks
+  but the server's metadata locks, consistent with MySQL 8.0's locks that follow a foreign key to the parent
+  and the child of a table being dropped or created (which 5.7 does not take). Restored into an empty database
+  (each file's DROP then finds nothing), none failed in 93 runs (31 per server).
+- **Dropping every table first is not enough** (tried first): MySQL 8.4 then passed 31 runs of 31, MariaDB failed
+  2 of 31 with ERROR 1100 "Table 'small_b' was not locked with LOCK TABLES" in the parent's file: the child was
+  created by another client between the parent's `LOCK TABLES … WRITE` and its INSERT. A table's definition
+  running beside another table's load is the conflict, not the DROP alone.
+- **Chosen: definitions first, one after the other, then the rows** (the task's first suggested shape; a retry
+  of a file is not a fix, and running the tables linked by a foreign key one after the other would lose most of
+  "Faster" on a schema where every table is linked). One `mysql` client gets, for every table in the
+  manifest's order, its first file from the start to the end of its definition (the file's settings, its
+  `DROP TABLE`, its `CREATE TABLE`), each followed by `SELECT 'kerno-defined:N'`, which the client prints back
+  (`--unbuffered`), so Kerno knows which definitions ran also after a failure or a cancel. Then each first file
+  is fed again without its definition (its settings, then its rows), N clients at once, its ranges after it, as
+  before; the routines, triggers, events and views last, as before. No temporary file: the client's standard
+  input is fed from parts of the files (`tools::StdinPart`). A failure in the definitions' run is said at the
+  line of the table's own file.
+- **Where a definition ends** is read, not guessed: from the first line starting `DROP TABLE `,
+  `/*!40101 SET @saved_cs_client` or `CREATE TABLE ` to the line `/*!40101 SET character_set_client =
+  @saved_cs_client */;` that mysqldump writes after a CREATE TABLE (`--skip-set-charset`, which leaves it out, is
+  already refused). A file where it is not found (rows before a definition, no end line within 64 MiB; a
+  `mariadb-dump` file, none tried here, that would end it otherwise) runs whole in the definitions' run: correct,
+  only slower. Checked on files written by mysqldump
+  26.10 from MySQL 8.4 and MariaDB 11 and 5.7.44 from 5.7 (`tests/fixtures/mysqldump/`: a partitioned table, an
+  empty one, `--skip-comments`, no DROP TABLE, definitions only, `--replace`, `--insert-ignore`, a column
+  comment that reads like a statement).
+- **A backup of the rows only** has no definition: its files load side by side as before. A backup without
+  DROP TABLE stops at the first CREATE of a table already there, before any row loads (what the wizard said
+  already). A backup of the definitions only runs whole in the definitions' run. The plain one-file restore is
+  not concerned: one client runs it in order.
+- **What a stopped restore says is read from the database**: once every client has ended, one `mysql` client
+  reads which of the backup's tables exist and which hold a row (`information_schema.TABLES`, then
+  `EXISTS(SELECT 1 …)`, each read bounded to 30 s, `lock_wait_timeout` 10 s from 5.5.3). The message lists
+  Loaded, Partly loaded (some of their rows), Empty now, Missing now, and "Not loaded, as they were before" for a
+  table whose definition never ran; "Run the restore again: it drops each of the backup's tables and loads it
+  from the start" (without DROP TABLE: drop the tables it created first). If the database cannot be read, the
+  tables not finished are named as "may now be empty, partly loaded or missing", with why. A backup of the rows
+  only keeps K63's words from the files' states (Kerno cannot tell its rows from those already there).
+- **Said before it happens.** The wizard reads the target's tables when it opens and again after each run (the
+  pass's wizard had read them while the database was empty, and Back kept that); Start waits for the read.
+  With some of the backup's tables there: "A restore drops and replaces the backup's tables that “db” holds",
+  then "“db” already holds 2 of the backup's 3 tables (…): each is dropped and replaced with the backup's table
+  and rows; the tables only in “db” stay", and what a stopped restore leaves; the confirmation says it too
+  ("dropping and replacing the backup's tables that the database holds", the same sentences), and the shown
+  command says the definitions come first. Production and read-only go through the same confirmation as every
+  restore. For a plain dump the wizard says that a dump with DROP TABLE statements replaces the tables it has,
+  without naming them: naming them means reading the whole file, minutes for a large dump, each time it is
+  chosen.
+- **The Speed hint** of the MySQL backup said "with “Block writes” below" while that row shows only once
+  "Faster" is ticked: unticked, it says "offered once this is ticked".
+- **Cost.** The definitions now run one after the other where they ran N at once: a few milliseconds each on the
+  test servers (not measured for a database of a thousand tables; BENCH.md's K63 numbers were not taken again).
+
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 
 The owner asked on 2026-11-16 (ROADMAP, "Limits found on the way") that the `.dmg` open on a window of its
@@ -4770,7 +4836,8 @@ stock tools, on every supported version (`kerno_core::tools::mysql_folder`).
   (the old client below, with `--skip-triggers`, exits 0 and writes no table).
 - **A restore into a database that is not empty** is said before the run: the backup's tables it already
   holds are dropped and created again from the backup, its other tables stay (or, for a backup made without
-  DROP TABLE statements, the restore stops at the first of them). Amended by the second review (G3): below.
+  DROP TABLE statements, the restore stops at the first of them). Amended by the second review (G3): below;
+  and by D-143 (K74): the definitions run first, one after the other, and the words say how many tables.
 - **Which tables are cut** (amended after the second review, G1 and G7; the coordinator's two decisions):
   a table is cut only where every range reads one moment, otherwise it is read whole by one process.
 

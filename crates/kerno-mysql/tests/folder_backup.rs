@@ -4,8 +4,10 @@
 //! compared table by table, with its views, routines, triggers and event;
 //! a cancel that leaves no tool, no folder and no lock. On MySQL 8.4,
 //! MariaDB 11 and the legacy servers that are up (5.1 to 5.7, with a MySQL
-//! 5.7 client: the newer ones cannot read 5.1). Every scratch database is
-//! `kerno_test_k63_*`, dropped also when the test fails.
+//! 5.7 client: the newer ones cannot read 5.1). K74: a folder restored again
+//! into a database that holds its tables. Every scratch database is
+//! `kerno_test_k63_*` or `kerno_test_k74_*`, dropped also when the test
+//! fails.
 
 mod common;
 
@@ -42,6 +44,8 @@ const SIZES: &str = "kerno_test_k63_sizes";
 const BUSY: &str = "kerno_test_k63_busy";
 const ARGS: &str = "kerno_test_k63_args";
 const STUCK: &str = "kerno_test_k63_stuck";
+const AGAIN_SOURCE: &str = "kerno_test_k74_src";
+const AGAIN_TARGET: &str = "kerno_test_k74_dst";
 
 /// One test of this file at a time: a test that holds the server's read
 /// lock would make the others' writes wait.
@@ -131,9 +135,9 @@ static OPENED: Mutex<Vec<(u16, String)>> = Mutex::new(Vec::new());
 
 /// Kills, from a thread, a runtime and a connection of its own (opened
 /// first), every connection the test opened on `params`' server and every
-/// one working in a `kerno_test_k63_*` database (the mysqldump and mysql
-/// processes): once told the test's body ended, or after [`LIMIT`] whatever
-/// happens. Its answer: whether the time ran out.
+/// one working in a `kerno_test_k63_*` or `kerno_test_k74_*` database (the
+/// mysqldump and mysql processes): once told the test's body ended, or
+/// after [`LIMIT`] whatever happens. Its answer: whether the time ran out.
 fn guard(params: &ConnectParams) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
     let params = params.clone();
     let (ended, wait) = std::sync::mpsc::channel::<()>();
@@ -161,7 +165,8 @@ fn guard(params: &ConnectParams) -> (std::sync::mpsc::Sender<()>, std::thread::J
                 .collect();
             let listed = format!(
                 "SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND \
-                 (ID IN ({}) OR DB LIKE 'kerno\\_test\\_k63%' OR INFO LIKE '%kerno_test_k63%')",
+                 (ID IN ({}) OR DB LIKE 'kerno\\_test\\_k63%' OR INFO LIKE '%kerno_test_k63%' \
+                 OR DB LIKE 'kerno\\_test\\_k74%' OR INFO LIKE '%kerno_test_k74%')",
                 if ours.is_empty() {
                     "0".into()
                 } else {
@@ -673,7 +678,7 @@ async fn failed(server: &'static Server, client: PathBuf) {
         "{said}"
     );
     assert!(
-        said.contains("Partly loaded (some rows, or a table stopped midway): “big”"),
+        said.contains("Partly loaded (some of their rows): “big”"),
         "{said}"
     );
     assert!(
@@ -1873,4 +1878,234 @@ async fn the_account_s_reload_privilege_is_read() {
         let admin = session(&params, None).await;
         assert!(mysql_folder::can_lock(&admin).await.unwrap(), "{name}");
     }
+}
+
+/// The shape the pass in the real app restored twice (K74): a table of
+/// 20,000 rows with a trigger and a view, a parent with a UNIQUE column and
+/// a child with a foreign key to it.
+const AGAIN_SCHEMA: [&str; 5] = [
+    "CREATE TABLE big (id INT NOT NULL PRIMARY KEY, label VARCHAR(60), note VARCHAR(70)) \
+     ENGINE=InnoDB",
+    "CREATE TABLE small_a (id INT NOT NULL PRIMARY KEY, code VARCHAR(20) NOT NULL UNIQUE) \
+     ENGINE=InnoDB",
+    "CREATE TABLE small_b (id INT NOT NULL PRIMARY KEY, a_id INT NOT NULL, \
+     FOREIGN KEY (a_id) REFERENCES small_a (id)) ENGINE=InnoDB",
+    "CREATE VIEW big_view AS SELECT id, label FROM big",
+    "CREATE TRIGGER big_note BEFORE INSERT ON big FOR EACH ROW \
+     SET NEW.note = CONCAT('t:', NEW.label)",
+];
+
+/// A backup folder restored with 8 clients into an empty database, then
+/// again and again into that database, now full: every run ends well, with
+/// the source's rows, never twice (K74: 1 run in 2 failed in the real app;
+/// before the fix, on MySQL 8.4 ERROR 1213 at the child's or the parent's
+/// `DROP TABLE` in 5 runs of 21 and 2 of 31, on MariaDB 11 ERROR 1205 at
+/// the parent's in 11 of 31, on 5.7 none in 31). Then a file that fails
+/// after its table's drop: the failure says which tables are missing or
+/// empty, as the target holds them, and the next run loads everything.
+/// `KERNO_K74_RUNS` sets the number of runs again (30).
+#[tokio::test]
+async fn a_folder_restored_again_into_a_full_database_never_deadlocks() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, client)) = servers() else {
+        return;
+    };
+    let runs: usize = std::env::var("KERNO_K74_RUNS")
+        .ok()
+        .and_then(|runs| runs.parse().ok())
+        .unwrap_or(30);
+    // Every server's failures, said at the end: one server's do not hide
+    // the next one's.
+    let failures: Arc<Mutex<Vec<String>>> = Arc::default();
+    for server in servers {
+        if !matches!(server.label.as_str(), "MySQL" | "MariaDB" | "kerno-mysql57") {
+            continue;
+        }
+        let server: &'static Server = Box::leak(Box::new(server));
+        with_scratch(
+            &server.params,
+            &[AGAIN_SOURCE, AGAIN_TARGET],
+            again(server, client.clone(), runs, failures.clone()),
+        )
+        .await;
+    }
+    let failures = failures.lock().unwrap();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+async fn again(
+    server: &'static Server,
+    client: PathBuf,
+    runs: usize,
+    failures: Arc<Mutex<Vec<String>>>,
+) {
+    let admin = session(&server.params, None).await;
+    for db in [AGAIN_SOURCE, AGAIN_TARGET] {
+        exec_ok(&admin, &format!("CREATE DATABASE {db}")).await;
+    }
+    let source = session(&server.params, Some(AGAIN_SOURCE)).await;
+    for sql in AGAIN_SCHEMA {
+        exec_ok(&source, sql).await;
+    }
+    for chunk in 0..20 {
+        let values: Vec<String> = (chunk * 1000..(chunk + 1) * 1000)
+            .map(|i| format!("({i}, 'row {i}')"))
+            .collect();
+        let insert = format!("INSERT INTO big (id, label) VALUES {}", values.join(", "));
+        exec_ok(&source, &insert).await;
+    }
+    let small: Vec<String> = (0..300).map(|i| format!("({i}, 'c{i}')")).collect();
+    exec_ok(
+        &source,
+        &format!("INSERT INTO small_a VALUES {}", small.join(", ")),
+    )
+    .await;
+    let small: Vec<String> = (0..300).map(|i| format!("({i}, {})", 299 - i)).collect();
+    exec_ok(
+        &source,
+        &format!("INSERT INTO small_b VALUES {}", small.join(", ")),
+    )
+    .await;
+    let server_version = admin.server().version_number;
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let (on_line, _) = sink();
+    let mut options = folder_options(AGAIN_SOURCE, 8, DumpMethod::SingleTransaction);
+    options.utf8mb4 = tools::utf8mb4(server.dump_version.as_ref(), server_version);
+    mysql_folder::back_up(
+        FolderBackup {
+            tool_path: server.dump.clone(),
+            params: server.params.clone(),
+            options,
+            folder: folder.clone(),
+            client: server.dump_version.clone(),
+            range_threshold: mysql_folder::RANGE_THRESHOLD,
+        },
+        source,
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .outcome
+    .unwrap_or_else(|error| panic!("{}: the backup failed: {error}", server.label));
+    let manifest = mysql_folder::read_manifest(&folder).unwrap();
+    let counts = |db: &'static str| {
+        let admin = admin.clone();
+        async move {
+            let mut all = Vec::new();
+            for table in ["big", "small_a", "small_b"] {
+                all.extend(rows(&admin, &format!("SELECT COUNT(*) FROM {db}.{table}")).await);
+            }
+            let triggers = format!(
+                "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = '{db}'"
+            );
+            all.extend(rows(&admin, &triggers).await);
+            all
+        }
+    };
+    let expected = counts(AGAIN_SOURCE).await;
+    let restore = || {
+        let (on_line, _) = sink();
+        mysql_folder::restore(
+            FolderRestore {
+                tool_path: client.clone(),
+                params: server.params.clone(),
+                options: RestoreOptions {
+                    tool_version: tools::version(&client),
+                    jobs: Some(8),
+                    utf8mb4: tools::utf8mb4(tools::version(&client).as_ref(), server_version),
+                    ..RestoreOptions::new(
+                        Engine::MySql,
+                        AGAIN_TARGET,
+                        &folder,
+                        BackupFormat::Directory,
+                    )
+                },
+                manifest: manifest.clone(),
+                sent: Arc::default(),
+            },
+            on_line,
+            Arc::new(AtomicBool::new(false)),
+        )
+    };
+    let mut failed = 0;
+    for run in 0..=runs {
+        if let Err(error) = restore().await.outcome {
+            eprintln!("RUN {run} FAILED: {error}");
+            failed += 1;
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("{}, run {run}: {error}", server.label));
+            continue;
+        }
+        let restored = counts(AGAIN_TARGET).await;
+        assert_eq!(restored, expected, "{}: run {run}", server.label);
+    }
+    eprintln!("{}: {failed} failed in {} restores", server.label, runs + 1);
+
+    // `small_b`'s file fails after its drop, before its CREATE: the message
+    // names it missing, and says of every table what the target holds.
+    let child = folder.join(&manifest.tables[2].files[0].file);
+    let original = std::fs::read_to_string(&child).unwrap();
+    let at = original.find("CREATE TABLE").unwrap();
+    let broken = format!("{}THIS IS NOT SQL;\n{}", &original[..at], &original[at..]);
+    std::fs::write(&child, broken).unwrap();
+    let said = restore().await.outcome.unwrap_err().to_string();
+    eprintln!("{}: {said}", server.label);
+    assert!(
+        said.contains("mysql failed on small_b: ERROR 1064"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Missing now: ") && said.contains("“small_b”"),
+        "{said}"
+    );
+    assert!(said.contains("Run the restore again"), "{said}");
+    let held = |table: &str| {
+        let admin = admin.clone();
+        let sql = format!(
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{AGAIN_TARGET}' \
+             AND TABLE_NAME = '{table}'"
+        );
+        async move { rows(&admin, &sql).await[0][0].clone() == Some("1".into()) }
+    };
+    assert!(!held("small_b").await, "{said}");
+    // Each other table is where the message puts it.
+    for (table, at) in [("big", 0), ("small_a", 1)] {
+        let quoted = format!("“{table}”");
+        let clause = said
+            .split(". ")
+            .find(|clause| clause.contains(&quoted))
+            .unwrap_or_else(|| panic!("{table} is not said: {said}"))
+            .to_string();
+        let count = if held(table).await {
+            rows(
+                &admin,
+                &format!("SELECT COUNT(*) FROM {AGAIN_TARGET}.{table}"),
+            )
+            .await[0][0]
+                .clone()
+        } else {
+            None
+        };
+        let count = count.as_deref();
+        if clause.starts_with("Loaded:") {
+            assert_eq!(count, expected[at][0].as_deref(), "{table}: {said}");
+        } else if clause.starts_with("Partly loaded") {
+            assert!(count.is_some_and(|count| count != "0"), "{table}: {said}");
+        } else if clause.starts_with("Empty now") {
+            assert_eq!(count, Some("0"), "{table}: {said}");
+        } else if clause.starts_with("Missing now") {
+            assert_eq!(count, None, "{table}: {said}");
+        } else {
+            panic!("{table}: {clause} ({said})");
+        }
+    }
+    std::fs::write(&child, original).unwrap();
+    restore()
+        .await
+        .outcome
+        .unwrap_or_else(|error| panic!("{}: after the failure: {error}", server.label));
+    assert_eq!(counts(AGAIN_TARGET).await, expected, "{}", server.label);
 }
