@@ -191,8 +191,9 @@ struct Input {
     /// lines (`USE `src``, as `mysqldump --databases` writes): that one.
     dump_uses: Option<String>,
     /// A folder backup's statements that name its database (K78), read
-    /// once off the UI thread.
-    naming: Vec<mysql_folder::FileNaming>,
+    /// once off the UI thread: names compared without case (a server that
+    /// folds them, or one not known yet), and with case.
+    naming: [Vec<mysql_folder::FileNaming>; 2],
     /// A PostgreSQL archive's list (`pg_restore --list`), when it could be
     /// read: what the restore needs is checked from it, and an extension
     /// is left out through it (K39).
@@ -359,8 +360,9 @@ pub struct BackupDialog {
     /// They are being read: Start waits (K74).
     target_reading: bool,
     /// The server compares table names without case
-    /// (`lower_case_table_names` other than 0), once read (K74, L4).
-    target_folds: bool,
+    /// (`lower_case_table_names` other than 0), once read (K74, L4); `None`
+    /// while not known (K78).
+    target_folds: Option<bool>,
     databases: Loaded<Vec<String>>,
     /// Global backup: the databases the user left out (what a task keeps).
     excluded: BTreeSet<String>,
@@ -691,7 +693,7 @@ impl BackupDialog {
             can_lock: None,
             target_tables: None,
             target_reading: false,
-            target_folds: false,
+            target_folds: None,
             databases: Loaded::Loading,
             excluded: BTreeSet::new(),
             closed: Vec::new(),
@@ -873,7 +875,7 @@ impl BackupDialog {
                 .ok()
                 .and_then(|done| done.results.first().map(|result| result.rows()))
                 .and_then(|rows| rows.first().and_then(|row| row.first().cloned().flatten()))
-                .is_some_and(|value| value.trim() != "0");
+                .map(|value| value.trim() != "0");
             session.close().await;
             objects.map(|objects| (objects, folds))
         });
@@ -881,10 +883,9 @@ impl BackupDialog {
             let read = reading.await;
             let _ = this.update(cx, |this, cx| {
                 this.target_reading = false;
-                let objects = read.map(|(objects, folds)| {
-                    this.target_folds = folds;
-                    objects
-                });
+                // Not known when the database could not be read (K78, M4).
+                this.target_folds = read.as_ref().and_then(|(_, folds)| *folds);
+                let objects = read.map(|(objects, _)| objects);
                 this.target_tables = objects.map(|entries| {
                     entries
                         .into_iter()
@@ -1754,6 +1755,8 @@ impl BackupDialog {
         options.extra_args = self.extra_value(cx);
         options.auth_user = self.auth_user_value(cx);
         options.allow_client_commands = self.allow_commands;
+        // How the server compares names, once the target is read (K78, M4).
+        options.names_fold = self.target_folds;
         options.tool_version = install.version.clone();
         options.utf8mb4 = self.utf8mb4();
         Some(Ok(mysql_folder::FolderRestore {
@@ -2759,7 +2762,12 @@ impl BackupDialog {
             },
             Err(error) => Step::Finished {
                 success: false,
-                text: format!("{error}. Nothing was run."),
+                text: failure_text(
+                    &error,
+                    &program,
+                    self.fed().map_or(0, |(sent, _)| sent),
+                    kept,
+                ),
             },
         };
         if let Step::Finished { text, .. } = &self.step {
@@ -3620,7 +3628,7 @@ fn examine(job: Job) -> Examined {
         refusal: None,
         archive_database: None,
         dump_uses: None,
-        naming: Vec::new(),
+        naming: Default::default(),
         list: None,
         extensions: Vec::new(),
         manifest: None,
@@ -3676,7 +3684,7 @@ fn examine(job: Job) -> Examined {
                 .files()
                 .next()
                 .is_some_and(|first| DumpHead::read(&file.join(first)).utf8mb4);
-            input.naming = mysql_folder::naming(&file, &manifest);
+            input.naming = [true, false].map(|fold| mysql_folder::naming(&file, &manifest, fold));
             input.manifest = Some(Arc::new(manifest));
         } else if format == BackupFormat::Sql {
             if job.engine != Engine::Postgres {
@@ -4201,6 +4209,18 @@ fn program_name(command: &ToolCommand) -> String {
 /// An error as the dialog says it. A refused script and other settings
 /// problems arrive as `Error::Config`, whose own wording starts with
 /// "invalid connection settings": shown without it.
+/// What a run that failed outside the tool's own exit says: "Nothing was
+/// run" only when no byte of the file had reached the tool (a check before
+/// it started, a file that could not be opened); once some had, the tool was
+/// stopped part way and `kept` says what stays (K78, P3).
+fn failure_text(error: &Error, program: &str, sent: u64, kept: &str) -> String {
+    if sent == 0 {
+        format!("{error}. Nothing was run.")
+    } else {
+        format!("{error}. {program} was stopped part way through the file.{kept}")
+    }
+}
+
 fn error_text(error: &Error) -> String {
     match error {
         Error::Config(message) => message.clone(),
@@ -6577,7 +6597,7 @@ mod tests {
             refusal: None,
             archive_database: Some("shop".into()),
             dump_uses: None,
-            naming: Vec::new(),
+            naming: Default::default(),
             list: None,
             extensions: Vec::new(),
             manifest: None,
@@ -6690,6 +6710,29 @@ mod tests {
         assert_eq!(
             left_out_closed(&five, usize::MAX).unwrap(),
             "Left out, this account may not open them: a, b, c, d, e"
+        );
+    }
+
+    /// K78, P3: a file that could not be read part way through the feed is
+    /// not "Nothing was run": what ran before is said kept.
+    #[test]
+    fn a_failure_part_way_through_the_feed_says_what_ran() {
+        let error = Error::io(
+            "could not read /b/dump.sql",
+            std::io::Error::other("Input/output error"),
+        );
+        let kept = " MySQL and MariaDB run the file statement by statement: what ran before it \
+                    stopped is kept.";
+        let before = failure_text(&error, "mysql", 0, kept);
+        assert!(before.ends_with(". Nothing was run."), "{before}");
+        let during = failure_text(&error, "mysql", 4096, kept);
+        assert!(!during.contains("Nothing was run"), "{during}");
+        assert!(
+            during.ends_with(
+                ". mysql was stopped part way through the file. MySQL and MariaDB run the file \
+                 statement by statement: what ran before it stopped is kept."
+            ),
+            "{during}"
         );
     }
 

@@ -2386,6 +2386,18 @@ async fn named_source(server: &'static Server, client: PathBuf) {
             "CREATE TRIGGER {src}.big_ai AFTER INSERT ON {src}.big FOR EACH ROW \
              INSERT INTO {src}.audit (note) VALUES (CONCAT('{src}.big ', NEW.id))"
         ),
+        // Typed under ANSI_QUOTES: MariaDB keeps it as typed (M1).
+        "SET SESSION sql_mode = 'ANSI_QUOTES'".to_string(),
+        format!(
+            "create trigger \"{src}\".\"big_bu\" after update on \"{src}\".\"big\" for each row \
+             insert into \"{src}\".\"audit\"(note) values ('ansi')"
+        ),
+        "SET SESSION sql_mode = DEFAULT".to_string(),
+        // Enabled: it would run against the source on its schedule (M6).
+        format!(
+            "CREATE EVENT {src}.hourly ON SCHEDULE EVERY 1 HOUR ENABLE \
+             DO DELETE FROM {src}.audit WHERE id < 0"
+        ),
         format!(
             "CREATE PROCEDURE {src}.count_big(OUT c INT) READS SQL DATA \
              SELECT COUNT(*) INTO c FROM {src}.big"
@@ -2428,7 +2440,7 @@ async fn named_source(server: &'static Server, client: PathBuf) {
     let manifest = mysql_folder::read_manifest(&folder).unwrap();
     // The source without its triggers: a restore that creates one there is
     // seen, not hidden by "already exists" (the pass's ERROR 1359).
-    for trigger in ["big_bi", "big_ai"] {
+    for trigger in ["big_bi", "big_ai", "big_bu"] {
         exec_ok(&admin, &format!("DROP TRIGGER {src}.{trigger}")).await;
     }
     let before = objects_of(&admin, src).await;
@@ -2469,6 +2481,14 @@ async fn named_source(server: &'static Server, client: PathBuf) {
                 "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = \
                  '{db}' ORDER BY 1"
             ),
+            "event" => format!(
+                "SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = '{db}' \
+                 ORDER BY 1"
+            ),
+            "view" => format!(
+                "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = '{db}' \
+                 ORDER BY 1"
+            ),
             _ => format!(
                 "SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = \
                  '{db}' ORDER BY 1"
@@ -2496,48 +2516,62 @@ async fn named_source(server: &'static Server, client: PathBuf) {
     );
     assert_eq!(count(dst, "big").await, big, "{}", server.label);
     assert_eq!(count(dst, "audit").await, audit, "{}", server.label);
-    // The routines and the view are in the target; the triggers MariaDB
-    // kept written for the source are left out and named.
+    // The routines, the view and the disabled event are in the target; the
+    // enabled event is left out (M6); so are the triggers MariaDB kept
+    // written for the source, the ANSI_QUOTES one too (M1).
     assert_eq!(
         names(dst, "routine").await,
         ["count_big", "quiet"],
         "{}",
         server.label
     );
+    assert_eq!(names(dst, "view").await, ["big_v"], "{}", server.label);
+    assert_eq!(names(dst, "event").await, ["nightly"], "{}", server.label);
     if mariadb {
         assert!(names(dst, "trigger").await.is_empty(), "{log}");
         assert!(
             said.starts_with(
-                "Left out: 2 triggers (“big_bi”, “big_ai”), written for the database \
+                "Left out: 3 triggers (“big_bi”, “big_ai”, “big_bu”), written for the database \
                  “kerno_test_k78_src”"
             ),
             "{said}"
         );
     } else {
-        // MySQL rewrites a trigger's header: only `big_ai`'s body names
-        // the source, and it is loaded.
-        assert_eq!(names(dst, "trigger").await, ["big_ai", "big_bi"]);
-        assert!(!said.contains("Left out"), "{said}");
+        // MySQL rewrites a trigger's header: only bodies name the source,
+        // and they are loaded.
+        assert_eq!(names(dst, "trigger").await, ["big_ai", "big_bi", "big_bu"]);
+        assert!(!said.contains("triggers ("), "{said}");
     }
     assert!(
-        said.contains("(“big_ai”, “nightly”, “count_big”) read or write “kerno_test_k78_src”")
-            || said.contains("(“nightly”, “count_big”) read or write “kerno_test_k78_src”"),
+        said.contains(
+            "Left out: 1 event that is enabled (“hourly”), whose body names “kerno_test_k78_src”"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("read or write “kerno_test_k78_src” by name"),
         "{said}"
     );
     assert!(!said.contains("“quiet”"), "{said}");
 
     // Loaded as written: what the statements say happens, the triggers
-    // created in the source.
+    // created in the source, the enabled event in the target.
     let (end, log) = restore(true).await;
     end.outcome
         .unwrap_or_else(|error| panic!("{}: as written: {error}: {log}", server.label));
+    assert_eq!(
+        names(dst, "event").await,
+        ["hourly", "nightly"],
+        "{}",
+        server.label
+    );
     if mariadb {
-        assert_eq!(names(src, "trigger").await, ["big_ai", "big_bi"]);
+        assert_eq!(names(src, "trigger").await, ["big_ai", "big_bi", "big_bu"]);
         assert!(names(dst, "trigger").await.is_empty());
         assert!(
             end.said
                 .unwrap_or_default()
-                .starts_with("Loaded as written, into “kerno_test_k78_src”: 2 triggers")
+                .starts_with("Loaded as written, into “kerno_test_k78_src”: 3 triggers")
         );
     } else {
         assert_eq!(objects_of(&admin, src).await, before, "{}", server.label);

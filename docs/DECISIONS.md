@@ -4554,9 +4554,50 @@ views were then not loaded, and "Run the restore again" failed the same way each
 - **Limits.** A database named like one of the backup's tables or views makes `src.x` ambiguous (a database's
   table or a table's column): there a body counts only when `x` is one of the backup's tables or views, or the
   name has three parts; a column named like a table, or an alias named like the database, can still be taken for
-  one (a body only: it is loaded either way, and the words may say one too many). A routine created under
-  `ANSI_QUOTES` reads `"src".t` as a string here, as the client does. Only MariaDB 11 and MySQL 8.4 files written
-  by mysqldump 26.10 were tried; `mariadb-dump`'s own files and the legacy servers were not.
+  one (a body only: it is loaded either way, and the words may say one too many). Only MariaDB 11 and MySQL
+  8.4 files written by mysqldump 26.10 were tried; `mariadb-dump`'s own files and the legacy servers were not.
+
+**Amended after the independent review** (of 4243ce9; one blocking miss and five points, confirmed on MariaDB
+11 and MySQL 8.4; fixed on top):
+
+- **Double quotes** (M1, blocking). A trigger typed under `ANSI_QUOTES` as `create trigger "src"."t" …` is
+  dumped as typed, after its `SET sql_mode = '…ANSI_QUOTES…'`, and the finder read `"src"` as a string: the
+  default restore created it in the source. Now the finder follows the file's `SET sql_mode` assignments (set,
+  kept in a variable, put back, `DEFAULT`; a mode it cannot read counts as having `ANSI_QUOTES`) and reads `"…"`
+  as a name while `ANSI_QUOTES` (or `ANSI`) is on; in any mode, a double-quoted word just before or after a `.`
+  (spaces and comments between) is a name, as a string could not stand there: when in doubt, a hit. A folder
+  backup made with `--compatible=ansi` is refused since K74 (N2); an older one is read by the same rules.
+  Strings are kept as words of their own, so that they never pass for a keyword or a definer.
+- **A file that selects a database** (M2): `use src`, `connect src` at the start of a statement, and `\u`, `\r`
+  anywhere in code make every unqualified statement after them act there. mysqldump writes none in a folder,
+  so such a file was edited by hand: it is left out whole, the line named. Chosen over refusing the run: the
+  tables load, and the words say what was left out. `connect` and `\r` were already refused in every file by
+  the client-command check (K63); `use` in a table's file is not looked for (it would mean reading every row
+  file a second time; mysqldump writes none there either).
+- **A kind word as a name** (M3). The kind was the first kind word anywhere before `(`: `CREATE
+  DEFINER=event@localhost TRIGGER src.x` was read as an event and its write missed. The head is now read word
+  by word where each word stands: the verb, `OR REPLACE`, `ALGORITHM = …`, `DEFINER = user@host` (bare, quoted
+  or `CURRENT_USER()`), `SQL SECURITY …`, `AGGREGATE`, the kind, `IF [NOT] EXISTS`, then a name; anything else
+  (another kind, no name where it should be: `ALTER TABLE src.event …`) is of an unknown kind and, when it names
+  the source, leaves its whole file out.
+- **Case** (M4). The backup's database and the target are one database where the server folds names
+  (`lower_case_table_names` 1 or 2): a restore into `SRC` of a backup of `src` leaves nothing out and says
+  nothing. Where case counts, a qualifier `SRC.` is another database than `src`. The wizard passes the target
+  server's rule (`RestoreOptions::names_fold`, read with the target's tables); not known, the careful side: two
+  names that differ by case are two databases, and qualifiers match without case. The wizard reads the folder
+  both ways once and shows the one the server's rule picks.
+- **mysqldump's own `ALTER DATABASE`** (M5) around a routine whose collation is not its database's are still
+  left out by default, but said for what they do: they would change the character set of “src”; the routine is
+  then created with the target's own character set and collation; no advice to edit `routines.sql`.
+- **Enabled events** (M6). An event whose body names the source runs against it on its schedule from the
+  restore on, with no one running it. Chosen, as the review proposed: an enabled event whose body names the
+  source is left out by default like a statement that writes into it (one alone on its lines, else its file),
+  said before the run and at its end; a `DISABLE`d one (`DISABLE ON SLAVE` too) is loaded and said as a body.
+- **Smaller points.** A rows client that stops reading before the end of its input (K79's failure) is said in
+  its own words, not as "invalid connection settings" (P1); in the definitions' run that failure names the
+  table whose part it stopped in (P2); "Nothing was run." follows a failure outside the tool only when no byte
+  of the file had reached it; after that the tool was stopped part way and what ran is kept (P3). The driver
+  test now also checks the target's view and events.
 
 ## D-144 — A connection opened again is a new tree; a lost tree read is read once more (K75; 2026-11-25)
 

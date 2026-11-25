@@ -2040,3 +2040,14 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   the views says which views were left as they were. "Save as task…" is disabled for settings it cannot keep;
   the log wraps. D-145, M12's K78.
 - Not verified: `mariadb-dump`'s own files, the legacy servers, the real app.
+
+## 2026-11-25 — K78: the independent review's points fixed
+
+- A trigger typed under `ANSI_QUOTES` (`"src"."t"`) was read as a string and still created in the source
+  (blocking, MariaDB 11): the finder now follows the file's `sql_mode` and reads a double-quoted word next to a
+  `.` as a name in any mode. A file that selects a database (`use`, `\u`) is left out whole; a statement's kind
+  is read where it stands (a bare definer named `event` hid a trigger); the source and the target are compared
+  by the server's case rule; mysqldump's own `ALTER DATABASE` around a routine is said for what it does; an
+  enabled event whose body names the source is left out by default. D-145 amended, M12's K78 table.
+- K79's agent's three points in the same files: a rows client that stopped reading said in plain words, the
+  definitions' run naming the table it stopped in, "Nothing was run." only when nothing reached the tool.

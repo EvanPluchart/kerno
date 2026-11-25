@@ -1424,6 +1424,12 @@ pub struct RestoreOptions {
     /// which are left out otherwise. Asked at each run, never kept.
     #[serde(skip)]
     pub load_as_written: bool,
+    /// The target server compares database and table names without case
+    /// (`lower_case_table_names` not 0), with case, or not known (`None`):
+    /// how a folder restore tells the backup's database from the target and
+    /// reads qualifiers (K78).
+    #[serde(skip)]
+    pub names_fold: Option<bool>,
 }
 
 impl RestoreOptions {
@@ -1454,6 +1460,7 @@ impl RestoreOptions {
             use_list: None,
             utf8mb4: false,
             load_as_written: false,
+            names_fold: None,
         }
     }
 }

@@ -1268,7 +1268,9 @@ async fn run_pool(
                         end.states.insert(file, FileState::Stopped);
                         continue;
                     }
-                    Ok((Err(error), ..)) => Some(error.to_string()),
+                    // The sentence as written, without the error kind's own words
+                    // (K78, P1).
+                    Ok((Err(error), ..)) => Some(said(&error)),
                 };
                 match failed {
                     None => {
@@ -2155,8 +2157,8 @@ pub fn find_definition(path: &Path) -> std::io::Result<Option<Definition>> {
 }
 
 /// A statement of `routines.sql` or `views.sql` that names the database the
-/// backup was taken from as a qualifier (`src.x`, `` `src`.`x` ``), outside
-/// strings and comments (K78).
+/// backup was taken from as a qualifier (`src.x`, `` `src`.`x` ``, and
+/// `"src"."x"`), outside strings and comments (K78).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Naming {
     /// What it creates, drops or alters: `trigger`, `procedure`,
@@ -2166,16 +2168,27 @@ pub struct Naming {
     /// Its name, without the database.
     pub name: String,
     /// The statement itself creates, drops or alters something in the
-    /// source (its name, or a trigger's table, is qualified with it; or the
-    /// kind is not known): it would write into the source at the restore.
-    /// Otherwise only its body names the source: it acts on the source each
-    /// time it runs.
+    /// source (its name, or a trigger's table, is qualified with it; `ALTER
+    /// DATABASE src`; or the kind is not known): it would write into the
+    /// source at the restore.
     pub creates: bool,
+    /// An enabled event whose body names the source: from the restore on it
+    /// would run against the source on its schedule, with no one running it.
+    pub scheduled: bool,
     /// Its bytes in the file, from the start of its first line to the end
     /// of the line its delimiter ends.
     pub range: std::ops::Range<u64>,
     /// The same lines, numbered from 1, the end excluded.
     pub lines: std::ops::Range<u64>,
+}
+
+impl Naming {
+    /// Whether it would write into the source by itself, at the restore or
+    /// on its schedule: left out unless loaded as written. Otherwise only
+    /// its body names the source, and it acts there each time it is run.
+    pub fn writes(&self) -> bool {
+        self.creates || self.scheduled
+    }
 }
 
 /// What [`naming`] found in one file after the tables.
@@ -2187,8 +2200,8 @@ pub struct FileNaming {
     /// Why the statements that would write into the source cannot be left
     /// out one by one, so that the whole file is: one is not alone on its
     /// lines, or of a kind Kerno does not know, or a view (mysqldump
-    /// creates a stand-in first, which would stay), or the file could not
-    /// be read.
+    /// creates a stand-in first, which would stay); the file selects a
+    /// database itself (`use`, `\u`, `connect`); or it could not be read.
     pub whole: Option<String>,
 }
 
@@ -2196,7 +2209,7 @@ impl FileNaming {
     /// Whether the restore leaves something of it out unless told to load
     /// it as written.
     pub fn writes(&self) -> bool {
-        self.whole.is_some() || self.found.iter().any(|named| named.creates)
+        self.whole.is_some() || self.found.iter().any(Naming::writes)
     }
 }
 
@@ -2204,14 +2217,33 @@ impl FileNaming {
 /// name: they hold no rows.
 const NAMING_WITHIN: u64 = 64 << 20;
 
+/// Whether `a` and `b` name one database on a server that compares names
+/// without case (`fold`, its `lower_case_table_names` not 0), or with case;
+/// `None` (not known) compares with case: two names that differ by case
+/// are then taken for two databases (K78, M4).
+pub fn same_database(a: &str, b: &str, fold: Option<bool>) -> bool {
+    match fold {
+        Some(true) => a.to_lowercase() == b.to_lowercase(),
+        _ => a == b,
+    }
+}
+
 /// The statements of `text` (a file after the tables) that name `source`
 /// as a qualifier, outside strings and comments, read with the client's own
-/// rules: `DELIMITER` lines, quotes, comments, `/*!…*/` as code. `local`:
-/// the backup's tables and views; where one is named like the database,
-/// `src.x` in a body counts only when `x` is one of them too (a three-part
-/// `src.t.c` always). Names compare without case. Also why the file can
-/// only be left out whole, if it can.
-pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>, Option<String>) {
+/// rules: `DELIMITER` lines, quotes, comments, `/*!…*/` as code; a
+/// double-quoted word is a name under the `sql_mode` the file sets with
+/// `ANSI_QUOTES`, or where it stands next to a `.`. `local`: the backup's
+/// tables and views; where one is named like the database, `src.x` in a body
+/// counts only when `x` is one of them too (a three-part `src.t.c` always).
+/// `fold`: names compare without case (a server that folds them, or one
+/// whose rule is not known). Also why the file can only be left out whole,
+/// if it can.
+pub fn find_naming(
+    text: &[u8],
+    source: &str,
+    local: &[String],
+    fold: bool,
+) -> (Vec<Naming>, Option<String>) {
     // What each byte is part of, with the tracker of K74.
     let mut part = vec![Quoted::Code; text.len()];
     let mut state = Quoted::Code;
@@ -2223,14 +2255,26 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
         line_starts.push((at, state));
     }
     line_starts.pop();
-    let statements = split_statements(text, &part, &line_starts);
-    let same = |word: &str| word.eq_ignore_ascii_case(source);
+    let split = split_statements(text, &part, &line_starts);
+    let same = |word: &str| {
+        if fold {
+            word.to_lowercase() == source.to_lowercase()
+        } else {
+            word == source
+        }
+    };
     let clash = local.iter().any(|name| same(name));
     let known = |word: &str| local.iter().any(|name| name.eq_ignore_ascii_case(word));
     let mut found = Vec::new();
-    let mut whole = None;
-    for (start, end) in statements {
-        let tokens = tokens(&text[start..end], &part[start..end]);
+    // A file that selects a database itself: every statement after it acts
+    // there (M2).
+    let mut whole = split.selects.map(|(line, what)| {
+        format!("its line {line} selects a database itself (“{what}”), so what follows acts there")
+    });
+    let mut mode = SqlMode::default();
+    for (start, end) in split.statements {
+        let tokens = names(tokens(&text[start..end], &part[start..end]), mode.ansi());
+        mode.follow(&tokens);
         let head = head(&tokens);
         let at_head = |index: usize| {
             head.as_ref()
@@ -2250,6 +2294,7 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
         for index in 0..tokens.len() {
             // `x.src.y`: `src` is a table there.
             if at_head(index + 2)
+                || !tokens[index].is_name()
                 || !same(&tokens[index].text)
                 || !dot(index + 1)
                 || (index > 0 && dot(index - 1))
@@ -2287,6 +2332,7 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
                     kind: "statement",
                     name: String::new(),
                     creates,
+                    scheduled: false,
                     range: first as u64..last as u64,
                     lines,
                 });
@@ -2296,9 +2342,12 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
         if !(creates || body) {
             continue;
         }
+        // An enabled event writes on its schedule, with no one running it
+        // (M6).
+        let scheduled = !creates && head.enabled_event;
         let alone = text[first..start].iter().all(u8::is_ascii_whitespace)
             && text[end..last].iter().all(u8::is_ascii_whitespace);
-        if creates && !alone {
+        if (creates || scheduled) && !alone {
             whole.get_or_insert_with(|| {
                 format!(
                     "the {} “{}” shares its lines with other statements",
@@ -2310,6 +2359,7 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
             kind: head.kind,
             name: head.name,
             creates,
+            scheduled,
             range: first as u64..last as u64,
             lines,
         });
@@ -2317,14 +2367,96 @@ pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>,
     (found, whole)
 }
 
-/// The statements of `text`, each from its first byte of code to the end
-/// of its delimiter, `DELIMITER` lines followed as the mysql client does.
-fn split_statements(
-    text: &[u8],
-    part: &[Quoted],
-    line_starts: &[(usize, Quoted)],
-) -> Vec<(usize, usize)> {
+/// The `sql_mode` a file sets for the statements after it (mysqldump writes
+/// each routine's and trigger's own before it, and puts the previous one
+/// back after), as far as the file says it: `None` when not known.
+#[derive(Debug, Default)]
+struct SqlMode {
+    current: Option<String>,
+    /// The user variables a mode was kept in (`SET @saved_sql_mode =
+    /// @@sql_mode`).
+    saved: BTreeMap<String, Option<String>>,
+}
+
+impl SqlMode {
+    /// Whether `"…"` quotes a name now: the mode has `ANSI_QUOTES` (or
+    /// `ANSI`, which holds it), or the mode is not known (the careful side:
+    /// a name read where a string was can only add a hit).
+    fn ansi(&self) -> bool {
+        self.current.as_deref().is_none_or(|mode| {
+            mode.split(',')
+                .any(|item| matches!(item.trim().to_uppercase().as_str(), "ANSI_QUOTES" | "ANSI"))
+        })
+    }
+
+    /// Follows a `SET` statement's assignments of the mode.
+    fn follow(&mut self, tokens: &[Token]) {
+        if !tokens.first().is_some_and(|token| token.is("SET")) {
+            return;
+        }
+        for assignment in tokens[1..].split(|token| token.is(",")) {
+            let Some(equal) = assignment.iter().position(|token| token.is("=")) else {
+                continue;
+            };
+            let side = |tokens: &[Token]| -> String {
+                tokens
+                    .iter()
+                    .map(|token| token.text.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let (left, right) = (side(&assignment[..equal]), &assignment[equal + 1..]);
+            let mode_var = |name: &str| {
+                matches!(
+                    name,
+                    "sql_mode"
+                        | "sessionsql_mode"
+                        | "localsql_mode"
+                        | "@@sql_mode"
+                        | "@@session.sql_mode"
+                        | "@@local.sql_mode"
+                )
+            };
+            let value = match right {
+                [one] if matches!(one.kind, TokenKind::Single | TokenKind::Double) => {
+                    Some(one.text.clone())
+                }
+                [one] if one.is("DEFAULT") => Some(String::new()),
+                _ if mode_var(&side(right)) => self.current.clone(),
+                _ => {
+                    let name = side(right);
+                    match name.strip_prefix('@').filter(|name| !name.starts_with('@')) {
+                        Some(var) => self.saved.get(var).cloned().flatten(),
+                        None => None,
+                    }
+                }
+            };
+            if mode_var(&left) {
+                self.current = value;
+            } else if let Some(var) = left.strip_prefix('@').filter(|var| !var.starts_with('@'))
+                && mode_var(&side(right))
+            {
+                self.saved.insert(var.to_string(), self.current.clone());
+            }
+        }
+    }
+}
+
+/// What [`split_statements`] found.
+struct Split {
+    /// Each statement, from its first byte of code to the end of its
+    /// delimiter.
+    statements: Vec<(usize, usize)>,
+    /// The first line that selects a database (`use`, `connect`, `\u`,
+    /// `\r`), and what it says.
+    selects: Option<(u64, String)>,
+}
+
+/// The statements of `text`, `DELIMITER` lines followed as the mysql client
+/// does, and the first client command that selects a database.
+fn split_statements(text: &[u8], part: &[Quoted], line_starts: &[(usize, Quoted)]) -> Split {
     let mut statements = Vec::new();
+    let mut selects = None;
     let mut delimiter: Vec<u8> = b";".to_vec();
     let mut open: Option<usize> = None;
     for (index, &(start, state)) in line_starts.iter().enumerate() {
@@ -2338,26 +2470,43 @@ fn split_statements(
             .count();
         let word = line[lead..]
             .iter()
-            .take_while(|byte| !byte.is_ascii_whitespace())
+            .take_while(|byte| !byte.is_ascii_whitespace() && **byte != b';')
             .count();
-        if open.is_none()
-            && state == Quoted::Code
-            && line[lead..lead + word].eq_ignore_ascii_case(b"delimiter")
-        {
-            let value: Vec<u8> = line[lead + word..]
-                .iter()
-                .skip_while(|byte| byte.is_ascii_whitespace())
-                .take_while(|byte| !byte.is_ascii_whitespace())
-                .copied()
-                .collect();
-            if !value.is_empty() {
-                delimiter = value;
+        let first = &line[lead..lead + word];
+        let said = || {
+            String::from_utf8_lossy(line)
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>()
+        };
+        if open.is_none() && state == Quoted::Code {
+            if first.eq_ignore_ascii_case(b"delimiter") {
+                let value: Vec<u8> = line[lead + word..]
+                    .iter()
+                    .skip_while(|byte| byte.is_ascii_whitespace())
+                    .take_while(|byte| !byte.is_ascii_whitespace())
+                    .copied()
+                    .collect();
+                if !value.is_empty() {
+                    delimiter = value;
+                }
+                continue;
             }
-            continue;
+            // `use db` and `connect db` are the client's own, at the start of
+            // a statement.
+            if first.eq_ignore_ascii_case(b"use") || first.eq_ignore_ascii_case(b"connect") {
+                selects.get_or_insert_with(|| (index as u64 + 1, said()));
+                continue;
+            }
         }
         let mut at = start;
         while at < end {
             let code = part[at] == Quoted::Code;
+            // `\u db` and `\r db`, anywhere in code.
+            if code && text[at] == b'\\' && matches!(text.get(at + 1), Some(b'u' | b'r')) {
+                selects.get_or_insert_with(|| (index as u64 + 1, said()));
+            }
             if open.is_none() && code && !text[at].is_ascii_whitespace() {
                 open = Some(at);
             }
@@ -2382,26 +2531,50 @@ fn split_statements(
     if let Some(first) = open {
         statements.push((first, text.len()));
     }
-    statements
-}
-
-/// A word of a statement: a keyword or a name, or one of `.()=@,`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Token {
-    text: String,
-    /// A name in backticks: never a keyword.
-    quoted: bool,
-}
-
-impl Token {
-    fn is(&self, word: &str) -> bool {
-        !self.quoted && self.text.eq_ignore_ascii_case(word)
+    Split {
+        statements,
+        selects,
     }
 }
 
-/// The words of a statement's code and quoted names (unquoted), and its
-/// `.`, `(`, `)`, `=`, `@` and `,`; the `/*!NNNNN` and `*/` of versioned
-/// comments read as spaces, strings and comments left out.
+/// What a word of a statement is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    /// A keyword or a bare name.
+    Word,
+    /// A name in backticks, or in double quotes read as a name.
+    Name,
+    /// A string in single quotes.
+    Single,
+    /// A string in double quotes.
+    Double,
+    /// One of `.()=@,`.
+    Punct,
+}
+
+/// A word of a statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    text: String,
+    kind: TokenKind,
+}
+
+impl Token {
+    /// A keyword or a punctuation mark, never a quoted name or a string.
+    fn is(&self, word: &str) -> bool {
+        matches!(self.kind, TokenKind::Word | TokenKind::Punct)
+            && self.text.eq_ignore_ascii_case(word)
+    }
+
+    /// A name, bare or quoted.
+    fn is_name(&self) -> bool {
+        matches!(self.kind, TokenKind::Word | TokenKind::Name)
+    }
+}
+
+/// The words of a statement's code, quoted names and strings (unquoted),
+/// and its `.`, `(`, `)`, `=`, `@` and `,`; the `/*!NNNNN` and `*/` of
+/// versioned comments read as spaces, comments left out.
 fn tokens(text: &[u8], part: &[Quoted]) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut at = 0;
@@ -2409,55 +2582,84 @@ fn tokens(text: &[u8], part: &[Quoted]) -> Vec<Token> {
         |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80;
     while at < text.len() {
         let byte = text[at];
-        match part[at] {
-            // From the opening backtick to the closing one, doubled ones
-            // read as one.
-            Quoted::Backtick => {
+        let quoted = match part[at] {
+            Quoted::Backtick => Some((b'`', TokenKind::Name)),
+            Quoted::Single => Some((b'\'', TokenKind::Single)),
+            Quoted::Double => Some((b'"', TokenKind::Double)),
+            Quoted::Code | Quoted::Comment => None,
+        };
+        match (part[at], quoted) {
+            // From the opening quote to the closing one, doubled ones read
+            // as one, a backslash's next byte as it is in a string.
+            (what, Some((quote, kind))) => {
                 let mut close = at + 1;
-                let mut name = Vec::new();
-                while close < text.len() && part[close] == Quoted::Backtick {
-                    if text[close] == b'`' {
-                        if text.get(close + 1) == Some(&b'`') {
-                            name.push(b'`');
+                let mut inside = Vec::new();
+                while close < text.len() && part[close] == what {
+                    let byte = text[close];
+                    if byte == b'\\' && quote != b'`' {
+                        inside.extend(text.get(close + 1));
+                        close += 2;
+                        continue;
+                    }
+                    if byte == quote {
+                        if text.get(close + 1) == Some(&quote) {
+                            inside.push(quote);
                             close += 2;
                             continue;
                         }
                         break;
                     }
-                    name.push(text[close]);
+                    inside.push(byte);
                     close += 1;
                 }
                 tokens.push(Token {
-                    text: String::from_utf8_lossy(&name).into_owned(),
-                    quoted: true,
+                    text: String::from_utf8_lossy(&inside).into_owned(),
+                    kind,
                 });
                 at = close + 1;
             }
-            Quoted::Code if text[at..].starts_with(b"/*!") || text[at..].starts_with(b"/*+") => {
+            (Quoted::Code, None)
+                if text[at..].starts_with(b"/*!") || text[at..].starts_with(b"/*+") =>
+            {
                 at += 3;
                 while at < text.len() && text[at].is_ascii_digit() {
                     at += 1;
                 }
             }
-            Quoted::Code if text[at..].starts_with(b"*/") => at += 2,
-            Quoted::Code if word(byte) => {
+            (Quoted::Code, None) if text[at..].starts_with(b"*/") => at += 2,
+            (Quoted::Code, None) if word(byte) => {
                 let end = (at..text.len())
                     .find(|&end| part[end] != Quoted::Code || !word(text[end]))
                     .unwrap_or(text.len());
                 tokens.push(Token {
                     text: String::from_utf8_lossy(&text[at..end]).into_owned(),
-                    quoted: false,
+                    kind: TokenKind::Word,
                 });
                 at = end;
             }
-            Quoted::Code if b".()=@,".contains(&byte) => {
+            (Quoted::Code, None) if b".()=@,".contains(&byte) => {
                 tokens.push(Token {
                     text: (byte as char).to_string(),
-                    quoted: false,
+                    kind: TokenKind::Punct,
                 });
                 at += 1;
             }
             _ => at += 1,
+        }
+    }
+    tokens
+}
+
+/// `tokens` with each double-quoted word read as a name where it is one:
+/// always under `ANSI_QUOTES` (`ansi`), and in any mode next to a `.`,
+/// where a string could not stand (M1: when in doubt, a name).
+fn names(mut tokens: Vec<Token>, ansi: bool) -> Vec<Token> {
+    for index in 0..tokens.len() {
+        let dot = |at: Option<usize>| at.and_then(|at| tokens.get(at)).is_some_and(|t| t.is("."));
+        if tokens[index].kind == TokenKind::Double
+            && (ansi || dot(index.checked_sub(1)) || dot(Some(index + 1)))
+        {
+            tokens[index].kind = TokenKind::Name;
         }
     }
     tokens
@@ -2470,10 +2672,16 @@ struct Head {
     /// The tokens that name it (and a trigger's table): a qualifier before
     /// one of them is the statement's own, not its body's.
     names: Vec<usize>,
+    /// An event that is not `DISABLE`d: it runs on its schedule.
+    enabled_event: bool,
 }
 
-/// The head of a `CREATE`, `DROP` or `ALTER` statement of a kind the folder's
-/// files hold, `None` for any other statement.
+/// The head of a `CREATE`, `DROP` or `ALTER` statement of a kind the
+/// folder's files hold, read word by word where each word stands (M3):
+/// the verb, `OR REPLACE`, `ALGORITHM = …`, `DEFINER = user@host`, `SQL
+/// SECURITY …`, `AGGREGATE`, then the kind, `IF [NOT] EXISTS` and a name.
+/// `None` for any other statement, or one whose name is not where it should
+/// be: of a kind Kerno does not know.
 fn head(tokens: &[Token]) -> Option<Head> {
     const KINDS: [(&str, &str); 7] = [
         ("TRIGGER", "trigger"),
@@ -2484,62 +2692,107 @@ fn head(tokens: &[Token]) -> Option<Head> {
         ("DATABASE", "database"),
         ("SCHEMA", "database"),
     ];
-    let verb = tokens.first()?;
-    if !["CREATE", "DROP", "ALTER"].iter().any(|word| verb.is(word)) {
+    let is = |at: usize, word: &str| tokens.get(at).is_some_and(|token| token.is(word));
+    let value = |at: usize| {
+        tokens
+            .get(at)
+            .is_some_and(|token| token.kind != TokenKind::Punct)
+    };
+    if !["CREATE", "DROP", "ALTER"].iter().any(|verb| is(0, verb)) {
         return None;
     }
-    // The first kind word, before any `(`.
-    let (at, kind) = tokens
-        .iter()
-        .enumerate()
-        .take_while(|(_, token)| !token.is("("))
-        .find_map(|(at, token)| {
-            KINDS
-                .iter()
-                .find(|(word, _)| token.is(word))
-                .map(|(_, kind)| (at, *kind))
-        })?;
-    let mut name_at = at + 1;
-    for word in ["IF", "NOT", "EXISTS"] {
-        if tokens.get(name_at).is_some_and(|token| token.is(word)) {
-            name_at += 1;
+    let mut at = 1;
+    if is(at, "OR") && is(at + 1, "REPLACE") {
+        at += 2;
+    }
+    loop {
+        if is(at, "ALGORITHM") && is(at + 1, "=") {
+            at += 3;
+        } else if is(at, "DEFINER") && is(at + 1, "=") {
+            at += 2;
+            if is(at, "CURRENT_USER") {
+                at += 1;
+                if is(at, "(") && is(at + 1, ")") {
+                    at += 2;
+                }
+            } else if value(at) {
+                at += 1;
+            }
+            if is(at, "@") {
+                at += 1;
+                if value(at) {
+                    at += 1;
+                }
+            }
+        } else if is(at, "SQL") && is(at + 1, "SECURITY") {
+            at += 3;
+        } else if is(at, "AGGREGATE") {
+            at += 1;
+        } else {
+            break;
         }
     }
-    let dot = |index: usize| tokens.get(index).is_some_and(|token| token.is("."));
+    let kind = KINDS
+        .iter()
+        .find(|(word, _)| is(at, word))
+        .map(|(_, kind)| *kind)?;
+    at += 1;
+    for word in ["IF", "NOT", "EXISTS"] {
+        if is(at, word) {
+            at += 1;
+        }
+    }
+    let name_at = at;
+    let named = |at: usize| tokens.get(at).is_some_and(Token::is_name);
+    if !named(name_at) {
+        return None;
+    }
     let mut names = vec![name_at];
-    let mut name = tokens.get(name_at)?.text.clone();
-    if dot(name_at + 1) {
-        name = tokens.get(name_at + 2)?.text.clone();
+    let mut name = tokens[name_at].text.clone();
+    if is(name_at + 1, ".") {
+        if !named(name_at + 2) {
+            return None;
+        }
+        name = tokens[name_at + 2].text.clone();
         names.push(name_at + 2);
     }
     // A trigger's table, after its ON.
     if kind == "trigger"
-        && let Some(on) = tokens
-            .iter()
-            .enumerate()
-            .skip(name_at)
-            .take(8)
-            .find(|(_, token)| token.is("ON"))
-            .map(|(on, _)| on + 1)
+        && let Some(on) = (name_at..tokens.len().min(name_at + 8)).find(|&at| is(at, "ON"))
     {
-        names.push(on);
-        if dot(on + 1) {
-            names.push(on + 2);
+        names.push(on + 1);
+        if is(on + 2, ".") {
+            names.push(on + 3);
         }
     }
-    Some(Head { kind, name, names })
+    // An event runs unless it is created or altered DISABLE (before DO).
+    let enabled_event = kind == "event"
+        && !is(0, "DROP")
+        && !tokens
+            .iter()
+            .take_while(|token| !token.is("DO"))
+            .any(|token| token.is("DISABLE"));
+    Some(Head {
+        kind,
+        name,
+        names,
+        enabled_event,
+    })
 }
 
-/// Whether the name at `index` is qualified (`q.name`) by a word `same`
+/// Whether the name at `index` is qualified (`q.name`) by a name `same`
 /// takes for the source.
 fn qualified_by(tokens: &[Token], index: usize, same: &impl Fn(&str) -> bool) -> bool {
-    index >= 2 && tokens[index - 1].is(".") && same(&tokens[index - 2].text)
+    index >= 2
+        && tokens[index - 1].is(".")
+        && tokens[index - 2].is_name()
+        && same(&tokens[index - 2].text)
 }
 
 /// The statements of the backup's files after the tables that name the
 /// database it was taken from (K78), read from `folder` (each file up to
-/// [`NAMING_WITHIN`]). Blocking.
-pub fn naming(folder: &Path, manifest: &Manifest) -> Vec<FileNaming> {
+/// [`NAMING_WITHIN`]); `fold`: as [`find_naming`]. Blocking.
+pub fn naming(folder: &Path, manifest: &Manifest, fold: bool) -> Vec<FileNaming> {
     let local: Vec<String> = manifest
         .tables
         .iter()
@@ -2568,8 +2821,8 @@ pub fn naming(folder: &Path, manifest: &Manifest) -> Vec<FileNaming> {
             });
             match read {
                 Ok(text) => {
-                    let (found, mut whole) = find_naming(&text, &manifest.database, &local);
-                    if after.kind == AfterKind::Views && found.iter().any(|named| named.creates) {
+                    let (found, mut whole) = find_naming(&text, &manifest.database, &local, fold);
+                    if after.kind == AfterKind::Views && found.iter().any(Naming::writes) {
                         whole.get_or_insert_with(|| {
                             "mysqldump writes a stand-in for each view first, which would stay"
                                 .to_string()
@@ -2657,12 +2910,25 @@ pub fn naming_said(
             format!(" ({names})")
         }
     };
-    // Left out one by one: the statements that write into the source.
-    let creating: Vec<&Naming> = found
-        .iter()
-        .filter(|file| file.whole.is_none())
-        .flat_map(|file| file.found.iter().filter(|named| named.creates))
-        .collect();
+    let cut = |test: &dyn Fn(&Naming) -> bool| -> Vec<&Naming> {
+        found
+            .iter()
+            .filter(|file| file.whole.is_none())
+            .flat_map(|file| file.found.iter().filter(|named| test(named)))
+            .collect()
+    };
+    // Left out one by one: what would create something in the source;
+    // mysqldump's `ALTER DATABASE` around a routine (M5); an enabled event
+    // whose body names the source (M6).
+    let creating = cut(&|named| named.creates && named.kind != "database");
+    let altering = cut(&|named| named.creates && named.kind == "database");
+    let scheduled = cut(&|named| named.scheduled);
+    let unless = |one: bool| {
+        format!(
+            "Kerno leaves {} out unless you tick “Load them as written”",
+            if one { "it" } else { "them" }
+        )
+    };
     if !creating.is_empty() {
         let (counts, names) = counted(&creating);
         let one = creating.len() == 1;
@@ -2670,13 +2936,12 @@ pub fn naming_said(
             (false, false) => format!(
                 " {counts} of this backup{} {} written for the database “{source}”: restored \
                  into “{target}” as {}, {} would be created in “{source}”, not in “{target}”. \
-                 Kerno leaves {} out unless you tick “Load them as written”; the tables, their \
-                 rows and everything else are loaded.",
+                 {}; the tables, their rows and everything else are loaded.",
                 them(&names),
                 if one { "is" } else { "are" },
                 if one { "it is" } else { "they are" },
                 if one { "it" } else { "they" },
-                if one { "it" } else { "them" },
+                unless(one),
             ),
             (false, true) => format!(
                 " {counts} of this backup{} {} written for the database “{source}”: you chose \
@@ -2700,10 +2965,88 @@ pub fn naming_said(
             ),
         });
     }
+    if !scheduled.is_empty() {
+        let (counts, names) = counted(&scheduled);
+        let enabled = if scheduled.len() == 1 {
+            format!("{counts} that is enabled")
+        } else {
+            format!("{counts} that are enabled")
+        };
+        let one = scheduled.len() == 1;
+        text.push_str(&match (ran, as_written) {
+            (false, false) => format!(
+                " {enabled}{} {} “{source}” in {} body: restored, {} would run against \
+                 “{source}” on {} schedule from the restore on, with no one running {}. {}.",
+                them(&names),
+                if one { "names" } else { "name" },
+                if one { "its" } else { "their" },
+                if one { "it" } else { "they" },
+                if one { "its" } else { "their" },
+                if one { "it" } else { "them" },
+                unless(one),
+            ),
+            (false, true) => format!(
+                " {enabled}{} {} “{source}” in {} body: you chose to load {} as written, so {} \
+                 run{} against “{source}” on {} schedule.",
+                them(&names),
+                if one { "names" } else { "name" },
+                if one { "its" } else { "their" },
+                if one { "it" } else { "them" },
+                if one { "it" } else { "they" },
+                if one { "s" } else { "" },
+                if one { "its" } else { "their" },
+            ),
+            (true, false) => format!(
+                " Left out: {enabled}{}, whose body names “{source}”: {} would have run against \
+                 “{source}” on {} schedule.",
+                them(&names),
+                if one { "it" } else { "they" },
+                if one { "its" } else { "their" },
+            ),
+            (true, true) => format!(
+                " Loaded as written: {enabled}{}, which run{} against “{source}” on {} \
+                 schedule.",
+                them(&names),
+                if one { "s" } else { "" },
+                if one { "its" } else { "their" },
+            ),
+        });
+    }
+    if !altering.is_empty() {
+        let n = altering.len();
+        let statements = if n == 1 {
+            "1 ALTER DATABASE statement".to_string()
+        } else {
+            format!("{n} ALTER DATABASE statements")
+        };
+        let one = n == 1;
+        text.push_str(&match (ran, as_written) {
+            (false, false) => format!(
+                " {statements} that mysqldump wrote around a routine whose character set is not \
+                 its database's would change the character set of “{source}”. {}; the routine \
+                 is then created with “{target}”'s own character set and collation.",
+                unless(one)
+            ),
+            (false, true) => format!(
+                " {statements} that mysqldump wrote around a routine change the character set \
+                 of “{source}” for a moment (you chose to load them as written; mysqldump sets it \
+                 back after)."
+            ),
+            (true, false) => format!(
+                " Left out: {statements}, which would have changed the character set of \
+                 “{source}”; the routines they surround were created with “{target}”'s own \
+                 character set and collation."
+            ),
+            (true, true) => format!(
+                " Loaded as written: {statements}, which changed the character set of \
+                 “{source}” for a moment and set it back."
+            ),
+        });
+    }
     // Left out whole: the files whose statements cannot be cut one by one.
     for file in found.iter().filter(|file| file.whole.is_some()) {
         let why = file.whole.as_deref().unwrap_or_default();
-        let writing: Vec<&Naming> = file.found.iter().filter(|named| named.creates).collect();
+        let writing: Vec<&Naming> = file.found.iter().filter(|named| named.writes()).collect();
         let (counts, names) = counted(&writing);
         let holding = if counts.is_empty() {
             String::new()
@@ -2728,19 +3071,26 @@ pub fn naming_said(
             ),
         });
     }
-    let writes = !creating.is_empty() || found.iter().any(|file| file.whole.is_some());
-    if writes && !as_written {
-        // One statement left out, not a whole file: "it".
-        let single = creating.len() == 1 && found.iter().all(|file| file.whole.is_none());
+    // How to have what was left out, but for mysqldump's own wrappers, which
+    // a routine does not need.
+    let wanted = creating.len() + scheduled.len();
+    let wholes = found.iter().filter(|file| file.whole.is_some()).count();
+    if (wanted > 0 || wholes > 0) && !as_written {
         let files: Vec<&str> = found
             .iter()
-            .filter(|file| file.writes())
+            .filter(|file| {
+                file.whole.is_some()
+                    || file
+                        .found
+                        .iter()
+                        .any(|named| named.writes() && named.kind != "database")
+            })
             .map(|file| file.file.as_str())
             .collect();
         text.push_str(&format!(
             " To have {} in “{target}”, edit {} and run it there; or restore into a database \
              named “{source}”.",
-            match (ran, single) {
+            match (ran, wanted == 1 && wholes == 0) {
                 (_, true) => "it",
                 (true, false) => "them",
                 (false, false) => "those",
@@ -2752,7 +3102,7 @@ pub fn naming_said(
     let using: Vec<&Naming> = found
         .iter()
         .filter(|file| file.whole.is_none() || as_written)
-        .flat_map(|file| file.found.iter().filter(|named| !named.creates))
+        .flat_map(|file| file.found.iter().filter(|named| !named.writes()))
         .collect();
     if !using.is_empty() {
         let (counts, names) = counted(&using);
@@ -3078,8 +3428,18 @@ async fn define(
                 |last| in_its_file(&last, start, file),
             ),
         ))),
-        // A part that could not be read: the error names its file.
-        Err(error) => Some(Err((label(None), said(&error)))),
+        // A part that could not be read, or a client that stopped reading:
+        // the error names the file, whose table it was (K78, P2).
+        Err(error) => {
+            let text = said(&error);
+            let at = found
+                .iter()
+                .find(|(_, _, piece)| {
+                    text.contains(&job.options.input.join(&piece.file).display().to_string())
+                })
+                .map(|(index, ..)| *index);
+            Some(Err((label(at), text)))
+        }
     }
 }
 
@@ -3141,7 +3501,10 @@ async fn restore_in(
         .collect();
     // Into another database than the backup's own: the statements that
     // name the backup's database, read before anything runs (K78).
-    let renamed = job.options.database != manifest.database;
+    // By the server's rule for names: one that folds them takes `SRC` and
+    // `src` for one database; one not known, for two (M4).
+    let fold = job.options.names_fold;
+    let renamed = !same_database(&job.options.database, &manifest.database, fold);
     let (folder, listed) = (job.options.input.clone(), manifest.clone());
     // All the files before the first client: a refusal loads nothing.
     let checking = cancel.clone();
@@ -3159,7 +3522,7 @@ async fn restore_in(
             })
             .collect::<Result<Vec<_>>>()?;
         let named = if renamed {
-            naming(&folder, &listed)
+            naming(&folder, &listed, fold.unwrap_or(true))
         } else {
             Vec::new()
         };
@@ -3303,9 +3666,9 @@ async fn restore_in(
             }
             let mut kept = Vec::new();
             let mut from = 0;
-            for named in file.found.iter().filter(|named| named.creates) {
+            for named in file.found.iter().filter(|named| named.writes()) {
                 on_line(format!(
-                    "Kerno: left out of {}: the {} “{}”, written for “{}”.",
+                    "Kerno: left out of {}: the {} “{}”, which names “{}”.",
                     after.file, named.kind, named.name, manifest.database
                 ));
                 kept.push(from..named.range.start);
@@ -3461,7 +3824,7 @@ async fn restore_in(
                 found: file
                     .found
                     .iter()
-                    .filter(|named| named.creates)
+                    .filter(|named| named.writes())
                     .cloned()
                     .collect(),
                 ..file.clone()
@@ -3845,6 +4208,128 @@ mod tests {
                 low.is_none_or(|low| key >= low) && high.is_none_or(|high| key < high)
             })
             .count()
+    }
+
+    /// K78, P1: a rows client that ends well before the end of its input
+    /// (K79's failure) is said in its own words, not as "invalid connection
+    /// settings".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rows_client_that_stops_reading_is_said_in_plain_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let ten = dir.path().join("ten.sql");
+        std::fs::write(&ten, "SELECT 1;\n").unwrap();
+        // More than a pipe holds: its writes fail once the client is gone.
+        let rest = dir.path().join("rest.sql");
+        std::fs::write(&rest, vec![b'x'; 1024 * 1024]).unwrap();
+        let file = |path: &Path| StdinPart::File {
+            path: path.to_path_buf(),
+            range: 0..u64::MAX,
+            counted: true,
+        };
+        let command = ToolCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "head -c 10 > /dev/null; exit 0".into()],
+            env: Vec::new(),
+            password: None,
+            stdin: None,
+            stdin_parts: vec![file(&ten), file(&rest)],
+            sent: Arc::default(),
+            tunnel: None,
+            script_check: None,
+            files: Vec::new(),
+        };
+        let groups = vec![VecDeque::from([Stage::Side(vec![Job {
+            file: "rest.sql".into(),
+            label: "big".into(),
+            command,
+        }])])];
+        let end = run_pool(
+            groups,
+            1,
+            Arc::new(|_| {}),
+            &AtomicBool::new(false),
+            None,
+            false,
+        )
+        .await;
+        let (label, why) = end.failure.expect("a failure");
+        assert_eq!(label, "big");
+        assert_eq!(
+            why,
+            format!(
+                "sh stopped reading before the end of {} and ended without an error: the rest \
+                 of the script was not run.",
+                rest.display()
+            )
+        );
+    }
+
+    /// K78, P2: the definitions' client stopping in a table's part names
+    /// that table, not "the tables' definitions".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_definitions_run_that_stops_names_the_table_it_stopped_in() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("backup");
+        std::fs::create_dir(&folder).unwrap();
+        let client = dir.path().join("mysql");
+        std::fs::write(&client, "#!/bin/sh\nhead -c 10 > /dev/null\nexit 0\n").unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let definition = |table: &str, comment: usize| {
+            format!(
+                "DROP TABLE IF EXISTS `{table}`;\n/*!40101 SET @saved_cs_client = \
+                 @@character_set_client */;\nCREATE TABLE `{table}` (\n  `id` int NOT NULL \
+                 COMMENT '{}'\n);\n/*!40101 SET character_set_client = @saved_cs_client */;\n\
+                 INSERT INTO `{table}` VALUES (1);\n",
+                "x".repeat(comment)
+            )
+        };
+        // The first table's part fits in the pipe; the second's does not.
+        std::fs::write(folder.join("0001-a.sql"), definition("a", 10)).unwrap();
+        std::fs::write(folder.join("0002-b.sql"), definition("b", 1024 * 1024)).unwrap();
+        let tables: Vec<TableFiles> = ["a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(at, table)| TableFiles {
+                table: table.to_string(),
+                engine: Some("InnoDB".into()),
+                files: vec![Piece {
+                    file: format!("{:04}-{table}.sql", at + 1),
+                    condition: None,
+                }],
+            })
+            .collect();
+        let definitions: Vec<Option<Definition>> = tables
+            .iter()
+            .map(|table| find_definition(&folder.join(&table.files[0].file)).unwrap())
+            .collect();
+        assert!(definitions.iter().all(Option::is_some));
+        let job = FolderRestore {
+            tool_path: client,
+            params: crate::testing::params(Engine::MySql),
+            options: RestoreOptions::new(Engine::MySql, "dst", &folder, BackupFormat::Directory),
+            manifest: Manifest {
+                tables,
+                ..manifest()
+            },
+            sent: Arc::default(),
+        };
+        let mut defined = BTreeSet::new();
+        let stopped = define(
+            &job,
+            &definitions,
+            &mut defined,
+            &(Arc::new(|_| {}) as Arc<dyn Fn(String) + Send + Sync>),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let Some(Err((label, why))) = stopped else {
+            panic!("{stopped:?}");
+        };
+        assert_eq!(label, "b", "{why}");
+        assert!(why.contains("stopped reading before the end of"), "{why}");
     }
 
     #[test]
@@ -4969,10 +5454,12 @@ mod tests {
         assert!(dump_client_problem(None, Engine::MySql, (5, 1, 73), &found).is_none());
     }
 
-    /// What [`find_naming`] found, as `(kind, name, creates)`.
-    fn named(text: &[u8], source: &str, local: &[&str]) -> (Vec<(String, String, bool)>, bool) {
+    /// What [`find_naming`] found, as `(kind, name, what)`: `writes` (it
+    /// would write into the source at the restore), `runs` (an enabled event
+    /// that would, on its schedule), `names` (its body only).
+    fn named(text: &[u8], source: &str, local: &[&str]) -> (Vec<(String, String, String)>, bool) {
         let local: Vec<String> = local.iter().map(|name| name.to_string()).collect();
-        let (found, whole) = find_naming(text, source, &local);
+        let (found, whole) = find_naming(text, source, &local, true);
         for named in &found {
             // Each range is whole lines, the statement's delimiter its end.
             let range = &text[named.range.start as usize..named.range.end as usize];
@@ -4989,14 +5476,21 @@ mod tests {
         (
             found
                 .into_iter()
-                .map(|named| (named.kind.to_string(), named.name, named.creates))
+                .map(|named| {
+                    let what = match (named.creates, named.scheduled) {
+                        (true, _) => "writes",
+                        (_, true) => "runs",
+                        _ => "names",
+                    };
+                    (named.kind.to_string(), named.name, what.to_string())
+                })
                 .collect(),
             whole.is_some(),
         )
     }
 
-    fn hit(kind: &str, name: &str, creates: bool) -> (String, String, bool) {
-        (kind.into(), name.into(), creates)
+    fn hit(kind: &str, name: &str, what: &str) -> (String, String, String) {
+        (kind.into(), name.into(), what.into())
     }
 
     /// K78: the statements of `routines.sql` and `views.sql` that name the
@@ -5018,10 +5512,14 @@ mod tests {
             named(&read("k78-maria-fx-routines.sql"), fx, &local),
             (
                 vec![
-                    hit("trigger", "big_bi", true),
-                    hit("trigger", "big_ai", true),
-                    hit("event", "nightly", false),
-                    hit("procedure", "count_big", false),
+                    hit("trigger", "big_bi", "writes"),
+                    hit("trigger", "big_ai", "writes"),
+                    // Typed under ANSI_QUOTES, dumped as typed (M1).
+                    hit("trigger", "big_bu", "writes"),
+                    // Enabled: it would run on its schedule (M6).
+                    hit("event", "hourly", "runs"),
+                    hit("event", "nightly", "names"),
+                    hit("procedure", "count_big", "names"),
                 ],
                 false
             )
@@ -5030,9 +5528,11 @@ mod tests {
             named(&read("k78-84-fx-routines.sql"), fx, &local),
             (
                 vec![
-                    hit("trigger", "big_ai", false),
-                    hit("event", "nightly", false),
-                    hit("procedure", "count_big", false),
+                    hit("trigger", "big_ai", "names"),
+                    hit("trigger", "big_bu", "names"),
+                    hit("event", "hourly", "runs"),
+                    hit("event", "nightly", "names"),
+                    hit("procedure", "count_big", "names"),
                 ],
                 false
             )
@@ -5048,13 +5548,13 @@ mod tests {
                 &local
             )
             .0[0],
-            hit("trigger", "big_bi", true)
+            hit("trigger", "big_bi", "writes")
         );
         let same = "kerno_test_k78_same";
         for file in ["k78-maria-same-routines.sql", "k78-84-same-routines.sql"] {
             assert_eq!(
                 named(&read(file), same, &[same, "other"]),
-                (vec![hit("trigger", "same_bi", false)], false),
+                (vec![hit("trigger", "same_bi", "names")], false),
                 "{file}"
             );
         }
@@ -5063,13 +5563,13 @@ mod tests {
         // range is one statement alone on its lines, its DELIMITER kept.
         let text = read("k78-maria-fx-routines.sql");
         let local: Vec<String> = local.iter().map(|name| name.to_string()).collect();
-        let (found, _) = find_naming(&text, fx, &local);
+        let (found, _) = find_naming(&text, fx, &local, true);
         // Their lines, from 1: the trigger's one, the procedure's three.
         assert_eq!(found[0].lines, 26..27);
-        assert_eq!(found[3].lines, 114..117);
+        assert_eq!(found[5].lines, 147..150);
         let mut kept = Vec::new();
         let mut from = 0;
-        for named in found.iter().filter(|named| named.creates) {
+        for named in found.iter().filter(|named| named.writes()) {
             kept.extend_from_slice(&text[from..named.range.start as usize]);
             from = named.range.end as usize;
         }
@@ -5079,9 +5579,16 @@ mod tests {
             !kept.contains("TRIGGER") && !kept.contains("trigger "),
             "{kept}"
         );
-        assert_eq!(kept.matches("DELIMITER ;;").count(), 5, "{kept}");
-        assert_eq!(kept.matches("DELIMITER ;\n").count(), 5, "{kept}");
+        let original = String::from_utf8_lossy(&text);
+        for line in ["DELIMITER ;;", "DELIMITER ;\n"] {
+            assert_eq!(
+                kept.matches(line).count(),
+                original.matches(line).count(),
+                "{kept}"
+            );
+        }
         assert!(kept.contains("EVENT `nightly`") && kept.contains("PROCEDURE `count_big`"));
+        assert!(!kept.contains("EVENT `hourly`"), "{kept}");
 
         // Shapes mysqldump did not write here.
         let src = "src";
@@ -5098,7 +5605,7 @@ mod tests {
                 "DELIMITER ;;\nCREATE DEFINER=`event`@`%` PROCEDURE `p`() SELECT * FROM \
                  `src`.`t` ;;\nDELIMITER ;\n"
                     .into(),
-                (vec![hit("procedure", "p", false)], false),
+                (vec![hit("procedure", "p", "names")], false),
             ),
             // `x.src.y`: `src` is a table there.
             (
@@ -5108,17 +5615,17 @@ mod tests {
             // A trigger of the source's table, its own name unqualified.
             (
                 "CREATE TRIGGER x BEFORE INSERT ON `src`.`t` FOR EACH ROW SET NEW.a = 1;\n".into(),
-                (vec![hit("trigger", "x", true)], false),
+                (vec![hit("trigger", "x", "writes")], false),
             ),
             (
                 "DROP PROCEDURE IF EXISTS src.p;\n".into(),
-                (vec![hit("procedure", "p", true)], false),
+                (vec![hit("procedure", "p", "writes")], false),
             ),
             (
                 "/*!50003 ALTER DATABASE `src` CHARACTER SET latin1 COLLATE latin1_swedish_ci */ \
                  ;\n"
                 .into(),
-                (vec![hit("database", "src", true)], false),
+                (vec![hit("database", "src", "writes")], false),
             ),
             // A quoted name holding the delimiter and the source's name.
             (
@@ -5130,16 +5637,110 @@ mod tests {
                 "DELIMITER ;;\n/*!50003 CREATE*/ /*!50003 TRIGGER src.x BEFORE INSERT ON src.t \
                  FOR EACH ROW SET NEW.a = 1 */;; SELECT 1;;\nDELIMITER ;\n"
                     .into(),
-                (vec![hit("trigger", "x", true)], true),
+                (vec![hit("trigger", "x", "writes")], true),
             ),
             // A statement of a kind Kerno does not know: whole, too.
             (
                 "INSERT INTO src.t VALUES (1);\n".into(),
-                (vec![hit("statement", "", true)], true),
+                (vec![hit("statement", "", "writes")], true),
+            ),
+            // M1: double quotes are names under ANSI_QUOTES (set, kept,
+            // put back as mysqldump does), and next to a `.` in any mode,
+            // comments between; a lone double-quoted word is a string.
+            (
+                "SET sql_mode = 'STRICT_TRANS_TABLES';\nSET @saved = @@sql_mode;\n\
+                 SET sql_mode = 'ANSI';\nCREATE TRIGGER \"src\".\"x\" BEFORE INSERT ON \"t\" FOR \
+                 EACH ROW SET NEW.a = 1;\nSET sql_mode = @saved;\n\
+                 CREATE PROCEDURE p() SELECT \"src\", 'src.t';\n\
+                 CREATE PROCEDURE q() SELECT * FROM \"src\" /* c */ . /* d */ \"t\";\n"
+                    .into(),
+                (
+                    vec![
+                        hit("trigger", "x", "writes"),
+                        hit("procedure", "q", "names"),
+                    ],
+                    false,
+                ),
+            ),
+            // M2: a line that selects a database: the file goes whole.
+            (
+                "use src;\nCREATE PROCEDURE p() SELECT 1;\n".into(),
+                (vec![], true),
+            ),
+            ("CONNECT src\nSELECT 1;\n".into(), (vec![], true)),
+            ("\\u src\nSELECT 1;\n".into(), (vec![], true)),
+            // M3: a bare definer or name that is a kind word hides nothing.
+            (
+                "CREATE DEFINER=event@localhost TRIGGER src.x BEFORE INSERT ON src.t FOR EACH ROW \
+                 SET NEW.a = 1;\n"
+                    .into(),
+                (vec![hit("trigger", "x", "writes")], false),
+            ),
+            (
+                "CREATE DEFINER = trigger @ localhost PROCEDURE src.p() SELECT 1;\n".into(),
+                (vec![hit("procedure", "p", "writes")], false),
+            ),
+            (
+                "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = CURRENT_USER() SQL SECURITY \
+                 INVOKER VIEW src.v AS SELECT 1;\nCREATE DEFINER='root'@'%' FUNCTION f() RETURNS \
+                 INT RETURN 1;\n"
+                    .into(),
+                (vec![hit("view", "v", "writes")], false),
+            ),
+            (
+                "ALTER TABLE src.event ADD c INT;\n".into(),
+                (vec![hit("statement", "", "writes")], true),
+            ),
+            // M6: an enabled event runs on its schedule; a disabled one does
+            // not.
+            (
+                "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO DELETE FROM src.t;\n\
+                 CREATE EVENT d ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src.t;\n\
+                 CREATE EVENT r ON SCHEDULE EVERY 1 DAY DISABLE ON SLAVE DO DELETE FROM src.t;\n"
+                    .into(),
+                (
+                    vec![
+                        hit("event", "e", "runs"),
+                        hit("event", "d", "names"),
+                        hit("event", "r", "names"),
+                    ],
+                    false,
+                ),
             ),
         ] {
             assert_eq!(named(text.as_bytes(), src, &["t"]), expected, "{text}");
         }
+    }
+
+    /// K78, M4: one database or two, by the server's rule for names; a
+    /// qualifier read the same way. M5: mysqldump's own `ALTER DATABASE`
+    /// around a routine whose collation differs (a real 8.4 file).
+    #[test]
+    fn names_follow_the_server_s_case_rule_and_mysqldump_s_alter_database_is_found() {
+        assert!(same_database("SRC", "src", Some(true)));
+        assert!(!same_database("SRC", "src", Some(false)));
+        assert!(!same_database("SRC", "src", None));
+        assert!(same_database("src", "src", None));
+        let text = b"CREATE PROCEDURE p() SELECT * FROM SRC.t;\n";
+        let local = vec!["t".to_string()];
+        assert_eq!(find_naming(text, "src", &local, true).0.len(), 1);
+        assert!(find_naming(text, "src", &local, false).0.is_empty());
+
+        let folder = crate::testing::fixtures().join("mysqldump");
+        let text = std::fs::read(folder.join("k78-84-alter-routines.sql")).unwrap();
+        let found = named(&text, "kerno_test_k78r_src", &["audit", "big", "v1"]);
+        assert!(!found.1, "{found:?}");
+        let altering: Vec<_> = found
+            .0
+            .iter()
+            .filter(|(kind, ..)| kind == "database")
+            .collect();
+        assert_eq!(altering.len(), 4, "{found:?}");
+        assert!(altering.iter().all(|(.., what)| what == "writes"));
+        assert!(
+            found.0.contains(&hit("procedure", "p_new", "names")),
+            "{found:?}"
+        );
     }
 
     /// K78: what the wizard, the confirmation and the run's end say of the
@@ -5150,6 +5751,7 @@ mod tests {
             kind,
             name: name.into(),
             creates,
+            scheduled: false,
             range: 0..1,
             lines: 1..2,
         };
@@ -5222,6 +5824,51 @@ mod tests {
              on “src” each time it runs."
         );
         assert!(naming_said(&[], "src", "dst", false, false).is_none());
+        // M5: mysqldump's ALTER DATABASE around a routine, said for what it
+        // does, without the advice that does not fit.
+        let wrapped = FileNaming {
+            found: vec![
+                naming("database", "src", true),
+                naming("database", "src", true),
+            ],
+            ..routines.clone()
+        };
+        let before = said(std::slice::from_ref(&wrapped), false, false);
+        assert_eq!(
+            before,
+            "2 ALTER DATABASE statements that mysqldump wrote around a routine whose character \
+             set is not its database's would change the character set of “src”. Kerno leaves \
+             them out unless you tick “Load them as written”; the routine is then created with \
+             “dst”'s own character set and collation."
+        );
+        assert!(
+            said(std::slice::from_ref(&wrapped), false, true).starts_with(
+                "Left out: 2 ALTER DATABASE statements, which would have changed the character \
+                 set of “src”; the routines they surround were created with “dst”'s own \
+                 character set and collation."
+            )
+        );
+        // M6: an enabled event whose body names the source.
+        let scheduled = FileNaming {
+            found: vec![Naming {
+                scheduled: true,
+                ..naming("event", "hourly", false)
+            }],
+            ..routines.clone()
+        };
+        assert_eq!(
+            said(std::slice::from_ref(&scheduled), false, false),
+            "1 event that is enabled (“hourly”) names “src” in its body: restored, it would run \
+             against “src” on its schedule from the restore on, with no one running it. Kerno \
+             leaves it out unless you tick “Load them as written”. To have it in “dst”, edit \
+             routines.sql and run it there; or restore into a database named “src”."
+        );
+        assert!(
+            said(std::slice::from_ref(&scheduled), false, true).starts_with(
+                "Left out: 1 event that is enabled (“hourly”), whose body names “src”: it would \
+                 have run against “src” on its schedule."
+            )
+        );
     }
 
     /// K78: a failure in a file after the tables, every table in: the words
@@ -5279,6 +5926,7 @@ mod tests {
             kind: "trigger",
             name: "big_bi".into(),
             creates: true,
+            scheduled: false,
             range: 0..1,
             lines: 3..4,
         };

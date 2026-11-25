@@ -719,9 +719,14 @@ statements out unless you tick **Load them as written (they act on “shop”)**
 everything else are loaded, and the end of the run names what was left out and how to get it (edit
 `routines.sql` and run it in “shop_copy”, or restore into a database named “shop”). A statement that only names
 “shop” in its body is loaded either way and said once before the run and at its end: it acts on “shop” each
-time it runs. The confirmation says the same, the choice included. Kerno reads `routines.sql` and `views.sql` for
-this, strings and comments left aside; a statement it cannot leave out alone (one that shares its lines with
-another, or a view) leaves its whole file out, and says so. A plain SQL dump is read only for its first lines:
+time it runs; an enabled event whose body names “shop” is left out too, as it would run against “shop” on
+its schedule with no one running it. The statements mysqldump writes itself to change “shop”'s character set
+around a routine are left out as well, and the routine is created with “shop_copy”'s own. On a server that
+compares names without case, “SHOP” and “shop” are the same database and nothing is left out. The
+confirmation says the same, the choice included. Kerno reads `routines.sql` and `views.sql` for
+this, strings and comments left aside, names in double quotes read as names where the file's `sql_mode` makes
+them so; a statement it cannot leave out alone (one that shares its lines with another, a view, a line that
+selects a database with `use`) leaves its whole file out, and says so. A plain SQL dump is read only for its first lines:
 the restore says which database it was taken from, or the database it selects itself (`USE`), when that is
 not the one chosen. A routines or views file that fails once every table is in says that the tables and their
 rows are in place, and what a rerun would do, rather than "run it again"; the backup's views a database

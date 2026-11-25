@@ -631,7 +631,7 @@ impl BackupDialog {
         };
         // Without case only where the server compares names so (L4).
         let fold = |name: &str| {
-            if self.target_folds {
+            if self.target_folds == Some(true) {
                 name.to_lowercase()
             } else {
                 name.to_string()
@@ -825,12 +825,13 @@ impl BackupDialog {
             return None;
         };
         let target = &self.database;
+        let other = |source: &str| !mysql_folder::same_database(source, target, self.target_folds);
         if input.manifest.is_some() {
             let source = input.archive_database.as_deref()?;
-            return (source != target)
+            return other(source)
                 .then(|| {
                     mysql_folder::naming_said(
-                        &input.naming,
+                        self.naming(input),
                         source,
                         target,
                         self.restore.load_as_written,
@@ -839,7 +840,7 @@ impl BackupDialog {
                 })
                 .flatten();
         }
-        if let Some(uses) = input.dump_uses.as_deref().filter(|uses| *uses != target) {
+        if let Some(uses) = input.dump_uses.as_deref().filter(|uses| other(uses)) {
             return Some(format!(
                 "This dump selects the database “{uses}” itself (USE `{uses}`): restored, what it \
                  holds goes into “{uses}”, not into “{target}”."
@@ -848,7 +849,7 @@ impl BackupDialog {
         let source = input
             .archive_database
             .as_deref()
-            .filter(|source| *source != target)?;
+            .filter(|source| other(source))?;
         Some(format!(
             "This dump was taken from the database “{source}”: its triggers, routines, events or \
              views that name “{source}” would act on “{source}”, not on “{target}”. Kerno reads \
@@ -861,18 +862,29 @@ impl BackupDialog {
     /// "Load them as written" is ticked (K78).
     pub(super) fn source_writes(&self) -> bool {
         match &self.input {
-            Some(Ok(Input {
-                manifest: Some(_),
-                archive_database: Some(source),
-                naming,
-                ..
-            })) => {
+            Some(Ok(
+                input @ Input {
+                    manifest: Some(_),
+                    archive_database: Some(source),
+                    ..
+                },
+            )) => {
                 self.mode == Mode::Restore
-                    && *source != self.database
-                    && naming.iter().any(mysql_folder::FileNaming::writes)
+                    && !mysql_folder::same_database(source, &self.database, self.target_folds)
+                    && self
+                        .naming(input)
+                        .iter()
+                        .any(mysql_folder::FileNaming::writes)
             }
             _ => false,
         }
+    }
+
+    /// The folder's statements that name its database, read by the target
+    /// server's rule for names: with case only where it is known to keep
+    /// case (K78, M4).
+    fn naming<'a>(&self, input: &'a Input) -> &'a [mysql_folder::FileNaming] {
+        &input.naming[usize::from(self.target_folds == Some(false))]
     }
 
     /// The client in use, small, with the way to another one.
