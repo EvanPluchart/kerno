@@ -1864,3 +1864,8 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   0.0.0, no elevation check: the runner is administrator only).
 - Not proved: a standard user's update on a real Windows, the installer's pages clicked by a person, what
   Windows' Restart Manager does to a running Kerno, SmartScreen's words on the unsigned installer.
+- K70 merged after its second review; the workflows take the installer: `release.yml`'s `windows` job uploads
+  `Kerno-<version>-windows-x86_64-setup.exe` beside the zip and `SHA256SUMS` lists it (nine packages, ten
+  files in a draft: without that line a Kerno on Windows refuses its update and opens the release page);
+  `ci.yml`'s `windows-package` keeps the installer and the picture taken after the install. K68's `windows`
+  job (the workspace's tests against the seeded servers) is in with it.

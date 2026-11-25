@@ -8,7 +8,8 @@
 #   windows      clippy and the workspace tests on Windows, against a PostgreSQL 17 and a MySQL 8.4
 #                of the image seeded as the containers by scripts/windows-test-servers.sh (K68,
 #                D-137); MariaDB, SSH and the legacy MySQL servers are not there, their tests skip
-#   windows-package  the release's Windows zip, built by scripts/bundle-windows.sh and kept 7
+#   windows-package  the release's Windows zip and installer, built by scripts/bundle-windows.sh
+#                (which installs, launches and uninstalls the installer's Kerno once) and kept 7
 #                days with the run, and pictures of the packaged app driven by keys against the
 #                seeded PostgreSQL (scripts/windows-app-pictures.ps1)
 #   macos-package    the release's .dmg, built by scripts/bundle-macos.sh and kept 7 days
@@ -146,7 +147,7 @@ jobs:
         run: scripts/windows-test-servers.sh down
 
   windows-package:
-    name: release zip (Windows)
+    name: release zip and installer (Windows)
     runs-on: windows-2025
     timeout-minutes: 120
     defaults:
@@ -162,7 +163,7 @@ jobs:
         with:
           shared-key: release-windows
           cache-on-failure: true
-      - name: Build, check the version, launch once and zip
+      - name: Build, check the version, launch once, zip, build the installer and try it
         run: scripts/bundle-windows.sh
       # The packaged app at work: a connection from a URL, a query, a table, the connection
       # dialog and Settings, against the seeded PostgreSQL (K68).
@@ -178,10 +179,13 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kerno-windows-x86_64
-          # The zip, the picture of the screen taken at the launch check, and the app at work.
+          # The zip, the installer, the pictures of the screen taken at the launch check and
+          # after the install, and the app at work.
           path: |
             dist/*.zip
+            dist/*-setup.exe
             dist/kerno-windows-launch.png
+            dist/kerno-windows-installed.png
             dist/pictures/*.png
           if-no-files-found: error
           retention-days: 7
