@@ -14,6 +14,7 @@ that cover it, is in [FEATURES.md](FEATURES.md).
 - [Open a connection from the shell](#open-a-connection-from-the-shell)
 - [Move your setup to another computer](#move-your-setup-to-another-computer)
 - [Which databases a PostgreSQL connection shows](#which-databases-a-postgresql-connection-shows)
+- [When a connection opens again](#when-a-connection-opens-again)
 - [AI assistant and what it sends](#ai-assistant-and-what-it-sends)
 - [Vim mode](#vim-mode)
 - [Updates](#updates)
@@ -221,6 +222,19 @@ billing, crm"); a saved task reads them again at each run. MySQL and MariaDB lis
 see, and have no such choice. To hide databases by name, use Filter ▸ on a database of the tree. An import
 from DBeaver keeps DBeaver's "Show all databases" (off in DBeaver: the default database alone), and an
 exported connections file carries the choice.
+
+## When a connection opens again
+
+Reconnect, the Read-only switch (its toolbar button, the connection's menu, the palette), saving an open
+connection's settings and a connection that comes back after the server went away all close the connection's
+sessions and open new ones. The schema tree is then read again from the databases, its folders closed; a table
+open in a tab reads its rows again, and a query tab opens a new session at its next statement. An open
+transaction is never carried over: the first three ask about it before, and a lost connection says that the
+server rolled it back.
+
+A read of the tree whose session the server closed (an administrator, a timeout) opens a new session and reads
+again once, without a word. If that fails too, its row says so in plain words first ("The connection to
+“name” was lost. Reconnect it (its menu in the sidebar), then try again."), the driver's words below.
 
 ## AI assistant and what it sends
 

@@ -232,6 +232,9 @@ pub enum FailureKind {
     SshForward,
     /// The saved password could not be read from the system secret store.
     SecretStore,
+    /// An open connection, or one of its sessions, was closed or lost
+    /// while in use (K75).
+    Lost,
     /// A database file (SQLite) is not where the connection says.
     FileMissing,
     /// The file is not a database Kerno can open.
@@ -532,6 +535,8 @@ pub fn explain(raw: &str, config: &crate::config::ConnectionConfig) -> Explained
             format!("{host}:{port} did not answer in time."),
             "Check the host and port, and that no firewall or VPN blocks the way.".to_string(),
         )
+    } else if raw.starts_with(LOST) {
+        lost_words(config)
     } else {
         other()
     };
@@ -880,10 +885,28 @@ fn file_words(
             "Turn Read-only on to open it as it is, or give yourself write permission on the file \
              and its folder.",
         )
+    } else if raw.starts_with(LOST) {
+        return lost_words(config);
     } else {
         return other();
     };
     (kind, headline, next.to_string())
+}
+
+/// How [`Error::Closed`] starts: a connection or a session closed in use.
+const LOST: &str = "connection closed: ";
+
+/// A connection, or one of its sessions, closed or lost while in use (K75).
+fn lost_words(config: &crate::config::ConnectionConfig) -> (FailureKind, String, String) {
+    let headline = match config.name.trim() {
+        "" => "The connection to the server was lost.".to_string(),
+        name => format!("The connection to “{name}” was lost."),
+    };
+    (
+        FailureKind::Lost,
+        headline,
+        "Reconnect it (its menu in the sidebar), then try again.".to_string(),
+    )
 }
 
 fn other() -> (FailureKind, String, String) {
@@ -1284,6 +1307,41 @@ mod tests {
             "Host “studio” was not found. Check the host name; for a server on this \
              computer, use localhost."
         );
+    }
+
+    /// K75: a connection or a session closed in use, on a server or a file, says so with the
+    /// connection's name and the next step; a refused connection still says it was refused.
+    #[test]
+    fn a_lost_connection_is_told_in_plain_words() {
+        let closed = Error::Closed("the session was closed".into()).to_string();
+        let named = ConnectionConfig {
+            name: "shop test".into(),
+            ..config()
+        };
+        let file = ConnectionConfig {
+            name: "notes".into(),
+            file: Some("/tmp/notes.db".into()),
+            ..ConnectionConfig::new(Engine::Sqlite)
+        };
+        for config in [&named, &file] {
+            let explained = explain(&closed, config);
+            assert_eq!(explained.kind, FailureKind::Lost);
+            assert_eq!(
+                format!("{} {}", explained.headline, explained.next_step),
+                format!(
+                    "The connection to “{}” was lost. Reconnect it (its menu in the sidebar), \
+                     then try again.",
+                    config.name
+                )
+            );
+            assert_eq!(explained.raw, closed);
+        }
+        assert_eq!(
+            explain(&closed, &config()).headline,
+            "The connection to the server was lost."
+        );
+        let refused = "connection closed: Connection refused (os error 61)";
+        assert_eq!(explain(refused, &named).kind, FailureKind::Refused);
     }
 
     #[test]

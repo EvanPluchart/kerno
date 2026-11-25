@@ -1869,3 +1869,20 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   files in a draft: without that line a Kerno on Windows refuses its update and opens the release page);
   `ci.yml`'s `windows-package` keeps the installer and the picture taken after the install. K68's `windows`
   job (the workspace's tests against the seeded servers) is in with it.
+
+## 2026-11-25 — K75: the tree keeps no closed session, and Reconnect mends it
+
+- The real-app pass saw every schema not read yet say "connection closed: the session was closed", Refresh and
+  Reconnect no help. Reproduced in a UI test with the same row: on PostgreSQL by each way that opens an open
+  connection again, alone (the Read-only switch from the toolbar or the menu, saving its settings, Reconnect);
+  on MySQL by the toolbar's switch. The cancelled `pg_sleep` and K71's close play no part.
+- Cause: those ways close and open the connection in one update, and the tree learns of it only once the status
+  reads `Connecting`; it kept its sessions, closed. Now a tree read through another session of the connection
+  than the one it holds is read again from the databases (`navigator/view.rs`, D-144).
+- A tree read whose session the server ended opens a new one and reads once more, without asking; reads only.
+  A second failure says "The connection to “name” was lost." and what to do, then the driver's words
+  (`kerno_core::error::explain`, `FailureKind::Lost`).
+- A data tab reading at the moment its connection opened again kept the session it was opening on the old one:
+  it now drops that read and reads again on the new connection. Query tabs checked, unchanged.
+- Tests: `ui_tests/k75.rs` (five, PostgreSQL and MySQL, SQLite for the tree), two unit tests; each seen failing
+  with its part taken out.

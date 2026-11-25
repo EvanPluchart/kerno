@@ -414,6 +414,9 @@ impl DataTab {
                     (State::Waiting, false) => {}
                     (_, false) => {
                         this.close_session(cx);
+                        // A read still opening its session on the closing
+                        // connection would keep that session (K75).
+                        this.generation += 1;
                         this.state = State::Waiting;
                         cx.notify();
                     }
@@ -1386,6 +1389,12 @@ impl DataTab {
     #[cfg(test)]
     pub fn load_size(&self) -> u64 {
         self.load_size
+    }
+
+    /// The session the tab holds; for tests.
+    #[cfg(test)]
+    pub fn held_session(&self) -> Option<Arc<dyn Session>> {
+        self.session.clone()
     }
 
     /// Reads the next rows and adds them under those on screen (K36),

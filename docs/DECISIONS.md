@@ -4457,6 +4457,36 @@ one that finds the user's files, its updates and the backup tools.
   runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
   OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
 
+## D-144 — A connection opened again is a new tree; a lost tree read is read once more (K75; 2026-11-25)
+
+The real-app pass of 2026-11-25 found the schema tree failing every read with "connection closed: the session
+was closed" after the Read-only switch was used on an open connection, and Reconnect did not mend it. Reconnect,
+the Read-only switch, saving an open connection and a lost connection close and open the connection in one
+update; the tree learned of it only once its status read `Connecting`, and kept its closed sessions.
+
+- **Where the fix is.** In the tree, not in each of the four ways in: the tree remembers the connection's own
+  session it was read through, and a tree read through another one is read again from the databases. Not
+  chosen: making the manager say "disconnected" between the two halves (every subscriber would see a connection
+  closed by the user, the tree's row would close, the tabs would act as for a Disconnect), or forgetting the
+  tree on `Connecting` (an automatic reconnection would then select the connection's row and take the
+  selection away from where the user was, as a first connection does).
+- **What the user sees.** The tree is read again from its databases, its open folders closed, as after a
+  Disconnect and Connect. Not chosen: keeping which folders were open and reading them again, more code for a
+  rare moment; the tree's other choices (filters, which databases show) are settings and stay.
+- **One more read, reads only.** A tree read whose session is closed or lost lets that session go and reads
+  once more on a new one, without asking (CLAUDE.md §4 A5), and asks the manager to check the connection, as a
+  query tab does. Only the tree's loads (schemas, objects, columns, extensions) read again: the confirmed
+  statements of the tree go through the same function and are never run again. The list of databases is not
+  read again: it always runs on a new session, so a failure there is the connection's, which the check finds.
+- **The words.** `connection closed: …` is a kind of its own in `kerno_core::error::explain`, `Lost`: "The
+  connection to “name” was lost." then "Reconnect it (its menu in the sidebar), then try again.", for servers
+  and database files; one classification for every place that shows a connection's failure. A failure whose
+  text names a cause (refused, timed out, a password) keeps that cause's words.
+- **A data tab** drops a read started before its connection closed: it kept the session it was opening on the
+  old connection, closed (seen in a test), or by the code, not seen, open but out of the connection's list and
+  with its old settings. The administration tab does the same in a narrower window (read, not reproduced):
+  left, its next read fails once and opens a new session.
+
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 
 The owner asked on 2026-11-16 (ROADMAP, "Limits found on the way") that the `.dmg` open on a window of its

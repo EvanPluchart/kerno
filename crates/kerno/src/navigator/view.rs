@@ -174,6 +174,10 @@ const ROOT_LOAD: &str = "";
 struct Browse {
     root: Root,
     tree: Tree,
+    /// The connection's own session when the browse started: another one
+    /// means the connection was opened again, which closed every session
+    /// below (K75).
+    meta: Arc<dyn Session>,
     /// The tree's own sessions, opened as databases are browsed: one per
     /// database on PostgreSQL, one for the connection on MySQL (key `""`),
     /// never the connection's meta session, whose keep-alive a read waiting
@@ -492,6 +496,11 @@ impl Navigator {
                 self.select_id(&model::connection_row(id), cx);
                 return;
             }
+            // Opened again (Reconnect, the read-only toggle, a lost
+            // connection): its statuses come merged, so the tree may never
+            // have seen it closed, and its sessions were closed with the
+            // old one. Read again from the databases, on new sessions (K75).
+            Status::Connected { .. } if !self.browsing_meta(id, cx) => self.load_databases(id, cx),
             // Closed by the user: the row closes too.
             Status::Disconnected => {
                 self.forget(id, cx);
@@ -504,6 +513,14 @@ impl Navigator {
             _ => {}
         }
         self.sync(cx);
+    }
+
+    /// Whether the tree of `connection` was read through its session now.
+    fn browsing_meta(&self, connection: &str, cx: &App) -> bool {
+        let meta = self.meta(connection, cx);
+        self.browse
+            .get(connection)
+            .is_some_and(|browse| meta.is_some_and(|meta| Arc::ptr_eq(&meta, &browse.meta)))
     }
 
     /// Fetches the list of databases of `connection` again, from scratch.
@@ -540,6 +557,7 @@ impl Navigator {
                 root: Root::Loading,
                 tree: Tree::new(meta.dialect().has_schemas())
                     .with_routines(meta.dialect().has_routines()),
+                meta: meta.clone(),
                 sessions: HashMap::new(),
                 stops: HashMap::new(),
                 loading: HashMap::new(),
@@ -843,26 +861,40 @@ impl Navigator {
                         }
                         let kept = browse
                             .sessions
-                            .entry(key)
+                            .entry(key.clone())
                             .or_insert_with(|| session.clone());
                         Arc::ptr_eq(kept, &session)
                     })
                     .unwrap_or(false);
-                cx.update(|cx| {
-                    stop.run(cx, session, move |session| {
-                        let reading = work(session.clone());
-                        async move {
-                            let outcome = reading.await;
-                            // A session not kept holds no connection once read.
-                            if !keep {
-                                session.close().await;
+                let used = session.clone();
+                let outcome = cx
+                    .update(|cx| {
+                        stop.run(cx, session, move |session| {
+                            let reading = work(session.clone());
+                            async move {
+                                let outcome = reading.await;
+                                // A session not kept holds no connection once read.
+                                if !keep {
+                                    session.close().await;
+                                }
+                                outcome
                             }
-                            outcome
-                        }
+                        })
                     })
-                })
-                .await
-                .unwrap_or(Err(Error::Cancelled))
+                    .await
+                    .unwrap_or(Err(Error::Cancelled));
+                // A session found closed or lost is let go: the next read
+                // opens a new one (K75).
+                if matches!(&outcome, Err(error) if error.is_disconnect()) {
+                    let _ = this.update(cx, |this, _| {
+                        if let Some(browse) = this.live(&connection, generation)
+                            && (browse.sessions.get(&key)).is_some_and(|s| Arc::ptr_eq(s, &used))
+                        {
+                            browse.sessions.remove(&key);
+                        }
+                    });
+                }
+                outcome
             }
             .await;
             ended.set(true);
@@ -978,6 +1010,13 @@ impl Navigator {
 
     /// Runs a load of `connection` on the session of its database.
     fn run(&mut self, connection: &str, load: Load, cx: &mut Context<Self>) {
+        self.read_load(connection, load, true, cx);
+    }
+
+    /// [`Self::run`]; `again`: a session found closed or lost is replaced
+    /// and the load read once more, without asking (CLAUDE.md §4 A5, K75).
+    /// Loads only read: a statement that writes is never run again.
+    fn read_load(&mut self, connection: &str, load: Load, again: bool, cx: &mut Context<Self>) {
         let Some(generation) = self.browse.get(connection).map(|browse| browse.generation) else {
             return;
         };
@@ -1006,6 +1045,18 @@ impl Navigator {
         cx.spawn(async move |this, cx| {
             let outcome = fetching.await;
             let _ = this.update(cx, |this, cx| {
+                if again
+                    && matches!(&outcome, Err(error) if error.is_disconnect())
+                    && (this.live(&connection, generation))
+                        .is_some_and(|browse| browse.loading.contains_key(&load.id))
+                {
+                    // The connection too may be gone: checked, and opened
+                    // again if it is (the tree is then read again).
+                    this.connections
+                        .update(cx, |connections, cx| connections.verify(&connection, cx));
+                    this.read_load(&connection, load, false, cx);
+                    return;
+                }
                 let config =
                     (this.connections.read(cx).get(&connection)).map(|saved| saved.config.clone());
                 let outcome = outcome.map_err(|error: kerno_core::Error| {
@@ -3198,6 +3249,13 @@ impl Navigator {
             .collect()
     }
 
+    /// The tree's session of `connection` kept under `key` (a database on
+    /// PostgreSQL, `""` on MySQL); for tests.
+    #[cfg(test)]
+    pub fn tree_session(&self, connection: &str, key: &str) -> Option<Arc<dyn Session>> {
+        self.browse.get(connection)?.sessions.get(key).cloned()
+    }
+
     /// The rows now shown under `connection`, indented by depth; for tests.
     #[cfg(test)]
     pub fn outline_of(&self, connection: &str, cx: &App) -> Vec<String> {
@@ -3962,9 +4020,9 @@ fn kind_name(object: &ObjectRef) -> &'static str {
 }
 
 /// What a failed read of the tree says on its row (C14). A session that
-/// could not open in `database` (a privilege, a server's rule) is said in
-/// plain words first, then the server's own (CLAUDE.md §3 item 5, K62);
-/// a statement's error is said as it is.
+/// could not open in `database` (a privilege, a server's rule), or was
+/// lost (K75), is said in plain words first, then the server's own
+/// (CLAUDE.md §3 item 5, K62); a statement's error is said as it is.
 fn read_failure(
     error: &Error,
     reading: &str,
@@ -3973,7 +4031,7 @@ fn read_failure(
 ) -> String {
     let raw = format!("Could not read {reading}: {}", describe(error));
     let explained = match (error, config) {
-        (Error::Connect(_), Some(config)) => kerno_core::error::explain(
+        (Error::Connect(_) | Error::Closed(_), Some(config)) => kerno_core::error::explain(
             &error.to_string(),
             &kerno_core::config::ConnectionConfig {
                 database: Some(database.to_string()),
@@ -4587,6 +4645,23 @@ mod tests {
         assert_eq!(
             read_failure(&other, "the schemas", "billing", Some(&config)),
             "Could not read the schemas: could not connect: something unheard of"
+        );
+    }
+
+    /// K75: a read whose session was lost (once read again) says so in plain words first, with
+    /// what to do, then the driver's own words.
+    #[test]
+    fn a_lost_session_is_said_in_plain_words_first() {
+        let config = ConnectionConfig {
+            name: "pg test".into(),
+            ..ConnectionConfig::new(Engine::Postgres)
+        };
+        let lost = Error::Closed("the session was closed".into());
+        assert_eq!(
+            read_failure(&lost, "the objects of shop", "kerno", Some(&config)),
+            "The connection to “pg test” was lost.\nReconnect it (its menu in the sidebar), then \
+             try again.\nCould not read the objects of shop: connection closed: the session was \
+             closed"
         );
     }
 }
