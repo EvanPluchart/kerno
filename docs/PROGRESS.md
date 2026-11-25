@@ -2005,3 +2005,7 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Proved by the three K75 tests of a tree opened again, extended (PostgreSQL, MySQL, SQLite), a new one for a
   node dropped meanwhile, two DBeaver tests and the connections file's test, and the core test of the names, each
   seen failing under a one-line mutation; headless captures of the dialog light and dark (not committed).
+- The first run of the whole workspace's tests on Windows with K69 merged (K69's own probe ran only its
+  tests): the rule "no file of another computer" refused `\\?\C:\…`, a canonical path of this computer:
+  accepted now in that exact spelling (D-138 amended). A form test wrote a Unix path where Windows needs a
+  drive: it writes a full path of each system. A Windows-only test of `tools.rs` lacked K74's new field.

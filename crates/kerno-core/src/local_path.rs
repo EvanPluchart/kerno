@@ -31,11 +31,14 @@ const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 ///
 /// An allow-list, `/` read as `\` as Windows does: a drive's absolute path
 /// (`X:\…`, a mapped network drive included: Windows logged in to it when the
-/// user mapped it) or a path under the home (`~\…`), with no further `:` (no
+/// user mapped it; also in the exact spelling `\\?\X:\…` that Windows gives a
+/// path made canonical, which can only name a drive) or a path under the home
+/// (`~\…`), with no further `:` (no
 /// alternate data stream, no second drive), no NUL and no component that is a
 /// device name (`CON`, `NUL`, `COM1`, `LPT1.txt`…). Everything else is
 /// refused: two leading separators in any spelling (`\\host`, `//host`,
-/// `\/host`, `/\host`), `\\?\`, `\\.\`, `\??\`, a rooted path without a
+/// `\/host`, `/\host`), `\\?\UNC\…` and every other `\\?\` (a volume, a
+/// device, `//?/` with slashes), `\\.\`, `\??\`, a rooted path without a
 /// drive (`\Users\…`: when Kerno's working folder is a share, it names that
 /// share), a drive-relative `X:file`, a path relative to the folder Kerno
 /// happens to run in. Named pipes are [`crate::ssh::is_local_pipe`]'s. A
@@ -43,10 +46,19 @@ const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 /// doing, not a saved connection's, and is followed. On Windows the drive is
 /// confirmed by `Path::components` too.
 pub fn is_local_file(path: &str) -> bool {
+    // A canonical path's prefix, backslashes only: what follows must be a
+    // drive's absolute path, and Windows then reads no `/` as a separator.
+    let (canonical, path) = match path.strip_prefix(r"\\?\") {
+        Some(rest) => (true, rest),
+        None => (false, path),
+    };
+    if canonical && path.contains('/') {
+        return false;
+    }
     let path = path.replace('/', "\\");
     let rest = match path.as_bytes() {
         [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic() => &path[3..],
-        [b'~', b'\\', ..] => &path[2..],
+        [b'~', b'\\', ..] if !canonical => &path[2..],
         _ => return false,
     };
     if rest.contains([':', '\0']) || rest.split('\\').any(is_device) {
@@ -222,6 +234,8 @@ mod tests {
             r"~\.ssh\id_ed25519",
             "~/.ssh/id_ed25519",
             r"C:\\double\\separators\inside",
+            r"\\?\C:\Users\ada\AppData\Local\Temp\shop.sql",
+            r"\\?\d:\keys\id",
             r"C:\console\conx.d\com10\lpt0\nul-file",
         ] {
             assert!(is_local_file(local), "{local}");
@@ -234,7 +248,15 @@ mod tests {
             r"\\HOST\SHARE\ID",
             r"\\?\UNC\host\share\id",
             r"//?/unc/host/share/id",
-            r"\\?\C:\id",
+            r"//?/C:/id",
+            r"\\?\\\?\C:\id",
+            r"\\?\\\host\share\id",
+            r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\id",
+            r"\\?\GLOBALROOT\Device\Mup\host\share\id",
+            r"\\?\C:id",
+            r"\\?\~\id",
+            r"\\?\C:/id",
+            r"\\?\C:\id:stream",
             r"\\.\C:\id",
             r"//./c:/id",
             r"\\.\pipe\openssh-ssh-agent",

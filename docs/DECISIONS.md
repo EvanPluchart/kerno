@@ -5395,3 +5395,11 @@ by Kerno, which sets `CREATE_NO_WINDOW` on its own) shows a console window on a 
 **macOS and Linux.** Unchanged in behaviour: `openssh/unix.rs`'s shared parts moved to `openssh.rs`,
 `tunnel_args` gives the same arguments (`Via::Socket`), the checks above are Windows-only at their call sites
 or inside the functions; the too-old line is told on Windows only. The home is K67's `home::dir()`.
+
+**Amended 2026-11-25, after the first run of the whole workspace's tests on Windows with K69 in.** The
+allow-list refused `\\?\C:\…`, the spelling Windows gives a path made canonical: twelve UI tests that hand
+the app such a path failed there, and so would any path Kerno or another program made canonical before
+giving it. That spelling can only name a drive: it is accepted, in that exact form only (backslashes, then a
+drive's absolute path, the same checks on the rest: no `:`, no device name), and `\\?\UNC\…`, a volume, a
+device, `\\?\` twice and `//?/` stay refused. Unit-tested on every system; the Windows job of the CI is the
+proof of the twelve.

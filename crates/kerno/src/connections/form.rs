@@ -912,8 +912,14 @@ mod tests {
         form.user = String::new();
         form.port = "70000".into();
         form.options = "application_name=kerno\n# a comment\n\nnot an option\n=novalue".into();
-        form.ca_file = "/nonexistent/ca.pem".into();
-        form.cert_file = "/nonexistent/client.crt".into();
+        // A file that is not there, written as a full path of this system (on
+        // Windows a path without a drive is refused for another reason).
+        let missing = |name: &str| match cfg!(windows) {
+            true => format!(r"C:\nonexistent\{name}"),
+            false => format!("/nonexistent/{name}"),
+        };
+        form.ca_file = missing("ca.pem");
+        form.cert_file = missing("client.crt");
         form.ssh_enabled = true;
         form.ssh_port = "0".into();
         form.ssh_keepalive = "often".into();
@@ -943,7 +949,7 @@ mod tests {
             errors[3].message
         );
         assert!(
-            errors[5].message.contains("/nonexistent/ca.pem"),
+            errors[5].message.contains(&missing("ca.pem")),
             "{}",
             errors[5].message
         );
