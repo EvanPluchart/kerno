@@ -2828,10 +2828,11 @@ mod tests {
             .sample_command()
             .unwrap()
             .display();
-        assert!(
-            sample.contains("'--result-file=/backups/db-folder/<table>.sql'"),
-            "{sample}"
+        let sample_file = format!(
+            "'--result-file={}'",
+            job.folder.join("<table>.sql").display()
         );
+        assert!(sample.contains(&sample_file), "{sample}");
         assert!(!sample.contains(crate::testing::DB_PASSWORD));
     }
 
