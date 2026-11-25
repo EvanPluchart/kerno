@@ -262,6 +262,14 @@ reads its rows again, and a query tab opens a new session at its next statement.
 carried over: the first three ask about it before, and a lost connection says that the server rolled it back.
 After Disconnect then Connect, the tree starts afresh.
 
+A refresh keeps your place the same way, as DBeaver does: Refresh on a connection, a folder of connections or
+the empty area of the sidebar, Refresh the schema tree (Cmd+Alt+Y), Refresh (F5) on a database, a schema, a
+folder or a table, "Try again" under a connection whose databases could not be listed, and the refresh Kerno
+does itself after a change (a table created or altered, an import, a restore or a script that ended well). What
+it reads again comes back with the rows that were open under it open again (each read again), the selected row
+selected again if it still exists, and the scroll kept; the rest of the tree is not touched. Refresh on a
+connection selects that connection's row.
+
 A read of the tree whose session the server closed (an administrator, a timeout) opens a new session and reads
 again once, without a word. If that fails too, its row says so in plain words first ("The connection to
 “name” was lost. Reconnect it (its menu in the sidebar), then try again."), the driver's words below.

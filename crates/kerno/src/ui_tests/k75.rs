@@ -517,3 +517,120 @@ fn a_node_gone_when_the_tree_is_read_again_is_not_there(cx: &mut TestAppContext)
     assert!(!app.shows(cx, &["kerno", SCHEMA]), "{:#?}", app.tree(cx));
     assert!(app.shows(cx, &["kerno", "shop", "Tables", "customers"]));
 }
+
+/// K80: every kind of refresh of the tree, `table` (a path down to a table) open on its columns
+/// and selected, `other` open too: after each, the same nodes are open and the same row is
+/// selected (the connection's own row after its menu's Refresh, which selects it).
+fn every_refresh_keeps_the_tree_where_it_was_on(
+    app: &Fixture,
+    cx: &mut TestAppContext,
+    table: &[&str],
+    other: &[&str],
+    schema: &str,
+) {
+    use crate::navigator::model::connection_row;
+    let id = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let navigator = cx.update(|cx| app.workspace.read(cx).navigator(cx));
+    // `open_path` takes a path cut at the tree's last row as found: the databases read first.
+    app.wait_until(cx, "the tree", |app, cx| {
+        let tree = app.tree(cx);
+        tree.len() > 1 && !tree.iter().any(|line| line.trim().starts_with("Loading"))
+    });
+    app.open_path(cx, &[table, &["Columns"]].concat());
+    if !other.is_empty() {
+        app.open_path(cx, other);
+        if !app.is_open(cx, other) {
+            app.toggle(cx, other);
+        }
+    }
+    app.click_row(cx, table, false);
+    let before = settled(app, cx, "before");
+    assert!(
+        (before.1.as_deref()).is_some_and(|row| row.ends_with("rel:customers")),
+        "{before:?}"
+    );
+    // The menu's Refresh on each node of the way down: the database, the schema (PostgreSQL),
+    // the Tables folder, the table.
+    for depth in 1..=table.len() {
+        let node = &table[..depth];
+        app.act(cx, Action::Refresh, node);
+        assert_eq!(settled(app, cx, &format!("{node:?}")), before, "{node:?}");
+    }
+    let ways = [
+        "Refresh the schema tree",
+        "the sidebar's Refresh",
+        "after a run",
+        "its tables",
+        "Try again",
+    ];
+    for how in ways {
+        match how {
+            "Refresh the schema tree" => app.dispatch(cx, actions::RefreshSchemaTree),
+            // The empty area's menu: the list read again, then every tree.
+            "the sidebar's Refresh" => app.sidebar_does(cx, Subject::List, SidebarAction::Refresh),
+            // After a script or a restore that went well (`open_wizard_with`).
+            "after a run" => cx.update(|cx| {
+                navigator.update(cx, |navigator, cx| {
+                    navigator.refresh_database(&id, table[0], cx)
+                })
+            }),
+            // After DDL from a query tab or a table form, after an import.
+            "its tables" => cx.update(|cx| {
+                navigator.update(cx, |navigator, cx| {
+                    navigator.refresh_tables(&id, None, schema, cx)
+                })
+            }),
+            // The databases' listing stopped, then its "Try again".
+            _ => {
+                cx.update(|cx| {
+                    navigator.update(cx, |navigator, cx| {
+                        navigator.reload(&id, cx);
+                        assert!(navigator.cancel_load(&connection_row(&id), cx));
+                    })
+                });
+                app.click(cx, ("connection-retry", 0usize));
+            }
+        }
+        assert_eq!(settled(app, cx, how), before, "{how}");
+    }
+    app.sidebar_does(cx, Subject::Connection(id.clone()), SidebarAction::Refresh);
+    let after = settled(app, cx, "the connection's Refresh");
+    assert_eq!(after, (before.0, Some(connection_row(&id))));
+}
+
+/// K80: a refresh of the tree or of a node in it (the menus, Refresh the schema tree, after a
+/// run, after DDL or an import, "Try again") reads it again and opens again what was open under
+/// what it reads, as DBeaver does, and selects the selected row again. Seen failing without the
+/// place kept: the nodes under the one refreshed closed.
+#[gpui_kit::test]
+fn every_refresh_keeps_the_tree_where_it_was(cx: &mut TestAppContext) {
+    for engine in [Engine::Postgres, Engine::MySql] {
+        if !testing::available(engine) {
+            return;
+        }
+        let app = connected(cx, engine);
+        let (table, other, schema): (&[&str], &[&str], _) = match engine {
+            Engine::Postgres => (
+                &["kerno", "shop", "Tables", "customers"],
+                &["kerno", "analytics", "Tables"],
+                "shop",
+            ),
+            _ => (
+                &["kerno", "Tables", "customers"],
+                &["kerno_analytics"],
+                "kerno",
+            ),
+        };
+        every_refresh_keeps_the_tree_where_it_was_on(&app, cx, table, other, schema);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = super::sqlite::fixture_file(dir.path());
+    let app = connected_as(cx, super::sqlite::file_config(&file));
+    every_refresh_keeps_the_tree_where_it_was_on(
+        &app,
+        cx,
+        &["main", "Tables", "customers"],
+        &[],
+        "main",
+    );
+}

@@ -2522,13 +2522,8 @@ fn editing_a_source_applies_it_once_its_sql_is_confirmed(cx: &mut TestAppContext
             app.outcomes(cx)
         );
         assert_eq!(server("SELECT b FROM kerno_ui_source.v"), "2", "{engine:?}");
-        // The tree read the objects again: the view closed, and opens on
-        // its new column.
-        app.wait_until(cx, "the refresh", |app, cx| {
-            !app.shows(cx, &at(&["Views", "v", "Columns"]))
-        });
-        app.open_path(cx, &at(&["Views", "v", "Columns"]));
-        app.toggle(cx, &at(&["Views", "v", "Columns"]));
+        // The tree read the objects again, the view open on its columns
+        // again (K80), its new column there.
         app.wait_until(cx, "the new column", |app, cx| {
             app.shows(cx, &at(&["Views", "v", "Columns", "b"]))
         });

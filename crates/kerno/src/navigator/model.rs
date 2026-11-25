@@ -2,7 +2,7 @@
 //! filter lets through. Nothing here touches the UI or a server; the view
 //! asks for [`Load`]s, runs them and gives the answers back.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use kerno_core::config::{DatabasesShown, ObjectFilter};
 use kerno_core::schema::{
@@ -200,9 +200,6 @@ pub struct Tree {
     filter: String,
     /// The connection's object filters, by [`filter_key`].
     object_filters: BTreeMap<String, ObjectFilter>,
-    /// The folders that were open under a node being refreshed, to open
-    /// again when its new children arrive.
-    reopen: HashMap<String, Vec<String>>,
     /// The database the connection's session is in, when it is listed.
     default: Option<String>,
     /// The databases as the server listed them.
@@ -339,7 +336,16 @@ impl Tree {
         }
     }
 
-    /// Fetches the children of a node again; what is open below it closes.
+    /// The ids of the open nodes under the node `id`, as [`Self::open_ids`]
+    /// gives them: what a refresh of `id` opens again (K80).
+    pub fn open_ids_under(&self, id: &str) -> Vec<String> {
+        let mut open = self.open_ids();
+        open.retain(|open| open != id && leads_to(id, open));
+        open
+    }
+
+    /// Fetches the children of a node again; what is open below it closes
+    /// (the navigator opens it again, K80).
     pub fn refresh(&mut self, id: &str) -> Option<Load> {
         let has_schemas = self.has_schemas;
         let node = self.node_mut(id)?;
@@ -348,11 +354,8 @@ impl Tree {
             return None;
         }
         let load = load_for(node, has_schemas)?;
-        let mut open = Vec::new();
-        open_below(node, &mut open);
         node.children = Children::Loading;
         node.expanded = true;
-        self.reopen.insert(id.to_string(), open);
         Some(load)
     }
 
@@ -398,15 +401,6 @@ impl Tree {
                 Children::Loaded(nodes)
             }
         };
-        // Folders that were open before a refresh are open after it. A
-        // table that was open closes: its columns would have to be fetched.
-        for open in self.reopen.remove(id).unwrap_or_default() {
-            if let Some(node) = self.node_mut(&open)
-                && matches!(node.children, Children::Loaded(_))
-            {
-                node.expanded = true;
-            }
-        }
     }
 
     /// Shows only what matches `filter` (and what leads to it).
@@ -548,18 +542,6 @@ impl Tree {
             Reveal::Found
         } else {
             Reveal::Missing
-        }
-    }
-}
-
-/// The ids of the open nodes below `node`.
-fn open_below(node: &Node, open: &mut Vec<String>) {
-    if let Children::Loaded(children) = &node.children {
-        for child in children {
-            if child.expanded {
-                open.push(child.id.clone());
-            }
-            open_below(child, open);
         }
     }
 }
@@ -1962,8 +1944,19 @@ mod tests {
             tree.refresh_target(&orders).as_deref(),
             Some(orders.as_str())
         );
-        // Folders that are open stay open across a refresh.
+        // What is open under the node is said, for the navigator to open it
+        // again (K80); the node's own row stays open.
         let tables = format!("{shop}{SEP}tables");
+        tree.expand(&tables);
+        tree.expand(&orders);
+        tree.collapse(&format!("{shop}{SEP}views"));
+        assert_eq!(tree.open_ids_under(&shop), [tables.clone(), orders.clone()]);
+        assert_eq!(tree.open_ids_under(&tables), std::slice::from_ref(&orders));
+        tree.collapse(&tables);
+        assert!(
+            tree.open_ids_under(&shop).is_empty(),
+            "under a closed folder"
+        );
         tree.expand(&tables);
         let load = tree.refresh(&shop).unwrap();
         assert_eq!(
@@ -1974,8 +1967,8 @@ mod tests {
         );
         assert_eq!(tree.refresh(&shop), None, "already loading");
         tree.finish(&shop, Ok(Loaded::Objects(Box::new(objects()))));
-        assert!(tree.node(&tables).unwrap().expanded);
-        assert!(!tree.node(&format!("{shop}{SEP}views")).unwrap().expanded);
+        assert!(tree.node(&shop).unwrap().expanded);
+        assert!(!tree.node(&tables).unwrap().expanded);
 
         tree.refresh(&shop).unwrap();
         tree.finish(&shop, Ok(Loaded::Objects(Box::default())));

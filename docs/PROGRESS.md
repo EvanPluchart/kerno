@@ -2080,3 +2080,15 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Version 2026.11.4, its notes (`docs/release-notes/v2026.11.4.md`) and the READMEs' Windows section (the
   installer, the update from the app, what is still a preview). The tag `v2026.11.4` makes `release.yml`
   build the ten files and open a draft; publishing waits for the owner, who tries the draft first.
+
+## 2026-11-25 — K80 (2): a Refresh keeps the tree where it was
+
+- Every Refresh of the schema tree read from scratch and closed every node under what it read (the pass's
+  connection Refresh, and the refresh after an "Execute script…" that ended well). Now a connection's refresh
+  takes where the user was, as K77's reconnection does, and a node's refresh the open nodes under it, the
+  selected row and the scroll: put back lazily by the same machinery, nodes outside untouched, a node gone not
+  there; a failed or stopped listing keeps the place for "Try again". The model's own reopen list removed.
+  D-144 amended (K77's amendment, which sat under D-143, moved to it), M12's K80 (every caller listed);
+  `ui_tests/k75.rs`
+  `every_refresh_keeps_the_tree_where_it_was` on PostgreSQL, MySQL and SQLite, seen failing under three
+  mutations.

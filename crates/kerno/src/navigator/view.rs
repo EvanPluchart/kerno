@@ -198,6 +198,15 @@ struct Browse {
     restoring: Option<Restore>,
 }
 
+/// A listing of the databases that failed keeps where the user was for the
+/// next one ("Try again", Refresh), without the scroll, which would be put
+/// back at every change of the sidebar meanwhile (K80).
+fn keep_for_retry(restoring: &mut Option<Restore>) {
+    if let Some(restore) = restoring {
+        restore.scroll = None;
+    }
+}
+
 /// Where the user was in the tree of a connection opened again (Reconnect,
 /// the Read-only switch, its settings saved, a lost connection back): the
 /// nodes open again, each read on the new sessions as an expand reads it,
@@ -524,7 +533,7 @@ impl Navigator {
         };
         if reopened
             && !self.restore.contains_key(id)
-            && let Some(place) = self.place_of(id, cx)
+            && let Some(place) = self.place_of(id, None, cx)
         {
             self.restore.insert(id.to_string(), place);
         }
@@ -561,9 +570,10 @@ impl Navigator {
     }
 
     /// Where the user is in the tree of `connection`, when it is browsed:
-    /// its open nodes, its selected row (or the one selected last, when the
-    /// tree has already gone from the sidebar), the scroll (K77).
-    fn place_of(&self, connection: &str, cx: &App) -> Option<Restore> {
+    /// its open nodes (those under the node `under` only, for its refresh:
+    /// K80), its selected row (or the one selected last, when the tree has
+    /// already gone from the sidebar), the scroll (K77).
+    fn place_of(&self, connection: &str, under: Option<&str>, cx: &App) -> Option<Restore> {
         let browse = self.browse.get(connection)?;
         let state = self.tree_state.read(cx);
         // Opened again while its tree was still growing back: what was left
@@ -571,12 +581,21 @@ impl Navigator {
         let pending = browse.restoring.clone().unwrap_or_default();
         let selected = (state.selected_item().map(|item| item.id.to_string()))
             .or(pending.selected)
-            .or_else(|| self.last_selected.clone())
+            // A node's refresh leaves the tree in the sidebar: no older row.
+            .or_else(|| {
+                under
+                    .is_none()
+                    .then(|| self.last_selected.clone())
+                    .flatten()
+            })
             .filter(|row| {
                 matches!(model::parse_row(row), Some(RowId::Object { connection: of, .. })
                     if of == connection)
             });
-        let mut open = browse.tree.open_ids();
+        let mut open = match under {
+            Some(node) => browse.tree.open_ids_under(node),
+            None => browse.tree.open_ids(),
+        };
         open.extend(pending.open);
         Some(Restore {
             open,
@@ -595,9 +614,11 @@ impl Navigator {
             .is_some_and(|browse| meta.is_some_and(|meta| Arc::ptr_eq(&meta, &browse.meta)))
     }
 
-    /// Fetches the list of databases of `connection` again, from scratch.
+    /// Fetches the list of databases of `connection` again, then puts the
+    /// tree back where the user was, as after a reconnection (K80).
     pub fn reload(&mut self, connection: &str, cx: &mut Context<Self>) {
-        if self.browse.contains_key(connection) {
+        if let Some(place) = self.place_of(connection, None, cx) {
+            self.restore.insert(connection.to_string(), place);
             self.load_databases(connection, cx);
             self.sync(cx);
         }
@@ -674,7 +695,7 @@ impl Navigator {
                     }
                     Err(error) => {
                         browse.root = Root::Failed(describe(&error).to_string());
-                        browse.restoring = None;
+                        keep_for_retry(&mut browse.restoring);
                     }
                 }
                 this.sync(cx);
@@ -734,13 +755,11 @@ impl Navigator {
     }
 
     /// Reloads the node `id` of `connection` (or the nearest one above it
-    /// that the server answers for).
+    /// that the server answers for); what was open under it opens again, read
+    /// again as an expand reads it, and the selected row and the scroll are
+    /// put back, as after a reconnection (K80).
     fn refresh(&mut self, connection: &str, id: &str, cx: &mut Context<Self>) {
-        let Some(tree) = self
-            .browse
-            .get_mut(connection)
-            .map(|browse| &mut browse.tree)
-        else {
+        let Some(tree) = self.tree(connection) else {
             return;
         };
         // A database this account may not open is never read: its refresh
@@ -749,9 +768,15 @@ impl Navigator {
             self.reload(connection, cx);
             return;
         }
-        if let Some(target) = tree.refresh_target(id)
-            && let Some(load) = tree.refresh(&target)
-        {
+        let Some(target) = tree.refresh_target(id) else {
+            return;
+        };
+        let place = self.place_of(connection, Some(&target), cx);
+        let Some(browse) = self.browse.get_mut(connection) else {
+            return;
+        };
+        if let Some(load) = browse.tree.refresh(&target) {
+            browse.restoring = place;
             self.run(connection, load, cx);
             self.sync(cx);
         }
@@ -1036,7 +1061,7 @@ impl Navigator {
             let message = why.message(&loading.reading, id == ROOT_LOAD);
             if id == ROOT_LOAD {
                 browse.root = Root::Failed(message);
-                browse.restoring = None;
+                keep_for_retry(&mut browse.restoring);
             } else {
                 browse.tree.finish(&id, Err(message));
             }
@@ -2922,7 +2947,7 @@ impl Navigator {
     pub fn settling(&self, connection: &str) -> bool {
         self.restore.contains_key(connection)
             || self.browse.get(connection).is_none_or(|browse| {
-                browse.restoring.is_some()
+                (browse.restoring.is_some() && !matches!(browse.root, Root::Failed(_)))
                     || browse.root == Root::Loading
                     || !browse.loading.is_empty()
             })

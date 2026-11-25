@@ -4638,6 +4638,45 @@ update; the tree learned of it only once its status read `Connecting`, and kept 
   with its old settings. The administration tab does the same in a narrower window (read, not reproduced):
   left, its next read fails once and opens a new session.
 
+**Amended by K77 (2026-11-25), after the second pass in the real app:** K75's "not chosen: keeping which
+folders were open" lost the user's place at each Read-only switch. Now:
+
+- **What is kept.** When the tree learns that the connection is opened again or lost, before its tree goes: the
+  open nodes, taken from the model (not from the rows shown, which the filter cuts), each only under open ones;
+  the selected row, or the one selected at the tree's last rebuild when the tree has already left the sidebar
+  (a save's list change comes first); the scroll offset. Kept by connection outside the tree's browse, so a lost
+  connection whose retry fails (the browse forgotten) keeps it; a Disconnect drops it: the user closed it.
+- **How it comes back.** Lazily, the way an expand reads, on the new sessions: once the databases are listed and
+  after each read, a node that is there opens (and is read when its children are not known), one whose parent
+  is still read waits, one missing from a parent read since is gone, one under a failed read is dropped (its
+  row says the failure, as today). Not chosen: reading every node again before showing the tree (a slow schema
+  would hold the whole tree; a node gone would have to be told apart from one not read yet anyway), or showing
+  the old tree until the new one is read (rows on closed sessions, with menus that would act on them).
+- **The selected row** is selected again once its row is there, without scrolling to it, unless another row is
+  selected by then; the scroll offset is put back at each change while the tree grows (the kit clamps it to the
+  rows there). A click on a row ends both. A wheel scroll while it grows is overridden at the next change, a
+  matter of the reads' time.
+- **Only the reopenings.** Refresh and Try again read from scratch as before; the first connection selects the
+  connection's row as before, except when a place is waiting to come back.
+
+**Amended by K80 (2026-11-25), after the fourth pass in the real app:** K77's last point is reversed: a Refresh
+closed every node under what it read (the connection's, a node's, the one Kerno does after a script that ended
+well), where DBeaver keeps them open. Now:
+
+- **One way to put back.** A connection's refresh (`reload`, and every caller that lists the databases again)
+  takes where the user is, as a reconnection does; a node's refresh takes the open nodes under that node only,
+  with the selected row and the scroll, into the same `Restore`, put back lazily by the same `advance_restore`.
+  The model's own list of folders to reopen after a refresh (which reopened only folders read with their
+  parent, and closed a table's columns) is removed. Not chosen: reading every open node again before showing
+  the refreshed one (a slow node would hold the rest, as for K77).
+- **A failed listing keeps the place.** A listing of the databases that fails or is stopped keeps what was to
+  come back, without the scroll (put back at each change of the sidebar, it would fight the user while the row
+  shows its failure); "Try again" or a Refresh then brings it back.
+- **The selected row.** As K77: selected again once there, unless the user selected another row meanwhile. A
+  node's refresh takes the row selected now, never the last one seen before (the tree is still in the sidebar),
+  so a refresh with nothing selected selects nothing. The connection's menu Refresh selects the connection's
+  row, as before.
+
 ## D-143 — A folder restore defines every table first, on one connection, then loads the rows side by side (K74; 2026-11-25)
 
 The pass in the real app of 2026-11-25 restored a MySQL folder backup (K63, D-135) with "Faster" into a
@@ -4759,26 +4798,6 @@ called three tables "partly loaded"; one of them was empty, one held its old row
   disabled and the reason only by the field on the Settings page (in the simple view, nowhere). The reason now
   shows above the buttons wherever Start is (the simple view, the wizard's last page), as "Cannot start: …",
   for every reason `blocked()` gives.
-**Amended by K77 (2026-11-25), after the second pass in the real app:** K75's "not chosen: keeping which
-folders were open" lost the user's place at each Read-only switch. Now:
-
-- **What is kept.** When the tree learns that the connection is opened again or lost, before its tree goes: the
-  open nodes, taken from the model (not from the rows shown, which the filter cuts), each only under open ones;
-  the selected row, or the one selected at the tree's last rebuild when the tree has already left the sidebar
-  (a save's list change comes first); the scroll offset. Kept by connection outside the tree's browse, so a lost
-  connection whose retry fails (the browse forgotten) keeps it; a Disconnect drops it: the user closed it.
-- **How it comes back.** Lazily, the way an expand reads, on the new sessions: once the databases are listed and
-  after each read, a node that is there opens (and is read when its children are not known), one whose parent
-  is still read waits, one missing from a parent read since is gone, one under a failed read is dropped (its
-  row says the failure, as today). Not chosen: reading every node again before showing the tree (a slow schema
-  would hold the whole tree; a node gone would have to be told apart from one not read yet anyway), or showing
-  the old tree until the new one is read (rows on closed sessions, with menus that would act on them).
-- **The selected row** is selected again once its row is there, without scrolling to it, unless another row is
-  selected by then; the scroll offset is put back at each change while the tree grows (the kit clamps it to the
-  rows there). A click on a row ends both. A wheel scroll while it grows is overridden at the next change, a
-  matter of the reads' time.
-- **Only the reopenings.** Refresh and Try again read from scratch as before; the first connection selects the
-  connection's row as before, except when a place is waiting to come back.
 
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 

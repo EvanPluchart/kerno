@@ -198,11 +198,13 @@ fn the_tree_shows_what_the_connection_chose_and_says_what_is_closed(cx: &mut Tes
     }
     assert!(menu_entry(&app, cx, Action::Tools.label()).is_none());
     app.press(cx, &["escape"]);
-    // Its Refresh lists the databases again; still no session in it.
+    // Its Refresh lists the databases again, the tree put back (K80: it is
+    // open again on its line); still no session in it.
     app.act(cx, Action::Refresh, &[CLOSED]);
+    assert!(!app.tree(cx).contains(&row(1, NOT_ALLOWED)));
     app.wait_until(cx, "the databases again", |app, cx| {
         let tree = app.tree(cx);
-        tree.contains(&row(0, CLOSED)) && !tree.contains(&row(1, NOT_ALLOWED))
+        tree.contains(&row(0, CLOSED)) && tree.contains(&row(1, NOT_ALLOWED))
     });
     assert!(!sessions(cx).contains(&CLOSED.to_string()));
 
