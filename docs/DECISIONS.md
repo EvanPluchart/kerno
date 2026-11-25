@@ -5250,7 +5250,7 @@ a profile named with "É"); this is the decision as it stands after them.
 | The tunnel's private folder | `AppPaths::local_data_dir()\ssh\kerno-ssh-<12 hex>` (`%LOCALAPPDATA%\Kerno\data\ssh`, in the profile), whatever `TEMP` and `KERNO_DATA_DIR` say; removed at the tunnel's end | The profile's access list: the user, SYSTEM, the administrators. Kerno holds its two files open with `FILE_SHARE_READ` while the tunnel lives: others may read them, not write or delete them |
 | Its `config` (`-F`) | Kerno's own: `LogLevel INFO`, no password, no keyboard-interactive, `BatchMode no`, then `Include` of the user's file and the system's | `ssh.exe` runs in the folder's parent with `-F kerno-ssh-…/config`: OpenSSH writes `-F` unquoted in a jump host's command, and that relative path has no space whatever the profile's name |
 | The questions (`SSH_ASKPASS`) | Kerno itself (`kerno.exe`, a windowed program), `SSH_ASKPASS_REQUIRE=force`, its path spelled in ASCII (relative to where `ssh.exe` runs when the profile's name has another letter; see below) | Over a named pipe (random name, local peers only, first instance) whose two ends prove they read the token in the folder's `ask` file (the running instance's handshake, D-131) before a byte crosses. The environment carries the file's path and the asking `ssh`'s number, never the token or the passphrase |
-| Another account and the pipe | Each peer in a task of its own, at most 8 at once, the next one waiting its turn; a peer's nonce waited for 1 s, the whole exchange 10 s (the same on the instance's pipe, S2) | It can open the pipe for reading (a pipe's default access list) and take the 8 places a second at a time: a proved peer waits about a second, never dropped. It can neither receive the passphrase nor answer the helper (no proof) |
+| Another account and the pipe | Each peer in a task of its own, at most 8 at once, the next one waiting its turn; a peer's nonce waited for 1 s, the whole exchange 10 s (the same on the instance's pipe, S2, which takes a place in a branch of its own so that its lines are read meanwhile, T5) | It can open the pipe for reading (a pipe's default access list) and take the 8 places a second at a time: a proved peer waits about a second, never dropped. It can neither receive the passphrase nor answer the helper (no proof) |
 | The passphrase | From the secret store; tried on the key file first (`passphrase_opens`, ssh-key's `decrypt`) | Never in an argument, the environment or a log. Answered only while the asking `ssh` is still logging in: once its login line is seen, its later questions are refused. Kept in memory for the tunnel's life (each `ssh.exe` asks again) |
 | A file named by a connection or a task | `local_path::resolve`: `~\` put under the home, then an allow-list: a drive's absolute path or `~\…`, no further `:`, no device name (`CON`, `NUL`, `COM1`…), no NUL | Checked where it is used: the three drivers' connect (TLS files, the SQLite database), the tools' TLS options and a task's output folder, backup file and script, the MySQL folder backup's folder (before it is made or its manifest read), both SSH clients' key, `ssh.exe`'s `-i` and `IdentityAgent` (a pipe of this computer), the password command's program, the `Include`s Kerno reads to list aliases; the dialog, the backup wizard (`~\` expanded before the folder is judged, S4) and the imports say it early |
 
@@ -5306,9 +5306,13 @@ then System32's `taskkill /T /F` stops each, at a stream's drop, a failed start 
 of PowerShell, off the UI thread), and the pipes close. Any depth: a chain of three jump hosts is tested. The pids of the trees not stopped yet are listed (only while Kerno holds their handles, so no pid is
 reused meanwhile), and the app's quit lists once and stops them all, waiting (`openssh::stop_all`, the list
 locked across its kills, a stream's handle dropped under the same lock: S3). A middle hop that died on its own
-before the stream ends leaves its own children out of the listing's tree. A crash stops nothing: without a
-job object (it needs `unsafe`) the `ssh.exe` of the open sessions stay until their server closes them or the
-user logs out, visible in Task Manager.
+before the stream ends leaves its own children out of the listing's tree. The listing and each `taskkill`
+are given 5 s, then stopped (T2): a hung WMI service costs the quit 5 s, and the roots are stopped without the
+listing, by `taskkill /T` alone. Kerno holds no handle on the hops, only on each stream's own `ssh.exe`: a
+hop's pid that ended and was given to another process between the listing and its `taskkill` (a second at
+most) would be stopped with it (T3, left: the window is that of `taskkill /T` itself). A crash stops nothing:
+without a job object (it needs `unsafe`) the `ssh.exe` of the open sessions stay until their server closes
+them or the user logs out, visible in Task Manager.
 
 **A profile named with a letter beyond ASCII.** Windows' OpenSSH reads `SSH_ASKPASS` with the C runtime's
 `getenv` (the ANSI code page) and starts it as UTF-8 (`posix_spawnp`, `CreateProcessW`), so a helper under
@@ -5323,6 +5327,19 @@ have such a letter, or another drive), the tunnel still runs (an agent and a rec
 and a failure begins "Windows' OpenSSH cannot start Kerno's helper from a folder whose name has the letter
 “É”.", with the next step: the agent (`ssh-add`), the built-in client, or a folder with plain letters. Nothing
 is copied elsewhere (a folder other accounts can write would let them replace the helper).
+
+**Which file a relative spelling starts (T1).** `CreateProcessW` without an application name looks for a
+name that has no folder in it in the starting program's own folder first, then the current one (its
+documentation, "If the file name does not contain a directory path…"); a third reading asked whether a name
+such as `..\..\..\Programs\Kerno\kerno.exe` goes the same way, which from `C:\Windows\System32\OpenSSH` would
+end at `C:\Programs\Kerno\kerno.exe`, a folder any account may make. Settled on the runner, not by reading
+(`a_relative_helper_is_never_taken_from_ssh_exe_s_folder`): a copy of OpenSSH three folders deep, a working
+helper planted at `<that copy's folder>\<the spelling>`, the real one absent: the login fails at
+`CreateProcessW failed error:2` and the planted one never runs, for both shapes Kerno makes (`..\…` and `.\…`);
+with the real one in place, under the folder `ssh.exe` runs in, it answers. So such a name is resolved
+against the current folder only. The documentation found says it only for a name with no folder at all, so
+the runner's test, not a page, is the proof of this rule; it runs at every push of the probe. Kerno therefore never gives a relative spelling that does not begin with `.\` or `..\` (a name like
+`Kerno\kerno.exe` would be searched in `ssh.exe`'s folder first), and the test stays as the proof.
 
 **Files of another computer.** On Windows a path such as `\\host\share\x` (any spelling: `//host`, `\/host`,
 `\\?\UNC\…`, `\??\…`, a device path) is opened over SMB with the user's Windows credentials, by Kerno or by a

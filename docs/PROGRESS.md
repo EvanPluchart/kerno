@@ -1980,3 +1980,7 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   whose path has "É" (Kerno names itself in ASCII, relative to the tunnels' folder; where it cannot, the
   failure says so first).
 - Proved by run 45521821890 on the code, every step green; a red run with six mutations.
+- The third reading (T1 to T5): a relative spelling of the helper is resolved against the tunnels' folder
+  only, shown on the runner with a working helper planted under `ssh.exe`'s own folder that never ran; the
+  listing and each `taskkill` given 5 s; the chain test counts by the parent chain; the instance's pipe reads
+  its lines while every place is held.
