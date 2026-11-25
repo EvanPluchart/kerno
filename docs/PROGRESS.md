@@ -1886,3 +1886,8 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   it now drops that read and reads again on the new connection. Query tabs checked, unchanged.
 - Tests: `ui_tests/k75.rs` (five, PostgreSQL and MySQL, SQLite for the tree), two unit tests; each seen failing
   with its part taken out.
+- The first run of the Windows job over the whole workspace on `main` (after K63 and K70): three tests failed
+  there, none a defect of the app. A folder-backup test needs a server that compares table names with case
+  (it now says so and stops on one that folds them, as MySQL on Windows does); a plain-backup test is built on
+  a stand-in mysqldump, a `/bin/sh` script (it stops on Windows as the other stand-in tests do); the tree
+  filter's test looked at the tree before its schemas were read (it now waits for the row).

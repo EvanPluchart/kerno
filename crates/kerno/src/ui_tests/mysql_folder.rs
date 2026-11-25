@@ -7,7 +7,7 @@ use kerno_core::tools::{
     BackupContent, BackupFormat, ClientFamily, DumpMethod, EngineBackup, MySqlBackup, mysql_folder,
 };
 
-use super::tool_wizards::{fake_client, paints};
+use super::tool_wizards::{fake_client, fake_tools_run, paints};
 use super::*;
 use crate::backup_dialog::BackupDialog;
 
@@ -316,7 +316,8 @@ fn an_old_server_needs_an_old_client(cx: &mut TestAppContext) {
 /// fields") still exits 0: a failure, its file removed (K63, F6).
 #[gpui_kit::test]
 fn a_plain_backup_that_read_no_column_fails_and_removes_its_file(cx: &mut TestAppContext) {
-    if !testing::available(Engine::MySql) {
+    // The stand-in mysqldump must really run: it is what reads no column.
+    if !testing::available(Engine::MySql) || !fake_tools_run() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

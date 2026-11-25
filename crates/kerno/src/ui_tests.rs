@@ -11148,13 +11148,11 @@ fn a_key_puts_the_keyboard_in_the_tree_filter(cx: &mut TestAppContext) {
     assert!(!in_filter(&app, cx));
     app.press(cx, &["secondary-alt-f"]);
     assert!(in_filter(&app, cx));
-    // What is typed filters the tree.
+    // What is typed filters the tree, once its schemas are read.
     app.type_text(cx, "shop");
-    assert!(
-        app.tree(cx).iter().any(|row| row.trim() == "shop"),
-        "{:#?}",
-        app.tree(cx)
-    );
+    app.wait_until(cx, "shop in the filtered tree", |app, cx| {
+        app.tree(cx).iter().any(|row| row.trim() == "shop")
+    });
 }
 
 #[gpui_kit::test]

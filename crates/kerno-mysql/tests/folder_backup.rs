@@ -1466,11 +1466,15 @@ async fn named_tables_that_are_gone_stop_the_backup() {
             .await;
         }
         let fold = rows(&admin, "SELECT @@lower_case_table_names").await[0][0].clone();
-        assert_eq!(
-            fold.as_deref(),
-            Some("0"),
-            "a server that compares names with case"
-        );
+        // A server on Windows or macOS folds table names: `orders` is then
+        // `Orders`, and the test has nothing to say there.
+        if fold.as_deref() != Some("0") {
+            eprintln!(
+                "SKIPPED: this server folds table names (lower_case_table_names = {fold:?}); \
+                 the test needs one that compares them with case"
+            );
+            return;
+        }
         let mut options = folder_options(NAMES, 2, DumpMethod::SingleTransaction);
         options.tables = ["kept", "orders", "renamed_away"]
             .map(|name| kerno_core::schema::TableRef::new(NAMES, name))
