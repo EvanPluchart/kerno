@@ -81,9 +81,12 @@ fn set_phase(cx: &mut App, phase: Phase) {
 
 /// A newer `version` found by a check becomes the item's: over nothing, a version offered or
 /// failed, or an older one downloaded but not installed (K57: its download removed). A download
-/// or an install under way keeps its state, and so does a download of this same version.
-fn found_newer(cx: &mut App, version: Version) {
+/// or an install under way keeps its state, and so does a download of this same version. The
+/// very version that failed stays failed for the timed checks, its item on "Release page" as the
+/// failure notice says (K70, X1); a check asked for (`manual`) offers it again.
+fn found_newer(cx: &mut App, version: Version, manual: bool) {
     match phase(cx) {
+        Some(Phase::Failed(failed, _)) if failed == version && !manual => {}
         Some(Phase::Idle | Phase::Available(_) | Phase::Failed(..)) => {
             set_phase(cx, Phase::Available(version))
         }
@@ -268,10 +271,19 @@ impl Workspace {
             updates.checking = false;
             updates.current.clone()
         });
+        // A failure notice is about the item's "Release page": once a check has put an update
+        // back on the item, the notice goes with it (X1).
+        let failed_before = matches!(phase(cx), Some(Phase::Failed(..)));
+        let dismiss_failure = |window: &mut Window, cx: &mut Context<Self>| {
+            if failed_before && !matches!(phase(cx), Some(Phase::Failed(..))) {
+                window.remove_notification::<NotInstalledNotice>(cx);
+            }
+        };
         // Asked from the About window (K42): the answer is said there.
         if cx.try_global::<AboutCheck>() == Some(&AboutCheck::Checking) {
             if let Ok(Some(version)) = &found {
-                found_newer(cx, *version);
+                found_newer(cx, *version, true);
+                dismiss_failure(window, cx);
                 self.ask_notes(*version, cx);
             }
             cx.set_global(match found {
@@ -287,7 +299,8 @@ impl Workspace {
         match found {
             Ok(Some(version)) => {
                 // A skipped version keeps its item too (D-097): only the dialog is left out.
-                found_newer(cx, version);
+                found_newer(cx, version, manual);
+                dismiss_failure(window, cx);
                 if !manual {
                     #[cfg(not(feature = "test-update-without-click"))]
                     self.offer_update(version, window, cx);
@@ -662,7 +675,9 @@ pub fn not_installed(version: Version, why: String, window: &mut Window, cx: &mu
             "Kerno {version} was not installed: {why}. Nothing was changed. You can download it \
              from its release page: click “Release page” in the status bar."
         )))
-        // It stays until closed: said at a start, it must not go before it is read (K70).
+        // One at a time; it stays until closed: said at a start, it must not go before it is
+        // read (K70).
+        .id::<NotInstalledNotice>()
         .autohide(false),
         cx,
     );
@@ -686,6 +701,9 @@ fn installed_covers(version: Version, cx: &App) -> Option<(Version, PathBuf)> {
         .clone()
         .filter(|(installed, _)| *installed >= version)
 }
+
+/// The notice of [`not_installed`].
+struct NotInstalledNotice;
 
 /// The notice of [`start_installed`].
 struct StartInstalled;

@@ -331,12 +331,13 @@ fn start(
             // which has just started this Kerno again): one more try a minute later.
             // The download of a Kerno still running is left alone (W2).
             let alive = |pid| update::kerno_alive(&update::System, pid);
-            if !update::sweep_downloads(downloads, &alive).is_empty() {
+            let now = std::time::SystemTime::now();
+            if !update::sweep_downloads(downloads, &alive, now).is_empty() {
                 let downloads = downloads.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let alive = |pid| update::kerno_alive(&update::System, pid);
-                    update::sweep_downloads(&downloads, &alive);
+                    update::sweep_downloads(&downloads, &alive, std::time::SystemTime::now());
                 });
             }
             said

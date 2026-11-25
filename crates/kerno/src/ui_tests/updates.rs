@@ -1251,12 +1251,14 @@ fn on_windows_update_starts_the_checked_installer_and_the_next_start_says_if_it_
     app.step(cx, |window, cx| {
         crate::workspace::updates::not_installed(version, why, window, cx)
     });
-    // It stays until closed, a minute later too.
+    // One at a time (it replaces the refusal's above), and it stays until closed, a minute
+    // later too.
+    assert!(before >= 1);
     cx.executor().advance_clock(Duration::from_secs(60));
     cx.run_until_parked();
     assert_eq!(
         app.step(cx, |window, cx| window.notifications(cx).len()),
-        before + 1
+        before
     );
     assert_eq!(
         label(cx).as_deref(),
@@ -1278,15 +1280,36 @@ fn a_failed_install_said_at_start_is_not_offered_again_by_the_dialog(cx: &mut Te
     let tag = latest.clone();
     let fake = Fake::new(move |_, _| Ok(redirect_to(&tag.lock().unwrap())));
     allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+    let before = notification_count(&app, cx);
     app.step(cx, |window, cx| {
         crate::workspace::updates::not_installed(v("0.2.0"), "it stopped".into(), window, cx)
     });
+    // X1: the timed check finds the very version that failed: the item stays on "Release
+    // page", as the notice says, and the notice stays.
     check(&app, cx, false);
     assert!(!update_dialog(&app, cx));
     assert_eq!(
         label(cx).as_deref(),
+        Some("Kerno 0.2.0 was not installed · Release page")
+    );
+    assert_eq!(notification_count(&app, cx), before + 1);
+    // A check asked for (the About window's) offers it again, and the failure notice goes.
+    let workspace = app.workspace.clone();
+    app.step(cx, |window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.check_from_about(window, cx))
+    });
+    app.wait_until(cx, "the check", |_, cx| {
+        cx.update(|cx| !cx.try_global::<Updates>().is_some_and(|u| u.checking))
+    });
+    assert_eq!(
+        label(cx).as_deref(),
         Some("Kerno 0.2.0 is available · Update")
     );
+    // Once it has slid out.
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(notification_count(&app, cx), before);
+    // A newer version found by a timed check is offered by the dialog as before.
     *latest.lock().unwrap() = "v0.3.0";
     check(&app, cx, false);
     assert!(update_dialog(&app, cx));

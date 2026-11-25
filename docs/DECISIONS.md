@@ -5067,3 +5067,7 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
     On the runner with `/wait=20` and a process that lives 45 s.
   - W4, the failure notice ended "its release page has it": it now ends "Nothing was changed. You can
     download it from its release page: click “Release page” in the status bar."
+  - X1, X2 (its last look): a timed check that finds the very version that failed leaves the item on
+    "Release page", as the notice says (on every system: before, it went back to "Update" and offered the
+    same failure again); a check asked for offers it again and closes the notice. A download folder older
+    than 7 days goes whatever `tasklist` says, unless it is this process's.

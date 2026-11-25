@@ -484,9 +484,15 @@ pub fn downloads_dir() -> Option<PathBuf> {
 /// that was declined), except the folders of a Kerno that still runs: a folder is named
 /// `kerno-update-<pid>-<time>` by the Kerno that downloads into it, and one whose `<pid>` is
 /// `kerno_alive` (another Kerno's download in progress, or checked and waiting for its quit
-/// question) is left (W2). One still in use (an installer running from it) cannot be removed and
-/// is returned, to try again later (K70, V4).
-pub fn sweep_downloads(downloads: &Path, kerno_alive: &dyn Fn(u32) -> bool) -> Vec<PathBuf> {
+/// question) is left (W2), unless its `<time>` is more than [`DOWNLOAD_KEPT`] before `now`: a
+/// machine where `tasklist` cannot answer would otherwise keep every one; this process's own are
+/// always left (X2). One still in use (an installer running from it) cannot be removed and is
+/// returned, to try again later (K70, V4).
+pub fn sweep_downloads(
+    downloads: &Path,
+    kerno_alive: &dyn Fn(u32) -> bool,
+    now: SystemTime,
+) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(downloads) else {
         return Vec::new();
     };
@@ -497,16 +503,28 @@ pub fn sweep_downloads(downloads: &Path, kerno_alive: &dyn Fn(u32) -> bool) -> V
             let Some(rest) = name.strip_prefix("kerno-update-") else {
                 return false;
             };
-            let owner = rest
-                .split('-')
+            let mut parts = rest.split('-');
+            let owner = parts.next().and_then(|pid| pid.parse::<u32>().ok());
+            let made = parts
                 .next()
-                .and_then(|pid| pid.parse::<u32>().ok());
-            entry.file_type().is_ok_and(|kind| kind.is_dir()) && !owner.is_some_and(kerno_alive)
+                .and_then(|nanos| nanos.parse::<u64>().ok())
+                .map(|nanos| std::time::UNIX_EPOCH + Duration::from_nanos(nanos));
+            let old = made.is_some_and(|made| {
+                now.duration_since(made)
+                    .is_ok_and(|age| age > DOWNLOAD_KEPT)
+            });
+            let keep =
+                owner.is_some_and(|pid| pid == std::process::id() || (kerno_alive(pid) && !old));
+            entry.file_type().is_ok_and(|kind| kind.is_dir()) && !keep
         })
         .map(|entry| entry.path())
         .filter(|folder| fs::remove_dir_all(folder).is_err() && folder.exists())
         .collect()
 }
+
+/// How long the download of a Kerno that may still run is left by [`sweep_downloads`]: no download
+/// waits a week for its quit question.
+pub const DOWNLOAD_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Windows: whether process `pid` is a running `kerno.exe` (this one included), from
 /// `tasklist /fi "PID eq <pid>" /fo csv /nh`; when `tasklist.exe` cannot answer, it counts as
@@ -1799,10 +1817,15 @@ pub mod tests {
         };
         // Another Kerno's download, in progress or checked and waiting: its pid is a running
         // `kerno.exe`, and its folder stays (W2).
-        let theirs = downloads.path().join("kerno-update-77-5");
+        let now = SystemTime::now();
+        let stamp = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let theirs = downloads.path().join(format!("kerno-update-77-{stamp}"));
         fs::create_dir(&theirs).unwrap();
         let alive = |pid| pid == 77;
-        let left = sweep_downloads(downloads.path(), &alive);
+        let left = sweep_downloads(downloads.path(), &alive, now);
         assert!(theirs.is_dir());
         assert!(!old.exists());
         assert!(downloads.path().join("other").is_dir());
@@ -1811,16 +1834,50 @@ pub mod tests {
         {
             assert_eq!(left, std::slice::from_ref(&held));
             drop(running);
-            assert!(sweep_downloads(downloads.path(), &alive).is_empty());
+            assert!(sweep_downloads(downloads.path(), &alive, now).is_empty());
         }
         #[cfg(not(windows))]
         assert!(left.is_empty());
         assert!(!held.exists());
         // No folder at all: nothing to do.
-        assert!(sweep_downloads(&downloads.path().join("none"), &alive).is_empty());
+        assert!(sweep_downloads(&downloads.path().join("none"), &alive, now).is_empty());
         // That Kerno gone (or its pid now another program's): its folder goes too.
-        assert!(sweep_downloads(downloads.path(), &|_| false).is_empty());
+        assert!(sweep_downloads(downloads.path(), &|_| false, now).is_empty());
         assert!(!theirs.exists());
+    }
+
+    /// X2: past a week a download goes even when its pid still answers as a Kerno (or when
+    /// `tasklist` cannot answer, which counts as alive); this process's own never.
+    #[test]
+    fn a_download_older_than_a_week_goes_whatever_tasklist_says() {
+        let downloads = tempfile::tempdir().unwrap();
+        let made = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let stamp = made
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let theirs = downloads.path().join(format!("kerno-update-77-{stamp}"));
+        let mine = downloads
+            .path()
+            .join(format!("kerno-update-{}-{stamp}", std::process::id()));
+        fs::create_dir(&theirs).unwrap();
+        fs::create_dir(&mine).unwrap();
+        let alive = |_| true;
+        // Six days on: both stay.
+        sweep_downloads(
+            downloads.path(),
+            &alive,
+            made + Duration::from_secs(6 * 24 * 3600),
+        );
+        assert!(theirs.is_dir() && mine.is_dir());
+        // Eight days on: the other Kerno's goes, this one's stays.
+        sweep_downloads(
+            downloads.path(),
+            &alive,
+            made + Duration::from_secs(8 * 24 * 3600),
+        );
+        assert!(!theirs.exists());
+        assert!(mine.is_dir());
     }
 
     /// W2: `tasklist`'s answer names a running `kerno.exe` by its pid, in any language.

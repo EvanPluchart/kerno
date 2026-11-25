@@ -1891,3 +1891,6 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   (it now says so and stops on one that folds them, as MySQL on Windows does); a plain-backup test is built on
   a stand-in mysqldump, a `/bin/sh` script (it stops on Windows as the other stand-in tests do); the tree
   filter's test looked at the tree before its schemas were read (it now waits for the row).
+- Two reviews after: the installer's own code in the download's folder, the user's TEMP given back to the Kerno it
+  starts, the install check behind a guard, Windows' programs only from C:\Windows, a bounded wait, and a failed
+  version left on "Release page" until a check is asked for (D-139's review blocks).
