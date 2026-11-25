@@ -1080,7 +1080,10 @@ impl ImportSetup {
                         div()
                             .id("import-nothing")
                             .test_support()
+                            // Shrinks below its one-line width and wraps,
+                            // or it runs out of the dialog's left edge (K80).
                             .flex_1()
+                            .min_w_0()
                             .text_sm()
                             .text_color(muted)
                             .child(nothing)

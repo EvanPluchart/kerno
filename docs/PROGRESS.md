@@ -2057,3 +2057,12 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   client reads its script: one that never read it ended before or after Kerno had written it, by chance, and
   a run then failed rightly ("stopped reading before the end…") on a slow runner
   (`a_script_task_asks_before_each_run…` on the Linux job).
+
+## 2026-11-25 — K80 (1, 3): a sentence cut at a dialog's edge, a warning in the success colour
+
+- The fourth pass in the real app: the import previews' "Nothing to import…" sentence ran out of the dialog's
+  left edge (a flex child that could not shrink below its one-line width); it now wraps inside the dialog at
+  every width it takes, the buttons in place (DBeaver and connections file). The DBeaver import's report keeps
+  "Imported …" in the success colour and draws its "To check" notes in the warning colour, as the preview does.
+  M12's K80; UI tests in `ui_tests/k80.rs`, each seen failing without its part; headless captures light and
+  dark looked at.

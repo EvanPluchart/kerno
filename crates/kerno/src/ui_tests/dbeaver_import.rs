@@ -14,7 +14,11 @@ use crate::dbeaver_import::DbeaverImport;
 
 impl Fixture {
     /// Opens the DBeaver import preview of `path`, once it is read.
-    fn dbeaver_preview(&self, cx: &mut TestAppContext, path: PathBuf) -> Entity<DbeaverImport> {
+    pub(super) fn dbeaver_preview(
+        &self,
+        cx: &mut TestAppContext,
+        path: PathBuf,
+    ) -> Entity<DbeaverImport> {
         let slot: Rc<RefCell<Option<Entity<DbeaverImport>>>> = Rc::default();
         let (connections, filled) = (self.connections.clone(), slot.clone());
         self.step(cx, move |window, cx| {
@@ -26,7 +30,11 @@ impl Fixture {
         slot.borrow().clone().unwrap()
     }
 
-    fn dbeaver_import(&self, cx: &mut TestAppContext, view: &Entity<DbeaverImport>) -> String {
+    pub(super) fn dbeaver_import(
+        &self,
+        cx: &mut TestAppContext,
+        view: &Entity<DbeaverImport>,
+    ) -> String {
         self.step(cx, |window, cx| {
             view.update(cx, |view, cx| view.import(window, cx))
         });

@@ -800,7 +800,10 @@ impl DbeaverImport {
                         div()
                             .id("dbeaver-nothing")
                             .test_support()
+                            // Shrinks below its one-line width and wraps,
+                            // or it runs out of the dialog's left edge (K80).
                             .flex_1()
+                            .min_w_0()
                             .text_sm()
                             .text_color(muted)
                             .child(nothing)
@@ -884,19 +887,41 @@ fn report(
 impl Render for DbeaverImport {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (success, danger) = (theme.success, theme.danger);
+        let (success, warning, danger) = (theme.success, theme.warning, theme.danger);
         let body = match &self.step {
             Step::Preview => self.render_preview(cx),
             Step::Importing => vec![div().text_sm().child("Importing…").into_any_element()],
             Step::Done(message) | Step::Failed(message) => {
                 let failed = matches!(self.step, Step::Failed(_));
+                // The report's first line says what was written; what follows
+                // ("To check", scripts skipped) is a warning, drawn as the
+                // preview draws it (K80).
+                let (head, rest) = match message.split_once('\n') {
+                    Some((head, rest)) if !failed => (head, Some(rest)),
+                    _ => (message.as_str(), None),
+                };
                 vec![
-                    div()
-                        .id("dbeaver-done")
-                        .test_support()
+                    v_flex()
+                        .gap_1()
                         .text_sm()
-                        .text_color(if failed { danger } else { success })
-                        .child(SharedString::from(message.clone()))
+                        .child(
+                            div()
+                                .id("dbeaver-done")
+                                .test_support()
+                                .text_color(if failed { danger } else { success })
+                                .child(SharedString::from(head.to_string()))
+                                .test_text(head.to_string()),
+                        )
+                        .when_some(rest, |this, rest| {
+                            this.child(
+                                div()
+                                    .id("dbeaver-to-check")
+                                    .test_support()
+                                    .text_color(warning)
+                                    .child(SharedString::from(rest.to_string()))
+                                    .test_text(rest.to_string()),
+                            )
+                        })
                         .into_any_element(),
                     h_flex()
                         .justify_end()

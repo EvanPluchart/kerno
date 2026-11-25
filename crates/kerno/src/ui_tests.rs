@@ -75,6 +75,7 @@ mod k62;
 mod k72;
 mod k75;
 mod k76;
+mod k80;
 mod legacy;
 mod menus;
 mod multi_run;
