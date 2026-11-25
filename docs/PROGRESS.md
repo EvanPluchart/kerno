@@ -1940,3 +1940,13 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   total; one true sentence when the target cannot be read and for a plain dump; names compared as the server
   does; a manifest table without a file; the tests' guard only kills its own databases' connections.
 - Each fix seen failing under a mutation. Left: `--force` makes mysql exit 0 after errors (before K74).
+
+## 2026-11-25 — K74: the second review's points fixed
+
+- A feed that fails keeps the client's input open until the client is killed, and its error wins over the
+  client's exit status: a client never runs a statement cut short, nor ends a rows run as "Done" with nothing
+  loaded (N1). `--compatible` refused for a folder backup (N2); `--print-defaults`, `--version`, `--help`
+  refused for every MySQL / MariaDB tool, which would exit 0 having run nothing (N3); why Start cannot run is
+  said above the buttons, in the simple view and on the wizard's last page, so a saved task with an argument
+  refused now says it where it starts (N4). D-143, M12's K74 tables.
+- Left: the read of the database after a stop cannot be cancelled; `NO_BACKSLASH_ESCAPES` reasoned, not run.

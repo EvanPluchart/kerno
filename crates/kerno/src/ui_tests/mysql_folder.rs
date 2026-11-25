@@ -931,6 +931,72 @@ fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut
     );
 }
 
+/// K74, N4: a saved folder-restore task whose extra arguments are refused
+/// now (`--table`) opens from the Tasks view with Start disabled, and says
+/// why where the user starts, naming the argument; it never runs.
+#[gpui_kit::test]
+fn a_task_with_refused_arguments_says_why_where_it_starts(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) || !fake_tools_run() {
+        return;
+    }
+    let target = "kerno_test_k74_ui_task";
+    let _scratch = Scratch::new(
+        engine,
+        &[&format!("DROP DATABASE IF EXISTS {target}")],
+        &[&format!("CREATE DATABASE {target}")],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let ran = root.join("ran");
+    let client = fake_client(
+        &root,
+        "mysql",
+        ClientFamily::MySql,
+        "mysqldump  Ver 8.4.6 for macos15 on arm64",
+        &format!("touch '{}'", ran.display()),
+    );
+    let app = connected(cx, engine);
+    app.use_client(cx, ClientFamily::MySql, &client);
+    let folder = folder_of(&root, "task", &["one"], BackupContent::All, true);
+    let connection = cx.update(|cx| app.connections.read(cx).saved()[0].id.clone());
+    let options = kerno_core::tools::RestoreOptions {
+        jobs: Some(2),
+        extra_args: "--force --table".into(),
+        ..kerno_core::tools::RestoreOptions::new(
+            Engine::MySql,
+            target,
+            &folder,
+            BackupFormat::Directory,
+        )
+    };
+    let task = kerno_core::storage::SavedTask::new(
+        "kerno_test_k74 restore",
+        connection,
+        kerno_core::tools::TaskSettings::Restore(options),
+    );
+    let id = app.storage.save_task(&task).unwrap();
+    let view = app.tasks_view(cx);
+    app.task_does(cx, &view, crate::tasks_view::TaskAction::Run, id);
+    let dialog = app.task_wizard(cx, &view);
+    app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    assert!(!cx.update(|cx| dialog.read(cx).ready_to_start(cx)));
+    assert!(paints(
+        &app,
+        cx,
+        "Cannot start: “--table” is not allowed for a folder restore"
+    ));
+    assert!(!ran.exists(), "a client ran");
+    assert!(
+        cx.update(|cx| dialog.read(cx).state(cx))
+            .starts_with("ready")
+    );
+    app.tap(cx, "backup-close");
+}
+
 /// A backup made in utf8mb4 (its first lines set it), restored into a
 /// server older than 5.5.3: said before anything runs (G10).
 #[gpui_kit::test]

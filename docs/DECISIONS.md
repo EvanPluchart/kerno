@@ -4586,7 +4586,28 @@ called three tables "partly loaded"; one of them was empty, one held its old row
   without a file included (L5); the driver tests' guard kills only connections working in the databases the
   test named (L6).
 - **Left**: L7, `--force` in the extra arguments makes `mysql` exit 0 after errors, so a file can "succeed"
-  with statements that failed (as before K74, plain restore too); MariaDB's own `mariadb-dump` files not tried.
+  with statements that failed (as before K74, plain restore too); MariaDB's own `mariadb-dump` files not tried;
+  the read of the database after a stop cannot itself be cancelled (two reads of 30 s at most, about 10 s in
+  practice); `NO_BACKSLASH_ESCAPES` in the server's mode was reasoned about for the quote tracker, not run.
+
+**Amended after the second review** (of d605bde):
+
+- **A feed that fails keeps the client's input open until the client is killed** (N1). `feed` used to drop
+  its pipe as it returned its error: the client saw the end of its input before `run` killed it, and could run
+  a last statement cut short, or end with 0 so that `run`, whose `select!` was not biased, returned that status
+  (a rows run whose second part could not be opened then said "Done" with an emptied table). Now the error
+  comes back with the pipe, `run` kills the client and only then drops it; the `select!` is biased, the feed
+  first, and a feed that failed as the client ended still wins.
+- **`--compatible` refused for a folder backup** (N2): with `--compatible=ansi` mysqldump quotes names in
+  double quotes, which the tracker reads with backslash escapes; a name holding `\"` and a newline could be
+  cut wrong (the base failed on such a file too).
+- **Options that print and stop** (N3): `--print-defaults`, `--version`/`-V`, `--help`/`-?`/`-I` make every
+  MySQL / MariaDB tool exit 0 without running anything, so a restore or a backup said "Done" with nothing
+  done. Refused for all of them in the shared list of the extra arguments, in every spelling.
+- **Why Start cannot run, beside Start** (N4): a saved task whose arguments are refused now opened with Start
+  disabled and the reason only by the field on the Settings page (in the simple view, nowhere). The reason now
+  shows above the buttons wherever Start is (the simple view, the wizard's last page), as "Cannot start: …",
+  for every reason `blocked()` gives.
 
 ## D-142 — The disk image's window: a layout written once by Finder and committed (K73; 2026-11-24)
 

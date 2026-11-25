@@ -1789,9 +1789,39 @@ const PG_REFUSED_FAMILIES: &[&str] = &["ssl"];
 const PG_REFUSED_LETTERS: &str = "hpUdlWfcvoL";
 const MYSQL_REFUSED_LETTERS: &str = "hPupSDer";
 
+/// MySQL's and MariaDB's options that make a tool print something and stop
+/// without running anything, exit 0: a run would look done with nothing
+/// loaded or written (K74, N3). By long name, then by letter (`-V -? -I`).
+const MYSQL_NOTHING_RUN: &[&str] = &["print-defaults", "version", "help"];
+const MYSQL_NOTHING_RUN_LETTERS: &str = "V?I";
+
 fn refused_arg(word: &str, family: ClientFamily) -> Option<&'static str> {
     let connection = "the server, the user, the database, the TLS settings and the password are \
                       the connection's own";
+    let nothing = "it makes the tool print something and stop without running anything, and the run \
+                   would look done";
+    if family == ClientFamily::MySql {
+        let stops = match word.strip_prefix("--") {
+            Some(long) => {
+                let name = long
+                    .split('=')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .replace('_', "-");
+                let name = name.strip_prefix("loose-").unwrap_or(&name).to_string();
+                !name.is_empty() && MYSQL_NOTHING_RUN.iter().any(|stop| stop.starts_with(&name))
+            }
+            None => word.strip_prefix('-').is_some_and(|cluster| {
+                cluster
+                    .chars()
+                    .any(|letter| MYSQL_NOTHING_RUN_LETTERS.contains(letter))
+            }),
+        };
+        if stops {
+            return Some(nothing);
+        }
+    }
     let (refused, families, short) = match family {
         ClientFamily::Postgres => (PG_REFUSED_OPTIONS, PG_REFUSED_FAMILIES, PG_REFUSED_LETTERS),
         ClientFamily::MySql => (
@@ -2718,8 +2748,12 @@ pub async fn run(
     let mut tick = tokio::time::interval(CANCEL_POLL);
     loop {
         tokio::select! {
+            // The feed first: its error wins over anything the child does
+            // (K74, N1).
+            biased;
             // A part that could not be read: the child must not go on with
-            // what it was given (K74, F1).
+            // what it was given (K74, F1). Its input stays open until it is
+            // killed, so it never takes the cut for the end of its script.
             fed = async {
                 match feeding.0.as_mut() {
                     Some(task) => task.await,
@@ -2727,8 +2761,9 @@ pub async fn run(
                 }
             }, if feeding.0.is_some() => {
                 feeding.0 = None;
-                if let Ok(Err(error)) = fed {
+                if let Ok(Err((error, pipe))) = fed {
                     let _ = child.kill().await;
+                    drop(pipe);
                     return Err(error);
                 }
             }
@@ -2741,6 +2776,16 @@ pub async fn run(
             // Both pipes are read to their end first, so a chatty child
             // never blocks on a full pipe.
             status = child.wait(), if stdout.is_none() && stderr.is_none() => {
+                // A feed that failed as the child ended: its error wins.
+                if let Some(task) = feeding.0.take() {
+                    if task.is_finished() {
+                        if let Ok(Err((error, _))) = task.await {
+                            return Err(error);
+                        }
+                    } else {
+                        task.abort();
+                    }
+                }
                 return status.map_err(|error| Error::io("waiting for the tool", error));
             }
             _ = tick.tick() => {
@@ -2760,9 +2805,25 @@ pub async fn run(
 /// child closes its end first: it stopped on an error, or was killed. A
 /// file that cannot be opened or read is an error: [`run`] then kills the
 /// child.
+///
+/// On such an error the pipe comes back with it, still open: the child
+/// must never see the end of its input (it would run a last statement cut
+/// short, or end well with rows missing) before [`run`] kills it (K74, N1).
 async fn feed(
     input: Vec<StdinPart>,
     mut pipe: tokio::process::ChildStdin,
+    sent: Arc<AtomicU64>,
+) -> std::result::Result<(), (Error, tokio::process::ChildStdin)> {
+    match feed_parts(input, &mut pipe, sent).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err((error, pipe)),
+    }
+}
+
+/// [`feed`]'s work, the pipe borrowed.
+async fn feed_parts(
+    input: Vec<StdinPart>,
+    pipe: &mut tokio::process::ChildStdin,
     sent: Arc<AtomicU64>,
 ) -> Result<()> {
     use tokio::io::AsyncSeekExt as _;
@@ -2805,8 +2866,11 @@ async fn feed(
     Ok(())
 }
 
+/// How [`feed`] ended: well, or an error with the pipe still open.
+type Fed = std::result::Result<(), (Error, tokio::process::ChildStdin)>;
+
 /// Aborts the feeding task when [`run`] returns, however it returns.
-struct Feeding(Option<tokio::task::JoinHandle<Result<()>>>);
+struct Feeding(Option<tokio::task::JoinHandle<Fed>>);
 
 impl Drop for Feeding {
     fn drop(&mut self) {
@@ -4869,6 +4933,41 @@ mod tests {
         assert!(extra_args("--exclude-table=\"open", ClientFamily::Postgres).is_err());
     }
 
+    /// K74, N3: MySQL's options that print and stop without running
+    /// anything (exit 0, a run that looks done) are refused for every
+    /// MySQL / MariaDB tool, in every spelling; the ones near them pass.
+    #[test]
+    fn options_that_print_and_stop_are_refused() {
+        for arg in [
+            "--print-defaults",
+            "--version",
+            "--vers",
+            "--help",
+            "--loose-help",
+            "-V",
+            "-?",
+            "-I",
+            "-NV",
+        ] {
+            let error = extra_args(arg, ClientFamily::MySql)
+                .err()
+                .unwrap_or_else(|| panic!("{arg} let through"))
+                .to_string();
+            assert!(
+                error.contains("stop without running anything"),
+                "{arg}: {error}"
+            );
+        }
+        for arg in ["--verbose", "--hex-blob", "-N", "--force", "--no-create-db"] {
+            assert!(
+                extra_args(arg, ClientFamily::MySql).is_ok(),
+                "{arg} refused"
+            );
+        }
+        // PostgreSQL's tools are not concerned.
+        assert!(extra_args("-V", ClientFamily::Postgres).is_ok());
+    }
+
     #[test]
     fn extra_arguments_that_change_the_route_or_carry_a_password_are_refused() {
         let pg_refused = [
@@ -5837,6 +5936,59 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("absent.sql"), "{error}");
         assert!(lines.lock().unwrap().is_empty());
+    }
+
+    /// K74, N1: a part that fails mid-way never shows the child the end of
+    /// its input (a client would run a last statement cut short, or end
+    /// well), and its error always wins over the child's status: a stand-in
+    /// that writes `EOF` once its input ends, 200 runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_feed_that_fails_never_ends_the_child_s_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sql");
+        std::fs::write(&first, "INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2").unwrap();
+        // A folder passes the check and fails at its read.
+        let broken = dir.path().join("broken.sql");
+        std::fs::create_dir(&broken).unwrap();
+        let out = dir.path().join("out.txt");
+        for run_at in 0..200 {
+            let _ = std::fs::remove_file(&out);
+            let mut command = shell(&format!(
+                "cat > '{out}'; echo EOF >> '{out}'; exit 0",
+                out = out.display()
+            ));
+            for path in [first.clone(), broken.clone()] {
+                command.stdin_parts.push(StdinPart::File {
+                    path,
+                    range: 0..u64::MAX,
+                    counted: true,
+                });
+            }
+            let ended = run(command, |_| {}, Arc::new(AtomicBool::new(false))).await;
+            let error = ended.expect_err(&format!("run {run_at}: the child's status won"));
+            assert!(error.to_string().contains("broken.sql"), "{error}");
+            // The child, killed, never wrote that its input ended.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let seen = std::fs::read_to_string(&out).unwrap_or_default();
+            assert!(!seen.contains("EOF"), "run {run_at}: {seen}");
+        }
+        // A child that ends well on its own as its feed fails (it reads the
+        // first part's bytes and stops): the feed's error wins, every time.
+        let ten = dir.path().join("ten.sql");
+        std::fs::write(&ten, "SELECT 1;\n").unwrap();
+        for run_at in 0..500 {
+            let mut command = shell("head -c 10 > /dev/null; exit 0");
+            for path in [ten.clone(), broken.clone()] {
+                command.stdin_parts.push(StdinPart::File {
+                    path,
+                    range: 0..u64::MAX,
+                    counted: true,
+                });
+            }
+            let ended = run(command, |_| {}, Arc::new(AtomicBool::new(false))).await;
+            assert!(ended.is_err(), "run {run_at}: the child's status won");
+        }
     }
 
     /// A client that stops reading (psql's ON_ERROR_STOP) ends the run at

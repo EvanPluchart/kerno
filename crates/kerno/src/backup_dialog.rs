@@ -6127,11 +6127,36 @@ impl Render for BackupDialog {
                             ),
                     ),
             )
+            .when_some(self.start_blocked_note(simple, cx), |this, note| {
+                this.child(note)
+            })
             .child(if simple && matches!(self.step, Step::Options) {
                 self.render_simple_footer(cx)
             } else {
                 self.render_footer(cx)
             })
+    }
+}
+
+impl BackupDialog {
+    /// Why Start cannot run, said beside it (K74, N4): a task opened with
+    /// arguments that are refused now shows it where the user starts, not
+    /// only by a field on another page.
+    fn start_blocked_note(&self, simple: bool, cx: &Context<Self>) -> Option<AnyElement> {
+        let starts_here = matches!(self.step, Step::Options)
+            && !self.showing_clients
+            && (simple || self.page == self.last_settings_page());
+        let why = self.blocked(cx).filter(|_| starts_here)?;
+        Some(
+            div()
+                .id("backup-start-blocked")
+                .test_support()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(SharedString::from(format!("Cannot start: {why}")))
+                .test_text(format!("Cannot start: {why}"))
+                .into_any_element(),
+        )
     }
 }
 

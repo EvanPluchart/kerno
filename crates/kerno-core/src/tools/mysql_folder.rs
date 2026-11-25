@@ -417,7 +417,12 @@ const FOLDER_KEEPS: [&str; 4] = [
 /// break it), by their long names, with what it does instead: one of the
 /// user's (any abbreviation mysqldump would take for it, a `skip-` or
 /// `loose-` form) would come after and win.
-const FOLDER_OWNS: [(&str, &str); 31] = [
+const FOLDER_OWNS: [(&str, &str); 32] = [
+    (
+        "compatible",
+        "it changes how mysqldump quotes names, and the restore reads the files to find where \
+         each table's definition ends (K74, N2)",
+    ),
     ("where", WHERE),
     (
         "tab",
@@ -3074,6 +3079,7 @@ mod tests {
             ("--opt", "which the backup's Settings choose"),
             ("--skip-opt", "which the backup's Settings choose"),
             ("--compact", "which the backup's Settings choose"),
+            ("--compatible=ansi", "how mysqldump quotes names"),
             ("--skip-set-charset", "which the backup's Settings choose"),
             (
                 "--skip-add-drop-table",

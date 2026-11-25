@@ -19,7 +19,7 @@ use crate::tasks_view::{TaskAction, TasksView};
 
 impl Fixture {
     /// Opens the Tasks view (Tools ▸ Tasks), once its list is read.
-    fn tasks_view(&self, cx: &mut TestAppContext) -> Entity<TasksView> {
+    pub(super) fn tasks_view(&self, cx: &mut TestAppContext) -> Entity<TasksView> {
         let workspace = self.workspace.clone();
         let view = self.step(cx, |window, cx| {
             workspace.update(cx, |workspace, cx| workspace.open_tasks(window, cx))
@@ -32,7 +32,7 @@ impl Fixture {
     }
 
     /// Does what an entry of a task's menu does.
-    fn task_does(
+    pub(super) fn task_does(
         &self,
         cx: &mut TestAppContext,
         view: &Entity<TasksView>,
@@ -45,7 +45,7 @@ impl Fixture {
     }
 
     /// The wizard the Tasks view opened last.
-    fn task_wizard(
+    pub(super) fn task_wizard(
         &self,
         cx: &mut TestAppContext,
         view: &Entity<TasksView>,
