@@ -922,9 +922,11 @@ quits (after asking about open transactions and pending changes, as quitting doe
 Kerno and starts it again; your tabs, unsaved text included, come back. A copy unpacked from the zip is updated
 the same way: the new version is installed for your account as above, and the unpacked folder stays where it
 is, yours to delete. A Kerno started as administrator ("Run as administrator") never runs an installer it
-downloaded: Update opens the release page instead. If the installer cannot finish (another Kerno still open
-from the same folder, a folder it cannot write), it changes nothing, starts the Kerno you had again, and that
-Kerno says what happened and where the installer's log is (`%APPDATA%\Kerno\data\update-setup.log`).
+downloaded: Update opens the release page instead. Kerno takes `curl.exe` and the other programs Windows ships
+only from `C:\Windows\System32`: on a Windows installed elsewhere (rare), it checks for no update and Update
+opens the release page. If the installer cannot finish (another Kerno still open from the same folder, a folder
+it cannot write), it changes nothing, starts the Kerno you had again, and that Kerno says what happened and
+where the installer's log is (`%APPDATA%\Kerno\data\update-setup.log`).
 
 Quit Kerno before you install a version over it by hand. Uninstalling removes the program, its shortcuts and its
 entry, never your data: connections, settings, history, saved queries and Kerno's password file stay in

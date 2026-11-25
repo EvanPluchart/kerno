@@ -1267,3 +1267,62 @@ fn on_windows_update_starts_the_checked_installer_and_the_next_start_says_if_it_
         None
     );
 }
+
+/// K70 (V5): a failed install said at a start is not offered again by the dialog in that run; the
+/// status bar item stays, and a newer version found later is offered as before.
+#[gpui_kit::test]
+fn a_failed_install_said_at_start_is_not_offered_again_by_the_dialog(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let latest = Arc::new(std::sync::Mutex::new("v0.2.0"));
+    let tag = latest.clone();
+    let fake = Fake::new(move |_, _| Ok(redirect_to(&tag.lock().unwrap())));
+    allow_updates(&app, cx, fake, "0.1.0", Install::Page, temp.path());
+    app.step(cx, |window, cx| {
+        crate::workspace::updates::not_installed(v("0.2.0"), "it stopped".into(), window, cx)
+    });
+    check(&app, cx, false);
+    assert!(!update_dialog(&app, cx));
+    assert_eq!(
+        label(cx).as_deref(),
+        Some("Kerno 0.2.0 is available · Update")
+    );
+    *latest.lock().unwrap() = "v0.3.0";
+    check(&app, cx, false);
+    assert!(update_dialog(&app, cx));
+}
+
+/// K70 (V5): a zip copy whose profile has Kerno installed at the version found offers to start
+/// that one, from the timed check and from the status bar item, and installs nothing.
+#[gpui_kit::test]
+fn a_zip_copy_offers_to_start_the_kerno_installed_in_the_profile(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let temp = tempfile::tempdir().unwrap();
+    let installed = std::path::PathBuf::from(r"C:\Users\x\AppData\Local\Programs\Kerno\kerno.exe");
+    let fake = Fake::new(|_, _| Ok(redirect_to("v0.2.0")));
+    allow_updates(
+        &app,
+        cx,
+        fake.clone(),
+        "0.1.0",
+        Install::Setup("kerno.exe".into()),
+        temp.path(),
+    );
+    let at = installed.clone();
+    cx.update(|cx| cx.global_mut::<Updates>().installed = Some((v("0.2.0"), at)));
+    let before = notification_count(&app, cx);
+    check(&app, cx, false);
+    assert!(!update_dialog(&app, cx));
+    assert_eq!(notification_count(&app, cx), before + 1);
+    // Said again, in place of the first.
+    app.click(cx, "status-update-button");
+    assert_eq!(notification_count(&app, cx), before + 1);
+    // Only the check was sent: nothing downloaded.
+    assert_eq!(curl_args(&fake).len(), 1);
+    // The notification's button, once it has slid in.
+    cx.executor().advance_clock(Duration::from_secs(1));
+    app.click(cx, "update-start-installed");
+    let (program, args) = fake.calls().last().unwrap().clone();
+    assert_eq!((program, args), (installed, Vec::<String>::new()));
+    assert_eq!(phase(cx), Phase::Available(v("0.2.0")));
+}

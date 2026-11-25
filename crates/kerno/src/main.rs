@@ -163,7 +163,7 @@ fn main() {
         Invocation::Run => None,
         Invocation::Open(url) => Some(url),
         Invocation::Version => {
-            let _ = writeln!(std::io::stdout(), "kerno {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(std::io::stdout(), "{}", update::VERSION_LINE);
             return;
         }
         Invocation::Help => {
@@ -308,13 +308,39 @@ fn start(
     let keymap_problems = actions::bind_keys(&startup.paths.keymap(), cx);
     // The one request Kerno makes by itself (CLAUDE.md §1), unless an off
     // switch is set: where this copy lives is looked at off the UI thread.
-    // An update on Windows that did not finish is said whatever the
-    // switches (K70).
+    // Windows: an update that did not finish is said whatever the switches,
+    // and what earlier updates left in the downloads folder goes (K70).
     let exe = std::env::current_exe().ok();
     let data_dir = startup.paths.data_dir.clone();
     let updates = bridge::spawn_blocking(cx, move || {
-        let not_installed = update::downloads_dir()
-            .and_then(|downloads| update::after_install(&data_dir, update::CURRENT, &downloads));
+        let downloads = update::downloads_dir().filter(|_| cfg!(windows));
+        let not_installed = downloads.as_ref().and_then(|downloads| {
+            // What the installer gave back as this Kerno's temporary folders (K70, W1).
+            let shown = |name| {
+                std::env::var_os(name).map_or("(unset)".into(), |value| {
+                    value.to_string_lossy().into_owned()
+                })
+            };
+            tracing::info!(
+                "temporary folders at start: TEMP=[{}] TMP=[{}]",
+                shown("TEMP"),
+                shown("TMP")
+            );
+            let said = update::after_install(&data_dir, update::CURRENT, downloads);
+            // An installer still running from its folder (a failed install's stub,
+            // which has just started this Kerno again): one more try a minute later.
+            // The download of a Kerno still running is left alone (W2).
+            let alive = |pid| update::kerno_alive(&update::System, pid);
+            if !update::sweep_downloads(downloads, &alive).is_empty() {
+                let downloads = downloads.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let alive = |pid| update::kerno_alive(&update::System, pid);
+                    update::sweep_downloads(&downloads, &alive);
+                });
+            }
+            said
+        });
         let updates = update::for_this_run(|name| std::env::var_os(name).is_some(), exe, data_dir);
         if let Some(updates) = &updates {
             update::remove_leftovers(&updates.target);

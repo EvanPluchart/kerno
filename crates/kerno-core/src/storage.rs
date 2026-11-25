@@ -1547,6 +1547,12 @@ impl AppPaths {
             .map(|dirs| dirs.data_local_dir().to_path_buf())
     }
 
+    /// Where programs installed for this user alone go: on Windows `%LOCALAPPDATA%\Programs`, Inno
+    /// Setup's `{userpf}`, where Kerno's installer puts `Kerno` (K70, D-139).
+    pub fn user_programs_dir() -> Option<PathBuf> {
+        directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join("Programs"))
+    }
+
     /// Everything under one directory.
     pub fn under(dir: PathBuf) -> Self {
         Self {

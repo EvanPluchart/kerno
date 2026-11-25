@@ -61,10 +61,16 @@ pub fn what_update_does(target: &Install, version: Version) -> String {
              rights): Kerno is installed in AppData\\Local\\Programs\\Kerno and started again. A \
              copy unpacked from the zip stays where it is. {asks}"
         ),
-        Install::Page => "This copy of Kerno cannot replace itself (a package, an AppImage, a \
-             build, a folder Kerno may not write, or Kerno running as administrator): Update \
-             opens the release page in your browser, to download it from there."
-            .to_string(),
+        Install::Page => format!(
+            "This copy of Kerno cannot replace itself (a package, an AppImage, a build, a folder \
+             Kerno may not write{}): Update opens the release page in your browser, to download it \
+             from there.",
+            if cfg!(windows) {
+                ", or Kerno running as administrator"
+            } else {
+                ""
+            }
+        ),
     }
 }
 
@@ -340,6 +346,11 @@ impl Workspace {
         {
             return;
         }
+        if let Some((installed, exe)) = installed_covers(version, cx) {
+            cx.update_global::<Updates, _>(|updates, _| updates.offered = Some(version));
+            start_installed(installed, exe, window, cx);
+            return;
+        }
         let have = SharedString::from(format!("You have {}.", updates.current));
         let does = SharedString::from(what_update_does(&updates.target, version));
         if window.has_active_dialog(cx) {
@@ -496,6 +507,11 @@ impl Workspace {
                 Phase::Downloading(_) | Phase::Installing(_) => window
                     .push_notification(Notification::info("The update is already under way."), cx),
                 _ if target == Install::Page => cx.open_url(&release_page(version)),
+                _ if installed_covers(version, cx).is_some() => {
+                    if let Some((installed, exe)) = installed_covers(version, cx) {
+                        start_installed(installed, exe, window, cx);
+                    }
+                }
                 Phase::Ready(_, file) if file.is_file() => {
                     self.quit_to_install(version, file, window, cx)
                 }
@@ -643,8 +659,8 @@ impl Workspace {
 pub fn not_installed(version: Version, why: String, window: &mut Window, cx: &mut App) {
     window.push_notification(
         Notification::error(SharedString::from(format!(
-            "Kerno {version} was not installed: {why}. Nothing was changed; its release page \
-             has it."
+            "Kerno {version} was not installed: {why}. Nothing was changed. You can download it \
+             from its release page: click “Release page” in the status bar."
         )))
         // It stays until closed: said at a start, it must not go before it is read (K70).
         .autohide(false),
@@ -652,8 +668,55 @@ pub fn not_installed(version: Version, why: String, window: &mut Window, cx: &mu
     );
     tracing::warn!(%version, "an update was not installed: {why}");
     if cx.try_global::<Updates>().is_some() {
+        // Said once: the dialog does not offer that version again in this run; the status bar
+        // item and "Check for updates" still do (K70, V5).
+        cx.update_global::<Updates, _>(|updates, _| {
+            updates.offered = updates.offered.max(Some(version));
+        });
         set_phase(cx, Phase::Failed(version, why));
     }
+}
+
+/// Windows, a copy that is not the installed one (the zip's): the Kerno installed in the profile
+/// when it is `version` or newer; an update of that version starts it instead of installing it
+/// again (K70, V5).
+fn installed_covers(version: Version, cx: &App) -> Option<(Version, PathBuf)> {
+    cx.try_global::<Updates>()?
+        .installed
+        .clone()
+        .filter(|(installed, _)| *installed >= version)
+}
+
+/// The notice of [`start_installed`].
+struct StartInstalled;
+
+/// Says that Kerno `installed` is in the profile, with a button that starts it.
+fn start_installed(installed: Version, exe: PathBuf, window: &mut Window, cx: &mut App) {
+    let runner = cx
+        .try_global::<Updates>()
+        .map(|updates| updates.runner.clone());
+    window.push_notification(
+        Notification::info(SharedString::from(format!(
+            "Kerno {installed} is installed in your profile: start that one. This copy, unpacked \
+             from the zip, stays as it is."
+        )))
+        // One at a time: said again, it replaces the one on screen.
+        .id::<StartInstalled>()
+        .action(move |_, _, _| {
+            let (runner, exe) = (runner.clone(), exe.clone());
+            Button::new("update-start-installed")
+                .small()
+                .label("Start it")
+                .on_click(move |_, window, cx| {
+                    if let Some(runner) = &runner
+                        && let Err(why) = runner.start(&exe, &[])
+                    {
+                        window.push_notification(Notification::error(SharedString::from(why)), cx);
+                    }
+                })
+        }),
+        cx,
+    );
 }
 
 /// Removes the private folder a download was made in.

@@ -10,13 +10,17 @@
 # a test build (the test-update-without-click feature), and the app is launched once on a scratch
 # data directory and an in-memory secret store: it must still run after it wrote its data, a
 # picture of the screen is kept in dist/kerno-windows-launch.png, then it is stopped.
-# After packing, the install check (docs/DECISIONS.md D-139): the installer is run silently for
-# this user, its files, Start menu shortcut and uninstall entry are checked, the installed
-# kerno.exe is launched once (dist/kerno-windows-installed.png), then the uninstaller runs
-# silently: the folder, the shortcut and the entry must be gone, Kerno's data folder still there.
-# The check refuses to run where Kerno is installed or has data for this user (it would use them).
-# KERNO_SKIP_LAUNCH_CHECK=1 skips both launches and the install check (no desktop). The names go
-# with what the release workflow lists in SHA256SUMS and with kerno_core::update::artifact.
+# After packing, the install check (docs/DECISIONS.md D-139), on GitHub's runners or when asked
+# for by name (KERNO_INSTALL_CHECK=1), never by surprise on someone's own Windows: the installer
+# is run silently for this user, its files, Start menu shortcut and uninstall entry are checked,
+# the installed kerno.exe is launched once (dist/kerno-windows-installed.png), then the
+# uninstaller runs silently: the folder, the shortcut and the entry must be gone, Kerno's data
+# folder still there. It refuses to run where it could touch the user's own Kerno
+# (scripts/windows-install-guard.sh: KERNO_DATA_DIR set, Kerno's data, local data or install
+# folder, its uninstall entry or a failed read of it, a running kerno.exe), and on a failure it
+# uninstalls only what it installed. KERNO_SKIP_LAUNCH_CHECK=1 skips both launches and the install
+# check (no desktop). The names go with what the release workflow lists in SHA256SUMS and with
+# kerno_core::update::artifact.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,17 +28,22 @@ version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Carg
 arch=$(rustc -vV | sed -n 's/^host: \([^-]*\)-.*/\1/p')
 name=kerno-$version-windows-$arch
 setup=Kerno-$version-windows-$arch-setup
-# packaging/windows/kerno.iss's AppId: Windows' uninstall entry is named after it.
-uninstall_key='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{A1106071-CFCF-4417-8D07-D209FC6B030D}_is1'
 
 cargo build --release --locked -p kerno
 exe=target/release/kerno.exe
 printed=$("$exe" --version)
+# A test build says so in its version (crates/kerno/src/update.rs, VERSION_LINE): never packaged.
+case $printed in
+  *+test-update-without-click*)
+    echo "$exe is a test build ($printed): never packaged" >&2
+    exit 1
+    ;;
+esac
 if [ "$printed" != "kerno $version" ]; then
   echo "kerno.exe --version printed \"$printed\", not \"kerno $version\"" >&2
   exit 1
 fi
-# The feature's own log line (crates/kerno/src/workspace/updates.rs) is only in a test build.
+# And the feature's own log line (crates/kerno/src/workspace/updates.rs), as a second check.
 if grep -aq "test-update-without-click" "$exe"; then
   echo "$exe is a test build (test-update-without-click): never packaged" >&2
   exit 1
@@ -42,8 +51,13 @@ fi
 
 pids=()
 temps=()
+installed_here=
 cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  # Only what this run installed (the guard saw no Kerno before it).
+  if [ -n "$installed_here" ] && [ -f "$app/unins000.exe" ]; then
+    MSYS_NO_PATHCONV=1 "$app/unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART || true
+  fi
   rm -rf "${temps[@]}" dist/.stage-windows
 }
 trap cleanup EXIT
@@ -110,8 +124,13 @@ MSYS_NO_PATHCONV=1 "$iscc" /Q "/DAppVersion=$version" "/DSource=$(cygpath -aw "$
 ls -la "dist/$setup.exe"
 
 [ "${KERNO_SKIP_LAUNCH_CHECK:-}" != 1 ] || exit 0
+if [ "${GITHUB_ACTIONS:-}" != true ] && [ "${KERNO_INSTALL_CHECK:-}" != 1 ]; then
+  echo "install check: skipped (it installs and uninstalls Kerno for this user: GitHub's runners, or KERNO_INSTALL_CHECK=1)"
+  exit 0
+fi
 
 # The install check.
+. scripts/windows-install-guard.sh
 registry() { # the value $1 of the uninstall entry, or nothing
   powershell -NoProfile -Command "(Get-ItemProperty -ErrorAction SilentlyContinue '$uninstall_key').$1" | tr -d '\r'
 }
@@ -119,11 +138,13 @@ app=$(cygpath -u "$LOCALAPPDATA")/Programs/Kerno
 start_menu=$(cygpath -u "$APPDATA")/Microsoft/Windows/"Start Menu"/Programs/Kerno.lnk
 desktop=$(cygpath -u "$USERPROFILE")/Desktop/Kerno.lnk
 user_data=$(cygpath -u "$APPDATA")/Kerno
-if [ -n "$(registry DisplayVersion)" ] || [ -e "$app" ] || [ -e "$user_data" ]; then
-  echo "install check: Kerno is installed or has data for this user ($app, $user_data): not run" >&2
+why=$(install_check_refusal)
+if [ -n "$why" ]; then
+  echo "install check: not run: $why" >&2
   exit 1
 fi
 fail() { echo "install check: $*" >&2; exit 1; }
+installed_here=1
 MSYS_NO_PATHCONV=1 "dist/$setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART \
   "/LOG=$(cygpath -aw dist/kerno-windows-install.log)" || fail "the installer failed ($?)"
 for file in kerno.exe LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md README.md unins000.exe; do
@@ -156,6 +177,7 @@ done
 [ ! -e "$app" ] || fail "$app is still there after uninstalling: $(ls -A "$app" | tr '\n' ' ')"
 [ ! -e "$start_menu" ] || fail "the Start menu shortcut is still there"
 [ -z "$(registry DisplayVersion)" ] || fail "the uninstall entry is still there"
+installed_here=
 [ -n "$(ls -A "$user_data/data" 2>/dev/null)" ] || fail "Kerno's data folder $user_data/data is gone"
 echo "install check: uninstalled ($uninstaller): folder, shortcut and entry gone; data kept: $(ls "$user_data/data" | tr '\n' ' ')"
 # This check's own data, made by its launch.

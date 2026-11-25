@@ -11,12 +11,23 @@
 # Kerno that updates is a second build with the test-update-without-click feature, which differs
 # from the shipped one in three things: it takes the update without the click on Update, it says
 # it is 0.0.0, and it does not refuse to run the installer as administrator (the runner has no
-# other kind of user). What it installs is the shipped installer of dist/, unchanged.
+# other kind of user); it also takes its downloads folder from KERNO_TEST_DOWNLOADS_DIR. What it
+# installs is the shipped installer of dist/, unchanged.
 #   1. the shipped kerno.exe (the zip's folder), as administrator: the release page, no installer
 #   2. a wrong line in SHA256SUMS: refused after the download, nothing installed or run
+# Then 0.0.0 is installed into a folder whose path holds a space and an accent, as a profile named
+# "Jean Dupont Élodie" would give (/DIR=, that first install only; the updates keep that folder),
+# and the data and downloads folders of 3 and 4 are named so too:
 #   3. another Kerno running from the install folder: the installer stops before replacing
-#      anything, the old Kerno is started again and says why
-#   4. the update: the installer replaces 0.0.0 with this version and starts the new Kerno
+#      anything, the old Kerno is started again and says why; its download goes at that start
+#   4. the update: the installer, its own temporary files in the download's folder, replaces
+#      0.0.0 with this version and starts the new Kerno
+#   5. a Kerno slow to quit (a process that lives 45 s): the installer waits for it, past the 30 s
+#      it once gave up after, then installs and starts Kerno
+#   6. a Kerno that does not quit within the installer's limit (/wait=20 here): nothing installed,
+#      that Kerno not started a second time
+# In 3 and 4 every Kerno of the case (the one that asked, the one the installer started) must have
+# had the same TEMP and TMP, and that TEMP must take a file once the update's folder is gone.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "${RUNNER_TEMP:-}" ] \
@@ -59,6 +70,23 @@ kerno_runs() { [ -n "$(running_from "$1")" ]; }
 no_kerno() { [ -z "$(running_from "$1")" ]; }
 version_is() { [ "$(registry DisplayVersion)" = "$1" ]; }
 logs_say() { grep -rqF -- "$2" "$1/logs" 2>/dev/null; }
+# The temporary folders each Kerno logged at its start in data folder $1.
+starts() { grep -rah "temporary folders at start:" "$1/logs" 2>/dev/null | sed 's/.*temporary folders at start: //'; }
+two_starts() { [ "$(starts "$1" | wc -l)" -ge 2 ]; }
+# W1: every Kerno of data folder $1 (the one that asked, the one the installer started) had the
+# same TEMP and TMP, not the update's folder, and that TEMP takes a file now that the update's
+# folder is gone.
+same_temp() {
+  local seen temp file
+  seen=$(starts "$1" | sort -u)
+  echo "$seen"
+  two_starts "$1" || return 1
+  [ "$(printf '%s\n' "$seen" | wc -l)" = 1 ] || return 1
+  temp=$(printf '%s' "$seen" | sed 's/^TEMP=\[\(.*\)\] TMP=.*/\1/')
+  case $temp in *kerno-update-*|"(unset)"|"") return 1 ;; esac
+  file="$(cygpath -u "$temp")/kerno-w1-$$"
+  : > "$file" && rm "$file"
+}
 picture() { powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-screenshot.ps1 "$1"; }
 
 # Everything is built before github.com is changed.
@@ -71,6 +99,8 @@ grep -aq "test-update-without-click" "$work/kerno-shipped.exe" && fail "the ship
 cargo build --release --locked -p kerno --features test-update-without-click
 cp target/release/kerno.exe "$work/kerno-test.exe"
 grep -aq "test-update-without-click" "$work/kerno-test.exe" || fail "the test build lacks its feature"
+[ "$("$work/kerno-test.exe" --version)" = "kerno $version+test-update-without-click" ] \
+  || fail "the test build's --version: $("$work/kerno-test.exe" --version)"
 say "the shipped kerno.exe has no test-update-without-click; the test build has it"
 # A folder of the zip's shape holding the test build.
 mkdir -p "$work/test/kerno"
@@ -99,7 +129,9 @@ printf '\r\n127.0.0.1 github.com\r\n' >> /c/Windows/System32/drivers/etc/hosts
 ipconfig //flushdns > /dev/null
 pids=()
 trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; stop_from "$app/kerno.exe" || true' EXIT
-served() { grep -csF -- "$1" "$work/server.log" || true; }
+served() {
+  if [ -f "$work/server.log" ]; then grep -cF -- "$1" "$work/server.log" || true; else echo 0; fi
+}
 # Whether the fake release's log holds more than $2 lines with $1.
 served_more() { [ "$(served "$1")" -gt "$2" ]; }
 # Starts the fake release (its requests appended to server.log); stopped, github.com is offline.
@@ -110,7 +142,8 @@ start_server() {
     "$(cygpath -w "$work/cert.pem")" "$(cygpath -w "$work/key.pem")" 2>> "$work/server.log" &
   server=$!
   pids+=("$server")
-  until_true 10 served_more "serving Kerno" "${before:-0}" || fail "the fake release did not start"
+  until_true 30 served_more "serving Kerno" "$before" \
+    || { cat "$work/server.log" >&2; fail "the fake release did not start"; }
 }
 start_server
 
@@ -142,28 +175,36 @@ kill -0 "$pid" 2>/dev/null || fail "2: Kerno quit after the refusal"
 kill "$pid"
 say "2: a wrong SHA256SUMS line: downloaded, refused, nothing kept, run or installed; Kerno still running"
 
-# The old version, installed.
-MSYS_NO_PATHCONV=1 "$old_setup" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART || fail "the 0.0.0 installer failed"
+# The old version, installed into a folder with a space and an accent.
+people="$work/Jean Dupont Élodie"
+app=$people/Programs/Kerno
+downloads=$people/AppData/Local/Kerno/data/updates
+export KERNO_TEST_DOWNLOADS_DIR
+KERNO_TEST_DOWNLOADS_DIR=$(cygpath -w "$downloads")
+MSYS_NO_PATHCONV=1 "$old_setup" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/DIR=$(cygpath -w "$app")" \
+  || fail "the 0.0.0 installer failed"
 [ "$(registry DisplayVersion)" = 0.0.0 ] || fail "0.0.0 is not installed: $(registry DisplayVersion)"
-cmp -s "$work/kerno-test.exe" "$app/kerno.exe" || fail "the installed 0.0.0 is not the test build"
+cmp -s "$work/kerno-test.exe" "$app/kerno.exe" || fail "the installed 0.0.0 is not the test build in $app"
 cp "$work/release/good.sums" "$work/release/SHA256SUMS"
+downloads_empty() { [ -z "$(ls -A "$downloads" 2>/dev/null)" ]; }
 
 # 3. Another Kerno holds the install folder's kerno.exe: nothing replaced, the old one says why.
 KERNO_DATA_DIR=$(cygpath -w "$work/data-other") KERNO_SECRET_STORE=memory KERNO_NO_UPDATE_CHECK=1 "$app/kerno.exe" &
 other=$!
 pids+=("$other")
-data=$work/data-3
+data="$people/données 3"
 until_true 30 has_files "$work/data-other" || fail "3: the other Kerno did not start"
 before=$(served "/download/v$version/$setup")
 KERNO_DATA_DIR=$(cygpath -w "$data") KERNO_SECRET_STORE=memory "$app/kerno.exe" &
 pids+=("$!")
 until_true 60 served_more "GET /EvanPluchart/kerno/releases/download/v$version/$setup" "$before" \
   || fail "3: the installer was not downloaded"
+ls -d "$downloads"/kerno-update-* > /dev/null || fail "3: nothing was downloaded into $downloads"
 # The Kerno started again would take the update again: github.com goes offline, so that what it
 # says on screen is the failed install.
 kill "$server"
 until_true 90 logs_say "$data" "its installer stopped before it finished" \
-  || { cat "$data/update-setup.log" 2>/dev/null | tail -20; fail "3: the old Kerno did not say the update failed"; }
+  || { tail -20 "$data/update-setup.log" 2>/dev/null; fail "3: the old Kerno did not say the update failed"; }
 grep -F "Another Kerno is still running" "$data/update-setup.log" || fail "3: the installer's log does not say why"
 [ "$(registry DisplayVersion)" = 0.0.0 ] || fail "3: the version changed to $(registry DisplayVersion)"
 cmp -s "$work/kerno-test.exe" "$app/kerno.exe" || fail "3: kerno.exe was replaced"
@@ -171,14 +212,17 @@ cmp -s "$work/kerno-test.exe" "$app/kerno.exe" || fail "3: kerno.exe was replace
 sleep 6
 picture dist/kerno-windows-update-failed.png
 [ -n "$(running_from "$app/kerno.exe")" ] || fail "3: no Kerno runs from $app"
+# The download goes at that start, or a minute later when the installer's stub still ran then.
+until_true 90 downloads_empty || fail "3: $downloads still holds $(ls "$downloads")"
+same_temp "$data" || fail "3: the Kerno started again has not the TEMP and TMP of the one that asked"
 stop_from "$app/kerno.exe"
 kill "$other" 2>/dev/null || true
 until_true 20 no_kerno "$app/kerno.exe" || fail "3: a Kerno still runs from $app"
-say "3: another Kerno running: the installer replaced nothing, the old Kerno started again and said why"
+say "3: another Kerno running: the installer replaced nothing, the old Kerno (from a path with a space and an accent) started again and said why; the download removed"
 
 # 4. The update.
 start_server
-data=$work/data-4
+data="$people/données 4"
 before=$(served "/download/v$version/$setup")
 KERNO_DATA_DIR=$(cygpath -w "$data") KERNO_SECRET_STORE=memory "$app/kerno.exe" &
 pid=$!
@@ -194,12 +238,70 @@ until_true 30 test ! -e "$data/update-pending.txt" || fail "4: the new Kerno did
 cmp -s "$work/kerno-shipped.exe" "$app/kerno.exe" || fail "4: the installed kerno.exe is not the shipped one"
 [ "$("$app/kerno.exe" --version)" = "kerno $version" ] || fail "4: kerno.exe --version says $("$app/kerno.exe" --version)"
 logs_say "$data" "was not installed" && fail "4: the new Kerno says the update failed"
-ls -d "$downloads"/kerno-update-* 2>/dev/null && fail "4: the download was kept"
+# V1: the installer unpacked its own code into the download's folder, not into %TEMP%.
+unpacked=$(grep -a "temporary directory" "$data/update-setup.log" || true)
+echo "$unpacked"
+case $unpacked in
+  *kerno-update-*) ;;
+  *) fail "4: the installer's temporary folder is not in the download's folder" ;;
+esac
 sleep 6
 picture dist/kerno-windows-updated.png
 stop_from "$app/kerno.exe"
-say "4: 0.0.0 updated to $version by the shipped installer: uninstall entry $version, kerno.exe the shipped one, the new Kerno started, the note and the download removed"
+# The new Kerno is the shipped build: it sweeps its own downloads folder, not this test one. The
+# next start of a Kerno that downloads here (the test build) removes this update's folder.
+KERNO_DATA_DIR=$(cygpath -w "$work/data-sweep") KERNO_SECRET_STORE=memory KERNO_NO_UPDATE_CHECK=1 "$work/test/kerno/kerno.exe" &
+sweeper=$!
+pids+=("$sweeper")
+until_true 90 downloads_empty || fail "4: $downloads still holds $(ls "$downloads")"
+kill "$sweeper"
+until_true 30 two_starts "$data" || fail "4: the new Kerno logged no start"
+same_temp "$data" || fail "4: the new Kerno has not the TEMP and TMP of the one that asked"
+grep -a "for the Kerno started at the end" "$data/update-setup.log" || fail "4: the installer did not put TEMP and TMP back"
 cp "$data/update-setup.log" dist/kerno-windows-update-setup.log
+say "4: 0.0.0 updated to $version by the shipped installer in a path with a space and an accent: uninstall entry $version, kerno.exe the shipped one, the new Kerno started, the installer's temporary files in the download's folder, the note removed, the download gone at the next start"
+
+# 5. A Kerno slow to quit: the installer waits for that process, however long, then installs.
+until_true 20 no_kerno "$app/kerno.exe" || true
+kill "$server"
+/c/Windows/System32/PING.EXE -n 46 127.0.0.1 > /dev/null &
+slow=$!
+pids+=("$slow")
+slow_pid=$(cat "/proc/$slow/winpid")
+data="$people/données 5"
+mkdir -p "$data"
+MSYS_NO_PATHCONV=1 "$old_setup" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS \
+  /relaunch=1 "/pid=$slow_pid" "/kerno=$(cygpath -w "$app/kerno.exe")" "/LOG=$(cygpath -w "$data/update-setup.log")" &
+installer=$!
+sleep 35
+version_is "$version" || fail "5: the installer did not wait for the slow Kerno ($(registry DisplayVersion))"
+kill -0 "$slow" 2>/dev/null || fail "5: the slow process ended too soon"
+wait "$installer" || true
+until_true 60 version_is 0.0.0 || { tail -20 "$data/update-setup.log"; fail "5: nothing was installed after the slow Kerno quit"; }
+until_true 60 kerno_runs "$app/kerno.exe" || fail "5: no Kerno was started after the install"
+stop_from "$app/kerno.exe"
+say "5: a Kerno 45 s slow to quit: the installer waited for it, then installed and started Kerno"
+
+# 6. A Kerno that does not quit within the installer's limit (/wait=20 here, 600 s by default):
+# nothing installed, that Kerno not started a second time, the installer gone (W3).
+/c/Windows/System32/PING.EXE -n 46 127.0.0.1 > /dev/null &
+slow=$!
+pids+=("$slow")
+slow_pid=$(cat "/proc/$slow/winpid")
+data="$people/données 6"
+mkdir -p "$data"
+MSYS_NO_PATHCONV=1 "dist/$setup" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS \
+  /relaunch=1 "/pid=$slow_pid" /wait=20 "/kerno=$(cygpath -w "$app/kerno.exe")" "/LOG=$(cygpath -w "$data/update-setup.log")" &
+installer=$!
+until_true 60 eval '! kill -0 "$installer" 2>/dev/null' || fail "6: the installer still runs after 60 s"
+kill -0 "$slow" 2>/dev/null || fail "6: the slow process ended too soon"
+grep -a "Kerno did not quit within 20 seconds: nothing was installed" "$data/update-setup.log" \
+  || { tail -20 "$data/update-setup.log"; fail "6: the installer's log does not say why"; }
+version_is 0.0.0 || fail "6: something was installed ($(registry DisplayVersion))"
+sleep 5
+no_kerno "$app/kerno.exe" || fail "6: a Kerno was started though the one that asked still ran"
+kill "$slow" 2>/dev/null || true
+say "6: a Kerno that did not quit within the limit: nothing installed, no second Kerno started, the installer gone"
 
 # Tidy: uninstall.
 until_true 20 no_kerno "$app/kerno.exe" || true

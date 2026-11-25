@@ -4837,7 +4837,7 @@ it" with what a runner can show; a person's use is still to come.
 - **Left as found**: no menu bar on Windows, as on Linux (GPUI draws none outside macOS; the toolbar and the
   palette hold every command); `actions::RECORD_RULE` calls the Windows key "Super", the Linux word.
 
-## D-139 — Windows, step 3b: an installer for this user, and the update installed from the app (K70; 2026-11-24)
+## D-139 — Windows, step 3c: an installer for this user, and the update installed from the app (K70; 2026-11-24)
 
 The owner's pick for the next release ("A4"): Windows gets what macOS and Linux have, an install and an update
 from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vigie".
@@ -4871,16 +4871,17 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
   changes), the tabs and settings written, a note in the data folder (`update-pending.txt`: the version and the
   download's folder), and the installer started with `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
   /NOCLOSEAPPLICATIONS /relaunch=1 /pid=<this process> /kerno=<this kerno.exe> /LOG=<data>\update-setup.log`;
-  Kerno quits. The installer waits up to 30 s for that process to end (`OpenProcess` and
-  `WaitForSingleObject` imported by Inno's Pascal script, not Rust code), then up to 10 s for
+  with `TEMP` and `TMP` set to the download's own folder; Kerno quits. The installer waits for that process
+  to end, however long (`OpenProcess` and `WaitForSingleObject` imported by Inno's Pascal script, not Rust
+  code; a line in its log each minute), then up to 10 s for
   `{app}\kerno.exe` to be writable; another Kerno still running from there stops it before anything is
   replaced ("Another Kerno is still running from …"), it never closes one (an open transaction). Installed,
   it starts the new Kerno; not installed, it starts the Kerno that asked again (`/kerno`). At each start Kerno
   reads the note: this version or newer, the note and the download go silently; older, it says "Kerno X was
   not installed: its installer stopped before it finished … what it did is in <log>" (a notice that stays
-  until closed), and the status bar offers the release page. The download stays while the installer runs (it reads its files from it) and goes
-  at the next start; a note naming anything but a `kerno-update-*` folder of the downloads' folder removes
-  nothing.
+  until closed), and the status bar offers the release page. The download stays while the installer runs
+  (it reads its files from it) and goes at the next start; a note naming anything but a `kerno-update-*`
+  folder of the downloads' folder removes nothing.
 - **What is run is what was checked (a review finding).** On Windows a new folder gets only what its parent
   passes on (D-131), and `TEMP` may name a folder every account can write (`C:\Temp`, a RAM disk): another
   account could then swap the installer between its check and its start. So (1) the downloads go to
@@ -4914,19 +4915,19 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
   into `%TEMP%`, Kerno into its local data folder, the installer held shut from its check to its start.
 - **Elevation.** As Recto: a Kerno running with more than a standard user's rights never runs a downloaded
   installer, it opens the release page. Asking Windows takes `unsafe`, so Kerno reads
-  `%SystemRoot%\System32\whoami.exe /groups /fo csv /nh` (one helper with K67's `curl.exe`, `system32`:
-  `SystemRoot` only when it is a drive's absolute path, else `C:\Windows`, never a bare name; run through
-  `System::output`, which starts it without a console window, K67's `no_console`) and decides by the integrity level's SID
-  in the third column, never by its name, which Windows translates: Medium (`S-1-16-8192`) alone runs the
-  installer; High (`S-1-16-12288`) and System (`S-1-16-16384`) open the release page (an elevated installer
-  would run as the administrator, and a process of the user without those rights could swap the checked
-  file before it runs); Low (`S-1-16-4096`) opens it too (a sandbox the installer could not write from); no
-  level, two levels, an empty answer, a missing or failing `whoami.exe`: Kerno cannot tell, and opens the
-  release page rather than run an installer. A per-user installer started from an elevated Kerno would install
-  into whichever account is elevated, maybe another person's: that is what the check prevents. A machine-wide
-  install does not exist (`lowest` without override); a `kerno.exe` copied by hand under `Program Files` with
-  its licences is treated as a zip and gets a per-user install beside it. A per-user folder that cannot be
-  written makes the installer fail: the note and the log say it at the next start.
+  `C:\Windows\System32\whoami.exe /groups /fo csv /nh` (one helper with K67's `curl.exe`,
+  `kerno_core::tools::system_program`, only from `C:\Windows`: review V3 below; run through `System::output`,
+  which starts it without a console window, K67's `no_console`) and decides by the integrity level's SID in the
+  third column, never by its name, which Windows translates: Medium (`S-1-16-8192`) alone runs the installer;
+  High (`S-1-16-12288`) and System (`S-1-16-16384`) open the release page (an elevated installer would run as
+  the administrator, and a process of the user without those rights could swap the checked file before it
+  runs); Low (`S-1-16-4096`) opens it too (a sandbox the installer could not write from); no level, two levels,
+  an empty answer, a missing or failing `whoami.exe`: Kerno cannot tell, and opens the release page rather than
+  run an installer. A per-user installer started from an elevated Kerno would install into whichever account is
+  elevated, maybe another person's: that is what the check prevents. A machine-wide install does not exist
+  (`lowest` without override); a `kerno.exe` copied by hand under `Program Files` with its licences is treated
+  as a zip and gets a per-user install beside it. A per-user folder that cannot be written makes the installer
+  fail: the note and the log say it at the next start.
 - **An unsigned installer.** No certificate: SmartScreen says "Windows protected your PC" for a download it
   does not know, with "More info" then "Run anyway"; the guide says so (the README's line is the main
   session's). The installer Kerno downloads with `curl` carries no mark of the web, which is what SmartScreen
@@ -4961,3 +4962,78 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
   `dist/*-setup.exe` too, `publish` lists `Kerno-$VERSION-windows-x86_64-setup.exe` after the zip in
   `SHA256SUMS` (ten files in the draft), and `ci.yml`'s `windows-package` keeps it with the run. Without it in
   `SHA256SUMS`, a Windows Kerno refuses the update and opens the release page.
+
+- **An independent review, and what it changed (V1 to V10).**
+  - V1, the installer's own code: Inno's stub unpacks `is-*.tmp\<name>.tmp` into `TEMP` and runs it; the
+    checksum and the held handle cover `setup.exe` only. The installer is now started with `TEMP` and `TMP`
+    set to the download's private folder in the profile, for its process only (`Runner::start_with_temp`);
+    the runner's log of a real update shows "Created protected temporary directory: …\kerno-update-…\is-….tmp"
+    (before: `C:\Users\…\AppData\Local\Temp\is-….tmp`, an earlier run's log).
+  - V2, `scripts/bundle-windows.sh`'s install check could open a developer's real data (`KERNO_DATA_DIR`
+    inherited by the installed Kerno's launch). It now runs only on GitHub's runners or with
+    `KERNO_INSTALL_CHECK=1` (elsewhere one line says it was skipped), and `scripts/windows-install-guard.sh`
+    refuses it when `KERNO_DATA_DIR` is set, when `%APPDATA%\Kerno`, `%LOCALAPPDATA%\Kerno` or the install
+    folder exists, when the uninstall entry exists or cannot be read, or when a `kerno.exe` runs; a failure
+    uninstalls only what that run installed. Each refusal is made on the runner and seen refused.
+  - V3, `SystemRoot`: a process of the same user can set it for the user's next programs, and a Kerno then
+    started as administrator would run its `whoami.exe` (which answers "Medium") and, three seconds later,
+    its `curl.exe`, elevated. Every program Windows ships is now taken only from `C:\Windows\System32`, and
+    only when `SystemRoot` is exactly `C:\Windows` (any case, a trailing separator ignored):
+    `kerno_core::tools::system_program(system_root, relative)` and `windows_program(relative)`. Anything
+    else means no update check (silent, as offline) and Update opens the release page. A Windows installed
+    elsewhere than `C:\Windows` (rare) gets no update from the app: the release page has it.
+  - V4, leftovers: at each start on Windows every `kerno-update-*` folder of the downloads folder that is
+    not in use goes (a failed install's, a declined download's); one still held by a running installer is
+    tried again a minute later. The uninstaller removes `%LOCALAPPDATA%\Kerno\data\updates` too.
+  - V5, offered again: a failed install said at a start is not offered again by the dialog in that run (the
+    status bar item and "Check for updates" still do). A copy unpacked from the zip that finds Kerno
+    installed in the profile at the version found (the uninstall entry's `DisplayVersion` through `reg.exe`,
+    the installed `kerno.exe` in `%LOCALAPPDATA%\Programs\Kerno`) says "Kerno X is installed in your
+    profile: start that one" with a Start it button, instead of installing it again.
+  - V6, paths with a space and an accent: the update that fails and the one that succeeds are run on the
+    runner with the install folder, the data folder and the downloads folder under "Jean Dupont Élodie"
+    (the install folder by `/DIR=` at the first install of 0.0.0 only, which the update keeps; the downloads
+    folder by `KERNO_TEST_DOWNLOADS_DIR`, read by the test build only). The installer used to give up after
+    30 s of waiting for the Kerno that asked, then started it again while it was still quitting; it now
+    waits as long as that Kerno takes (it has decided to quit; a Kerno hung there is ended by the user, and
+    the update then goes on). Proved with a process that lives 45 s.
+  - V7, what is left after the handle: the handle is released once the installer's process exists, before
+    Inno's `setup.tmp` reads the payload from `setup.exe` by path; only the same user can replace it then
+    (the folder is in the profile). The real answer is a signed installer.
+  - V8, the release workflows: the main session's.
+  - V9, the packaging refusal of the test build no longer rests on a log string alone: a test build's
+    `--version` says `kerno <version>+test-update-without-click` (a unit test asserts it), which
+    `scripts/bundle-windows.sh` refuses; the string check stays as a second one.
+  - V10, a failure half-way through the copy: Inno does not put back the files it already replaced.
+    `kerno.exe` is replaced first, so a failure on it leaves the old Kerno whole; a failure on a later file
+    (disk full) leaves the new `kerno.exe` with some older documents, and the uninstall entry still at the
+    old version. The new Kerno starts (the installer's `[Run]` does not run then: the old one is started
+    again by `/kerno`, which is now the new `kerno.exe`) and, being that version, says nothing. Not
+    observed: no test fills a disk.
+  - On every system now: an update failure notice stays until closed (said at a start, it must not go
+    before it is read); the release page clause "or Kerno running as administrator" shows on Windows only;
+    the note of a Windows update is read only on Windows.
+- **The second review (W1 to W4).**
+  - W1, the `TEMP` the installer hands on: the Kerno it starts (the new one, or the old one again)
+    inherited the installer's `TEMP` and `TMP`, the update's folder, which that Kerno then removes at its
+    start, so its temporary files (the XLSX export's, every program it starts) would have had no folder
+    for the whole session. Kerno now passes its own two in `KERNO_SETUP_TEMP` and `KERNO_SETUP_TMP`
+    (`update::setup_env`; an unset or empty one is passed as absent), and `kerno.iss` puts them back with
+    `SetEnvironmentVariableW` at `InitializeSetup`, after its stub has unpacked into the update's folder
+    (V1 holds) and before anything starts Kerno; an absent one is removed, not set empty. Every Kerno logs
+    its two at start ("temporary folders at start: TEMP=[…] TMP=[…]"); on the runner, in the failed
+    update and in the successful one, the Kerno that asked and the Kerno the installer started logged the
+    same, the user's, and a file can be made in that folder after the update's folder is gone.
+  - W2, a sweep per user, not per Kerno: a folder is named `kerno-update-<pid>-<time>` by the Kerno that
+    downloads into it; the sweep leaves it while `<pid>` is a running `kerno.exe` (`tasklist /fi "PID eq
+    <pid>" /fo csv /nh`, from `C:\Windows\System32` only; this process counts as running; no answer from
+    `tasklist` counts as running, so the folder stays). A pid reused by another program: the folder goes,
+    rightly (its Kerno is gone). A pid reused by another `kerno.exe`: the folder stays until that one
+    ends, then the next start removes it. Unit tests of the rule and of `tasklist`'s answer.
+  - W3, no limit to the wait: the installer now waits up to 600 s (`/wait=<seconds>`) for the Kerno that
+    asked; past that it installs nothing, writes "Kerno did not quit within 600 seconds: nothing was
+    installed" in its log, does not start that Kerno a second time, and exits. Kerno's note stays, so
+    that Kerno, once ended and started again, says the update was not installed and where the log is.
+    On the runner with `/wait=20` and a process that lives 45 s.
+  - W4, the failure notice ended "its release page has it": it now ends "Nothing was changed. You can
+    download it from its release page: click “Release page” in the status bar."

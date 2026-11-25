@@ -6,10 +6,12 @@
 ;
 ; An update from the app (crates/kerno/src/update.rs) runs it with
 ;   /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /relaunch=1 /pid=<n> /kerno=<exe> /LOG=<file>
-; It waits for that Kerno (process <n>) to quit, refuses to start while another Kerno runs from the
-; install folder, starts the new Kerno when it is done, and starts <exe> (the Kerno that asked)
-; again when it is not. The model is the owner's Recto (packaging/windows/recto.iss, MIT), which
-; waits on a named mutex instead: Kerno has none (no `unsafe` for one), so the process itself.
+; and with TEMP and TMP set to the download's own folder (its stub unpacks its code there), the
+; user's own two in KERNO_SETUP_TEMP and KERNO_SETUP_TMP, put back at once. It waits for that
+; Kerno (process <n>) to quit, up to /wait=<seconds> (600), refuses to start while another Kerno
+; runs from the install folder, starts the new Kerno when it is done, and starts <exe> (the Kerno
+; that asked) again when it is not. The model is the owner's Recto (packaging/windows/recto.iss,
+; MIT), which waits on a named mutex instead: Kerno has none (no `unsafe` for one), so the process.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -61,8 +63,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 en.LaunchKerno=Launch Kerno
 en.DataKept=Kerno is removed. Your connections, settings, history and saved queries are kept in the Kerno folder of your profile's AppData\Roaming; delete that folder to remove them too. Saved passwords stay in Windows' Credential Manager.
-en.StillRunning=The Kerno that asked for this update is still running after 30 seconds.
 en.OtherKerno=Another Kerno is still running from %1. Quit it, then update again.
+en.KernoHung=Kerno did not quit within %1 seconds: nothing was installed. Once that Kerno is ended and started again, it says what happened.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -74,6 +76,10 @@ Source: "{#Source}\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+
+[UninstallDelete]
+; What updates from the app downloaded (K70, V4): Kerno's own folder of downloads, never its data.
+Type: filesandordirs; Name: "{localappdata}\Kerno\data\updates"
 
 [Icons]
 Name: "{userprograms}\Kerno"; Filename: "{app}\kerno.exe"
@@ -91,6 +97,8 @@ const
 
 var
   Installed: Boolean;
+  { The Kerno that asked still runs: it is not started a second time. }
+  AskerRuns: Boolean;
 
 function OpenProcess(Access: Cardinal; Inherit: Boolean; Pid: Cardinal): THandle;
   external 'OpenProcess@kernel32.dll stdcall';
@@ -98,6 +106,11 @@ function WaitForSingleObject(Handle: THandle; Milliseconds: Cardinal): Cardinal;
   external 'WaitForSingleObject@kernel32.dll stdcall';
 function CloseHandle(Handle: THandle): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
+function SetEnvironmentVariable(Name: String; Value: String): Boolean;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+{ The same function with a null value: the variable is removed. }
+function RemoveEnvironmentVariable(Name: String; Null: Cardinal): Boolean;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
 
 { Started by Kerno's Update. }
 function RelaunchAsked(): Boolean;
@@ -105,12 +118,45 @@ begin
   Result := ExpandConstant('{param:relaunch|0}') = '1';
 end;
 
-{ Waits up to Milliseconds for process Pid to end; False when it still runs. A process that
-  cannot be opened has ended (or is not one this user may wait on: then the file check below
-  still stops Setup if it holds kerno.exe). }
-function ProcessEnded(Pid: Integer; Milliseconds: Cardinal): Boolean;
+{ Kerno started this Setup with TEMP and TMP set to the update's private folder, where the stub has
+  already unpacked Setup's own code (K70, V1). The user's own two are in KERNO_SETUP_TEMP and
+  KERNO_SETUP_TMP (an unset or empty one is absent): put back now, so that the Kerno started at the
+  end (the new one, or the old one again) gets them, and not a folder it removes at its start (W1). }
+procedure RestoreTemporaryFolder(const Name: String);
+var
+  Value: String;
+begin
+  Value := GetEnv('KERNO_SETUP_' + Name);
+  if Value <> '' then
+    SetEnvironmentVariable(Name, Value)
+  else
+    RemoveEnvironmentVariable(Name, 0);
+  RemoveEnvironmentVariable('KERNO_SETUP_' + Name, 0);
+  Log(Format('%s for the Kerno started at the end: %s', [Name, GetEnv(Name)]));
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  if GetEnv('KERNO_SETUP_ENV') = '1' then
+  begin
+    RestoreTemporaryFolder('TEMP');
+    RestoreTemporaryFolder('TMP');
+    RemoveEnvironmentVariable('KERNO_SETUP_ENV', 0);
+  end;
+end;
+
+{ Waits for process Pid to end: the Kerno that asked has decided to quit. Its quit can take a while
+  (connections to close); after Seconds (/wait=, 600 by default) Setup gives up rather than stay
+  invisible for ever, installs nothing and does not start that Kerno a second time; started again
+  once it has ended, it says what happened (K70, V6, W3). Logged each minute. True when it ended. A
+  process that cannot be opened has ended (or is not one this user may wait on: then the file check
+  below still stops Setup if it holds kerno.exe). }
+function WaitForProcess(Pid: Integer; Seconds: Integer): Boolean;
 var
   Process: THandle;
+  Waited: Integer;
+  Step: Cardinal;
 begin
   Result := True;
   if Pid <= 0 then
@@ -118,7 +164,18 @@ begin
   Process := OpenProcess(Synchronize, False, Pid);
   if Process = 0 then
     Exit;
-  Result := WaitForSingleObject(Process, Milliseconds) <> WaitTimeout;
+  Waited := 0;
+  Result := False;
+  while (not Result) and (Waited < Seconds) do
+  begin
+    Step := 60;
+    if Seconds - Waited < Step then
+      Step := Seconds - Waited;
+    Result := WaitForSingleObject(Process, Step * 1000) <> WaitTimeout;
+    Waited := Waited + Step;
+    if not Result then
+      Log(Format('The Kerno that asked (process %d) still runs after %d s: waiting.', [Pid, Waited]));
+  end;
   CloseHandle(Process);
 end;
 
@@ -143,15 +200,17 @@ end;
   transaction): stop before anything is replaced. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Waited: Integer;
+  Waited, Limit: Integer;
   Exe: String;
 begin
   Result := '';
   if not RelaunchAsked() then
     Exit;
-  if not ProcessEnded(StrToIntDef(ExpandConstant('{param:pid|0}'), 0), 30000) then
+  Limit := StrToIntDef(ExpandConstant('{param:wait|600}'), 600);
+  if not WaitForProcess(StrToIntDef(ExpandConstant('{param:pid|0}'), 0), Limit) then
   begin
-    Result := CustomMessage('StillRunning');
+    AskerRuns := True;
+    Result := FmtMessage(CustomMessage('KernoHung'), [IntToStr(Limit)]);
     Exit;
   end;
   Exe := ExpandConstant('{app}\kerno.exe');
@@ -172,13 +231,14 @@ begin
 end;
 
 { An update that did not install: start the Kerno that asked again, so the user is not left
-  with none; it reads why in its data folder (update::after_install) and says so. }
+  with none; it reads why in its data folder (update::after_install) and says so. Not when it
+  still runs (W3). }
 procedure DeinitializeSetup();
 var
   Old: String;
   Code: Integer;
 begin
-  if RelaunchAsked() and not Installed then
+  if RelaunchAsked() and not Installed and not AskerRuns then
   begin
     Old := ExpandConstant('{param:kerno|}');
     if (Old <> '') and FileExists(Old) then

@@ -2586,6 +2586,24 @@ fn is_database_variable(name: &OsStr) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// A program Windows ships, at `relative` under `C:\Windows\System32` (`curl.exe`, `whoami.exe`,
+/// `reg.exe`, `OpenSSH\ssh.exe`), and only there. `system_root` is the `SystemRoot` variable; any
+/// value but `C:\Windows` (any case, a trailing separator ignored) gives `None`: another drive, a
+/// relative or UNC path, an empty or absent value. A process of the same user can set that variable
+/// for the user's next programs, and a Kerno then started as administrator would run what lies in a
+/// folder of its choosing (K70, D-139). A Windows installed elsewhere than `C:\Windows` gets none
+/// of these programs: no update check, no installer run.
+pub fn system_program(system_root: Option<&str>, relative: &str) -> Option<PathBuf> {
+    let root = system_root?.trim_end_matches(['\\', '/']);
+    root.eq_ignore_ascii_case(r"C:\Windows")
+        .then(|| PathBuf::from(format!(r"C:\Windows\System32\{relative}")))
+}
+
+/// [`system_program`] with this process's `SystemRoot`.
+pub fn windows_program(relative: &str) -> Option<PathBuf> {
+    system_program(std::env::var("SystemRoot").ok().as_deref(), relative)
+}
+
 /// Windows: the child gets no console window. A release Kerno is a windowed program with no
 /// console to share, so Windows would open one for each console program it starts
 /// (`CREATE_NO_WINDOW`). Nothing on other systems.
